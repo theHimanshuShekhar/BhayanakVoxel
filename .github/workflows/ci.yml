@@ -23,6 +23,16 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
+        env:
+          # Where the golden image test writes actual.png, expected.png and diff.png on a mismatch.
+          GOLDEN_FAILURE_DIR: ${{ github.workspace }}/golden-failures
+      - name: Upload golden image failures
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: golden-image-failures
+          path: golden-failures
+          if-no-files-found: ignore
       - name: Server must not depend on wgpu or winit
         shell: bash
         run: |
@@ -55,6 +65,13 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest]
         profile: [debug, release]
+        include:
+          # The workspace optimises these crates in dev builds so that tests run fast; undo that
+          # here so that the debug leg really tests unoptimised code.
+          - profile: debug
+            flags: --config profile.dev.package.planet-gen.opt-level=0 --config profile.dev.package.brick-store.opt-level=0
+          - profile: release
+            flags: --release
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -62,4 +79,4 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.profile }}
-      - run: cargo test ${{ matrix.profile == 'release' && '--release' || '' }} -p planet-gen golden
+      - run: cargo test ${{ matrix.flags }} -p planet-gen golden

@@ -23,3 +23,11 @@ winit = "0.30.13"
 # Keeps the shared target dir from filling the disk.
 debug = "line-tables-only"
 incremental = false
+
+# Tests generate regions of the test Planet, which is slow unoptimised. Output is bit-identical
+# in every profile (ADR 0003).
+[profile.dev.package.planet-gen]
+opt-level = 3
+
+[profile.dev.package.brick-store]
+opt-level = 3

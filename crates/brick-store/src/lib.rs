@@ -4,6 +4,6 @@ mod brick;
 mod coord;
 mod store;
 
-pub use brick::{BRICK_VOXELS, Brick, Material};
+pub use brick::{BRICK_VOXELS, Brick, BrickView, Material};
 pub use coord::{BRICK_SIZE, BrickCoord, LocalCoord, VoxelCoord};
 pub use store::BrickStore;

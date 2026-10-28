@@ -1,15 +1,26 @@
-//! wgpu rendering on the Vulkan backend.
+//! wgpu rendering on the Vulkan backend: compute-shader DDA through the Planet's bricks.
+//!
+//! `trace(ray) -> Hit` in `shaders/trace.wgsl` is the single entry point the renderer calls to
+//! find what a ray hits. [`reference`] is its CPU twin, used by tests. A window ([`Renderer`])
+//! and an offscreen target ([`Offscreen`]) share one [`tracer::Tracer`], so tests render with the
+//! code that the window runs.
+
+pub mod camera;
+mod offscreen;
+pub mod reference;
+pub mod scene;
+mod shaders;
+pub mod tracer;
+mod window;
 
 use std::error::Error;
 
-type Result<T> = std::result::Result<T, Box<dyn Error>>;
+pub use camera::Camera;
+pub use offscreen::{Image, Offscreen};
+pub use scene::Scene;
+pub use window::Renderer;
 
-const CLEAR_COLOR: wgpu::Color = wgpu::Color {
-    r: 0.02,
-    g: 0.05,
-    b: 0.12,
-    a: 1.0,
-};
+pub(crate) type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
 /// Vulkan is the only supported backend (ADR 0001).
 fn create_instance() -> wgpu::Instance {
@@ -30,92 +41,65 @@ fn request_gpu(
     }))?;
     let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
         label: Some("bhayanak device"),
+        // The Planet's bricks are one big storage buffer, well over the portable 128 MiB limit.
+        required_limits: adapter.limits(),
         ..Default::default()
     }))?;
     Ok((adapter, device, queue))
 }
 
-/// Draws to a window surface, currently just clearing it to a colour.
-pub struct Renderer {
-    surface: wgpu::Surface<'static>,
-    config: wgpu::SurfaceConfiguration,
-    device: wgpu::Device,
-    queue: wgpu::Queue,
+/// Submits `encoder` and returns the first `size` bytes of `staging`, a `MAP_READ` buffer that
+/// the encoder copies into.
+fn finish_and_read(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    encoder: wgpu::CommandEncoder,
+    staging: &wgpu::Buffer,
+    size: u64,
+) -> Vec<u8> {
+    queue.submit([encoder.finish()]);
+    let (sender, receiver) = std::sync::mpsc::channel();
+    staging
+        .slice(..size)
+        .map_async(wgpu::MapMode::Read, move |result| {
+            sender.send(result).expect("receiver outlives the map");
+        });
+    device
+        .poll(wgpu::PollType::wait_indefinitely())
+        .expect("device poll failed");
+    receiver
+        .recv()
+        .expect("map callback ran")
+        .expect("staging buffer maps");
+    let bytes = staging
+        .slice(..size)
+        .get_mapped_range()
+        .expect("mapped range")
+        .to_vec();
+    staging.unmap();
+    bytes
 }
 
-impl Renderer {
-    /// `window` is anything wgpu can make a surface from, e.g. an `Arc<winit::window::Window>`.
-    pub fn new(
-        window: impl Into<wgpu::SurfaceTarget<'static>>,
-        width: u32,
-        height: u32,
-    ) -> Result<Self> {
-        let instance = create_instance();
-        let surface = instance.create_surface(window)?;
-        let (adapter, device, queue) = request_gpu(&instance, Some(&surface))?;
-        let config = surface
-            .get_default_config(&adapter, width.max(1), height.max(1))
-            .ok_or("surface is not supported by the adapter")?;
-        surface.configure(&device, &config);
-        Ok(Self {
-            surface,
-            config,
-            device,
-            queue,
-        })
-    }
+fn staging_buffer(device: &wgpu::Device, size: u64) -> wgpu::Buffer {
+    device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("readback"),
+        size,
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    })
+}
 
-    /// Reconfigures the surface. Zero-sized windows (minimised) are ignored.
-    pub fn resize(&mut self, width: u32, height: u32) {
-        if width == 0 || height == 0 {
-            return;
-        }
-        self.config.width = width;
-        self.config.height = height;
-        self.surface.configure(&self.device, &self.config);
-    }
-
-    /// Clears the surface and presents it. A frame that cannot be acquired is skipped.
-    /// A suboptimal surface is reconfigured after its frame is presented.
-    pub fn render(&mut self) {
-        let (frame, suboptimal) = match self.surface.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(frame) => (frame, false),
-            wgpu::CurrentSurfaceTexture::Suboptimal(frame) => (frame, true),
-            wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
-                self.surface.configure(&self.device, &self.config);
-                return;
-            }
-            wgpu::CurrentSurfaceTexture::Timeout
-            | wgpu::CurrentSurfaceTexture::Occluded
-            | wgpu::CurrentSurfaceTexture::Validation => return,
-        };
-        let view = frame
-            .texture
-            .create_view(&wgpu::TextureViewDescriptor::default());
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
-        encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("clear"),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: &view,
-                depth_slice: None,
-                resolve_target: None,
-                ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(CLEAR_COLOR),
-                    store: wgpu::StoreOp::Store,
-                },
-            })],
-            ..Default::default()
-        });
-        self.queue.submit([encoder.finish()]);
-        self.queue.present(frame);
-        // The surface cannot be reconfigured while a frame is alive, so this waits until
-        // the frame has been presented.
-        if suboptimal {
-            self.surface.configure(&self.device, &self.config);
-        }
-    }
+/// Copies `size` bytes of `buffer` (which needs `COPY_SRC`) to the CPU.
+fn read_buffer(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    mut encoder: wgpu::CommandEncoder,
+    buffer: &wgpu::Buffer,
+    size: u64,
+) -> Vec<u8> {
+    let staging = staging_buffer(device, size);
+    encoder.copy_buffer_to_buffer(buffer, 0, &staging, 0, size);
+    finish_and_read(device, queue, encoder, &staging, size)
 }
 
 #[cfg(test)]
