@@ -38,6 +38,25 @@ struct Mixed {
     indices: Vec<u8>,
 }
 
+/// Read-only view of how a brick is stored, for uploading it elsewhere (e.g. to the GPU).
+#[derive(Clone, Copy, Debug)]
+pub enum BrickView<'a> {
+    Air,
+    Solid(Material),
+    Mixed {
+        /// Bit `i % 64` of word `i / 64` is set when Voxel `i` is solid. Voxel `i` is
+        /// `x | y << 3 | z << 6`.
+        occupancy: &'a [u64; 8],
+        /// Materials that the packed indices point into.
+        palette: &'a [Material],
+        /// Bits per palette index: 1, 2, 4, 8 or 16.
+        bits: u32,
+        /// One `bits`-wide palette index per Voxel, packed little-endian from the lowest bit.
+        /// Indices of air Voxels are meaningless.
+        indices: &'a [u8],
+    },
+}
+
 /// Position of a Voxel in occupancy and index order: x fastest, then y, then z.
 fn voxel_index(local: LocalCoord) -> usize {
     let [x, y, z] = local.map(usize::from);
@@ -190,6 +209,20 @@ impl Brick {
         };
         mixed.set(voxel_index(local), voxel);
         self.0 = mixed.uniform().unwrap_or(Repr::Mixed(mixed));
+    }
+
+    /// The brick's stored representation.
+    pub fn view(&self) -> BrickView<'_> {
+        match &self.0 {
+            Repr::Air => BrickView::Air,
+            Repr::Solid(material) => BrickView::Solid(*material),
+            Repr::Mixed(mixed) => BrickView::Mixed {
+                occupancy: &mixed.occupancy,
+                palette: &mixed.palette,
+                bits: mixed.bits,
+                indices: &mixed.indices,
+            },
+        }
     }
 
     /// True when the brick is all air.
@@ -411,6 +444,29 @@ mod tests {
         let mut dug = Brick::solid(ROCK);
         dug.set([0, 0, 0], None);
         assert_ne!(dug.content_hash(), Brick::solid(ROCK).content_hash());
+    }
+
+    #[test]
+    fn the_view_exposes_the_packed_representation() {
+        assert!(matches!(Brick::AIR.view(), BrickView::Air));
+        assert!(matches!(Brick::solid(ROCK).view(), BrickView::Solid(m) if m == ROCK));
+        let mut b = Brick::AIR;
+        b.set([1, 0, 0], Some(ROCK));
+        b.set([2, 0, 0], Some(Material(9)));
+        let BrickView::Mixed {
+            occupancy,
+            palette,
+            bits,
+            indices,
+        } = b.view()
+        else {
+            panic!("expected a mixed brick");
+        };
+        assert_eq!(occupancy[0], 0b110);
+        assert_eq!(palette, [ROCK, Material(9)]);
+        assert_eq!(bits, 1);
+        // Voxel 1 uses palette index 0 and voxel 2 uses index 1: bit 2 of byte 0.
+        assert_eq!(indices[0], 0b100);
     }
 
     #[test]

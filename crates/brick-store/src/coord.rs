@@ -36,6 +36,21 @@ impl BrickCoord {
         }))
     }
 
+    /// True when every Voxel of this brick lies within `radius` Voxels of the Planet's centre.
+    /// A Voxel is measured at its minimum corner, the point its coordinate names.
+    pub fn within_ball(self, radius: i32) -> bool {
+        let far_sq: i64 = self
+            .origin()
+            .0
+            .map(|o| {
+                let far = i64::from(o).abs().max(i64::from(o + BRICK_SIZE - 1).abs());
+                far * far
+            })
+            .iter()
+            .sum();
+        far_sq <= i64::from(radius).pow(2)
+    }
+
     /// The Voxel at `local` inside this brick.
     pub fn voxel(self, local: LocalCoord) -> VoxelCoord {
         let o = self.origin().0;
@@ -96,6 +111,16 @@ mod tests {
     #[should_panic(expected = "out of Voxel range")]
     fn a_very_negative_origin_panics_in_every_profile() {
         BrickCoord([0, i32::MIN / 8 - 1, 0]).origin();
+    }
+
+    #[test]
+    fn a_brick_is_within_a_ball_only_when_its_farthest_voxel_is() {
+        // Farthest Voxel of brick 0 is (7, 7, 7): 147 squared. Of brick -1 it is (-8, -8, -8): 192.
+        assert!(!BrickCoord([0, 0, 0]).within_ball(12));
+        assert!(BrickCoord([0, 0, 0]).within_ball(13));
+        assert!(!BrickCoord([-1, -1, -1]).within_ball(13));
+        assert!(BrickCoord([-1, -1, -1]).within_ball(14));
+        assert!(!BrickCoord([1000, 0, 0]).within_ball(1500));
     }
 
     #[test]
