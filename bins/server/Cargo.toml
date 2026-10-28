@@ -1,0 +1,9 @@
+[package]
+name = "server"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+sim.workspace = true
+ctrlc = "3.5.2"
