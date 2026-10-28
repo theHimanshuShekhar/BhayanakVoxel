@@ -1,0 +1,24 @@
+[workspace]
+resolver = "3"
+members = ["crates/*", "bins/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace.dependencies]
+planet-gen = { path = "crates/planet-gen" }
+sim = { path = "crates/sim" }
+net = { path = "crates/net" }
+render = { path = "crates/render" }
+
+# wgpu is pinned to one exact version; each upgrade is a deliberate task (ADR 0001).
+# Vulkan is the only supported backend, so the other backends are not compiled in.
+wgpu = { version = "=30.0.1", default-features = false, features = ["std", "parking_lot", "vulkan", "wgsl"] }
+winit = "0.30.13"
+
+[profile.dev]
+# Keeps the shared target dir from filling the disk.
+debug = "line-tables-only"
+incremental = false

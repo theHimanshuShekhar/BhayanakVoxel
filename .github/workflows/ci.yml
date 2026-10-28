@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      # lavapipe is a software Vulkan driver, so render tests can create a device without a GPU.
+      - name: Install lavapipe
+        run: sudo apt-get update && sudo apt-get install -y mesa-vulkan-drivers
+      - run: cargo fmt --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+      - name: Server must not depend on wgpu or winit
+        shell: bash
+        run: |
+          set -euo pipefail
+          deps=$(cargo tree -p server -e normal --prefix none --target all)
+          if grep -E '^(wgpu|winit)' <<<"$deps"; then
+            echo "::error::server must not depend on wgpu or winit"
+            exit 1
+          fi
+
+  windows-client:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release -p client
+      - uses: actions/upload-artifact@v4
+        with:
+          name: client-windows
+          path: target/release/client.exe
+          if-no-files-found: error
