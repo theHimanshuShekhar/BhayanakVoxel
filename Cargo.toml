@@ -8,6 +8,7 @@ edition = "2024"
 publish = false
 
 [workspace.dependencies]
+brick-store = { path = "crates/brick-store" }
 planet-gen = { path = "crates/planet-gen" }
 sim = { path = "crates/sim" }
 net = { path = "crates/net" }
