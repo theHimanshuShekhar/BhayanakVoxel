@@ -45,3 +45,21 @@ jobs:
           name: client-windows
           path: target/release/client.exe
           if-no-files-found: error
+
+  # Every runner checks the same committed golden hashes, so passing everywhere means the
+  # runners agree with each other (ADR 0003).
+  determinism:
+    name: determinism (${{ matrix.os }}, ${{ matrix.profile }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        profile: [debug, release]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.profile }}
+      - run: cargo test ${{ matrix.profile == 'release' && '--release' || '' }} -p planet-gen golden

@@ -1,0 +1,5 @@
+[package]
+name = "brick-store"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
