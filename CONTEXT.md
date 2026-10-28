@@ -22,6 +22,10 @@ _Avoid_: Block type, voxel type
 A player-caused change to the Planet's Voxels: digging (removing) or placing.
 _Avoid_: Modification, build
 
+**Brush**:
+The shape and size an Edit applies to the Planet (e.g. a 1 m sphere).
+_Avoid_: Tool size, cursor
+
 **Debris**:
 A group of Voxels detached from the Planet by Edits that moves as a physical rigid body.
 _Avoid_: Fragment, chunk (reserved for storage, if used at all)
