@@ -129,8 +129,8 @@ as those are the passes that exist. The later stages (sun shadows 0.4, GI 1.5, r
 glass 0.7, volumetrics 1.0, denoise 1.0, atmosphere 0.3, upscale 0.5, edits 1.0, post 0.5) are
 in the file as comments: **whoever adds a pass uncomments its budget and names it the same**
 (a pass is named by the string given to `Profiler::compute_pass`). `reference` has no budget in
-#10, and the number in the file is a placeholder to catch a gross regression; replace it with a
-figure from the first real run.
+#10; its 3.0 ms (a sample, pass and total) catches a gross regression, set from the first real run
+on the 4090, which measured a mean of 1.10 ms.
 
 ## Tests
 

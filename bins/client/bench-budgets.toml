@@ -16,10 +16,10 @@
 # M1a: primary visibility, 1 ray per pixel.
 primary = 1.0
 
-# Placeholder. The reference path tracer is the ground truth and has no budget in #10; this
-# only catches an order-of-magnitude regression of one sample. Set it from the first run on the
-# 4090.
-reference = 25.0
+# The reference path tracer is the ground truth and has no budget in #10. This catches a gross
+# regression of one sample: the first run on the 4090 (bdbba3d, the planet flyover) measured a
+# mean of 1.10 ms a sample, p95 2.69 ms.
+reference = 3.0
 
 # M1 stages from #10, for when the passes exist (the names are suggestions):
 # shadows      = 0.4   # sun shadows, 1 ray/px
@@ -41,5 +41,5 @@ reference = 25.0
 [gpu_total]
 # M1 total from #10 (about 9 ms of GPU work in a 16.7 ms frame).
 primary = 8.6
-# Placeholder, like the reference pass.
-reference = 30.0
+# One reference sample, measured like the reference pass above.
+reference = 3.0
