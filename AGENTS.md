@@ -11,3 +11,7 @@ Uses the default label names: `needs-triage`, `needs-info`, `ready-for-agent`, `
 ### Domain docs
 
 Single-context: one `CONTEXT.md` and `docs/adr/` at the repo root. See `docs/agents/domain.md`.
+
+### Benchmarking
+
+PRs that touch rendering or performance get the `needs-benchmark` label; the dev runs `client bench` on the PR's Windows artifact. See `docs/agents/benchmarking.md`.

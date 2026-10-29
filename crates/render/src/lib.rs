@@ -33,7 +33,7 @@ use std::error::Error;
 
 pub use camera::Camera;
 pub use debug_view::DebugView;
-pub use offscreen::{Image, Offscreen};
+pub use offscreen::{GpuInfo, Image, Offscreen};
 pub use profiler::Profiler;
 pub use scene::{Scene, SceneUpdate};
 pub use sun::Sun;

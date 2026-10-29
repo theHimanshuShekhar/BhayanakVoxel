@@ -1,7 +1,9 @@
+mod bench;
 mod fly;
 mod world;
 
 use std::error::Error;
+use std::process::ExitCode;
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::Instant;
@@ -30,6 +32,16 @@ const TITLE: &str = "BhayanakVoxel";
 /// Radians the sun turns per arrow key press (and per repeat while it is held).
 const SUN_STEP: f32 = 0.05;
 
+/// The test Planet's bricks packed for the GPU, with its rock core standing in for the bricks
+/// that are not stored.
+fn planet_scene(store: &BrickStore) -> Scene {
+    let core = Core {
+        radius: planet_gen::CORE_RADIUS,
+        material: planet_gen::ROCK,
+    };
+    Scene::new(store, Some(core))
+}
+
 /// The test Planet as the client and the in-process server each hold it, and the client's packed
 /// copy of it.
 struct Loaded {
@@ -49,11 +61,7 @@ fn load_planet() -> Loaded {
         store.len(),
         started.elapsed()
     );
-    let core = Core {
-        radius: planet_gen::CORE_RADIUS,
-        material: planet_gen::ROCK,
-    };
-    let scene = Scene::new(&store, Some(core));
+    let scene = planet_scene(&store);
     // Generation is deterministic, so the server's Planet is what generating it again would
     // give; copying it is quicker.
     let server_store = store.clone();
@@ -495,12 +503,16 @@ impl ApplicationHandler for App {
     }
 }
 
-fn main() -> Result<(), Box<dyn Error>> {
+fn main() -> Result<ExitCode, Box<dyn Error>> {
+    let mut args = std::env::args().skip(1);
+    if args.next().as_deref() == Some("bench") {
+        return Ok(bench::main(args));
+    }
     let event_loop = EventLoop::new()?;
     event_loop.set_control_flow(ControlFlow::Poll);
     let mut app = App::new();
     event_loop.run_app(&mut app)?;
-    app.error.map_or(Ok(()), Err)
+    app.error.map_or(Ok(ExitCode::SUCCESS), Err)
 }
 
 #[cfg(test)]

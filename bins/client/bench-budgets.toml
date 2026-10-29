@@ -1,0 +1,45 @@
+# Default budgets for `client bench`: milliseconds of GPU time per frame, on the dev's RTX 4090
+# at 1440p output (1280x720 traced internally). A pass whose mean time over the run is above its
+# budget is marked "over", fails the run (exit status 2), and blocks the merge of the PR (#13).
+#
+# This file is compiled into the executable. `client bench --budgets FILE` uses another file
+# instead; a copy of this one is the place to start.
+#
+# The numbers come from the rendering decision (#10, "Frame budget"). A stage gets a line here
+# once there is a pass of that name; the rest are listed, commented out, for whoever adds the
+# pass. A budget for a pass that does not run is ignored (the report lists it); a pass that ran
+# but could not be timed, because the GPU lacks timestamp queries, is "no-data" and fails the
+# run, since nothing was checked.
+
+# By pass name, wherever the pass runs.
+[passes]
+# M1a: primary visibility, 1 ray per pixel.
+primary = 1.0
+
+# Placeholder. The reference path tracer is the ground truth and has no budget in #10; this
+# only catches an order-of-magnitude regression of one sample. Set it from the first run on the
+# 4090.
+reference = 25.0
+
+# M1 stages from #10, for when the passes exist (the names are suggestions):
+# shadows      = 0.4   # sun shadows, 1 ray/px
+# gi           = 1.5   # GI bounce and radiance cache
+# reflections  = 0.7
+# glass        = 0.7
+# volumetrics  = 1.0
+# denoise      = 1.0
+# atmosphere   = 0.3
+# upscale      = 0.5
+# edits        = 1.0   # Edits and BVH updates
+# post         = 0.5   # post-processing and UI (the window's blit and overlay passes are not
+#                      # run by the offscreen bench)
+
+# The GPU time of one profiler frame, by mode: from the start of its first pass to the end of
+# its last. In primary mode that is one frame of the path. In reference mode every sample is a
+# profiler frame of its own, so `gpu_total.reference` budgets one sample, not the frames' worth
+# of samples that the camera path's frame draws.
+[gpu_total]
+# M1 total from #10 (about 9 ms of GPU work in a 16.7 ms frame).
+primary = 8.6
+# Placeholder, like the reference pass.
+reference = 30.0

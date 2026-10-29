@@ -13,3 +13,5 @@ The skills speak in terms of five canonical triage roles. This file maps those r
 When a skill mentions a role (e.g. "apply the AFK-ready triage label"), use the corresponding label string from this table.
 
 Edit the right-hand column to match whatever vocabulary you actually use.
+
+PR labels (not triage roles): `needs-benchmark` marks a PR that touches rendering or performance, for the dev to run `client bench` on its artifact. See `docs/agents/benchmarking.md`.

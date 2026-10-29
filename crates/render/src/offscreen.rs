@@ -18,8 +18,20 @@ pub struct Image {
     pub rgba: Vec<u8>,
 }
 
+/// Which GPU and driver a device is on, for tools that report where they ran.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GpuInfo {
+    pub name: String,
+    /// `Discrete`, `Integrated`, `Virtual`, `Cpu` (software, such as lavapipe) or `Other`.
+    pub device_type: String,
+    pub driver: String,
+    pub driver_info: String,
+    pub backend: String,
+}
+
 /// The renderer with an image of its own instead of a window.
 pub struct Offscreen {
+    info: GpuInfo,
     device: wgpu::Device,
     queue: wgpu::Queue,
     tracer: Tracer,
@@ -41,11 +53,20 @@ impl Offscreen {
     }
 
     fn create(width: u32, height: u32, scene: &Scene, timers: bool) -> Result<Self> {
-        let (_adapter, device, queue) = request_gpu(&create_instance(), None, timers)?;
+        let (adapter, device, queue) = request_gpu(&create_instance(), None, timers)?;
+        let info = adapter.get_info();
+        let info = GpuInfo {
+            name: info.name,
+            device_type: format!("{:?}", info.device_type),
+            driver: info.driver,
+            driver_info: info.driver_info,
+            backend: format!("{:?}", info.backend),
+        };
         let tracer = Tracer::new(&device, scene)?;
         let profiler = Profiler::new(&device, &queue);
         let target = Target::new(&device, width, height);
         Ok(Self {
+            info,
             device,
             queue,
             tracer,
@@ -77,6 +98,11 @@ impl Offscreen {
     /// none (see [`Offscreen::timers_supported`]).
     pub fn timings(&self) -> &Timings {
         self.profiler.timings()
+    }
+
+    /// The GPU that this renders on.
+    pub fn gpu_info(&self) -> &GpuInfo {
+        &self.info
     }
 
     /// Whether the device can time passes.
