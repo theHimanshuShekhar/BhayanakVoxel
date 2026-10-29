@@ -9,6 +9,7 @@ publish = false
 
 [workspace.dependencies]
 brick-store = { path = "crates/brick-store" }
+materials = { path = "crates/materials" }
 planet-gen = { path = "crates/planet-gen" }
 sim = { path = "crates/sim" }
 net = { path = "crates/net" }

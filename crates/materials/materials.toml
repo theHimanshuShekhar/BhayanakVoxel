@@ -1,0 +1,1016 @@
+# Every Material of the game (decision in #15). One `[[material]]` table each; adding a Material
+# is adding a table here, with the next free `id`, and needs no code change.
+#
+# Ids are stable: they are stored in saved Planets and sent over the network, so never renumber
+# or reuse one. Ids 1 (rock) and 2 (soil) are what the Planet generator places (ADR 0003).
+#
+# Every property must be given; a missing or unknown one is a load error.
+#
+#   id                  16-bit, unique.
+#   name                not empty, and unique ignoring case; what the palette panel searches.
+#   category            "natural", "building" or "light".
+#   colour              base albedo, linear RGB, each 0..1.
+#   noise_scale         edge, in Voxels, of the patches the variation below changes over (> 0).
+#   hue_jitter          most the hue is turned either way per patch, in degrees (0..180).
+#   value_jitter        most the brightness is scaled either way per patch, as a fraction (0..1).
+#   roughness           0 mirror-smooth .. 1 fully diffuse.
+#   metalness           0 dielectric .. 1 metal.
+#   emissive            colour of the light it gives off, linear RGB, each 0..1.
+#   emissive_intensity  multiplier on `emissive`, as a multiple of the sun's radiance; 0 for none.
+#   transparency        0 opaque .. 1 clear.
+#   ior                 index of refraction (>= 1); 1 for opaque Materials.
+#   hardness            how long it takes to dig, 0 (none) .. 10 (slowest); soil 2, rock 6.
+#   density             kg/m^3; the mass of Debris made of it.
+#   fluid               "none", "water", "sand" or "lava": how it flows once Fluids exist.
+#
+# Glass (transparency, ior) and metalness are stored now; only M1b shades them.
+
+[[material]]
+id = 1
+name = "rock"
+category = "natural"
+colour = [0.45, 0.43, 0.4]
+noise_scale = 1.0
+hue_jitter = 0.0
+value_jitter = 0.1
+roughness = 0.9
+metalness = 0.0
+emissive = [0.0, 0.0, 0.0]
+emissive_intensity = 0.0
+transparency = 0.0
+ior = 1.0
+hardness = 6.0
+density = 2700.0
+fluid = "none"
+
+[[material]]
+id = 2
+name = "soil"
+category = "natural"
+colour = [0.3, 0.5, 0.2]
+noise_scale = 1.0
+hue_jitter = 0.0
+value_jitter = 0.1
+roughness = 1.0
+metalness = 0.0
+emissive = [0.0, 0.0, 0.0]
+emissive_intensity = 0.0
+transparency = 0.0
+ior = 1.0
+hardness = 2.0
+density = 1500.0
+fluid = "none"
+
+[[material]]
+id = 3
+name = "grassy soil"
+category = "natural"
+colour = [0.22, 0.42, 0.12]
+noise_scale = 1.0
+hue_jitter = 6.0
+value_jitter = 0.12
+roughness = 1.0
+metalness = 0.0
+emissive = [0.0, 0.0, 0.0]
+emissive_intensity = 0.0
+transparency = 0.0
+ior = 1.0
+hardness = 2.0
+density = 1400.0
+fluid = "none"
+
+[[material]]
+id = 4
+name = "clay"
+category = "natural"
+colour = [0.55, 0.38, 0.28]
+noise_scale = 2.0
+hue_jitter = 3.0
+value_jitter = 0.06
+roughness = 0.85
+metalness = 0.0
+emissive = [0.0, 0.0, 0.0]
+emissive_intensity = 0.0
+transparency = 0.0
+ior = 1.0
+hardness = 2.5
+density = 1800.0
+fluid = "none"
+
+[[material]]
+id = 5
+name = "gravel"
+category = "natural"
+colour = [0.5, 0.48, 0.45]
+noise_scale = 1.0
+hue_jitter = 5.0
+value_jitter = 0.18
+roughness = 0.95
+metalness = 0.0
+emissive = [0.0, 0.0, 0.0]
+emissive_intensity = 0.0
+transparency = 0.0
+ior = 1.0
+hardness = 3.0
+density = 1700.0
+fluid = "none"
+
+[[material]]
+id = 6
+name = "sand"
+category = "natural"
+colour = [0.76, 0.65, 0.4]
+noise_scale = 1.0
+hue_jitter = 3.0
+value_jitter = 0.06
+roughness = 1.0
+metalness = 0.0
+emissive = [0.0, 0.0, 0.0]
+emissive_intensity = 0.0
+transparency = 0.0
+ior = 1.0
+hardness = 1.0
+density = 1600.0
+fluid = "sand"
+
+[[material]]
+id = 7
+name = "sandstone"
+category = "natural"
+colour = [0.68, 0.52, 0.32]
+noise_scale = 4.0
+hue_jitter = 3.0
+value_jitter = 0.08
+roughness = 0.9
+metalness = 0.0
+emissive = [0.0, 0.0, 0.0]
+emissive_intensity = 0.0
+transparency = 0.0
+ior = 1.0
+hardness = 4.0
+density = 2300.0
+fluid = "none"
+
+[[material]]
+id = 8
+name = "limestone"
+category = "natural"
+colour = [0.78, 0.75, 0.66]
+noise_scale = 4.0
+hue_jitter = 2.0
+value_jitter = 0.06
+roughness = 0.85
+metalness = 0.0
+emissive = [0.0, 0.0, 0.0]
+emissive_intensity = 0.0
+transparency = 0.0
+ior = 1.0
+hardness = 4.0
+density = 2400.0
+fluid = "none"
+
+[[material]]
+id = 9
+name = "shale"
+category = "natural"
+colour = [0.3, 0.31, 0.34]
+noise_scale = 2.0
+hue_jitter = 2.0
+value_jitter = 0.1
+roughness = 0.85
+metalness = 0.0
+emissive = [0.0, 0.0, 0.0]
+emissive_intensity = 0.0
+transparency = 0.0
+ior = 1.0
+hardness = 4.5
+density = 2500.0
+fluid = "none"
+
+[[material]]
+id = 10
+name = "granite"
+category = "natural"
+colour = [0.62, 0.55, 0.52]
+noise_scale = 1.0
+hue_jitter = 8.0
+value_jitter = 0.2
+roughness = 0.7
+metalness = 0.0
+emissive = [0.0, 0.0, 0.0]
+emissive_intensity = 0.0
+transparency = 0.0
+ior = 1.0
+hardness = 7.0
+density = 2700.0
+fluid = "none"
+
+[[material]]
+id = 11
+name = "basalt"
+category = "natural"
+colour = [0.18, 0.18, 0.2]
+noise_scale = 2.0
+hue_jitter = 0.0
+value_jitter = 0.08
+roughness = 0.8
+metalness = 0.0
+emissive = [0.0, 0.0, 0.0]
+emissive_intensity = 0.0
+transparency = 0.0
+ior = 1.0
+hardness = 7.0
+density = 3000.0
+fluid = "none"
+
+[[material]]
+id = 12
+name = "obsidian"
+category = "natural"
+colour = [0.05, 0.05, 0.07]
+noise_scale = 3.0
+hue_jitter = 0.0
+value_jitter = 0.05
+roughness = 0.1
+metalness = 0.0
+emissive = [0.0, 0.0, 0.0]
+emissive_intensity = 0.0
+transparency = 0.0
+ior = 1.0
+hardness = 8.0
+density = 2400.0
+fluid = "none"
+
+[[material]]
+id = 13
+name = "deep rock"
+category = "natural"
+colour = [0.25, 0.23, 0.24]
+noise_scale = 2.0
+hue_jitter = 0.0
+value_jitter = 0.12
+roughness = 0.9
+metalness = 0.0
+emissive = [0.0, 0.0, 0.0]
+emissive_intensity = 0.0
+transparency = 0.0
+ior = 1.0
+hardness = 9.0
+density = 3300.0
+fluid = "none"
+
+[[material]]
+id = 14
+name = "snow"
+category = "natural"
+colour = [0.92, 0.94, 0.98]
+noise_scale = 2.0
+hue_jitter = 0.0
+value_jitter = 0.04
+roughness = 1.0
+metalness = 0.0
+emissive = [0.0, 0.0, 0.0]
+emissive_intensity = 0.0
+transparency = 0.0
+ior = 1.0
+hardness = 0.5
+density = 300.0
+fluid = "none"
+
+[[material]]
+id = 15
+name = "ice"
+category = "natural"
+colour = [0.65, 0.8, 0.92]
+noise_scale = 3.0
+hue_jitter = 2.0
+value_jitter = 0.05
+roughness = 0.1
+metalness = 0.0
+emissive = [0.0, 0.0, 0.0]
+emissive_intensity = 0.0
+transparency = 0.6
+ior = 1.31
+hardness = 2.0
+density = 920.0
+fluid = "none"
+
+[[material]]
+id = 16
+name = "molten core"
+category = "natural"
+colour = [0.8, 0.2, 0.04]
+noise_scale = 3.0
+hue_jitter = 8.0
+value_jitter = 0.25
+roughness = 0.6
+metalness = 0.0
+emissive = [1.0, 0.35, 0.08]
+emissive_intensity = 12.0
+transparency = 0.0
+ior = 1.0
+hardness = 10.0
+density = 9000.0
+fluid = "none"
+
+[[material]]
+id = 17
+name = "crystal"
+category = "natural"
+colour = [0.35, 0.6, 0.95]
+noise_scale = 2.0
+hue_jitter = 6.0
+value_jitter = 0.1
+roughness = 0.05
+metalness = 0.0
+emissive = [0.3, 0.55, 1.0]
+emissive_intensity = 4.0
+transparency = 0.3
+ior = 1.55
+hardness = 6.0
+density = 2600.0
+fluid = "none"
+
+[[material]]
+id = 18
+name = "bark"
+category = "natural"
+colour = [0.28, 0.19, 0.12]
+noise_scale = 1.0
+hue_jitter = 4.0
+value_jitter = 0.18
+roughness = 1.0
+metalness = 0.0
+emissive = [0.0, 0.0, 0.0]
+emissive_intensity = 0.0
+transparency = 0.0
+ior = 1.0
+hardness = 2.5
+density = 600.0
+fluid = "none"
+
+[[material]]
+id = 19
+name = "wood"
+category = "natural"
+colour = [0.55, 0.38, 0.22]
+noise_scale = 1.0
+hue_jitter = 3.0
+value_jitter = 0.1
+roughness = 0.85
+metalness = 0.0
+emissive = [0.0, 0.0, 0.0]
+emissive_intensity = 0.0
+transparency = 0.0
+ior = 1.0
+hardness = 2.5
+density = 650.0
+fluid = "none"
+
+[[material]]
+id = 20
+name = "leaves"
+category = "natural"
+colour = [0.16, 0.38, 0.1]
+noise_scale = 1.0
+hue_jitter = 10.0
+value_jitter = 0.2
+roughness = 0.95
+metalness = 0.0
+emissive = [0.0, 0.0, 0.0]
+emissive_intensity = 0.0
+transparency = 0.0
+ior = 1.0
+hardness = 0.5
+density = 120.0
+fluid = "none"
+
+[[material]]
+id = 21
+name = "dry grass"
+category = "natural"
+colour = [0.6, 0.52, 0.25]
+noise_scale = 1.0
+hue_jitter = 5.0
+value_jitter = 0.15
+roughness = 1.0
+metalness = 0.0
+emissive = [0.0, 0.0, 0.0]
+emissive_intensity = 0.0
+transparency = 0.0
+ior = 1.0
+hardness = 0.5
+density = 100.0
+fluid = "none"
+
+[[material]]
+id = 22
+name = "moss"
+category = "natural"
+colour = [0.15, 0.35, 0.12]
+noise_scale = 1.0
+hue_jitter = 6.0
+value_jitter = 0.15
+roughness = 1.0
+metalness = 0.0
+emissive = [0.0, 0.0, 0.0]
+emissive_intensity = 0.0
+transparency = 0.0
+ior = 1.0
+hardness = 0.5
+density = 150.0
+fluid = "none"
+
+[[material]]
+id = 23
+name = "flowers"
+category = "natural"
+colour = [0.85, 0.25, 0.4]
+noise_scale = 1.0
+hue_jitter = 25.0
+value_jitter = 0.15
+roughness = 0.95
+metalness = 0.0
+emissive = [0.0, 0.0, 0.0]
+emissive_intensity = 0.0
+transparency = 0.0
+ior = 1.0
+hardness = 0.5
+density = 100.0
+fluid = "none"
+
+[[material]]
+id = 24
+name = "cactus"
+category = "natural"
+colour = [0.18, 0.45, 0.22]
+noise_scale = 1.0
+hue_jitter = 4.0
+value_jitter = 0.1
+roughness = 0.9
+metalness = 0.0
+emissive = [0.0, 0.0, 0.0]
+emissive_intensity = 0.0
+transparency = 0.0
+ior = 1.0
+hardness = 1.5
+density = 700.0
+fluid = "none"
+
+[[material]]
+id = 25
+name = "glowing mushroom"
+category = "natural"
+colour = [0.3, 0.55, 0.6]
+noise_scale = 1.0
+hue_jitter = 5.0
+value_jitter = 0.12
+roughness = 0.8
+metalness = 0.0
+emissive = [0.25, 0.9, 0.85]
+emissive_intensity = 2.5
+transparency = 0.0
+ior = 1.0
+hardness = 0.5
+density = 200.0
+fluid = "none"
+
+[[material]]
+id = 26
+name = "glowing moss"
+category = "natural"
+colour = [0.2, 0.45, 0.15]
+noise_scale = 1.0
+hue_jitter = 5.0
+value_jitter = 0.15
+roughness = 1.0
+metalness = 0.0
+emissive = [0.4, 1.0, 0.3]
+emissive_intensity = 1.5
+transparency = 0.0
+ior = 1.0
+hardness = 0.5
+density = 150.0
+fluid = "none"
+
+[[material]]
+id = 27
+name = "water"
+category = "natural"
+colour = [0.1, 0.3, 0.5]
+noise_scale = 4.0
+hue_jitter = 2.0
+value_jitter = 0.04
+roughness = 0.02
+metalness = 0.0
+emissive = [0.0, 0.0, 0.0]
+emissive_intensity = 0.0
+transparency = 0.9
+ior = 1.33
+hardness = 0.0
+density = 1000.0
+fluid = "water"
+
+[[material]]
+id = 28
+name = "lava"
+category = "natural"
+colour = [0.8, 0.18, 0.03]
+noise_scale = 3.0
+hue_jitter = 8.0
+value_jitter = 0.25
+roughness = 0.5
+metalness = 0.0
+emissive = [1.0, 0.3, 0.05]
+emissive_intensity = 8.0
+transparency = 0.0
+ior = 1.0
+hardness = 0.0
+density = 2800.0
+fluid = "lava"
+
+[[material]]
+id = 29
+name = "red sand"
+category = "natural"
+colour = [0.7, 0.35, 0.2]
+noise_scale = 1.0
+hue_jitter = 3.0
+value_jitter = 0.06
+roughness = 1.0
+metalness = 0.0
+emissive = [0.0, 0.0, 0.0]
+emissive_intensity = 0.0
+transparency = 0.0
+ior = 1.0
+hardness = 1.0
+density = 1600.0
+fluid = "sand"
+
+[[material]]
+id = 30
+name = "coal"
+category = "natural"
+colour = [0.06, 0.06, 0.07]
+noise_scale = 1.0
+hue_jitter = 0.0
+value_jitter = 0.15
+roughness = 0.7
+metalness = 0.0
+emissive = [0.0, 0.0, 0.0]
+emissive_intensity = 0.0
+transparency = 0.0
+ior = 1.0
+hardness = 3.0
+density = 1400.0
+fluid = "none"
+
+[[material]]
+id = 31
+name = "mud"
+category = "natural"
+colour = [0.25, 0.18, 0.12]
+noise_scale = 2.0
+hue_jitter = 3.0
+value_jitter = 0.08
+roughness = 0.4
+metalness = 0.0
+emissive = [0.0, 0.0, 0.0]
+emissive_intensity = 0.0
+transparency = 0.0
+ior = 1.0
+hardness = 1.0
+density = 1700.0
+fluid = "none"
+
+[[material]]
+id = 32
+name = "peat"
+category = "natural"
+colour = [0.14, 0.1, 0.07]
+noise_scale = 2.0
+hue_jitter = 3.0
+value_jitter = 0.1
+roughness = 1.0
+metalness = 0.0
+emissive = [0.0, 0.0, 0.0]
+emissive_intensity = 0.0
+transparency = 0.0
+ior = 1.0
+hardness = 1.5
+density = 800.0
+fluid = "none"
+
+[[material]]
+id = 33
+name = "planks"
+category = "building"
+colour = [0.62, 0.45, 0.26]
+noise_scale = 1.0
+hue_jitter = 2.0
+value_jitter = 0.06
+roughness = 0.8
+metalness = 0.0
+emissive = [0.0, 0.0, 0.0]
+emissive_intensity = 0.0
+transparency = 0.0
+ior = 1.0
+hardness = 2.5
+density = 650.0
+fluid = "none"
+
+[[material]]
+id = 34
+name = "dark planks"
+category = "building"
+colour = [0.3, 0.2, 0.12]
+noise_scale = 1.0
+hue_jitter = 2.0
+value_jitter = 0.06
+roughness = 0.8
+metalness = 0.0
+emissive = [0.0, 0.0, 0.0]
+emissive_intensity = 0.0
+transparency = 0.0
+ior = 1.0
+hardness = 2.5
+density = 700.0
+fluid = "none"
+
+[[material]]
+id = 35
+name = "stone bricks"
+category = "building"
+colour = [0.5, 0.5, 0.52]
+noise_scale = 1.0
+hue_jitter = 0.0
+value_jitter = 0.06
+roughness = 0.85
+metalness = 0.0
+emissive = [0.0, 0.0, 0.0]
+emissive_intensity = 0.0
+transparency = 0.0
+ior = 1.0
+hardness = 6.0
+density = 2500.0
+fluid = "none"
+
+[[material]]
+id = 36
+name = "clay bricks"
+category = "building"
+colour = [0.6, 0.28, 0.2]
+noise_scale = 1.0
+hue_jitter = 2.0
+value_jitter = 0.08
+roughness = 0.9
+metalness = 0.0
+emissive = [0.0, 0.0, 0.0]
+emissive_intensity = 0.0
+transparency = 0.0
+ior = 1.0
+hardness = 5.0
+density = 1900.0
+fluid = "none"
+
+[[material]]
+id = 37
+name = "concrete"
+category = "building"
+colour = [0.58, 0.58, 0.58]
+noise_scale = 1.0
+hue_jitter = 0.0
+value_jitter = 0.03
+roughness = 0.9
+metalness = 0.0
+emissive = [0.0, 0.0, 0.0]
+emissive_intensity = 0.0
+transparency = 0.0
+ior = 1.0
+hardness = 6.5
+density = 2400.0
+fluid = "none"
+
+[[material]]
+id = 38
+name = "marble"
+category = "building"
+colour = [0.88, 0.87, 0.85]
+noise_scale = 4.0
+hue_jitter = 1.0
+value_jitter = 0.04
+roughness = 0.25
+metalness = 0.0
+emissive = [0.0, 0.0, 0.0]
+emissive_intensity = 0.0
+transparency = 0.0
+ior = 1.0
+hardness = 5.0
+density = 2700.0
+fluid = "none"
+
+[[material]]
+id = 39
+name = "iron"
+category = "building"
+colour = [0.56, 0.57, 0.58]
+noise_scale = 1.0
+hue_jitter = 0.0
+value_jitter = 0.03
+roughness = 0.4
+metalness = 1.0
+emissive = [0.0, 0.0, 0.0]
+emissive_intensity = 0.0
+transparency = 0.0
+ior = 1.0
+hardness = 8.0
+density = 7870.0
+fluid = "none"
+
+[[material]]
+id = 40
+name = "steel"
+category = "building"
+colour = [0.7, 0.72, 0.75]
+noise_scale = 1.0
+hue_jitter = 0.0
+value_jitter = 0.02
+roughness = 0.25
+metalness = 1.0
+emissive = [0.0, 0.0, 0.0]
+emissive_intensity = 0.0
+transparency = 0.0
+ior = 1.0
+hardness = 9.0
+density = 7850.0
+fluid = "none"
+
+[[material]]
+id = 41
+name = "copper"
+category = "building"
+colour = [0.95, 0.64, 0.54]
+noise_scale = 1.0
+hue_jitter = 2.0
+value_jitter = 0.03
+roughness = 0.3
+metalness = 1.0
+emissive = [0.0, 0.0, 0.0]
+emissive_intensity = 0.0
+transparency = 0.0
+ior = 1.0
+hardness = 5.0
+density = 8960.0
+fluid = "none"
+
+[[material]]
+id = 42
+name = "clear glass"
+category = "building"
+colour = [0.9, 0.95, 0.95]
+noise_scale = 1.0
+hue_jitter = 0.0
+value_jitter = 0.0
+roughness = 0.02
+metalness = 0.0
+emissive = [0.0, 0.0, 0.0]
+emissive_intensity = 0.0
+transparency = 0.95
+ior = 1.5
+hardness = 3.0
+density = 2500.0
+fluid = "none"
+
+[[material]]
+id = 43
+name = "blue glass"
+category = "building"
+colour = [0.3, 0.5, 0.9]
+noise_scale = 1.0
+hue_jitter = 0.0
+value_jitter = 0.0
+roughness = 0.02
+metalness = 0.0
+emissive = [0.0, 0.0, 0.0]
+emissive_intensity = 0.0
+transparency = 0.8
+ior = 1.5
+hardness = 3.0
+density = 2500.0
+fluid = "none"
+
+[[material]]
+id = 44
+name = "amber glass"
+category = "building"
+colour = [0.9, 0.6, 0.15]
+noise_scale = 1.0
+hue_jitter = 0.0
+value_jitter = 0.0
+roughness = 0.02
+metalness = 0.0
+emissive = [0.0, 0.0, 0.0]
+emissive_intensity = 0.0
+transparency = 0.8
+ior = 1.5
+hardness = 3.0
+density = 2500.0
+fluid = "none"
+
+[[material]]
+id = 45
+name = "roof tiles"
+category = "building"
+colour = [0.55, 0.22, 0.15]
+noise_scale = 1.0
+hue_jitter = 3.0
+value_jitter = 0.1
+roughness = 0.75
+metalness = 0.0
+emissive = [0.0, 0.0, 0.0]
+emissive_intensity = 0.0
+transparency = 0.0
+ior = 1.0
+hardness = 4.0
+density = 1900.0
+fluid = "none"
+
+[[material]]
+id = 46
+name = "white cloth"
+category = "building"
+colour = [0.88, 0.88, 0.84]
+noise_scale = 1.0
+hue_jitter = 0.0
+value_jitter = 0.08
+roughness = 1.0
+metalness = 0.0
+emissive = [0.0, 0.0, 0.0]
+emissive_intensity = 0.0
+transparency = 0.0
+ior = 1.0
+hardness = 0.5
+density = 300.0
+fluid = "none"
+
+[[material]]
+id = 47
+name = "red cloth"
+category = "building"
+colour = [0.65, 0.1, 0.1]
+noise_scale = 1.0
+hue_jitter = 0.0
+value_jitter = 0.08
+roughness = 1.0
+metalness = 0.0
+emissive = [0.0, 0.0, 0.0]
+emissive_intensity = 0.0
+transparency = 0.0
+ior = 1.0
+hardness = 0.5
+density = 300.0
+fluid = "none"
+
+[[material]]
+id = 48
+name = "rope"
+category = "building"
+colour = [0.6, 0.5, 0.32]
+noise_scale = 1.0
+hue_jitter = 3.0
+value_jitter = 0.2
+roughness = 1.0
+metalness = 0.0
+emissive = [0.0, 0.0, 0.0]
+emissive_intensity = 0.0
+transparency = 0.0
+ior = 1.0
+hardness = 0.5
+density = 400.0
+fluid = "none"
+
+[[material]]
+id = 49
+name = "thatch"
+category = "building"
+colour = [0.65, 0.55, 0.28]
+noise_scale = 1.0
+hue_jitter = 4.0
+value_jitter = 0.2
+roughness = 1.0
+metalness = 0.0
+emissive = [0.0, 0.0, 0.0]
+emissive_intensity = 0.0
+transparency = 0.0
+ior = 1.0
+hardness = 0.5
+density = 200.0
+fluid = "none"
+
+[[material]]
+id = 50
+name = "white light"
+category = "light"
+colour = [1.0, 1.0, 1.0]
+noise_scale = 1.0
+hue_jitter = 0.0
+value_jitter = 0.0
+roughness = 0.5
+metalness = 0.0
+emissive = [1.0, 1.0, 1.0]
+emissive_intensity = 10.0
+transparency = 0.0
+ior = 1.0
+hardness = 2.0
+density = 1000.0
+fluid = "none"
+
+[[material]]
+id = 51
+name = "warm light"
+category = "light"
+colour = [1.0, 0.75, 0.45]
+noise_scale = 1.0
+hue_jitter = 0.0
+value_jitter = 0.0
+roughness = 0.5
+metalness = 0.0
+emissive = [1.0, 0.7, 0.35]
+emissive_intensity = 10.0
+transparency = 0.0
+ior = 1.0
+hardness = 2.0
+density = 1000.0
+fluid = "none"
+
+[[material]]
+id = 52
+name = "red light"
+category = "light"
+colour = [1.0, 0.2, 0.15]
+noise_scale = 1.0
+hue_jitter = 0.0
+value_jitter = 0.0
+roughness = 0.5
+metalness = 0.0
+emissive = [1.0, 0.15, 0.1]
+emissive_intensity = 10.0
+transparency = 0.0
+ior = 1.0
+hardness = 2.0
+density = 1000.0
+fluid = "none"
+
+[[material]]
+id = 53
+name = "green light"
+category = "light"
+colour = [0.25, 1.0, 0.3]
+noise_scale = 1.0
+hue_jitter = 0.0
+value_jitter = 0.0
+roughness = 0.5
+metalness = 0.0
+emissive = [0.2, 1.0, 0.25]
+emissive_intensity = 10.0
+transparency = 0.0
+ior = 1.0
+hardness = 2.0
+density = 1000.0
+fluid = "none"
+
+[[material]]
+id = 54
+name = "blue light"
+category = "light"
+colour = [0.25, 0.45, 1.0]
+noise_scale = 1.0
+hue_jitter = 0.0
+value_jitter = 0.0
+roughness = 0.5
+metalness = 0.0
+emissive = [0.2, 0.4, 1.0]
+emissive_intensity = 10.0
+transparency = 0.0
+ior = 1.0
+hardness = 2.0
+density = 1000.0
+fluid = "none"
+
+[[material]]
+id = 55
+name = "purple light"
+category = "light"
+colour = [0.65, 0.25, 1.0]
+noise_scale = 1.0
+hue_jitter = 0.0
+value_jitter = 0.0
+roughness = 0.5
+metalness = 0.0
+emissive = [0.6, 0.2, 1.0]
+emissive_intensity = 10.0
+transparency = 0.0
+ior = 1.0
+hardness = 2.0
+density = 1000.0
+fluid = "none"

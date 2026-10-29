@@ -6,3 +6,7 @@ publish.workspace = true
 
 [dependencies]
 brick-store.workspace = true
+
+[dev-dependencies]
+# The generator only places Materials the shared table defines (checked in its tests).
+materials.workspace = true
