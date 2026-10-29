@@ -39,16 +39,19 @@ impl BrickCoord {
     /// True when every Voxel of this brick lies within `radius` Voxels of the Planet's centre.
     /// A Voxel is measured at its minimum corner, the point its coordinate names.
     pub fn within_ball(self, radius: i32) -> bool {
-        let far_sq: i64 = self
+        // Unsigned, since the squares of three coordinates near `i32::MAX` overflow an `i64`.
+        let far_sq: u64 = self
             .origin()
             .0
             .map(|o| {
-                let far = i64::from(o).abs().max(i64::from(o + BRICK_SIZE - 1).abs());
+                let far = i64::from(o)
+                    .unsigned_abs()
+                    .max((i64::from(o) + i64::from(BRICK_SIZE - 1)).unsigned_abs());
                 far * far
             })
             .iter()
             .sum();
-        far_sq <= i64::from(radius).pow(2)
+        far_sq <= i64::from(radius).unsigned_abs().pow(2)
     }
 
     /// The Voxel at `local` inside this brick.
@@ -121,6 +124,12 @@ mod tests {
         assert!(!BrickCoord([-1, -1, -1]).within_ball(13));
         assert!(BrickCoord([-1, -1, -1]).within_ball(14));
         assert!(!BrickCoord([1000, 0, 0]).within_ball(1500));
+    }
+
+    #[test]
+    fn within_ball_does_not_overflow_at_the_edge_of_the_voxel_range() {
+        assert!(!BrickCoord([i32::MAX / 8; 3]).within_ball(i32::MAX));
+        assert!(BrickCoord([0; 3]).within_ball(i32::MAX));
     }
 
     #[test]

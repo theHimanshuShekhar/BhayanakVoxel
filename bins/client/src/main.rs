@@ -1,18 +1,22 @@
 mod fly;
+mod world;
 
 use std::error::Error;
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::Instant;
 
+use brick_store::BrickStore;
 use fly::{Action, Fly};
 use render::scene::Core;
-use render::{Camera, Mode, Renderer, Scene, Sun};
+use render::{Camera, Mode, Renderer, Scene, SceneUpdate, Sun};
+use sim::{Predictor, ServerHandle};
 use winit::application::ApplicationHandler;
 use winit::event::{DeviceEvent, DeviceId, ElementState, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{CursorGrabMode, Window, WindowId};
+use world::World;
 
 const SEED: u64 = 0xB4A7_A9AC;
 
@@ -25,31 +29,50 @@ const TITLE: &str = "BhayanakVoxel";
 /// Radians the sun turns per arrow key press (and per repeat while it is held).
 const SUN_STEP: f32 = 0.05;
 
+/// The test Planet as the client and the in-process server each hold it, and the client's packed
+/// copy of it.
+struct Loaded {
+    store: BrickStore,
+    server_store: BrickStore,
+    scene: Scene,
+}
+
 /// Generates the test Planet and packs it for the GPU. This takes about 25 seconds on eight
 /// cores in a release build (several times that in debug), so it runs on its own threads while
 /// the window is already up.
-fn load_planet() -> Scene {
+fn load_planet() -> Loaded {
     let started = Instant::now();
-    let bricks = planet_gen::generate_planet(SEED);
+    let store = planet_gen::generate_planet(SEED);
     eprintln!(
         "generated {} bricks in {:.1?}",
-        bricks.len(),
+        store.len(),
         started.elapsed()
     );
     let core = Core {
         radius: planet_gen::CORE_RADIUS,
         material: planet_gen::ROCK,
     };
-    let scene = Scene::new(&bricks, Some(core));
+    let scene = Scene::new(&store, Some(core));
+    // Generation is deterministic, so the server's Planet is what generating it again would
+    // give; copying it is quicker.
+    let server_store = store.clone();
     eprintln!("planet ready after {:.1?}", started.elapsed());
-    scene
+    Loaded {
+        store,
+        server_store,
+        scene,
+    }
 }
 
 struct App {
     window: Option<Arc<Window>>,
     renderer: Option<Renderer>,
     /// The Planet, while it is still being generated.
-    loading: Option<Receiver<Scene>>,
+    loading: Option<Receiver<Loaded>>,
+    /// The Planet and the link to the server, once loaded.
+    world: Option<World>,
+    /// The in-process server, which runs the same simulation as the dedicated one.
+    server: Option<ServerHandle>,
     camera: Camera,
     fly: Fly,
     /// The sun as an azimuth and an elevation, which the arrow keys turn.
@@ -73,6 +96,8 @@ impl App {
             window: None,
             renderer: None,
             loading: Some(receiver),
+            world: None,
+            server: None,
             // Far enough out to see the whole Planet (radius 1500 Voxels), looking at its centre.
             camera: Camera::looking_at([0.0, 400.0, 3400.0], [0.0; 3]),
             fly: Fly::default(),
@@ -100,20 +125,57 @@ impl App {
         Ok(())
     }
 
-    /// Hands the Planet to the renderer once the loading thread has finished it.
+    /// Hands the Planet to the renderer and starts the server once the loading thread has
+    /// finished it.
     fn poll_loading(&mut self) -> Result<(), Box<dyn Error>> {
         let Some(receiver) = &self.loading else {
             return Ok(());
         };
         match receiver.try_recv() {
-            Ok(scene) => {
+            Ok(loaded) => {
                 self.loading = None;
                 if let Some(renderer) = &mut self.renderer {
-                    renderer.set_scene(&scene)?;
+                    renderer.set_scene(&loaded.scene)?;
                 }
+                let (client_end, server_end) = net::loopback();
+                let server_store = loaded.server_store;
+                self.server = Some(sim::spawn(move || server_store, vec![server_end]));
+                self.world = Some(World::new(
+                    loaded.scene,
+                    Predictor::new(loaded.store),
+                    client_end,
+                ));
             }
             Err(TryRecvError::Empty) => {}
             Err(TryRecvError::Disconnected) => return Err("the Planet failed to generate".into()),
+        }
+        Ok(())
+    }
+
+    /// Takes in the server's answers to our Edits.
+    fn poll_server(&mut self) -> Result<(), Box<dyn Error>> {
+        let Some(world) = &mut self.world else {
+            return Ok(());
+        };
+        let update = world.poll().map_err(|_| "the server stopped")?;
+        self.show(update)
+    }
+
+    /// Digs where the camera looks. The hole is drawn at once and confirmed by the server.
+    fn dig(&mut self) -> Result<(), Box<dyn Error>> {
+        let Some(world) = &mut self.world else {
+            return Ok(());
+        };
+        let update = world.dig(&self.camera).map_err(|_| "the server stopped")?;
+        self.show(update)
+    }
+
+    /// Copies what changed in the Planet to the GPU.
+    fn show(&mut self, update: Option<SceneUpdate>) -> Result<(), Box<dyn Error>> {
+        if let (Some(update), Some(world), Some(renderer)) =
+            (update, &self.world, &mut self.renderer)
+        {
+            renderer.update_scene(world.scene(), &update)?;
         }
         Ok(())
     }
@@ -231,7 +293,15 @@ impl ApplicationHandler for App {
                 state: ElementState::Pressed,
                 button: MouseButton::Left,
                 ..
-            } => self.grab(true),
+            } => {
+                // The click that captures the mouse does not dig.
+                if !self.grabbed {
+                    self.grab(true);
+                } else if let Err(err) = self.dig() {
+                    self.error = Some(err);
+                    event_loop.exit();
+                }
+            }
             WindowEvent::Focused(false) => {
                 self.grab(false);
                 // Key releases that happen while unfocused never arrive.
@@ -263,7 +333,7 @@ impl ApplicationHandler for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        if let Err(err) = self.poll_loading() {
+        if let Err(err) = self.poll_loading().and_then(|()| self.poll_server()) {
             self.error = Some(err);
             event_loop.exit();
         }
@@ -273,6 +343,10 @@ impl ApplicationHandler for App {
     }
 
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        // Dropping the handle tells the server thread to stop; it is not waited for, since it
+        // may still be starting up. Its end of the loopback goes when the thread does.
+        self.world = None;
+        self.server = None;
         // Drop the renderer (and its surface) before the window it draws to.
         self.renderer = None;
         self.window = None;

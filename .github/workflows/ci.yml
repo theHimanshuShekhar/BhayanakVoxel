@@ -68,6 +68,7 @@ jobs:
         include:
           # The workspace optimises these crates in dev builds so that tests run fast; undo that
           # here so that the debug leg really tests unoptimised code.
+          # `sim` is not listed: its Edit code runs at the default opt-level in dev builds.
           - profile: debug
             flags: --config profile.dev.package.planet-gen.opt-level=0 --config profile.dev.package.brick-store.opt-level=0
           - profile: release
@@ -79,4 +80,4 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.profile }}
-      - run: cargo test ${{ matrix.flags }} -p planet-gen golden
+      - run: cargo test ${{ matrix.flags }} -p planet-gen -p sim golden

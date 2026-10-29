@@ -9,7 +9,7 @@ use crate::coord::{BrickCoord, VoxelCoord};
 ///
 /// The index is a `HashMap`, whose iteration order is random per process, so it is never
 /// exposed: use [`Self::sorted_coords`] wherever order matters.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct BrickStore {
     bricks: HashMap<BrickCoord, Brick>,
 }
@@ -35,6 +35,31 @@ impl BrickStore {
     /// Stores `brick` at `coord`, replacing any brick there.
     pub fn insert(&mut self, coord: BrickCoord, brick: Brick) {
         self.bricks.insert(coord, brick);
+    }
+
+    /// Removes the brick at `coord`, which then reads as air.
+    pub fn remove(&mut self, coord: BrickCoord) -> Option<Brick> {
+        self.bricks.remove(&coord)
+    }
+
+    /// FNV-1a hash of the Planet's content: the coordinate and [`Brick::content_hash`] of every
+    /// brick held, in ascending coordinate order. Bricks held as air count: inside the Planet's
+    /// core a brick that is not held reads as rock, so one dug out to air differs from one never
+    /// touched, and two stores that differ only in that must not hash alike.
+    pub fn content_hash(&self) -> u64 {
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        for coord in self.sorted_coords() {
+            let brick = &self.bricks[&coord];
+            let bytes = coord
+                .0
+                .into_iter()
+                .flat_map(i32::to_le_bytes)
+                .chain(brick.content_hash().to_le_bytes());
+            for byte in bytes {
+                hash = (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3);
+            }
+        }
+        hash
     }
 
     /// Coordinates of all bricks held, in ascending order.
@@ -105,6 +130,48 @@ mod tests {
         let mut store = BrickStore::new();
         store.set(VoxelCoord([9, 9, 9]), None);
         assert!(store.is_empty());
+    }
+
+    #[test]
+    fn remove_makes_a_brick_read_as_air_again() {
+        let mut store = BrickStore::new();
+        store.set(VoxelCoord([1, 2, 3]), Some(ROCK));
+        assert!(store.remove(BrickCoord([0, 0, 0])).is_some());
+        assert_eq!(store.get(VoxelCoord([1, 2, 3])), None);
+        assert!(store.remove(BrickCoord([0, 0, 0])).is_none());
+    }
+
+    #[test]
+    fn content_hash_ignores_insertion_order() {
+        let (mut a, mut b) = (BrickStore::new(), BrickStore::new());
+        a.insert(BrickCoord([1, 0, 0]), Brick::solid(ROCK));
+        a.insert(BrickCoord([-1, 0, 0]), Brick::solid(Material(4)));
+        b.insert(BrickCoord([-1, 0, 0]), Brick::solid(Material(4)));
+        b.insert(BrickCoord([1, 0, 0]), Brick::solid(ROCK));
+        assert_eq!(a.content_hash(), b.content_hash());
+    }
+
+    #[test]
+    fn content_hash_tells_a_brick_held_as_air_from_one_not_held() {
+        let (mut held, mut absent) = (BrickStore::new(), BrickStore::new());
+        for store in [&mut held, &mut absent] {
+            store.insert(BrickCoord([1, 0, 0]), Brick::solid(ROCK));
+        }
+        held.insert(BrickCoord([9, 9, 9]), Brick::AIR);
+        assert_ne!(held.content_hash(), absent.content_hash());
+    }
+
+    #[test]
+    fn content_hash_sees_where_a_brick_is_and_what_is_in_it() {
+        let hash = |coord, material| {
+            let mut store = BrickStore::new();
+            store.insert(BrickCoord(coord), Brick::solid(Material(material)));
+            store.content_hash()
+        };
+        let base = hash([1, 0, 0], 3);
+        assert_ne!(base, hash([0, 1, 0], 3));
+        assert_ne!(base, hash([1, 0, 0], 4));
+        assert_ne!(base, BrickStore::new().content_hash());
     }
 
     #[test]

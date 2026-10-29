@@ -5,6 +5,9 @@ edition.workspace = true
 publish.workspace = true
 
 [dependencies]
+brick-store.workspace = true
+net.workspace = true
 planet-gen.workspace = true
 render.workspace = true
+sim.workspace = true
 winit.workspace = true

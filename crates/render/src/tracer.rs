@@ -8,7 +8,7 @@ use wgpu::util::DeviceExt;
 use crate::accumulation::Accumulator;
 use crate::camera::{Camera, CameraUniform};
 use crate::reference::{Hit, Ray};
-use crate::scene::Scene;
+use crate::scene::{REGION_WORDS, Scene, SceneUpdate, spare_words};
 use crate::sun::{Sun, SunUniform};
 use crate::{Result, shaders};
 
@@ -88,7 +88,7 @@ struct View {
 }
 
 pub struct Tracer {
-    scene_group: wgpu::BindGroup,
+    scene: SceneBuffers,
     scene_layout: wgpu::BindGroupLayout,
     camera_buffer: wgpu::Buffer,
     frame_buffer: wgpu::Buffer,
@@ -144,28 +144,100 @@ fn compute_pipeline(
     })
 }
 
-/// A storage buffer holding `words`, padded to a non-empty size as bindings must be.
-fn storage_buffer(device: &wgpu::Device, label: &str, words: &[u32]) -> Result<wgpu::Buffer> {
-    let bytes: &[u8] = if words.is_empty() {
-        &[0; 16]
-    } else {
-        bytemuck::cast_slice(words)
-    };
+/// A storage buffer holding `words`, with room for `spare` more words (as far as the device's
+/// limit allows), padded to a non-empty size as bindings must be. Returns it and its size in
+/// words. It can be written to with `COPY_DST`.
+fn storage_buffer(
+    device: &wgpu::Device,
+    label: &str,
+    words: &[u32],
+    spare: usize,
+) -> Result<(wgpu::Buffer, usize)> {
     let limit = device.limits().max_storage_buffer_binding_size;
-    if bytes.len() as u64 > limit {
+    if words.len() as u64 * 4 > limit {
         return Err(format!(
             "{label} needs {} bytes, more than the device's {limit} limit",
-            bytes.len()
+            words.len() * 4
         )
         .into());
     }
-    Ok(
-        device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some(label),
-            contents: bytes,
-            usage: wgpu::BufferUsages::STORAGE,
-        }),
-    )
+    let capacity = (words.len() + spare).min((limit / 4) as usize).max(4);
+    let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some(label),
+        size: capacity as u64 * 4,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: true,
+    });
+    {
+        let mut view = buffer
+            .get_mapped_range_mut(..)
+            .expect("a buffer created mapped");
+        view.slice(..words.len() * 4)
+            .copy_from_slice(bytemuck::cast_slice(words));
+    }
+    buffer.unmap();
+    Ok((buffer, capacity))
+}
+
+/// The Planet's packed bricks on the GPU. `brick_refs` and `bricks` have room to grow, since
+/// an Edit appends to them (see [`Scene::update`]).
+struct SceneBuffers {
+    regions: wgpu::Buffer,
+    brick_refs: wgpu::Buffer,
+    bricks: wgpu::Buffer,
+    /// Sizes of `brick_refs` and `bricks`, in words.
+    capacity: [usize; 2],
+    group: wgpu::BindGroup,
+}
+
+impl SceneBuffers {
+    fn new(device: &wgpu::Device, layout: &wgpu::BindGroupLayout, scene: &Scene) -> Result<Self> {
+        let header = SceneHeader {
+            origin: scene.origin,
+            table_mask: scene.table_mask(),
+            dims: scene.dims,
+            pad: 0,
+        };
+        let header = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("scene header"),
+            contents: bytemuck::bytes_of(&header),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+        let (table, _) = storage_buffer(device, "region table", &scene.table, 0)?;
+        let (regions, _) = storage_buffer(device, "regions", &scene.regions, 0)?;
+        let (brick_refs, refs_capacity) = storage_buffer(
+            device,
+            "brick refs",
+            &scene.brick_refs,
+            spare_words(scene.brick_refs.len()),
+        )?;
+        let (bricks, bricks_capacity) = storage_buffer(
+            device,
+            "bricks",
+            &scene.bricks,
+            spare_words(scene.bricks.len()),
+        )?;
+        let entries: Vec<_> = [&header, &table, &regions, &brick_refs, &bricks]
+            .into_iter()
+            .enumerate()
+            .map(|(binding, buffer)| wgpu::BindGroupEntry {
+                binding: binding as u32,
+                resource: buffer.as_entire_binding(),
+            })
+            .collect();
+        let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("scene"),
+            layout,
+            entries: &entries,
+        });
+        Ok(Self {
+            regions,
+            brick_refs,
+            bricks,
+            capacity: [refs_capacity, bricks_capacity],
+            group,
+        })
+    }
 }
 
 impl Tracer {
@@ -181,36 +253,7 @@ impl Tracer {
                 layout_entry(4, buffer_binding(STORAGE_READ)),
             ],
         });
-        let header = SceneHeader {
-            origin: scene.origin,
-            table_mask: scene.table_mask(),
-            dims: scene.dims,
-            pad: 0,
-        };
-        let header = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("scene header"),
-            contents: bytemuck::bytes_of(&header),
-            usage: wgpu::BufferUsages::UNIFORM,
-        });
-        let buffers = [
-            storage_buffer(device, "region table", &scene.table)?,
-            storage_buffer(device, "regions", &scene.regions)?,
-            storage_buffer(device, "brick refs", &scene.brick_refs)?,
-            storage_buffer(device, "bricks", &scene.bricks)?,
-        ];
-        let entries: Vec<_> = std::iter::once(&header)
-            .chain(&buffers)
-            .enumerate()
-            .map(|(binding, buffer)| wgpu::BindGroupEntry {
-                binding: binding as u32,
-                resource: buffer.as_entire_binding(),
-            })
-            .collect();
-        let scene_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("scene"),
-            layout: &scene_layout,
-            entries: &entries,
-        });
+        let scene_buffers = SceneBuffers::new(device, &scene_layout, scene)?;
 
         let camera_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("camera, image and accumulation"),
@@ -260,7 +303,7 @@ impl Tracer {
             &scene_layout,
         );
         Ok(Self {
-            scene_group,
+            scene: scene_buffers,
             scene_layout,
             camera_buffer,
             frame_buffer,
@@ -331,6 +374,55 @@ impl Tracer {
         self.dispatch(device, encoder, &self.reference, target);
     }
 
+    /// Brings the GPU copy of the Planet up to date with `scene`, which `update` describes the
+    /// change to, and starts the reference image over. Only what changed is written, unless it
+    /// no longer fits in the buffers, when all of `scene` is uploaded again.
+    pub fn update_scene(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        scene: &Scene,
+        update: &SceneUpdate,
+    ) -> Result<()> {
+        self.accumulator.reset();
+        let SceneUpdate::Patched {
+            regions,
+            brick_refs_from,
+            bricks_from,
+        } = update
+        else {
+            self.scene = SceneBuffers::new(device, &self.scene_layout, scene)?;
+            return Ok(());
+        };
+        let buffers = &self.scene;
+        if scene.brick_refs.len() > buffers.capacity[0] || scene.bricks.len() > buffers.capacity[1]
+        {
+            self.scene = SceneBuffers::new(device, &self.scene_layout, scene)?;
+            return Ok(());
+        }
+        for &region in regions {
+            let words = &scene.regions[region * REGION_WORDS..][..REGION_WORDS];
+            queue.write_buffer(
+                &buffers.regions,
+                (region * REGION_WORDS * 4) as u64,
+                bytemuck::cast_slice(words),
+            );
+        }
+        for (buffer, words, from) in [
+            (&buffers.brick_refs, &scene.brick_refs, *brick_refs_from),
+            (&buffers.bricks, &scene.bricks, *bricks_from),
+        ] {
+            if from < words.len() {
+                queue.write_buffer(
+                    buffer,
+                    from as u64 * 4,
+                    bytemuck::cast_slice(&words[from..]),
+                );
+            }
+        }
+        Ok(())
+    }
+
     /// Starts the reference image over, for what the `View` cannot see: a new `Target`, whose
     /// buffer is empty whatever the count says.
     pub fn reset_accumulation(&mut self) {
@@ -389,7 +481,7 @@ impl Tracer {
             timestamp_writes: None,
         });
         pass.set_pipeline(pipeline);
-        pass.set_bind_group(0, &self.scene_group, &[]);
+        pass.set_bind_group(0, &self.scene.group, &[]);
         pass.set_bind_group(1, &group, &[]);
         pass.dispatch_workgroups(target.size.0.div_ceil(8), target.size.1.div_ceil(8), 1);
     }
@@ -464,7 +556,7 @@ impl Tracer {
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
             pass.set_pipeline(&pipeline);
-            pass.set_bind_group(0, &self.scene_group, &[]);
+            pass.set_bind_group(0, &self.scene.group, &[]);
             pass.set_bind_group(1, &group, &[]);
             pass.dispatch_workgroups((rays.len() as u32).div_ceil(64), 1, 1);
         }

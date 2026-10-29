@@ -1,6 +1,14 @@
 //! Simulation logic shared by the server and the in-process single-player server.
 
+mod edit;
+mod prediction;
+mod server;
+
 use std::time::Duration;
+
+pub use edit::{MAX_BRUSH_RADIUS, Undo, apply, validate};
+pub use prediction::Predictor;
+pub use server::{Outcome, Server, ServerHandle, TICK_RATE_HZ, spawn};
 
 /// Fixed-timestep accumulator: turns elapsed wall-clock time into a whole number of ticks.
 pub struct FixedTimestep {

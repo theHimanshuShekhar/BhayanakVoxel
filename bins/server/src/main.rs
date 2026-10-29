@@ -2,9 +2,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use sim::FixedTimestep;
+use sim::{FixedTimestep, TICK_RATE_HZ};
 
-const TICK_RATE_HZ: u32 = 60;
 /// After a stall, run at most this many ticks to catch up and drop the rest.
 const MAX_TICKS_PER_ADVANCE: u32 = 5;
 
