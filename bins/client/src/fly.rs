@@ -40,13 +40,14 @@ impl Fly {
     }
 
     /// Moves the camera for `dt` seconds of the held keys: forward and back along where it
-    /// looks, left and right across it, up and down along the world's y axis.
+    /// looks, left and right across it, up and down along the horizon's up. The horizon is then
+    /// levelled to the Planet's centre-out direction at the new position.
     pub fn update(&self, camera: &mut Camera, dt: f64) {
         let (forward, right) = (camera.forward(), camera.right());
         let wish = [0, 1, 2].map(|a| {
             forward[a] * self.axis(Action::Forward, Action::Back)
                 + right[a] * self.axis(Action::Right, Action::Left)
-                + [0.0, 1.0, 0.0][a] * self.axis(Action::Up, Action::Down)
+                + camera.horizon_up[a] * self.axis(Action::Up, Action::Down)
         });
         let length = wish.iter().map(|c| c * c).sum::<f64>().sqrt();
         if length == 0.0 {
@@ -62,6 +63,7 @@ impl Fly {
         for (position, wish) in camera.position.iter_mut().zip(wish) {
             *position += wish / length * speed * dt;
         }
+        camera.carry_up(camera.position);
     }
 }
 
@@ -102,7 +104,7 @@ mod tests {
     }
 
     #[test]
-    fn up_and_down_move_along_the_world_y_axis_even_when_looking_down() {
+    fn up_and_down_move_along_the_horizons_up_even_when_looking_down() {
         let mut camera = camera();
         camera.turn(0.0, -1.0);
         held(&[Action::Up]).update(&mut camera, 1.0);
@@ -149,5 +151,93 @@ mod tests {
         let mut camera = self::camera();
         Fly::default().look(&mut camera, 0.0, 100.0);
         assert!(camera.forward()[1] < 0.0);
+    }
+
+    fn dot(a: [f64; 3], b: [f64; 3]) -> f64 {
+        (0..3).map(|i| a[i] * b[i]).sum()
+    }
+
+    /// A level camera over the Planet at `position`, looking along `towards`.
+    fn over_the_planet(position: [f64; 3], towards: [f64; 3]) -> Camera {
+        let mut camera = Camera::looking_at(position, towards);
+        camera.carry_up(position);
+        camera
+    }
+
+    #[test]
+    fn up_and_down_move_along_the_radial_up_away_from_the_pole() {
+        for (position, radial) in [
+            ([3000.0, 0.0, 0.0], [1.0, 0.0, 0.0]),
+            ([0.0, 0.0, -3000.0], [0.0, 0.0, -1.0]),
+            ([0.0, -3000.0, 0.0], [0.0, -1.0, 0.0]),
+        ] {
+            let mut camera = over_the_planet(position, [0.0; 3]);
+            camera.turn(0.4, 0.3);
+            held(&[Action::Up]).update(&mut camera, 1.0);
+            let moved = [0, 1, 2].map(|a| camera.position[a] - position[a]);
+            assert!(
+                (0..3).all(|a| (moved[a] - 60.0 * radial[a]).abs() < 1e-9),
+                "up from {position:?} moved {moved:?}"
+            );
+            held(&[Action::Down]).update(&mut camera, 1.0);
+            assert!((0..3).all(|a| (camera.position[a] - position[a]).abs() < 1e-3));
+        }
+    }
+
+    #[test]
+    fn mouse_look_keeps_the_horizon_level_away_from_the_pole() {
+        let position = [0.0, 0.0, 3000.0];
+        let mut camera = over_the_planet(position, [0.0; 3]);
+        Fly::default().look(&mut camera, 300.0, -50.0);
+        assert!(dot(camera.right(), [0.0, 0.0, 1.0]).abs() < 1e-12);
+        assert!(dot(camera.forward(), [0.0, 0.0, 1.0]) > 0.0);
+    }
+
+    #[test]
+    fn flying_straight_over_a_pole_carries_the_heading_smoothly() {
+        // Level, heading +x, 300 Voxels short of the +y pole.
+        let mut camera = over_the_planet([-300.0, 3000.0, 0.0], [0.0, 3000.0, 0.0]);
+        let fly = held(&[Action::Forward]);
+        let mut forward = camera.forward();
+        let mut crossed = false;
+        for _ in 0..200 {
+            fly.update(&mut camera, 0.1);
+            crossed |= camera.position[0] > 0.0;
+            let next = camera.forward();
+            let step = (0..3).map(|a| (next[a] - forward[a]).powi(2)).sum::<f64>();
+            // Each step is 6 Voxels, 0.002 radians of the Planet: nothing like a flip or a spin.
+            assert!(
+                step.sqrt() < 0.005,
+                "forward jumped by {} at {:?}",
+                step.sqrt(),
+                camera.position
+            );
+            let radial = camera
+                .position
+                .map(|c| c / dot(camera.position, camera.position).sqrt());
+            assert!(dot(camera.right(), radial).abs() < 1e-9);
+            forward = next;
+        }
+        assert!(crossed, "the path should have passed over the pole");
+    }
+
+    #[test]
+    fn flying_at_the_centre_gives_no_nan() {
+        let mut camera = over_the_planet([0.0, 0.0, 6.0], [0.0; 3]);
+        held(&[Action::Forward, Action::Up]).update(&mut camera, 0.0);
+        assert!(camera.forward().iter().all(|c| c.is_finite()));
+        // Down for 0.1 s is 6 Voxels: onto the centre, and then through it.
+        let fly = held(&[Action::Down]);
+        for _ in 0..2 {
+            fly.update(&mut camera, 0.1);
+            for v in [
+                camera.position,
+                camera.forward(),
+                camera.right(),
+                camera.up(),
+            ] {
+                assert!(v.iter().all(|c| c.is_finite()), "{camera:?}");
+            }
+        }
     }
 }
