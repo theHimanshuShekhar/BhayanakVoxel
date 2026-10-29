@@ -34,6 +34,10 @@ fn primary(@builtin(global_invocation_id) id: vec3<u32>) {
         return;
     }
     let ray = camera_ray(id.xy, size, vec2<f32>(0.5));
-    let colour = shade(ray, trace(ray));
-    textureStore(output, id.xy, vec4<f32>(encode(colour), 1.0));
+    let hit = trace(ray);
+    if frame.params.z != 0u {
+        textureStore(output, id.xy, vec4<f32>(debug_colour(frame.params.z, hit, frame.params.x), 1.0));
+        return;
+    }
+    textureStore(output, id.xy, vec4<f32>(encode(shade(ray, hit)), 1.0));
 }

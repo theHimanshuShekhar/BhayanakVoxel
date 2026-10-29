@@ -84,5 +84,12 @@ fn reference(@builtin(global_invocation_id) id: vec3<u32>) {
         mean = accum[at].xyz + (estimate - accum[at].xyz) / f32(sample_index + 1u);
     }
     accum[at] = vec4<f32>(mean, 1.0);
-    textureStore(output, id.xy, vec4<f32>(encode(mean), 1.0));
+    var shown = encode(mean);
+    // A debug view replaces what is shown, not what is accumulated, so switching back to the
+    // lit image loses no samples.
+    if frame.params.z != 0u {
+        let first = camera_ray(id.xy, size, vec2<f32>(0.5));
+        shown = debug_colour(frame.params.z, trace(first), sample_index);
+    }
+    textureStore(output, id.xy, vec4<f32>(shown, 1.0));
 }

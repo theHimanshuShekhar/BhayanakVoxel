@@ -105,7 +105,7 @@ fn a_rebuilt_scene_is_uploaded_whole() {
     assert_eq!(update, SceneUpdate::Rebuilt);
     gpu.update_scene(&scene, &update).unwrap();
 
-    let fresh = Offscreen::new(32, 32, &Scene::new(&store, Some(CORE))).unwrap();
+    let mut fresh = Offscreen::new(32, 32, &Scene::new(&store, Some(CORE))).unwrap();
     let after = gpu.render(&camera);
     assert_ne!(after, before, "the brick shows");
     assert_eq!(after, fresh.render(&camera));

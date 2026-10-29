@@ -56,7 +56,7 @@ fn dot(a: [f32; 3], b: [f32; 3]) -> f32 {
 
 /// Runs the probe: for each thread, four vec4s of output (see the kernel).
 fn run_probe() -> Vec<[f32; 4]> {
-    let (_adapter, device, queue) = request_gpu(&create_instance(), None).unwrap();
+    let (_adapter, device, queue) = request_gpu(&create_instance(), None, true).unwrap();
     let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("sampling probe"),
         source: wgpu::ShaderSource::Wgsl(format!("{}\n{PROBE}", shaders::SAMPLING).into()),
@@ -158,7 +158,7 @@ fn a_zero_radius_cone_is_exactly_the_axis() {
          out[0] = vec4<f32>(sample_cone(vec3<f32>(0.0, 1.0, 0.0), 1.0, vec2<f32>(0.3, 0.9)), 0.0);\n}}",
         shaders::SAMPLING
     );
-    let (_adapter, device, queue) = request_gpu(&create_instance(), None).unwrap();
+    let (_adapter, device, queue) = request_gpu(&create_instance(), None, true).unwrap();
     let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: None,
         source: wgpu::ShaderSource::Wgsl(module_src.into()),
