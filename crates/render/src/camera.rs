@@ -30,7 +30,7 @@ pub struct Camera {
 /// Just short of straight up or down, where "right" would be undefined.
 const MAX_PITCH: f64 = 89.0 * std::f64::consts::PI / 180.0;
 
-/// The camera as the shader reads it (`Camera` in `primary.wgsl`).
+/// The camera as the shader reads it (`Camera` in `common.wgsl`).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Zeroable, PartialEq)]
 pub struct CameraUniform {

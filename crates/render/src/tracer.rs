@@ -5,9 +5,11 @@
 use bytemuck::{Pod, Zeroable};
 use wgpu::util::DeviceExt;
 
+use crate::accumulation::Accumulator;
 use crate::camera::{Camera, CameraUniform};
 use crate::reference::{Hit, Ray};
 use crate::scene::Scene;
+use crate::sun::{Sun, SunUniform};
 use crate::{Result, shaders};
 
 /// Format of the traced image: sRGB-encoded values in a plain unorm texture.
@@ -23,12 +25,77 @@ struct SceneHeader {
     pad: u32,
 }
 
+/// Seeds the reference path tracer's random numbers: a given view, sun and sample count always
+/// give the same image.
+pub const RNG_SEED: u32 = 0xB4A7_A9AC;
+
+/// `Frame` in `common.wgsl`.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct FrameUniform {
+    sun: SunUniform,
+    /// The sample's index, the random seed, then two unused.
+    params: [u32; 4],
+}
+
+/// What the kernels draw into: the image, and the float buffer that holds the reference path
+/// tracer's running mean, one `vec4<f32>` per pixel.
+pub struct Target {
+    texture: wgpu::Texture,
+    view: wgpu::TextureView,
+    accum: wgpu::Buffer,
+    size: (u32, u32),
+}
+
+impl Target {
+    pub fn new(device: &wgpu::Device, width: u32, height: u32) -> Self {
+        let texture = Tracer::create_image(device, width, height);
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let accum = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("accumulation"),
+            size: u64::from(width) * u64::from(height) * 16,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
+        Self {
+            texture,
+            view,
+            accum,
+            size: (width, height),
+        }
+    }
+
+    pub fn texture(&self) -> &wgpu::Texture {
+        &self.texture
+    }
+
+    pub fn view(&self) -> &wgpu::TextureView {
+        &self.view
+    }
+
+    pub fn size(&self) -> (u32, u32) {
+        self.size
+    }
+}
+
+/// Everything that decides what the reference image looks like, bar the scene (a new scene is a
+/// new `Tracer`). Accumulation restarts when any of it changes.
+#[derive(Clone, PartialEq)]
+struct View {
+    camera: Camera,
+    sun: Sun,
+    size: (u32, u32),
+}
+
 pub struct Tracer {
     scene_group: wgpu::BindGroup,
     scene_layout: wgpu::BindGroupLayout,
     camera_buffer: wgpu::Buffer,
+    frame_buffer: wgpu::Buffer,
     camera_layout: wgpu::BindGroupLayout,
     primary: wgpu::ComputePipeline,
+    reference: wgpu::ComputePipeline,
+    accumulator: Accumulator<View>,
 }
 
 fn layout_entry(binding: u32, ty: wgpu::BindingType) -> wgpu::BindGroupLayoutEntry {
@@ -146,7 +213,7 @@ impl Tracer {
         });
 
         let camera_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("camera and image"),
+            label: Some("camera, image and accumulation"),
             entries: &[
                 layout_entry(0, buffer_binding(wgpu::BufferBindingType::Uniform)),
                 layout_entry(
@@ -157,11 +224,22 @@ impl Tracer {
                         view_dimension: wgpu::TextureViewDimension::D2,
                     },
                 ),
+                layout_entry(2, buffer_binding(wgpu::BufferBindingType::Uniform)),
+                layout_entry(
+                    3,
+                    buffer_binding(wgpu::BufferBindingType::Storage { read_only: false }),
+                ),
             ],
         });
         let camera_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("camera"),
             size: size_of::<CameraUniform>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let frame_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("frame"),
+            size: size_of::<FrameUniform>() as u64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -173,17 +251,28 @@ impl Tracer {
             &camera_layout,
             &scene_layout,
         );
+        let reference = compute_pipeline(
+            device,
+            "reference",
+            shaders::PATHTRACE,
+            "reference",
+            &camera_layout,
+            &scene_layout,
+        );
         Ok(Self {
             scene_group,
             scene_layout,
             camera_buffer,
+            frame_buffer,
             camera_layout,
             primary,
+            reference,
+            accumulator: Accumulator::new(),
         })
     }
 
-    /// A texture the primary kernel can write and that can be read back or sampled.
-    pub fn create_image(device: &wgpu::Device, width: u32, height: u32) -> wgpu::Texture {
+    /// A texture the kernels can write and that can be read back or sampled.
+    fn create_image(device: &wgpu::Device, width: u32, height: u32) -> wgpu::Texture {
         device.create_texture(&wgpu::TextureDescriptor {
             label: Some("traced image"),
             size: wgpu::Extent3d {
@@ -202,23 +291,79 @@ impl Tracer {
         })
     }
 
-    /// Records the primary visibility pass: one ray per pixel of `image` from `camera`.
+    /// Records the primary visibility pass: one ray per pixel of `target` from `camera`, lit by
+    /// `sun`.
     pub fn encode_primary(
         &self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
         camera: &Camera,
-        image: &wgpu::TextureView,
-        size: (u32, u32),
+        sun: &Sun,
+        target: &Target,
     ) {
+        self.write_uniforms(queue, camera, sun, 0);
+        self.dispatch(device, encoder, &self.primary, target);
+    }
+
+    /// Records one more sample of the reference path tracer for every pixel of `target`, added
+    /// to the running mean there. If the camera, the sun or the size of `target` differs from
+    /// the last call, the mean starts over.
+    ///
+    /// The uniforms are written when this is called, so each sample must be submitted before the
+    /// next is encoded.
+    pub fn encode_reference(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        camera: &Camera,
+        sun: &Sun,
+        target: &Target,
+    ) {
+        let view = View {
+            camera: *camera,
+            sun: *sun,
+            size: target.size,
+        };
+        let sample_index = self.accumulator.begin_sample(&view);
+        self.write_uniforms(queue, camera, sun, sample_index);
+        self.dispatch(device, encoder, &self.reference, target);
+    }
+
+    /// Starts the reference image over, for what the `View` cannot see: a new `Target`, whose
+    /// buffer is empty whatever the count says.
+    pub fn reset_accumulation(&mut self) {
+        self.accumulator.reset();
+    }
+
+    /// Samples in the reference image so far.
+    pub fn samples(&self) -> u32 {
+        self.accumulator.samples()
+    }
+
+    fn write_uniforms(&self, queue: &wgpu::Queue, camera: &Camera, sun: &Sun, sample_index: u32) {
         queue.write_buffer(
             &self.camera_buffer,
             0,
             bytemuck::bytes_of(&camera.uniform()),
         );
+        let frame = FrameUniform {
+            sun: sun.uniform(),
+            params: [sample_index, RNG_SEED, 0, 0],
+        };
+        queue.write_buffer(&self.frame_buffer, 0, bytemuck::bytes_of(&frame));
+    }
+
+    fn dispatch(
+        &self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        pipeline: &wgpu::ComputePipeline,
+        target: &Target,
+    ) {
         let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("camera and image"),
+            label: Some("camera, image and accumulation"),
             layout: &self.camera_layout,
             entries: &[
                 wgpu::BindGroupEntry {
@@ -227,18 +372,26 @@ impl Tracer {
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: wgpu::BindingResource::TextureView(image),
+                    resource: wgpu::BindingResource::TextureView(target.view()),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: self.frame_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: target.accum.as_entire_binding(),
                 },
             ],
         });
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("primary"),
+            label: Some("kernel"),
             timestamp_writes: None,
         });
-        pass.set_pipeline(&self.primary);
+        pass.set_pipeline(pipeline);
         pass.set_bind_group(0, &self.scene_group, &[]);
         pass.set_bind_group(1, &group, &[]);
-        pass.dispatch_workgroups(size.0.div_ceil(8), size.1.div_ceil(8), 1);
+        pass.dispatch_workgroups(target.size.0.div_ceil(8), target.size.1.div_ceil(8), 1);
     }
 
     /// Casts `rays` through `trace()` on the GPU and returns the hits, in order.

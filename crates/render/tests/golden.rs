@@ -1,10 +1,12 @@
-//! Golden image gate: a fixed view of the test Planet, rendered offscreen on lavapipe, must match
-//! the approved PNG in `tests/golden/`.
+//! Golden image gate: fixed views of the test Planet, rendered offscreen on lavapipe, must match
+//! the approved PNGs in `tests/golden/`: one of primary visibility, one of the reference path
+//! tracer after a fixed number of samples.
 //!
-//! On a mismatch the test fails and writes `actual.png`, `expected.png` and `diff.png` to
-//! `target/golden-failures/` (or `$GOLDEN_FAILURE_DIR`); CI uploads that directory.
+//! On a mismatch the test fails and writes `actual.png`, `expected.png` and `diff.png` to a
+//! folder named for the image in `target/golden-failures/` (or `$GOLDEN_FAILURE_DIR`); CI
+//! uploads that directory.
 //!
-//! To approve a deliberate change to the image, rerun with `UPDATE_GOLDEN=1`
+//! To approve a deliberate change to an image, rerun with `UPDATE_GOLDEN=1`
 //! (`UPDATE_GOLDEN=1 cargo test -p render --test golden`), look at the new PNG, and commit it.
 //!
 //! The comparison tolerates what differs between Mesa versions and drivers: tiny rounding
@@ -16,23 +18,41 @@ use std::path::{Path, PathBuf};
 
 use brick_store::BrickCoord;
 use planet_gen::generate_region;
-use render::{Camera, Image, Offscreen, Scene};
+use render::{Camera, Image, Offscreen, Scene, Sun};
 
 const WIDTH: u32 = 256;
 const HEIGHT: u32 = 144;
 const SEED: u64 = 0xB4A7_A9AC;
 
-/// Mean squared error per channel (0..=255 scale), over pixels that are not far off, above which
-/// the images differ. Rounding noise is far below 1; shifting one channel of a third of the image
-/// by 20 levels is over 40.
-const MAX_MSE: f64 = 4.0;
 /// A pixel is "far off" when any channel is off by more than this many levels.
 const FAR_OFF: u8 = 40;
-/// Most pixels that may be far off: edges where a ray lands on a neighbouring Voxel.
-const MAX_FAR_OFF_FRACTION: f64 = 0.005;
 
-fn golden_path() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden/planet_256x144.png")
+/// How much two images may differ and still match.
+struct Tolerance {
+    /// Mean squared error per channel (0..=255 scale), over pixels that are not far off.
+    max_mse: f64,
+    /// Most pixels, as a fraction of the image, that may be far off.
+    max_far_off_fraction: f64,
+}
+
+/// Rounding noise is far below an MSE of 1; shifting one channel of a third of the image by 20
+/// levels is over 40. Far-off pixels are edges where a ray lands on a neighbouring Voxel.
+const PRIMARY: Tolerance = Tolerance {
+    max_mse: 4.0,
+    max_far_off_fraction: 0.005,
+};
+
+/// A path-traced image has no hard edges to flip, only noise that is the same every run, so it
+/// can be held much closer.
+const REFERENCE: Tolerance = Tolerance {
+    max_mse: 1.0,
+    max_far_off_fraction: 0.002,
+};
+
+fn golden_path(name: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/golden")
+        .join(name)
 }
 
 fn failure_dir() -> PathBuf {
@@ -42,14 +62,17 @@ fn failure_dir() -> PathBuf {
     )
 }
 
+/// A patch of the test Planet near the +y pole: Voxels x -440..=447, y 1360..=1575,
+/// z -360..=263, the ground out to the horizon from deep in the rock to above the highest peak.
+fn planet_patch() -> Scene {
+    let store = generate_region(SEED, BrickCoord([-55, 170, -45]), BrickCoord([55, 196, 32]));
+    Scene::new(&store, None)
+}
+
 /// The view: low over the surface near the +y pole, looking along it towards the horizon.
 fn render_view() -> Image {
-    // Voxels x -440..=447, y 1360..=1575, z -360..=263: the ground out to the horizon, from
-    // deep in the rock to above the highest peak.
-    let store = generate_region(SEED, BrickCoord([-55, 170, -45]), BrickCoord([55, 196, 32]));
-    let scene = Scene::new(&store, None);
     let camera = Camera::looking_at([0.0, 1548.0, 250.0], [0.0, 1535.0, -300.0]);
-    Offscreen::new(WIDTH, HEIGHT, &scene)
+    Offscreen::new(WIDTH, HEIGHT, &planet_patch())
         .unwrap()
         .render(&camera)
 }
@@ -131,8 +154,9 @@ fn compare(actual: &Image, expected: &Image) -> Difference {
     }
 }
 
-fn within_tolerance(difference: &Difference, pixels: usize) -> bool {
-    difference.mse <= MAX_MSE && difference.far_off as f64 <= MAX_FAR_OFF_FRACTION * pixels as f64
+fn within_tolerance(difference: &Difference, pixels: usize, tolerance: &Tolerance) -> bool {
+    difference.mse <= tolerance.max_mse
+        && difference.far_off as f64 <= tolerance.max_far_off_fraction * pixels as f64
 }
 
 /// Per-channel absolute difference, times 4 so small errors show, on an opaque image.
@@ -153,30 +177,66 @@ fn diff_image(actual: &Image, expected: &Image) -> Image {
     }
 }
 
-#[test]
-fn the_test_planet_matches_the_approved_golden_image() {
-    let actual = render_view();
-    let path = golden_path();
+/// Checks `actual` against the approved image `name`, or approves it under `UPDATE_GOLDEN`.
+fn check_golden(name: &str, actual: &Image, tolerance: &Tolerance) {
+    let path = golden_path(name);
     if std::env::var_os("UPDATE_GOLDEN").is_some() {
-        write_png(&path, &actual);
+        write_png(&path, actual);
         eprintln!("wrote {}", path.display());
         return;
     }
     let expected = read_png(&path);
-    let difference = compare(&actual, &expected);
-    if !within_tolerance(&difference, (WIDTH * HEIGHT) as usize) {
-        let dir = failure_dir();
-        write_png(&dir.join("actual.png"), &actual);
+    let difference = compare(actual, &expected);
+    let pixels = (actual.width * actual.height) as usize;
+    if !within_tolerance(&difference, pixels, tolerance) {
+        let dir = failure_dir().join(name.trim_end_matches(".png"));
+        write_png(&dir.join("actual.png"), actual);
         write_png(&dir.join("expected.png"), &expected);
-        write_png(&dir.join("diff.png"), &diff_image(&actual, &expected));
+        write_png(&dir.join("diff.png"), &diff_image(actual, &expected));
         panic!(
-            "render differs from {}: {difference:?} (limits: mse {MAX_MSE}, far off {} pixels). \
+            "render differs from {}: {difference:?} (limits: mse {}, far off {} pixels). \
              Images are in {}. If the change is intended, rerun with UPDATE_GOLDEN=1.",
             path.display(),
-            (MAX_FAR_OFF_FRACTION * f64::from(WIDTH * HEIGHT)) as usize,
+            tolerance.max_mse,
+            (tolerance.max_far_off_fraction * pixels as f64) as usize,
             dir.display(),
         );
     }
+}
+
+#[test]
+fn the_test_planet_matches_the_approved_golden_image() {
+    check_golden("planet_256x144.png", &render_view(), &PRIMARY);
+}
+
+const SAMPLES: u32 = 64;
+
+/// The reference path tracer's view: close to the terraced hillside, with a low sun to the side,
+/// so that steps are lit on one face and shade the ground below them on the other.
+fn render_reference() -> Image {
+    let camera = Camera::looking_at([0.0, 1535.0, 120.0], [0.0, 1508.0, 20.0]);
+    let mut offscreen = Offscreen::new(WIDTH, HEIGHT, &planet_patch()).unwrap();
+    offscreen.set_sun(Sun::from_angles(0.9, 0.25, 0.04));
+    offscreen.render_reference(&camera, SAMPLES)
+}
+
+/// The fixed seed makes the noise the same every run, so the image is compared like any other.
+/// All the random numbers are integer maths; what can differ between Mesa versions is float
+/// rounding, which sends a few paths to a neighbouring Voxel and so changes one sample of 64 at
+/// a few pixels.
+///
+/// Mean squared error of changed renders against this image, measured (the limit is 1): a
+/// different seed, which is all new noise, 4.06; no shadow rays 62; the sun 0.1 rad round the
+/// sky 5.9; the sun's strength up 10% 5.1; one albedo channel up 0.05 about 38; the sun's
+/// strength up 3% 0.6; hard shadows 0.9; one bounce fewer 0.02. A change too small to fail here
+/// is for the primary-visibility golden and the analytic checks in `path_tracer.rs`.
+#[test]
+fn the_reference_path_tracer_matches_the_approved_golden_image() {
+    check_golden(
+        "planet_reference_256x144_64spp.png",
+        &render_reference(),
+        &REFERENCE,
+    );
 }
 
 fn flat(rgb: [u8; 3]) -> Image {
@@ -213,7 +273,10 @@ fn rounding_noise_and_a_few_flipped_edge_pixels_pass() {
         }
     }
     let difference = compare(&actual, &expected);
-    assert!(within_tolerance(&difference, PIXELS), "{difference:?}");
+    assert!(
+        within_tolerance(&difference, PIXELS, &PRIMARY),
+        "{difference:?}"
+    );
 }
 
 #[test]
@@ -224,7 +287,10 @@ fn a_shifted_albedo_over_a_third_of_the_image_fails() {
         pixel[1] += 20;
     }
     let difference = compare(&actual, &expected);
-    assert!(!within_tolerance(&difference, PIXELS), "{difference:?}");
+    assert!(
+        !within_tolerance(&difference, PIXELS, &PRIMARY),
+        "{difference:?}"
+    );
 }
 
 #[test]
@@ -236,7 +302,10 @@ fn a_missing_patch_of_terrain_fails() {
         pixel[..3].copy_from_slice(&[190, 210, 235]);
     }
     let difference = compare(&actual, &expected);
-    assert!(!within_tolerance(&difference, PIXELS), "{difference:?}");
+    assert!(
+        !within_tolerance(&difference, PIXELS, &PRIMARY),
+        "{difference:?}"
+    );
 }
 
 #[test]
@@ -250,8 +319,8 @@ fn a_small_global_brightness_drift_fails_only_when_it_is_large() {
             .for_each(|p| p[..3].iter_mut().for_each(|c| *c += d));
         compare(&actual, &expected)
     };
-    assert!(within_tolerance(&drift(1), PIXELS));
-    assert!(!within_tolerance(&drift(3), PIXELS));
+    assert!(within_tolerance(&drift(1), PIXELS, &PRIMARY));
+    assert!(!within_tolerance(&drift(3), PIXELS, &PRIMARY));
 }
 
 #[test]
