@@ -28,6 +28,10 @@ const SEED: u64 = 0xB4A7_A9AC;
 const MAX_FRAME_TIME: f64 = 0.1;
 
 const TITLE: &str = "BhayanakVoxel";
+/// Degrees below the horizon the client spawns looking: the Planet's limb is then about 27
+/// degrees below the middle of the view, and 60 is far from the pitch limit, so turning left and
+/// right does not spin the view about its middle.
+const SPAWN_PITCH: f64 = -60.0;
 
 /// Radians the sun turns per arrow key press (and per repeat while it is held).
 const SUN_STEP: f32 = 0.05;
@@ -102,6 +106,17 @@ struct App {
     error: Option<Box<dyn Error>>,
 }
 
+/// Far enough out to see the whole Planet (radius 1500 Voxels), with the horizon level to the
+/// Planet's radial up, heading towards it and pitched down so that its limb shows as a level arc
+/// below the middle of the view.
+fn spawn_camera() -> Camera {
+    let position = [0.0, 400.0, 3400.0];
+    let mut camera = Camera::looking_at(position, [0.0; 3]);
+    camera.carry_up(position);
+    camera.turn(0.0, SPAWN_PITCH.to_radians() - camera.pitch);
+    camera
+}
+
 impl App {
     fn new() -> Self {
         let (sender, receiver) = mpsc::channel();
@@ -116,8 +131,7 @@ impl App {
             loading: Some(receiver),
             world: None,
             server: None,
-            // Far enough out to see the whole Planet (radius 1500 Voxels), looking at its centre.
-            camera: Camera::looking_at([0.0, 400.0, 3400.0], [0.0; 3]),
+            camera: spawn_camera(),
             fly: Fly::default(),
             sun: Sun::default().angles(),
             title: String::new(),
@@ -520,6 +534,22 @@ mod tests {
     use std::f32::consts::{FRAC_PI_2, PI};
 
     use super::*;
+
+    #[test]
+    fn the_client_spawns_pitched_down_with_the_planet_in_view_and_a_level_horizon() {
+        let camera = spawn_camera();
+        assert_eq!(camera.position, [0.0, 400.0, 3400.0]);
+        let radial = camera.position.map(|c| c / 3400.0_f64.hypot(400.0));
+        let dot = |a: [f64; 3], b: [f64; 3]| (0..3).map(|i| a[i] * b[i]).sum::<f64>();
+        // Level: no roll relative to the Planet's horizon.
+        assert!(dot(camera.right(), radial).abs() < 1e-12);
+        // Pitched 60 degrees below the horizon, clearly short of the 89 degree clamp.
+        assert!((dot(camera.forward(), radial) - (-60.0_f64).to_radians().sin()).abs() < 1e-12);
+        // The Planet's centre is straight down, 30 degrees from the middle of the view: inside
+        // the 35 degree half field of view.
+        let to_centre = dot(camera.forward(), radial.map(|c| -c)).acos();
+        assert!(to_centre < camera.fov_y / 2.0, "{to_centre}");
+    }
 
     #[test]
     fn an_azimuth_past_a_half_turn_wraps_round_instead_of_leaving_the_sliders_range() {
