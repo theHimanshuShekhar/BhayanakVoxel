@@ -162,6 +162,12 @@ mod tests {
     }
 
     #[test]
+    fn the_overlay_has_a_font_to_draw_with() {
+        // Without egui's `default_fonts` feature every glyph renders as a box.
+        assert!(!egui::FontDefinitions::default().font_data.is_empty());
+    }
+
+    #[test]
     fn times_without_data_read_na() {
         assert_eq!(ms(None), "n/a");
         assert_eq!(ms(Some(1.23456)), "1.235");
