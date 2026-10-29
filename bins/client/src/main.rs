@@ -7,7 +7,7 @@ use std::time::Instant;
 
 use fly::{Action, Fly};
 use render::scene::Core;
-use render::{Camera, Renderer, Scene};
+use render::{Camera, Mode, Renderer, Scene, Sun};
 use winit::application::ApplicationHandler;
 use winit::event::{DeviceEvent, DeviceId, ElementState, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
@@ -21,6 +21,9 @@ const SEED: u64 = 0xB4A7_A9AC;
 const MAX_FRAME_TIME: f64 = 0.1;
 
 const TITLE: &str = "BhayanakVoxel";
+
+/// Radians the sun turns per arrow key press (and per repeat while it is held).
+const SUN_STEP: f32 = 0.05;
 
 /// Generates the test Planet and packs it for the GPU. This takes about 25 seconds on eight
 /// cores in a release build (several times that in debug), so it runs on its own threads while
@@ -49,6 +52,10 @@ struct App {
     loading: Option<Receiver<Scene>>,
     camera: Camera,
     fly: Fly,
+    /// The sun as an azimuth and an elevation, which the arrow keys turn.
+    sun: (f32, f32),
+    /// The title last set, so that it is only set when it changes.
+    title: String,
     grabbed: bool,
     last_frame: Instant,
     /// Set when startup fails inside the event loop, which cannot return errors itself.
@@ -69,6 +76,8 @@ impl App {
             // Far enough out to see the whole Planet (radius 1500 Voxels), looking at its centre.
             camera: Camera::looking_at([0.0, 400.0, 3400.0], [0.0; 3]),
             fly: Fly::default(),
+            sun: Sun::default().angles(),
+            title: String::new(),
             grabbed: false,
             last_frame: Instant::now(),
             error: None,
@@ -102,14 +111,46 @@ impl App {
                 if let Some(renderer) = &mut self.renderer {
                     renderer.set_scene(&scene)?;
                 }
-                if let Some(window) = &self.window {
-                    window.set_title(TITLE);
-                }
             }
             Err(TryRecvError::Empty) => {}
             Err(TryRecvError::Disconnected) => return Err("the Planet failed to generate".into()),
         }
         Ok(())
+    }
+
+    /// Shows the state in the window title: loading, or which way the Planet is drawn, with the
+    /// reference image's sample count.
+    fn update_title(&mut self) {
+        let (Some(window), Some(renderer)) = (&self.window, &self.renderer) else {
+            return;
+        };
+        let title = if self.loading.is_some() {
+            format!("{TITLE} (generating the Planet...)")
+        } else if renderer.mode() == Mode::Reference {
+            format!("{TITLE} - reference, {} samples", renderer.samples())
+        } else {
+            TITLE.to_string()
+        };
+        if title != self.title {
+            window.set_title(&title);
+            self.title = title;
+        }
+    }
+
+    /// Turns the sun by `azimuth` and `elevation` radians, keeping it from going past the poles.
+    fn turn_sun(&mut self, azimuth: f32, elevation: f32) {
+        let half_turn = std::f32::consts::FRAC_PI_2;
+        self.sun = (
+            self.sun.0 + azimuth,
+            (self.sun.1 + elevation).clamp(-half_turn, half_turn),
+        );
+        if let Some(renderer) = &mut self.renderer {
+            renderer.set_sun(Sun::from_angles(
+                self.sun.0,
+                self.sun.1,
+                Sun::default().angular_radius(),
+            ));
+        }
     }
 
     /// Captures or releases the mouse for looking around.
@@ -165,8 +206,24 @@ impl ApplicationHandler for App {
                 if let PhysicalKey::Code(code) = event.physical_key {
                     if let Some(action) = action_for(code) {
                         self.fly.set(action, pressed);
-                    } else if code == KeyCode::Escape && pressed {
-                        self.grab(false);
+                    } else if pressed {
+                        match code {
+                            KeyCode::Escape => self.grab(false),
+                            // Switches between primary visibility and the reference path tracer.
+                            KeyCode::KeyR if !event.repeat => {
+                                if let Some(renderer) = &mut self.renderer {
+                                    renderer.set_mode(match renderer.mode() {
+                                        Mode::Primary => Mode::Reference,
+                                        Mode::Reference => Mode::Primary,
+                                    });
+                                }
+                            }
+                            KeyCode::ArrowLeft => self.turn_sun(-SUN_STEP, 0.0),
+                            KeyCode::ArrowRight => self.turn_sun(SUN_STEP, 0.0),
+                            KeyCode::ArrowUp => self.turn_sun(0.0, SUN_STEP),
+                            KeyCode::ArrowDown => self.turn_sun(0.0, -SUN_STEP),
+                            _ => {}
+                        }
                     }
                 }
             }
@@ -191,6 +248,7 @@ impl ApplicationHandler for App {
                 if let Some(renderer) = &mut self.renderer {
                     renderer.render(&self.camera);
                 }
+                self.update_title();
             }
             _ => {}
         }

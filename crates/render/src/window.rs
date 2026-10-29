@@ -2,8 +2,20 @@
 
 use crate::camera::Camera;
 use crate::scene::Scene;
-use crate::tracer::Tracer;
+use crate::sun::Sun;
+use crate::tracer::{Target, Tracer};
 use crate::{Result, create_instance, request_gpu, shaders};
+
+/// How the Planet is drawn.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Mode {
+    /// Primary visibility, shaded by normal and albedo: cheap and noise-free.
+    #[default]
+    Primary,
+    /// The reference path tracer: while nothing changes, samples accumulate without limit and
+    /// the image converges.
+    Reference,
+}
 
 /// Traces the Planet into an image and presents it.
 pub struct Renderer {
@@ -12,7 +24,9 @@ pub struct Renderer {
     device: wgpu::Device,
     queue: wgpu::Queue,
     tracer: Tracer,
-    image: wgpu::TextureView,
+    target: Target,
+    mode: Mode,
+    sun: Sun,
     blit: wgpu::RenderPipeline,
     blit_layout: wgpu::BindGroupLayout,
     blit_group: wgpu::BindGroup,
@@ -84,44 +98,64 @@ impl Renderer {
             multiview_mask: None,
             cache: None,
         });
-        let (image, blit_group) =
-            Self::create_image(&device, &blit_layout, config.width, config.height);
+        let (target, blit_group) =
+            Self::create_target(&device, &blit_layout, config.width, config.height);
         Ok(Self {
             surface,
             config,
             device,
             queue,
             tracer,
-            image,
+            target,
+            mode: Mode::default(),
+            sun: Sun::default(),
             blit,
             blit_layout,
             blit_group,
         })
     }
 
-    fn create_image(
+    fn create_target(
         device: &wgpu::Device,
         layout: &wgpu::BindGroupLayout,
         width: u32,
         height: u32,
-    ) -> (wgpu::TextureView, wgpu::BindGroup) {
-        let view = Tracer::create_image(device, width, height)
-            .create_view(&wgpu::TextureViewDescriptor::default());
+    ) -> (Target, wgpu::BindGroup) {
+        let target = Target::new(device, width, height);
         let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("blit"),
             layout,
             entries: &[wgpu::BindGroupEntry {
                 binding: 0,
-                resource: wgpu::BindingResource::TextureView(&view),
+                resource: wgpu::BindingResource::TextureView(target.view()),
             }],
         });
-        (view, group)
+        (target, group)
     }
 
-    /// Replaces the Planet being drawn.
+    /// Replaces the Planet being drawn. A new Planet starts the reference image over.
     pub fn set_scene(&mut self, scene: &Scene) -> Result<()> {
         self.tracer = Tracer::new(&self.device, scene)?;
         Ok(())
+    }
+
+    pub fn mode(&self) -> Mode {
+        self.mode
+    }
+
+    /// Switches how the Planet is drawn.
+    pub fn set_mode(&mut self, mode: Mode) {
+        self.mode = mode;
+    }
+
+    /// Changes the sun. In reference mode this starts the image over.
+    pub fn set_sun(&mut self, sun: Sun) {
+        self.sun = sun;
+    }
+
+    /// Samples in the reference image so far, to show on screen.
+    pub fn samples(&self) -> u32 {
+        self.tracer.samples()
     }
 
     /// Reconfigures the surface and the traced image. Zero-sized windows (minimised) are ignored.
@@ -132,11 +166,13 @@ impl Renderer {
         self.config.width = width;
         self.config.height = height;
         self.surface.configure(&self.device, &self.config);
-        (self.image, self.blit_group) =
-            Self::create_image(&self.device, &self.blit_layout, width, height);
+        (self.target, self.blit_group) =
+            Self::create_target(&self.device, &self.blit_layout, width, height);
+        self.tracer.reset_accumulation();
     }
 
-    /// Traces the view from `camera` and presents it. A frame that cannot be acquired is
+    /// Traces the view from `camera` and presents it: in reference mode, one more sample of the
+    /// image, which starts over if the camera moved. A frame that cannot be acquired is
     /// skipped. A suboptimal surface is reconfigured after its frame is presented.
     pub fn render(&mut self, camera: &Camera) {
         let (frame, suboptimal) = match self.surface.get_current_texture() {
@@ -156,15 +192,26 @@ impl Renderer {
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
-        let size = (self.config.width, self.config.height);
-        self.tracer.encode_primary(
-            &self.device,
-            &self.queue,
-            &mut encoder,
-            camera,
-            &self.image,
-            size,
-        );
+        match self.mode {
+            Mode::Primary => self.tracer.encode_primary(
+                &self.device,
+                &self.queue,
+                &mut encoder,
+                camera,
+                &self.sun,
+                &self.target,
+            ),
+            Mode::Reference => {
+                self.tracer.encode_reference(
+                    &self.device,
+                    &self.queue,
+                    &mut encoder,
+                    camera,
+                    &self.sun,
+                    &self.target,
+                );
+            }
+        }
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("blit"),

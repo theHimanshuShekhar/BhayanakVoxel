@@ -4,12 +4,20 @@
 //! find what a ray hits. [`reference`] is its CPU twin, used by tests. A window ([`Renderer`])
 //! and an offscreen target ([`Offscreen`]) share one [`tracer::Tracer`], so tests render with the
 //! code that the window runs.
+//!
+//! Two ways of drawing share that `trace()`: primary visibility, and the reference path tracer
+//! (`shaders/pathtrace.wgsl`), which accumulates samples while nothing changes and is the ground
+//! truth for later lighting techniques. [`accumulation`] decides when it starts over.
 
+pub mod accumulation;
 pub mod camera;
 mod offscreen;
 pub mod reference;
+#[cfg(test)]
+mod sampling_tests;
 pub mod scene;
 mod shaders;
+pub mod sun;
 pub mod tracer;
 mod window;
 
@@ -18,7 +26,8 @@ use std::error::Error;
 pub use camera::Camera;
 pub use offscreen::{Image, Offscreen};
 pub use scene::Scene;
-pub use window::Renderer;
+pub use sun::Sun;
+pub use window::{Mode, Renderer};
 
 pub(crate) type Result<T> = std::result::Result<T, Box<dyn Error>>;
 

@@ -3,7 +3,8 @@
 use crate::camera::Camera;
 use crate::reference::{Hit, Ray};
 use crate::scene::Scene;
-use crate::tracer::Tracer;
+use crate::sun::Sun;
+use crate::tracer::{Target, Tracer};
 use crate::{Result, create_instance, finish_and_read, request_gpu, staging_buffer};
 
 /// A finished frame: tightly packed RGBA8, rows from the top.
@@ -19,8 +20,8 @@ pub struct Offscreen {
     device: wgpu::Device,
     queue: wgpu::Queue,
     tracer: Tracer,
-    image: wgpu::Texture,
-    size: (u32, u32),
+    target: Target,
+    sun: Sun,
 }
 
 impl Offscreen {
@@ -28,22 +29,23 @@ impl Offscreen {
     pub fn new(width: u32, height: u32, scene: &Scene) -> Result<Self> {
         let (_adapter, device, queue) = request_gpu(&create_instance(), None)?;
         let tracer = Tracer::new(&device, scene)?;
-        let image = Tracer::create_image(&device, width, height);
+        let target = Target::new(&device, width, height);
         Ok(Self {
             device,
             queue,
             tracer,
-            image,
-            size: (width, height),
+            target,
+            sun: Sun::default(),
         })
     }
 
-    /// Renders one frame from `camera` and reads it back.
+    /// Changes the sun that both ways of rendering light the Planet with.
+    pub fn set_sun(&mut self, sun: Sun) {
+        self.sun = sun;
+    }
+
+    /// Renders primary visibility from `camera` and reads it back.
     pub fn render(&self, camera: &Camera) -> Image {
-        let (width, height) = self.size;
-        let view = self
-            .image
-            .create_view(&wgpu::TextureViewDescriptor::default());
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
@@ -52,15 +54,46 @@ impl Offscreen {
             &self.queue,
             &mut encoder,
             camera,
-            &view,
-            self.size,
+            &self.sun,
+            &self.target,
         );
+        self.read_image(encoder)
+    }
+
+    /// Adds `samples` samples of the reference path tracer to the image of `camera` and reads
+    /// back the mean so far. The image starts over if `camera` or the sun is not the one of the
+    /// previous call. With zero samples it just reads the image again.
+    pub fn render_reference(&mut self, camera: &Camera, samples: u32) -> Image {
+        for _ in 0..samples {
+            let mut encoder = self
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+            self.tracer.encode_reference(
+                &self.device,
+                &self.queue,
+                &mut encoder,
+                camera,
+                &self.sun,
+                &self.target,
+            );
+            // The uniforms of the next sample are written over these.
+            self.queue.submit([encoder.finish()]);
+        }
+        self.read_image(
+            self.device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor::default()),
+        )
+    }
+
+    /// Reads back the image, after the work recorded in `encoder`.
+    fn read_image(&self, mut encoder: wgpu::CommandEncoder) -> Image {
+        let (width, height) = self.target.size();
         // Rows in a texture-to-buffer copy start at multiples of 256 bytes.
         let row = (width * 4).next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
         let size = u64::from(row) * u64::from(height);
         let staging = staging_buffer(&self.device, size);
         encoder.copy_texture_to_buffer(
-            self.image.as_image_copy(),
+            self.target.texture().as_image_copy(),
             wgpu::TexelCopyBufferInfo {
                 buffer: &staging,
                 layout: wgpu::TexelCopyBufferLayout {
