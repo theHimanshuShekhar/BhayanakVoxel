@@ -8,6 +8,7 @@ use std::time::Instant;
 
 use brick_store::BrickStore;
 use fly::{Action, Fly};
+use render::overlay::{self, Controls};
 use render::scene::Core;
 use render::{Camera, Mode, Renderer, Scene, SceneUpdate, Sun};
 use sim::{Predictor, ServerHandle};
@@ -64,9 +65,17 @@ fn load_planet() -> Loaded {
     }
 }
 
+/// The debug overlay's egui state. While it is hidden, none of it runs.
+struct Gui {
+    ctx: egui::Context,
+    state: egui_winit::State,
+    visible: bool,
+}
+
 struct App {
     window: Option<Arc<Window>>,
     renderer: Option<Renderer>,
+    gui: Option<Gui>,
     /// The Planet, while it is still being generated.
     loading: Option<Receiver<Loaded>>,
     /// The Planet and the link to the server, once loaded.
@@ -95,6 +104,7 @@ impl App {
         Self {
             window: None,
             renderer: None,
+            gui: None,
             loading: Some(receiver),
             world: None,
             server: None,
@@ -121,6 +131,20 @@ impl App {
             size.height,
             &Scene::default(),
         )?);
+        let ctx = egui::Context::default();
+        let state = egui_winit::State::new(
+            ctx.clone(),
+            egui::ViewportId::ROOT,
+            &*window,
+            Some(window.scale_factor() as f32),
+            window.theme(),
+            None,
+        );
+        self.gui = Some(Gui {
+            ctx,
+            state,
+            visible: true,
+        });
         self.window = Some(window);
         Ok(())
     }
@@ -180,16 +204,12 @@ impl App {
         Ok(())
     }
 
-    /// Shows the state in the window title: loading, or which way the Planet is drawn, with the
-    /// reference image's sample count.
+    /// Shows in the window title whether the Planet is still being generated. The rest of the
+    /// state (mode, sample count, timings) is in the overlay.
     fn update_title(&mut self) {
-        let (Some(window), Some(renderer)) = (&self.window, &self.renderer) else {
-            return;
-        };
+        let Some(window) = &self.window else { return };
         let title = if self.loading.is_some() {
             format!("{TITLE} (generating the Planet...)")
-        } else if renderer.mode() == Mode::Reference {
-            format!("{TITLE} - reference, {} samples", renderer.samples())
         } else {
             TITLE.to_string()
         };
@@ -201,11 +221,12 @@ impl App {
 
     /// Turns the sun by `azimuth` and `elevation` radians, keeping it from going past the poles.
     fn turn_sun(&mut self, azimuth: f32, elevation: f32) {
-        let half_turn = std::f32::consts::FRAC_PI_2;
-        self.sun = (
-            self.sun.0 + azimuth,
-            (self.sun.1 + elevation).clamp(-half_turn, half_turn),
-        );
+        self.set_sun(self.sun.0 + azimuth, self.sun.1 + elevation);
+    }
+
+    /// Points the sun at `azimuth` and `elevation` radians, keeping it from going past the poles.
+    fn set_sun(&mut self, azimuth: f32, elevation: f32) {
+        self.sun = normalize_sun(azimuth, elevation);
         if let Some(renderer) = &mut self.renderer {
             renderer.set_sun(Sun::from_angles(
                 self.sun.0,
@@ -215,10 +236,90 @@ impl App {
         }
     }
 
+    /// Hands `event` to the overlay and says whether the overlay used it, in which case the
+    /// camera and the dig must ignore it. A hidden overlay sees nothing. While the mouse is
+    /// captured for looking around, the overlay gets no pointer events (the cursor is not on the
+    /// screen) except button releases, so that it never believes a button is still down.
+    fn overlay_event(&mut self, event: &WindowEvent) -> bool {
+        let (Some(window), Some(gui)) = (&self.window, &mut self.gui) else {
+            return false;
+        };
+        if !gui.visible || matches!(event, WindowEvent::RedrawRequested) {
+            return false;
+        }
+        let pointer = matches!(
+            event,
+            WindowEvent::CursorMoved { .. }
+                | WindowEvent::CursorEntered { .. }
+                | WindowEvent::CursorLeft { .. }
+                | WindowEvent::MouseWheel { .. }
+                | WindowEvent::MouseInput { .. }
+                | WindowEvent::Touch(_)
+        );
+        let release = matches!(
+            event,
+            WindowEvent::MouseInput {
+                state: ElementState::Released,
+                ..
+            }
+        );
+        if pointer && self.grabbed && !release {
+            return false;
+        }
+        gui.state.on_window_event(window, event).consumed
+    }
+
+    /// Lays out the overlay for this frame, if it is shown, and applies what the user changed in
+    /// it. Hidden, this does nothing: no layout, no paint.
+    fn run_overlay(&mut self) -> Option<egui::FullOutput> {
+        let (Some(window), Some(renderer), Some(gui)) =
+            (&self.window, &mut self.renderer, &mut self.gui)
+        else {
+            return None;
+        };
+        if !gui.visible {
+            return None;
+        }
+        let before = Controls {
+            mode: renderer.mode(),
+            debug_view: renderer.debug_view(),
+            sun: self.sun,
+        };
+        let mut controls = before;
+        let info = overlay::Info {
+            timings: renderer.timings(),
+            timers_supported: renderer.timers_supported(),
+            samples: renderer.samples(),
+        };
+        let input = gui.state.take_egui_input(window);
+        let mut output = gui
+            .ctx
+            .run_pass(input, |ctx| overlay::show(ctx, &info, &mut controls));
+        gui.state
+            .handle_platform_output(window, std::mem::take(&mut output.platform_output));
+        if controls.mode != before.mode {
+            renderer.set_mode(controls.mode);
+        }
+        if controls.debug_view != before.debug_view {
+            renderer.set_debug_view(controls.debug_view);
+        }
+        if controls.sun != before.sun {
+            self.set_sun(controls.sun.0, controls.sun.1);
+        }
+        Some(output)
+    }
+
     /// Captures or releases the mouse for looking around.
     fn grab(&mut self, grab: bool) {
         let Some(window) = &self.window else { return };
         if grab {
+            // The cursor leaves the overlay's sight.
+            if let Some(gui) = &mut self.gui {
+                gui.state
+                    .egui_input_mut()
+                    .events
+                    .push(egui::Event::PointerGone);
+            }
             // Not every platform supports locking the cursor; confining it also works for look.
             let result = window
                 .set_cursor_grab(CursorGrabMode::Locked)
@@ -230,6 +331,22 @@ impl App {
         }
         window.set_cursor_visible(!self.grabbed);
     }
+}
+
+/// The azimuth wrapped into (-pi, pi], which is the range of the overlay's slider, and the
+/// elevation kept from going past the poles. A slider clamps what it is given, so an azimuth
+/// outside its range would be snapped back, restarting the reference image.
+fn normalize_sun(azimuth: f32, elevation: f32) -> (f32, f32) {
+    use std::f32::consts::{FRAC_PI_2, PI, TAU};
+    let azimuth = if azimuth > -PI && azimuth <= PI {
+        // Left alone, so that arithmetic cannot nudge a value that was already in range.
+        azimuth
+    } else {
+        let wrapped = (azimuth + PI).rem_euclid(TAU) - PI;
+        // The shift above gives [-pi, pi); -pi is the same direction as pi.
+        if wrapped <= -PI { PI } else { wrapped }
+    };
+    (azimuth, elevation.clamp(-FRAC_PI_2, FRAC_PI_2))
 }
 
 fn action_for(code: KeyCode) -> Option<Action> {
@@ -256,6 +373,8 @@ impl ApplicationHandler for App {
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+        // Whether the overlay took this event (a click on it, typing into a field of it).
+        let used_by_overlay = self.overlay_event(&event);
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(size) => {
@@ -266,11 +385,28 @@ impl ApplicationHandler for App {
             WindowEvent::KeyboardInput { event, .. } => {
                 let pressed = event.state == ElementState::Pressed;
                 if let PhysicalKey::Code(code) = event.physical_key {
-                    if let Some(action) = action_for(code) {
-                        self.fly.set(action, pressed);
-                    } else if pressed {
+                    if code == KeyCode::F1 {
+                        if pressed
+                            && !event.repeat
+                            && let Some(gui) = &mut self.gui
+                        {
+                            gui.visible = !gui.visible;
+                        }
+                    } else if let Some(action) = action_for(code) {
+                        // A key the overlay is typing with does not move the camera, but its
+                        // release always counts, or the camera would keep going.
+                        if !(pressed && used_by_overlay) {
+                            self.fly.set(action, pressed);
+                        }
+                    } else if pressed && !used_by_overlay {
                         match code {
                             KeyCode::Escape => self.grab(false),
+                            // Cycles through the debug views.
+                            KeyCode::KeyV if !event.repeat => {
+                                if let Some(renderer) = &mut self.renderer {
+                                    renderer.set_debug_view(renderer.debug_view().next());
+                                }
+                            }
                             // Switches between primary visibility and the reference path tracer.
                             KeyCode::KeyR if !event.repeat => {
                                 if let Some(renderer) = &mut self.renderer {
@@ -294,12 +430,15 @@ impl ApplicationHandler for App {
                 button: MouseButton::Left,
                 ..
             } => {
-                // The click that captures the mouse does not dig.
-                if !self.grabbed {
-                    self.grab(true);
-                } else if let Err(err) = self.dig() {
-                    self.error = Some(err);
-                    event_loop.exit();
+                // A click on the overlay is not for the camera. The click that captures the mouse
+                // does not dig.
+                if !used_by_overlay {
+                    if !self.grabbed {
+                        self.grab(true);
+                    } else if let Err(err) = self.dig() {
+                        self.error = Some(err);
+                        event_loop.exit();
+                    }
                 }
             }
             WindowEvent::Focused(false) => {
@@ -315,8 +454,10 @@ impl ApplicationHandler for App {
                     .min(MAX_FRAME_TIME);
                 self.last_frame = now;
                 self.fly.update(&mut self.camera, dt);
+                let overlay = self.run_overlay();
+                let ctx = self.gui.as_ref().map(|gui| gui.ctx.clone());
                 if let Some(renderer) = &mut self.renderer {
-                    renderer.render(&self.camera);
+                    renderer.render(&self.camera, overlay.zip(ctx.as_ref()).map(|(o, c)| (c, o)));
                 }
                 self.update_title();
             }
@@ -348,6 +489,7 @@ impl ApplicationHandler for App {
         self.world = None;
         self.server = None;
         // Drop the renderer (and its surface) before the window it draws to.
+        self.gui = None;
         self.renderer = None;
         self.window = None;
     }
@@ -359,4 +501,36 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut app = App::new();
     event_loop.run_app(&mut app)?;
     app.error.map_or(Ok(()), Err)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::f32::consts::{FRAC_PI_2, PI};
+
+    use super::*;
+
+    #[test]
+    fn an_azimuth_past_a_half_turn_wraps_round_instead_of_leaving_the_sliders_range() {
+        let (azimuth, _) = normalize_sun(PI + 0.1, 0.0);
+        assert!((azimuth - (-PI + 0.1)).abs() < 1e-5, "{azimuth}");
+        let (azimuth, _) = normalize_sun(-PI - 0.1, 0.0);
+        assert!((azimuth - (PI - 0.1)).abs() < 1e-5, "{azimuth}");
+        let (azimuth, _) = normalize_sun(5.0 * PI + 0.2, 0.0);
+        assert!((azimuth - (-PI + 0.2)).abs() < 1e-4, "{azimuth}");
+    }
+
+    #[test]
+    fn an_azimuth_in_range_is_unchanged_and_the_range_is_open_at_minus_pi() {
+        for azimuth in [0.0, 1.0, -1.0, PI] {
+            assert_eq!(normalize_sun(azimuth, 0.0).0, azimuth);
+        }
+        assert_eq!(normalize_sun(-PI, 0.0).0, PI);
+    }
+
+    #[test]
+    fn the_elevation_stops_at_the_poles() {
+        assert_eq!(normalize_sun(0.0, 3.0).1, FRAC_PI_2);
+        assert_eq!(normalize_sun(0.0, -3.0).1, -FRAC_PI_2);
+        assert_eq!(normalize_sun(0.0, 0.3).1, 0.3);
+    }
 }

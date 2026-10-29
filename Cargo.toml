@@ -18,6 +18,12 @@ render = { path = "crates/render" }
 # Vulkan is the only supported backend, so the other backends are not compiled in.
 wgpu = { version = "=30.0.1", default-features = false, features = ["std", "parking_lot", "vulkan", "wgsl"] }
 winit = "0.30.13"
+# egui 0.37 is the release line that builds against wgpu 30 and winit 0.30.13. The three crates
+# release in lockstep, so they are pinned together. egui-wgpu's default features turn on every
+# wgpu backend; Vulkan is the only one supported (ADR 0001).
+egui = "=0.37.0"
+egui-wgpu = { version = "=0.37.0", default-features = false }
+egui-winit = { version = "=0.37.0", default-features = false, features = ["x11", "wayland"] }
 
 [profile.dev]
 # Keeps the shared target dir from filling the disk.

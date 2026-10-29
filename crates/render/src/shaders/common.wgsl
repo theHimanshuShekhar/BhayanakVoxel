@@ -17,7 +17,7 @@ struct Frame {
     // The unit vector towards the sun, then the cosine of the sun's angular radius.
     sun: vec4<f32>,
     // The index of this sample among those accumulated (0 starts a new image), the seed of the
-    // random numbers, then two unused.
+    // random numbers, the debug view (0 is the lit image), then one unused.
     params: vec4<u32>,
 }
 
@@ -57,4 +57,32 @@ fn camera_ray(pixel: vec2<u32>, size: vec2<u32>, offset: vec2<f32>) -> Ray {
 // 0..1.
 fn encode(linear: vec3<f32>) -> vec3<f32> {
     return pow(linear, vec3<f32>(1.0 / 2.2));
+}
+
+// What the debug views show, as the values written to the image (already encoded). `view` is
+// never 0 here: that is the lit image, which the kernels draw themselves. The colours of misses
+// are black. Keep the numbers in step with DebugView in debug_view.rs.
+const VIEW_NORMALS = 1u;
+const VIEW_ALBEDO = 2u;
+const VIEW_DEPTH = 3u;
+const VIEW_SAMPLE_COUNT = 4u;
+// Voxels at which the depth view is half as bright as at the camera.
+const DEPTH_HALF = 64.0;
+// The sample count at which the sample count view reaches its brightest colour.
+const SAMPLES_BRIGHTEST = 1024.0;
+
+fn debug_colour(view: u32, hit: Hit, sample_index: u32) -> vec3<f32> {
+    if view == VIEW_SAMPLE_COUNT {
+        let scale = clamp(log2(f32(sample_index + 1u)) / log2(SAMPLES_BRIGHTEST), 0.0, 1.0);
+        return mix(vec3<f32>(0.10, 0.0, 0.30), vec3<f32>(1.0, 0.90, 0.20), scale);
+    }
+    if !hit.hit {
+        return vec3<f32>(0.0);
+    }
+    switch view {
+        case VIEW_NORMALS: { return hit.normal * 0.5 + 0.5; }
+        case VIEW_ALBEDO: { return encode(albedo(hit.material)); }
+        case VIEW_DEPTH: { return vec3<f32>(DEPTH_HALF / (DEPTH_HALF + hit.t)); }
+        default: { return vec3<f32>(1.0, 0.0, 1.0); }
+    }
 }

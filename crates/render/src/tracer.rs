@@ -7,6 +7,8 @@ use wgpu::util::DeviceExt;
 
 use crate::accumulation::Accumulator;
 use crate::camera::{Camera, CameraUniform};
+use crate::debug_view::DebugView;
+use crate::profiler::Profiler;
 use crate::reference::{Hit, Ray};
 use crate::scene::{REGION_WORDS, Scene, SceneUpdate, spare_words};
 use crate::sun::{Sun, SunUniform};
@@ -34,7 +36,7 @@ pub const RNG_SEED: u32 = 0xB4A7_A9AC;
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct FrameUniform {
     sun: SunUniform,
-    /// The sample's index, the random seed, then two unused.
+    /// The sample's index, the random seed, the debug view, then one unused.
     params: [u32; 4],
 }
 
@@ -96,6 +98,7 @@ pub struct Tracer {
     primary: wgpu::ComputePipeline,
     reference: wgpu::ComputePipeline,
     accumulator: Accumulator<View>,
+    debug_view: DebugView,
 }
 
 fn layout_entry(binding: u32, ty: wgpu::BindingType) -> wgpu::BindGroupLayoutEntry {
@@ -311,6 +314,7 @@ impl Tracer {
             primary,
             reference,
             accumulator: Accumulator::new(),
+            debug_view: DebugView::default(),
         })
     }
 
@@ -335,18 +339,20 @@ impl Tracer {
     }
 
     /// Records the primary visibility pass: one ray per pixel of `target` from `camera`, lit by
-    /// `sun`.
+    /// `sun`. The pass is timed by `profiler`.
+    #[allow(clippy::too_many_arguments)]
     pub fn encode_primary(
         &self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
+        profiler: &mut Profiler,
         encoder: &mut wgpu::CommandEncoder,
         camera: &Camera,
         sun: &Sun,
         target: &Target,
     ) {
         self.write_uniforms(queue, camera, sun, 0);
-        self.dispatch(device, encoder, &self.primary, target);
+        self.dispatch(device, profiler, encoder, "primary", &self.primary, target);
     }
 
     /// Records one more sample of the reference path tracer for every pixel of `target`, added
@@ -354,11 +360,13 @@ impl Tracer {
     /// the last call, the mean starts over.
     ///
     /// The uniforms are written when this is called, so each sample must be submitted before the
-    /// next is encoded.
+    /// next is encoded. The pass is timed by `profiler`.
+    #[allow(clippy::too_many_arguments)]
     pub fn encode_reference(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
+        profiler: &mut Profiler,
         encoder: &mut wgpu::CommandEncoder,
         camera: &Camera,
         sun: &Sun,
@@ -371,7 +379,14 @@ impl Tracer {
         };
         let sample_index = self.accumulator.begin_sample(&view);
         self.write_uniforms(queue, camera, sun, sample_index);
-        self.dispatch(device, encoder, &self.reference, target);
+        self.dispatch(
+            device,
+            profiler,
+            encoder,
+            "reference",
+            &self.reference,
+            target,
+        );
     }
 
     /// Brings the GPU copy of the Planet up to date with `scene`, which `update` describes the
@@ -429,6 +444,16 @@ impl Tracer {
         self.accumulator.reset();
     }
 
+    pub fn debug_view(&self) -> DebugView {
+        self.debug_view
+    }
+
+    /// Chooses what the kernels draw (see [`DebugView`]). The reference image keeps
+    /// accumulating whichever is chosen.
+    pub fn set_debug_view(&mut self, view: DebugView) {
+        self.debug_view = view;
+    }
+
     /// Samples in the reference image so far.
     pub fn samples(&self) -> u32 {
         self.accumulator.samples()
@@ -442,7 +467,7 @@ impl Tracer {
         );
         let frame = FrameUniform {
             sun: sun.uniform(),
-            params: [sample_index, RNG_SEED, 0, 0],
+            params: [sample_index, RNG_SEED, self.debug_view.index(), 0],
         };
         queue.write_buffer(&self.frame_buffer, 0, bytemuck::bytes_of(&frame));
     }
@@ -450,7 +475,9 @@ impl Tracer {
     fn dispatch(
         &self,
         device: &wgpu::Device,
+        profiler: &mut Profiler,
         encoder: &mut wgpu::CommandEncoder,
+        name: &str,
         pipeline: &wgpu::ComputePipeline,
         target: &Target,
     ) {
@@ -476,10 +503,7 @@ impl Tracer {
                 },
             ],
         });
-        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("kernel"),
-            timestamp_writes: None,
-        });
+        let mut pass = profiler.compute_pass(encoder, name);
         pass.set_pipeline(pipeline);
         pass.set_bind_group(0, &self.scene.group, &[]);
         pass.set_bind_group(1, &group, &[]);
@@ -554,7 +578,8 @@ impl Tracer {
         );
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
         {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
+            // A one-shot probe with its own submit, so not timed.
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default()); // untimed
             pass.set_pipeline(&pipeline);
             pass.set_bind_group(0, &self.scene.group, &[]);
             pass.set_bind_group(1, &group, &[]);

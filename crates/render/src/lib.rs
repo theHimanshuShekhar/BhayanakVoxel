@@ -8,25 +8,36 @@
 //! Two ways of drawing share that `trace()`: primary visibility, and the reference path tracer
 //! (`shaders/pathtrace.wgsl`), which accumulates samples while nothing changes and is the ground
 //! truth for later lighting techniques. [`accumulation`] decides when it starts over.
+//!
+//! Every pass is timed on the GPU where the device allows ([`Profiler`], [`timing`]), and
+//! [`overlay`] draws those times, with the render settings, as an egui panel. [`DebugView`]s show
+//! one input of the shading at a time.
 
 pub mod accumulation;
 pub mod camera;
+mod debug_view;
 mod offscreen;
+pub mod overlay;
+mod profiler;
 pub mod reference;
 #[cfg(test)]
 mod sampling_tests;
 pub mod scene;
 mod shaders;
 pub mod sun;
+pub mod timing;
 pub mod tracer;
 mod window;
 
 use std::error::Error;
 
 pub use camera::Camera;
+pub use debug_view::DebugView;
 pub use offscreen::{Image, Offscreen};
+pub use profiler::Profiler;
 pub use scene::{Scene, SceneUpdate};
 pub use sun::Sun;
+pub use timing::Timings;
 pub use window::{Mode, Renderer};
 
 pub(crate) type Result<T> = std::result::Result<T, Box<dyn Error>>;
@@ -38,10 +49,12 @@ fn create_instance() -> wgpu::Instance {
     wgpu::Instance::new(desc)
 }
 
-/// Requests a device on a Vulkan adapter, presentable to `surface` if one is given.
+/// Requests a device on a Vulkan adapter, presentable to `surface` if one is given. With
+/// `timers`, it has timestamp queries if the adapter does.
 fn request_gpu(
     instance: &wgpu::Instance,
     surface: Option<&wgpu::Surface<'_>>,
+    timers: bool,
 ) -> Result<(wgpu::Adapter, wgpu::Device, wgpu::Queue)> {
     let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
         power_preference: wgpu::PowerPreference::HighPerformance,
@@ -50,6 +63,12 @@ fn request_gpu(
     }))?;
     let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
         label: Some("bhayanak device"),
+        // Pass timers, where the adapter has them; without them the timers read "n/a".
+        required_features: if timers {
+            adapter.features() & profiler::FEATURES
+        } else {
+            wgpu::Features::empty()
+        },
         // The Planet's bricks are one big storage buffer, well over the portable 128 MiB limit.
         required_limits: adapter.limits(),
         ..Default::default()
@@ -118,7 +137,7 @@ mod tests {
     /// Needs a Vulkan driver; CI uses lavapipe (mesa-vulkan-drivers).
     #[test]
     fn vulkan_device_can_be_created_without_a_window() {
-        let (adapter, _device, _queue) = request_gpu(&create_instance(), None).unwrap();
+        let (adapter, _device, _queue) = request_gpu(&create_instance(), None, true).unwrap();
         assert_eq!(adapter.get_info().backend, wgpu::Backend::Vulkan);
     }
 }

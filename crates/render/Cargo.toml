@@ -7,6 +7,8 @@ publish.workspace = true
 [dependencies]
 brick-store.workspace = true
 bytemuck = { version = "1.25", features = ["derive"] }
+egui.workspace = true
+egui-wgpu.workspace = true
 wgpu.workspace = true
 pollster = "1.0.1"
 
