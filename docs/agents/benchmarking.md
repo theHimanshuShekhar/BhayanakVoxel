@@ -1,0 +1,141 @@
+# Benchmarking
+
+`client bench` is the performance loop of the project (decision in #13). It flies a fixed camera
+path over the test Planet, times every GPU pass, and writes a JSON report and screenshots. It
+exists so that "is this PR within the frame budget?" has a number for an answer, measured on the
+dev's RTX 4090.
+
+## The `needs-benchmark` label
+
+- **Agents** add `needs-benchmark` to every PR that touches rendering (shaders, passes, the
+  tracer, the scene's GPU layout) or anything performance-sensitive (planet generation, brick
+  packing, the sim hot path), and say in the PR body which passes are expected to change.
+- **The dev** downloads the PR's `client-windows` artifact, runs the bench on the RTX 4090
+  (below), and pastes `report.json` into a PR comment, together with a screenshot or two.
+- **A pass over its budget blocks the merge** (#13). The dev removes the label once the report is
+  in and nothing is over. Budgets are in `bins/client/bench-budgets.toml`; a PR that deliberately
+  changes one says so and why.
+- CI runs the bench too, but only as a smoke test on lavapipe (software Vulkan): it checks that
+  it runs and that the report has the right shape, and its timings mean nothing.
+
+## Running it
+
+From the Windows artifact, which needs no Rust toolchain and no other files:
+
+```
+client.exe bench --out bench-out
+```
+
+With a checkout, `cargo run --release -p client -- bench --out bench-out` does the same. Build in
+release: a debug build's CPU side is slow enough to distort the frame times.
+
+| Option | Meaning |
+| --- | --- |
+| `--out DIR` | Where `report.json` and the screenshots go. Default `bench-out`. |
+| `--budgets FILE` | Use this budgets file instead of the one built into the executable. |
+| `--size WxH` | Resolution of the traced image. Default `1280x720`, which is the internal resolution behind 1440p output that the budgets are for. Do not change it for a report you paste. |
+| `--short` | A tiny run (160x90, a handful of frames, a patch of the Planet): the CI smoke test. |
+| `--no-fail` | Exit with status 0 even if a pass is over budget. |
+
+It runs unattended and takes a minute or so (generating the whole Planet is about 22 s of it).
+The report is written to `DIR/report.json` and also printed on stdout; progress and a table go
+to stderr.
+
+**Exit status:** 0 if every budget is met, 2 if a pass is over its budget (or has a budget but
+could not be timed), 1 if the bench could not run (no Vulkan device, an unreadable budgets
+file, a bad option).
+
+### What it does
+
+1. Generates the test Planet and uploads it to the GPU.
+2. Flies the camera path in **primary mode**, then in **reference mode** (the progressive path
+   tracer, 4 samples per frame of the path). Each mode first draws a few warm-up frames, which are
+   not measured: the first frames after a mode switch carry the other mode's state (see the notes
+   on #28).
+3. Writes a screenshot at each keyframe of the path, per mode.
+
+The camera is a function of the frame index only (keyframes, interpolated in a straight line at
+constant speed), never of the clock, so every run on every machine shows the GPU the same views.
+The path has a version in its name (`planet-flyover-v1`); if the path ever changes, the version
+changes, and reports of different versions are not comparable.
+
+It draws **offscreen** (`render::Offscreen`), not in a window. The tracer and the pass timers are
+the same as the window's; what is left out is the window's `blit` and `overlay` passes, and
+what is gained is that nothing waits for the display and that a frame's GPU times are in when it
+returns, so there is no lag to correct for. It asks Vulkan for the high-performance adapter, as
+the window does, and the report says which GPU it got: check `machine.device_type` is not `Cpu`
+before reading anything into the times.
+
+## Reading the report
+
+```
+{
+  "schema_version": 1,
+  "build":   { "version", "commit" },          // commit: CI builds only, else null; on a PR
+                                               // build it is GitHub's merge commit, not the head
+  "machine": { "gpu", "device_type", "driver", "driver_info", "backend", "os", "arch",
+               "timers_supported" },
+  "config":  { "width", "height", "scene", "path", "keyframes" },
+  "modes": {
+    "primary":   { "frames", "warmup_frames", "spp", "passes": [ENTRY...], "gpu_total": ENTRY,
+                   "frame_time": STATS },
+    "reference": { ... same ... }
+  },
+  "screenshots": [ "primary-frame0000.png", ... ],
+  "budgets": { "source", "ok", "failed": ["primary/primary"], "unmatched": [] }
+}
+```
+
+- `STATS` is `{ "samples", "mean_ms", "p95_ms", "max_ms" }`. The figures are `null` when there are
+  no samples. `p95_ms` is the nearest rank. Times come from every sample the GPU timers recorded
+  over the measured frames (`Timings::history()`), not from the overlay's rolling window.
+- `ENTRY` is `STATS` plus `name`, `budget_ms` (null if the pass has none) and `status`:
+  - `within`: the **mean** is at most the budget.
+  - `over`: the mean is above it. This blocks the merge.
+  - `no-budget`: nothing declares a budget for it.
+  - `no-data`: it has a budget but no times, because the GPU has no timestamp queries
+    (`machine.timers_supported` is `false`). It fails the run, since nothing was checked.
+- `gpu_total` is the GPU time of one profiler frame, from the start of its first pass to the end
+  of its last. In primary mode that is one frame of the path. In reference mode every sample is a
+  profiler frame of its own, so `passes[]` and `gpu_total` are **per sample** there, with
+  `frames * spp` samples, and `gpu_total.reference` budgets one sample.
+- `frame_time` is CPU time to draw one frame of the path and read the image back. For reference
+  mode a frame is all its samples. It is context, not a budget.
+- `budgets.unmatched` lists budgets for passes that did not run (`passes.shadows` before there is
+  a shadows pass): they are not an error.
+
+The mean is what is held to the budget; look at `p95_ms` and `max_ms` for stutter.
+
+## Budgets
+
+`bins/client/bench-budgets.toml` is compiled into the executable, so the Windows artifact needs no
+file beside it. To try other numbers, copy it and pass `--budgets copy.toml`. The report says
+which budgets it used (`budgets.source`).
+
+```toml
+[passes]            # milliseconds of GPU time per frame, by the name of the pass
+primary = 1.0
+
+[gpu_total]         # GPU total of one profiler frame, by mode: primary, or one reference sample
+primary = 8.6
+```
+
+Anything else in the file, a pass or mode with a zero, negative or non-numeric budget, is an
+error: a typo must not silently turn a budget off.
+
+The numbers are the per-stage frame budget of the rendering decision (#10), on the RTX 4090 at
+1440p output. Only `primary` (Primary visibility, 1.0 ms) and the total (8.6 ms) are live today,
+as those are the passes that exist. The later stages (sun shadows 0.4, GI 1.5, reflections 0.7,
+glass 0.7, volumetrics 1.0, denoise 1.0, atmosphere 0.3, upscale 0.5, edits 1.0, post 0.5) are
+in the file as comments: **whoever adds a pass uncomments its budget and names it the same**
+(a pass is named by the string given to `Profiler::compute_pass`). `reference` has no budget in
+#10, and the number in the file is a placeholder to catch a gross regression; replace it with a
+figure from the first real run.
+
+## Tests
+
+The statistics, budget evaluation and exit status, camera path, argument parsing and report shape
+are unit tests in `bins/client/src/bench/`. `bins/client/tests/bench.rs` runs the real
+`client bench --short` and checks the report's schema, the screenshots and the exit codes: it
+runs in `cargo test` (and so in CI) on lavapipe. `--short` uses a patch of the Planet, the one the
+golden image test renders, because the whole Planet takes about 22 s to generate in release.
