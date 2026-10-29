@@ -11,6 +11,8 @@ use std::sync::atomic::{AtomicI32, Ordering};
 
 use brick_store::{BRICK_SIZE, Brick, BrickCoord, BrickStore, Material, VoxelCoord};
 
+pub mod world_map;
+
 /// Identifies the generation algorithm. Bump it whenever generated bricks change.
 pub const GENERATOR_VERSION: u32 = 1;
 

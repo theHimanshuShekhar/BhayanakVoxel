@@ -6,3 +6,7 @@ publish.workspace = true
 
 [dependencies]
 brick-store.workspace = true
+
+[dev-dependencies]
+# Writes the world map's debug images (examples/world_map.rs).
+png = "0.18.1"

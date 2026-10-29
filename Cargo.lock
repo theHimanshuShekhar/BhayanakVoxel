@@ -1695,6 +1695,7 @@ name = "planet-gen"
 version = "0.1.0"
 dependencies = [
  "brick-store",
+ "png",
 ]
 
 [[package]]

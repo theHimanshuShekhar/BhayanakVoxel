@@ -5,6 +5,7 @@
 //! `actual` column printed by a failing run.
 
 use brick_store::{Brick, BrickCoord};
+use planet_gen::world_map::WorldMap;
 use planet_gen::{GENERATOR_VERSION, generate_brick};
 
 const SEED: u64 = 0x5EED_B41A_2024;
@@ -68,4 +69,16 @@ fn golden_brick_hashes() {
             &format!("{coord:?} {got_kind:?} actual {got_hash:#018x} want {want_hash:#018x}\n");
     }
     assert!(!failed, "golden mismatch:\n{report}");
+}
+
+/// Texels along a face of the world map the golden hash covers: coarse, to keep CI fast. The
+/// map's algorithm is the same at every size.
+const WORLD_MAP_SIZE: u32 = 128;
+
+const WORLD_MAP_HASH: u64 = 0xcd2f00519adae333;
+
+#[test]
+fn golden_world_map_hash() {
+    let actual = WorldMap::generate(SEED, WORLD_MAP_SIZE).content_hash();
+    assert_eq!(actual, WORLD_MAP_HASH, "actual {actual:#018x}");
 }
