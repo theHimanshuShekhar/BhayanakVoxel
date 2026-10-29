@@ -2,7 +2,7 @@
 
 use crate::camera::Camera;
 use crate::reference::{Hit, Ray};
-use crate::scene::Scene;
+use crate::scene::{Scene, SceneUpdate};
 use crate::sun::Sun;
 use crate::tracer::{Target, Tracer};
 use crate::{Result, create_instance, finish_and_read, request_gpu, staging_buffer};
@@ -37,6 +37,13 @@ impl Offscreen {
             target,
             sun: Sun::default(),
         })
+    }
+
+    /// Brings the GPU copy of the Planet up to date with `scene`, after `update` (the result of
+    /// [`Scene::update`]) changed it. This starts the reference image over.
+    pub fn update_scene(&mut self, scene: &Scene, update: &SceneUpdate) -> Result<()> {
+        self.tracer
+            .update_scene(&self.device, &self.queue, scene, update)
     }
 
     /// Changes the sun that both ways of rendering light the Planet with.

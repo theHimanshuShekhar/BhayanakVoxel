@@ -3,3 +3,8 @@ name = "sim"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
+
+[dependencies]
+brick-store.workspace = true
+net.workspace = true
+planet-gen.workspace = true

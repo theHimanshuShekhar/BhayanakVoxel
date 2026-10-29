@@ -67,6 +67,32 @@ pub struct Scene {
     pub regions: Vec<u32>,
     pub brick_refs: Vec<u32>,
     pub bricks: Vec<u32>,
+    /// What [`Scene::update`] resolves bricks the store does not hold against.
+    core: Option<Core>,
+    /// Words of `brick_refs` and `bricks` that updates have replaced and nothing refers to.
+    garbage: usize,
+}
+
+/// Room to leave in a buffer of `len` words for it to grow by: a sixteenth, and some. The GPU
+/// buffers are made this much bigger than the scene, and [`Scene::update`] packs the scene again
+/// once its garbage passes this much.
+pub(crate) fn spare_words(len: usize) -> usize {
+    len / 16 + 4096
+}
+
+/// What [`Scene::update`] changed, for copying to a GPU copy of the scene.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SceneUpdate {
+    /// `brick_refs` and `bricks` only grew: everything from these offsets (in words) to the end
+    /// is new. The records in `regions` listed (by index, ascending) were rewritten in place.
+    /// The header (`origin`, `dims`) and the table are as before.
+    Patched {
+        regions: Vec<usize>,
+        brick_refs_from: usize,
+        bricks_from: usize,
+    },
+    /// The scene was built again from scratch, so all of it is new.
+    Rebuilt,
 }
 
 /// Mixes a region coordinate into a table slot. The WGSL `hash_region` is the same function.
@@ -171,7 +197,10 @@ impl Scene {
         // Regions that ended up with nothing in them, such as one of only stored air.
         by_region.retain(|_, region| region.uniform.is_some() || !region.bricks.is_empty());
         let Some(first) = by_region.keys().next() else {
-            return Scene::default();
+            return Scene {
+                core,
+                ..Scene::default()
+            };
         };
         let (mut min, mut max) = (*first, *first);
         for region in by_region.keys() {
@@ -184,6 +213,7 @@ impl Scene {
         let mut scene = Scene {
             origin: min.map(|m| m * REGION_VOXELS),
             dims: [0, 1, 2].map(|axis| (max[axis] - min[axis] + 1) as u32),
+            core,
             ..Scene::default()
         };
         let slots = (by_region.len() * 2).next_power_of_two().max(2);
@@ -265,6 +295,114 @@ impl Scene {
     /// Slots in the table, minus one. Slots are a power of two.
     pub fn table_mask(&self) -> u32 {
         (self.table.len() / 4).saturating_sub(1) as u32
+    }
+
+    /// Brings the scene up to date with `store` after the bricks `changed` (in any order, and
+    /// possibly including ones that did not change) were edited, without packing all of it again.
+    ///
+    /// Each region holding a changed brick gets a new record in place. Its changed bricks are
+    /// packed again at the end of `brick_refs` and `bricks`, and its other bricks are referred
+    /// to where they already were. What was replaced stays behind as garbage, so that the
+    /// buffers only ever grow, until there is more of it than [`spare_words`] of what is live.
+    /// Then the scene is packed from scratch, which drops the garbage but takes about 1.6 s for
+    /// the test Planet. The same happens if a changed brick is in a region that the scene lacks.
+    /// Both are reported as [`SceneUpdate::Rebuilt`]. A region that Edits empty keeps a record
+    /// with no bricks in it.
+    pub fn update(&mut self, store: &BrickStore, changed: &[BrickCoord]) -> SceneUpdate {
+        let mut by_region: BTreeMap<usize, Vec<BrickCoord>> = BTreeMap::new();
+        for &brick in changed {
+            let Some(index) = self.find_region(region_of(brick)) else {
+                *self = Scene::new(store, self.core);
+                return SceneUpdate::Rebuilt;
+            };
+            by_region.entry(index).or_default().push(brick);
+        }
+        let (brick_refs_from, bricks_from) = (self.brick_refs.len(), self.bricks.len());
+        for (&index, changed) in &by_region {
+            let origin = region_of(changed[0]).map(|r| r * REGION_BRICKS);
+            let first_ref = self.brick_refs.len() as u32;
+            let mut mask = [0u32; 16];
+            self.garbage += self.region_refs(index);
+            for bit in 0..512 {
+                let coord = BrickCoord(std::array::from_fn(|a| {
+                    origin[a] + (bit >> (3 * a) & 7) as i32
+                }));
+                let entry = if changed.contains(&coord) {
+                    let old = self.entry(index, bit);
+                    self.garbage += old.map_or(0, |entry| self.mixed_words(entry));
+                    self.resolve(store, coord).map(|view| self.pack_brick(view))
+                } else {
+                    self.entry(index, bit)
+                };
+                if let Some(entry) = entry {
+                    mask[bit / 32] |= 1 << (bit % 32);
+                    self.brick_refs.push(entry);
+                }
+            }
+            let at = index * REGION_WORDS;
+            self.regions[at..at + 16].copy_from_slice(&mask);
+            self.regions[at + 16] = first_ref;
+        }
+        let live = self.brick_refs.len() + self.bricks.len() - self.garbage;
+        if self.garbage > spare_words(live) {
+            *self = Scene::new(store, self.core);
+            return SceneUpdate::Rebuilt;
+        }
+        SceneUpdate::Patched {
+            regions: by_region.into_keys().collect(),
+            brick_refs_from,
+            bricks_from,
+        }
+    }
+
+    /// Entries that the region record at `index` has in `brick_refs`.
+    fn region_refs(&self, index: usize) -> usize {
+        let record = &self.regions[index * REGION_WORDS..][..REGION_WORDS];
+        if record[16] & SOLID_FLAG != 0 {
+            return 0;
+        }
+        record[..16].iter().map(|w| w.count_ones() as usize).sum()
+    }
+
+    /// Words that the brick with `brick_refs` entry `entry` has in `bricks`: none for a brick
+    /// that is one Material throughout.
+    fn mixed_words(&self, entry: u32) -> usize {
+        if entry & SOLID_FLAG != 0 {
+            return 0;
+        }
+        let header = self.bricks[entry as usize + 16];
+        let (bits, palette_len) = ((header & 0xff) as usize, (header >> 8) as usize);
+        // Occupancy and header, the palette, then 512 indices of `bits` bits.
+        17 + palette_len.div_ceil(2) + 512 * bits / 32
+    }
+
+    /// How the scene shows the brick at `coord`: as the store has it, else as the core, else air.
+    fn resolve<'a>(&self, store: &'a BrickStore, coord: BrickCoord) -> Option<BrickView<'a>> {
+        match store.brick(coord) {
+            Some(brick) if brick.is_air() => None,
+            Some(brick) => Some(brick.view()),
+            None => self
+                .core
+                .filter(|core| coord.within_ball(core.radius))
+                .map(|core| BrickView::Solid(core.material)),
+        }
+    }
+
+    /// The `brick_refs` entry for mask bit `bit` of the region record at `index`, if the region
+    /// has that brick.
+    fn entry(&self, index: usize, bit: usize) -> Option<u32> {
+        let record = &self.regions[index * REGION_WORDS..][..REGION_WORDS];
+        let first_ref = record[16];
+        if first_ref & SOLID_FLAG != 0 {
+            return Some(first_ref);
+        }
+        let mask = &record[..16];
+        if mask[bit / 32] >> (bit % 32) & 1 == 0 {
+            return None;
+        }
+        let lower: u32 = mask[..bit / 32].iter().map(|w| w.count_ones()).sum::<u32>()
+            + (mask[bit / 32] & ((1u32 << (bit % 32)) - 1)).count_ones();
+        Some(self.brick_refs[(first_ref + lower) as usize])
     }
 
     /// Index in `regions` of the region at absolute region coordinate `key`.
@@ -459,6 +597,177 @@ mod tests {
         );
         let mask = &scene.regions[..16];
         assert_eq!((mask[0], mask[2]), (1 << 3 | 1 << 8, 1));
+    }
+
+    /// The Material at `voxel` as the reference tracer sees it: a ray that starts inside a
+    /// solid Voxel hits that Voxel at once.
+    fn material_at(scene: &Scene, voxel: [i32; 3]) -> Option<u16> {
+        let ray = crate::reference::Ray {
+            cell: voxel,
+            origin: [0.5; 3],
+            dir: [1.0, 0.0, 0.0],
+        };
+        crate::reference::trace(scene, &ray)
+            .filter(|hit| hit.voxel == voxel)
+            .map(|hit| hit.material)
+    }
+
+    /// Digs a ball like an Edit does: a core brick is stored as the rock it is before it is dug.
+    fn dig(store: &mut BrickStore, core: Core, centre: [i32; 3], radius: i32) -> Vec<BrickCoord> {
+        let mut changed = std::collections::BTreeSet::new();
+        for x in -radius..=radius {
+            for y in -radius..=radius {
+                for z in -radius..=radius {
+                    if x * x + y * y + z * z > radius * radius {
+                        continue;
+                    }
+                    let voxel = VoxelCoord([centre[0] + x, centre[1] + y, centre[2] + z]);
+                    let brick = voxel.brick();
+                    if store.brick(brick).is_none() && brick.within_ball(core.radius) {
+                        store.insert(brick, Brick::solid(core.material));
+                    }
+                    if store.get(voxel).is_some() {
+                        changed.insert(brick);
+                    }
+                    store.set(voxel, None);
+                }
+            }
+        }
+        changed.into_iter().collect()
+    }
+
+    fn assert_same_voxels(a: &Scene, b: &Scene, lo: [i32; 3], hi: [i32; 3]) {
+        for x in lo[0]..=hi[0] {
+            for y in lo[1]..=hi[1] {
+                for z in lo[2]..=hi[2] {
+                    let at = [x, y, z];
+                    assert_eq!(material_at(a, at), material_at(b, at), "{at:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn an_updated_scene_shows_the_same_voxels_as_one_built_from_scratch() {
+        let core = Core {
+            radius: 120,
+            material: ROCK,
+        };
+        let mut store = BrickStore::new();
+        // A mixed brick and a solid one outside the core, in a region of their own.
+        store.set(VoxelCoord([200, 3, 3]), Some(SOIL));
+        store.insert(BrickCoord([26, 0, 0]), Brick::solid(SOIL));
+        let mut scene = Scene::new(&store, Some(core));
+
+        // Digs inside the core's uniform region, across a region boundary into negative
+        // coordinates, through the mixed brick, and out of a whole solid brick.
+        let mut changed = dig(&mut store, core, [8, 8, 8], 6);
+        changed.extend(dig(&mut store, core, [-2, 3, -60], 9));
+        changed.extend(dig(&mut store, core, [200, 3, 3], 1));
+        changed.extend(dig(&mut store, core, [212, 3, 3], 8));
+        let patch = scene.update(&store, &changed);
+        let SceneUpdate::Patched { regions, .. } = patch else {
+            panic!("a dig needs no new region: {patch:?}");
+        };
+        assert!(regions.len() >= 3 && regions.is_sorted());
+
+        let fresh = Scene::new(&store, Some(core));
+        assert_same_voxels(&scene, &fresh, [-14, -4, -72], [22, 20, 20]);
+        assert_same_voxels(&scene, &fresh, [190, 0, 0], [225, 12, 12]);
+        // Beyond what was edited nothing differs either.
+        assert_same_voxels(&scene, &fresh, [60, 60, 60], [70, 70, 70]);
+    }
+
+    #[test]
+    fn an_update_only_appends_to_the_buffers() {
+        let core = Core {
+            radius: 120,
+            material: ROCK,
+        };
+        let mut store = BrickStore::new();
+        let mut scene = Scene::new(&store, Some(core));
+        let before = (
+            scene.regions.clone(),
+            scene.brick_refs.clone(),
+            scene.bricks.clone(),
+        );
+        let changed = dig(&mut store, core, [8, 8, 8], 3);
+        let SceneUpdate::Patched {
+            brick_refs_from,
+            bricks_from,
+            ..
+        } = scene.update(&store, &changed)
+        else {
+            panic!("a patch");
+        };
+        assert_eq!(
+            (brick_refs_from, bricks_from),
+            (before.1.len(), before.2.len())
+        );
+        assert_eq!(scene.regions.len(), before.0.len());
+        assert_eq!(scene.brick_refs[..brick_refs_from], before.1[..]);
+        assert_eq!(scene.bricks[..bricks_from], before.2[..]);
+        assert!(scene.bricks.len() > bricks_from, "the dug bricks are mixed");
+    }
+
+    #[test]
+    fn replaced_records_are_counted_and_too_many_pack_the_scene_again() {
+        let core = Core {
+            radius: 120,
+            material: ROCK,
+        };
+        let mut store = BrickStore::new();
+        let mut scene = Scene::new(&store, Some(core));
+        let mut rebuilt = 0;
+        for i in 0..40 {
+            // Digs that overlap, so that bricks are replaced again and again.
+            let changed = dig(&mut store, core, [i % 5 * 3, i % 3 * 4, 10], 9);
+            let update = scene.update(&store, &changed);
+            let fresh = Scene::new(&store, Some(core));
+            if update == SceneUpdate::Rebuilt {
+                rebuilt += 1;
+                assert_eq!(scene.garbage, 0);
+                assert_eq!(
+                    (&scene.brick_refs, &scene.bricks),
+                    (&fresh.brick_refs, &fresh.bricks)
+                );
+            } else {
+                let live = fresh.brick_refs.len() + fresh.bricks.len();
+                let all = scene.brick_refs.len() + scene.bricks.len();
+                assert_eq!(all - scene.garbage, live, "update {i}");
+                assert!(scene.garbage <= spare_words(live));
+            }
+        }
+        assert!(rebuilt > 0, "the garbage was cleared at some point");
+        assert_same_voxels(
+            &scene,
+            &Scene::new(&store, Some(core)),
+            [-2, -2, 0],
+            [20, 20, 24],
+        );
+    }
+
+    #[test]
+    fn a_region_dug_out_completely_stays_in_the_table_and_reads_as_air() {
+        let mut store = BrickStore::new();
+        store.insert(BrickCoord([0, 0, 0]), Brick::solid(SOIL));
+        let mut scene = Scene::new(&store, None);
+        assert_eq!(material_at(&scene, [3, 3, 3]), Some(2));
+        store.insert(BrickCoord([0, 0, 0]), Brick::AIR);
+        scene.update(&store, &[BrickCoord([0, 0, 0])]);
+        assert_eq!(material_at(&scene, [3, 3, 3]), None);
+        assert!(scene.find_region([0, 0, 0]).is_some());
+    }
+
+    #[test]
+    fn a_change_outside_every_region_rebuilds_the_scene() {
+        let mut store = BrickStore::new();
+        store.insert(BrickCoord([0, 0, 0]), Brick::solid(SOIL));
+        let mut scene = Scene::new(&store, None);
+        store.insert(BrickCoord([100, 0, 0]), Brick::solid(SOIL));
+        let patch = scene.update(&store, &[BrickCoord([100, 0, 0])]);
+        assert_eq!(patch, SceneUpdate::Rebuilt);
+        assert_eq!(material_at(&scene, [800, 3, 3]), Some(2));
     }
 
     #[test]

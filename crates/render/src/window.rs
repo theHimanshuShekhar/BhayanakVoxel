@@ -1,7 +1,7 @@
 //! Rendering to a window surface.
 
 use crate::camera::Camera;
-use crate::scene::Scene;
+use crate::scene::{Scene, SceneUpdate};
 use crate::sun::Sun;
 use crate::tracer::{Target, Tracer};
 use crate::{Result, create_instance, request_gpu, shaders};
@@ -137,6 +137,13 @@ impl Renderer {
     pub fn set_scene(&mut self, scene: &Scene) -> Result<()> {
         self.tracer = Tracer::new(&self.device, scene)?;
         Ok(())
+    }
+
+    /// Brings the GPU copy of the Planet up to date with `scene`, after `update` (the result of
+    /// [`Scene::update`]) changed it. This starts the reference image over.
+    pub fn update_scene(&mut self, scene: &Scene, update: &SceneUpdate) -> Result<()> {
+        self.tracer
+            .update_scene(&self.device, &self.queue, scene, update)
     }
 
     pub fn mode(&self) -> Mode {

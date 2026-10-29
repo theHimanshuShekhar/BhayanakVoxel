@@ -25,7 +25,7 @@ use std::error::Error;
 
 pub use camera::Camera;
 pub use offscreen::{Image, Offscreen};
-pub use scene::Scene;
+pub use scene::{Scene, SceneUpdate};
 pub use sun::Sun;
 pub use window::{Mode, Renderer};
 
