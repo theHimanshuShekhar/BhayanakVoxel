@@ -9,7 +9,7 @@
 
 use std::sync::atomic::{AtomicI32, Ordering};
 
-use brick_store::{BRICK_SIZE, Brick, BrickCoord, BrickStore, Material, VoxelCoord};
+use brick_store::{BRICK_SIZE, Brick, BrickCoord, BrickStore, Interior, Material, VoxelCoord};
 
 /// Identifies the generation algorithm. Bump it whenever generated bricks change.
 pub const GENERATOR_VERSION: u32 = 1;
@@ -34,6 +34,14 @@ const MAX_RELIEF: f64 = 34.0;
 /// [`MAX_RELIEF`] below [`PLANET_RADIUS`], and the soil is [`SOIL_DEPTH`] thick. A brick wholly
 /// inside is therefore uniform rock, which [`generate_planet`] leaves out.
 pub const CORE_RADIUS: i32 = PLANET_RADIUS - MAX_RELIEF as i32 - SOIL_DEPTH as i32;
+
+/// The core as the brick store reads it: where [`generate_planet`] holds no brick, a brick wholly
+/// inside [`CORE_RADIUS`] is [`ROCK`]. `sim::apply` digs it, and the store's coarse levels are
+/// made from it.
+pub const CORE: Interior = Interior {
+    radius: CORE_RADIUS,
+    material: ROCK,
+};
 
 /// Hashes a seed and lattice point to 64 well-mixed bits (splitmix64 finalizer per coordinate).
 fn hash(seed: u64, point: [i32; 3]) -> u64 {
@@ -158,8 +166,11 @@ pub fn generate_region(seed: u64, min: BrickCoord, max: BrickCoord) -> BrickStor
 
 /// Generates the whole Planet except its core: every non-air brick that is not wholly inside
 /// [`CORE_RADIUS`]. The core is a ball of uniform [`ROCK`] about 24 million bricks big, which
-/// the caller represents without a brick per cell. About 2.6 million bricks remain; generating
-/// them takes about 20 seconds on eight cores in a release build.
+/// the store represents as its source [`CORE`], without a brick per cell. About 2.6 million
+/// bricks remain; generating them takes about 20 seconds on eight cores in a release build.
+///
+/// Every brick that is not wholly inside the core and not air is held, which is what makes the
+/// coarse levels that [`CORE`] helps to make true to the Planet (see [`brick_store::BrickSource`]).
 pub fn generate_planet(seed: u64) -> BrickStore {
     // The surface reaches PLANET_RADIUS + MAX_RELIEF, which is inside this many bricks.
     let extent = (PLANET_RADIUS + MAX_RELIEF as i32) / BRICK_SIZE + 1;
@@ -210,6 +221,9 @@ fn generate_box(seed: u64, min: BrickCoord, max: BrickCoord, skip_core: bool) ->
     let mut store = BrickStore::new();
     for (coord, brick) in slabs.into_iter().flatten() {
         store.insert(coord, brick);
+    }
+    if skip_core {
+        store.set_source(CORE);
     }
     store
 }
@@ -268,6 +282,21 @@ mod tests {
         assert!(bricks.first().unwrap().is_uniform());
         assert!(bricks.last().unwrap().is_air());
         assert!(bricks.iter().any(|b| !b.is_uniform()));
+    }
+
+    #[test]
+    fn a_planet_without_its_core_reads_the_core_as_rock() {
+        let store = generate_box(SEED, BrickCoord([-3; 3]), BrickCoord([3; 3]), true);
+        assert!(store.is_empty());
+        assert_eq!(
+            *store.brick_at(0, BrickCoord([0, 0, 0])),
+            Brick::solid(ROCK)
+        );
+        // Well outside the core, nothing is implied.
+        assert!(store.brick_at(0, BrickCoord([300, 0, 0])).is_air());
+        // A region holds the bricks it is asked for, core or not, and implies nothing.
+        let region = generate_region(SEED, BrickCoord([0; 3]), BrickCoord([1; 3]));
+        assert!(region.brick_at(0, BrickCoord([3, 3, 3])).is_air());
     }
 
     #[test]
