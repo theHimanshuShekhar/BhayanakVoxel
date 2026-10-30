@@ -17,6 +17,12 @@
 //! never reached; leaving them out would mean packing the ring again whenever the finer one
 //! moved.
 //!
+//! A ring is only walked inside the smallest box of regions that has all the regions it lists
+//! (`Level::occupied_first` and `occupied_end`, kept up to date by every operation that changes
+//! them). Rings that the Planet does not reach, and the sky above and below its crust, then cost
+//! a clip and no steps: without that a ray that misses everything stepped through every ring's
+//! empty regions, three times the steps of one level.
+//!
 //! The buffers are allocated once, for every region the boxes could hold and a budget of words
 //! for bricks that all the rings share ([`Room`] says how much for each ring), so they are the
 //! same size however full the boxes are and wherever the camera goes. [`Scene::recentre`] moves
@@ -300,6 +306,8 @@ impl Scene {
                 .map(|(level, first)| Level {
                     origin: first.map(|f| f * (REGION_VOXELS << level)),
                     dims: [RING_REGIONS as u32; 3],
+                    occupied_first: [0; 3],
+                    occupied_end: [0; 3],
                     table_base: (level * slots) as u32,
                     table_mask: slots as u32 - 1,
                 })
@@ -682,9 +690,44 @@ impl Scene {
         &mut self.rings.as_mut().expect("a scene of rings").patch
     }
 
+    /// Fits the occupied box of every level to the regions it lists now, and says whether any
+    /// changed.
+    fn occupy(&mut self) -> bool {
+        let mut changed = false;
+        for level in 0..self.levels.len() {
+            let Level {
+                table_base,
+                table_mask,
+                ..
+            } = self.levels[level];
+            let (mut first, mut end) = ([i32::MAX; 3], [i32::MIN; 3]);
+            for slot in table_base..=table_base + table_mask {
+                let entry = &self.table[slot as usize * 4..][..4];
+                if entry[3] != 0 {
+                    for a in 0..3 {
+                        first[a] = first[a].min(entry[a] as i32);
+                        end[a] = end[a].max(entry[a] as i32 + 1);
+                    }
+                }
+            }
+            let (first, end) = if first[0] == i32::MAX {
+                ([0; 3], [0; 3])
+            } else {
+                (first, end)
+            };
+            let l = &mut self.levels[level];
+            changed |= (l.occupied_first, l.occupied_end) != (first, end);
+            (l.occupied_first, l.occupied_end) = (first, end);
+        }
+        changed
+    }
+
     /// Hands out what has been written since the last call.
     fn take_patch(&mut self) -> RingPatch {
-        let patch = std::mem::take(self.patch());
+        let mut patch = std::mem::take(self.patch());
+        if !patch.table.is_empty() {
+            patch.levels |= self.occupy();
+        }
         RingPatch {
             regions: patch.regions.into_iter().collect(),
             table: patch.table.into_iter().collect(),
@@ -1210,6 +1253,89 @@ mod tests {
             assert_eq!(scene.find_region(0, *key).is_some(), i % 3 != 0, "{key:?}");
         }
         assert_eq!(scene.remove_region(0, keys[0], &mut touched), None);
+    }
+
+    /// The box of regions that bounds what `scene` lists at mip `level`.
+    fn bounds(scene: &Scene, level: usize) -> ([i32; 3], [i32; 3]) {
+        let keys: Vec<[i32; 3]> = shown(scene)
+            .into_keys()
+            .filter(|&(l, _)| l == level)
+            .map(|(_, key)| key)
+            .collect();
+        if keys.is_empty() {
+            return ([0; 3], [0; 3]);
+        }
+        (
+            std::array::from_fn(|a| keys.iter().map(|k| k[a]).min().unwrap()),
+            std::array::from_fn(|a| keys.iter().map(|k| k[a]).max().unwrap() + 1),
+        )
+    }
+
+    fn assert_occupied(scene: &Scene, what: &str) {
+        for (level, l) in scene.levels.iter().enumerate() {
+            assert_eq!(
+                (l.occupied_first, l.occupied_end),
+                bounds(scene, level),
+                "{what}, level {level}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_level_is_walked_only_where_it_lists_regions() {
+        // The ground is far below the camera: the first ring lists nothing.
+        let scene = rings_at([0.0, 2200.0, 600.0]);
+        assert_occupied(&scene, "a new scene");
+        let empty = (scene.levels[0].occupied_first, scene.levels[0].occupied_end);
+        assert_eq!(empty, ([0; 3], [0; 3]));
+        // Near it, a ring lists a slab of the crust.
+        let near = rings_at(ABOVE);
+        let slab = &near.levels[0];
+        assert!(slab.occupied_end[1] - slab.occupied_first[1] < RING_REGIONS / 2);
+        assert!(slab.occupied_end[0] - slab.occupied_first[0] > RING_REGIONS / 2);
+        // An ordinary scene is walked where it has bricks, as before.
+        let flat = Scene::new(ground(), None);
+        let l = &flat.levels[0];
+        assert_eq!(l.occupied_first, l.origin.map(|o| o >> 6));
+        assert_eq!(
+            l.occupied_end,
+            std::array::from_fn(|a| l.occupied_first[a] + l.dims[a] as i32)
+        );
+    }
+
+    #[test]
+    fn the_occupied_boxes_follow_the_rings_as_they_move_and_are_edited() {
+        let mut scene = rings_at([-400.0, 1560.0, 0.0]);
+        let mut changed = 0;
+        for at in [
+            [300.0, 1560.0, 0.0],
+            [300.0, 1900.0, 100.0],
+            [300.0, 2900.0, 100.0],
+            [-300.0, 1500.0, -100.0],
+        ] {
+            let patch = patch_of(scene.recentre(ground(), at).unwrap());
+            changed += usize::from(patch.levels);
+            assert_occupied(&scene, &format!("moved to {at:?}"));
+        }
+        assert!(changed > 0);
+
+        // A Voxel in the air, in a region that no ring lists, makes it listed, so the box grows
+        // and the GPU is told.
+        let mut store = ground().clone();
+        let voxel = VoxelCoord([-300, 1560, -100]);
+        let before = scene.levels.clone();
+        store.set(
+            VoxelCoord([voxel.0[0], voxel.0[1] + 400, voxel.0[2]]),
+            Some(Material(1)),
+        );
+        let brick = VoxelCoord([voxel.0[0], voxel.0[1] + 400, voxel.0[2]]).brick();
+        store.refresh_lod([brick]);
+        let SceneUpdate::Rings(patch) = scene.update(&store, &[brick]).unwrap() else {
+            panic!("an edit patches the rings");
+        };
+        assert!(patch.levels);
+        assert_ne!(before, scene.levels);
+        assert_occupied(&scene, "after an Edit into the air");
     }
 
     #[test]

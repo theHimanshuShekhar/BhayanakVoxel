@@ -86,6 +86,12 @@ pub struct Level {
     pub origin: [i32; 3],
     /// Extent of the box in regions of this level.
     pub dims: [u32; 3],
+    /// The smallest box of regions of this level, from the first to the one after the last, that
+    /// has every region the level lists: the walk goes no further than it, so a ray that is
+    /// clear of it, or a level with nothing, costs no steps. The two are equal for a level that
+    /// lists nothing.
+    pub occupied_first: [i32; 3],
+    pub occupied_end: [i32; 3],
     /// First slot of the level's part of [`Scene::table`], and its slot count minus one. Slots
     /// are a power of two.
     pub table_base: u32,
@@ -288,6 +294,8 @@ impl Scene {
             levels: vec![Level {
                 origin: min.map(|m| m * REGION_VOXELS),
                 dims: [0, 1, 2].map(|axis| (max[axis] - min[axis] + 1) as u32),
+                occupied_first: min,
+                occupied_end: max.map(|m| m + 1),
                 table_base: 0,
                 table_mask: slots as u32 - 1,
             }],
@@ -541,24 +549,36 @@ impl Scene {
 
     /// Index in `regions` of the region at absolute region coordinate `key` of mip `level`.
     pub fn find_region(&self, level: usize, key: [i32; 3]) -> Option<usize> {
-        let Level {
+        self.find_region_probes(level, key).0
+    }
+
+    /// [`Scene::find_region`], and how many slots of `table` it looked at.
+    pub fn find_region_probes(&self, level: usize, key: [i32; 3]) -> (Option<usize>, u32) {
+        let Some(&Level {
             table_base,
             table_mask: mask,
             ..
-        } = *self.levels.get(level)?;
+        }) = self.levels.get(level)
+        else {
+            return (None, 0);
+        };
         let mut slot = hash_region(key) & mask;
+        let mut probes = 0;
         for _ in 0..=mask {
+            probes += 1;
             let at = (table_base + slot) as usize * 4;
-            let index = *self.table.get(at + 3)?;
+            let Some(&index) = self.table.get(at + 3) else {
+                return (None, probes);
+            };
             if index == 0 {
-                return None;
+                return (None, probes);
             }
             if self.table[at..at + 3] == key.map(|k| k as u32) {
-                return Some(index as usize - 1);
+                return (Some(index as usize - 1), probes);
             }
             slot = (slot + 1) & mask;
         }
-        None
+        (None, probes)
     }
 }
 

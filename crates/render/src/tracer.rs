@@ -23,9 +23,9 @@ pub const IMAGE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct LevelHeader {
-    origin: [i32; 3],
+    occupied_first: [i32; 3],
     table_mask: u32,
-    dims: [u32; 3],
+    occupied_end: [i32; 3],
     table_base: u32,
     hole_first: [i32; 3],
     pad0: u32,
@@ -50,9 +50,9 @@ impl SceneHeader {
         for (level, (slot, l)) in header.levels.iter_mut().zip(&scene.levels).enumerate() {
             let (hole_first, hole_end) = scene.hole(level);
             *slot = LevelHeader {
-                origin: l.origin,
+                occupied_first: l.occupied_first,
                 table_mask: l.table_mask,
-                dims: l.dims,
+                occupied_end: l.occupied_end,
                 table_base: l.table_base,
                 hole_first,
                 pad0: 0,

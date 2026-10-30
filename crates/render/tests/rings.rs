@@ -246,3 +246,144 @@ fn a_flight_from_the_surface_to_orbit_and_back_keeps_the_gpu_memory_bounded() {
     assert!(worst * 4 < bytes, "a step wrote {worst} bytes of {bytes}");
     assert!(written < 8 * bytes, "{written} bytes written, of {bytes}");
 }
+
+/// What the walk costs, in steps (see `reference::Steps`), averaged over a fan of primary rays
+/// from cameras along the bench's flight over the Planet (`planet-flyover-v1`), by what the rays
+/// do: miss, hit the ground face on, or graze it.
+#[derive(Clone, Copy, Default)]
+struct Cost {
+    rays: u32,
+    steps: render::reference::Steps,
+}
+
+impl Cost {
+    fn add(&mut self, steps: render::reference::Steps) {
+        let s = &mut self.steps;
+        self.rays += 1;
+        s.examined += steps.examined;
+        s.levels += steps.levels;
+        s.regions += steps.regions;
+        s.probes += steps.probes;
+        s.bricks += steps.bricks;
+        s.voxels += steps.voxels;
+    }
+
+    /// Mean steps of each kind per ray: levels looked at, levels walked, regions, probes,
+    /// bricks, Voxels.
+    fn mean(&self) -> [f64; 6] {
+        let s = &self.steps;
+        [
+            s.examined, s.levels, s.regions, s.probes, s.bricks, s.voxels,
+        ]
+        .map(|n| f64::from(n) / f64::from(self.rays.max(1)))
+    }
+
+    /// Region, brick and Voxel steps per ray.
+    fn total(&self) -> f64 {
+        let m = self.mean();
+        m[2] + m[4] + m[5]
+    }
+}
+
+/// The keyframes of the bench's `planet-flyover-v1`: where the camera is, and what it looks at.
+const FLYOVER: [([f64; 3], [f64; 3]); 5] = [
+    ([0.0, 400.0, 3400.0], [0.0; 3]),
+    ([0.0, 1900.0, 1500.0], [0.0, 1500.0, 0.0]),
+    ([0.0, 1548.0, 250.0], [0.0, 1535.0, -300.0]),
+    ([0.0, 1552.0, 0.0], [200.0, 1530.0, -300.0]),
+    ([-150.0, 1556.0, -200.0], [-300.0, 1530.0, -360.0]),
+];
+
+/// The camera `frame` of `frames` along the flyover, as the bench's `CameraPath` has it.
+fn flyover_camera(frame: u32, frames: u32) -> Camera {
+    let segments = FLYOVER.len() - 1;
+    let along = f64::from(frame) * segments as f64 / f64::from(frames - 1);
+    let segment = (along.floor() as usize).min(segments - 1);
+    let t = along - segment as f64;
+    let lerp = |a: [f64; 3], b: [f64; 3]| [0, 1, 2].map(|i| a[i] * (1.0 - t) + b[i] * t);
+    let (from, to) = (FLYOVER[segment], FLYOVER[segment + 1]);
+    Camera::looking_at(lerp(from.0, to.0), lerp(from.1, to.1))
+}
+
+/// A fan of `width` by `width * 9 / 16` primary rays from `camera`.
+fn primary_rays(camera: &Camera, width: u32) -> Vec<Ray> {
+    let height = width * 9 / 16;
+    let tan_half = (camera.fov_y / 2.0).tan();
+    let (right, up, forward) = (camera.right(), camera.up(), camera.forward());
+    let mut rays = Vec::new();
+    for y in 0..height {
+        for x in 0..width {
+            let ndc = [
+                (f64::from(x) + 0.5) / f64::from(width) * 2.0 - 1.0,
+                (f64::from(y) + 0.5) / f64::from(height) * 2.0 - 1.0,
+            ];
+            let aspect = f64::from(width) / f64::from(height);
+            let d: [f64; 3] = std::array::from_fn(|a| {
+                forward[a] + right[a] * ndc[0] * aspect * tan_half - up[a] * ndc[1] * tan_half
+            });
+            let len = d.iter().map(|c| c * c).sum::<f64>().sqrt();
+            let (cell, origin) = render::camera::split(camera.position);
+            rays.push(Ray {
+                cell,
+                origin,
+                dir: d.map(|c| (c / len) as f32),
+            });
+        }
+    }
+    rays
+}
+
+/// Costs of `scene` along the flyover, by sky, ground and grazing rays, and in all.
+fn flyover_cost(mut scene: Scene, rings: bool) -> [Cost; 4] {
+    let mut costs = [Cost::default(); 4];
+    for frame in 0..24 {
+        let camera = flyover_camera(frame * 10, 240);
+        if rings {
+            scene.recentre(planet(), camera.position).unwrap();
+        }
+        for ray in primary_rays(&camera, 64) {
+            let (hit, steps) = render::reference::trace_counting(&scene, &ray);
+            let kind = match hit {
+                None => 0,
+                Some(hit) => {
+                    let facing: f32 = (0..3).map(|a| ray.dir[a] * hit.normal[a] as f32).sum();
+                    if facing.abs() > 0.3 { 1 } else { 2 }
+                }
+            };
+            costs[kind].add(steps);
+            costs[3].add(steps);
+        }
+    }
+    costs
+}
+
+#[test]
+fn the_rings_walk_about_as_many_steps_as_a_single_level_scene_along_the_bench_flight() {
+    let single = flyover_cost(whole_planet(), false);
+    let rings = flyover_cost(rings_at(flyover_camera(0, 240).position), true);
+    for (name, (a, b)) in ["sky", "ground", "grazing", "all"]
+        .iter()
+        .zip(single.iter().zip(&rings))
+    {
+        eprintln!(
+            "{name:8} rays {:5}  single: looked-at/walked levels, regions, probes, bricks, voxels {:5.1?} total {:6.1}   rings: {:5.1?} total {:6.1}   x{:.2}",
+            a.rays,
+            a.mean().map(|v| (v * 10.0).round() / 10.0),
+            a.total(),
+            b.mean().map(|v| (v * 10.0).round() / 10.0),
+            b.total(),
+            b.total() / a.total().max(1e-9)
+        );
+        // The rings cost what the one level does, rays that miss included: those cross every
+        // ring, so without the walk's clipping to what each ring lists they cost about three
+        // times as much.
+        assert!(
+            b.total() <= 1.1 * a.total(),
+            "{name}: {} steps a ray, against {}",
+            b.total(),
+            a.total()
+        );
+    }
+    // A ray that hits does not look at the rings beyond the one it hits in.
+    assert!(rings[1].mean()[0] < 4.0, "{:?}", rings[1].mean());
+}
