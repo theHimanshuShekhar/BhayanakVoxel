@@ -5,7 +5,7 @@
 //! Planet are in `golden.rs`.
 
 use brick_store::{BrickStore, Material, VoxelCoord};
-use render::{Camera, DebugView, Image, Offscreen, Resolution, Scene};
+use render::{Camera, DebugView, Image, Offscreen, Resolution, Scene, SceneUpdate};
 
 const STONE: Material = Material(1);
 /// Rock in `materials.toml`.
@@ -228,28 +228,103 @@ fn a_still_camera_keeps_the_edges_as_steep_as_the_supersampled_image() {
     assert!(steepest(&converged) * 10 >= steepest(&truth) * 8);
 }
 
-#[test]
-fn a_panning_camera_is_not_smeared_beyond_what_clamping_allows() {
+/// The view, moved `frames` frames' worth sideways, a couple of output pixels a frame at the
+/// distance of the block, with the camera still looking the same way. Unlike a turn, this moves
+/// the camera, so the reprojection needs the shift between the cameras.
+fn strafed(frames: u32) -> Camera {
+    let mut camera = view();
+    let right = camera.right();
+    camera.position =
+        std::array::from_fn(|a| camera.position[a] + right[a] * 0.25 * f64::from(frames));
+    camera
+}
+
+/// The view, moved `frames` frames' worth towards what it looks at.
+fn dollied(frames: u32) -> Camera {
+    let mut camera = view();
+    let forward = camera.forward();
+    camera.position =
+        std::array::from_fn(|a| camera.position[a] + forward[a] * 0.3 * f64::from(frames));
+    camera
+}
+
+/// Flies `path` for 24 frames and checks that the last is not smeared: it is `gain` times closer
+/// to what the camera sees now than to what it saw 8 frames ago, and no worse than one frame upscaled
+/// with no history.
+fn check_motion(path: fn(u32) -> Camera, gain: f64) {
     let mut gpu = gpu();
     let frames = 24;
-    let mut image = gpu.render_upscaled(&panned(0));
+    let mut image = gpu.render_upscaled(&path(0));
     for frame in 1..=frames {
-        image = gpu.render_upscaled(&panned(frame));
+        image = gpu.render_upscaled(&path(frame));
     }
-    let now = mse(&image, &truth(&panned(frames)));
+    let now = mse(&image, &truth(&path(frames)));
     // A frame of history that was not moved with the camera would be this far from it.
-    let unmoved = mse(&image, &truth(&panned(frames - 8)));
-    // A single upscaled frame is the least that the pan can be asked to match.
+    let unmoved = mse(&image, &truth(&path(frames - 8)));
+    // A single upscaled frame is the least that the motion can be asked to match.
     let mut fresh = Offscreen::with_resolution(resolution(), &floor_and_block()).unwrap();
-    let single = mse(
-        &fresh.render_upscaled(&panned(frames)),
-        &truth(&panned(frames)),
-    );
+    let single = mse(&fresh.render_upscaled(&path(frames)), &truth(&path(frames)));
     eprintln!(
-        "pan: {now:.1} against the camera now, {unmoved:.1} against 8 frames back, a single frame {single:.1}"
+        "motion: {now:.1} against the camera now, {unmoved:.1} against 8 frames back, a single frame {single:.1}"
     );
-    assert!(now < unmoved / 3.0, "{now} against {unmoved}");
+    assert!(now * gain < unmoved, "{now} against {unmoved}");
     assert!(now < single, "{now} against {single}");
+}
+
+#[test]
+fn a_panning_camera_is_not_smeared_beyond_what_clamping_allows() {
+    check_motion(panned, 3.0);
+}
+
+#[test]
+fn a_camera_moving_sideways_is_not_smeared_beyond_what_clamping_allows() {
+    // Sideways, the block uncovers what is behind it, which no history can show.
+    check_motion(strafed, 1.5);
+}
+
+#[test]
+fn a_camera_moving_forwards_is_not_smeared_beyond_what_clamping_allows() {
+    check_motion(dollied, 3.0);
+}
+
+#[test]
+fn history_that_no_longer_matches_is_thrown_away_and_the_new_colour_wins_at_once() {
+    // A floor of one Material that turns into another between two frames of the same view: what
+    // the history holds is wrong everywhere, and the clamp cannot make it right.
+    let scene = |material| {
+        let mut store = BrickStore::new();
+        for x in -32..32 {
+            for z in -32..32 {
+                store.set(VoxelCoord([x, -1, z]), Some(material));
+            }
+        }
+        Scene::new(&store, None)
+    };
+    let camera = Camera::looking_at([0.5, 10.0, 0.5], [0.5, 0.0, 0.5]);
+    // Twenty frames of stone, then one frame of soil, shown as `view`.
+    let frame_after_the_change = |view| {
+        let mut gpu = Offscreen::with_resolution(resolution(), &scene(STONE)).unwrap();
+        for _ in 0..20 {
+            gpu.render_upscaled(&camera);
+        }
+        gpu.update_scene(&scene(Material(2)), &SceneUpdate::Rebuilt)
+            .unwrap();
+        gpu.set_debug_view(view);
+        pixel(&gpu.render_upscaled(&camera), 40, 20)
+    };
+    // The history has started again: one frame, the dark end of the scale (0.10, 0, 0.30).
+    near(
+        frame_after_the_change(DebugView::HistoryLength),
+        [25.5, 0.0, 76.5],
+    );
+    // And the first frame already shows the new colour, to within the variation of a Voxel's
+    // colour: nothing of the old shows through.
+    let soil = frame_after_the_change(DebugView::Lit);
+    let encoded = |c: [f64; 3]| c.map(|c| c.powf(1.0 / 2.2) * 255.0);
+    let (new, old) = (encoded([0.3, 0.5, 0.2]), encoded(STONE_ALBEDO));
+    let off =
+        |p: [u8; 3], to: [f64; 3]| (0..3).map(|c| (f64::from(p[c]) - to[c]).abs()).sum::<f64>();
+    assert!(off(soil, new) < off(soil, old) / 3.0, "{soil:?}");
 }
 
 #[test]

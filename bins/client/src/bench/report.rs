@@ -6,7 +6,7 @@ use serde::Serialize;
 use super::budget::{Budgets, Status, status};
 use super::stats::Stats;
 
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// One timed thing (a pass, or the GPU total of a profiler frame) in one mode, against its
 /// budget. In reference mode a profiler frame is one sample, so the entries of that mode have
@@ -347,7 +347,7 @@ mod tests {
                 "screenshots"
             ]
         );
-        assert_eq!(json["schema_version"], 1);
+        assert_eq!(json["schema_version"], 2);
         assert_eq!(json["build"]["commit"], serde_json::Value::Null);
         assert_eq!(json["machine"]["timers_supported"], true);
         let pass = &json["modes"]["primary"]["passes"][0];

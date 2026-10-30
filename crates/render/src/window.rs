@@ -258,8 +258,8 @@ impl Renderer {
     }
 
     /// Traces primary visibility at `scale` of the window's width and height (0.5 is the default,
-    /// 1.0 traces every pixel); the upscaler fills in the rest. The reference path tracer always
-    /// traces every pixel of the window.
+    /// 1.0 traces every pixel); the upscaler fills in the rest. The reference path tracer traces
+    /// at the same size as primary visibility, and its image is stretched to the window.
     pub fn set_render_scale(&mut self, scale: f32) {
         if scale.is_finite() && scale > 0.0 && scale != self.scale {
             self.scale = scale;

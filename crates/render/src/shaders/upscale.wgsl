@@ -56,7 +56,7 @@ const MAX_HISTORY = 16.0;
 // from the centre of the output pixel.
 const SHARPNESS = 8.0;
 // How far (in encoded colour) the clamp may move the history before the pixel's history is
-// halved: the history was of something else.
+// thrown away: it was of something else.
 const CLAMP_REJECT = 0.1;
 // Keep in step with DebugView in debug_view.rs.
 const VIEW_HISTORY_LENGTH = 5u;
@@ -157,14 +157,14 @@ fn upscale_pass(@builtin(global_invocation_id) id: vec3<u32>) {
         if z > 1e-4 && all(at >= vec2<f32>(0.0)) && all(at < vec2<f32>(out_size)) {
             let past = read_history(at, out_size);
             let kept = clamp(past, low, high);
-            frames = textureLoad(history, vec2<i32>(at), 0).a;
-            if distance(kept, past) > CLAMP_REJECT {
-                frames = floor(frames * 0.5);
+            if distance(kept, past) <= CLAMP_REJECT {
+                frames = min(textureLoad(history, vec2<i32>(at), 0).a + 1.0, MAX_HISTORY);
+                // A traced sample far from the pixel's centre (a weak total weight) says little
+                // about it, so it takes a smaller share than a near one.
+                shown = mix(kept, shown, clamp(total, 0.0, 1.0) / frames);
             }
-            frames = min(frames + 1.0, MAX_HISTORY);
-            // A traced sample far from the pixel's centre (a weak total weight) says little about it,
-            // so it takes a smaller share than a near one.
-            shown = mix(kept, shown, clamp(total, 0.0, 1.0) / frames);
+            // Otherwise the history was of something else: it is thrown away, and the pixel
+            // starts again from this frame's samples alone (frames is 1, the current colour).
         }
     }
 

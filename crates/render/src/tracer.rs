@@ -505,16 +505,7 @@ impl Tracer {
         target: &Target,
     ) {
         self.write_uniforms(queue, camera, sun, 0, CENTRE);
-        self.dispatch(
-            device,
-            profiler,
-            encoder,
-            "primary",
-            &self.primary,
-            target,
-            &target.lit.view,
-            target.resolution.internal,
-        );
+        self.dispatch(device, profiler, encoder, "primary", &self.primary, target);
     }
 
     /// Records a frame of primary visibility from `camera`, lit by `sun`: the primary pass, one ray
@@ -524,6 +515,11 @@ impl Tracer {
     ///
     /// The uniforms are written when this is called, so each frame must be submitted before the
     /// next is encoded.
+    ///
+    /// The history starts over for a new `Target`, a new size or scale, or a debug view; not for
+    /// what changes in the scene. Ring re-centres, Edits and teleports are left to the clamp to
+    /// the new samples and to history that reprojects off the screen: resetting on a ring move
+    /// would wipe the history every frame while flying.
     #[allow(clippy::too_many_arguments)]
     pub fn encode_upscaled(
         &mut self,
@@ -539,16 +535,7 @@ impl Tracer {
             .history
             .begin(target.resolution(), camera, self.debug_view);
         self.write_uniforms(queue, camera, sun, 0, frame.jitter());
-        self.dispatch(
-            device,
-            profiler,
-            encoder,
-            "primary",
-            &self.primary,
-            target,
-            &target.lit.view,
-            target.resolution.internal,
-        );
+        self.dispatch(device, profiler, encoder, "primary", &self.primary, target);
         self.upscale
             .encode(device, queue, profiler, encoder, &frame, target);
     }
@@ -584,8 +571,6 @@ impl Tracer {
             "reference",
             &self.reference,
             target,
-            &target.lit.view,
-            target.resolution.internal,
         );
     }
 
@@ -730,7 +715,7 @@ impl Tracer {
         queue.write_buffer(&self.frame_buffer, 0, bytemuck::bytes_of(&frame));
     }
 
-    #[allow(clippy::too_many_arguments)]
+    /// Runs `pipeline` over every pixel of the lit image of `target`, at the internal resolution.
     fn dispatch(
         &self,
         device: &wgpu::Device,
@@ -739,9 +724,8 @@ impl Tracer {
         name: &str,
         pipeline: &wgpu::ComputePipeline,
         target: &Target,
-        output: &wgpu::TextureView,
-        (width, height): (u32, u32),
     ) {
+        let (width, height) = target.resolution.internal;
         let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("camera, image, accumulation, materials and G-buffer"),
             layout: &self.camera_layout,
@@ -752,7 +736,7 @@ impl Tracer {
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: wgpu::BindingResource::TextureView(output),
+                    resource: wgpu::BindingResource::TextureView(&target.lit.view),
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,

@@ -78,13 +78,13 @@ before reading anything into the times.
 
 ```
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "build":   { "version", "commit" },          // commit: CI builds only, else null; on a PR
                                                // build it is GitHub's merge commit, not the head
   "machine": { "gpu", "device_type", "driver", "driver_info", "backend", "os", "arch",
                "timers_supported" },
-  "config":  { "width", "height", "output_width", "output_height", "scene", "path", "keyframes" },
-                                               // width, height: traced; output_*: upscaled (primary)
+  "config":  { "width", "height", "output_width", "output_height", "scene", "path",
+               "keyframes" },                  // width, height: traced; output_*: upscaled
   "modes": {
     "primary":   { "frames", "warmup_frames", "spp", "passes": [ENTRY...], "gpu_total": ENTRY,
                    "frame_time": STATS },
@@ -132,14 +132,14 @@ primary = 8.6
 Anything else in the file, a pass or mode with a zero, negative or non-numeric budget, is an
 error: a typo must not silently turn a budget off.
 
-The numbers are the per-stage frame budget of the rendering decision (#10), on the RTX 4090 at
-1440p output. Only `primary` (Primary visibility, 1.0 ms), `upscale` (the TAAU pass, 0.5 ms) and the total
-(8.6 ms) are live today, as those are the passes that exist. The later stages (sun shadows 0.4, GI 1.5, reflections 0.7,
-glass 0.7, volumetrics 1.0, denoise 1.0, atmosphere 0.3, edits 1.0, post 0.5) are
-in the file as comments: **whoever adds a pass uncomments its budget and names it the same**
-(a pass is named by the string given to `Profiler::compute_pass`). `reference` has no budget in
-#10; its 3.0 ms (a sample, pass and total) catches a gross regression, set from the first real run
-on the 4090, which measured a mean of 1.10 ms.
+The numbers are the per-stage frame budget of the rendering decision (#10), on the RTX 4090 at 1440p
+output. Only `primary` (Primary visibility, 1.0 ms), `upscale` (the TAAU pass, 0.5 ms) and the total
+(8.6 ms) are live today, as those are the passes that exist. The later stages (sun shadows 0.4, GI
+1.5, reflections 0.7, glass 0.7, volumetrics 1.0, denoise 1.0, atmosphere 0.3, edits 1.0, post 0.5)
+are in the file as comments: **whoever adds a pass uncomments its budget and names it the same** (a
+pass is named by the string given to `Profiler::compute_pass`). `reference` has no budget in #10;
+its 3.0 ms (a sample, pass and total) catches a gross regression, set from the first real run on the
+4090, which measured a mean of 1.10 ms.
 
 ## Tests
 
