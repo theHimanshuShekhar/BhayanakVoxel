@@ -8,5 +8,7 @@ publish.workspace = true
 brick-store.workspace = true
 
 [dev-dependencies]
+# The generator only places Materials the shared table defines (checked in its tests).
+materials.workspace = true
 # Writes the world map's debug images (examples/world_map.rs).
 png = "0.18.1"

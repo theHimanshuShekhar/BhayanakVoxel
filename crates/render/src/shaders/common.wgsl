@@ -25,13 +25,65 @@ struct Frame {
 @group(1) @binding(1) var output: texture_storage_2d<rgba8unorm, write>;
 @group(1) @binding(2) var<uniform> frame: Frame;
 
-// Hardcoded albedo per Material id (see planet-gen: 1 rock, 2 soil).
+// The Material table (materials.toml), one record per id. Four vec4s each; keep this in step
+// with gpu_materials.rs, which documents them:
+//   0: base colour, roughness
+//   1: noise scale (Voxels), hue jitter (radians), value jitter, metalness
+//   2: emitted light (colour times intensity)
+//   3: transparency, IOR, 1 if the table defines the id, unused
+@group(1) @binding(4) var<storage, read> materials: array<vec4<f32>>;
+
+const RECORD_VEC4S = 4u;
+const UNKNOWN = vec3<f32>(1.0, 0.0, 1.0);
+
+// Whether the table defines `material`. An id past its end, or in a gap in it, is unknown.
+fn is_known(material: u32) -> bool {
+    let at = material * RECORD_VEC4S;
+    return at + 3u < arrayLength(&materials) && materials[at + 3u].z != 0.0;
+}
+
+// The Material's base colour: magenta if it is unknown.
 fn albedo(material: u32) -> vec3<f32> {
-    switch material {
-        case 1u: { return vec3<f32>(0.45, 0.43, 0.40); }
-        case 2u: { return vec3<f32>(0.30, 0.50, 0.20); }
-        default: { return vec3<f32>(1.0, 0.0, 1.0); }
+    if !is_known(material) {
+        return UNKNOWN;
     }
+    return materials[material * RECORD_VEC4S].xyz;
+}
+
+// The light the Material gives off, which is none if it is unknown.
+fn emission(material: u32) -> vec3<f32> {
+    if !is_known(material) {
+        return vec3<f32>(0.0);
+    }
+    return materials[material * RECORD_VEC4S + 2u].xyz;
+}
+
+fn hash_voxel(cell: vec3<i32>) -> u32 {
+    var h = bitcast<u32>(cell.x) * 0x8da6b343u ^ bitcast<u32>(cell.y) * 0xd8163841u ^ bitcast<u32>(cell.z) * 0xcb1ab31fu;
+    h ^= h >> 15u;
+    h *= 0x2c1b3c6du;
+    return h ^ (h >> 12u);
+}
+
+// The Material's colour at `voxel`: its base colour with the hue and brightness turned by up to
+// the Material's jitter, by an amount that depends only on the patch of `noise_scale` Voxels
+// that `voxel` is in. `strength` (0..1) scales the jitter down; 0 is the base colour. There is no
+// colour stored per Voxel: this is a function of the Voxel's position alone.
+fn varied_albedo(material: u32, voxel: vec3<i32>, strength: f32) -> vec3<f32> {
+    let base = albedo(material);
+    if !is_known(material) {
+        return base;
+    }
+    let params = materials[material * RECORD_VEC4S + 1u];
+    let h = hash_voxel(vec3<i32>(floor(vec3<f32>(voxel) / params.x)));
+    // Two independent numbers in -1..1.
+    let value = f32(h & 255u) / 255.0 * 2.0 - 1.0;
+    let hue = f32((h >> 8u) & 255u) / 255.0 * 2.0 - 1.0;
+    // Turn the colour about the grey axis (Rodrigues' rotation) for the hue.
+    let angle = hue * params.y * strength;
+    let axis = vec3<f32>(0.57735027);
+    let turned = base * cos(angle) + cross(axis, base) * sin(angle) + axis * dot(axis, base) * (1.0 - cos(angle));
+    return max(turned, vec3<f32>(0.0)) * (1.0 + value * params.z * strength);
 }
 
 // A simple gradient from the horizon to the zenith, until the atmosphere replaces it. It uses
