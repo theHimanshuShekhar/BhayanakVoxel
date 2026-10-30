@@ -13,54 +13,16 @@
 //! differences move a few edge pixels to the neighbouring Voxel and nudge shading by a level or
 //! two. A real regression (an albedo, the sun, a missed brick, a shifted camera) changes far more.
 
-use std::fs;
-use std::path::{Path, PathBuf};
+mod common;
 
 use brick_store::BrickCoord;
+use common::{Difference, PRIMARY, REFERENCE, check_golden, compare, diff_image, within_tolerance};
 use planet_gen::generate_region;
 use render::{Camera, Image, Offscreen, Scene, Sun};
 
 const WIDTH: u32 = 256;
 const HEIGHT: u32 = 144;
 const SEED: u64 = 0xB4A7_A9AC;
-
-/// A pixel is "far off" when any channel is off by more than this many levels.
-const FAR_OFF: u8 = 40;
-
-/// How much two images may differ and still match.
-struct Tolerance {
-    /// Mean squared error per channel (0..=255 scale), over pixels that are not far off.
-    max_mse: f64,
-    /// Most pixels, as a fraction of the image, that may be far off.
-    max_far_off_fraction: f64,
-}
-
-/// Rounding noise is far below an MSE of 1; shifting one channel of a third of the image by 20
-/// levels is over 40. Far-off pixels are edges where a ray lands on a neighbouring Voxel.
-const PRIMARY: Tolerance = Tolerance {
-    max_mse: 4.0,
-    max_far_off_fraction: 0.005,
-};
-
-/// A path-traced image has no hard edges to flip, only noise that is the same every run, so it
-/// can be held much closer.
-const REFERENCE: Tolerance = Tolerance {
-    max_mse: 1.0,
-    max_far_off_fraction: 0.002,
-};
-
-fn golden_path(name: &str) -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/golden")
-        .join(name)
-}
-
-fn failure_dir() -> PathBuf {
-    std::env::var_os("GOLDEN_FAILURE_DIR").map_or_else(
-        || Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/golden-failures"),
-        PathBuf::from,
-    )
-}
 
 /// A patch of the test Planet near the +y pole: Voxels x -440..=447, y 1360..=1575,
 /// z -360..=263, the ground out to the horizon from deep in the rock to above the highest peak.
@@ -75,133 +37,6 @@ fn render_view() -> Image {
     Offscreen::new(WIDTH, HEIGHT, &planet_patch())
         .unwrap()
         .render(&camera)
-}
-
-fn write_png(path: &Path, image: &Image) {
-    fs::create_dir_all(path.parent().unwrap()).unwrap();
-    let file = fs::File::create(path).unwrap();
-    let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), image.width, image.height);
-    encoder.set_color(png::ColorType::Rgba);
-    encoder.set_depth(png::BitDepth::Eight);
-    encoder
-        .write_header()
-        .unwrap()
-        .write_image_data(&image.rgba)
-        .unwrap();
-}
-
-fn read_png(path: &Path) -> Image {
-    let bytes = fs::read(path).unwrap_or_else(|e| {
-        panic!(
-            "no golden image at {}: {e}. Approve one with UPDATE_GOLDEN=1.",
-            path.display()
-        )
-    });
-    let mut reader = png::Decoder::new(std::io::Cursor::new(bytes))
-        .read_info()
-        .unwrap();
-    let mut rgba = vec![0; reader.output_buffer_size().unwrap()];
-    let info = reader.next_frame(&mut rgba).unwrap();
-    assert_eq!(
-        info.color_type,
-        png::ColorType::Rgba,
-        "golden must be 8-bit RGBA"
-    );
-    assert_eq!(
-        info.bit_depth,
-        png::BitDepth::Eight,
-        "golden must be 8-bit RGBA"
-    );
-    Image {
-        width: info.width,
-        height: info.height,
-        rgba,
-    }
-}
-
-/// How two images differ.
-#[derive(Debug, PartialEq)]
-struct Difference {
-    /// Mean over RGB channels of the squared error, 0..=255 scale, of the pixels that are not far
-    /// off. Far-off pixels are counted instead, so that a few flipped edges cannot dominate it.
-    mse: f64,
-    /// Pixels with a channel off by more than [`FAR_OFF`].
-    far_off: usize,
-}
-
-fn compare(actual: &Image, expected: &Image) -> Difference {
-    assert_eq!(
-        (actual.width, actual.height),
-        (expected.width, expected.height),
-        "image sizes differ"
-    );
-    let mut squares = 0u64;
-    let mut far_off = 0;
-    for (a, e) in actual.rgba.chunks(4).zip(expected.rgba.chunks(4)) {
-        let errors = [0, 1, 2].map(|c| a[c].abs_diff(e[c]));
-        if errors.iter().any(|&d| d > FAR_OFF) {
-            far_off += 1;
-        } else {
-            squares += errors
-                .iter()
-                .map(|&d| u64::from(d) * u64::from(d))
-                .sum::<u64>();
-        }
-    }
-    Difference {
-        mse: squares as f64 / (3 * actual.width * actual.height) as f64,
-        far_off,
-    }
-}
-
-fn within_tolerance(difference: &Difference, pixels: usize, tolerance: &Tolerance) -> bool {
-    difference.mse <= tolerance.max_mse
-        && difference.far_off as f64 <= tolerance.max_far_off_fraction * pixels as f64
-}
-
-/// Per-channel absolute difference, times 4 so small errors show, on an opaque image.
-fn diff_image(actual: &Image, expected: &Image) -> Image {
-    let rgba = actual
-        .rgba
-        .chunks(4)
-        .zip(expected.rgba.chunks(4))
-        .flat_map(|(a, e)| {
-            let d = |c: usize| a[c].abs_diff(e[c]).saturating_mul(4);
-            [d(0), d(1), d(2), 255]
-        })
-        .collect();
-    Image {
-        width: actual.width,
-        height: actual.height,
-        rgba,
-    }
-}
-
-/// Checks `actual` against the approved image `name`, or approves it under `UPDATE_GOLDEN`.
-fn check_golden(name: &str, actual: &Image, tolerance: &Tolerance) {
-    let path = golden_path(name);
-    if std::env::var_os("UPDATE_GOLDEN").is_some() {
-        write_png(&path, actual);
-        eprintln!("wrote {}", path.display());
-        return;
-    }
-    let expected = read_png(&path);
-    let difference = compare(actual, &expected);
-    let pixels = (actual.width * actual.height) as usize;
-    if !within_tolerance(&difference, pixels, tolerance) {
-        let dir = failure_dir().join(name.trim_end_matches(".png"));
-        write_png(&dir.join("actual.png"), actual);
-        write_png(&dir.join("expected.png"), &expected);
-        write_png(&dir.join("diff.png"), &diff_image(actual, &expected));
-        panic!(
-            "render differs from {}: {difference:?} (limits: mse {}, far off {} pixels). \
-             Images are in {}. If the change is intended, rerun with UPDATE_GOLDEN=1.",
-            path.display(),
-            tolerance.max_mse,
-            (tolerance.max_far_off_fraction * pixels as f64) as usize,
-            dir.display(),
-        );
-    }
 }
 
 #[test]

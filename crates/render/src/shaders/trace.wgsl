@@ -6,14 +6,36 @@
 // Voxel, brick and region coordinates are absolute i32 Planet-frame integers. Floats are only
 // ever relative to the ray's `cell`, the integer Voxel the camera is in, so nothing loses
 // precision far from the Planet's origin.
+//
+// The Planet is in levels, finest first: level n has Voxels 2^n times the size of level 0's, in
+// a box of regions around the camera. A level only counts outside the box of the level before
+// it, so that each part of space is seen at one level only, finer near the camera and coarser
+// far from it. Voxel, brick and region coordinates are those of the level being walked; the
+// boxes are in Voxels of level 0, and so are distances along the ray, at every level.
 
-struct SceneHeader {
-    // Minimum corner of the occupied regions in Voxels, and the table's slot count minus one.
+// Most levels there can be, as in scene.rs.
+const MAX_LEVELS = 20;
+
+struct Level {
+    // Minimum corner of the box in Voxels of level 0, and the slot count of the level's part of
+    // `table` minus one.
     origin: vec3<i32>,
     table_mask: u32,
-    // Extent of the occupied regions, in regions.
+    // Extent of the box, in regions of this level, and the first slot of the level's part of
+    // `table`.
     dims: vec3<u32>,
-    pad: u32,
+    table_base: u32,
+    // The regions of this level's box that the level before it holds instead: from the first
+    // up to, and not including, the end. None if the end is not past the first.
+    hole_first: vec3<i32>,
+    pad0: u32,
+    hole_end: vec3<i32>,
+    pad1: u32,
+}
+
+struct SceneHeader {
+    level_count: u32,
+    levels: array<Level, MAX_LEVELS>,
 }
 
 @group(0) @binding(0) var<uniform> scene: SceneHeader;
@@ -48,7 +70,8 @@ struct Hit {
     // Unit normal of that face, pointing back towards the ray. For a ray that starts inside a
     // solid Voxel (t = 0) it faces against the ray's largest direction component.
     normal: vec3<f32>,
-    // Absolute Planet-frame Voxel coordinate.
+    // Absolute Planet-frame Voxel coordinate. For a Voxel of a coarser level, the Voxel of level 0
+    // inside it that the hit is in: on the face the ray entered through.
     voxel: vec3<i32>,
     material: u32,
 }
@@ -61,12 +84,14 @@ fn hash_region(key: vec3<i32>) -> u32 {
     return h ^ (h >> 12u);
 }
 
-// Index of the region at absolute region coordinate `key` in `regions`, or -1.
-fn find_region(key: vec3<i32>) -> i32 {
+// Index of the region at absolute region coordinate `key` of `level` in `regions`, or -1.
+fn find_region(level: u32, key: vec3<i32>) -> i32 {
     let k = bitcast<vec3<u32>>(key);
-    var slot = hash_region(key) & scene.table_mask;
-    for (var i = 0u; i <= scene.table_mask; i++) {
-        let at = slot * 4u;
+    let mask = scene.levels[level].table_mask;
+    let base = scene.levels[level].table_base;
+    var slot = hash_region(key) & mask;
+    for (var i = 0u; i <= mask; i++) {
+        let at = (base + slot) * 4u;
         let index = table[at + 3u];
         if index == 0u {
             return -1;
@@ -74,7 +99,7 @@ fn find_region(key: vec3<i32>) -> i32 {
         if table[at] == k.x && table[at + 1u] == k.y && table[at + 2u] == k.z {
             return i32(index - 1u);
         }
-        slot = (slot + 1u) & scene.table_mask;
+        slot = (slot + 1u) & mask;
     }
     return -1;
 }
@@ -130,6 +155,16 @@ fn hit_at(ray: Ray, t: f32, normal: vec3<f32>, voxel: vec3<i32>, material: u32) 
     return h;
 }
 
+// The hit on the Voxel at `voxel` of `level`, entered at `t` through the face with `normal`: as
+// hit_at, with the Voxel of level 0 that is inside it and on that face, where the ray is.
+fn hit_level_voxel(ray: Ray, w: Walk, level: u32, t: f32, normal: vec3<f32>, voxel: vec3<i32>, material: u32) -> Hit {
+    let low = voxel << vec3<u32>(level);
+    let high = low + (1i << level) - 1;
+    let at = clamp(voxel_at(ray, w, t), low, high);
+    let inner = select(select(at, high, normal > vec3<f32>(0.0)), low, normal < vec3<f32>(0.0));
+    return hit_at(ray, t, normal, inner, material);
+}
+
 // The ray with what every level of the walk needs. `d` is the direction with zeros nudged off
 // zero, `inv` is 1 / d, `step` is the sign of d, and `upper` is 1 on axes that step upwards.
 struct Walk {
@@ -149,24 +184,25 @@ fn voxel_at(ray: Ray, w: Walk, t: f32) -> vec3<i32> {
     return ray.cell + vec3<i32>(floor(ray.origin + w.d * t));
 }
 
-// Walks the Voxels of the brick at absolute brick coordinate `brick` (entry `entry` in
-// `brick_refs`), entered at `t_in` through the face with normal `normal_in`.
-fn hit_brick(ray: Ray, w: Walk, entry: u32, brick: vec3<i32>, t_in: f32, normal_in: vec3<f32>) -> Hit {
+// Walks the Voxels of the brick at absolute brick coordinate `brick` of `level` (entry `entry`
+// in `brick_refs`), entered at `t_in` through the face with normal `normal_in`.
+fn hit_brick(ray: Ray, w: Walk, level: u32, entry: u32, brick: vec3<i32>, t_in: f32, normal_in: vec3<f32>) -> Hit {
     let first = brick * 8;
     // The entry point is on the brick's boundary, so rounding can put it a hair outside.
-    var voxel = clamp(voxel_at(ray, w, t_in), first, first + 7);
+    var voxel = clamp(voxel_at(ray, w, t_in) >> vec3<u32>(level), first, first + 7);
     if (entry & SOLID_FLAG) != 0u {
-        return hit_at(ray, t_in, normal_in, voxel, entry & 0xffffu);
+        return hit_level_voxel(ray, w, level, t_in, normal_in, voxel, entry & 0xffffu);
     }
-    var next = reach(ray, w, voxel + w.upper);
-    let delta = abs(w.inv);
+    let size = f32(1u << level);
+    var next = reach(ray, w, (voxel + w.upper) << vec3<u32>(level));
+    let delta = abs(w.inv * size);
     var t = t_in;
     var normal = normal_in;
     for (var i = 0; i < BLOCK_STEPS; i++) {
         let local = vec3<u32>(voxel - first);
         let bit = local.x | (local.y << 3u) | (local.z << 6u);
         if ((bricks[entry + (bit >> 5u)] >> (bit & 31u)) & 1u) != 0u {
-            return hit_at(ray, t, normal, voxel, mixed_material(entry, bit));
+            return hit_level_voxel(ray, w, level, t, normal, voxel, mixed_material(entry, bit));
         }
         let axis = first_axis(next);
         t = min3(next);
@@ -180,20 +216,21 @@ fn hit_brick(ray: Ray, w: Walk, entry: u32, brick: vec3<i32>, t_in: f32, normal_
     return miss();
 }
 
-// Walks the bricks of the region at absolute region coordinate `rc` (index `region` in
-// `regions`), entered at `t_in` through the face with normal `normal_in`.
-fn hit_region(ray: Ray, w: Walk, region: u32, rc: vec3<i32>, t_in: f32, normal_in: vec3<f32>) -> Hit {
+// Walks the bricks of the region at absolute region coordinate `rc` of `level` (index `region`
+// in `regions`), entered at `t_in` through the face with normal `normal_in`.
+fn hit_region(ray: Ray, w: Walk, level: u32, region: u32, rc: vec3<i32>, t_in: f32, normal_in: vec3<f32>) -> Hit {
     let base = region * REGION_WORDS;
     let first = rc * 8;
     let first_ref = regions[base + 16u];
     if (first_ref & SOLID_FLAG) != 0u {
         // The whole region is one Material.
-        let voxel = clamp(voxel_at(ray, w, t_in), first * 8, first * 8 + 63);
-        return hit_at(ray, t_in, normal_in, voxel, first_ref & 0xffffu);
+        let voxel = clamp(voxel_at(ray, w, t_in) >> vec3<u32>(level), first * 8, first * 8 + 63);
+        return hit_level_voxel(ray, w, level, t_in, normal_in, voxel, first_ref & 0xffffu);
     }
-    var brick = clamp(voxel_at(ray, w, t_in) >> vec3<u32>(3u), first, first + 7);
-    var next = reach(ray, w, (brick + w.upper) * 8);
-    let delta = abs(8.0 * w.inv);
+    var brick = clamp(voxel_at(ray, w, t_in) >> vec3<u32>(level + 3u), first, first + 7);
+    var next = reach(ray, w, ((brick + w.upper) * 8) << vec3<u32>(level));
+    let size = f32(1u << level);
+    let delta = abs(8.0 * size * w.inv);
     var t = t_in;
     var normal = normal_in;
     for (var i = 0; i < BLOCK_STEPS; i++) {
@@ -207,7 +244,7 @@ fn hit_region(ray: Ray, w: Walk, region: u32, rc: vec3<i32>, t_in: f32, normal_i
                 rank += countOneBits(regions[base + j]);
             }
             let entry = brick_refs[first_ref + rank];
-            let h = hit_brick(ray, w, entry, brick, t, normal);
+            let h = hit_brick(ray, w, level, entry, brick, t, normal);
             if h.hit {
                 return h;
             }
@@ -224,25 +261,16 @@ fn hit_region(ray: Ray, w: Walk, region: u32, rc: vec3<i32>, t_in: f32, normal_i
     return miss();
 }
 
-// The first solid Voxel along the ray, or a miss.
-fn trace(ray: Ray) -> Hit {
-    if any(scene.dims == vec3<u32>(0u)) {
-        return miss();
-    }
-    var w: Walk;
-    w.d = select(ray.dir, vec3<f32>(TINY), abs(ray.dir) < vec3<f32>(TINY));
-    w.inv = 1.0 / w.d;
-    w.step = select(vec3<i32>(-1), vec3<i32>(1), w.d > vec3<f32>(0.0));
-    w.upper = max(w.step, vec3<i32>(0));
-
-    // Clip the ray to the box of occupied regions.
-    let lowest = scene.origin >> vec3<u32>(6u);
-    let highest = lowest + vec3<i32>(scene.dims) - 1;
-    let t_a = reach(ray, w, scene.origin);
-    let t_b = reach(ray, w, scene.origin + vec3<i32>(scene.dims) * 64);
+// The first solid Voxel of `level` along the ray, in its box and outside the box of the level
+// before it, if it is nearer than `limit`, or a miss.
+fn hit_level(ray: Ray, w: Walk, level: u32, limit: f32) -> Hit {
+    let lv = scene.levels[level];
+    // Clip the ray to the level's box.
+    let t_a = reach(ray, w, lv.origin);
+    let t_b = reach(ray, w, lv.origin + vec3<i32>(lv.dims) * (64i << level));
     let t_near = min(t_a, t_b);
     let t_enter = max(max3(t_near), 0.0);
-    if t_enter > min3(max(t_a, t_b)) {
+    if t_enter > min3(max(t_a, t_b)) || t_enter >= limit {
         return miss();
     }
     // The ray enters through the face it crosses last. If it starts inside the box, the normal
@@ -252,16 +280,27 @@ fn trace(ray: Ray) -> Hit {
         normal = select(vec3<f32>(0.0), -vec3<f32>(w.step), largest_axis(t_near));
     }
 
+    let shift = 6u + level;
+    let lowest = lv.origin >> vec3<u32>(shift);
+    let highest = lowest + vec3<i32>(lv.dims) - 1;
+    let hole_last = lv.hole_end - 1;
     var t = t_enter;
-    var rc = clamp(voxel_at(ray, w, t) >> vec3<u32>(6u), lowest, highest);
-    var next = reach(ray, w, (rc + w.upper) * 64);
-    let delta = abs(64.0 * w.inv);
+    var rc = clamp(voxel_at(ray, w, t) >> vec3<u32>(shift), lowest, highest);
+    var next = reach(ray, w, (rc + w.upper) << vec3<u32>(shift));
+    let delta = abs(f32(64u << level) * w.inv);
     for (var i = 0; i < MAX_REGION_STEPS; i++) {
-        let region = find_region(rc);
-        if region >= 0 {
-            let h = hit_region(ray, w, u32(region), rc, t, normal);
-            if h.hit {
-                return h;
+        // Nothing from here on is nearer than the hit we have.
+        if t >= limit {
+            break;
+        }
+        // The regions of the hole are the finer level's.
+        if any(rc < lv.hole_first) || any(rc > hole_last) {
+            let region = find_region(level, rc);
+            if region >= 0 {
+                let h = hit_region(ray, w, level, u32(region), rc, t, normal);
+                if h.hit {
+                    return h;
+                }
             }
         }
         let axis = first_axis(next);
@@ -274,4 +313,26 @@ fn trace(ray: Ray) -> Hit {
         }
     }
     return miss();
+}
+
+// The first solid Voxel along the ray, or a miss.
+fn trace(ray: Ray) -> Hit {
+    var w: Walk;
+    w.d = select(ray.dir, vec3<f32>(TINY), abs(ray.dir) < vec3<f32>(TINY));
+    w.inv = 1.0 / w.d;
+    w.step = select(vec3<i32>(-1), vec3<i32>(1), w.d > vec3<f32>(0.0));
+    w.upper = max(w.step, vec3<i32>(0));
+
+    // Every level is a part of space of its own, so the nearest hit of all is the first one.
+    // Once there is one, the levels beyond it only need looking at up to it.
+    var nearest = miss();
+    var limit = 3.4e38;
+    for (var level = 0u; level < scene.level_count; level++) {
+        let h = hit_level(ray, w, level, limit);
+        if h.hit && h.t < limit {
+            limit = h.t;
+            nearest = h;
+        }
+    }
+    return nearest;
 }

@@ -47,7 +47,10 @@ file, a bad option).
 
 ### What it does
 
-1. Generates the test Planet and uploads it to the GPU.
+1. Generates the test Planet and uploads it to the GPU, as camera-centred rings of levels of
+   detail (ADR 0002), and prints how much GPU memory they take. The rings follow the camera
+   along the path: moving them (packing the regions that come in, writing them to the GPU) is
+   done before a frame is timed, so it is in no pass and not in the frame's CPU time either.
 2. Flies the camera path in **primary mode**, then in **reference mode** (the progressive path
    tracer, 4 samples per frame of the path). Each mode first draws a few warm-up frames, which are
    not measured: the first frames after a mode switch carry the other mode's state (see the notes

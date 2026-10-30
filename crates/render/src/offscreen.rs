@@ -100,6 +100,16 @@ impl Offscreen {
         self.profiler.timings()
     }
 
+    /// Bytes of GPU memory that the Planet's bricks take.
+    pub fn scene_bytes(&self) -> u64 {
+        self.tracer.scene_bytes()
+    }
+
+    /// Bytes of the Planet written to the GPU so far, at the start and by each update.
+    pub fn uploaded_bytes(&self) -> u64 {
+        self.tracer.uploaded_bytes()
+    }
+
     /// The GPU that this renders on.
     pub fn gpu_info(&self) -> &GpuInfo {
         &self.info

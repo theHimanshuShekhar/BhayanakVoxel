@@ -25,16 +25,28 @@
 //! `regions` plus one, or 0 for an empty slot.
 //!
 //! Voxel and region coordinates are absolute `i32` Planet-frame integers on both sides, so
-//! nothing in the structure loses precision far from the origin. `origin` and `dims` bound the
-//! occupied regions, so a ray from far away can jump straight to them.
+//! nothing in the structure loses precision far from the origin. The box of a level bounds its
+//! regions, so a ray from far away can jump straight to them.
 //!
-//! Level of detail, later: each LOD level is another `Scene` of coarser bricks (its own `table`
-//! and arrays), traversed by the same code with a larger Voxel size. Nothing here assumes a
-//! single level, and nothing is built for it yet.
+//! **Level of detail.** A scene is one or more *levels*, and level `n` is mip `n` of the brick
+//! store (ADR 0002): bricks, and so Voxels, `2^n` times the size of level 0's. Every level has
+//! its own part of `table`, and its regions are in the one `regions`; the bricks of all levels
+//! share `brick_refs` and `bricks`, so that the GPU needs no more buffers for more levels. A
+//! region of level `n` is 8×8×8 bricks of that level, and so `64 << n` Voxels across. The
+//! coordinates in `table`, `regions` and in the walk are those of the level's own Voxels, bricks
+//! and regions; only the boxes ([`Level`]) are in level 0 Voxels, so that all levels share one
+//! frame.
+//!
+//! [`Scene::new`] makes the one level of an ordinary scene, which holds all of its bricks.
+//! [`Scene::rings`] makes camera-centred *rings*, which are described at that function.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use brick_store::{Brick, BrickCoord, BrickStore, BrickView, Material};
+
+mod rings;
+
+pub use rings::{RingPatch, RingsFull};
 
 /// Bricks along each edge of a region.
 pub const REGION_BRICKS: i32 = 8;
@@ -44,6 +56,14 @@ pub const REGION_VOXELS: i32 = 64;
 pub const REGION_WORDS: usize = 17;
 /// Set in a brick entry for a brick that is one Material throughout.
 pub const SOLID_FLAG: u32 = 0x8000_0000;
+/// Regions along each edge of a ring's box. A ring then spans `1024 << level` Voxels, centred on
+/// the camera to within a region, and is used out to half that: its Voxels are then about a
+/// quarter of a degree across at the nearest, a couple of pixels at 1280×720.
+pub const RING_REGIONS: i32 = 16;
+/// Most levels a scene can have. Level `n` has regions `64 << n` Voxels across, and a ring's box
+/// must stay within `i32` Voxel coordinates: that is about 22 levels, so 20 leaves room.
+/// `MAX_LEVELS` in `trace.wgsl` is the same number.
+pub const MAX_LEVELS: usize = 20;
 
 /// A ball of one Material at the Planet's centre, standing in for the bricks inside it so that
 /// they need not be stored. A brick the store holds wins over the ball.
@@ -56,21 +76,46 @@ pub struct Core {
     pub material: Material,
 }
 
-/// Packed bricks and the index over them. Built by [`Scene::new`], uploaded as-is.
+/// The box of regions that a scene holds of one mip level, whose index in [`Scene::levels`] is
+/// the level. The box is in level 0 Voxels, so that every level is in one frame; a region of
+/// level `n` is `REGION_VOXELS << n` of them across.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Level {
+    /// Level 0 Voxel coordinate of the box's minimum corner: a multiple of the level's region
+    /// size.
+    pub origin: [i32; 3],
+    /// Extent of the box in regions of this level.
+    pub dims: [u32; 3],
+    /// First slot of the level's part of [`Scene::table`], and its slot count minus one. Slots
+    /// are a power of two.
+    pub table_base: u32,
+    pub table_mask: u32,
+}
+
+impl Level {
+    /// Coordinate, in regions of mip `level`, of the box's first region.
+    pub fn first_region(&self, level: usize) -> [i32; 3] {
+        self.origin.map(|o| o >> (6 + level))
+    }
+}
+
+/// Packed bricks and the index over them. Built by [`Scene::new`] or [`Scene::rings`], uploaded
+/// as-is.
 #[derive(Debug, Default)]
 pub struct Scene {
-    /// Voxel coordinate of the scene-space origin: a multiple of [`REGION_VOXELS`].
-    pub origin: [i32; 3],
-    /// Extent in regions along each axis. Zero when there are no bricks.
-    pub dims: [u32; 3],
+    /// The boxes of regions held, finest level first. Empty when there are no bricks.
+    pub levels: Vec<Level>,
     pub table: Vec<u32>,
     pub regions: Vec<u32>,
     pub brick_refs: Vec<u32>,
     pub bricks: Vec<u32>,
-    /// What [`Scene::update`] resolves bricks the store does not hold against.
+    /// What [`Scene::update`] resolves bricks the store does not hold against. Rings ask the
+    /// store instead, which has its own source (see [`brick_store::BrickSource`]).
     core: Option<Core>,
     /// Words of `brick_refs` and `bricks` that updates have replaced and nothing refers to.
     garbage: usize,
+    /// What a scene of rings keeps besides the buffers; set if this is one.
+    rings: Option<rings::Rings>,
 }
 
 /// Room to leave in a buffer of `len` words for it to grow by: a sixteenth, and some. The GPU
@@ -85,12 +130,15 @@ pub(crate) fn spare_words(len: usize) -> usize {
 pub enum SceneUpdate {
     /// `brick_refs` and `bricks` only grew: everything from these offsets (in words) to the end
     /// is new. The records in `regions` listed (by index, ascending) were rewritten in place.
-    /// The header (`origin`, `dims`) and the table are as before.
+    /// The header (`levels`) and the table are as before.
     Patched {
         regions: Vec<usize>,
         brick_refs_from: usize,
         bricks_from: usize,
     },
+    /// A scene of rings was moved or edited. The patch lists what changed, wherever in the
+    /// buffers it is.
+    Rings(RingPatch),
     /// The scene was built again from scratch, so all of it is new.
     Rebuilt,
 }
@@ -124,6 +172,31 @@ fn region_of(brick: BrickCoord) -> [i32; 3] {
 fn bit_of(brick: BrickCoord) -> usize {
     let [x, y, z] = brick.0.map(|c| c.rem_euclid(REGION_BRICKS) as usize);
     x | y << 3 | z << 6
+}
+
+/// Appends the words of a mixed brick to `out`, laid out as in the table in the module docs.
+fn encode_mixed(
+    out: &mut Vec<u32>,
+    occupancy: &[u64; 8],
+    palette: &[Material],
+    bits: u32,
+    indices: &[u8],
+) {
+    for word in occupancy {
+        out.extend([*word as u32, (*word >> 32) as u32]);
+    }
+    out.push(bits | (palette.len() as u32) << 8);
+    for pair in palette.chunks(2) {
+        let low = u32::from(pair[0].0);
+        let high = pair.get(1).map_or(0, |m| u32::from(m.0));
+        out.push(low | high << 16);
+    }
+    // The CPU packs indices into bytes from the lowest bit; little-endian words keep that order.
+    out.extend(
+        indices
+            .chunks(4)
+            .map(|c| u32::from_le_bytes(c.try_into().expect("indices are whole words"))),
+    );
 }
 
 /// Fills in the bricks of `core` that the store does not hold.
@@ -210,14 +283,18 @@ impl Scene {
             }
         }
 
+        let slots = (by_region.len() * 2).next_power_of_two().max(2);
         let mut scene = Scene {
-            origin: min.map(|m| m * REGION_VOXELS),
-            dims: [0, 1, 2].map(|axis| (max[axis] - min[axis] + 1) as u32),
+            levels: vec![Level {
+                origin: min.map(|m| m * REGION_VOXELS),
+                dims: [0, 1, 2].map(|axis| (max[axis] - min[axis] + 1) as u32),
+                table_base: 0,
+                table_mask: slots as u32 - 1,
+            }],
+            table: vec![0; slots * 4],
             core,
             ..Scene::default()
         };
-        let slots = (by_region.len() * 2).next_power_of_two().max(2);
-        scene.table = vec![0; slots * 4];
         for (index, (key, region)) in by_region.into_iter().enumerate() {
             if let Some(material) = region.uniform {
                 scene.regions.extend([u32::MAX; 16]);
@@ -243,7 +320,7 @@ impl Scene {
                 scene.regions.extend(mask);
                 scene.regions.push(first_ref);
             }
-            scene.insert_region(key, index as u32);
+            scene.insert_region(0, key, index as u32);
         }
         scene
     }
@@ -260,41 +337,82 @@ impl Scene {
                 indices,
             } => {
                 let offset = self.bricks.len() as u32;
-                for word in occupancy {
-                    self.bricks.extend([*word as u32, (*word >> 32) as u32]);
-                }
-                self.bricks.push(bits | (palette.len() as u32) << 8);
-                for pair in palette.chunks(2) {
-                    let low = u32::from(pair[0].0);
-                    let high = pair.get(1).map_or(0, |m| u32::from(m.0));
-                    self.bricks.push(low | high << 16);
-                }
-                // The CPU packs indices into bytes from the lowest bit; little-endian words
-                // keep that order.
-                self.bricks.extend(
-                    indices.chunks(4).map(|c| {
-                        u32::from_le_bytes(c.try_into().expect("indices are whole words"))
-                    }),
-                );
+                encode_mixed(&mut self.bricks, occupancy, palette, bits, indices);
                 offset
             }
         }
     }
 
-    fn insert_region(&mut self, region: [i32; 3], index: u32) {
-        let mask = self.table_mask();
-        let mut slot = hash_region(region) & mask;
-        while self.table[slot as usize * 4 + 3] != 0 {
+    /// Lists the region at `key` of mip `level`, whose record in `regions` is `index`. Returns
+    /// the slot of `table` that it took.
+    fn insert_region(&mut self, level: usize, key: [i32; 3], index: u32) -> usize {
+        let Level {
+            table_base,
+            table_mask: mask,
+            ..
+        } = self.levels[level];
+        let mut slot = hash_region(key) & mask;
+        while self.table[(table_base + slot) as usize * 4 + 3] != 0 {
             slot = (slot + 1) & mask;
         }
-        let at = slot as usize * 4;
-        self.table[at..at + 3].copy_from_slice(&region.map(|r| r as u32));
+        let at = (table_base + slot) as usize * 4;
+        self.table[at..at + 3].copy_from_slice(&key.map(|r| r as u32));
         self.table[at + 3] = index + 1;
+        (table_base + slot) as usize
     }
 
-    /// Slots in the table, minus one. Slots are a power of two.
-    pub fn table_mask(&self) -> u32 {
-        (self.table.len() / 4).saturating_sub(1) as u32
+    /// Unlists the region at `key` of mip `level` and returns its record's index in `regions`.
+    /// The slots of `table` that changed are added to `touched`.
+    ///
+    /// A search for a region ends at an empty slot, and regions that collided with the one
+    /// removed may sit after its slot, so those are moved back to close the gap.
+    fn remove_region(
+        &mut self,
+        level: usize,
+        key: [i32; 3],
+        touched: &mut BTreeSet<usize>,
+    ) -> Option<usize> {
+        let Level {
+            table_base,
+            table_mask: mask,
+            ..
+        } = *self.levels.get(level)?;
+        let at = |slot: u32| (table_base + slot) as usize * 4;
+        let mut hole = hash_region(key) & mask;
+        loop {
+            if self.table[at(hole) + 3] == 0 {
+                return None;
+            }
+            if self.table[at(hole)..at(hole) + 3] == key.map(|k| k as u32) {
+                break;
+            }
+            hole = (hole + 1) & mask;
+        }
+        let index = self.table[at(hole) + 3] as usize - 1;
+        let mut next = hole;
+        loop {
+            next = (next + 1) & mask;
+            let entry: [u32; 4] = self.table[at(next)..at(next) + 4].try_into().unwrap();
+            if entry[3] == 0 {
+                break;
+            }
+            let home = hash_region([entry[0], entry[1], entry[2]].map(|k| k as i32)) & mask;
+            // It stays if its home slot is after the hole and no later than itself, going round
+            // the end of the table if need be: moving it to the hole would put it before home.
+            let stays = if hole <= next {
+                hole < home && home <= next
+            } else {
+                hole < home || home <= next
+            };
+            if !stays {
+                self.table[at(hole)..at(hole) + 4].copy_from_slice(&entry);
+                touched.insert((table_base + hole) as usize);
+                hole = next;
+            }
+        }
+        self.table[at(hole)..at(hole) + 4].fill(0);
+        touched.insert((table_base + hole) as usize);
+        Some(index)
     }
 
     /// Brings the scene up to date with `store` after the bricks `changed` (in any order, and
@@ -308,10 +426,16 @@ impl Scene {
     /// the test Planet. The same happens if a changed brick is in a region that the scene lacks.
     /// Both are reported as [`SceneUpdate::Rebuilt`]. A region that Edits empty keeps a record
     /// with no bricks in it.
+    ///
+    /// `changed` are bricks of level 0. A scene of rings also takes in the coarser bricks over
+    /// them: see [`Scene::rings`].
     pub fn update(&mut self, store: &BrickStore, changed: &[BrickCoord]) -> SceneUpdate {
+        if self.rings.is_some() {
+            return self.update_rings(store, changed);
+        }
         let mut by_region: BTreeMap<usize, Vec<BrickCoord>> = BTreeMap::new();
         for &brick in changed {
-            let Some(index) = self.find_region(region_of(brick)) else {
+            let Some(index) = self.find_region(0, region_of(brick)) else {
                 *self = Scene::new(store, self.core);
                 return SceneUpdate::Rebuilt;
             };
@@ -405,12 +529,16 @@ impl Scene {
         Some(self.brick_refs[(first_ref + lower) as usize])
     }
 
-    /// Index in `regions` of the region at absolute region coordinate `key`.
-    pub fn find_region(&self, key: [i32; 3]) -> Option<usize> {
-        let mask = self.table_mask();
+    /// Index in `regions` of the region at absolute region coordinate `key` of mip `level`.
+    pub fn find_region(&self, level: usize, key: [i32; 3]) -> Option<usize> {
+        let Level {
+            table_base,
+            table_mask: mask,
+            ..
+        } = *self.levels.get(level)?;
         let mut slot = hash_region(key) & mask;
         for _ in 0..=mask {
-            let at = slot as usize * 4;
+            let at = (table_base + slot) as usize * 4;
             let index = *self.table.get(at + 3)?;
             if index == 0 {
                 return None;
@@ -436,8 +564,8 @@ mod tests {
     #[test]
     fn no_bricks_make_an_empty_scene() {
         let scene = Scene::new(&BrickStore::new(), None);
-        assert_eq!(scene.dims, [0, 0, 0]);
-        assert_eq!(scene.find_region([0, 0, 0]), None);
+        assert!(scene.levels.is_empty());
+        assert_eq!(scene.find_region(0, [0, 0, 0]), None);
     }
 
     #[test]
@@ -447,8 +575,8 @@ mod tests {
         store.insert(BrickCoord([17, 9, -30]), Brick::solid(ROCK));
         let scene = Scene::new(&store, None);
         // Bricks -1 and 17 are in regions -1 and 2; 0 and 9 in 0 and 1; -30 in -4 (floor).
-        assert_eq!(scene.origin, [-64, 0, -256]);
-        assert_eq!(scene.dims, [4, 2, 5]);
+        assert_eq!(scene.levels[0].origin, [-64, 0, -256]);
+        assert_eq!(scene.levels[0].dims, [4, 2, 5]);
     }
 
     #[test]
@@ -463,13 +591,13 @@ mod tests {
         let scene = Scene::new(&store, None);
         let mut found: Vec<_> = regions
             .iter()
-            .map(|&r| scene.find_region(r).unwrap())
+            .map(|&r| scene.find_region(0, r).unwrap())
             .collect();
         found.sort_unstable();
         found.dedup();
         assert_eq!(found.len(), regions.len(), "each region has its own record");
-        assert_eq!(scene.find_region([1000, 0, 0]), None);
-        assert_eq!(scene.find_region([0, 0, 0]), None);
+        assert_eq!(scene.find_region(0, [1000, 0, 0]), None);
+        assert_eq!(scene.find_region(0, [0, 0, 0]), None);
     }
 
     #[test]
@@ -480,11 +608,11 @@ mod tests {
         };
         let scene = Scene::new(&BrickStore::new(), Some(core));
         // Region (0, 0, 0) spans 0..64 on each axis: its far corner is 109 from the centre.
-        let inner = scene.find_region([0, 0, 0]).unwrap() * REGION_WORDS;
+        let inner = scene.find_region(0, [0, 0, 0]).unwrap() * REGION_WORDS;
         assert_eq!(scene.regions[inner + 16], SOLID_FLAG | 1);
         assert_eq!(scene.regions[inner], u32::MAX);
         // Region (1, 0, 0) is cut by the ball: some of its bricks are the core's, others absent.
-        let edge = scene.find_region([1, 0, 0]).unwrap() * REGION_WORDS;
+        let edge = scene.find_region(0, [1, 0, 0]).unwrap() * REGION_WORDS;
         assert_ne!(scene.regions[edge + 16] & SOLID_FLAG, SOLID_FLAG);
         let present: u32 = scene.regions[edge..edge + 16]
             .iter()
@@ -492,8 +620,8 @@ mod tests {
             .sum();
         assert!(present > 0 && present < 512, "{present}");
         // A region the ball cannot reach is not there at all.
-        assert_eq!(scene.find_region([2, 2, 2]), None);
-        assert_eq!(scene.find_region([5, 0, 0]), None);
+        assert_eq!(scene.find_region(0, [2, 2, 2]), None);
+        assert_eq!(scene.find_region(0, [5, 0, 0]), None);
     }
 
     #[test]
@@ -507,7 +635,7 @@ mod tests {
         let scene = Scene::new(&store, Some(core));
         // The stored brick sits in a region that would otherwise be uniform: now it is a
         // normal region with the SOIL brick among core bricks.
-        let region = scene.find_region([0, 0, 0]).unwrap() * REGION_WORDS;
+        let region = scene.find_region(0, [0, 0, 0]).unwrap() * REGION_WORDS;
         assert_eq!(scene.regions[region + 16] & SOLID_FLAG, 0);
         let bit = 1 | 1 << 3 | 1 << 6;
         let (word, shift) = (bit / 32, bit % 32);
@@ -529,7 +657,7 @@ mod tests {
         let mut store = BrickStore::new();
         store.insert(BrickCoord([1, 1, 1]), Brick::AIR);
         let scene = Scene::new(&store, Some(core));
-        let region = scene.find_region([0, 0, 0]).unwrap() * REGION_WORDS;
+        let region = scene.find_region(0, [0, 0, 0]).unwrap() * REGION_WORDS;
         assert_eq!(scene.regions[region + 16] & SOLID_FLAG, 0);
         let bit = 1 | 1 << 3 | 1 << 6;
         let mask = &scene.regions[region..region + 16];
@@ -546,7 +674,7 @@ mod tests {
         // Stored air outside the core makes no region of its own.
         let mut store = BrickStore::new();
         store.insert(BrickCoord([500, 0, 0]), Brick::AIR);
-        assert_eq!(Scene::new(&store, None).dims, [0, 0, 0]);
+        assert!(Scene::new(&store, None).levels.is_empty());
     }
 
     #[test]
@@ -557,7 +685,7 @@ mod tests {
         assert_eq!(scene.brick_refs, [SOLID_FLAG | 2]);
         assert!(scene.bricks.is_empty());
         // Region (1, 0, 0), brick (1, 0, 0) inside it is mask bit 1.
-        let region = scene.find_region([1, 0, 0]).unwrap() * REGION_WORDS;
+        let region = scene.find_region(0, [1, 0, 0]).unwrap() * REGION_WORDS;
         assert_eq!(scene.regions[region], 0b10);
         assert_eq!(scene.regions[region + 16], 0);
     }
@@ -756,7 +884,7 @@ mod tests {
         store.insert(BrickCoord([0, 0, 0]), Brick::AIR);
         scene.update(&store, &[BrickCoord([0, 0, 0])]);
         assert_eq!(material_at(&scene, [3, 3, 3]), None);
-        assert!(scene.find_region([0, 0, 0]).is_some());
+        assert!(scene.find_region(0, [0, 0, 0]).is_some());
     }
 
     #[test]

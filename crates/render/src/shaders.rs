@@ -94,6 +94,12 @@ mod tests {
     }
 
     #[test]
+    fn the_shader_and_the_scene_agree_on_how_many_levels_there_can_be() {
+        let line = format!("const MAX_LEVELS = {};", crate::scene::MAX_LEVELS);
+        assert!(TRACE.contains(&line), "trace.wgsl lacks {line:?}");
+    }
+
+    #[test]
     fn trace_is_defined_exactly_once() {
         assert_eq!(TRACE.matches("fn trace(").count(), 1);
         for other in [

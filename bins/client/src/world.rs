@@ -5,7 +5,7 @@
 use brick_store::VoxelCoord;
 use net::{ClientEnd, Disconnected, EditOp, TryRecvError};
 use render::reference::{Hit, Ray, trace};
-use render::{Camera, Scene, SceneUpdate, camera};
+use render::{Camera, RingsFull, Scene, SceneUpdate, camera};
 use sim::Predictor;
 
 /// Radius of the sphere a click digs: 1 m at 10 cm Voxels.
@@ -42,6 +42,12 @@ impl World {
 
     pub fn scene(&self) -> &Scene {
         &self.scene
+    }
+
+    /// Moves the rings of the Planet to centre on `camera`, a position in Voxels. Returns how
+    /// the scene changed, if it did.
+    pub fn recentre(&mut self, camera: [f64; 3]) -> Result<Option<SceneUpdate>, RingsFull> {
+        self.scene.recentre(self.predictor.store(), camera)
     }
 
     /// Digs a sphere where the camera looks: shows it at once, and asks the server for it.
@@ -127,6 +133,28 @@ mod tests {
         // The hole is drawn at once: the same ray now reaches deeper than the front face.
         let deeper = centre_hit(world.scene(), &camera()).unwrap();
         assert!(deeper.voxel[2] < -1, "{deeper:?}");
+    }
+
+    #[test]
+    fn a_dig_in_a_scene_of_rings_is_drawn_at_once_and_the_rings_follow_the_camera() {
+        let mut store = wall();
+        store.build_lod(4);
+        let scene = Scene::rings(&store, camera().position, 5).unwrap();
+        let (client, _server) = loopback();
+        let mut world = World::new(scene, Predictor::new(store), client);
+
+        let update = world.dig(&camera()).unwrap();
+        assert!(matches!(update, Some(SceneUpdate::Rings(_))), "{update:?}");
+        let deeper = centre_hit(world.scene(), &camera()).unwrap();
+        assert!(deeper.voxel[2] < -1, "{deeper:?}");
+
+        // Where the camera is, the rings stay; far away, they move.
+        assert_eq!(world.recentre(camera().position), Ok(None));
+        let far = [camera().position[0] + 900.0, 16.5, 20.5];
+        assert!(matches!(
+            world.recentre(far),
+            Ok(Some(SceneUpdate::Rings(_)))
+        ));
     }
 
     #[test]
