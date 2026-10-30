@@ -200,9 +200,9 @@ fn moving_the_camera_moves_the_rings_without_writing_the_bricks_that_stay() {
         gpu.scene_bytes()
     );
 
-    // And what is drawn is what rings built there draw.
+    // And what is drawn is what the same rings built from scratch draw.
     let camera = Camera::looking_at(end, [0.0, 1535.0, -300.0]);
-    let fresh = Offscreen::new(WIDTH, HEIGHT, &rings_at(end))
+    let fresh = Offscreen::new(WIDTH, HEIGHT, &scene.rebuilt_rings(planet()).unwrap())
         .unwrap()
         .render(&camera);
     assert_eq!(gpu.render(&camera), fresh);
@@ -232,7 +232,7 @@ fn a_flight_from_the_surface_to_orbit_and_back_keeps_the_gpu_memory_bounded() {
         // What the camera sees from here is what rings built here show, now and then.
         if step % 30 == 0 {
             let camera = Camera::looking_at(at, [0.0; 3]);
-            let fresh = Offscreen::new(64, 36, &rings_at(at))
+            let fresh = Offscreen::new(64, 36, &scene.rebuilt_rings(planet()).unwrap())
                 .unwrap()
                 .render(&camera);
             assert_eq!(gpu.render(&camera), fresh, "step {step} at {at:?}");

@@ -316,6 +316,20 @@ fn hit_level(scene: &Scene, ray: &Ray, w: &Walk, level: u32, limit: f32) -> Opti
     let highest: [i32; 3] = std::array::from_fn(|a| lowest[a] + lv.dims[a] as i32 - 1);
     let (hole_first, hole_end) = scene.hole(level as usize);
     let hole_last = hole_end.map(|e| e - 1);
+
+    // A ray that starts in the hole has nothing to find in it: walk from where it leaves.
+    let h_a = reach(ray, w, hole_first.map(|f| f << shift));
+    let h_b = reach(ray, w, hole_end.map(|e| e << shift));
+    let h_near: [f32; 3] = std::array::from_fn(|a| h_a[a].min(h_b[a]));
+    let h_far: [f32; 3] = std::array::from_fn(|a| h_a[a].max(h_b[a]));
+    let mut t_enter = t_enter;
+    if max3(h_near) <= t_enter && t_enter < min3(h_far) {
+        t_enter = min3(h_far);
+        normal = face(w, first_axis(h_far));
+        if t_enter >= limit {
+            return None;
+        }
+    }
     let mut t = t_enter;
     let mut rc = clamp3(voxel_at(ray, w, t).map(|v| v >> shift), lowest, highest);
     let mut next = reach(

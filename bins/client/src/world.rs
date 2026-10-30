@@ -11,6 +11,38 @@ use sim::Predictor;
 /// Radius of the sphere a click digs: 1 m at 10 cm Voxels.
 const DIG_RADIUS: u16 = 10;
 
+/// Why the Planet cannot be kept going.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Stopped {
+    /// The server is gone.
+    Disconnected,
+    /// The Planet no longer fits the rings' buffers; the scene is not to be used again.
+    RingsFull,
+}
+
+impl std::fmt::Display for Stopped {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Disconnected => write!(f, "the server stopped"),
+            Self::RingsFull => write!(f, "{RingsFull}"),
+        }
+    }
+}
+
+impl std::error::Error for Stopped {}
+
+impl From<Disconnected> for Stopped {
+    fn from(_: Disconnected) -> Self {
+        Self::Disconnected
+    }
+}
+
+impl From<RingsFull> for Stopped {
+    fn from(_: RingsFull) -> Self {
+        Self::RingsFull
+    }
+}
+
 pub struct World {
     scene: Scene,
     predictor: Predictor,
@@ -52,32 +84,38 @@ impl World {
 
     /// Digs a sphere where the camera looks: shows it at once, and asks the server for it.
     /// Returns how the scene changed, if there was anything to dig.
-    pub fn dig(&mut self, camera: &Camera) -> Result<Option<SceneUpdate>, Disconnected> {
+    pub fn dig(&mut self, camera: &Camera) -> Result<Option<SceneUpdate>, Stopped> {
         let Some(hit) = centre_hit(&self.scene, camera) else {
             return Ok(None);
         };
         let op = EditOp::dig_sphere(VoxelCoord(hit.voxel), DIG_RADIUS);
         let (request, changed) = self.predictor.edit(op);
         self.link.send(request)?;
-        Ok(self.refresh(&changed))
+        Ok(self.refresh(&changed)?)
     }
 
     /// Takes in what the server has sent. Returns how the scene changed, if it did.
-    pub fn poll(&mut self) -> Result<Option<SceneUpdate>, Disconnected> {
+    pub fn poll(&mut self) -> Result<Option<SceneUpdate>, Stopped> {
         let mut changed = Vec::new();
         loop {
             match self.link.try_recv() {
                 Ok(message) => changed.extend(self.predictor.receive(message)),
                 Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => return Err(Disconnected),
+                Err(TryRecvError::Disconnected) => return Err(Disconnected.into()),
             }
         }
-        Ok(self.refresh(&changed))
+        Ok(self.refresh(&changed)?)
     }
 
     /// Packs the bricks that changed.
-    fn refresh(&mut self, changed: &[brick_store::BrickCoord]) -> Option<SceneUpdate> {
-        (!changed.is_empty()).then(|| self.scene.update(self.predictor.store(), changed))
+    fn refresh(
+        &mut self,
+        changed: &[brick_store::BrickCoord],
+    ) -> Result<Option<SceneUpdate>, RingsFull> {
+        if changed.is_empty() {
+            return Ok(None);
+        }
+        self.scene.update(self.predictor.store(), changed).map(Some)
     }
 }
 
@@ -202,7 +240,7 @@ mod tests {
     fn a_server_that_is_gone_is_an_error() {
         let (mut world, server) = world();
         drop(server);
-        assert_eq!(world.poll().err(), Some(Disconnected));
-        assert_eq!(world.dig(&camera()).err(), Some(Disconnected));
+        assert_eq!(world.poll().err(), Some(Stopped::Disconnected));
+        assert_eq!(world.dig(&camera()).err(), Some(Stopped::Disconnected));
     }
 }

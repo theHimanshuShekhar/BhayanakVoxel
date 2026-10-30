@@ -46,7 +46,7 @@ use brick_store::{Brick, BrickCoord, BrickStore, BrickView, Material};
 
 mod rings;
 
-pub use rings::{RingPatch, RingsFull};
+pub use rings::{RingPatch, RingsFull, Room};
 
 /// Bricks along each edge of a region.
 pub const REGION_BRICKS: i32 = 8;
@@ -428,11 +428,21 @@ impl Scene {
     /// with no bricks in it.
     ///
     /// `changed` are bricks of level 0. A scene of rings also takes in the coarser bricks over
-    /// them: see [`Scene::rings`].
-    pub fn update(&mut self, store: &BrickStore, changed: &[BrickCoord]) -> SceneUpdate {
+    /// them, and can run out of room to do it even when packed again from scratch: that is
+    /// [`RingsFull`], and then the scene is not to be used again. No other scene fails.
+    pub fn update(
+        &mut self,
+        store: &BrickStore,
+        changed: &[BrickCoord],
+    ) -> Result<SceneUpdate, RingsFull> {
         if self.rings.is_some() {
             return self.update_rings(store, changed);
         }
+        Ok(self.update_flat(store, changed))
+    }
+
+    /// [`Scene::update`] for a scene that is not rings.
+    fn update_flat(&mut self, store: &BrickStore, changed: &[BrickCoord]) -> SceneUpdate {
         let mut by_region: BTreeMap<usize, Vec<BrickCoord>> = BTreeMap::new();
         for &brick in changed {
             let Some(index) = self.find_region(0, region_of(brick)) else {
@@ -793,7 +803,7 @@ mod tests {
         changed.extend(dig(&mut store, core, [-2, 3, -60], 9));
         changed.extend(dig(&mut store, core, [200, 3, 3], 1));
         changed.extend(dig(&mut store, core, [212, 3, 3], 8));
-        let patch = scene.update(&store, &changed);
+        let patch = scene.update(&store, &changed).unwrap();
         let SceneUpdate::Patched { regions, .. } = patch else {
             panic!("a dig needs no new region: {patch:?}");
         };
@@ -824,7 +834,7 @@ mod tests {
             brick_refs_from,
             bricks_from,
             ..
-        } = scene.update(&store, &changed)
+        } = scene.update(&store, &changed).unwrap()
         else {
             panic!("a patch");
         };
@@ -850,7 +860,7 @@ mod tests {
         for i in 0..40 {
             // Digs that overlap, so that bricks are replaced again and again.
             let changed = dig(&mut store, core, [i % 5 * 3, i % 3 * 4, 10], 9);
-            let update = scene.update(&store, &changed);
+            let update = scene.update(&store, &changed).unwrap();
             let fresh = Scene::new(&store, Some(core));
             if update == SceneUpdate::Rebuilt {
                 rebuilt += 1;
@@ -882,7 +892,7 @@ mod tests {
         let mut scene = Scene::new(&store, None);
         assert_eq!(material_at(&scene, [3, 3, 3]), Some(2));
         store.insert(BrickCoord([0, 0, 0]), Brick::AIR);
-        scene.update(&store, &[BrickCoord([0, 0, 0])]);
+        scene.update(&store, &[BrickCoord([0, 0, 0])]).unwrap();
         assert_eq!(material_at(&scene, [3, 3, 3]), None);
         assert!(scene.find_region(0, [0, 0, 0]).is_some());
     }
@@ -893,7 +903,7 @@ mod tests {
         store.insert(BrickCoord([0, 0, 0]), Brick::solid(SOIL));
         let mut scene = Scene::new(&store, None);
         store.insert(BrickCoord([100, 0, 0]), Brick::solid(SOIL));
-        let patch = scene.update(&store, &[BrickCoord([100, 0, 0])]);
+        let patch = scene.update(&store, &[BrickCoord([100, 0, 0])]).unwrap();
         assert_eq!(patch, SceneUpdate::Rebuilt);
         assert_eq!(material_at(&scene, [800, 3, 3]), Some(2));
     }

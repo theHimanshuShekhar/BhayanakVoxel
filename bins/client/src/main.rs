@@ -205,7 +205,7 @@ impl App {
         let Some(world) = &mut self.world else {
             return Ok(());
         };
-        let update = world.poll().map_err(|_| "the server stopped")?;
+        let update = world.poll()?;
         self.show(update)
     }
 
@@ -214,7 +214,7 @@ impl App {
         let Some(world) = &mut self.world else {
             return Ok(());
         };
-        let update = world.dig(&self.camera).map_err(|_| "the server stopped")?;
+        let update = world.dig(&self.camera)?;
         self.show(update)
     }
 

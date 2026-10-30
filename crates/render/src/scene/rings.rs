@@ -17,12 +17,18 @@
 //! never reached; leaving them out would mean packing the ring again whenever the finer one
 //! moved.
 //!
-//! The buffers are allocated once, for every region the boxes could hold and a fixed number of
-//! words of bricks for each ring, so they are the same size however full the boxes are and
-//! wherever the camera goes. [`Scene::recentre`] moves the boxes with the camera, and touches
-//! only the regions that enter or leave a box: the words of those that leave are handed to the
-//! ones that enter. [`Scene::update`] takes Edits into every ring at once, from the bricks of
-//! level 0 that they changed, and rewrites only the bricks that differ.
+//! The buffers are allocated once, for every region the boxes could hold and a budget of words
+//! for bricks that all the rings share ([`Room`] says how much for each ring), so they are the
+//! same size however full the boxes are and wherever the camera goes. [`Scene::recentre`] moves
+//! the boxes with the camera, and touches only the regions that enter or leave a box: the words
+//! of those that leave are handed to the ones that enter. [`Scene::update`] takes Edits into
+//! every ring at once, from the bricks of level 0 that they changed, and rewrites only the
+//! bricks that differ.
+//!
+//! The one way this can fail is that the words run out ([`RingsFull`]): the Planet is denser than
+//! the budget, or Edits have made it so (they only turn uniform bricks into mixed ones, which
+//! take words). A scene that has failed is not to be used again: its boxes and its pending
+//! patch no longer match what is on the GPU, so the caller stops.
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
@@ -36,12 +42,26 @@ use super::{
     SceneUpdate, bit_of, encode_mixed, region_of,
 };
 
-/// Words of `brick_refs` that each ring has room for: one for every brick it lists that is not
-/// inside a region of one Material.
-const REFS_PER_RING: usize = 1 << 18;
-/// Words of `bricks` that each ring has room for. A brick of two Materials with a surface in it
-/// takes 34 to 50 words, so this is room for 40 to 60 thousand of them in each ring.
-const WORDS_PER_RING: usize = 1 << 21;
+/// How many words the buffers of a scene of rings have, for each ring. The rings share what they
+/// have, so a ring that is fuller than the others is no trouble while the others are emptier.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Room {
+    /// Words of `brick_refs` for each ring: one for every brick it lists that is not inside a
+    /// region of one Material.
+    pub refs_per_ring: usize,
+    /// Words of `bricks` for each ring. A brick of two Materials with a surface in it takes 34
+    /// to 50 words, so the default is room for 40 to 60 thousand of them in each ring.
+    pub words_per_ring: usize,
+}
+
+impl Default for Room {
+    fn default() -> Self {
+        Self {
+            refs_per_ring: 1 << 18,
+            words_per_ring: 1 << 21,
+        }
+    }
+}
 
 /// The rings do not fit in their buffers: the Planet is denser than they were sized for, or the
 /// words that are free are in pieces too small for a region.
@@ -103,6 +123,7 @@ impl Pool {
 /// What a scene of rings keeps besides the buffers.
 #[derive(Debug)]
 pub(super) struct Rings {
+    room: Room,
     /// The records of `regions` that no region uses. There is one for every region the boxes
     /// could hold, so a region always finds one when it enters a box.
     free: Vec<usize>,
@@ -214,20 +235,30 @@ fn inside(first: [i32; 3], key: [i32; 3]) -> bool {
     (0..3).all(|a| key[a] >= first[a] && key[a] < first[a] + RING_REGIONS)
 }
 
+/// Regions of a box from its start that the camera may be in without the box moving: the box
+/// moves when the camera leaves these, and then puts the camera in the middle.
+const SLACK: std::ops::RangeInclusive<i32> = (RING_REGIONS / 2 - 2)..=(RING_REGIONS / 2 + 1);
+
 /// Where the boxes of `levels` rings start, in regions of their own level, for a camera at
-/// `camera`: with the region that holds the camera in the middle, give or take one.
+/// `camera`, given where they start now (`current`, empty at the start). A box stays where it is
+/// on an axis while the camera is in the regions of [`SLACK`] counted from its start, so a
+/// camera that hovers about a plane between two regions does not move the box with every
+/// crossing. Otherwise the region that holds the camera is put in the middle, give or take one.
 ///
-/// A start is even, so the box of a ring is a whole number of regions of the next. Then the box
-/// of a ring is inside the box of the ring outside it, whatever the camera: the region that
-/// holds the camera at one level is the half of a region at the next, so the boxes' middles
-/// move together. A test checks it.
-fn place(camera: [f64; 3], levels: usize) -> Vec<[i32; 3]> {
+/// A start is even, so the box of a ring is a whole number of regions of the next. With the
+/// camera in the regions 6 to 9 of every box, the box of a ring is inside the box of the ring
+/// outside it by at least three of its regions on every side, whatever the camera: the region
+/// that holds the camera at one level is the half of a region at the next. A test checks it.
+fn place(camera: [f64; 3], levels: usize, current: &[[i32; 3]]) -> Vec<[i32; 3]> {
     (0..levels)
         .map(|level| {
             let size = f64::from(REGION_VOXELS << level);
             std::array::from_fn(|a| {
                 let region = (camera[a] / size).floor() as i32;
-                (region - (RING_REGIONS / 2 - 1)).div_euclid(2) * 2
+                match current.get(level) {
+                    Some(first) if SLACK.contains(&(region - first[a])) => first[a],
+                    _ => (region - (RING_REGIONS / 2 - 1)).div_euclid(2) * 2,
+                }
             })
         })
         .collect()
@@ -244,12 +275,22 @@ impl Scene {
     /// centred on the camera and [`Scene::update`] takes Edits in. This fails if the rings do
     /// not fit in their buffers.
     pub fn rings(store: &BrickStore, camera: [f64; 3], levels: usize) -> Result<Scene, RingsFull> {
+        Scene::rings_in(store, camera, levels, Room::default())
+    }
+
+    /// [`Scene::rings`] with buffers of another size.
+    pub fn rings_in(
+        store: &BrickStore,
+        camera: [f64; 3],
+        levels: usize,
+        room: Room,
+    ) -> Result<Scene, RingsFull> {
         let levels = levels.min(store.level_count()).min(MAX_LEVELS);
-        Scene::with_boxes(store, &place(camera, levels))
+        Scene::with_boxes(store, &place(camera, levels, &[]), room)
     }
 
     /// Rings with their boxes starting at the regions `firsts`, one for each level.
-    fn with_boxes(store: &BrickStore, firsts: &[[i32; 3]]) -> Result<Scene, RingsFull> {
+    fn with_boxes(store: &BrickStore, firsts: &[[i32; 3]], room: Room) -> Result<Scene, RingsFull> {
         let per_level = RING_REGIONS.pow(3) as usize;
         // Half full at most, so searches for a region end quickly.
         let slots = (per_level * 2).next_power_of_two();
@@ -265,12 +306,13 @@ impl Scene {
                 .collect(),
             table: vec![0; levels * slots * 4],
             regions: vec![0; levels * per_level * REGION_WORDS],
-            brick_refs: vec![0; levels * REFS_PER_RING],
-            bricks: vec![0; levels * WORDS_PER_RING],
+            brick_refs: vec![0; levels * room.refs_per_ring],
+            bricks: vec![0; levels * room.words_per_ring],
             rings: Some(Rings {
+                room,
                 free: (0..levels * per_level).rev().collect(),
-                refs: Pool::new(levels * REFS_PER_RING),
-                data: Pool::new(levels * WORDS_PER_RING),
+                refs: Pool::new(levels * room.refs_per_ring),
+                data: Pool::new(levels * room.words_per_ring),
                 scratch: Vec::new(),
                 patch: Patch::default(),
             }),
@@ -285,12 +327,18 @@ impl Scene {
         Ok(scene)
     }
 
-    /// The scene packed again from scratch from `store`, with the same boxes.
-    pub(super) fn rebuilt_rings(&self, store: &BrickStore) -> Result<Scene, RingsFull> {
-        let firsts: Vec<_> = (self.levels.iter().enumerate())
+    /// Where each level's box starts, in regions of that level.
+    pub fn box_starts(&self) -> Vec<[i32; 3]> {
+        (self.levels.iter().enumerate())
             .map(|(level, l)| l.first_region(level))
-            .collect();
-        Scene::with_boxes(store, &firsts)
+            .collect()
+    }
+
+    /// A scene of rings packed again from scratch from `store`, with the same boxes and room: what
+    /// the scene should show, with the words in order.
+    pub fn rebuilt_rings(&self, store: &BrickStore) -> Result<Scene, RingsFull> {
+        let room = self.rings.as_ref().map_or_else(Room::default, |r| r.room);
+        Scene::with_boxes(store, &self.box_starts(), room)
     }
 
     /// Whether this is a scene of rings (see [`Scene::rings`]).
@@ -299,13 +347,14 @@ impl Scene {
     }
 
     /// Moves the rings' boxes to centre on `camera` (a position in Voxels), if the camera has
-    /// moved far enough to need it: a box moves two regions at a time, so the camera is in the
-    /// middle of it to within that. The regions that leave a box are dropped and those that
-    /// enter it are packed from `store`; nothing else is touched. Returns what changed, or `None`
-    /// if nothing did (and if this is not a scene of rings).
+    /// left the middle of one of them: a box moves two regions at a time, and the camera may be
+    /// in any of four regions of it without it moving (see `SLACK`). The regions that leave a box
+    /// are dropped and those that enter it are packed from `store`; nothing else is touched.
+    /// Returns what changed, or `None` if nothing did (and if this is not a scene of rings).
     ///
     /// If the regions that enter do not fit, the scene is packed again from scratch, which is
-    /// reported as [`SceneUpdate::Rebuilt`]. It is an error only if they do not fit even then.
+    /// reported as [`SceneUpdate::Rebuilt`]. It is an error only if they do not fit even then, and
+    /// then the scene is half moved and not to be used again.
     pub fn recentre(
         &mut self,
         store: &BrickStore,
@@ -314,17 +363,16 @@ impl Scene {
         if self.rings.is_none() {
             return Ok(None);
         }
-        let current: Vec<_> = (self.levels.iter().enumerate())
-            .map(|(level, l)| l.first_region(level))
-            .collect();
-        let wanted = place(camera, current.len());
+        let current = self.box_starts();
+        let wanted = place(camera, current.len(), &current);
         if wanted == current {
             return Ok(None);
         }
         Ok(Some(match self.move_boxes(store, &current, &wanted) {
             Ok(patch) => SceneUpdate::Rings(patch),
             Err(RingsFull) => {
-                *self = Scene::with_boxes(store, &wanted)?;
+                let room = self.rings.as_ref().map_or_else(Room::default, |r| r.room);
+                *self = Scene::with_boxes(store, &wanted, room)?;
                 SceneUpdate::Rebuilt
             }
         }))
@@ -358,20 +406,21 @@ impl Scene {
     /// [`BrickStore::refresh_lod`]). A brick whose words are what they were is not written again.
     /// A region that a box has but the scene lacks, because it was all air, is added.
     ///
-    /// Panics if the rings do not fit, even packed again from scratch.
+    /// If the words run out the scene is packed again from scratch ([`SceneUpdate::Rebuilt`]),
+    /// which frees what the Edits left; it is an error only if they do not fit even then, and
+    /// then the scene is half changed and not to be used again.
     pub(super) fn update_rings(
         &mut self,
         store: &BrickStore,
         changed: &[BrickCoord],
-    ) -> SceneUpdate {
-        match self.repack_regions(store, changed) {
+    ) -> Result<SceneUpdate, RingsFull> {
+        Ok(match self.repack_regions(store, changed) {
             Ok(patch) => SceneUpdate::Rings(patch),
             Err(RingsFull) => {
-                *self =
-                    (self.rebuilt_rings(store)).expect("the Edited Planet fits the rings' buffers");
+                *self = self.rebuilt_rings(store)?;
                 SceneUpdate::Rebuilt
             }
-        }
+        })
     }
 
     fn repack_regions(
@@ -782,27 +831,95 @@ mod tests {
     }
 
     #[test]
-    fn each_box_contains_the_box_inside_it_wherever_the_camera_is() {
-        // A walk over many regions of every level, across zero.
+    fn each_box_contains_the_box_inside_it_wherever_the_camera_goes() {
+        // Walks, turns, jitter about the planes between regions of every level, and jumps, across
+        // zero. The boxes carry on from where they were, as they do in a flight.
+        let mut state = 5u64;
+        let mut rng = move || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 40) as f64 / (1u64 << 24) as f64
+        };
         let mut camera = [-9000.0, 700.0, 3000.0];
         let mut step = [137.3, -61.9, 29.1];
-        for i in 0..400 {
-            let boxes = place(camera, LEVELS);
-            for level in 1..LEVELS {
-                for (a, (inner, outer)) in boxes[level - 1].iter().zip(boxes[level]).enumerate() {
-                    // Both in regions of the inner level: the outer box is twice as wide.
-                    let (inner, outer) = (*inner, 2 * outer);
+        let mut boxes: Vec<[i32; 3]> = Vec::new();
+        for i in 0..4000 {
+            boxes = place(camera, LEVELS, &boxes);
+            for (level, first) in boxes.iter().enumerate() {
+                let size = region_size(level);
+                for (a, &start) in first.iter().enumerate() {
+                    let region = (camera[a] / size).floor() as i32;
                     assert!(
-                        inner >= outer && inner + RING_REGIONS <= outer + 2 * RING_REGIONS,
-                        "step {i}, level {level}, axis {a}: {inner} in {outer}"
+                        (RING_REGIONS / 2 - 2..=RING_REGIONS / 2 + 1).contains(&(region - start)),
+                        "step {i}, level {level}, axis {a}: camera in region {region} of a box at {start}"
                     );
-                    assert_eq!(inner % 2, 0, "the start of a box is even");
+                    assert_eq!(start % 2, 0, "the start of a box is even");
                 }
             }
-            for (at, by) in camera.iter_mut().zip(&mut step) {
-                *at += *by;
-                *by *= 1.003;
+            for level in 1..LEVELS {
+                for (a, (inner, outer)) in boxes[level - 1].iter().zip(boxes[level]).enumerate() {
+                    // Both in regions of the inner level: the outer box is twice as wide, and the
+                    // inner box is at least three of its regions inside it on every side.
+                    let (inner, outer) = (*inner, 2 * outer);
+                    assert!(
+                        inner >= outer + 3 && inner + RING_REGIONS + 3 <= outer + 2 * RING_REGIONS,
+                        "step {i}, level {level}, axis {a}: {inner} in {outer}"
+                    );
+                }
             }
+            match i % 400 {
+                // Jitter across the plane between two regions of level 0.
+                100..200 => camera[0] = 575.5 + f64::from(i % 2),
+                // A jump to anywhere in the 200000 Voxels about the origin.
+                399 => camera = [0, 1, 2].map(|_| (rng() - 0.5) * 200_000.0),
+                // Back and forth along an axis.
+                200..300 => camera[2] += (rng() - 0.5) * 300.0,
+                _ => {
+                    for (at, by) in camera.iter_mut().zip(&mut step) {
+                        *at += *by;
+                        *by *= 1.003;
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_camera_that_jitters_across_a_boundary_between_regions_moves_nothing_after_the_first_time()
+    {
+        // A plane between regions of every level, and of the odd and the even regions.
+        for level in 0..LEVELS {
+            for k in [3, 4] {
+                let plane = f64::from(k) * region_size(level);
+                let at = |x: f64| [x, 1560.0, 0.0];
+                let mut scene = rings_at(at(plane - 0.5));
+                for x in [
+                    plane + 0.5,
+                    plane - 0.5,
+                    plane + 0.5,
+                    plane - 1.5,
+                    plane + 1.5,
+                ] {
+                    assert_eq!(
+                        scene.recentre(ground(), at(x)),
+                        Ok(None),
+                        "level {level}, plane {k}, x {x}"
+                    );
+                }
+            }
+        }
+        // And the first crossing that is out of the slack moves it once, and then it rests.
+        let mut scene = rings_at([0.0, 1560.0, 0.0]);
+        let x = 10.0 * region_size(0);
+        assert!(
+            scene
+                .recentre(ground(), [x, 1560.0, 0.0])
+                .unwrap()
+                .is_some()
+        );
+        for x in [x + 1.0, x - 1.0, x + 70.0, x - 70.0] {
+            assert_eq!(scene.recentre(ground(), [x, 1560.0, 0.0]), Ok(None));
         }
     }
 
@@ -851,7 +968,7 @@ mod tests {
     }
 
     #[test]
-    fn a_camera_that_stays_within_a_region_or_so_of_the_middle_moves_nothing() {
+    fn a_camera_that_stays_in_the_middle_of_the_boxes_moves_nothing() {
         let mut scene = rings_at(ABOVE);
         // Level 0 regions are 64 Voxels across and the camera is in region 0 of x and z.
         assert_eq!(scene.recentre(ground(), [63.0, 1560.0, 63.0]), Ok(None));
@@ -873,7 +990,13 @@ mod tests {
         ] {
             let update = scene.recentre(ground(), to).unwrap();
             assert_eq!(update.is_some(), moved, "{to:?}");
-            assert_eq!(shown(&scene), shown(&rings_at(to)), "{to:?}");
+            // A box moves when the camera leaves its middle, not for every region it crosses, so
+            // it is not where a new scene would put it: but it is the scene that has those boxes.
+            assert_eq!(
+                shown(&scene),
+                shown(&scene.rebuilt_rings(ground()).unwrap()),
+                "{to:?}"
+            );
         }
     }
 
@@ -881,9 +1004,7 @@ mod tests {
     fn a_move_writes_what_a_copy_needs_and_leaves_regions_that_stay_alone() {
         let mut scene = rings_at([-400.0, 1560.0, 0.0]);
         let before = Copy::of(&scene);
-        let boxes: Vec<_> = (scene.levels.iter().enumerate())
-            .map(|(level, l)| l.first_region(level))
-            .collect();
+        let boxes = scene.box_starts();
         let patch = patch_of(scene.recentre(ground(), [300.0, 1560.0, 0.0]).unwrap());
         assert!(patch.levels);
 
@@ -976,7 +1097,10 @@ mod tests {
             );
             assert_eq!(copy, Copy::of(&scene), "step {step}");
         }
-        assert_eq!(shown(&scene), shown(&rings_at(at)));
+        assert_eq!(
+            shown(&scene),
+            shown(&scene.rebuilt_rings(ground()).unwrap())
+        );
     }
 
     /// Digs a ball of Voxels out of `store` and returns the bricks of level 0 it changed.
@@ -1006,7 +1130,7 @@ mod tests {
         let refresh = store.refresh_lod(changed.iter().copied());
         assert!(refresh.changed.iter().any(|&(level, _)| level >= 2));
 
-        let SceneUpdate::Rings(patch) = scene.update(&store, &changed) else {
+        let SceneUpdate::Rings(patch) = scene.update(&store, &changed).unwrap() else {
             panic!("an edit patches the rings");
         };
         assert_eq!(
@@ -1020,11 +1144,52 @@ mod tests {
         assert!(!patch.levels);
 
         // The same Edit again finds every brick as it is, so writes none of them.
-        let SceneUpdate::Rings(again) = scene.update(&store, &changed) else {
+        let SceneUpdate::Rings(again) = scene.update(&store, &changed).unwrap() else {
             panic!("an edit patches the rings");
         };
         assert!(again.bricks.is_empty(), "{again:?}");
         assert_eq!(copy, Copy::of(&scene));
+    }
+
+    /// Words of `bricks` that the scene's bricks take.
+    fn words_taken(scene: &Scene) -> usize {
+        let free: usize = scene
+            .rings
+            .as_ref()
+            .unwrap()
+            .data
+            .free
+            .iter()
+            .map(Range::len)
+            .sum();
+        scene.bricks.len() - free
+    }
+
+    /// Room for a ring set of `scene`, and `spare` words more.
+    fn room_for(scene: &Scene, spare: usize) -> Room {
+        Room {
+            words_per_ring: (words_taken(scene) + spare).div_ceil(LEVELS),
+            ..Room::default()
+        }
+    }
+
+    #[test]
+    fn edits_that_need_more_words_than_the_rings_have_are_an_error_and_not_a_panic() {
+        let mut store = ground().clone();
+        let room = room_for(&rings_at(ABOVE), 300);
+        let mut scene = Scene::rings_in(&store, ABOVE, LEVELS, room).unwrap();
+        // Digging turns bricks of rock into bricks of Voxels, which take words.
+        let changed = dig(&mut store, [20, 1510, -30], 14);
+        store.refresh_lod(changed.iter().copied());
+        assert_eq!(scene.update(&store, &changed), Err(RingsFull));
+    }
+
+    #[test]
+    fn rings_that_move_to_where_there_is_more_than_they_have_room_for_are_an_error() {
+        let orbit = [0.0, 3600.0, 3000.0];
+        let room = room_for(&rings_at(orbit), 300);
+        let mut scene = Scene::rings_in(ground(), orbit, LEVELS, room).unwrap();
+        assert_eq!(scene.recentre(ground(), ABOVE), Err(RingsFull));
     }
 
     #[test]

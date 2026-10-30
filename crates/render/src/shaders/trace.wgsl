@@ -284,7 +284,21 @@ fn hit_level(ray: Ray, w: Walk, level: u32, limit: f32) -> Hit {
     let lowest = lv.origin >> vec3<u32>(shift);
     let highest = lowest + vec3<i32>(lv.dims) - 1;
     let hole_last = lv.hole_end - 1;
-    var t = t_enter;
+
+    // A ray that starts in the hole has nothing to find in it: walk from where it leaves.
+    let h_a = reach(ray, w, lv.hole_first << vec3<u32>(shift));
+    let h_b = reach(ray, w, lv.hole_end << vec3<u32>(shift));
+    let h_near = min(h_a, h_b);
+    let h_far = max(h_a, h_b);
+    var t_start = t_enter;
+    if max3(h_near) <= t_start && t_start < min3(h_far) {
+        t_start = min3(h_far);
+        normal = select(vec3<f32>(0.0), -vec3<f32>(w.step), first_axis(h_far));
+        if t_start >= limit {
+            return miss();
+        }
+    }
+    var t = t_start;
     var rc = clamp(voxel_at(ray, w, t) >> vec3<u32>(shift), lowest, highest);
     var next = reach(ray, w, (rc + w.upper) << vec3<u32>(shift));
     let delta = abs(f32(64u << level) * w.inv);

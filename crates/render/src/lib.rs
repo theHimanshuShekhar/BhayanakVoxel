@@ -36,7 +36,7 @@ pub use camera::Camera;
 pub use debug_view::DebugView;
 pub use offscreen::{GpuInfo, Image, Offscreen};
 pub use profiler::Profiler;
-pub use scene::{RingsFull, Scene, SceneUpdate};
+pub use scene::{RingsFull, Room, Scene, SceneUpdate};
 pub use sun::Sun;
 pub use timing::Timings;
 pub use window::{Mode, Renderer};
