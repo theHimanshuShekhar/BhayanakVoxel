@@ -1,17 +1,46 @@
 //! Sparse hash index of bricks keyed by integer brick coordinate.
 
-use std::collections::HashMap;
+use std::borrow::Cow;
+use std::collections::{BTreeSet, HashMap};
+use std::sync::Arc;
 
 use crate::brick::{Brick, Material};
 use crate::coord::{BrickCoord, VoxelCoord};
+use crate::lod::{BrickSource, downsample};
 
 /// The Planet's bricks. A brick that is absent reads as air.
 ///
 /// The index is a `HashMap`, whose iteration order is random per process, so it is never
 /// exposed: use [`Self::sorted_coords`] wherever order matters.
+///
+/// A brick that is not held can read as something other than air: see [`BrickSource`].
+/// [`Self::brick`], [`Self::get`] and [`Self::content_hash`] only see the bricks held;
+/// [`Self::brick_at`] and [`Self::voxel_at`] read what is there, at any level.
+///
+/// A store can also carry a pyramid of coarser mip levels (ADR 0002), built by
+/// [`Self::build_lod`]. Level `n` is a store of its own, in bricks of Voxels `2^n` times the
+/// size of level 0's. A coarse brick is held exactly when it covers a brick held at level 0,
+/// and is then the downsampling of the eight bricks below it, each read as [`Self::brick_at`]
+/// does. The pyramid is not updated by [`Self::insert`], [`Self::remove`] or [`Self::set`]:
+/// after changing level 0 bricks, tell it which with [`Self::refresh_lod`]. `sim::apply` does.
 #[derive(Clone, Debug, Default)]
 pub struct BrickStore {
     bricks: HashMap<BrickCoord, Brick>,
+    /// Mip levels 1 and up, finest first. Empty when there is no pyramid; the stores in it have
+    /// no pyramid or source of their own.
+    coarse: Vec<BrickStore>,
+    source: Option<Arc<dyn BrickSource>>,
+}
+
+/// What [`BrickStore::refresh_lod`] did.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LodRefresh {
+    /// How many coarse bricks it remade: the ancestors of the bricks it was told had changed.
+    pub remade: usize,
+    /// The coarse bricks that read differently afterwards, as `(level, coordinate)`, finest
+    /// level first and ascending within a level. These are the ones to send on to wherever
+    /// the coarse levels are drawn from.
+    pub changed: Vec<(usize, BrickCoord)>,
 }
 
 impl BrickStore {
@@ -62,6 +91,113 @@ impl BrickStore {
         hash
     }
 
+    /// Sets what a brick reads as where none is held, replacing any source, and remakes the
+    /// pyramid to match. Set it before holding bricks that depend on it.
+    pub fn set_source(&mut self, source: impl BrickSource + 'static) {
+        self.source = Some(Arc::new(source));
+        self.build_lod(self.coarse.len());
+    }
+
+    /// The brick at `coord` of mip `level`, as it reads: the one held, or else what the source
+    /// gives, or else air. Level 0 is this store's own bricks. Panics if there is no such level.
+    pub fn brick_at(&self, level: usize, coord: BrickCoord) -> Cow<'_, Brick> {
+        let held = self.level(level).expect("no such level").brick(coord);
+        match (held, &self.source) {
+            (Some(brick), _) => Cow::Borrowed(brick),
+            (None, Some(source)) => Cow::Owned(source.brick(level, coord)),
+            (None, None) => Cow::Owned(Brick::AIR),
+        }
+    }
+
+    /// The Voxel at `coord` of mip `level`, as [`Self::brick_at`] reads it: `None` for air.
+    pub fn voxel_at(&self, level: usize, coord: VoxelCoord) -> Option<Material> {
+        self.brick_at(level, coord.brick()).get(coord.local())
+    }
+
+    /// Replaces the pyramid with `coarse_levels` levels above this one. The Planet needs about
+    /// 19 or 20 to reach from 10 cm Voxels to its disc.
+    pub fn build_lod(&mut self, coarse_levels: usize) {
+        self.coarse = vec![BrickStore::new(); coarse_levels];
+        self.remake_above(self.bricks.keys().copied().collect());
+    }
+
+    /// Number of mip levels, counting this one as level 0: 1 when there is no pyramid.
+    pub fn level_count(&self) -> usize {
+        1 + self.coarse.len()
+    }
+
+    /// The bricks held at mip level `level`, or `None` beyond the pyramid. Level 0 is this
+    /// store. Reading it ignores the source: use [`Self::brick_at`] for that.
+    pub fn level(&self, level: usize) -> Option<&BrickStore> {
+        match level {
+            0 => Some(self),
+            n => self.coarse.get(n - 1),
+        }
+    }
+
+    /// Makes the pyramid match the level 0 bricks at `changed` after they were changed (held,
+    /// replaced or removed), by remaking only the coarse bricks over them. Does nothing without
+    /// a pyramid. The result is the pyramid that [`Self::build_lod`] would make.
+    pub fn refresh_lod(&mut self, changed: impl IntoIterator<Item = BrickCoord>) -> LodRefresh {
+        self.remake_above(changed.into_iter().collect())
+    }
+
+    /// FNV-1a hash of the pyramid: the number and [`Self::content_hash`] of each coarse level,
+    /// finest first. Level 0 is left to `content_hash`, so what the two hash is disjoint.
+    pub fn lod_hash(&self) -> u64 {
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        for (n, level) in (1u32..).zip(&self.coarse) {
+            let bytes = n
+                .to_le_bytes()
+                .into_iter()
+                .chain(level.content_hash().to_le_bytes());
+            for byte in bytes {
+                hash = (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3);
+            }
+        }
+        hash
+    }
+
+    /// Remakes the ancestors, at every coarse level, of the level 0 bricks `changed`.
+    fn remake_above(&mut self, changed: BTreeSet<BrickCoord>) -> LodRefresh {
+        let mut refresh = LodRefresh::default();
+        if self.coarse.is_empty() {
+            return refresh;
+        }
+        let mut below = changed;
+        for level in 1..=self.coarse.len() {
+            below = below.into_iter().map(BrickCoord::parent).collect();
+            for &coord in &below {
+                let before = self.brick_at(level, coord).into_owned();
+                self.remake(level, coord);
+                refresh.remade += 1;
+                if before != *self.brick_at(level, coord) {
+                    refresh.changed.push((level, coord));
+                }
+            }
+        }
+        refresh
+    }
+
+    /// Remakes brick `coord` of coarse level `level` from the eight bricks of the level below:
+    /// held if any of them is held, and not held otherwise.
+    fn remake(&mut self, level: usize, coord: BrickCoord) {
+        let finer = self.level(level - 1).expect("the level below exists");
+        let children = coord.children();
+        let brick = children
+            .iter()
+            .any(|c| finer.bricks.contains_key(c))
+            .then(|| {
+                let read = children.map(|child| self.brick_at(level - 1, child));
+                downsample(read.each_ref().map(|c| &**c))
+            });
+        let coarse = &mut self.coarse[level - 1].bricks;
+        match brick {
+            Some(brick) => coarse.insert(coord, brick),
+            None => coarse.remove(&coord),
+        };
+    }
+
     /// Coordinates of all bricks held, in ascending order.
     pub fn sorted_coords(&self) -> Vec<BrickCoord> {
         let mut coords: Vec<_> = self.bricks.keys().copied().collect();
@@ -91,6 +227,7 @@ impl BrickStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lod::Interior;
 
     const ROCK: Material = Material(3);
 
@@ -189,5 +326,420 @@ mod tests {
                 BrickCoord([2, 0, 0]),
             ]
         );
+    }
+
+    /// A 16-Voxel cube of solid ROCK: the eight level 0 bricks 0..=1 on each axis, which are
+    /// the children of level 1 brick (0, 0, 0).
+    fn block() -> BrickStore {
+        let mut store = BrickStore::new();
+        for i in 0..8 {
+            store.insert(BrickCoord([i & 1, i >> 1 & 1, i >> 2]), Brick::solid(ROCK));
+        }
+        store
+    }
+
+    /// 4×4×4 solid bricks about the origin, in three Materials that vary from brick to brick.
+    fn banded() -> BrickStore {
+        let mut store = BrickStore::new();
+        for i in 0..64 {
+            let at = [i % 4 - 2, i / 4 % 4 - 2, i / 16 - 2];
+            let material = Material(1 + at.iter().sum::<i32>().rem_euclid(3) as u16);
+            store.insert(BrickCoord(at), Brick::solid(material));
+        }
+        store
+    }
+
+    /// The coarse bricks, as `(level, coordinate)`, that read differently in the two stores.
+    fn differing(before: &BrickStore, after: &BrickStore) -> Vec<(usize, BrickCoord)> {
+        let mut differing = Vec::new();
+        for level in 1..before.level_count() {
+            let mut coords = before.level(level).unwrap().sorted_coords();
+            coords.extend(after.level(level).unwrap().sorted_coords());
+            coords.sort();
+            coords.dedup();
+            differing.extend(
+                coords
+                    .into_iter()
+                    .filter(|&c| before.brick_at(level, c) != after.brick_at(level, c))
+                    .map(|c| (level, c)),
+            );
+        }
+        differing
+    }
+
+    /// The pyramid that `build_lod` makes of `store`'s level 0 bricks and source.
+    fn rebuilt(store: &BrickStore) -> BrickStore {
+        let mut again = store.clone();
+        again.build_lod(store.level_count() - 1);
+        again
+    }
+
+    #[test]
+    fn a_store_without_a_pyramid_has_one_level_and_refreshing_it_does_nothing() {
+        let mut store = block();
+        assert_eq!(store.level_count(), 1);
+        assert!(store.level(1).is_none());
+        assert_eq!(
+            store.refresh_lod([BrickCoord([0, 0, 0])]),
+            LodRefresh::default()
+        );
+        assert_eq!(store.lod_hash(), BrickStore::new().lod_hash());
+    }
+
+    #[test]
+    fn level_0_of_a_pyramid_is_the_store_itself() {
+        let mut store = block();
+        store.build_lod(3);
+        assert_eq!(store.level_count(), 4);
+        assert_eq!(store.level(0).unwrap().len(), 8);
+        assert!(store.level(4).is_none());
+    }
+
+    #[test]
+    fn a_pyramid_does_not_change_the_hash_of_level_0() {
+        let plain = block();
+        let mut pyramid = block();
+        pyramid.build_lod(4);
+        assert_eq!(pyramid.content_hash(), plain.content_hash());
+        assert_ne!(pyramid.lod_hash(), plain.lod_hash());
+    }
+
+    #[test]
+    fn a_cube_of_stone_shrinks_by_half_at_each_level() {
+        let mut store = block();
+        store.build_lod(4);
+        let level = |n| store.level(n).unwrap();
+        // Level 1 brick 0 is the eight bricks as one solid brick.
+        assert_eq!(level(1).sorted_coords(), [BrickCoord([0; 3])]);
+        assert!(level(1).brick(BrickCoord([0; 3])).unwrap().is_uniform());
+        // Each level up, the cube is half as many Voxels wide: 8, 4, 2 then 1.
+        for (n, width) in [(1, 8), (2, 4), (3, 2), (4, 1)] {
+            for v in 0..9 {
+                let inside = v < width;
+                let want = inside.then_some(ROCK);
+                assert_eq!(
+                    store.voxel_at(n, VoxelCoord([v, v, v])),
+                    want,
+                    "level {n} Voxel {v}"
+                );
+                assert_eq!(
+                    store.voxel_at(n, VoxelCoord([v, 0, width])),
+                    None,
+                    "level {n} Voxel {v}"
+                );
+            }
+        }
+        assert_eq!(level(4).len(), 1);
+    }
+
+    #[test]
+    fn a_lone_voxel_is_too_few_to_show_in_the_levels_above() {
+        let mut store = BrickStore::new();
+        store.set(VoxelCoord([3, 3, 3]), Some(ROCK));
+        store.build_lod(3);
+        // The coarse bricks are held, as they cover a held brick, but read as air.
+        for n in 1..=3 {
+            assert!(store.brick_at(n, BrickCoord([0; 3])).is_air(), "level {n}");
+        }
+    }
+
+    #[test]
+    fn building_again_replaces_the_old_pyramid() {
+        let mut store = block();
+        store.build_lod(4);
+        let four = store.lod_hash();
+        store.build_lod(1);
+        assert_eq!(store.level_count(), 2);
+        let mut fresh = block();
+        fresh.build_lod(1);
+        assert_eq!(store.lod_hash(), fresh.lod_hash());
+        assert_ne!(store.lod_hash(), four);
+        // What is left of level 1 is its content, and not just the right number of levels.
+        assert!(store.brick_at(1, BrickCoord([0; 3])).is_uniform());
+        assert_eq!(store.voxel_at(1, VoxelCoord([7, 7, 7])), Some(ROCK));
+        store.build_lod(0);
+        assert_eq!(store.level_count(), 1);
+        assert_eq!(store.lod_hash(), BrickStore::new().lod_hash());
+    }
+
+    #[test]
+    fn refreshing_remakes_the_ancestors_of_a_changed_brick_and_reports_what_differs() {
+        let mut store = block();
+        store.build_lod(4);
+        let before = store.clone();
+        store.insert(BrickCoord([1, 0, 1]), Brick::AIR);
+        let refresh = store.refresh_lod([BrickCoord([1, 0, 1])]);
+        // One ancestor per level, the coarse brick 0 each time.
+        assert_eq!(refresh.remade, 4);
+        // The hole shows up to level 3, and at level 4 it is one child in eight: still rock.
+        assert_eq!(
+            refresh.changed,
+            [
+                (1, BrickCoord([0; 3])),
+                (2, BrickCoord([0; 3])),
+                (3, BrickCoord([0; 3]))
+            ]
+        );
+        assert_eq!(refresh.changed, differing(&before, &store));
+        assert_eq!(store.lod_hash(), rebuilt(&store).lod_hash());
+    }
+
+    #[test]
+    fn refreshing_a_brick_that_did_not_change_reports_nothing() {
+        let mut store = block();
+        store.build_lod(4);
+        let refresh = store.refresh_lod([BrickCoord([1, 0, 1])]);
+        assert_eq!(refresh.remade, 4);
+        assert!(refresh.changed.is_empty());
+    }
+
+    #[test]
+    fn bricks_that_share_ancestors_are_remade_once_and_the_rest_each_get_a_chain() {
+        let mut store = block();
+        store.build_lod(4);
+        // Bricks -1 and 0 never share a parent, at any level, so the two chains stay apart.
+        let refresh = store.refresh_lod([BrickCoord([-1, 0, 0]), BrickCoord([0, 0, 0])]);
+        assert_eq!(refresh.remade, 2 * 4);
+        // Four children of one parent are one chain.
+        let refresh =
+            store.refresh_lod([[0, 0, 0], [1, 0, 0], [0, 1, 0], [1, 1, 0]].map(BrickCoord));
+        assert_eq!(refresh.remade, 4);
+        // Twenty-seven neighbours span two parents per axis at each level.
+        let cube = (0..27).map(|i| BrickCoord([i % 3 - 1, i / 3 % 3 - 1, i / 9 - 1]));
+        assert_eq!(store.refresh_lod(cube).remade, 8 * 4);
+    }
+
+    #[test]
+    fn those_ancestors_are_all_that_differs_when_the_bricks_really_changed() {
+        let mut store = block();
+        for far in [[40, 0, 0], [-33, -33, 17], [2, 2, 2]] {
+            store.insert(BrickCoord(far), Brick::solid(Material(5)));
+        }
+        store.build_lod(4);
+        let before = store.clone();
+        // The eight bricks around the origin, where -1 and 0 never share an ancestor.
+        let around: Vec<_> = (0..8)
+            .map(|i| BrickCoord([i & 1, i >> 1 & 1, i >> 2].map(|b| b - 1)))
+            .collect();
+        for &coord in &around {
+            store.insert(coord, Brick::AIR);
+        }
+        store.insert(BrickCoord([0, 0, 0]), Brick::solid(Material(4)));
+        let refresh = store.refresh_lod(around.iter().copied());
+        assert_eq!(refresh.remade, 8 * 4);
+
+        let differing = differing(&before, &store);
+        assert!(!differing.is_empty());
+        assert_eq!(refresh.changed, differing);
+        // Everything that differs is over the bricks changed: coarse bricks -1 and 0 on each axis.
+        let over = |&(_, c): &(usize, BrickCoord)| c.0.iter().all(|&a| a == 0 || a == -1);
+        assert!(differing.iter().all(over), "{differing:?}");
+    }
+
+    #[test]
+    fn a_refreshed_pyramid_is_the_one_a_rebuild_would_make() {
+        let mut store = banded();
+        store.build_lod(5);
+        for centre in [
+            [0, 0, 0],
+            [1, 1, 1],
+            [-8, -8, -8],
+            [-1, 0, 7],
+            [-2, -3, -4],
+            [9, 8, 7],
+        ] {
+            let mut changed = BTreeSet::new();
+            for d in 0..27 {
+                let at = [0, 1, 2].map(|a| centre[a] + [d % 3, d / 3 % 3, d / 9][a] - 1);
+                store.set(VoxelCoord(at), None);
+                changed.insert(VoxelCoord(at).brick());
+            }
+            store.refresh_lod(changed);
+            assert_eq!(
+                store.lod_hash(),
+                rebuilt(&store).lod_hash(),
+                "after {centre:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn coarse_bricks_are_held_exactly_over_held_bricks() {
+        let mut store = block();
+        store.build_lod(2);
+        assert_eq!(store.level(1).unwrap().len(), 1);
+        assert_eq!(store.level(2).unwrap().len(), 1);
+        // Held as air, a brick still has its ancestors held, reading as air.
+        for coord in store.sorted_coords() {
+            store.insert(coord, Brick::AIR);
+        }
+        store.refresh_lod(store.sorted_coords());
+        assert_eq!(store.level(2).unwrap().len(), 1);
+        assert!(store.brick_at(1, BrickCoord([0; 3])).is_air());
+        assert!(store.brick_at(2, BrickCoord([0; 3])).is_air());
+        // Removed, they have none.
+        for coord in store.sorted_coords() {
+            store.remove(coord);
+        }
+        store.refresh_lod(block().sorted_coords());
+        assert!(store.level(1).unwrap().is_empty());
+        assert!(store.level(2).unwrap().is_empty());
+        assert_eq!(store.lod_hash(), rebuilt(&store).lod_hash());
+    }
+
+    /// An interior of radius 100, and so with coarse bricks over its edge from level 4 up.
+    const INTERIOR: Interior = Interior {
+        radius: 100,
+        material: ROCK,
+    };
+
+    #[test]
+    fn a_source_decides_what_a_brick_that_is_not_held_reads_as() {
+        let mut store = BrickStore::new();
+        store.build_lod(3);
+        assert!(store.brick_at(2, BrickCoord([0; 3])).is_air());
+        store.set_source(INTERIOR);
+        // Wholly inside the ball: level 0 brick 0, and level 2 brick 0 (Voxels 0..=31).
+        assert_eq!(store.voxel_at(0, VoxelCoord([3, 3, 3])), Some(ROCK));
+        assert_eq!(store.voxel_at(2, VoxelCoord([7, 7, 7])), Some(ROCK));
+        // Not wholly inside: level 0 brick 20 (Voxels 160..), and level 3 brick 4 (Voxels 256..).
+        assert_eq!(store.voxel_at(0, VoxelCoord([160, 0, 0])), None);
+        assert_eq!(store.voxel_at(3, VoxelCoord([32, 0, 0])), None);
+        // The held bricks are only those held: reading as rock does not hold it.
+        assert_eq!(store.get(VoxelCoord([3, 3, 3])), None);
+        assert!(store.is_empty() && store.level(1).unwrap().is_empty());
+    }
+
+    #[test]
+    fn digging_a_brick_out_of_the_interior_shows_in_the_levels_over_it() {
+        let mut store = BrickStore::new();
+        store.set_source(INTERIOR);
+        store.build_lod(2);
+
+        // A level 0 brick dug out to air: an eighth of level 1 brick 0 and of level 2 brick 0,
+        // with the rock of the interior around it.
+        store.insert(BrickCoord([0; 3]), Brick::AIR);
+        let refresh = store.refresh_lod([BrickCoord([0; 3])]);
+        assert_eq!(refresh.remade, 2);
+        assert_eq!(
+            refresh.changed,
+            [(1, BrickCoord([0; 3])), (2, BrickCoord([0; 3]))]
+        );
+        assert_eq!(store.voxel_at(1, VoxelCoord([3, 3, 3])), None);
+        assert_eq!(store.voxel_at(1, VoxelCoord([4, 0, 0])), Some(ROCK));
+        assert_eq!(store.voxel_at(2, VoxelCoord([1, 1, 1])), None);
+        assert_eq!(store.voxel_at(2, VoxelCoord([2, 0, 0])), Some(ROCK));
+
+        // Rock put back: the coarse bricks are held still, but read as they did at first.
+        store.insert(BrickCoord([0; 3]), Brick::solid(ROCK));
+        let refresh = store.refresh_lod([BrickCoord([0; 3])]);
+        assert_eq!(refresh.changed.len(), 2);
+        assert_eq!(store.voxel_at(1, VoxelCoord([3, 3, 3])), Some(ROCK));
+        // Taken away, they are gone, and the pyramid is as bare as when it was built.
+        store.remove(BrickCoord([0; 3]));
+        store.refresh_lod([BrickCoord([0; 3])]);
+        assert!(store.level(1).unwrap().is_empty() && store.level(2).unwrap().is_empty());
+        let mut bare = BrickStore::new();
+        bare.set_source(INTERIOR);
+        bare.build_lod(2);
+        assert_eq!(store.lod_hash(), bare.lod_hash());
+    }
+
+    #[test]
+    fn taking_back_an_edit_leaves_the_pyramid_as_it_was_even_over_the_edge_of_the_interior() {
+        let mut store = BrickStore::new();
+        store.set_source(INTERIOR);
+        store.build_lod(9);
+        let bare = store.lod_hash();
+        // Level 4 and up have coarse bricks that are only partly inside the ball. Digging at
+        // the origin remakes them from the bricks around, which the source says are air.
+        store.insert(BrickCoord([0; 3]), Brick::AIR);
+        let dug = store.refresh_lod([BrickCoord([0; 3])]);
+        assert_eq!(dug.remade, 9);
+        assert_ne!(store.lod_hash(), bare);
+        assert_eq!(store.lod_hash(), rebuilt(&store).lod_hash());
+        store.remove(BrickCoord([0; 3]));
+        let undone = store.refresh_lod([BrickCoord([0; 3])]);
+        assert_eq!(undone.remade, 9);
+        assert_eq!(store.lod_hash(), bare);
+        assert_eq!(dug.changed.len(), undone.changed.len());
+    }
+
+    /// Rock out to `rock` Voxels from the origin. Bricks wholly within `core` are held only if
+    /// `hold_core`.
+    fn planet(rock: i32, core: i32, hold_core: bool) -> BrickStore {
+        let mut store = BrickStore::new();
+        for i in 0..12 * 12 * 12 {
+            let coord = BrickCoord([i % 12 - 6, i / 12 % 12 - 6, i / 144 - 6]);
+            if !hold_core && coord.within_ball(core) {
+                continue;
+            }
+            let mut brick = Brick::AIR;
+            for v in 0..512 {
+                let local = [v & 7, v >> 3 & 7, v >> 6].map(|a| a as u8);
+                let at = coord.voxel(local).0.map(i64::from);
+                if at.iter().map(|a| a * a).sum::<i64>() <= i64::from(rock * rock) {
+                    brick.set(local, Some(ROCK));
+                }
+            }
+            if !brick.is_air() {
+                store.insert(coord, brick);
+            }
+        }
+        store
+    }
+
+    #[test]
+    fn an_interior_with_its_crust_held_makes_the_pyramid_of_a_planet_that_holds_it_all() {
+        // The core and the crust it needs, but not the bricks wholly inside the core.
+        let mut implied = planet(36, 24, false);
+        let core = Interior {
+            radius: 24,
+            material: ROCK,
+        };
+        implied.set_source(core);
+        implied.build_lod(7);
+        let mut whole = planet(36, 24, true);
+        whole.build_lod(7);
+        assert!(whole.len() > implied.len() + 10);
+
+        for level in 1..=7 {
+            let mut coords = whole.level(level).unwrap().sorted_coords();
+            coords.extend(implied.level(level).unwrap().sorted_coords());
+            coords.sort();
+            coords.dedup();
+            assert!(!coords.is_empty());
+            for coord in coords {
+                assert_eq!(
+                    whole.brick_at(level, coord),
+                    implied.brick_at(level, coord),
+                    "level {level} {coord:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn lod_hash_ignores_the_order_the_bricks_were_inserted_in() {
+        let mut backwards = BrickStore::new();
+        for coord in block().sorted_coords().into_iter().rev() {
+            backwards.insert(coord, Brick::solid(ROCK));
+        }
+        let mut forwards = block();
+        forwards.build_lod(3);
+        backwards.build_lod(3);
+        assert_eq!(forwards.lod_hash(), backwards.lod_hash());
+    }
+
+    #[test]
+    fn lod_hash_sees_the_material_in_a_coarse_brick_and_the_number_of_levels() {
+        let hash = |material, levels| {
+            let mut store = BrickStore::new();
+            store.insert(BrickCoord([5, 5, 5]), Brick::solid(Material(material)));
+            store.build_lod(levels);
+            store.lod_hash()
+        };
+        assert_ne!(hash(3, 3), hash(4, 3));
+        assert_ne!(hash(3, 3), hash(3, 2));
     }
 }
