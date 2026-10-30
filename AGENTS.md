@@ -14,4 +14,4 @@ Single-context: one `CONTEXT.md` and `docs/adr/` at the repo root. See `docs/age
 
 ### Benchmarking
 
-PRs that touch rendering or performance get the `needs-benchmark` label; the dev runs `client bench` on the PR's Windows artifact. See `docs/agents/benchmarking.md`.
+PRs that can change GPU timings (shaders, passes, the tracer, GPU uploads) get the `needs-benchmark` label; the dev runs `client bench` on the PR's Windows artifact. CPU-only PRs merge on green CI. See `docs/agents/benchmarking.md`.
