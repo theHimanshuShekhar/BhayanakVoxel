@@ -64,9 +64,17 @@ struct Loaded {
     camera: Camera,
 }
 
-/// Makes the Planet of `map` into what the client starts with: the ground around a spawn on
-/// gentle land, its pyramid, and the rings around the spawn.
-fn load(map: WorldMap, reach: i32) -> Result<Loaded, RingsFull> {
+/// The Planet's ground as the client and the in-process server each hold it, before it is
+/// packed for the GPU.
+struct Ground {
+    store: BrickStore,
+    server_store: BrickStore,
+    camera: Camera,
+}
+
+/// Generates the ground around a spawn on gentle land of the Planet of `map`, with a pyramid of
+/// `levels` levels for the client's copy of it.
+fn generate_ground(map: WorldMap, reach: i32, levels: usize) -> Ground {
     let started = Instant::now();
     let planet = Planet::new(map);
     let ground = planet.spawn(reach);
@@ -79,8 +87,23 @@ fn load(map: WorldMap, reach: i32) -> Result<Loaded, RingsFull> {
     // Generation is deterministic, so the server's Planet is what generating it again would
     // give; copying it is quicker. The server draws nothing, so it needs no coarse levels.
     let server_store = store.clone();
-    store.build_lod(RING_LEVELS - 1);
-    let camera = spawn_camera(ground);
+    store.build_lod(levels - 1);
+    Ground {
+        store,
+        server_store,
+        camera: spawn_camera(ground),
+    }
+}
+
+/// Makes the Planet of `map` into what the client starts with: the ground around a spawn on
+/// gentle land, its pyramid, and the rings around the spawn.
+fn load(map: WorldMap, reach: i32) -> Result<Loaded, RingsFull> {
+    let started = Instant::now();
+    let Ground {
+        store,
+        server_store,
+        camera,
+    } = generate_ground(map, reach, RING_LEVELS);
     let scene = planet_scene(&store, camera.position)?;
     eprintln!("planet ready after {:.1?}", started.elapsed());
     Ok(Loaded {
@@ -131,19 +154,14 @@ struct App {
 }
 
 /// A camera [`SPAWN_HEIGHT`] above `ground`, a point on the Planet's ground, with the horizon
-/// level to the Planet's radial up, heading along the ground towards the +x axis (towards +y
-/// at the poles of x) and pitched down to [`SPAWN_PITCH`].
+/// level to the Planet's radial up, heading along the ground the way
+/// [`planet_gen::planet::tangents`] says, and pitched down to [`SPAWN_PITCH`].
 fn spawn_camera(ground: [f64; 3]) -> Camera {
     let length = ground.iter().map(|c| c * c).sum::<f64>().sqrt();
     let up = ground.map(|c| c / length);
     let position: [f64; 3] = std::array::from_fn(|a| ground[a] + up[a] * SPAWN_HEIGHT);
-    let axis = if up[0].abs() < 0.9 {
-        [1.0, 0.0, 0.0]
-    } else {
-        [0.0, 1.0, 0.0]
-    };
-    let along: f64 = (0..3).map(|a| axis[a] * up[a]).sum();
-    let ahead: [f64; 3] = std::array::from_fn(|a| position[a] + axis[a] - up[a] * along);
+    let (heading, _) = planet_gen::planet::tangents(up);
+    let ahead: [f64; 3] = std::array::from_fn(|a| position[a] + heading[a]);
     let mut camera = Camera::looking_at(position, ahead);
     camera.carry_up(position);
     camera.turn(0.0, SPAWN_PITCH.to_radians() - camera.pitch);
@@ -615,8 +633,9 @@ mod tests {
     }
 
     #[test]
-    fn the_client_loads_a_planet_it_stands_on_land_in_with_the_ground_around_it_in_the_rings() {
-        let loaded = load(WorldMap::generate(SEED, 512), 100).unwrap();
+    fn the_client_generates_a_planet_it_stands_on_land_in_with_the_ground_around_it() {
+        // Ring packing is the renderer's and is tested there; one level is the ground alone.
+        let loaded = generate_ground(WorldMap::generate(SEED, 512), 100, 1);
         let [x, y, z] = loaded.camera.position;
         let up = loaded.camera.horizon_up;
         let feet = |down: f64| {
@@ -624,28 +643,28 @@ mod tests {
                 [x - up[0] * down, y - up[1] * down, z - up[2] * down].map(|c| c.round() as i32),
             )
         };
-        // Standing in air, over ground that is not water, and the first of it is the biome's.
+        // Standing in air, over ground that is not water.
         assert_eq!(loaded.store.voxel_at(0, feet(0.0)), None);
         let below = loaded.store.voxel_at(0, feet(SPAWN_HEIGHT + 3.0));
         assert!(
             below.is_some_and(|m| m != planet_gen::planet::WATER),
             "{below:?}"
         );
-        // The server holds the same ground, and the rings were packed around the camera.
+        // The server holds the same ground.
         assert_eq!(
             loaded.server_store.content_hash(),
             loaded.store.content_hash()
         );
-        assert!(loaded.scene.is_rings());
-        assert!(loaded.scene.used_bytes() > 0);
     }
 
-    /// Takes about 40 seconds in a release build: `cargo test --release -p client -- --ignored`.
+    /// Walks 200 m over the full-size Planet in steps of 1 m, moving the rings at each as the
+    /// client does, and reports how long each move took. Takes about 40 seconds in a release
+    /// build: `cargo test --release -p client -- --ignored --nocapture full_size`.
     #[test]
     #[ignore = "generates the full-size world map"]
-    fn the_full_size_planet_loads_into_the_rings() {
+    fn the_full_size_planet_loads_into_the_rings_and_walking_over_it_does_not_stall() {
         let started = Instant::now();
-        let loaded = load_planet();
+        let mut loaded = load_planet();
         eprintln!(
             "{} bricks held, {} bytes in the rings, camera at {:?}, {:.1?} in all",
             loaded.store.len(),
@@ -654,6 +673,23 @@ mod tests {
             started.elapsed()
         );
         assert!(loaded.scene.is_rings());
+        let (heading, _) = planet_gen::planet::tangents(loaded.camera.horizon_up);
+        let mut position = loaded.camera.position;
+        let (mut worst, mut total, mut moves) =
+            (std::time::Duration::ZERO, std::time::Duration::ZERO, 0);
+        for _ in 0..200 {
+            position = std::array::from_fn(|a| position[a] + heading[a] * 10.0);
+            let started = Instant::now();
+            let moved = loaded.scene.recentre(&loaded.store, position).unwrap();
+            let took = started.elapsed();
+            if moved.is_some() {
+                (worst, total, moves) = (worst.max(took), total + took, moves + 1);
+            }
+        }
+        eprintln!(
+            "200 steps of 1 m: {moves} moves of the rings, longest {worst:.1?}, in all {total:.1?}"
+        );
+        assert!(worst < std::time::Duration::from_millis(500), "{worst:?}");
     }
 
     #[test]

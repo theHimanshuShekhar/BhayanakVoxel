@@ -227,24 +227,25 @@ impl WorldMap {
     /// bounds, since the hull is then not known to be on one face. Cheap, if they are near each
     /// other.
     pub fn elevation_range(&self, directions: &[[f64; 3]]) -> (f64, f64) {
-        let places: Vec<_> = directions.iter().map(|&d| position(self.size, d)).collect();
-        let face = places[0].0;
-        if places.iter().any(|p| p.0 != face) {
-            return (-f64::from(TRENCH), f64::from(PEAK));
+        // The face the directions are on, and the extremes of where they are on it.
+        let mut places = directions.iter().map(|&d| position(self.size, d));
+        let (face, x, y) = places.next().expect("directions must not be empty");
+        let (mut xs, mut ys) = ((x, x), (y, y));
+        for (f, x, y) in places {
+            if f != face {
+                return (-f64::from(TRENCH), f64::from(PEAK));
+            }
+            xs = (xs.0.min(x), xs.1.max(x));
+            ys = (ys.0.min(y), ys.1.max(y));
         }
         // Texel centres are at whole numbers, half a texel in from the edges of `position`. A
         // point is interpolated between the texels from (floor(x), floor(y)) to one more along
         // each.
-        let span = |pick: fn(&(usize, f64, f64)) -> f64| {
-            let (lo, hi) = places
-                .iter()
-                .map(|p| pick(p) - 0.5)
-                .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), v| {
-                    (lo.min(v), hi.max(v))
-                });
+        let span = |(lo, hi): (f64, f64)| {
+            let (lo, hi) = (lo - 0.5, hi - 0.5);
             (lo, hi, lo.floor() as i32, hi.floor() as i32 + 1)
         };
-        let ((x0, x1, i0, i1), (y0, y1, j0, j1)) = (span(|p| p.1), span(|p| p.2));
+        let ((x0, x1, i0, i1), (y0, y1, j0, j1)) = (span(xs), span(ys));
         let texel = |i, j| self.elevation_beyond(face, i, j);
         let (mut low, mut high) = (f64::INFINITY, f64::NEG_INFINITY);
         if i1 - i0 == 1 && j1 - j0 == 1 {

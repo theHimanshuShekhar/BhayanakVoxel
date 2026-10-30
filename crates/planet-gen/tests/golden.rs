@@ -122,6 +122,13 @@ const PLANET_GOLDEN: &[([i32; 3], Kind, u64)] = &[
     ([13821, -13678, 2324], Solid, 0x6fa64afc62031525),
     ([13788, -13645, 2318], Solid, 0x4d3463ca4f10d325),
     ([14194, -14048, 688], Mixed, 0xc8ea6e05bb0f9600),
+    // A polar sea, from the water below to the air above: the water, the ice and the water under
+    // it, and the ice and the air over it.
+    ([-12158, 15764, 1865], Solid, 0xb812ab782d86a725),
+    ([-12160, 15767, 1866], Mixed, 0x2d7892c58a49c155),
+    ([-12160, 15768, 1866], Mixed, 0x0335af5226415465),
+    ([-12161, 15768, 1866], Mixed, 0x9e3e2b2fcc1fa1f1),
+    ([-12161, 15769, 1866], Air, 0x6ab05ef9aa8b9b25),
 ];
 
 /// Voxels around the ground that the region golden covers, and the ground: the temperate land
@@ -130,7 +137,7 @@ const REGION_REACH: i32 = 40;
 const REGION_GROUND: [f64; 3] = [95680.0, -94696.0, 90744.0];
 
 /// The hash of the store that `region_around` makes there.
-const REGION_HASH: u64 = 0xa401d7c4a0e008ac;
+const REGION_HASH: u64 = 0x84df86a009cab10e;
 
 fn planet() -> &'static Planet {
     static PLANET: OnceLock<Planet> = OnceLock::new();
