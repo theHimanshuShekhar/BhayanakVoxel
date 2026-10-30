@@ -159,6 +159,7 @@ mod tests {
     fn the_embedded_budgets_parse_and_hold_the_passes_that_exist() {
         let budgets = Budgets::parse(EMBEDDED).unwrap();
         assert_eq!(budgets.passes["primary"], 1.0, "Primary visibility, #10");
+        assert_eq!(budgets.passes["upscale"], 0.5, "Upscale, #10");
         assert!(budgets.passes.contains_key("reference"));
         assert!(budgets.gpu_total.contains_key("primary"));
     }

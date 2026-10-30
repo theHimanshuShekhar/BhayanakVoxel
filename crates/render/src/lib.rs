@@ -9,6 +9,10 @@
 //! (`shaders/pathtrace.wgsl`), which accumulates samples while nothing changes and is the ground
 //! truth for later lighting techniques. [`accumulation`] decides when it starts over.
 //!
+//! Primary visibility traces at an internal resolution, half of the output's per axis by default,
+//! and writes a G-buffer beside the image; [`upscale`] builds the presented image from it and
+//! from the frames before (TAAU). The reference path tracer needs no upscaling.
+//!
 //! Every pass is timed on the GPU where the device allows ([`Profiler`], [`timing`]), and
 //! [`overlay`] draws those times, with the render settings, as an egui panel. [`DebugView`]s show
 //! one input of the shading at a time.
@@ -28,6 +32,7 @@ mod shaders;
 pub mod sun;
 pub mod timing;
 pub mod tracer;
+pub mod upscale;
 mod window;
 
 use std::error::Error;
@@ -39,6 +44,7 @@ pub use profiler::Profiler;
 pub use scene::{RingsFull, Room, Scene, SceneUpdate};
 pub use sun::Sun;
 pub use timing::Timings;
+pub use upscale::Resolution;
 pub use window::{Mode, Renderer};
 
 pub(crate) type Result<T> = std::result::Result<T, Box<dyn Error>>;

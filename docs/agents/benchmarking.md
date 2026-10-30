@@ -36,7 +36,7 @@ release: a debug build's CPU side is slow enough to distort the frame times.
 | --- | --- |
 | `--out DIR` | Where `report.json` and the screenshots go. Default `bench-out`. |
 | `--budgets FILE` | Use this budgets file instead of the one built into the executable. |
-| `--size WxH` | Resolution of the traced image. Default `1280x720`, which is the internal resolution behind 1440p output that the budgets are for. Do not change it for a report you paste. |
+| `--size WxH` | Resolution of the traced (internal) image. Default `1280x720`, the internal resolution behind 1440p output that the budgets are for; primary mode upscales it to twice that in each direction (2560x1440). Do not change it for a report you paste. |
 | `--short` | A tiny run (160x90, a handful of frames, a patch of the Planet): the CI smoke test. |
 | `--no-fail` | Exit with status 0 even if a pass is over budget. |
 
@@ -58,6 +58,8 @@ file, a bad option).
    tracer, 4 samples per frame of the path). Each mode first draws a few warm-up frames, which are
    not measured: the first frames after a mode switch carry the other mode's state (see the notes
    on #28).
+   Primary mode traces at `config.width` x `config.height` and upscales to `output_*` (passes
+   `primary` and `upscale`); reference mode traces at the traced size, with no upscaling.
 3. Writes a screenshot at each keyframe of the path, per mode.
 
 The camera is a function of the frame index only (keyframes, interpolated in a straight line at
@@ -81,7 +83,8 @@ before reading anything into the times.
                                                // build it is GitHub's merge commit, not the head
   "machine": { "gpu", "device_type", "driver", "driver_info", "backend", "os", "arch",
                "timers_supported" },
-  "config":  { "width", "height", "scene", "path", "keyframes" },
+  "config":  { "width", "height", "output_width", "output_height", "scene", "path", "keyframes" },
+                                               // width, height: traced; output_*: upscaled (primary)
   "modes": {
     "primary":   { "frames", "warmup_frames", "spp", "passes": [ENTRY...], "gpu_total": ENTRY,
                    "frame_time": STATS },
@@ -130,9 +133,9 @@ Anything else in the file, a pass or mode with a zero, negative or non-numeric b
 error: a typo must not silently turn a budget off.
 
 The numbers are the per-stage frame budget of the rendering decision (#10), on the RTX 4090 at
-1440p output. Only `primary` (Primary visibility, 1.0 ms) and the total (8.6 ms) are live today,
-as those are the passes that exist. The later stages (sun shadows 0.4, GI 1.5, reflections 0.7,
-glass 0.7, volumetrics 1.0, denoise 1.0, atmosphere 0.3, upscale 0.5, edits 1.0, post 0.5) are
+1440p output. Only `primary` (Primary visibility, 1.0 ms), `upscale` (the TAAU pass, 0.5 ms) and the total
+(8.6 ms) are live today, as those are the passes that exist. The later stages (sun shadows 0.4, GI 1.5, reflections 0.7,
+glass 0.7, volumetrics 1.0, denoise 1.0, atmosphere 0.3, edits 1.0, post 0.5) are
 in the file as comments: **whoever adds a pass uncomments its budget and names it the same**
 (a pass is named by the string given to `Profiler::compute_pass`). `reference` has no budget in
 #10; its 3.0 ms (a sample, pass and total) catches a gross regression, set from the first real run

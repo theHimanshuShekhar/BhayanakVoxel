@@ -23,7 +23,7 @@ use std::process::ExitCode;
 use std::time::Instant;
 
 use brick_store::{BrickCoord, BrickStore};
-use render::{Camera, Image, Mode, Offscreen, Scene};
+use render::{Camera, Image, Mode, Offscreen, Resolution, Scene};
 
 use args::{Args, Parsed, USAGE};
 use budget::{Budgets, Status};
@@ -34,6 +34,8 @@ const REPORT_FILE: &str = "report.json";
 
 /// How much of the path to draw, how, and on what.
 struct Plan {
+    /// The traced (internal) resolution. The image presented is twice as big in each direction:
+    /// 2560x1440 for the default 1280x720.
     width: u32,
     height: u32,
     /// The test Planet, or `--short`'s patch of it.
@@ -168,7 +170,11 @@ fn run(args: &Args) -> Result<u8, Box<dyn Error>> {
     };
     eprintln!("scene ready after {:.1?}", started.elapsed());
 
-    let mut gpu = Offscreen::new(plan.width, plan.height, &flight.scene)?;
+    let resolution = Resolution {
+        internal: (plan.width, plan.height),
+        output: (plan.width * 2, plan.height * 2),
+    };
+    let mut gpu = Offscreen::with_resolution(resolution, &flight.scene)?;
     eprintln!(
         "the Planet takes {:.1} MiB of GPU memory",
         gpu.scene_bytes() as f64 / (1024.0 * 1024.0)
@@ -226,6 +232,8 @@ fn run(args: &Args) -> Result<u8, Box<dyn Error>> {
         config: Config {
             width: plan.width,
             height: plan.height,
+            output_width: resolution.output.0,
+            output_height: resolution.output.1,
             scene: if plan.patch { "patch" } else { "planet" }.to_string(),
             path: plan.path_name.to_string(),
             keyframes: plan.path.keyframes(),
@@ -294,7 +302,7 @@ impl Flight {
 
 fn draw(gpu: &mut Offscreen, mode: Mode, camera: &Camera, spp: u32) -> Image {
     match mode {
-        Mode::Primary => gpu.render(camera),
+        Mode::Primary => gpu.render_upscaled(camera),
         Mode::Reference => gpu.render_reference(camera, spp),
     }
 }

@@ -21,6 +21,9 @@ primary = 1.0
 # mean of 1.10 ms a sample, p95 2.69 ms.
 reference = 3.0
 
+# TAAU (#51): the upscale pass builds the 1440p image from the 1280x720 one and its history.
+upscale = 0.5
+
 # M1 stages from #10, for when the passes exist (the names are suggestions):
 # shadows      = 0.4   # sun shadows, 1 ray/px
 # gi           = 1.5   # GI bounce and radiance cache
@@ -29,7 +32,6 @@ reference = 3.0
 # volumetrics  = 1.0
 # denoise      = 1.0
 # atmosphere   = 0.3
-# upscale      = 0.5
 # edits        = 1.0   # Edits and BVH updates
 # post         = 0.5   # post-processing and UI (the window's blit and overlay passes are not
 #                      # run by the offscreen bench)

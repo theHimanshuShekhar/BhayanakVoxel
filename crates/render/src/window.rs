@@ -7,12 +7,14 @@ use crate::scene::{Scene, SceneUpdate};
 use crate::sun::Sun;
 use crate::timing::Timings;
 use crate::tracer::{Target, Tracer};
+use crate::upscale::{DEFAULT_SCALE, Resolution};
 use crate::{Result, create_instance, request_gpu, shaders};
 
 /// How the Planet is drawn.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Mode {
-    /// Primary visibility, shaded by normal and albedo: cheap and noise-free.
+    /// Primary visibility, shaded by normal and albedo: cheap and noise-free. It is traced at
+    /// a share of the window's size and upscaled over the frames.
     #[default]
     Primary,
     /// The reference path tracer: while nothing changes, samples accumulate without limit and
@@ -31,11 +33,15 @@ pub struct Renderer {
     /// Paints egui's output over the image.
     gui: egui_wgpu::Renderer,
     target: Target,
+    /// The share of the window's width and height that primary visibility traces.
+    scale: f32,
     mode: Mode,
     sun: Sun,
     blit: wgpu::RenderPipeline,
     blit_layout: wgpu::BindGroupLayout,
-    blit_group: wgpu::BindGroup,
+    blit_sampler: wgpu::Sampler,
+    /// What `blit` copies in each mode: the upscaled image, and the reference image.
+    blit_groups: [wgpu::BindGroup; 2],
 }
 
 impl Renderer {
@@ -65,16 +71,30 @@ impl Renderer {
         let gui = egui_wgpu::Renderer::new(&device, config.format, Default::default());
         let blit_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("blit"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Texture {
-                    sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                    view_dimension: wgpu::TextureViewDimension::D2,
-                    multisampled: false,
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
                 },
-                count: None,
-            }],
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+        let blit_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("blit"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
         });
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("blit"),
@@ -106,8 +126,12 @@ impl Renderer {
             multiview_mask: None,
             cache: None,
         });
-        let (target, blit_group) =
-            Self::create_target(&device, &blit_layout, config.width, config.height);
+        let (target, blit_groups) = Self::create_target(
+            &device,
+            &blit_layout,
+            &blit_sampler,
+            Resolution::scaled((config.width, config.height), DEFAULT_SCALE),
+        );
         Ok(Self {
             surface,
             config,
@@ -117,30 +141,41 @@ impl Renderer {
             profiler,
             gui,
             target,
+            scale: DEFAULT_SCALE,
             mode: Mode::default(),
             sun: Sun::default(),
             blit,
             blit_layout,
-            blit_group,
+            blit_sampler,
+            blit_groups,
         })
     }
 
     fn create_target(
         device: &wgpu::Device,
         layout: &wgpu::BindGroupLayout,
-        width: u32,
-        height: u32,
-    ) -> (Target, wgpu::BindGroup) {
-        let target = Target::new(device, width, height);
-        let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("blit"),
-            layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: wgpu::BindingResource::TextureView(target.view()),
-            }],
-        });
-        (target, group)
+        sampler: &wgpu::Sampler,
+        resolution: Resolution,
+    ) -> (Target, [wgpu::BindGroup; 2]) {
+        let target = Target::new(device, resolution);
+        let group = |view| {
+            device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("blit"),
+                layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(sampler),
+                    },
+                ],
+            })
+        };
+        let groups = [group(&target.image().view), group(&target.lit().view)];
+        (target, groups)
     }
 
     /// Replaces the Planet being drawn. A new Planet starts the reference image over.
@@ -206,7 +241,7 @@ impl Renderer {
         self.tracer.samples()
     }
 
-    /// Reconfigures the surface and the traced image. Zero-sized windows (minimised) are ignored.
+    /// Reconfigures the surface and the images. Zero-sized windows (minimised) are ignored.
     pub fn resize(&mut self, width: u32, height: u32) {
         if width == 0 || height == 0 {
             return;
@@ -214,8 +249,32 @@ impl Renderer {
         self.config.width = width;
         self.config.height = height;
         self.surface.configure(&self.device, &self.config);
-        (self.target, self.blit_group) =
-            Self::create_target(&self.device, &self.blit_layout, width, height);
+        self.recreate_target();
+    }
+
+    /// The share of the window's width and height that primary visibility traces.
+    pub fn render_scale(&self) -> f32 {
+        self.scale
+    }
+
+    /// Traces primary visibility at `scale` of the window's width and height (0.5 is the default,
+    /// 1.0 traces every pixel); the upscaler fills in the rest. The reference path tracer always
+    /// traces every pixel of the window.
+    pub fn set_render_scale(&mut self, scale: f32) {
+        if scale.is_finite() && scale > 0.0 && scale != self.scale {
+            self.scale = scale;
+            self.recreate_target();
+        }
+    }
+
+    fn recreate_target(&mut self) {
+        let resolution = Resolution::scaled((self.config.width, self.config.height), self.scale);
+        (self.target, self.blit_groups) = Self::create_target(
+            &self.device,
+            &self.blit_layout,
+            &self.blit_sampler,
+            resolution,
+        );
         self.tracer.reset_accumulation();
     }
 
@@ -262,7 +321,7 @@ impl Renderer {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
         self.profiler.begin_frame();
         match self.mode {
-            Mode::Primary => self.tracer.encode_primary(
+            Mode::Primary => self.tracer.encode_upscaled(
                 &self.device,
                 &self.queue,
                 &mut self.profiler,
@@ -290,7 +349,11 @@ impl Renderer {
                 &color_attachment(&view, wgpu::LoadOp::Clear(wgpu::Color::BLACK)),
             );
             pass.set_pipeline(&self.blit);
-            pass.set_bind_group(0, &self.blit_group, &[]);
+            let shown = match self.mode {
+                Mode::Primary => 0,
+                Mode::Reference => 1,
+            };
+            pass.set_bind_group(0, &self.blit_groups[shown], &[]);
             pass.draw(0..3, 0..1);
         }
         let mut commands = Vec::new();

@@ -160,8 +160,12 @@ pub struct Machine {
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct Config {
+    /// The traced (internal) resolution: what primary and reference mode trace.
     pub width: u32,
     pub height: u32,
+    /// The resolution of the image primary mode presents, upscaled from the traced one.
+    pub output_width: u32,
+    pub output_height: u32,
     /// `planet` is the whole test Planet; `patch` the cut of it near the pole that `--short` uses.
     pub scene: String,
     /// The camera path, which has a version in its name: the same name is the same flight.
@@ -317,6 +321,8 @@ mod tests {
             config: Config {
                 width: 64,
                 height: 36,
+                output_width: 128,
+                output_height: 72,
                 scene: "patch".into(),
                 path: "flyover".into(),
                 keyframes: 3,
