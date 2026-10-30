@@ -19,8 +19,9 @@ the Planet is Voxels all the way through, down to 10 cm, and every one of them i
 
 ## What makes it different
 
-- **One planet, no map borders.** A single sphere of Voxels, 10 cm across each, with caves and an
-  editable surface. Dig a crater locally and it is still there when you zoom out to orbit.
+- **One planet, no map borders.** A single sphere of Voxels, 10 cm across each, with an editable
+  surface. Edits propagate through the LOD pyramid, so a crater dug up close stays visible from
+  orbit.
 - **Continuous Zoom.** The camera pulls back from first/third person to a full view of the Planet
   without a separate map view or a load screen.
 - **Sparse 8³ Bricks, not an octree.** Each brick stores a 512-bit occupancy mask plus
