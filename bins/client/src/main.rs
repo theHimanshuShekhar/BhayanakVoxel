@@ -10,6 +10,8 @@ use std::time::Instant;
 
 use brick_store::BrickStore;
 use fly::{Action, Fly};
+use planet_gen::planet::Planet;
+use planet_gen::world_map::{WORLD_MAP_SIZE, WORLD_RADIUS, WorldMap};
 use render::overlay::{self, Controls, SceneMemory};
 use render::{Camera, Mode, Renderer, RingsFull, Scene, SceneUpdate, Sun};
 use sim::{Predictor, ServerHandle};
@@ -27,10 +29,17 @@ const SEED: u64 = 0xB4A7_A9AC;
 const MAX_FRAME_TIME: f64 = 0.1;
 
 const TITLE: &str = "BhayanakVoxel";
-/// Degrees below the horizon the client spawns looking: the Planet's limb is then about 27
-/// degrees below the middle of the view, and 60 is far from the pitch limit, so turning left and
-/// right does not spin the view about its middle.
-const SPAWN_PITCH: f64 = -60.0;
+/// Degrees below the horizon the client spawns looking: well short of the pitch limit, so that
+/// turning left and right does not spin the view about its middle.
+const SPAWN_PITCH: f64 = -25.0;
+/// How far above the ground the client spawns, in Voxels: 4 m.
+const SPAWN_HEIGHT: f64 = 40.0;
+/// Voxels from the spawn point that the client generates the Planet's ground to, along the
+/// ground (see [`Planet::region_around`]). Beyond it the rings draw the ground only where it is
+/// generated on demand, a ring's width from the camera, and otherwise only the deep rock and the
+/// core, until the Planet can be streamed (#47, #49): the test Planet's 2.6 million bricks of
+/// ground took 20 seconds, and this Planet has ten thousand times the ground.
+const SPAWN_REACH: i32 = 640;
 
 /// Radians the sun turns per arrow key press (and per repeat while it is held).
 const SUN_STEP: f32 = 0.05;
@@ -40,28 +49,30 @@ const SUN_STEP: f32 = 0.05;
 /// distance of the spawn point.
 const RING_LEVELS: usize = 7;
 
-/// The test Planet's bricks packed for the GPU as rings around `camera`. The store must have its
-/// pyramid ([`RING_LEVELS`] of it), and its source gives the rock core.
+/// A Planet's bricks packed for the GPU as rings around `camera`. The store must have its
+/// pyramid ([`RING_LEVELS`] of it); its source gives the bricks it does not hold.
 fn planet_scene(store: &BrickStore, camera: [f64; 3]) -> Result<Scene, RingsFull> {
     Scene::rings(store, camera, RING_LEVELS)
 }
 
-/// The test Planet as the client and the in-process server each hold it, and the client's packed
-/// copy of it.
+/// The Planet as the client and the in-process server each hold it, the client's packed copy of
+/// it, and where the client starts.
 struct Loaded {
     store: BrickStore,
     server_store: BrickStore,
     scene: Scene,
+    camera: Camera,
 }
 
-/// Generates the test Planet and packs it for the GPU. This takes about 25 seconds on eight
-/// cores in a release build (several times that in debug), so it runs on its own threads while
-/// the window is already up.
-fn load_planet() -> Loaded {
+/// Makes the Planet of `map` into what the client starts with: the ground around a spawn on
+/// gentle land, its pyramid, and the rings around the spawn.
+fn load(map: WorldMap, reach: i32) -> Result<Loaded, RingsFull> {
     let started = Instant::now();
-    let mut store = planet_gen::generate_planet(SEED);
+    let planet = Planet::new(map);
+    let ground = planet.spawn(reach);
+    let mut store = planet.region_around(ground, reach);
     eprintln!(
-        "generated {} bricks in {:.1?}",
+        "generated {} bricks around the spawn in {:.1?}",
         store.len(),
         started.elapsed()
     );
@@ -69,14 +80,25 @@ fn load_planet() -> Loaded {
     // give; copying it is quicker. The server draws nothing, so it needs no coarse levels.
     let server_store = store.clone();
     store.build_lod(RING_LEVELS - 1);
-    let scene = planet_scene(&store, spawn_camera().position)
-        .expect("the test Planet fits the rings' buffers");
+    let camera = spawn_camera(ground);
+    let scene = planet_scene(&store, camera.position)?;
     eprintln!("planet ready after {:.1?}", started.elapsed());
-    Loaded {
+    Ok(Loaded {
         store,
         server_store,
         scene,
-    }
+        camera,
+    })
+}
+
+/// Generates the Planet and packs it for the GPU. The world map takes about 25 seconds on eight
+/// cores in a release build (several times that in debug), so this runs on its own threads while
+/// the window is already up.
+fn load_planet() -> Loaded {
+    let started = Instant::now();
+    let map = WorldMap::generate(SEED, WORLD_MAP_SIZE);
+    eprintln!("world map generated in {:.1?}", started.elapsed());
+    load(map, SPAWN_REACH).expect("the ground around the spawn fits the rings' buffers")
 }
 
 /// The debug overlay's egui state. While it is hidden, none of it runs.
@@ -108,12 +130,21 @@ struct App {
     error: Option<Box<dyn Error>>,
 }
 
-/// Far enough out to see the whole Planet (radius 1500 Voxels), with the horizon level to the
-/// Planet's radial up, heading towards it and pitched down so that its limb shows as a level arc
-/// below the middle of the view.
-fn spawn_camera() -> Camera {
-    let position = [0.0, 400.0, 3400.0];
-    let mut camera = Camera::looking_at(position, [0.0; 3]);
+/// A camera [`SPAWN_HEIGHT`] above `ground`, a point on the Planet's ground, with the horizon
+/// level to the Planet's radial up, heading along the ground towards the +x axis (towards +y
+/// at the poles of x) and pitched down to [`SPAWN_PITCH`].
+fn spawn_camera(ground: [f64; 3]) -> Camera {
+    let length = ground.iter().map(|c| c * c).sum::<f64>().sqrt();
+    let up = ground.map(|c| c / length);
+    let position: [f64; 3] = std::array::from_fn(|a| ground[a] + up[a] * SPAWN_HEIGHT);
+    let axis = if up[0].abs() < 0.9 {
+        [1.0, 0.0, 0.0]
+    } else {
+        [0.0, 1.0, 0.0]
+    };
+    let along: f64 = (0..3).map(|a| axis[a] * up[a]).sum();
+    let ahead: [f64; 3] = std::array::from_fn(|a| position[a] + axis[a] - up[a] * along);
+    let mut camera = Camera::looking_at(position, ahead);
     camera.carry_up(position);
     camera.turn(0.0, SPAWN_PITCH.to_radians() - camera.pitch);
     camera
@@ -133,7 +164,8 @@ impl App {
             loading: Some(receiver),
             world: None,
             server: None,
-            camera: spawn_camera(),
+            // Until the Planet arrives there is only sky to look at, wherever from.
+            camera: spawn_camera([0.0, 0.0, f64::from(WORLD_RADIUS)]),
             fly: Fly::default(),
             sun: Sun::default().angles(),
             title: String::new(),
@@ -182,6 +214,7 @@ impl App {
         match receiver.try_recv() {
             Ok(loaded) => {
                 self.loading = None;
+                self.camera = loaded.camera;
                 if let Some(renderer) = &mut self.renderer {
                     renderer.set_scene(&loaded.scene)?;
                 }
@@ -552,22 +585,75 @@ fn main() -> Result<ExitCode, Box<dyn Error>> {
 mod tests {
     use std::f32::consts::{FRAC_PI_2, PI};
 
+    use brick_store::VoxelCoord;
+
     use super::*;
 
+    fn dot(a: [f64; 3], b: [f64; 3]) -> f64 {
+        (0..3).map(|i| a[i] * b[i]).sum()
+    }
+
     #[test]
-    fn the_client_spawns_pitched_down_with_the_planet_in_view_and_a_level_horizon() {
-        let camera = spawn_camera();
-        assert_eq!(camera.position, [0.0, 400.0, 3400.0]);
-        let radial = camera.position.map(|c| c / 3400.0_f64.hypot(400.0));
-        let dot = |a: [f64; 3], b: [f64; 3]| (0..3).map(|i| a[i] * b[i]).sum::<f64>();
-        // Level: no roll relative to the Planet's horizon.
-        assert!(dot(camera.right(), radial).abs() < 1e-12);
-        // Pitched 60 degrees below the horizon, clearly short of the 89 degree clamp.
-        assert!((dot(camera.forward(), radial) - (-60.0_f64).to_radians().sin()).abs() < 1e-12);
-        // The Planet's centre is straight down, 30 degrees from the middle of the view: inside
-        // the 35 degree half field of view.
-        let to_centre = dot(camera.forward(), radial.map(|c| -c)).acos();
-        assert!(to_centre < camera.fov_y / 2.0, "{to_centre}");
+    fn the_client_spawns_above_the_ground_pitched_down_with_a_level_horizon() {
+        for ground in [
+            [0.0, 0.0, 160_300.0],
+            [-93_000.0, 90_000.0, 94_000.0],
+            [160_400.0, 0.0, 0.0],
+        ] {
+            let camera = spawn_camera(ground);
+            let length = dot(ground, ground).sqrt();
+            let radial = ground.map(|c| c / length);
+            // Four metres up.
+            let height = dot(camera.position, radial) - length;
+            assert!((height - SPAWN_HEIGHT).abs() < 1e-6, "{height}");
+            // Level: no roll relative to the Planet's horizon.
+            assert!(dot(camera.right(), radial).abs() < 1e-9);
+            // Pitched down, short of the 89 degree clamp.
+            let pitch = dot(camera.forward(), radial).asin().to_degrees();
+            assert!((pitch - SPAWN_PITCH).abs() < 1e-6, "{pitch}");
+        }
+    }
+
+    #[test]
+    fn the_client_loads_a_planet_it_stands_on_land_in_with_the_ground_around_it_in_the_rings() {
+        let loaded = load(WorldMap::generate(SEED, 512), 100).unwrap();
+        let [x, y, z] = loaded.camera.position;
+        let up = loaded.camera.horizon_up;
+        let feet = |down: f64| {
+            VoxelCoord(
+                [x - up[0] * down, y - up[1] * down, z - up[2] * down].map(|c| c.round() as i32),
+            )
+        };
+        // Standing in air, over ground that is not water, and the first of it is the biome's.
+        assert_eq!(loaded.store.voxel_at(0, feet(0.0)), None);
+        let below = loaded.store.voxel_at(0, feet(SPAWN_HEIGHT + 3.0));
+        assert!(
+            below.is_some_and(|m| m != planet_gen::planet::WATER),
+            "{below:?}"
+        );
+        // The server holds the same ground, and the rings were packed around the camera.
+        assert_eq!(
+            loaded.server_store.content_hash(),
+            loaded.store.content_hash()
+        );
+        assert!(loaded.scene.is_rings());
+        assert!(loaded.scene.used_bytes() > 0);
+    }
+
+    /// Takes about 40 seconds in a release build: `cargo test --release -p client -- --ignored`.
+    #[test]
+    #[ignore = "generates the full-size world map"]
+    fn the_full_size_planet_loads_into_the_rings() {
+        let started = Instant::now();
+        let loaded = load_planet();
+        eprintln!(
+            "{} bricks held, {} bytes in the rings, camera at {:?}, {:.1?} in all",
+            loaded.store.len(),
+            loaded.scene.used_bytes(),
+            loaded.camera.position,
+            started.elapsed()
+        );
+        assert!(loaded.scene.is_rings());
     }
 
     #[test]
