@@ -38,6 +38,23 @@ struct Mixed {
     indices: Vec<u8>,
 }
 
+/// Bricks are equal when every Voxel is, whatever their palette layout. A mixed brick is never
+/// uniform, since `set` collapses one that is, so a mixed brick is never equal to a flag.
+impl PartialEq for Brick {
+    fn eq(&self, other: &Self) -> bool {
+        match (&self.0, &other.0) {
+            (Repr::Air, Repr::Air) => true,
+            (Repr::Solid(a), Repr::Solid(b)) => a == b,
+            (Repr::Mixed(a), Repr::Mixed(b)) => {
+                a.occupancy == b.occupancy && (0..BRICK_VOXELS).all(|i| a.get(i) == b.get(i))
+            }
+            _ => false,
+        }
+    }
+}
+
+impl Eq for Brick {}
+
 /// Read-only view of how a brick is stored, for uploading it elsewhere (e.g. to the GPU).
 #[derive(Clone, Copy, Debug)]
 pub enum BrickView<'a> {
@@ -334,6 +351,55 @@ mod tests {
         let mut b = Brick::AIR;
         b.set([1, 2, 3], None);
         assert!(b.is_uniform());
+    }
+
+    #[test]
+    fn bricks_with_the_same_voxels_are_equal_whatever_order_they_were_written_in() {
+        // Different palette order, and so different index layout, for the same content.
+        let voxels = [
+            ([0, 0, 0], 5),
+            ([1, 0, 0], 6),
+            ([2, 0, 0], 7),
+            ([3, 3, 3], 5),
+        ];
+        let (mut forwards, mut backwards) = (Brick::AIR, Brick::AIR);
+        for &(at, id) in &voxels {
+            forwards.set(at, Some(Material(id)));
+        }
+        for &(at, id) in voxels.iter().rev() {
+            backwards.set(at, Some(Material(id)));
+        }
+        let palette = |b: &Brick| match b.view() {
+            BrickView::Mixed { palette, .. } => palette.to_vec(),
+            _ => unreachable!("the brick is mixed"),
+        };
+        assert_ne!(palette(&forwards), palette(&backwards));
+        assert_eq!(forwards, backwards);
+        // Overwriting leaves an unused palette entry behind, which does not matter either.
+        let mut overwritten = forwards.clone();
+        overwritten.set([1, 0, 0], Some(Material(9)));
+        overwritten.set([1, 0, 0], Some(Material(6)));
+        assert_eq!(overwritten, forwards);
+    }
+
+    #[test]
+    fn bricks_with_different_voxels_are_not_equal() {
+        let mut base = Brick::AIR;
+        base.set([1, 2, 3], Some(ROCK));
+        let mut other_material = Brick::AIR;
+        other_material.set([1, 2, 3], Some(Material(8)));
+        let mut other_place = Brick::AIR;
+        other_place.set([1, 2, 4], Some(ROCK));
+        let mut extra = base.clone();
+        extra.set([5, 5, 5], Some(ROCK));
+        for other in [&other_material, &other_place, &extra, &Brick::AIR] {
+            assert_ne!(&base, other);
+        }
+        // A flag is never equal to a mixed brick, nor air to a solid one.
+        assert_ne!(Brick::AIR, Brick::solid(ROCK));
+        assert_ne!(Brick::solid(ROCK), Brick::solid(Material(8)));
+        assert_eq!(Brick::solid(ROCK), Brick::solid(ROCK));
+        assert_ne!(Brick::solid(ROCK), base);
     }
 
     #[test]
