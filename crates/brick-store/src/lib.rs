@@ -2,8 +2,10 @@
 
 mod brick;
 mod coord;
+mod lod;
 mod store;
 
 pub use brick::{BRICK_VOXELS, Brick, BrickView, Material};
 pub use coord::{BRICK_SIZE, BrickCoord, LocalCoord, VoxelCoord};
-pub use store::BrickStore;
+pub use lod::{BrickSource, Interior};
+pub use store::{BrickStore, LodRefresh};
