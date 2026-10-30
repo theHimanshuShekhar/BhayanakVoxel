@@ -7,9 +7,12 @@ dev's RTX 4090.
 
 ## The `needs-benchmark` label
 
-- **Agents** add `needs-benchmark` to every PR that touches rendering (shaders, passes, the
-  tracer, the scene's GPU layout) or anything performance-sensitive (planet generation, brick
-  packing, the sim hot path), and say in the PR body which passes are expected to change.
+- **Agents** add `needs-benchmark` to every PR that can change GPU timings: shaders, passes, the
+  tracer, the scene's GPU layout, or what is uploaded to the GPU and how much of it. They say in
+  the PR body which passes are expected to change.
+- **CPU-only PRs do not get the label**, even when they are performance-sensitive (planet
+  generation, brick packing, the sim hot path): the bench measures GPU passes, so it cannot see
+  them. Their throughput is guarded by CI targets and tests instead, and they merge on green CI.
 - **The dev** downloads the PR's `client-windows` artifact, runs the bench on the RTX 4090
   (below), and pastes `report.json` into a PR comment, together with a screenshot or two.
 - **A pass over its budget blocks the merge** (#13). The dev removes the label once the report is
