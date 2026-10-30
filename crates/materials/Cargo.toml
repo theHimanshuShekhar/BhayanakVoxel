@@ -1,0 +1,12 @@
+[package]
+name = "materials"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+brick-store.workspace = true
+# TOML is the data file's format, and serde reads it into the table. Neither touches the GPU, so
+# the server can link this crate. `toml` is configured as in the client's bench budgets.
+serde = { version = "1.0.229", features = ["derive"] }
+toml = { version = "1.1.6", default-features = false, features = ["std", "serde", "parse"] }

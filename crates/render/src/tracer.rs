@@ -3,11 +3,13 @@
 //! code path the window does.
 
 use bytemuck::{Pod, Zeroable};
+use materials::MaterialTable;
 use wgpu::util::DeviceExt;
 
 use crate::accumulation::Accumulator;
 use crate::camera::{Camera, CameraUniform};
 use crate::debug_view::DebugView;
+use crate::gpu_materials;
 use crate::profiler::Profiler;
 use crate::reference::{Hit, Ray};
 use crate::scene::{REGION_WORDS, Scene, SceneUpdate, spare_words};
@@ -94,6 +96,8 @@ pub struct Tracer {
     scene_layout: wgpu::BindGroupLayout,
     camera_buffer: wgpu::Buffer,
     frame_buffer: wgpu::Buffer,
+    /// The Material table (see [`gpu_materials`]), which nothing changes after the upload.
+    materials: wgpu::Buffer,
     camera_layout: wgpu::BindGroupLayout,
     primary: wgpu::ComputePipeline,
     reference: wgpu::ComputePipeline,
@@ -244,7 +248,7 @@ impl SceneBuffers {
 }
 
 impl Tracer {
-    /// Uploads `scene` and builds the pipelines.
+    /// Uploads `scene` and the built-in Material table, and builds the pipelines.
     pub fn new(device: &wgpu::Device, scene: &Scene) -> Result<Self> {
         let scene_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("scene"),
@@ -259,7 +263,7 @@ impl Tracer {
         let scene_buffers = SceneBuffers::new(device, &scene_layout, scene)?;
 
         let camera_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("camera, image and accumulation"),
+            label: Some("camera, image, accumulation and materials"),
             entries: &[
                 layout_entry(0, buffer_binding(wgpu::BufferBindingType::Uniform)),
                 layout_entry(
@@ -275,7 +279,13 @@ impl Tracer {
                     3,
                     buffer_binding(wgpu::BufferBindingType::Storage { read_only: false }),
                 ),
+                layout_entry(4, buffer_binding(STORAGE_READ)),
             ],
+        });
+        let materials = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("materials"),
+            contents: bytemuck::cast_slice(&gpu_materials::pack(MaterialTable::built_in())),
+            usage: wgpu::BufferUsages::STORAGE,
         });
         let camera_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("camera"),
@@ -310,6 +320,7 @@ impl Tracer {
             scene_layout,
             camera_buffer,
             frame_buffer,
+            materials,
             camera_layout,
             primary,
             reference,
@@ -482,7 +493,7 @@ impl Tracer {
         target: &Target,
     ) {
         let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("camera, image and accumulation"),
+            label: Some("camera, image, accumulation and materials"),
             layout: &self.camera_layout,
             entries: &[
                 wgpu::BindGroupEntry {
@@ -500,6 +511,10 @@ impl Tracer {
                 wgpu::BindGroupEntry {
                     binding: 3,
                     resource: target.accum.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: self.materials.as_entire_binding(),
                 },
             ],
         });

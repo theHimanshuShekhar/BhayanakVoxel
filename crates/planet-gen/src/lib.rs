@@ -266,6 +266,15 @@ mod tests {
         }
     }
 
+    /// Worlds already generated hold these ids; changing what they mean needs a
+    /// `GENERATOR_VERSION` bump and new golden hashes.
+    #[test]
+    fn rock_and_soil_are_materials_of_the_shared_table() {
+        let table = materials::MaterialTable::built_in();
+        assert_eq!(table.get(ROCK).map(|d| d.name.as_str()), Some("rock"));
+        assert_eq!(table.get(SOIL).map(|d| d.name.as_str()), Some("soil"));
+    }
+
     #[test]
     fn the_centre_is_uniform_rock_and_far_space_is_air() {
         let core = generate_brick(SEED, BrickCoord([0, 0, 0]));

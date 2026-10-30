@@ -5,22 +5,26 @@ use brick_store::{BrickStore, Material, VoxelCoord};
 use render::{Camera, Offscreen, Scene, Sun};
 
 const STONE: Material = Material(1);
-/// `albedo(1)` in `common.wgsl`.
+/// Rock in `materials.toml`.
 const STONE_ALBEDO: [f32; 3] = [0.45, 0.43, 0.40];
 /// `SUN_RADIANCE` in `pathtrace.wgsl`.
 const SUN_RADIANCE: [f32; 3] = [1.6, 1.5, 1.35];
 
-/// A flat floor of stone: Voxels y -8..=-1 (the top face is at y = 0), x and z -64..=63.
-fn floor() -> Scene {
+/// A flat floor of `material`: Voxels y -8..=-1 (the top face is at y = 0), x and z -64..=63.
+fn floor_of(material: Material) -> Scene {
     let mut store = BrickStore::new();
     for x in -64..64 {
         for z in -64..64 {
             for y in -8..0 {
-                store.set(VoxelCoord([x, y, z]), Some(STONE));
+                store.set(VoxelCoord([x, y, z]), Some(material));
             }
         }
     }
     Scene::new(&store, None)
+}
+
+fn floor() -> Scene {
+    floor_of(STONE)
 }
 
 /// 20 Voxels above the floor, looking straight down.
@@ -158,4 +162,22 @@ fn more_samples_make_a_smoother_image() {
         squares / f64::from(image.width * image.height)
     };
     assert!(spread(64) < 0.25 * spread(2));
+}
+
+#[test]
+fn a_light_source_adds_its_emission_to_what_it_reflects() {
+    // The sun is below the horizon, so only the sky lights the floor: the light leaving it is
+    // what it emits plus its albedo times the sky it sees (at most 0.92 here, the sky's brightest
+    // channel, which the floor reflects only a part of).
+    let table = materials::MaterialTable::built_in();
+    let moss = table.by_name("glowing moss").unwrap();
+    let emitted = f64::from(moss.emissive[0] * moss.emissive_intensity);
+    let reflected = f64::from(moss.colour[0]) * 0.92;
+    let mut offscreen = Offscreen::new(32, 32, &floor_of(Material(moss.id))).unwrap();
+    offscreen.set_sun(Sun::from_angles(0.0, -0.5, 0.02));
+    let got = mean_linear(&offscreen.render_reference(&overhead(), 32))[0];
+    assert!(
+        got >= emitted - 0.02 && got <= emitted + reflected,
+        "{got} is not {emitted} plus up to {reflected}"
+    );
 }

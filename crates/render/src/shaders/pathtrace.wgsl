@@ -4,6 +4,7 @@
 // A sample follows a path from the camera. At every hit on a Lambertian surface it:
 //   - adds the sun's light, by next-event estimation: a shadow ray to a random point on the
 //     sun's disc, which counts if nothing is in the way;
+//   - adds the light the Material itself gives off;
 //   - continues in a cosine-weighted random direction, so the throughput is just the albedo.
 // A path that escapes collects the sky. The sun is not part of the sky, so it is never counted
 // twice. Every ray goes through trace(), the only thing that knows about the Planet's storage.
@@ -49,7 +50,10 @@ fn radiance(first: Ray, rng: ptr<function, u32>) -> vec3<f32> {
             light += throughput * sky(ray.dir);
             break;
         }
+        // The Material's plain colour, not its per-Voxel variation, so that the image converges
+        // to something that can be worked out from the table alone.
         let colour = albedo(hit.material);
+        light += throughput * emission(hit.material);
 
         let to_sun = sample_cone(frame.sun.xyz, frame.sun.w, vec2<f32>(next_f32(rng), next_f32(rng)));
         let facing = dot(hit.normal, to_sun);
