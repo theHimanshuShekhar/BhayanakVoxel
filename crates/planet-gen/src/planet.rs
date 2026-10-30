@@ -192,6 +192,7 @@ struct Samples {
 impl Samples {
     /// The samples of the brick at `coord` of mip `level`, which is below 32.
     fn new(level: usize, coord: BrickCoord) -> Samples {
+        debug_assert!(level < 32);
         let size = f64::from(1u32 << level);
         let width = f64::from(BRICK_SIZE) * size;
         Samples {
@@ -1118,16 +1119,76 @@ mod tests {
 
     #[test]
     fn a_coarse_brick_over_the_ground_is_the_planets_downsampled_but_for_a_few_voxels() {
-        for level in 1..=4 {
+        for level in 1..=3 {
             assert!(differing(level) <= TOLERANCE[level - 1], "level {level}");
         }
     }
 
     #[test]
-    #[ignore = "takes several minutes: it downsamples 8^7 bricks for each coarse brick"]
+    #[ignore = "takes minutes: it downsamples 8^4 to 8^7 bricks for each coarse brick"]
     fn a_coarser_brick_over_the_ground_is_the_planets_downsampled_but_for_a_few_voxels() {
-        for level in 5..=TOLERANCE.len() {
+        for level in 4..=TOLERANCE.len() {
             assert!(differing(level) <= TOLERANCE[level - 1], "level {level}");
+        }
+    }
+
+    /// Most Voxels of the coarse bricks that hold ground that may differ from the majority
+    /// downsample of the eight bricks one level finer that [`Planet::coarse_brick`] makes, as a
+    /// fraction, at levels 8, 9, ...: the numbers measured (printed by the test below, 2.9% at
+    /// level 8, a peak of 3.8% at level 9 and down to 1.3% at level 14) with a margin. These are
+    /// the orbit levels, where the bricks under one are too many to make from the Planet, so this
+    /// is the agreement that can be checked there. It is one step, not the whole way down: each
+    /// finer brick is already a sample and not the Planet's majority.
+    const ORBIT_TOLERANCE: [f64; 7] = [0.037, 0.048, 0.043, 0.030, 0.025, 0.020, 0.016];
+
+    /// The brick at `coord` of mip `level` as majority downsampling makes it from the eight
+    /// bricks one level finer that [`Planet::coarse_brick`] generates, by the pyramid's own rule.
+    fn downsampled_from_finer(level: usize, coord: BrickCoord) -> Brick {
+        let mut store = BrickStore::new();
+        for child in coord.children() {
+            let brick = planet().coarse_brick(level - 1, child);
+            if !brick.is_air() {
+                store.insert(child, brick);
+            }
+        }
+        store.build_lod(1);
+        store.brick_at(1, coord).into_owned()
+    }
+
+    #[test]
+    fn an_orbit_level_brick_is_its_eight_finer_bricks_downsampled_but_for_a_few_voxels() {
+        for (n, tolerance) in ORBIT_TOLERANCE.into_iter().enumerate() {
+            let level = 8 + n;
+            let (mut differ, mut total) = (0, 0);
+            for d in lines().into_iter().chain(spread()) {
+                let surface = planet().map().elevation_at(d);
+                let over = ancestor(along(d, SEA_RADIUS + surface.max(0.0)).brick(), level).0;
+                // The brick over the ground, and the six that touch it, which hold the rest of it.
+                for i in 0..7_i32 {
+                    let coord = BrickCoord(std::array::from_fn(|a| {
+                        over[a]
+                            + if i > 0 && (i - 1) / 2 == a as i32 {
+                                i % 2 * 2 - 1
+                            } else {
+                                0
+                            }
+                    }));
+                    let made = planet().coarse_brick(level, coord);
+                    let real = downsampled_from_finer(level, coord);
+                    if made.is_uniform() && made == real {
+                        continue;
+                    }
+                    differ += locals().filter(|&l| made.get(l) != real.get(l)).count();
+                    total += 512;
+                }
+            }
+            let fraction = differ as f64 / total as f64;
+            eprintln!("level {level}: {differ} of {total} Voxels differ, {fraction:.4}");
+            assert!(
+                total >= 4_000,
+                "level {level}: only {total} Voxels compared"
+            );
+            assert!(fraction <= tolerance, "level {level}: {fraction}");
         }
     }
 
