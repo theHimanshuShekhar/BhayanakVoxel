@@ -130,7 +130,7 @@ pub fn show(ctx: &Context, info: &Info, controls: &mut Controls) {
             {
                 controls.sun.1 = degrees[1].to_radians();
             }
-            ui.weak("arrows: sun, V: view, F1: hide, Esc: free the mouse");
+            ui.weak("N: walk / noclip, arrows: sun, V: view, F1: hide, Esc: free the mouse");
         });
 }
 
@@ -185,6 +185,19 @@ mod tests {
     fn the_overlay_has_a_font_to_draw_with() {
         // Without egui's `default_fonts` feature every glyph renders as a box.
         assert!(!egui::FontDefinitions::default().font_data.is_empty());
+    }
+
+    #[test]
+    fn the_help_line_names_the_noclip_key() {
+        let timings = Timings::default();
+        let info = Info {
+            timings: &timings,
+            timers_supported: true,
+            samples: 0,
+            scene_memory: SceneMemory::default(),
+        };
+        let text = draw(&info, &mut controls());
+        assert!(text.contains("N: walk / noclip"), "{text}");
     }
 
     #[test]

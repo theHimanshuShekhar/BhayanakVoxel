@@ -2087,6 +2087,8 @@ dependencies = [
  "brick-store",
  "net",
  "planet-gen",
+ "serde",
+ "toml",
 ]
 
 [[package]]

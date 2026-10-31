@@ -11,9 +11,9 @@
 use std::collections::{BTreeSet, VecDeque};
 
 use brick_store::{BrickCoord, BrickStore};
-use net::{ClientMessage, EditOp, ServerMessage};
+use net::{BodyState, ClientMessage, EditOp, Leash, MoveInput, ServerMessage};
 
-use crate::{Undo, apply};
+use crate::{Character, Movement, Undo, apply};
 
 struct Pending {
     client_seq: u64,
@@ -21,11 +21,23 @@ struct Pending {
     undo: Undo,
 }
 
+/// An input that the server has not said it applied, with where it predicted the character to be
+/// after it.
+struct PendingInput {
+    seq: u64,
+    input: MoveInput,
+    after: BodyState,
+}
+
 pub struct Predictor {
     store: BrickStore,
     next_client_seq: u64,
     pending: VecDeque<Pending>,
     desyncs: u64,
+    character: Option<Character>,
+    next_input_seq: u64,
+    pending_inputs: VecDeque<PendingInput>,
+    body_desyncs: u64,
 }
 
 impl Predictor {
@@ -36,6 +48,68 @@ impl Predictor {
             next_client_seq: 0,
             pending: VecDeque::new(),
             desyncs: 0,
+            character: None,
+            next_input_seq: 0,
+            pending_inputs: VecDeque::new(),
+            body_desyncs: 0,
+        }
+    }
+
+    /// The character this client predicts, once it has spawned.
+    pub fn character(&self) -> Option<&Character> {
+        self.character.as_ref()
+    }
+
+    /// Times the server's word on the character differed from the prediction.
+    pub fn body_desyncs(&self) -> u64 {
+        self.body_desyncs
+    }
+
+    /// Puts the character on the Planet at `position`, standing there. Returns the request to
+    /// send to the server. Spawning again replaces the character.
+    pub fn spawn(&mut self, position: [f64; 3], leash: Option<Leash>) -> ClientMessage {
+        self.character = Some(Character::spawn(Movement::default(), position, leash));
+        self.next_input_seq = 0;
+        self.pending_inputs.clear();
+        ClientMessage::Spawn { position, leash }
+    }
+
+    /// Runs one tick of the character on the local Planet, which shows it at once. Returns the
+    /// request to send to the server, or `None` if the character has not spawned.
+    pub fn walk(&mut self, input: MoveInput) -> Option<ClientMessage> {
+        let character = self.character.as_mut()?;
+        character.tick(&self.store, &input);
+        let seq = self.next_input_seq;
+        self.next_input_seq += 1;
+        self.pending_inputs.push_back(PendingInput {
+            seq,
+            input,
+            after: *character.state(),
+        });
+        Some(ClientMessage::Input { seq, input })
+    }
+
+    /// Takes in where the server has the character after `applied` inputs. If that is not where
+    /// this client had it, takes the server's and runs the inputs the server has not seen again
+    /// from there.
+    fn receive_body(&mut self, applied: u64, state: BodyState) {
+        let Some(character) = self.character.as_mut() else {
+            return;
+        };
+        let mut predicted = None;
+        while self.pending_inputs.front().is_some_and(|p| p.seq < applied) {
+            predicted = self.pending_inputs.pop_front().map(|p| p.after);
+        }
+        // With no input applied yet (just after a spawn) the prediction is the spawn.
+        let same = predicted.map_or(applied == 0, |p| p.identical(&state));
+        if same {
+            return;
+        }
+        self.body_desyncs += 1;
+        character.set_state(state);
+        for pending in &mut self.pending_inputs {
+            character.tick(&self.store, &pending.input);
+            pending.after = *character.state();
         }
     }
 
@@ -91,6 +165,10 @@ impl Predictor {
                 self.apply_authoritative(op, Some(client_seq))
             }
             ServerMessage::Applied { op, ack: None, .. } => self.apply_authoritative(op, None),
+            ServerMessage::Body { applied, state } => {
+                self.receive_body(applied, state);
+                Vec::new()
+            }
             ServerMessage::Rejected { client_seq, .. } => {
                 let Some(index) = self.pending.iter().position(|p| p.client_seq == client_seq)
                 else {

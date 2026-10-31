@@ -1,5 +1,7 @@
-//! Free-fly camera controls: which keys are held, and how they move the camera.
+//! Which movement keys are held, and what they do: move the free-fly debug camera (noclip), or
+//! become the character's input for a tick.
 
+use net::MoveInput;
 use render::Camera;
 
 /// Radians of turn per pixel of mouse movement.
@@ -32,6 +34,21 @@ impl Fly {
 
     fn axis(&self, positive: Action, negative: Action) -> f64 {
         f64::from(i8::from(self.held[positive as usize]) - i8::from(self.held[negative as usize]))
+    }
+
+    /// The held keys as the character's input for one tick, heading where the camera looks.
+    /// Space jumps, Ctrl or C crouches, Shift runs.
+    pub fn move_input(&self, camera: &Camera) -> MoveInput {
+        let held = |action: Action| self.held[action as usize];
+        let axis = |positive, negative| held(positive) as i8 - held(negative) as i8;
+        MoveInput {
+            forward: axis(Action::Forward, Action::Back),
+            right: axis(Action::Right, Action::Left),
+            heading: camera.forward(),
+            jump: held(Action::Up),
+            run: held(Action::Fast),
+            crouch: held(Action::Down),
+        }
     }
 
     /// Turns the camera by a mouse movement of `dx`, `dy` pixels: right and down are positive.
@@ -88,6 +105,33 @@ mod tests {
         let mut camera = camera();
         held(actions).update(&mut camera, dt);
         camera.position.map(|c| (c * 1e9).round() / 1e9)
+    }
+
+    #[test]
+    fn held_keys_are_the_characters_input_heading_where_the_camera_looks() {
+        let camera = camera();
+        let input = held(&[
+            Action::Forward,
+            Action::Left,
+            Action::Up,
+            Action::Fast,
+            Action::Down,
+        ])
+        .move_input(&camera);
+        assert_eq!((input.forward, input.right), (1, -1));
+        assert!(input.jump && input.run && input.crouch);
+        assert_eq!(input.heading, camera.forward());
+        assert_eq!(
+            Fly::default().move_input(&camera),
+            MoveInput {
+                heading: camera.forward(),
+                ..MoveInput::default()
+            }
+        );
+        let back = held(&[Action::Back, Action::Right]).move_input(&camera);
+        assert_eq!((back.forward, back.right), (-1, 1));
+        let both = held(&[Action::Forward, Action::Back]).move_input(&camera);
+        assert_eq!(both.forward, 0);
     }
 
     #[test]

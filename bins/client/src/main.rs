@@ -6,16 +6,17 @@ use std::error::Error;
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use brick_store::BrickStore;
 use fly::{Action, Fly};
+use net::Leash;
 use planet_gen::planet::Planet;
 use planet_gen::world_map::{WORLD_MAP_SIZE, WORLD_RADIUS, WorldMap};
 use render::overlay::{self, Controls, SceneMemory};
 use render::scene::Bound;
 use render::{Camera, Mode, Renderer, RingsFull, Scene, SceneUpdate, Sun};
-use sim::{Predictor, ServerHandle};
+use sim::{FixedTimestep, Predictor, ServerHandle, TICK_RATE_HZ};
 use winit::application::ApplicationHandler;
 use winit::event::{DeviceEvent, DeviceId, ElementState, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
@@ -41,6 +42,11 @@ const SPAWN_HEIGHT: f64 = 40.0;
 /// core, until the Planet can be streamed (#47, #49): the test Planet's 2.6 million bricks of
 /// ground took 20 seconds, and this Planet has ten thousand times the ground.
 const SPAWN_REACH: i32 = 640;
+
+/// How far above the ground the character is set down, in Voxels: it drops the last few.
+const DROP_HEIGHT: f64 = 3.0;
+/// After a stall, run at most this many character ticks to catch up and drop the rest.
+const MAX_TICKS_PER_FRAME: u32 = 5;
 
 /// Radians the sun turns per arrow key press (and per repeat while it is held).
 const SUN_STEP: f32 = 0.05;
@@ -70,6 +76,8 @@ struct Loaded {
     server_store: BrickStore,
     scene: Scene,
     camera: Camera,
+    /// A point on the ground to put the character down on.
+    ground: [f64; 3],
 }
 
 /// The Planet's ground as the client and the in-process server each hold it, before it is
@@ -78,6 +86,7 @@ struct Ground {
     store: BrickStore,
     server_store: BrickStore,
     camera: Camera,
+    ground: [f64; 3],
 }
 
 /// Generates the ground around a spawn on gentle land of the Planet of `map`, with a pyramid of
@@ -100,6 +109,37 @@ fn generate_ground(map: WorldMap, reach: i32, levels: usize) -> Ground {
         store,
         server_store,
         camera: spawn_camera(ground),
+        ground,
+    }
+}
+
+/// Where the character is set down: [`DROP_HEIGHT`] above `ground`, along the radial up.
+fn drop_point(ground: [f64; 3]) -> [f64; 3] {
+    let length = ground.iter().map(|c| c * c).sum::<f64>().sqrt();
+    std::array::from_fn(|a| ground[a] + ground[a] / length * DROP_HEIGHT)
+}
+
+/// What bounds the character: the ground around `ground` that is generated, `reach` Voxels
+/// from the line through the Planet's centre (see [`Planet::region_around`]). Beyond it there
+/// is no ground yet (#49), so the character stops at the edge rather than fall through.
+fn leash_for(ground: [f64; 3], reach: i32) -> Leash {
+    let length = ground.iter().map(|c| c * c).sum::<f64>().sqrt();
+    Leash {
+        axis: ground.map(|c| c / length),
+        radius: f64::from(reach),
+    }
+}
+
+/// Where to put the character down when it leaves noclip with the camera at `eye`: under it, on
+/// the ground, or at the spawn if the camera is outside the leash or too low to know.
+fn landing(eye: [f64; 3], leash: &Leash, ground: [f64; 3]) -> [f64; 3] {
+    let along: f64 = (0..3).map(|a| eye[a] * leash.axis[a]).sum();
+    let square: f64 = eye.iter().map(|c| c * c).sum::<f64>() - along * along;
+    let margin = leash.radius - 2.0 * sim::Movement::default().radius;
+    if square.is_nan() || square >= margin * margin {
+        drop_point(ground)
+    } else {
+        eye
     }
 }
 
@@ -111,6 +151,7 @@ fn load(map: WorldMap, reach: i32) -> Result<Loaded, RingsFull> {
         store,
         server_store,
         camera,
+        ground,
     } = generate_ground(map, reach, RING_LEVELS);
     let scene = planet_scene(&store, camera.position)?;
     eprintln!("planet ready after {:.1?}", started.elapsed());
@@ -119,6 +160,7 @@ fn load(map: WorldMap, reach: i32) -> Result<Loaded, RingsFull> {
         server_store,
         scene,
         camera,
+        ground,
     })
 }
 
@@ -151,6 +193,16 @@ struct App {
     server: Option<ServerHandle>,
     camera: Camera,
     fly: Fly,
+    /// Walking as the character (the default), or flying the camera through everything as a
+    /// debug aid (noclip, `N`).
+    walking: bool,
+    /// Runs the character at the server's tick rate, whatever the frame rate.
+    clock: FixedTimestep,
+    /// Where the character was set down and what bounds it, once the Planet is loaded.
+    spawn: Option<([f64; 3], Leash)>,
+    /// The eyes after the previous and the latest character tick, which the camera is drawn
+    /// between so that it moves smoothly at any frame rate.
+    eyes: Option<([f64; 3], [f64; 3])>,
     /// The sun as an azimuth and an elevation, which the arrow keys turn.
     sun: (f32, f32),
     /// The title last set, so that it is only set when it changes.
@@ -193,6 +245,10 @@ impl App {
             // Until the Planet arrives there is only sky to look at, wherever from.
             camera: spawn_camera([0.0, 0.0, f64::from(WORLD_RADIUS)]),
             fly: Fly::default(),
+            walking: true,
+            clock: FixedTimestep::new(Duration::from_secs(1) / TICK_RATE_HZ, MAX_TICKS_PER_FRAME),
+            spawn: None,
+            eyes: None,
             sun: Sun::default().angles(),
             title: String::new(),
             grabbed: false,
@@ -247,11 +303,13 @@ impl App {
                 let (client_end, server_end) = net::loopback();
                 let server_store = loaded.server_store;
                 self.server = Some(sim::spawn(move || server_store, vec![server_end]));
-                self.world = Some(World::new(
-                    loaded.scene,
-                    Predictor::new(loaded.store),
-                    client_end,
-                ));
+                let mut world = World::new(loaded.scene, Predictor::new(loaded.store), client_end);
+                let leash = leash_for(loaded.ground, SPAWN_REACH);
+                world.spawn(drop_point(loaded.ground), leash)?;
+                self.spawn = Some((loaded.ground, leash));
+                self.world = Some(world);
+                self.clock =
+                    FixedTimestep::new(Duration::from_secs(1) / TICK_RATE_HZ, MAX_TICKS_PER_FRAME);
             }
             Err(TryRecvError::Empty) => {}
             Err(TryRecvError::Disconnected) => return Err("the Planet failed to generate".into()),
@@ -275,6 +333,43 @@ impl App {
         };
         let update = world.dig(&self.camera)?;
         self.show(update)
+    }
+
+    /// Runs the character for the time that has passed, as ticks at the server's rate, and puts
+    /// the camera at its eyes: between the last two ticks, so that it is smooth. The camera's
+    /// horizon is kept level to the Planet's radial up.
+    fn walk(&mut self, dt: f64) -> Result<(), Box<dyn Error>> {
+        let Some(world) = &mut self.world else {
+            return Ok(());
+        };
+        for _ in 0..self.clock.advance(Duration::from_secs_f64(dt)) {
+            world.walk(self.fly.move_input(&self.camera))?;
+            if let Some(eye) = world.eye() {
+                let before = self.eyes.map_or(eye, |(_, latest)| latest);
+                self.eyes = Some((before, eye));
+            }
+        }
+        if let Some((before, latest)) = self.eyes {
+            let step = Duration::from_secs(1) / TICK_RATE_HZ;
+            let alpha = 1.0 - self.clock.until_next_tick().as_secs_f64() / step.as_secs_f64();
+            self.camera.position =
+                std::array::from_fn(|a| before[a] + (latest[a] - before[a]) * alpha);
+            self.camera.carry_up(self.camera.position);
+        }
+        Ok(())
+    }
+
+    /// Switches between walking as the character and flying the camera through everything. On
+    /// the way back the character is set down where the camera is.
+    fn toggle_noclip(&mut self) -> Result<(), Box<dyn Error>> {
+        self.walking = !self.walking;
+        self.eyes = None;
+        if let (true, Some(world), Some((ground, leash))) =
+            (self.walking, &mut self.world, &self.spawn)
+        {
+            world.spawn(landing(self.camera.position, leash, *ground), *leash)?;
+        }
+        Ok(())
     }
 
     /// Moves the rings of the Planet to the camera, and copies what that changed to the GPU.
@@ -302,6 +397,8 @@ impl App {
         let Some(window) = &self.window else { return };
         let title = if self.loading.is_some() {
             format!("{TITLE} (generating the Planet...)")
+        } else if !self.walking {
+            format!("{TITLE} (noclip)")
         } else {
             TITLE.to_string()
         };
@@ -497,6 +594,13 @@ impl ApplicationHandler for App {
                     } else if pressed && !used_by_overlay {
                         match code {
                             KeyCode::Escape => self.grab(false),
+                            // Switches between walking and the debug noclip camera.
+                            KeyCode::KeyN if !event.repeat => {
+                                if let Err(err) = self.toggle_noclip() {
+                                    self.error = Some(err);
+                                    event_loop.exit();
+                                }
+                            }
                             // Cycles through the debug views.
                             KeyCode::KeyV if !event.repeat => {
                                 if let Some(renderer) = &mut self.renderer {
@@ -549,7 +653,14 @@ impl ApplicationHandler for App {
                     .as_secs_f64()
                     .min(MAX_FRAME_TIME);
                 self.last_frame = now;
-                self.fly.update(&mut self.camera, dt);
+                if self.walking {
+                    if let Err(err) = self.walk(dt) {
+                        self.error = Some(err);
+                        event_loop.exit();
+                    }
+                } else {
+                    self.fly.update(&mut self.camera, dt);
+                }
                 if let Err(err) = self.recentre() {
                     self.error = Some(err);
                     event_loop.exit();
@@ -638,6 +749,25 @@ mod tests {
             let pitch = dot(camera.forward(), radial).asin().to_degrees();
             assert!((pitch - SPAWN_PITCH).abs() < 1e-6, "{pitch}");
         }
+    }
+
+    #[test]
+    fn the_character_is_set_down_just_above_the_ground_and_leashed_to_the_generated_ground() {
+        let ground = [-93_000.0, 90_000.0, 94_000.0];
+        let length = dot(ground, ground).sqrt();
+        let up = ground.map(|c| c / length);
+        let drop = drop_point(ground);
+        assert!((dot(drop, up) - length - DROP_HEIGHT).abs() < 1e-6);
+        let leash = leash_for(ground, SPAWN_REACH);
+        assert_eq!(leash.axis, up);
+        assert_eq!(leash.radius, f64::from(SPAWN_REACH));
+        // Out of noclip over the ground, it lands under the camera; off the generated ground
+        // it goes back to the spawn.
+        let over = drop.map(|c| c + 1.0);
+        assert_eq!(landing(over, &leash, ground), over);
+        let far = std::array::from_fn(|a| drop[a] + up[a] * 5.0 + [1.0, 0.0, 0.0][a] * 1e4);
+        assert_eq!(landing(far, &leash, ground), drop);
+        assert_eq!(landing([f64::NAN; 3], &leash, ground), drop);
     }
 
     #[test]

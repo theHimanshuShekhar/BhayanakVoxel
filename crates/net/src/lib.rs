@@ -55,16 +55,77 @@ pub enum RejectReason {
     OutOfRange,
 }
 
+/// What a player asks of their character for one tick (the sim's fixed step): plain data, so
+/// that the client and the server feed the controller the same bits. Vectors are in the Planet
+/// frame.
+#[derive(Clone, Copy, Debug, PartialEq, Default)]
+pub struct MoveInput {
+    /// Towards `heading` (1) or away from it (-1). Anything else is clamped to these.
+    pub forward: i8,
+    /// To the right of `heading` (1) or the left (-1). Anything else is clamped to these.
+    pub right: i8,
+    /// The way "forward" points, as a vector the controller flattens onto the ground (so a
+    /// camera's view direction will do) and normalises. Zero, or straight up, moves nowhere.
+    pub heading: [f64; 3],
+    pub jump: bool,
+    pub run: bool,
+    pub crouch: bool,
+}
+
+/// Where a character is and how it is moving: everything that evolves from one tick to the next.
+/// The server's copy is the authority; the client predicts the same numbers and takes the
+/// server's if they ever differ.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BodyState {
+    /// The middle of the capsule's base, in Voxels.
+    pub position: [f64; 3],
+    /// Voxels per second.
+    pub velocity: [f64; 3],
+    /// Standing on something, so that it can jump and walk up steps.
+    pub grounded: bool,
+    pub crouching: bool,
+}
+
+impl BodyState {
+    /// Whether every bit is the same, which `==` is not for `-0.0` against `0.0`.
+    pub fn identical(&self, other: &Self) -> bool {
+        let bits = |s: &Self| [s.position, s.velocity].map(|v| v.map(f64::to_bits));
+        bits(self) == bits(other)
+            && self.grounded == other.grounded
+            && self.crouching == other.crouching
+    }
+}
+
+/// How far from its spawn a character may go: the Planet's ground is generated only that far
+/// (until it can be streamed, #49), so beyond it the controller treats space as solid rather
+/// than let the character fall through the missing ground. It is the cylinder of `radius`
+/// Voxels around the line from the Planet's centre through the spawn.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Leash {
+    /// Unit vector from the Planet's centre through the spawn.
+    pub axis: [f64; 3],
+    pub radius: f64,
+}
+
 /// Client to server.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum ClientMessage {
     /// Asks to make an Edit. `client_seq` numbers the client's requests from 0 upwards, and
     /// the reply names it.
     Edit { client_seq: u64, op: EditOp },
+    /// Puts this client's character on the Planet, standing at `position` in Voxels. The server
+    /// answers with [`ServerMessage::Body`] for no inputs applied yet.
+    Spawn {
+        position: [f64; 3],
+        leash: Option<Leash>,
+    },
+    /// The character's input for one tick. `seq` numbers the client's inputs from 0 upwards;
+    /// the server applies them in order, each as one tick.
+    Input { seq: u64, input: MoveInput },
 }
 
 /// Server to client.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum ServerMessage {
     /// The server made this Edit. Every client gets every Edit, in `global_seq` order (1 for
     /// the first Edit of the Planet). The client that asked for it also gets `ack`, the
@@ -81,6 +142,10 @@ pub enum ServerMessage {
         client_seq: u64,
         reason: RejectReason,
     },
+    /// The server has applied the first `applied` inputs of this client's character (none, just
+    /// after a spawn), and this is where the character is then. Sent once per server tick in
+    /// which any arrived.
+    Body { applied: u64, state: BodyState },
 }
 
 /// The other end is gone.

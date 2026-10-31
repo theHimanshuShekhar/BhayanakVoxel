@@ -79,14 +79,21 @@ window title says when it is done.
 | Input | Action |
 | --- | --- |
 | Click | Capture the mouse; click again to dig |
-| `W` `A` `S` `D` | Move |
-| `Space` / `Ctrl` or `C` | Up / down |
-| `Shift` | Fly faster |
+| `W` `A` `S` `D` | Walk |
+| `Shift` | Run |
+| `Space` | Jump |
+| `Ctrl` or `C` | Crouch |
+| `N` | Switch between walking and the debug noclip camera |
 | Arrow keys | Turn the sun |
 | `R` | Switch between primary visibility and the reference path tracer |
 | `V` | Cycle debug views |
 | `F1` | Show or hide the debug overlay |
 | `Esc` | Release the mouse |
+
+The client walks the Planet as a character (1.8 m tall, walks 4.5 m/s, runs 7, crouches 2, jumps
+about 1.2 m, steps up to 0.5 m; numbers in `crates/sim/movement.toml`). In noclip, `W` `A` `S` `D`
+fly along the view, `Space` and `Ctrl`/`C` go up and down, and `Shift` flies faster; nothing
+collides. Coming out of noclip sets the character down where the camera is.
 
 ## Benchmarks
 

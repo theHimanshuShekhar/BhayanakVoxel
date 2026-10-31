@@ -48,6 +48,8 @@ disallowed-methods = [
     { path = "f64::hypot", reason = "platform-dependent; use libm" },
     { path = "f64::cbrt", reason = "platform-dependent; use libm" },
     { path = "f64::powi", reason = "platform-dependent; multiply explicitly" },
+    { path = "f32::mul_add", reason = "rounds differently from a * b + c, and its software fallback varies by platform" },
+    { path = "f64::mul_add", reason = "rounds differently from a * b + c, and its software fallback varies by platform" },
 ]
 disallowed-types = [
     { path = "std::collections::HashMap", reason = "random iteration order; use sorted order" },
