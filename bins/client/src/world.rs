@@ -3,7 +3,7 @@
 //! [`sim::Predictor`], which calls [`sim::apply`].
 
 use brick_store::VoxelCoord;
-use net::{ClientEnd, Disconnected, EditOp, TryRecvError};
+use net::{ClientEnd, Disconnected, EditOp, Leash, MoveInput, TryRecvError};
 use render::reference::{Hit, Ray, trace};
 use render::{Camera, RingsFull, Scene, SceneUpdate, camera};
 use sim::Predictor;
@@ -74,6 +74,28 @@ impl World {
 
     pub fn scene(&self) -> &Scene {
         &self.scene
+    }
+
+    /// Puts the character on the Planet at `position` (Voxels), and tells the server. It falls
+    /// from there, and cannot leave `leash`.
+    pub fn spawn(&mut self, position: [f64; 3], leash: Leash) -> Result<(), Stopped> {
+        self.link
+            .send(self.predictor.spawn(position, Some(leash)))?;
+        Ok(())
+    }
+
+    /// Runs one tick of the character on `input` here and on the server. Does nothing before
+    /// the character has spawned.
+    pub fn walk(&mut self, input: MoveInput) -> Result<(), Stopped> {
+        if let Some(request) = self.predictor.walk(input) {
+            self.link.send(request)?;
+        }
+        Ok(())
+    }
+
+    /// Where the character's eyes are, if it has spawned.
+    pub fn eye(&self) -> Option<[f64; 3]> {
+        self.predictor.character().map(sim::Character::eye)
     }
 
     /// Moves the rings of the Planet to centre on `camera`, a position in Voxels. Returns how
@@ -196,6 +218,45 @@ mod tests {
     }
 
     #[test]
+    fn the_character_lands_on_the_wall_and_the_server_is_sent_its_spawn_and_every_tick() {
+        let (mut world, server) = world();
+        assert_eq!(world.eye(), None);
+        world.walk(MoveInput::default()).unwrap();
+        assert_eq!(
+            server.try_recv(),
+            Err(TryRecvError::Empty),
+            "not spawned yet"
+        );
+
+        let leash = Leash {
+            axis: [1.0, 0.0, 0.0],
+            // Wide enough for the whole wall: it is 16 Voxels off the axis.
+            radius: 40.0,
+        };
+        // Above the middle of the wall's +x face (x = 4032).
+        world.spawn([4036.0, 16.0, -16.0], leash).unwrap();
+        for _ in 0..120 {
+            world.walk(MoveInput::default()).unwrap();
+        }
+        let eye = world.eye().unwrap();
+        assert!((4032.0 + 15.0..4032.0 + 17.0).contains(&eye[0]), "{eye:?}");
+
+        assert_eq!(
+            server.try_recv(),
+            Ok(ClientMessage::Spawn {
+                position: [4036.0, 16.0, -16.0],
+                leash: Some(leash)
+            })
+        );
+        for seq in 0..120 {
+            let Ok(ClientMessage::Input { seq: got, .. }) = server.try_recv() else {
+                panic!("input {seq} missing");
+            };
+            assert_eq!(got, seq);
+        }
+    }
+
+    #[test]
     fn a_click_on_the_sky_does_nothing() {
         let (mut world, server) = world();
         let up = Camera::looking_at([4016.5, 16.5, 20.5], [4016.5, 100.0, 20.5]);
@@ -213,7 +274,9 @@ mod tests {
         world.dig(&camera()).unwrap();
         let second = hit(&world);
         assert!(whole != first && first != second);
-        let ClientMessage::Edit { op, .. } = server.try_recv().unwrap();
+        let Ok(ClientMessage::Edit { op, .. }) = server.try_recv() else {
+            panic!("no Edit sent");
+        };
 
         server
             .send(ServerMessage::Applied {

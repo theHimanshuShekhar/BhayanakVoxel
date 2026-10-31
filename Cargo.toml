@@ -39,3 +39,8 @@ opt-level = 3
 
 [profile.dev.package.brick-store]
 opt-level = 3
+
+# The character controller's tests walk capsules through thousands of steps, each testing every
+# Voxel the capsule touches. IEEE-exact operations give the same bits in every profile.
+[profile.dev.package.sim]
+opt-level = 3

@@ -1,0 +1,33 @@
+# How characters move (decision in #16). Metres and seconds; the sim converts to 10 cm Voxels.
+# Compiled into the client and the server, which must read the same numbers: they run the same
+# controller on the same inputs and expect bit-identical positions.
+
+# Gravity, towards the Planet's centre, in m/s^2.
+gravity = 9.8
+
+# Ground speeds, in m/s.
+walk_speed = 4.5
+run_speed = 7.0
+crouch_speed = 2.0
+
+# Height of a jump, in m. The take-off speed follows from it and gravity.
+jump_height = 1.2
+
+# Highest step the character walks up without jumping, in m.
+step_height = 0.5
+
+# The capsule: its full height standing and crouching, and its radius, in m.
+height = 1.8
+crouch_height = 1.2
+radius = 0.3
+
+# Eye height above the feet, standing and crouching, in m. Where the first-person camera goes.
+eye_height = 1.6
+crouch_eye_height = 1.0
+
+# How fast the horizontal velocity changes towards the wanted one in the air, in m/s^2. On the
+# ground it is the wanted one at once.
+air_acceleration = 12.0
+
+# Fastest the character falls, in m/s.
+terminal_speed = 50.0

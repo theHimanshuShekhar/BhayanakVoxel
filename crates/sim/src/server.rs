@@ -12,9 +12,9 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use brick_store::BrickStore;
-use net::{ClientMessage, EditOp, RejectReason, ServerEnd, ServerMessage};
+use net::{ClientMessage, EditOp, Leash, MoveInput, RejectReason, ServerEnd, ServerMessage};
 
-use crate::{FixedTimestep, apply, validate};
+use crate::{Character, FixedTimestep, Movement, apply, validate};
 
 /// The server simulates at this rate (issue 11).
 pub const TICK_RATE_HZ: u32 = 60;
@@ -36,11 +36,20 @@ pub enum Outcome {
     },
 }
 
-/// The authoritative Planet and the order of the Edits made to it.
+/// One client's character and how many of its inputs the server has applied.
+struct Avatar {
+    character: Character,
+    applied: u64,
+}
+
+/// The authoritative Planet, the order of the Edits made to it, and the characters on it.
 pub struct Server {
     store: BrickStore,
     /// Global sequence number of the latest Edit; the first Edit is 1.
     global_seq: u64,
+    movement: Movement,
+    /// The character of each client, by its index in the list given to [`Server::tick`].
+    avatars: Vec<Option<Avatar>>,
 }
 
 impl Server {
@@ -48,6 +57,8 @@ impl Server {
         Self {
             store,
             global_seq: 0,
+            movement: Movement::default(),
+            avatars: Vec::new(),
         }
     }
 
@@ -55,10 +66,15 @@ impl Server {
         &self.store
     }
 
+    /// The character of client `index` (its place in the list given to [`Server::tick`]), if it
+    /// has spawned.
+    pub fn character(&self, index: usize) -> Option<&Character> {
+        self.avatars.get(index)?.as_ref().map(|a| &a.character)
+    }
+
     /// Validates the request and, if it passes, applies it and gives it the next global
     /// sequence number. A rejected request changes nothing and takes no number.
-    pub fn handle(&mut self, message: ClientMessage) -> Outcome {
-        let ClientMessage::Edit { client_seq, op } = message;
+    fn handle_edit(&mut self, client_seq: u64, op: EditOp) -> Outcome {
         if let Err(reason) = validate(&op) {
             return Outcome::Rejected { client_seq, reason };
         }
@@ -71,31 +87,76 @@ impl Server {
         }
     }
 
+    /// (Re)places client `index`'s character, standing at `position` with no inputs applied.
+    fn spawn_character(&mut self, index: usize, position: [f64; 3], leash: Option<Leash>) {
+        if self.avatars.len() <= index {
+            self.avatars.resize_with(index + 1, || None);
+        }
+        self.avatars[index] = Some(Avatar {
+            character: Character::spawn(self.movement, position, leash),
+            applied: 0,
+        });
+    }
+
+    /// Applies one tick of input to client `index`'s character, if it has one and `seq` is the
+    /// input that is due (the channel is ordered, so any other is a repeat or a gap and is
+    /// ignored). Returns whether it was applied.
+    fn apply_input(&mut self, index: usize, seq: u64, input: &MoveInput) -> bool {
+        let Some(Some(avatar)) = self.avatars.get_mut(index) else {
+            return false;
+        };
+        if seq != avatar.applied {
+            return false;
+        }
+        avatar.character.tick(&self.store, input);
+        avatar.applied += 1;
+        true
+    }
+
     /// One tick: handles every request that has arrived, clients in order and each client's
     /// requests in the order it sent them. Each accepted Edit goes to every client, with the
-    /// ack only for the one that asked; a reject goes to the one that asked.
+    /// ack only for the one that asked; a reject goes to the one that asked. A client whose
+    /// character moved is told where it is, once, after its requests.
     pub fn tick(&mut self, clients: &[ServerEnd]) {
         for (asker, client) in clients.iter().enumerate() {
+            let mut moved = false;
             while let Ok(message) = client.try_recv() {
-                match self.handle(message) {
-                    Outcome::Applied {
-                        global_seq,
-                        op,
-                        client_seq,
-                    } => {
-                        for (index, client) in clients.iter().enumerate() {
-                            // A client that has gone away must not stop the others hearing.
-                            let _ = client.send(ServerMessage::Applied {
+                match message {
+                    ClientMessage::Edit { client_seq, op } => {
+                        match self.handle_edit(client_seq, op) {
+                            Outcome::Applied {
                                 global_seq,
                                 op,
-                                ack: (index == asker).then_some(client_seq),
-                            });
+                                client_seq,
+                            } => {
+                                for (index, client) in clients.iter().enumerate() {
+                                    // A client that has gone away must not stop the others hearing.
+                                    let _ = client.send(ServerMessage::Applied {
+                                        global_seq,
+                                        op,
+                                        ack: (index == asker).then_some(client_seq),
+                                    });
+                                }
+                            }
+                            Outcome::Rejected { client_seq, reason } => {
+                                let _ = client.send(ServerMessage::Rejected { client_seq, reason });
+                            }
                         }
                     }
-                    Outcome::Rejected { client_seq, reason } => {
-                        let _ = client.send(ServerMessage::Rejected { client_seq, reason });
+                    ClientMessage::Spawn { position, leash } => {
+                        self.spawn_character(asker, position, leash);
+                        moved = true;
+                    }
+                    ClientMessage::Input { seq, input } => {
+                        moved |= self.apply_input(asker, seq, &input);
                     }
                 }
+            }
+            if moved && let Some(Some(avatar)) = self.avatars.get(asker) {
+                let _ = client.send(ServerMessage::Body {
+                    applied: avatar.applied,
+                    state: *avatar.character.state(),
+                });
             }
         }
     }
