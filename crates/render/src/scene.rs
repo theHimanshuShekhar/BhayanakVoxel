@@ -108,27 +108,25 @@ impl Level {
 
 /// A ball that has the whole Planet in it: nothing is outside it. The walk goes no further than
 /// where a ray is in the ball, which is exact for any Planet that is inside it.
+///
+/// The ball bounds the Voxels of level 0. A Voxel of a coarser level is drawn as a whole cube,
+/// and is solid when half of its children are, so it can stick out of the ball by its diagonal;
+/// [`Scene::clip_radius`] allows for that. An Edit that adds matter beyond the ball (building,
+/// #60) must grow `radius` to hold it: digging only takes matter away, so it never does.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Bound {
     /// The ball's centre, in Voxels.
     pub centre: [i32; 3],
-    /// Its radius in Voxels, which must stay true: building above it needs a larger one. At least 1, and below 2^24 so that the GPU has it exactly. The
+    /// Its radius in Voxels: at least 1, and below 2^24 so that the GPU has it exactly. The
     /// Planet's mean radius plus the highest it goes (`planet_gen::MAX_RADIUS` for the test
     /// Planet), worked out from the world, and not from the box of regions that it fills.
     pub radius: i32,
 }
 
-/// Voxels added to the radius of a [`Bound`] when a ray is clipped to it, which are more than
-/// the clip's rounding can come to: a ray at the edge of the ball is a hair to either side of it
-/// in f32, never a Voxel.
+/// Voxels added to the radius that rays are clipped to, which are more than the clip's rounding
+/// can come to: a ray at the edge of the ball is a hair to either side of it in f32, never a
+/// Voxel.
 pub const BOUND_SLACK: f32 = 8.0;
-
-impl Bound {
-    /// The radius that rays are clipped to.
-    pub fn clip_radius(&self) -> f32 {
-        self.radius as f32 + BOUND_SLACK
-    }
-}
 
 /// Packed bricks and the index over them. Built by [`Scene::new`] or [`Scene::rings`], uploaded
 /// as-is.
@@ -578,6 +576,15 @@ impl Scene {
         let lower: u32 = mask[..bit / 32].iter().map(|w| w.count_ones()).sum::<u32>()
             + (mask[bit / 32] & ((1u32 << (bit % 32)) - 1)).count_ones();
         Some(self.brick_refs[(first_ref + lower) as usize])
+    }
+
+    /// The radius that rays are clipped to, if the scene has a [`Bound`]: its radius, and the
+    /// diagonal of a Voxel of the coarsest level the scene has (which is as far as such a Voxel
+    /// can stick out), and [`BOUND_SLACK`].
+    pub fn clip_radius(&self) -> Option<f32> {
+        let bound = self.bound?;
+        let coarsest = (1u32 << self.levels.len().saturating_sub(1)) as f32;
+        Some(bound.radius as f32 + coarsest * 3f32.sqrt() + BOUND_SLACK)
     }
 
     /// Index in `regions` of the region at absolute region coordinate `key` of mip `level`.

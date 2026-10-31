@@ -61,8 +61,8 @@ impl SceneHeader {
     fn new(scene: &Scene) -> Self {
         let mut header = SceneHeader::zeroed();
         header.level_count = scene.levels.len() as u32;
-        if let Some(bound) = scene.bound {
-            header.bound_radius = bound.clip_radius();
+        if let (Some(bound), Some(radius)) = (scene.bound, scene.clip_radius()) {
+            header.bound_radius = radius;
             header.bound_centre = bound.centre;
         }
         for (level, (slot, l)) in header.levels.iter_mut().zip(&scene.levels).enumerate() {
