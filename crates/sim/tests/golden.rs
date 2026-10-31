@@ -69,8 +69,8 @@ const CORE_GOLDEN: [u64; 6] = [
 /// The store's hash after each dig of `SURFACE`, over its coarse levels.
 #[rustfmt::skip]
 const SURFACE_LOD_GOLDEN: [u64; 8] = [
-    0x7838f0e25aad7202, 0xf81baf2a266826bc, 0x0243806a9662af48, 0x67a0f5e2f01e52ad,
-    0x67a0f5e2f01e52ad, 0xa4c1c93cc37c11e1, 0xa4c1c93cc37c11e1, 0xdaaa94ab0360afbf,
+    0x726b1bd2e356611e, 0x2f192f18dd65ada3, 0xd49787e2c9e04420, 0x7dd1e5e4db8e4b80,
+    0x7dd1e5e4db8e4b80, 0xde2f51cd5c3d20a8, 0xde2f51cd5c3d20a8, 0xcd0ec34bedfaaf34,
 ];
 
 /// The store's hash after each dig of `CORE`, over its coarse levels.

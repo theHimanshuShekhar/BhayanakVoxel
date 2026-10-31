@@ -169,3 +169,57 @@ fn golden_region_hash() {
         region.len()
     );
 }
+
+/// Coarse bricks of the real Planet on the same world map, generated directly at their level
+/// (`Planet::coarse_brick`): (mip level, a brick of level 0 under it, expected kind, hash). The
+/// level 0 bricks are those of the ground above, and the coarse brick is the one over each.
+/// The Voxels with air beside them take the Material at the ground's surface (#79), so the
+/// bricks over the ground changed with it, from level 3; those of levels 1 and 2 with ground
+/// in them, the sea, the sky and the interior did not.
+#[rustfmt::skip]
+const COARSE_GOLDEN: &[(usize, [i32; 3], Kind, u64)] = &[
+    // Temperate land, from 20 cm Voxels up to orbit: a brick is 1.6 km across at level 11, 13 km at
+    // level 14, and at level 19 a Voxel is 52 km, which is wider than the Planet, so it is air.
+    (1, [11960, -11837, 11343], Mixed, 0x8565e8f966d40f49),
+    (3, [11960, -11837, 11343], Mixed, 0x3788f7b911e25b6d),
+    (5, [11960, -11837, 11343], Mixed, 0x1e2eb33cedbfe41c),
+    (8, [11960, -11837, 11343], Mixed, 0x59fdfa374196f730),
+    (11, [11960, -11837, 11343], Mixed, 0x0cb55abb80f2d189),
+    (14, [11960, -11837, 11343], Mixed, 0x36301fd372a2ec18),
+    (19, [11960, -11837, 11343], Air, 0x6ab05ef9aa8b9b25),
+    // The other biomes, the sky above the land, the ocean, a coast and a polar sea.
+    (2, [12929, -10969, 10716], Mixed, 0x07787a6cc86d9a29),
+    (6, [12929, -10969, 10716], Mixed, 0xb1ff2acf10b58d64),
+    (2, [13730, -11919, -9818], Mixed, 0x41ef64706b0316db),
+    (6, [13730, -11919, -9818], Mixed, 0x1b18ebde98244c62),
+    (3, [11872, -11750, 11749], Mixed, 0x3d13405f56f7e5fd),
+    (2, [11962, -11838, 11345], Mixed, 0x6a00d8d9d876da05),
+    (4, [14115, -13969, 2373], Mixed, 0xce83b6cef716c779),
+    (9, [14115, -13969, 2373], Mixed, 0xa89a1db55bc431f5),
+    (4, [14194, -14048, 688], Mixed, 0x5886e977298e2ca8),
+    (1, [-12160, 15767, 1866], Mixed, 0x9e55f936177ff0d9),
+    (3, [-12160, 15767, 1866], Solid, 0xb812ab782d86a725),
+    (7, [-12160, 15767, 1866], Mixed, 0x702836b6574c4521),
+    // The core's edge, the interior's, and the interior far from either.
+    (1, [2309, 2309, 2309], Mixed, 0x237d2d4cb454ecf6),
+    (5, [2309, 2309, 2309], Mixed, 0xe2c5cca2e703b85f),
+    (10, [2309, 2309, 2309], Mixed, 0xee14a7ee217ce91c),
+    (6, [10790, 10790, 10790], Solid, 0xd97e511494bfdb25),
+    (4, [9000, 9000, 9000], Solid, 0xd97e511494bfdb25),
+];
+
+#[test]
+fn golden_coarse_brick_hashes() {
+    let mut report = String::new();
+    let mut failed = false;
+    for (level, under, want_kind, want_hash) in COARSE_GOLDEN {
+        let coord = BrickCoord(under.map(|c| c >> level));
+        let brick = planet().coarse_brick(*level, coord);
+        let (got_kind, got_hash) = (kind(&brick), brick.content_hash());
+        failed |= got_kind != *want_kind || got_hash != *want_hash;
+        report += &format!(
+            "({level}, {under:?}) {got_kind:?} actual {got_hash:#018x} want {want_hash:#018x}\n"
+        );
+    }
+    assert!(!failed, "golden mismatch:\n{report}");
+}

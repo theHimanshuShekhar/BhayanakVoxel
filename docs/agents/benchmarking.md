@@ -36,7 +36,7 @@ release: a debug build's CPU side is slow enough to distort the frame times.
 | --- | --- |
 | `--out DIR` | Where `report.json` and the screenshots go. Default `bench-out`. |
 | `--budgets FILE` | Use this budgets file instead of the one built into the executable. |
-| `--size WxH` | Resolution of the traced image. Default `1280x720`, which is the internal resolution behind 1440p output that the budgets are for. Do not change it for a report you paste. |
+| `--size WxH` | Resolution of the traced (internal) image. Default `1280x720`, the internal resolution behind 1440p output that the budgets are for; primary mode upscales it to twice that in each direction (2560x1440). Do not change it for a report you paste. |
 | `--short` | A tiny run (160x90, a handful of frames, a patch of the Planet): the CI smoke test. |
 | `--no-fail` | Exit with status 0 even if a pass is over budget. |
 
@@ -58,6 +58,11 @@ file, a bad option).
    tracer, 4 samples per frame of the path). Each mode first draws a few warm-up frames, which are
    not measured: the first frames after a mode switch carry the other mode's state (see the notes
    on #28).
+   Primary mode traces at `config.width` x `config.height` and upscales to `output_*` (passes
+   `primary` and `upscale`); reference mode traces at the traced size, with no upscaling. Primary
+   mode reads an image back only for a screenshot (a 1440p image is 15 MB), so that the frame is
+   not mostly readback with the GPU idle in between; `frame_time` is then the CPU time of the
+   frame as drawn, and a screenshot frame is slower.
 3. Writes a screenshot at each keyframe of the path, per mode.
 
 The camera is a function of the frame index only (keyframes, interpolated in a straight line at
@@ -76,12 +81,13 @@ before reading anything into the times.
 
 ```
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "build":   { "version", "commit" },          // commit: CI builds only, else null; on a PR
                                                // build it is GitHub's merge commit, not the head
   "machine": { "gpu", "device_type", "driver", "driver_info", "backend", "os", "arch",
                "timers_supported" },
-  "config":  { "width", "height", "scene", "path", "keyframes" },
+  "config":  { "width", "height", "output_width", "output_height", "scene", "path",
+               "keyframes" },                  // width, height: traced; output_*: upscaled
   "modes": {
     "primary":   { "frames", "warmup_frames", "spp", "passes": [ENTRY...], "gpu_total": ENTRY,
                    "frame_time": STATS },
@@ -105,8 +111,9 @@ before reading anything into the times.
   of its last. In primary mode that is one frame of the path. In reference mode every sample is a
   profiler frame of its own, so `passes[]` and `gpu_total` are **per sample** there, with
   `frames * spp` samples, and `gpu_total.reference` budgets one sample.
-- `frame_time` is CPU time to draw one frame of the path and read the image back. For reference
-  mode a frame is all its samples. It is context, not a budget.
+- `frame_time` is CPU time to draw one frame of the path, and to read the image back where it is
+  read (reference mode, and primary mode's screenshot frames). For reference mode a frame is all
+  its samples. It is context, not a budget.
 - `budgets.unmatched` lists budgets for passes that did not run (`passes.shadows` before there is
   a shadows pass): they are not an error.
 
@@ -129,14 +136,14 @@ primary = 8.6
 Anything else in the file, a pass or mode with a zero, negative or non-numeric budget, is an
 error: a typo must not silently turn a budget off.
 
-The numbers are the per-stage frame budget of the rendering decision (#10), on the RTX 4090 at
-1440p output. Only `primary` (Primary visibility, 1.0 ms) and the total (8.6 ms) are live today,
-as those are the passes that exist. The later stages (sun shadows 0.4, GI 1.5, reflections 0.7,
-glass 0.7, volumetrics 1.0, denoise 1.0, atmosphere 0.3, upscale 0.5, edits 1.0, post 0.5) are
-in the file as comments: **whoever adds a pass uncomments its budget and names it the same**
-(a pass is named by the string given to `Profiler::compute_pass`). `reference` has no budget in
-#10; its 3.0 ms (a sample, pass and total) catches a gross regression, set from the first real run
-on the 4090, which measured a mean of 1.10 ms.
+The numbers are the per-stage frame budget of the rendering decision (#10), on the RTX 4090 at 1440p
+output. Only `primary` (Primary visibility, 1.0 ms), `upscale` (the TAAU pass, 0.5 ms) and the total
+(8.6 ms) are live today, as those are the passes that exist. The later stages (sun shadows 0.4, GI
+1.5, reflections 0.7, glass 0.7, volumetrics 1.0, denoise 1.0, atmosphere 0.3, edits 1.0, post 0.5)
+are in the file as comments: **whoever adds a pass uncomments its budget and names it the same** (a
+pass is named by the string given to `Profiler::compute_pass`). `reference` has no budget in #10;
+its 3.0 ms (a sample, pass and total) catches a gross regression, set from the first real run on the
+4090, which measured a mean of 1.10 ms.
 
 ## Tests
 

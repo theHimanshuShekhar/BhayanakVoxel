@@ -1,6 +1,7 @@
 //! Golden image gate: fixed views of the test Planet, rendered offscreen on lavapipe, must match
 //! the approved PNGs in `tests/golden/`: one of primary visibility, one of the reference path
-//! tracer after a fixed number of samples.
+//! tracer after a fixed number of samples, and two of the temporal upscaler (a camera that stays
+//! still, and one that pans).
 //!
 //! On a mismatch the test fails and writes `actual.png`, `expected.png` and `diff.png` to a
 //! folder named for the image in `target/golden-failures/` (or `$GOLDEN_FAILURE_DIR`); CI
@@ -18,7 +19,7 @@ mod common;
 use brick_store::BrickCoord;
 use common::{Difference, PRIMARY, REFERENCE, check_golden, compare, diff_image, within_tolerance};
 use planet_gen::generate_region;
-use render::{Camera, Image, Offscreen, Scene, Sun};
+use render::{Camera, Image, Offscreen, Resolution, Scene, Sun};
 
 const WIDTH: u32 = 256;
 const HEIGHT: u32 = 144;
@@ -42,6 +43,58 @@ fn render_view() -> Image {
 #[test]
 fn the_test_planet_matches_the_approved_golden_image() {
     check_golden("planet_256x144.png", &render_view(), &PRIMARY);
+}
+
+/// The upscaler's view: the same as the primary visibility golden's, traced at 128x72 and
+/// upscaled to the golden's 256x144.
+fn upscaling() -> Offscreen {
+    let resolution = Resolution {
+        internal: (WIDTH / 2, HEIGHT / 2),
+        output: (WIDTH, HEIGHT),
+    };
+    Offscreen::with_resolution(resolution, &planet_patch()).unwrap()
+}
+
+const UPSCALED_FRAMES: u32 = 24;
+
+fn upscaled_view() -> Camera {
+    Camera::looking_at([0.0, 1548.0, 250.0], [0.0, 1535.0, -300.0])
+}
+
+/// A camera that stays still for [`UPSCALED_FRAMES`] frames: the upscaler has gathered the
+/// samples of a whole period of its jitter, and the image is as sharp as it gets.
+fn render_still() -> Image {
+    let camera = upscaled_view();
+    let mut offscreen = upscaling();
+    let mut image = offscreen.render_upscaled(&camera);
+    for _ in 1..UPSCALED_FRAMES {
+        image = offscreen.render_upscaled(&camera);
+    }
+    image
+}
+
+#[test]
+fn a_still_camera_matches_the_approved_upscaled_golden_image() {
+    check_golden("planet_taau_still_256x144.png", &render_still(), &PRIMARY);
+}
+
+/// A camera that turns about a third of a degree a frame (about one output pixel) to the left for
+/// [`UPSCALED_FRAMES`] frames: the last frame, where the history has been moved along with the
+/// camera 23 times and clamped to what the new samples allow.
+fn render_pan() -> Image {
+    let mut camera = upscaled_view();
+    let mut offscreen = upscaling();
+    let mut image = offscreen.render_upscaled(&camera);
+    for _ in 1..UPSCALED_FRAMES {
+        camera.turn(0.006, 0.0);
+        image = offscreen.render_upscaled(&camera);
+    }
+    image
+}
+
+#[test]
+fn a_panning_camera_matches_the_approved_upscaled_golden_image() {
+    check_golden("planet_taau_pan_256x144.png", &render_pan(), &PRIMARY);
 }
 
 const SAMPLES: u32 = 64;

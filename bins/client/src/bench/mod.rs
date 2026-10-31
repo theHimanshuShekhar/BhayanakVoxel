@@ -23,7 +23,7 @@ use std::process::ExitCode;
 use std::time::Instant;
 
 use brick_store::{BrickCoord, BrickStore};
-use render::{Camera, Image, Mode, Offscreen, Scene};
+use render::{Camera, Image, Mode, Offscreen, Resolution, Scene};
 
 use args::{Args, Parsed, USAGE};
 use budget::{Budgets, Status};
@@ -34,6 +34,8 @@ const REPORT_FILE: &str = "report.json";
 
 /// How much of the path to draw, how, and on what.
 struct Plan {
+    /// The traced (internal) resolution. The image presented is twice as big in each direction:
+    /// 2560x1440 for the default 1280x720.
     width: u32,
     height: u32,
     /// The test Planet, or `--short`'s patch of it.
@@ -168,7 +170,11 @@ fn run(args: &Args) -> Result<u8, Box<dyn Error>> {
     };
     eprintln!("scene ready after {:.1?}", started.elapsed());
 
-    let mut gpu = Offscreen::new(plan.width, plan.height, &flight.scene)?;
+    let resolution = Resolution {
+        internal: (plan.width, plan.height),
+        output: (plan.width * 2, plan.height * 2),
+    };
+    let mut gpu = Offscreen::with_resolution(resolution, &flight.scene)?;
     eprintln!(
         "the Planet takes {:.1} MiB of GPU memory",
         gpu.scene_bytes() as f64 / (1024.0 * 1024.0)
@@ -226,6 +232,8 @@ fn run(args: &Args) -> Result<u8, Box<dyn Error>> {
         config: Config {
             width: plan.width,
             height: plan.height,
+            output_width: resolution.output.0,
+            output_height: resolution.output.1,
             scene: if plan.patch { "patch" } else { "planet" }.to_string(),
             path: plan.path_name.to_string(),
             keyframes: plan.path.keyframes(),
@@ -292,10 +300,23 @@ impl Flight {
     }
 }
 
-fn draw(gpu: &mut Offscreen, mode: Mode, camera: &Camera, spp: u32) -> Image {
+/// Draws a frame, and returns its image if `read_back`. Primary mode only reads the image back
+/// for a screenshot: at 1440p it is 15 MB a frame, which would be most of the CPU time of the
+/// frame and leave the GPU idle between frames (and so at lower clocks than a real frame has).
+fn draw(
+    gpu: &mut Offscreen,
+    mode: Mode,
+    camera: &Camera,
+    spp: u32,
+    read_back: bool,
+) -> Option<Image> {
     match mode {
-        Mode::Primary => gpu.render(camera),
-        Mode::Reference => gpu.render_reference(camera, spp),
+        Mode::Primary if read_back => Some(gpu.render_upscaled(camera)),
+        Mode::Primary => {
+            gpu.draw_upscaled(camera);
+            None
+        }
+        Mode::Reference => Some(gpu.render_reference(camera, spp)),
     }
 }
 
@@ -326,7 +347,7 @@ fn run_mode(
         .camera_at(share.frames.saturating_sub(1), share.frames);
     flight.follow(gpu, &end)?;
     for _ in 0..share.warmup {
-        draw(gpu, mode, &end, share.spp);
+        draw(gpu, mode, &end, share.spp, false);
     }
     // The timers' histories hold everything since the start of the run, warm-up and the other
     // mode's frames included. From here on is this mode's.
@@ -344,9 +365,10 @@ fn run_mode(
         let camera = plan.path.camera_at(frame, share.frames);
         flight.follow(gpu, &camera)?;
         let began = Instant::now();
-        let image = draw(gpu, mode, &camera, share.spp);
+        let shot = shots.contains(&frame);
+        let image = draw(gpu, mode, &camera, share.spp, shot);
         wall.push(began.elapsed().as_secs_f64() * 1e3);
-        if shots.contains(&frame) {
+        if let (true, Some(image)) = (shot, image) {
             let file = format!("{name}-frame{frame:04}.png");
             write_png(&out.join(&file), &image)?;
             screenshots.push(file);

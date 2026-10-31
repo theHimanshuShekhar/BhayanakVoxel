@@ -280,3 +280,16 @@ fn a_materials_hue_varies_by_up_to_its_hue_jitter() {
     assert!(spread("rock") < 1.1, "{}", spread("rock"));
     assert!(spread("flowers") > 1.5, "{}", spread("flowers"));
 }
+
+#[test]
+fn the_history_length_view_of_the_reference_image_is_its_sample_count() {
+    // The reference image has no upscaler: the history it has is its samples.
+    let mut gpu = gpu(DebugView::HistoryLength);
+    let one = gpu.render_reference(&overhead(), 1);
+    near(pixel(&one, 3, 3), [25.5, 0.0, 76.5]);
+    let sixteen = gpu.render_reference(&overhead(), 15);
+    near(
+        pixel(&sixteen, 3, 3),
+        [255.0 * 0.46, 255.0 * 0.36, 255.0 * 0.26],
+    );
+}

@@ -14,10 +14,21 @@ use crate::profiler::Profiler;
 use crate::reference::{Hit, Ray};
 use crate::scene::{MAX_LEVELS, REGION_WORDS, Scene, SceneUpdate, spare_words};
 use crate::sun::{Sun, SunUniform};
+use crate::upscale::{History, Resolution, UpscalePass};
 use crate::{Result, shaders};
 
 /// Format of the traced image: sRGB-encoded values in a plain unorm texture.
 pub const IMAGE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
+
+/// Format of the G-buffer: two words a pixel, written in one store (see `primary.wgsl`). The
+/// first is the distance to the hit, as the bits of an f32 (-1 for no hit). The second has the
+/// albedo of the hit's surface in its first three bytes, encoded like the image, and the face
+/// that was hit in the last (0 for no hit, else 1 + 2 * axis + 1 if it points along the positive
+/// direction). The normals are along the axes, so a byte holds them exactly.
+pub const GBUFFER_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rg32Uint;
+
+/// Format of the upscaler's history: encoded colour, and in alpha the frames it has been through.
+pub const HISTORY_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 
 /// `Level` in `trace.wgsl`.
 #[repr(C)]
@@ -82,45 +93,122 @@ struct FrameUniform {
     sun: SunUniform,
     /// The sample's index, the random seed, the debug view, then one unused.
     params: [u32; 4],
+    /// Where in its pixel primary visibility traces, then two unused.
+    jitter: [f32; 4],
 }
 
-/// What the kernels draw into: the image, and the float buffer that holds the reference path
-/// tracer's running mean, one `vec4<f32>` per pixel.
+/// Where primary visibility traces when nothing moves it: the centre of the pixel.
+const CENTRE: [f32; 2] = [0.5; 2];
+
+/// A texture and a view of all of it.
+pub struct Plane {
+    pub texture: wgpu::Texture,
+    pub view: wgpu::TextureView,
+}
+
+impl Plane {
+    /// A 2D texture of `format` that kernels can write and read, and that can be copied from.
+    fn new(
+        device: &wgpu::Device,
+        label: &str,
+        (width, height): (u32, u32),
+        format: wgpu::TextureFormat,
+    ) -> Self {
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some(label),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::STORAGE_BINDING
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        Self { texture, view }
+    }
+}
+
+/// A texture of `format` that a kernel writes.
+pub(crate) fn storage_texture(format: wgpu::TextureFormat) -> wgpu::BindingType {
+    wgpu::BindingType::StorageTexture {
+        access: wgpu::StorageTextureAccess::WriteOnly,
+        format,
+        view_dimension: wgpu::TextureViewDimension::D2,
+    }
+}
+
+/// What the kernels draw into.
+///
+/// At the traced (internal) resolution, primary visibility draws the lit image and, beside it, the
+/// G-buffer for the passes after it: the distance to the hit, its face normal and its albedo.
+///
+/// The reference path tracer also draws the lit image, with the float buffer that holds its
+/// running mean, one `vec4<f32>` per pixel. It stays at the traced resolution: it costs the same
+/// per sample as the bench budgets for, and it anti-aliases itself, so it needs no upscaling. (A
+/// reference at the output's resolution is one traced at that resolution: `Resolution::native`.)
+///
+/// At the output resolution is the image that is presented, which the upscaler builds from the
+/// lit image and from its own history (two images, which take turns).
 pub struct Target {
-    texture: wgpu::Texture,
-    view: wgpu::TextureView,
+    resolution: Resolution,
+    lit: Plane,
+    gbuffer: Plane,
     accum: wgpu::Buffer,
-    size: (u32, u32),
+    image: Plane,
+    history: [Plane; 2],
 }
 
 impl Target {
-    pub fn new(device: &wgpu::Device, width: u32, height: u32) -> Self {
-        let texture = Tracer::create_image(device, width, height);
-        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    pub fn new(device: &wgpu::Device, resolution: Resolution) -> Self {
+        let Resolution { internal, output } = resolution;
         let accum = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("accumulation"),
-            size: u64::from(width) * u64::from(height) * 16,
+            size: u64::from(internal.0) * u64::from(internal.1) * 16,
             usage: wgpu::BufferUsages::STORAGE,
             mapped_at_creation: false,
         });
         Self {
-            texture,
-            view,
+            resolution,
+            lit: Plane::new(device, "lit image", internal, IMAGE_FORMAT),
+            gbuffer: Plane::new(device, "G-buffer", internal, GBUFFER_FORMAT),
             accum,
-            size: (width, height),
+            image: Plane::new(device, "upscaled image", output, IMAGE_FORMAT),
+            history: [0, 1]
+                .map(|i| Plane::new(device, &format!("history {i}"), output, HISTORY_FORMAT)),
         }
     }
 
-    pub fn texture(&self) -> &wgpu::Texture {
-        &self.texture
+    pub fn resolution(&self) -> Resolution {
+        self.resolution
     }
 
-    pub fn view(&self) -> &wgpu::TextureView {
-        &self.view
+    /// The lit image that primary visibility and the reference path tracer draw, at the internal
+    /// resolution.
+    pub fn lit(&self) -> &Plane {
+        &self.lit
     }
 
-    pub fn size(&self) -> (u32, u32) {
-        self.size
+    /// The image that the upscaler builds, at the output resolution.
+    pub fn image(&self) -> &Plane {
+        &self.image
+    }
+
+    /// The G-buffer (`GBUFFER_FORMAT`): the distance to the first hit, its albedo and the face of
+    /// its normal.
+    pub fn gbuffer(&self) -> &Plane {
+        &self.gbuffer
+    }
+
+    /// The upscaler's history image `which` (0 or 1).
+    pub(crate) fn history(&self, which: usize) -> &Plane {
+        &self.history[which]
     }
 }
 
@@ -143,13 +231,15 @@ pub struct Tracer {
     camera_layout: wgpu::BindGroupLayout,
     primary: wgpu::ComputePipeline,
     reference: wgpu::ComputePipeline,
+    upscale: UpscalePass,
+    history: History,
     accumulator: Accumulator<View>,
     debug_view: DebugView,
     /// Bytes of the Planet that have been written to the GPU, creating its buffers included.
     uploaded: u64,
 }
 
-fn layout_entry(binding: u32, ty: wgpu::BindingType) -> wgpu::BindGroupLayoutEntry {
+pub(crate) fn layout_entry(binding: u32, ty: wgpu::BindingType) -> wgpu::BindGroupLayoutEntry {
     wgpu::BindGroupLayoutEntry {
         binding,
         visibility: wgpu::ShaderStages::COMPUTE,
@@ -158,7 +248,7 @@ fn layout_entry(binding: u32, ty: wgpu::BindingType) -> wgpu::BindGroupLayoutEnt
     }
 }
 
-fn buffer_binding(ty: wgpu::BufferBindingType) -> wgpu::BindingType {
+pub(crate) fn buffer_binding(ty: wgpu::BufferBindingType) -> wgpu::BindingType {
     wgpu::BindingType::Buffer {
         ty,
         has_dynamic_offset: false,
@@ -166,7 +256,8 @@ fn buffer_binding(ty: wgpu::BufferBindingType) -> wgpu::BindingType {
     }
 }
 
-const STORAGE_READ: wgpu::BufferBindingType = wgpu::BufferBindingType::Storage { read_only: true };
+pub(crate) const STORAGE_READ: wgpu::BufferBindingType =
+    wgpu::BufferBindingType::Storage { read_only: true };
 
 fn compute_pipeline(
     device: &wgpu::Device,
@@ -323,23 +414,17 @@ impl Tracer {
         let scene_bytes = scene_buffers.bytes;
 
         let camera_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("camera, image, accumulation and materials"),
+            label: Some("camera, image, accumulation, materials and G-buffer"),
             entries: &[
                 layout_entry(0, buffer_binding(wgpu::BufferBindingType::Uniform)),
-                layout_entry(
-                    1,
-                    wgpu::BindingType::StorageTexture {
-                        access: wgpu::StorageTextureAccess::WriteOnly,
-                        format: IMAGE_FORMAT,
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                    },
-                ),
+                layout_entry(1, storage_texture(IMAGE_FORMAT)),
                 layout_entry(2, buffer_binding(wgpu::BufferBindingType::Uniform)),
                 layout_entry(
                     3,
                     buffer_binding(wgpu::BufferBindingType::Storage { read_only: false }),
                 ),
                 layout_entry(4, buffer_binding(STORAGE_READ)),
+                layout_entry(5, storage_texture(GBUFFER_FORMAT)),
             ],
         });
         let materials = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -384,34 +469,17 @@ impl Tracer {
             camera_layout,
             primary,
             reference,
+            upscale: UpscalePass::new(device),
+            history: History::default(),
             accumulator: Accumulator::new(),
             debug_view: DebugView::default(),
             uploaded: scene_bytes,
         })
     }
 
-    /// A texture the kernels can write and that can be read back or sampled.
-    fn create_image(device: &wgpu::Device, width: u32, height: u32) -> wgpu::Texture {
-        device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("traced image"),
-            size: wgpu::Extent3d {
-                width,
-                height,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: IMAGE_FORMAT,
-            usage: wgpu::TextureUsages::STORAGE_BINDING
-                | wgpu::TextureUsages::TEXTURE_BINDING
-                | wgpu::TextureUsages::COPY_SRC,
-            view_formats: &[],
-        })
-    }
-
-    /// Records the primary visibility pass: one ray per pixel of `target` from `camera`, lit by
-    /// `sun`. The pass is timed by `profiler`.
+    /// Records the primary visibility pass: one ray per pixel of the lit image of `target`, through
+    /// the centre of the pixel, from `camera`, lit by `sun`. Nothing carries over from one call
+    /// to the next. The pass is timed by `profiler`.
     #[allow(clippy::too_many_arguments)]
     pub fn encode_primary(
         &self,
@@ -423,13 +491,45 @@ impl Tracer {
         sun: &Sun,
         target: &Target,
     ) {
-        self.write_uniforms(queue, camera, sun, 0);
+        self.write_uniforms(queue, camera, sun, 0, CENTRE);
         self.dispatch(device, profiler, encoder, "primary", &self.primary, target);
     }
 
-    /// Records one more sample of the reference path tracer for every pixel of `target`, added
-    /// to the running mean there. If the camera, the sun or the size of `target` differs from
-    /// the last call, the mean starts over.
+    /// Records a frame of primary visibility from `camera`, lit by `sun`: the primary pass, one ray
+    /// per pixel of the lit image, through a different point of the pixel every frame; then the
+    /// upscale pass, which builds the output image from it and from the frames before. Both
+    /// passes are timed by `profiler`.
+    ///
+    /// The uniforms are written when this is called, so each frame must be submitted before the
+    /// next is encoded.
+    ///
+    /// The history starts over for a new `Target`, a new size or scale, or a debug view; not for
+    /// what changes in the scene. Ring re-centres, Edits and teleports are left to the clamp to
+    /// the new samples and to history that reprojects off the screen: resetting on a ring move
+    /// would wipe the history every frame while flying.
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_upscaled(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        profiler: &mut Profiler,
+        encoder: &mut wgpu::CommandEncoder,
+        camera: &Camera,
+        sun: &Sun,
+        target: &Target,
+    ) {
+        let frame = self
+            .history
+            .begin(target.resolution(), camera, self.debug_view);
+        self.write_uniforms(queue, camera, sun, 0, frame.jitter());
+        self.dispatch(device, profiler, encoder, "primary", &self.primary, target);
+        self.upscale
+            .encode(device, queue, profiler, encoder, &frame, target);
+    }
+
+    /// Records one more sample of the reference path tracer for every pixel of the lit image of
+    /// `target`, added to the running mean there. If the camera, the sun or the size of `target`
+    /// differs from the last call, the mean starts over.
     ///
     /// The uniforms are written when this is called, so each sample must be submitted before the
     /// next is encoded. The pass is timed by `profiler`.
@@ -447,10 +547,10 @@ impl Tracer {
         let view = View {
             camera: *camera,
             sun: *sun,
-            size: target.size,
+            size: target.resolution.internal,
         };
         let sample_index = self.accumulator.begin_sample(&view);
-        self.write_uniforms(queue, camera, sun, sample_index);
+        self.write_uniforms(queue, camera, sun, sample_index, CENTRE);
         self.dispatch(
             device,
             profiler,
@@ -559,10 +659,11 @@ impl Tracer {
         self.uploaded
     }
 
-    /// Starts the reference image over, for what the `View` cannot see: a new `Target`, whose
-    /// buffer is empty whatever the count says.
+    /// Starts the reference image and the upscaler's history over, for what the `View` cannot see:
+    /// a new `Target`, whose buffer and history are empty whatever the count says.
     pub fn reset_accumulation(&mut self) {
         self.accumulator.reset();
+        self.history.reset();
     }
 
     pub fn debug_view(&self) -> DebugView {
@@ -580,7 +681,14 @@ impl Tracer {
         self.accumulator.samples()
     }
 
-    fn write_uniforms(&self, queue: &wgpu::Queue, camera: &Camera, sun: &Sun, sample_index: u32) {
+    fn write_uniforms(
+        &self,
+        queue: &wgpu::Queue,
+        camera: &Camera,
+        sun: &Sun,
+        sample_index: u32,
+        jitter: [f32; 2],
+    ) {
         queue.write_buffer(
             &self.camera_buffer,
             0,
@@ -589,10 +697,12 @@ impl Tracer {
         let frame = FrameUniform {
             sun: sun.uniform(),
             params: [sample_index, RNG_SEED, self.debug_view.index(), 0],
+            jitter: [jitter[0], jitter[1], 0.0, 0.0],
         };
         queue.write_buffer(&self.frame_buffer, 0, bytemuck::bytes_of(&frame));
     }
 
+    /// Runs `pipeline` over every pixel of the lit image of `target`, at the internal resolution.
     fn dispatch(
         &self,
         device: &wgpu::Device,
@@ -602,8 +712,9 @@ impl Tracer {
         pipeline: &wgpu::ComputePipeline,
         target: &Target,
     ) {
+        let (width, height) = target.resolution.internal;
         let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("camera, image, accumulation and materials"),
+            label: Some("camera, image, accumulation, materials and G-buffer"),
             layout: &self.camera_layout,
             entries: &[
                 wgpu::BindGroupEntry {
@@ -612,7 +723,7 @@ impl Tracer {
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: wgpu::BindingResource::TextureView(target.view()),
+                    resource: wgpu::BindingResource::TextureView(&target.lit.view),
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
@@ -626,13 +737,17 @@ impl Tracer {
                     binding: 4,
                     resource: self.materials.as_entire_binding(),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: wgpu::BindingResource::TextureView(&target.gbuffer.view),
+                },
             ],
         });
         let mut pass = profiler.compute_pass(encoder, name);
         pass.set_pipeline(pipeline);
         pass.set_bind_group(0, &self.scene.group, &[]);
         pass.set_bind_group(1, &group, &[]);
-        pass.dispatch_workgroups(target.size.0.div_ceil(8), target.size.1.div_ceil(8), 1);
+        pass.dispatch_workgroups(width.div_ceil(8), height.div_ceil(8), 1);
     }
 
     /// Casts `rays` through `trace()` on the GPU and returns the hits, in order.

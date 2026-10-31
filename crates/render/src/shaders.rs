@@ -1,5 +1,6 @@
 //! WGSL sources. WGSL has no includes, so a module's source is `trace.wgsl` (and, for the
-//! kernels that draw, `common.wgsl`) joined with the file that uses it. Every module is
+//! kernels that draw, `common.wgsl`) joined with the file that uses it; the upscaler needs
+//! neither. Every module is
 //! validated by naga in the tests below, with no GPU needed.
 
 /// `trace(ray) -> Hit`, the one entry point the rest of the renderer calls.
@@ -30,6 +31,9 @@ pub const PATHTRACE: &str = concat!(
 /// can compile it alone.
 #[cfg(test)]
 pub const SAMPLING: &str = include_str!("shaders/sampling.wgsl");
+
+/// The temporal upscaler: the compute kernel that builds the output image from the traced one.
+pub const UPSCALE: &str = include_str!("shaders/upscale.wgsl");
 
 /// Copies the traced image to the window.
 pub const BLIT: &str = include_str!("shaders/blit.wgsl");
@@ -84,6 +88,12 @@ mod tests {
     }
 
     #[test]
+    fn the_upscale_kernel_is_valid_wgsl_and_does_not_touch_the_planet() {
+        assert_eq!(entry_points(UPSCALE), ["upscale_pass"]);
+        assert!(!UPSCALE.contains("trace("));
+    }
+
+    #[test]
     fn the_blit_shader_is_valid_wgsl() {
         assert_eq!(entry_points(BLIT), ["vertex", "fragment"]);
     }
@@ -108,6 +118,7 @@ mod tests {
             include_str!("shaders/pathtrace.wgsl"),
             include_str!("shaders/primary.wgsl"),
             include_str!("shaders/probe.wgsl"),
+            UPSCALE,
             BLIT,
         ] {
             assert_eq!(other.matches("fn trace(").count(), 0);
