@@ -60,7 +60,7 @@ struct SceneHeader {
 impl SceneHeader {
     fn new(scene: &Scene) -> Self {
         let mut header = SceneHeader::zeroed();
-        header.level_count = scene.levels.len() as u32;
+        header.level_count = scene.walked_levels() as u32;
         if let (Some(bound), Some(radius)) = (scene.bound, scene.clip_radius()) {
             header.bound_radius = radius;
             header.bound_centre = bound.centre;

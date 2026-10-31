@@ -104,6 +104,15 @@ impl World {
         self.scene.recentre(self.predictor.store(), camera)
     }
 
+    /// Selects the bricks again for other LOD `bands` (a new bias). Returns how the scene
+    /// changed, if it did.
+    pub fn set_bands(
+        &mut self,
+        bands: render::lod::Bands,
+    ) -> Result<Option<SceneUpdate>, RingsFull> {
+        self.scene.set_bands(self.predictor.store(), bands)
+    }
+
     /// Digs a sphere where the camera looks: shows it at once, and asks the server for it.
     /// Returns how the scene changed, if there was anything to dig.
     pub fn dig(&mut self, camera: &Camera) -> Result<Option<SceneUpdate>, Stopped> {
@@ -199,7 +208,17 @@ mod tests {
     fn a_dig_in_a_scene_of_rings_is_drawn_at_once_and_the_rings_follow_the_camera() {
         let mut store = wall();
         store.build_lod(4);
-        let scene = Scene::rings(&store, camera().position, 5).unwrap();
+        let bound = render::scene::Bound {
+            centre: [0; 3],
+            radius: 4200,
+        };
+        let scene = Scene::rings(
+            &store,
+            camera().position,
+            render::lod::Bands::with_d0(64.0),
+            bound,
+        )
+        .unwrap();
         let (client, _server) = loopback();
         let mut world = World::new(scene, Predictor::new(store), client);
 

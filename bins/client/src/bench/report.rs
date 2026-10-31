@@ -171,6 +171,11 @@ pub struct Config {
     /// The camera path, which has a version in its name: the same name is the same flight.
     pub path: String,
     pub keyframes: usize,
+    /// The LOD bias: output pixels one Voxel may cover (`--bias`).
+    pub bias: f64,
+    /// Bricks drawn at each level of detail (0 first) from the path's first camera. Empty for a
+    /// scene that is not drawn in levels (`--short`).
+    pub bricks_per_level: Vec<usize>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -326,6 +331,8 @@ mod tests {
                 scene: "patch".into(),
                 path: "flyover".into(),
                 keyframes: 3,
+                bias: 1.0,
+                bricks_per_level: vec![10, 0, 4],
             },
             modes: modes(0.5),
             screenshots: vec!["primary-0.png".into()],

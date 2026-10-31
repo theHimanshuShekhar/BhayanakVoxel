@@ -16,19 +16,23 @@ Options:
                    is twice as big in each direction
   --short          A tiny run on a patch of the Planet at low resolution: for a smoke test,
                    not for timings
+  --bias F         LOD bias: output pixels one Voxel may cover [default: 1]. Every switch
+                   distance between levels of detail scales with it; 2 does a quarter of the
+                   work for up to a pixel more of error
   --no-fail        Exit with status 0 even if a pass is over its budget
   -h, --help       Print this";
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq)]
 pub struct Args {
     pub out: PathBuf,
     pub budgets: Option<PathBuf>,
     pub short: bool,
     pub no_fail: bool,
     pub size: Option<(u32, u32)>,
+    pub bias: f64,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq)]
 pub enum Parsed {
     Help,
     Run(Args),
@@ -42,6 +46,7 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Parsed, String> {
         short: false,
         no_fail: false,
         size: None,
+        bias: 1.0,
     };
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
@@ -53,10 +58,19 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Parsed, String> {
             "--out" => parsed.out = value("--out")?.into(),
             "--budgets" => parsed.budgets = Some(value("--budgets")?.into()),
             "--size" => parsed.size = Some(size(&value("--size")?)?),
+            "--bias" => parsed.bias = bias(&value("--bias")?)?,
             _ => return Err(format!("unexpected argument `{arg}`")),
         }
     }
     Ok(Parsed::Run(parsed))
+}
+
+/// A LOD bias: a positive, finite number.
+fn bias(text: &str) -> Result<f64, String> {
+    text.parse::<f64>()
+        .ok()
+        .filter(|b| b.is_finite() && *b > 0.0)
+        .ok_or_else(|| format!("`{text}` is not a LOD bias like 1 or 2.5"))
 }
 
 /// `WIDTHxHEIGHT`, both at least 1.
@@ -91,7 +105,8 @@ mod tests {
                 budgets: None,
                 short: false,
                 no_fail: false,
-                size: None
+                size: None,
+                bias: 1.0
             }
         );
     }
@@ -107,11 +122,14 @@ mod tests {
             "b.toml",
             "--size",
             "640x360",
+            "--bias",
+            "2",
         ]);
         assert_eq!(args.out, PathBuf::from("o"));
         assert_eq!(args.budgets, Some(PathBuf::from("b.toml")));
         assert!(args.short && args.no_fail);
         assert_eq!(args.size, Some((640, 360)));
+        assert_eq!(args.bias, 2.0);
     }
 
     #[test]
@@ -129,6 +147,11 @@ mod tests {
             &["--size", "640"],
             &["--size", "0x360"],
             &["--size", "axb"],
+            &["--bias"],
+            &["--bias", "0"],
+            &["--bias", "-1"],
+            &["--bias", "fast"],
+            &["--bias", "inf"],
             &["stray"],
         ] {
             assert!(parse_all(bad).is_err(), "{bad:?}");

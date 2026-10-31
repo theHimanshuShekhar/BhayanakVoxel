@@ -162,13 +162,30 @@ fn run(args: &Args) -> Result<u8, Box<dyn Error>> {
         eprintln!("generating the Planet (this takes a while)...");
         let mut store = planet_gen::generate_planet(crate::SEED);
         store.build_lod(crate::RING_LEVELS - 1);
-        let scene = crate::planet_scene(&store, plan.path.camera_at(0, 2).position)?;
+        // The bands are for the image that is presented: twice the traced height.
+        let bands = render::lod::Bands::new(plan.height * 2, render::lod::VFOV, args.bias);
+        let scene = crate::planet_scene(
+            &store,
+            plan.path.camera_at(0, 2).position,
+            bands,
+            planet_gen::MAX_RADIUS,
+        )?;
         Flight {
             scene,
             store: Some(store),
         }
     };
     eprintln!("scene ready after {:.1?}", started.elapsed());
+    let bricks_per_level: Vec<usize> = if flight.scene.is_rings() {
+        (0..render::lod::LEVELS)
+            .map(|level| flight.scene.level_bricks(level))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    if !bricks_per_level.is_empty() {
+        eprintln!("bias {}, bricks per level {bricks_per_level:?}", args.bias);
+    }
 
     let resolution = Resolution {
         internal: (plan.width, plan.height),
@@ -237,6 +254,8 @@ fn run(args: &Args) -> Result<u8, Box<dyn Error>> {
             scene: if plan.patch { "patch" } else { "planet" }.to_string(),
             path: plan.path_name.to_string(),
             keyframes: plan.path.keyframes(),
+            bias: args.bias,
+            bricks_per_level,
         },
         screenshots,
         budgets: report::summarize(&source, &budgets, &modes),

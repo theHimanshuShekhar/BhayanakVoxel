@@ -98,6 +98,9 @@ fn check_schema(report: &Value, out: &Path) {
     assert_eq!(string(&config["scene"]), "patch");
     assert!(!string(&config["path"]).is_empty());
     assert!(config["keyframes"].as_u64().unwrap() >= 2);
+    // The LOD bias is recorded (1 unless asked), and the patch is not drawn in levels.
+    assert_eq!(config["bias"], 1.0);
+    assert_eq!(config["bricks_per_level"], serde_json::json!([]));
 
     for mode in ["primary", "reference"] {
         let run = &report["modes"][mode];
