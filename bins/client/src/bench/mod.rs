@@ -28,7 +28,9 @@ use render::{Camera, Image, Mode, Offscreen, Resolution, Scene};
 use args::{Args, Parsed, USAGE};
 use budget::{Budgets, Status};
 use path::CameraPath;
-use report::{Build, Config, Machine, Measured, ModeReport, Modes, Report, SCHEMA_VERSION};
+use report::{
+    Build, Config, KeyframeLod, Machine, Measured, ModeReport, Modes, Report, SCHEMA_VERSION,
+};
 
 const REPORT_FILE: &str = "report.json";
 
@@ -162,9 +164,12 @@ fn run(args: &Args) -> Result<u8, Box<dyn Error>> {
         eprintln!("generating the Planet (this takes a while)...");
         let mut store = planet_gen::generate_planet(crate::SEED);
         store.build_lod(crate::RING_LEVELS - 1);
+        // The bands are for the image that is presented: twice the traced height.
+        let bands = render::lod::Bands::new(plan.height * 2, render::lod::VFOV, args.bias);
         let scene = crate::planet_scene(
             &store,
             plan.path.camera_at(0, 2).position,
+            bands,
             planet_gen::MAX_RADIUS,
         )?;
         Flight {
@@ -173,7 +178,6 @@ fn run(args: &Args) -> Result<u8, Box<dyn Error>> {
         }
     };
     eprintln!("scene ready after {:.1?}", started.elapsed());
-
     let resolution = Resolution {
         internal: (plan.width, plan.height),
         output: (plan.width * 2, plan.height * 2),
@@ -241,6 +245,7 @@ fn run(args: &Args) -> Result<u8, Box<dyn Error>> {
             scene: if plan.patch { "patch" } else { "planet" }.to_string(),
             path: plan.path_name.to_string(),
             keyframes: plan.path.keyframes(),
+            bias: args.bias,
         },
         screenshots,
         budgets: report::summarize(&source, &budgets, &modes),
@@ -365,9 +370,25 @@ fn run_mode(
 
     let shots = plan.path.keyframe_frames(share.frames);
     let mut wall = Vec::new();
+    let mut scene_update = Vec::new();
+    let mut lod_at_keyframes = Vec::new();
     for frame in 0..share.frames {
         let camera = plan.path.camera_at(frame, share.frames);
+        let following = Instant::now();
         flight.follow(gpu, &camera)?;
+        scene_update.push(following.elapsed().as_secs_f64() * 1e3);
+        if shots.contains(&frame) && flight.scene.is_rings() {
+            let radius = f64::from(planet_gen::PLANET_RADIUS);
+            let distance = camera.position.iter().map(|c| c * c).sum::<f64>().sqrt();
+            lod_at_keyframes.push(KeyframeLod {
+                frame,
+                // 10 cm Voxels.
+                height_m: (distance - radius) * 0.1,
+                bricks: (0..render::lod::LEVELS)
+                    .map(|level| flight.scene.level_bricks(level))
+                    .collect(),
+            });
+        }
         let began = Instant::now();
         let shot = shots.contains(&frame);
         let image = draw(gpu, mode, &camera, share.spp, shot);
@@ -400,6 +421,8 @@ fn run_mode(
             passes,
             gpu_total: &timings.total().history()[total_start..],
             wall: &wall,
+            scene_update: &scene_update,
+            lod_at_keyframes,
         },
         budgets,
     ))
@@ -449,6 +472,19 @@ fn print_summary(report: &Report) {
             ms(run.frame_time.p95_ms),
             ms(run.frame_time.max_ms)
         );
+        eprintln!(
+            "  {:<12} {:>9} {:>9} {:>9}",
+            "scene (cpu)",
+            ms(run.scene_update_ms.mean_ms),
+            ms(run.scene_update_ms.p95_ms),
+            ms(run.scene_update_ms.max_ms)
+        );
+        for k in &run.lod_at_keyframes {
+            eprintln!(
+                "  frame {:>4} at {:>8.1} m: bricks per level {:?}",
+                k.frame, k.height_m, k.bricks
+            );
+        }
     }
     eprintln!();
 }

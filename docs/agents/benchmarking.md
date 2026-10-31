@@ -37,6 +37,7 @@ release: a debug build's CPU side is slow enough to distort the frame times.
 | `--out DIR` | Where `report.json` and the screenshots go. Default `bench-out`. |
 | `--budgets FILE` | Use this budgets file instead of the one built into the executable. |
 | `--size WxH` | Resolution of the traced (internal) image. Default `1280x720`, the internal resolution behind 1440p output that the budgets are for; primary mode upscales it to twice that in each direction (2560x1440). Do not change it for a report you paste. |
+| `--bias F` | LOD bias: output pixels one Voxel may cover, default 1. Every switch distance between levels of detail scales with it (see `CONTEXT.md`, LOD band); 2 does about a quarter of the work for up to a pixel more of error. The report records it, with the bricks drawn at each level from the path's first camera. A report with another bias is not comparable with the budgets. |
 | `--short` | A tiny run (160x90, a handful of frames, a patch of the Planet): the CI smoke test. |
 | `--no-fail` | Exit with status 0 even if a pass is over budget. |
 
@@ -50,10 +51,11 @@ file, a bad option).
 
 ### What it does
 
-1. Generates the test Planet and uploads it to the GPU, as camera-centred rings of levels of
-   detail (ADR 0002), and prints how much GPU memory they take. The rings follow the camera
-   along the path: moving them (packing the regions that come in, writing them to the GPU) is
-   done before a frame is timed, so it is in no pass and not in the frame's CPU time either.
+1. Generates the test Planet and uploads it to the GPU, each brick at the level of detail its
+   distance from the camera says (the LOD bands, ADR 0002), and prints how much GPU memory they
+   take and how many bricks each level has. The bands follow the camera along the path: selecting
+   again and packing the bricks that change level, and writing them to the GPU, is done before a
+   frame is timed, so it is in no pass and not in the frame's CPU time either.
 2. Flies the camera path in **primary mode**, then in **reference mode** (the progressive path
    tracer, 4 samples per frame of the path). Each mode first draws a few warm-up frames, which are
    not measured: the first frames after a mode switch carry the other mode's state (see the notes
