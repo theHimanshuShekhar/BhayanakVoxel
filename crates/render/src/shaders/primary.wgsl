@@ -1,9 +1,11 @@
 // Primary visibility: one ray per pixel through trace(), shaded by normal and albedo.
 
 // Far away, one pixel covers many Voxels whose faces point every which way, so the face normal
-// is noise, and so is their variation in colour. Until coarser levels of detail exist, blend
-// towards the direction away from the Planet's centre, and towards the Material's plain colour,
-// as the hit gets further than FAR_BLEND_START Voxels from the camera.
+// is noise, and so is their variation in colour. The rings of coarser levels (see scene.rs) make
+// the Voxels bigger with distance, which keeps them from being many to a pixel, but their faces
+// still point every which way: blend towards the direction away from the Planet's centre, and
+// towards the Material's plain colour, as the hit gets further than FAR_BLEND_START Voxels from
+// the camera.
 const FAR_BLEND_START = 100.0;
 const FAR_BLEND_END = 1500.0;
 

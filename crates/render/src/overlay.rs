@@ -18,6 +18,15 @@ pub struct Controls {
     pub sun: (f32, f32),
 }
 
+/// How much GPU memory the Planet's bricks take, in bytes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SceneMemory {
+    /// Of the buffers, what holds something (see [`Scene::used_bytes`](crate::Scene)).
+    pub used: u64,
+    /// The size of the buffers: what the GPU has been asked for.
+    pub allocated: u64,
+}
+
 /// What the overlay reports and does not edit.
 pub struct Info<'a> {
     pub timings: &'a Timings,
@@ -25,11 +34,17 @@ pub struct Info<'a> {
     pub timers_supported: bool,
     /// Samples in the reference image so far.
     pub samples: u32,
+    pub scene_memory: SceneMemory,
 }
 
 /// A time for the panel: milliseconds, or "n/a" where there is none.
 fn ms(time: Option<f64>) -> String {
     time.map_or_else(|| "n/a".to_string(), |t| format!("{t:.3}"))
+}
+
+/// Megabytes (2^20 bytes) for the panel, to a tenth.
+fn mib(bytes: u64) -> String {
+    format!("{:.1}", bytes as f64 / (1024.0 * 1024.0))
 }
 
 /// Frames per second for a series of frame times in milliseconds.
@@ -71,6 +86,11 @@ pub fn show(ctx: &Context, info: &Info, controls: &mut Controls) {
                 ui.end_row();
             });
             ui.label(format!("fps: {}", fps(info.timings.wall())));
+            ui.label(format!(
+                "planet memory: {} of {} MiB",
+                mib(info.scene_memory.used),
+                mib(info.scene_memory.allocated)
+            ));
             ui.separator();
 
             let mut reference = controls.mode == Mode::Reference;
@@ -188,6 +208,10 @@ mod tests {
             timings: &timings,
             timers_supported: true,
             samples: 7,
+            scene_memory: SceneMemory {
+                used: 5 * 1024 * 1024 + 512 * 1024,
+                allocated: 64 * 1024 * 1024,
+            },
         };
         let text = draw(&info, &mut controls());
         for expected in [
@@ -200,6 +224,7 @@ mod tests {
             "GPU total",
             "3.000",
             "frame (CPU)",
+            "planet memory: 5.5 of 64.0 MiB",
         ] {
             assert!(text.contains(expected), "no {expected:?} in:\n{text}");
         }
@@ -216,6 +241,7 @@ mod tests {
             timings: &timings,
             timers_supported: false,
             samples: 0,
+            scene_memory: SceneMemory::default(),
         };
         let text = draw(&info, &mut controls());
         assert!(text.contains("GPU timers: not supported"), "{text}");
@@ -229,6 +255,7 @@ mod tests {
             timings: &timings,
             timers_supported: true,
             samples: 42,
+            scene_memory: SceneMemory::default(),
         };
         let mut controls = Controls {
             mode: Mode::Reference,

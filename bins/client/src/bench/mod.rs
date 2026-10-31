@@ -22,7 +22,7 @@ use std::path::Path;
 use std::process::ExitCode;
 use std::time::Instant;
 
-use brick_store::BrickCoord;
+use brick_store::{BrickCoord, BrickStore};
 use render::{Camera, Image, Mode, Offscreen, Scene};
 
 use args::{Args, Parsed, USAGE};
@@ -151,15 +151,28 @@ fn run(args: &Args) -> Result<u8, Box<dyn Error>> {
         .map_err(|e| format!("cannot create {}: {e}", args.out.display()))?;
 
     let started = Instant::now();
-    let scene = if plan.patch {
-        patch_scene()
+    let mut flight = if plan.patch {
+        Flight {
+            scene: patch_scene(),
+            store: None,
+        }
     } else {
         eprintln!("generating the Planet (this takes a while)...");
-        crate::planet_scene(&planet_gen::generate_planet(crate::SEED))
+        let mut store = planet_gen::generate_planet(crate::SEED);
+        store.build_lod(crate::RING_LEVELS - 1);
+        let scene = crate::planet_scene(&store, plan.path.camera_at(0, 2).position)?;
+        Flight {
+            scene,
+            store: Some(store),
+        }
     };
     eprintln!("scene ready after {:.1?}", started.elapsed());
 
-    let mut gpu = Offscreen::new(plan.width, plan.height, &scene)?;
+    let mut gpu = Offscreen::new(plan.width, plan.height, &flight.scene)?;
+    eprintln!(
+        "the Planet takes {:.1} MiB of GPU memory",
+        gpu.scene_bytes() as f64 / (1024.0 * 1024.0)
+    );
     let info = gpu.gpu_info().clone();
     eprintln!(
         "GPU: {} ({}, {}, {})",
@@ -176,6 +189,7 @@ fn run(args: &Args) -> Result<u8, Box<dyn Error>> {
     let mut screenshots = Vec::new();
     let primary = run_mode(
         &mut gpu,
+        &mut flight,
         &plan,
         Mode::Primary,
         &budgets,
@@ -184,6 +198,7 @@ fn run(args: &Args) -> Result<u8, Box<dyn Error>> {
     )?;
     let reference = run_mode(
         &mut gpu,
+        &mut flight,
         &plan,
         Mode::Reference,
         &budgets,
@@ -257,6 +272,26 @@ fn patch_scene() -> Scene {
     Scene::new(&store, None)
 }
 
+/// The Planet being flown over: its packed bricks and, for rings, the bricks they are made from.
+struct Flight {
+    scene: Scene,
+    store: Option<BrickStore>,
+}
+
+impl Flight {
+    /// Moves the rings to the camera, if the scene has rings, and copies what that changed to
+    /// the GPU. A window does the same before it draws a frame; the time it takes is not part
+    /// of any pass.
+    fn follow(&mut self, gpu: &mut Offscreen, camera: &Camera) -> Result<(), Box<dyn Error>> {
+        if let Some(store) = &self.store
+            && let Some(update) = self.scene.recentre(store, camera.position)?
+        {
+            gpu.update_scene(&self.scene, &update)?;
+        }
+        Ok(())
+    }
+}
+
 fn draw(gpu: &mut Offscreen, mode: Mode, camera: &Camera, spp: u32) -> Image {
     match mode {
         Mode::Primary => gpu.render(camera),
@@ -268,6 +303,7 @@ fn draw(gpu: &mut Offscreen, mode: Mode, camera: &Camera, spp: u32) -> Image {
 /// and their names to `screenshots`.
 fn run_mode(
     gpu: &mut Offscreen,
+    flight: &mut Flight,
     plan: &Plan,
     mode: Mode,
     budgets: &Budgets,
@@ -288,6 +324,7 @@ fn run_mode(
     let end = plan
         .path
         .camera_at(share.frames.saturating_sub(1), share.frames);
+    flight.follow(gpu, &end)?;
     for _ in 0..share.warmup {
         draw(gpu, mode, &end, share.spp);
     }
@@ -305,6 +342,7 @@ fn run_mode(
     let mut wall = Vec::new();
     for frame in 0..share.frames {
         let camera = plan.path.camera_at(frame, share.frames);
+        flight.follow(gpu, &camera)?;
         let began = Instant::now();
         let image = draw(gpu, mode, &camera, share.spp);
         wall.push(began.elapsed().as_secs_f64() * 1e3);

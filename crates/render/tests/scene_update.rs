@@ -60,7 +60,7 @@ fn an_updated_scene_draws_what_a_new_one_would() {
 
     // A crater through the crust and into the core below it.
     let changed = dig(&mut store, [0, 98, 0], 14);
-    let update = scene.update(&store, &changed);
+    let update = scene.update(&store, &changed).unwrap();
     assert!(matches!(update, SceneUpdate::Patched { .. }));
     gpu.update_scene(&scene, &update).unwrap();
 
@@ -80,7 +80,7 @@ fn an_update_starts_the_reference_image_over() {
     gpu.render_reference(&camera(), 3);
 
     let changed = dig(&mut store, [0, 98, 0], 14);
-    let update = scene.update(&store, &changed);
+    let update = scene.update(&store, &changed).unwrap();
     gpu.update_scene(&scene, &update).unwrap();
 
     // Samples are seeded by their index, so an image that started over after the update equals
@@ -101,7 +101,7 @@ fn a_rebuilt_scene_is_uploaded_whole() {
     let before = gpu.render(&camera);
     // A brick far from every region: the scene has to be built again.
     store.insert(BrickCoord([0, 40, 0]), Brick::solid(SOIL));
-    let update = scene.update(&store, &[BrickCoord([0, 40, 0])]);
+    let update = scene.update(&store, &[BrickCoord([0, 40, 0])]).unwrap();
     assert_eq!(update, SceneUpdate::Rebuilt);
     gpu.update_scene(&scene, &update).unwrap();
 
@@ -121,7 +121,7 @@ fn many_updates_in_a_row_pack_the_scene_again_and_still_draw_right() {
     // scene is packed again (see `scene.rs` for the bound), which happens twice over these.
     for i in 0..120 {
         let changed = dig(&mut store, [i % 7 * 5 - 15, 98, i % 5 * 6 - 12], 12);
-        let update = scene.update(&store, &changed);
+        let update = scene.update(&store, &changed).unwrap();
         rebuilt += usize::from(update == SceneUpdate::Rebuilt);
         gpu.update_scene(&scene, &update).unwrap();
     }

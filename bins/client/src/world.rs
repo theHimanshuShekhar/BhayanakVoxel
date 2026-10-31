@@ -5,11 +5,43 @@
 use brick_store::VoxelCoord;
 use net::{ClientEnd, Disconnected, EditOp, TryRecvError};
 use render::reference::{Hit, Ray, trace};
-use render::{Camera, Scene, SceneUpdate, camera};
+use render::{Camera, RingsFull, Scene, SceneUpdate, camera};
 use sim::Predictor;
 
 /// Radius of the sphere a click digs: 1 m at 10 cm Voxels.
 const DIG_RADIUS: u16 = 10;
+
+/// Why the Planet cannot be kept going.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Stopped {
+    /// The server is gone.
+    Disconnected,
+    /// The Planet no longer fits the rings' buffers; the scene is not to be used again.
+    RingsFull,
+}
+
+impl std::fmt::Display for Stopped {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Disconnected => write!(f, "the server stopped"),
+            Self::RingsFull => write!(f, "{RingsFull}"),
+        }
+    }
+}
+
+impl std::error::Error for Stopped {}
+
+impl From<Disconnected> for Stopped {
+    fn from(_: Disconnected) -> Self {
+        Self::Disconnected
+    }
+}
+
+impl From<RingsFull> for Stopped {
+    fn from(_: RingsFull) -> Self {
+        Self::RingsFull
+    }
+}
 
 pub struct World {
     scene: Scene,
@@ -44,34 +76,46 @@ impl World {
         &self.scene
     }
 
+    /// Moves the rings of the Planet to centre on `camera`, a position in Voxels. Returns how
+    /// the scene changed, if it did.
+    pub fn recentre(&mut self, camera: [f64; 3]) -> Result<Option<SceneUpdate>, RingsFull> {
+        self.scene.recentre(self.predictor.store(), camera)
+    }
+
     /// Digs a sphere where the camera looks: shows it at once, and asks the server for it.
     /// Returns how the scene changed, if there was anything to dig.
-    pub fn dig(&mut self, camera: &Camera) -> Result<Option<SceneUpdate>, Disconnected> {
+    pub fn dig(&mut self, camera: &Camera) -> Result<Option<SceneUpdate>, Stopped> {
         let Some(hit) = centre_hit(&self.scene, camera) else {
             return Ok(None);
         };
         let op = EditOp::dig_sphere(VoxelCoord(hit.voxel), DIG_RADIUS);
         let (request, changed) = self.predictor.edit(op);
         self.link.send(request)?;
-        Ok(self.refresh(&changed))
+        Ok(self.refresh(&changed)?)
     }
 
     /// Takes in what the server has sent. Returns how the scene changed, if it did.
-    pub fn poll(&mut self) -> Result<Option<SceneUpdate>, Disconnected> {
+    pub fn poll(&mut self) -> Result<Option<SceneUpdate>, Stopped> {
         let mut changed = Vec::new();
         loop {
             match self.link.try_recv() {
                 Ok(message) => changed.extend(self.predictor.receive(message)),
                 Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => return Err(Disconnected),
+                Err(TryRecvError::Disconnected) => return Err(Disconnected.into()),
             }
         }
-        Ok(self.refresh(&changed))
+        Ok(self.refresh(&changed)?)
     }
 
     /// Packs the bricks that changed.
-    fn refresh(&mut self, changed: &[brick_store::BrickCoord]) -> Option<SceneUpdate> {
-        (!changed.is_empty()).then(|| self.scene.update(self.predictor.store(), changed))
+    fn refresh(
+        &mut self,
+        changed: &[brick_store::BrickCoord],
+    ) -> Result<Option<SceneUpdate>, RingsFull> {
+        if changed.is_empty() {
+            return Ok(None);
+        }
+        self.scene.update(self.predictor.store(), changed).map(Some)
     }
 }
 
@@ -130,6 +174,28 @@ mod tests {
     }
 
     #[test]
+    fn a_dig_in_a_scene_of_rings_is_drawn_at_once_and_the_rings_follow_the_camera() {
+        let mut store = wall();
+        store.build_lod(4);
+        let scene = Scene::rings(&store, camera().position, 5).unwrap();
+        let (client, _server) = loopback();
+        let mut world = World::new(scene, Predictor::new(store), client);
+
+        let update = world.dig(&camera()).unwrap();
+        assert!(matches!(update, Some(SceneUpdate::Rings(_))), "{update:?}");
+        let deeper = centre_hit(world.scene(), &camera()).unwrap();
+        assert!(deeper.voxel[2] < -1, "{deeper:?}");
+
+        // Where the camera is, the rings stay; far away, they move.
+        assert_eq!(world.recentre(camera().position), Ok(None));
+        let far = [camera().position[0] + 900.0, 16.5, 20.5];
+        assert!(matches!(
+            world.recentre(far),
+            Ok(Some(SceneUpdate::Rings(_)))
+        ));
+    }
+
+    #[test]
     fn a_click_on_the_sky_does_nothing() {
         let (mut world, server) = world();
         let up = Camera::looking_at([4016.5, 16.5, 20.5], [4016.5, 100.0, 20.5]);
@@ -174,7 +240,7 @@ mod tests {
     fn a_server_that_is_gone_is_an_error() {
         let (mut world, server) = world();
         drop(server);
-        assert_eq!(world.poll().err(), Some(Disconnected));
-        assert_eq!(world.dig(&camera()).err(), Some(Disconnected));
+        assert_eq!(world.poll().err(), Some(Stopped::Disconnected));
+        assert_eq!(world.dig(&camera()).err(), Some(Stopped::Disconnected));
     }
 }

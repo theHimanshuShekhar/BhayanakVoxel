@@ -12,21 +12,63 @@ use crate::debug_view::DebugView;
 use crate::gpu_materials;
 use crate::profiler::Profiler;
 use crate::reference::{Hit, Ray};
-use crate::scene::{REGION_WORDS, Scene, SceneUpdate, spare_words};
+use crate::scene::{MAX_LEVELS, REGION_WORDS, Scene, SceneUpdate, spare_words};
 use crate::sun::{Sun, SunUniform};
 use crate::{Result, shaders};
 
 /// Format of the traced image: sRGB-encoded values in a plain unorm texture.
 pub const IMAGE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 
-/// `SceneHeader` in `trace.wgsl`.
+/// `Level` in `trace.wgsl`.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct LevelHeader {
+    occupied_first: [i32; 3],
+    table_mask: u32,
+    occupied_end: [i32; 3],
+    table_base: u32,
+    hole_first: [i32; 3],
+    pad0: u32,
+    hole_end: [i32; 3],
+    pad1: u32,
+}
+
+/// `SceneHeader` in `trace.wgsl`: the number of levels, then the first `level_count` of the
+/// levels.
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct SceneHeader {
-    origin: [i32; 3],
-    table_mask: u32,
-    dims: [u32; 3],
-    pad: u32,
+    level_count: u32,
+    bound_radius: f32,
+    pad0: [u32; 2],
+    bound_centre: [i32; 3],
+    pad1: u32,
+    levels: [LevelHeader; MAX_LEVELS],
+}
+
+impl SceneHeader {
+    fn new(scene: &Scene) -> Self {
+        let mut header = SceneHeader::zeroed();
+        header.level_count = scene.levels.len() as u32;
+        if let (Some(bound), Some(radius)) = (scene.bound, scene.clip_radius()) {
+            header.bound_radius = radius;
+            header.bound_centre = bound.centre;
+        }
+        for (level, (slot, l)) in header.levels.iter_mut().zip(&scene.levels).enumerate() {
+            let (hole_first, hole_end) = scene.hole(level);
+            *slot = LevelHeader {
+                occupied_first: l.occupied_first,
+                table_mask: l.table_mask,
+                occupied_end: l.occupied_end,
+                table_base: l.table_base,
+                hole_first,
+                pad0: 0,
+                hole_end,
+                pad1: 0,
+            };
+        }
+        header
+    }
 }
 
 /// Seeds the reference path tracer's random numbers: a given view, sun and sample count always
@@ -103,6 +145,8 @@ pub struct Tracer {
     reference: wgpu::ComputePipeline,
     accumulator: Accumulator<View>,
     debug_view: DebugView,
+    /// Bytes of the Planet that have been written to the GPU, creating its buffers included.
+    uploaded: u64,
 }
 
 fn layout_entry(binding: u32, ty: wgpu::BindingType) -> wgpu::BindGroupLayoutEntry {
@@ -186,44 +230,56 @@ fn storage_buffer(
     Ok((buffer, capacity))
 }
 
-/// The Planet's packed bricks on the GPU. `brick_refs` and `bricks` have room to grow, since
-/// an Edit appends to them (see [`Scene::update`]).
+/// Writes `words` to `buffer`, starting at word `at`, and returns the bytes written.
+fn write_words(queue: &wgpu::Queue, buffer: &wgpu::Buffer, words: &[u32], at: usize) -> u64 {
+    queue.write_buffer(buffer, at as u64 * 4, bytemuck::cast_slice(words));
+    words.len() as u64 * 4
+}
+
+/// The Planet's packed bricks on the GPU. The buffers of an ordinary scene have room to grow,
+/// since an Edit appends to `brick_refs` and `bricks` (see [`Scene::update`]); those of rings
+/// are as big as the scene's, which has all its room already.
 struct SceneBuffers {
+    header: wgpu::Buffer,
+    table: wgpu::Buffer,
     regions: wgpu::Buffer,
     brick_refs: wgpu::Buffer,
     bricks: wgpu::Buffer,
     /// Sizes of `brick_refs` and `bricks`, in words.
     capacity: [usize; 2],
+    /// Bytes of GPU memory in the five buffers.
+    bytes: u64,
     group: wgpu::BindGroup,
 }
 
 impl SceneBuffers {
     fn new(device: &wgpu::Device, layout: &wgpu::BindGroupLayout, scene: &Scene) -> Result<Self> {
-        let header = SceneHeader {
-            origin: scene.origin,
-            table_mask: scene.table_mask(),
-            dims: scene.dims,
-            pad: 0,
-        };
         let header = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("scene header"),
-            contents: bytemuck::bytes_of(&header),
-            usage: wgpu::BufferUsages::UNIFORM,
+            contents: bytemuck::bytes_of(&SceneHeader::new(scene)),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
+        let spare = |len| {
+            if scene.is_rings() {
+                0
+            } else {
+                spare_words(len)
+            }
+        };
         let (table, _) = storage_buffer(device, "region table", &scene.table, 0)?;
         let (regions, _) = storage_buffer(device, "regions", &scene.regions, 0)?;
         let (brick_refs, refs_capacity) = storage_buffer(
             device,
             "brick refs",
             &scene.brick_refs,
-            spare_words(scene.brick_refs.len()),
+            spare(scene.brick_refs.len()),
         )?;
-        let (bricks, bricks_capacity) = storage_buffer(
-            device,
-            "bricks",
-            &scene.bricks,
-            spare_words(scene.bricks.len()),
-        )?;
+        let (bricks, bricks_capacity) =
+            storage_buffer(device, "bricks", &scene.bricks, spare(scene.bricks.len()))?;
+        let bytes = [&header, &table, &regions, &brick_refs, &bricks]
+            .iter()
+            .map(|buffer| buffer.size())
+            .sum();
         let entries: Vec<_> = [&header, &table, &regions, &brick_refs, &bricks]
             .into_iter()
             .enumerate()
@@ -238,10 +294,13 @@ impl SceneBuffers {
             entries: &entries,
         });
         Ok(Self {
+            header,
+            table,
             regions,
             brick_refs,
             bricks,
             capacity: [refs_capacity, bricks_capacity],
+            bytes,
             group,
         })
     }
@@ -261,6 +320,7 @@ impl Tracer {
             ],
         });
         let scene_buffers = SceneBuffers::new(device, &scene_layout, scene)?;
+        let scene_bytes = scene_buffers.bytes;
 
         let camera_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("camera, image, accumulation and materials"),
@@ -326,6 +386,7 @@ impl Tracer {
             reference,
             accumulator: Accumulator::new(),
             debug_view: DebugView::default(),
+            uploaded: scene_bytes,
         })
     }
 
@@ -411,42 +472,91 @@ impl Tracer {
         update: &SceneUpdate,
     ) -> Result<()> {
         self.accumulator.reset();
-        let SceneUpdate::Patched {
-            regions,
-            brick_refs_from,
-            bricks_from,
-        } = update
-        else {
-            self.scene = SceneBuffers::new(device, &self.scene_layout, scene)?;
-            return Ok(());
-        };
         let buffers = &self.scene;
-        if scene.brick_refs.len() > buffers.capacity[0] || scene.bricks.len() > buffers.capacity[1]
-        {
-            self.scene = SceneBuffers::new(device, &self.scene_layout, scene)?;
-            return Ok(());
-        }
-        for &region in regions {
-            let words = &scene.regions[region * REGION_WORDS..][..REGION_WORDS];
-            queue.write_buffer(
-                &buffers.regions,
-                (region * REGION_WORDS * 4) as u64,
-                bytemuck::cast_slice(words),
-            );
-        }
-        for (buffer, words, from) in [
-            (&buffers.brick_refs, &scene.brick_refs, *brick_refs_from),
-            (&buffers.bricks, &scene.bricks, *bricks_from),
-        ] {
-            if from < words.len() {
-                queue.write_buffer(
-                    buffer,
-                    from as u64 * 4,
-                    bytemuck::cast_slice(&words[from..]),
-                );
+        let mut written = 0;
+        match update {
+            SceneUpdate::Rebuilt => {
+                self.scene = SceneBuffers::new(device, &self.scene_layout, scene)?;
+                self.uploaded += self.scene.bytes;
+                return Ok(());
+            }
+            SceneUpdate::Rings(patch) => {
+                // The scene has all its room, so what changed is written where it is.
+                if patch.levels {
+                    let header = SceneHeader::new(scene);
+                    queue.write_buffer(&buffers.header, 0, bytemuck::bytes_of(&header));
+                    written += size_of::<SceneHeader>() as u64;
+                }
+                for &slot in &patch.table {
+                    written += write_words(
+                        queue,
+                        &buffers.table,
+                        &scene.table[slot * 4..][..4],
+                        slot * 4,
+                    );
+                }
+                for &region in &patch.regions {
+                    let at = region * REGION_WORDS;
+                    written += write_words(
+                        queue,
+                        &buffers.regions,
+                        &scene.regions[at..][..REGION_WORDS],
+                        at,
+                    );
+                }
+                for (buffer, words, ranges) in [
+                    (&buffers.brick_refs, &scene.brick_refs, &patch.brick_refs),
+                    (&buffers.bricks, &scene.bricks, &patch.bricks),
+                ] {
+                    for range in ranges {
+                        written += write_words(queue, buffer, &words[range.clone()], range.start);
+                    }
+                }
+            }
+            SceneUpdate::Patched {
+                regions,
+                brick_refs_from,
+                bricks_from,
+            } => {
+                if scene.brick_refs.len() > buffers.capacity[0]
+                    || scene.bricks.len() > buffers.capacity[1]
+                {
+                    self.scene = SceneBuffers::new(device, &self.scene_layout, scene)?;
+                    self.uploaded += self.scene.bytes;
+                    return Ok(());
+                }
+                for &region in regions {
+                    let at = region * REGION_WORDS;
+                    written += write_words(
+                        queue,
+                        &buffers.regions,
+                        &scene.regions[at..][..REGION_WORDS],
+                        at,
+                    );
+                }
+                for (buffer, words, from) in [
+                    (&buffers.brick_refs, &scene.brick_refs, *brick_refs_from),
+                    (&buffers.bricks, &scene.bricks, *bricks_from),
+                ] {
+                    if from < words.len() {
+                        written += write_words(queue, buffer, &words[from..], from);
+                    }
+                }
             }
         }
+        self.uploaded += written;
         Ok(())
+    }
+
+    /// Bytes of GPU memory that the Planet's bricks take: the five buffers of the scene.
+    pub fn scene_bytes(&self) -> u64 {
+        self.scene.bytes
+    }
+
+    /// Bytes of the Planet written to the GPU so far: what [`Tracer::new`] made its buffers
+    /// from, and what each update wrote.
+    pub fn uploaded_bytes(&self) -> u64 {
+        self.uploaded
     }
 
     /// Starts the reference image over, for what the `View` cannot see: a new `Target`, whose

@@ -1,68 +1,16 @@
 //! The GPU `trace()` and the CPU reference must agree on hit, position, normal and Material.
 //! Needs a Vulkan device: CI and local runs use lavapipe (see `.github/workflows/ci.yml`).
 
-use brick_store::{Brick, BrickCoord, BrickStore, Material, VoxelCoord};
+mod common;
+
+use brick_store::{Brick, BrickCoord, BrickStore, Interior, Material, VoxelCoord};
+use common::{Lcg, assert_agree, ray};
 use planet_gen::generate_region;
+use render::Offscreen;
 use render::reference::{Ray, trace};
 use render::scene::{Core, Scene};
-use render::{Offscreen, camera};
 
 const STONE: Material = Material(7);
-
-/// A small deterministic generator, so the ray sets are fixed.
-struct Lcg(u64);
-
-impl Lcg {
-    fn next(&mut self) -> f32 {
-        self.0 = self
-            .0
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(1442695040888963407);
-        ((self.0 >> 40) as f32) / ((1u64 << 24) as f32)
-    }
-}
-
-/// A ray from `position` (f64, Planet frame) towards `towards`.
-fn ray(position: [f64; 3], towards: [f64; 3]) -> Ray {
-    let d = [0, 1, 2].map(|a| towards[a] - position[a]);
-    let len = d.iter().map(|c| c * c).sum::<f64>().sqrt();
-    let (cell, origin) = camera::split(position);
-    Ray {
-        cell,
-        origin,
-        dir: d.map(|c| (c / len) as f32),
-    }
-}
-
-fn assert_agree(label: &str, rays: &[Ray], scene: &Scene) -> usize {
-    let gpu = Offscreen::new(8, 8, scene).unwrap().trace_rays(rays);
-    assert_eq!(gpu.len(), rays.len());
-    let mut hits = 0;
-    for (i, (r, got)) in rays.iter().zip(&gpu).enumerate() {
-        let want = trace(scene, r);
-        let context = format!("{label} ray {i}: {r:?}\n gpu {got:?}\n cpu {want:?}");
-        match (got, &want) {
-            (None, None) => {}
-            (Some(g), Some(w)) => {
-                hits += 1;
-                assert_eq!(
-                    (g.voxel, g.normal, g.material),
-                    (w.voxel, w.normal, w.material),
-                    "{context}"
-                );
-                assert!((g.t - w.t).abs() <= 1e-3 * (1.0 + w.t.abs()), "{context}");
-                for a in 0..3 {
-                    assert!(
-                        (g.position[a] - w.position[a]).abs() <= 1e-3 * (1.0 + w.t.abs()),
-                        "{context}"
-                    );
-                }
-            }
-            _ => panic!("hit and miss disagree\n{context}"),
-        }
-    }
-    hits
-}
 
 fn store_with(voxels: &[[i32; 3]]) -> BrickStore {
     let mut store = BrickStore::new();
@@ -254,4 +202,131 @@ fn rays_far_from_the_origin_agree_too() {
     ];
     let hits = assert_agree("far", &rays, &scene);
     assert_eq!(hits, 3);
+}
+
+/// A rock ball of 3000 Voxels' radius that the store holds no brick of, so that every level of
+/// its pyramid is read from the ball itself (see `Interior`): no generation, and a surface that
+/// is at its coarsest at the far levels.
+fn ball() -> BrickStore {
+    let mut store = BrickStore::new();
+    store.set_source(Interior {
+        radius: 3000,
+        material: STONE,
+    });
+    store.build_lod(6);
+    store
+}
+
+#[test]
+fn rings_agree_for_rays_that_end_at_every_level() {
+    let store = ball();
+    let mut rng = Lcg(77);
+    // Distances along the rays that hit, by the nearest level: what the ring that holds the
+    // Voxel it hits is, as far as a ring can be told from how far away it is.
+    let mut by_distance = [0usize; 3];
+    for (n, camera) in [
+        [0.0, 3010.0, 0.0],
+        [0.0, 3400.0, 200.0],
+        [5200.0, 1800.0, -900.0],
+        [-14000.0, 0.0, 300.0],
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let scene = Scene::rings(&store, camera, 7).unwrap();
+        let rays: Vec<Ray> = (0..300)
+            .map(|_| {
+                // A point on the ball, or a little above or below it.
+                let on = [rng.next() - 0.5, rng.next() - 0.5, rng.next() - 0.5];
+                let len = on.iter().map(|c| c * c).sum::<f32>().sqrt();
+                let at = on.map(|c| f64::from(c / len) * f64::from(2800.0 + 400.0 * rng.next()));
+                ray(camera, at)
+            })
+            .collect();
+        let hits = assert_agree(&format!("ball camera {n}"), &rays, &scene);
+        assert!(hits > 20, "camera {n}: {hits} hits");
+        for r in &rays {
+            if let Some(hit) = trace(&scene, r) {
+                by_distance[usize::from(hit.t > 512.0) + usize::from(hit.t > 4096.0)] += 1;
+            }
+        }
+    }
+    assert!(
+        by_distance.iter().all(|&n| n > 10),
+        "hits near, in the middle and far: {by_distance:?}"
+    );
+}
+
+#[test]
+fn rings_of_a_patch_of_the_test_planet_agree_with_mixed_bricks_at_every_level() {
+    let mut store = generate_region(7, BrickCoord([-12, 178, -12]), BrickCoord([12, 193, 12]));
+    store.build_lod(5);
+    let mut rng = Lcg(31);
+    let mut rays = Vec::new();
+    let mut scenes = 0;
+    for camera in [
+        [0.0, 1565.0, 0.0],
+        [90.0, 1900.0, -50.0],
+        [0.0, 3000.0, 400.0],
+    ] {
+        let scene = Scene::rings(&store, camera, 6).unwrap();
+        rays.clear();
+        for _ in 0..400 {
+            let at = [
+                f64::from(rng.next() * 160.0 - 80.0),
+                1380.0 + f64::from(rng.next() * 140.0),
+                f64::from(rng.next() * 160.0 - 80.0),
+            ];
+            rays.push(ray(camera, at));
+        }
+        // And rays that begin in a coarse ring and look back at where the camera is, as the
+        // path tracer's bounces do.
+        for _ in 0..100 {
+            let from = [
+                f64::from(rng.next() * 2000.0 - 1000.0),
+                1500.0 + f64::from(rng.next() * 100.0),
+                f64::from(rng.next() * 2000.0 - 1000.0),
+            ];
+            rays.push(ray(from, camera));
+        }
+        let hits = assert_agree("patch rings", &rays, &scene);
+        assert!(hits > 200, "{hits} of {} rays hit", rays.len());
+        scenes += 1;
+    }
+    assert_eq!(scenes, 3);
+}
+
+/// A floor inside the hole of ring 1 (the box of ring 0) and a short line of Voxels just outside
+/// the hole, on the top row of regions of ring 1's box of occupied regions.
+fn floor_and_a_line() -> BrickStore {
+    let mut store = BrickStore::new();
+    for x in -64..64 {
+        for z in -8..8 {
+            store.insert(BrickCoord([x, -1, z]), Brick::solid(STONE));
+        }
+    }
+    for (x, y) in [(512, 126), (513, 126), (512, 127), (513, 127)] {
+        store.set(VoxelCoord([x, y, 0]), Some(STONE));
+    }
+    store.build_lod(1);
+    store
+}
+
+#[test]
+fn a_ray_that_leaves_the_occupied_box_of_a_ring_before_it_leaves_the_hole_finds_nothing() {
+    let store = floor_and_a_line();
+    let camera = [0.5, 50.5, 0.5];
+    let scene = Scene::rings(&store, camera, 2).unwrap();
+    // Rising too steeply to be under the line when it gets as far along as the line is: no ray
+    // meets it, or anything else, and none may be said to.
+    let rays: Vec<Ray> = (0..40)
+        .map(|i| {
+            let slope = 0.16 + 0.011 * f64::from(i);
+            ray(camera, [camera[0] + 1.0, camera[1] + slope, camera[2]])
+        })
+        .collect();
+    for r in &rays {
+        assert_eq!(trace(&scene, r), None, "cpu {r:?}");
+    }
+    assert_eq!(assert_agree("line", &rays, &scene), 0);
 }

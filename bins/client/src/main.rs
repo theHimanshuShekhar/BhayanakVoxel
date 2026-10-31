@@ -10,9 +10,9 @@ use std::time::Instant;
 
 use brick_store::BrickStore;
 use fly::{Action, Fly};
-use render::overlay::{self, Controls};
-use render::scene::Core;
-use render::{Camera, Mode, Renderer, Scene, SceneUpdate, Sun};
+use render::overlay::{self, Controls, SceneMemory};
+use render::scene::Bound;
+use render::{Camera, Mode, Renderer, RingsFull, Scene, SceneUpdate, Sun};
 use sim::{Predictor, ServerHandle};
 use winit::application::ApplicationHandler;
 use winit::event::{DeviceEvent, DeviceId, ElementState, MouseButton, WindowEvent};
@@ -36,14 +36,22 @@ const SPAWN_PITCH: f64 = -60.0;
 /// Radians the sun turns per arrow key press (and per repeat while it is held).
 const SUN_STEP: f32 = 0.05;
 
-/// The test Planet's bricks packed for the GPU, with its rock core standing in for the bricks
-/// that are not stored.
-fn planet_scene(store: &BrickStore) -> Scene {
-    let core = Core {
-        radius: planet_gen::CORE_RADIUS,
-        material: planet_gen::ROCK,
-    };
-    Scene::new(store, Some(core))
+/// Mip levels the client draws the Planet in: rings of them, each twice as coarse as the one
+/// inside it. The outermost is 65536 Voxels across, which is room to zoom out to ten times the
+/// distance of the spawn point.
+const RING_LEVELS: usize = 7;
+
+/// The test Planet's bricks packed for the GPU as rings around `camera`. The store must have its
+/// pyramid ([`RING_LEVELS`] of it), and its source gives the rock core.
+fn planet_scene(store: &BrickStore, camera: [f64; 3]) -> Result<Scene, RingsFull> {
+    let mut scene = Scene::rings(store, camera, RING_LEVELS)?;
+    // Nothing of the Planet is further from its centre than this, so no ray need be walked
+    // beyond it.
+    scene.bound = Some(Bound {
+        centre: [0; 3],
+        radius: planet_gen::MAX_RADIUS,
+    });
+    Ok(scene)
 }
 
 /// The test Planet as the client and the in-process server each hold it, and the client's packed
@@ -59,16 +67,18 @@ struct Loaded {
 /// the window is already up.
 fn load_planet() -> Loaded {
     let started = Instant::now();
-    let store = planet_gen::generate_planet(SEED);
+    let mut store = planet_gen::generate_planet(SEED);
     eprintln!(
         "generated {} bricks in {:.1?}",
         store.len(),
         started.elapsed()
     );
-    let scene = planet_scene(&store);
     // Generation is deterministic, so the server's Planet is what generating it again would
-    // give; copying it is quicker.
+    // give; copying it is quicker. The server draws nothing, so it needs no coarse levels.
     let server_store = store.clone();
+    store.build_lod(RING_LEVELS - 1);
+    let scene = planet_scene(&store, spawn_camera().position)
+        .expect("the test Planet fits the rings' buffers");
     eprintln!("planet ready after {:.1?}", started.elapsed());
     Loaded {
         store,
@@ -203,7 +213,7 @@ impl App {
         let Some(world) = &mut self.world else {
             return Ok(());
         };
-        let update = world.poll().map_err(|_| "the server stopped")?;
+        let update = world.poll()?;
         self.show(update)
     }
 
@@ -212,7 +222,16 @@ impl App {
         let Some(world) = &mut self.world else {
             return Ok(());
         };
-        let update = world.dig(&self.camera).map_err(|_| "the server stopped")?;
+        let update = world.dig(&self.camera)?;
+        self.show(update)
+    }
+
+    /// Moves the rings of the Planet to the camera, and copies what that changed to the GPU.
+    fn recentre(&mut self) -> Result<(), Box<dyn Error>> {
+        let Some(world) = &mut self.world else {
+            return Ok(());
+        };
+        let update = world.recentre(self.camera.position)?;
         self.show(update)
     }
 
@@ -312,6 +331,10 @@ impl App {
             timings: renderer.timings(),
             timers_supported: renderer.timers_supported(),
             samples: renderer.samples(),
+            scene_memory: SceneMemory {
+                used: self.world.as_ref().map_or(0, |w| w.scene().used_bytes()),
+                allocated: renderer.scene_bytes(),
+            },
         };
         let input = gui.state.take_egui_input(window);
         let mut output = gui
@@ -476,6 +499,10 @@ impl ApplicationHandler for App {
                     .min(MAX_FRAME_TIME);
                 self.last_frame = now;
                 self.fly.update(&mut self.camera, dt);
+                if let Err(err) = self.recentre() {
+                    self.error = Some(err);
+                    event_loop.exit();
+                }
                 let overlay = self.run_overlay();
                 let ctx = self.gui.as_ref().map(|gui| gui.ctx.clone());
                 if let Some(renderer) = &mut self.renderer {
