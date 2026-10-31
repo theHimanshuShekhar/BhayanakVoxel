@@ -32,10 +32,25 @@ pub struct BrickStore {
     source: Option<Arc<dyn BrickSource>>,
 }
 
+/// The six bricks that share a face with `coord`.
+fn touching(coord: BrickCoord) -> impl Iterator<Item = BrickCoord> {
+    (0..6).map(move |face| {
+        let mut next = coord.0;
+        next[face / 2] = if face % 2 == 0 {
+            next[face / 2].saturating_sub(1)
+        } else {
+            next[face / 2].saturating_add(1)
+        };
+        BrickCoord(next)
+    })
+}
+
 /// What [`BrickStore::refresh_lod`] did.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct LodRefresh {
-    /// How many coarse bricks it remade: the ancestors of the bricks it was told had changed.
+    /// How many coarse bricks it remade: the ancestors of the bricks it was told had changed,
+    /// and those of the bricks touching them, since a coarse brick reads the Voxels beside the
+    /// bricks it is made from. It stops at the first level at which no brick reads differently.
     pub remade: usize,
     /// The coarse bricks that read differently afterwards, as `(level, coordinate)`, finest
     /// level first and ascending within a level. These are the ones to send on to wherever
@@ -101,11 +116,9 @@ impl BrickStore {
     /// The brick at `coord` of mip `level`, as it reads: the one held, or else what the source
     /// gives, or else air. Level 0 is this store's own bricks. Panics if there is no such level.
     pub fn brick_at(&self, level: usize, coord: BrickCoord) -> Cow<'_, Brick> {
-        let held = self.level(level).expect("no such level").brick(coord);
-        match (held, &self.source) {
-            (Some(brick), _) => Cow::Borrowed(brick),
-            (None, Some(source)) => Cow::Owned(source.brick(level, coord)),
-            (None, None) => Cow::Owned(Brick::AIR),
+        match self.level(level).expect("no such level").brick(coord) {
+            Some(brick) => Cow::Borrowed(brick),
+            None => Cow::Owned(self.unheld(level, coord)),
         }
     }
 
@@ -118,7 +131,7 @@ impl BrickStore {
     /// 19 or 20 to reach from 10 cm Voxels to its disc.
     pub fn build_lod(&mut self, coarse_levels: usize) {
         self.coarse = vec![BrickStore::new(); coarse_levels];
-        self.remake_above(self.bricks.keys().copied().collect());
+        self.remake_above(self.bricks.keys().copied().collect(), false);
     }
 
     /// Number of mip levels, counting this one as level 0: 1 when there is no pyramid.
@@ -136,10 +149,11 @@ impl BrickStore {
     }
 
     /// Makes the pyramid match the level 0 bricks at `changed` after they were changed (held,
-    /// replaced or removed), by remaking only the coarse bricks over them. Does nothing without
-    /// a pyramid. The result is the pyramid that [`Self::build_lod`] would make.
+    /// replaced or removed), by remaking only the coarse bricks over them and over the bricks
+    /// that touch them, as far up as any brick reads differently. Does nothing without a
+    /// pyramid. The result is the pyramid that [`Self::build_lod`] would make.
     pub fn refresh_lod(&mut self, changed: impl IntoIterator<Item = BrickCoord>) -> LodRefresh {
-        self.remake_above(changed.into_iter().collect())
+        self.remake_above(changed.into_iter().collect(), true)
     }
 
     /// FNV-1a hash of the pyramid: the number and [`Self::content_hash`] of each coarse level,
@@ -158,30 +172,55 @@ impl BrickStore {
         hash
     }
 
-    /// Remakes the ancestors, at every coarse level, of the level 0 bricks `changed`.
-    fn remake_above(&mut self, changed: BTreeSet<BrickCoord>) -> LodRefresh {
+    /// Remakes the coarse bricks over the level 0 bricks `changed`, level by level.
+    ///
+    /// A coarse brick is made from the eight bricks it covers, and from the Voxels beside them:
+    /// whether a Voxel of the eight is exposed to air depends on the Voxels next to it, in the
+    /// bricks that touch theirs (see [`downsample`]). So a brick that changed makes the coarse
+    /// bricks over it and over the six bricks touching it be remade, when `beside` is set. It
+    /// is not set to build every brick afresh, where all are remade anyway.
+    ///
+    /// A level is remade only from the bricks of the level below that changed, held or read
+    /// differently. When none did, nothing above it can have, and the rest is left alone.
+    fn remake_above(&mut self, changed: BTreeSet<BrickCoord>, beside: bool) -> LodRefresh {
         let mut refresh = LodRefresh::default();
-        if self.coarse.is_empty() {
-            return refresh;
-        }
-        let mut below = changed;
+        let mut moved = changed;
         for level in 1..=self.coarse.len() {
-            below = below.into_iter().map(BrickCoord::parent).collect();
-            for &coord in &below {
-                let before = self.brick_at(level, coord).into_owned();
-                self.remake(level, coord);
+            let over: BTreeSet<_> = moved
+                .iter()
+                .flat_map(|&coord| {
+                    let touching = beside.then(|| touching(coord)).into_iter().flatten();
+                    std::iter::once(coord).chain(touching)
+                })
+                .map(BrickCoord::parent)
+                .collect();
+            moved = BTreeSet::new();
+            for coord in over {
+                let held = self.remake(level, coord);
                 refresh.remade += 1;
-                if before != *self.brick_at(level, coord) {
+                let (was_held, before) = match held {
+                    Some(brick) => (true, brick),
+                    None => (false, self.unheld(level, coord)),
+                };
+                let now_held = self.coarse[level - 1].bricks.contains_key(&coord);
+                let read_differently = before != *self.brick_at(level, coord);
+                if read_differently {
                     refresh.changed.push((level, coord));
                 }
+                if read_differently || was_held != now_held {
+                    moved.insert(coord);
+                }
+            }
+            if moved.is_empty() {
+                break;
             }
         }
         refresh
     }
 
     /// Remakes brick `coord` of coarse level `level` from the eight bricks of the level below:
-    /// held if any of them is held, and not held otherwise.
-    fn remake(&mut self, level: usize, coord: BrickCoord) {
+    /// held if any of them is held, and not held otherwise. Returns the brick that was held.
+    fn remake(&mut self, level: usize, coord: BrickCoord) -> Option<Brick> {
         let finer = self.level(level - 1).expect("the level below exists");
         let children = coord.children();
         let brick = children
@@ -189,13 +228,27 @@ impl BrickStore {
             .any(|c| finer.bricks.contains_key(c))
             .then(|| {
                 let read = children.map(|child| self.brick_at(level - 1, child));
-                downsample(read.each_ref().map(|c| &**c))
+                let around = |at: [i32; 3]| {
+                    self.brick_at(
+                        level - 1,
+                        BrickCoord([0, 1, 2].map(|a| children[0].0[a] + at[a])),
+                    )
+                };
+                downsample(read.each_ref().map(|c| &**c), around)
             });
         let coarse = &mut self.coarse[level - 1].bricks;
         match brick {
             Some(brick) => coarse.insert(coord, brick),
             None => coarse.remove(&coord),
-        };
+        }
+    }
+
+    /// What the brick at `coord` of mip `level` reads as where none is held there.
+    fn unheld(&self, level: usize, coord: BrickCoord) -> Brick {
+        match &self.source {
+            Some(source) => source.brick(level, coord),
+            None => Brick::AIR,
+        }
     }
 
     /// Coordinates of all bricks held, in ascending order.
@@ -469,8 +522,9 @@ mod tests {
         let before = store.clone();
         store.insert(BrickCoord([1, 0, 1]), Brick::AIR);
         let refresh = store.refresh_lod([BrickCoord([1, 0, 1])]);
-        // One ancestor per level, the coarse brick 0 each time.
-        assert_eq!(refresh.remade, 4);
+        // Four per level: the ancestor, and the ones over the bricks beside it that are not in
+        // its parent. The hole is seen up to level 3, so level 4 is remade and then it stops.
+        assert_eq!(refresh.remade, 4 * 4);
         // The hole shows up to level 3, and at level 4 it is one child in eight: still rock.
         assert_eq!(
             refresh.changed,
@@ -494,19 +548,24 @@ mod tests {
     }
 
     #[test]
-    fn bricks_that_share_ancestors_are_remade_once_and_the_rest_each_get_a_chain() {
+    fn bricks_that_share_ancestors_or_touch_ones_that_do_are_remade_once() {
         let mut store = block();
         store.build_lod(4);
-        // Bricks -1 and 0 never share a parent, at any level, so the two chains stay apart.
+        // None of these change anything, so only level 1 is remade: the parents of the bricks
+        // and of the bricks touching them. Bricks -1 and 0 never share a parent, and each of the
+        // two touches the other, so the parents are those of -2 to 1 along x, and the y and z
+        // of the two bricks and of the ones beside them.
         let refresh = store.refresh_lod([BrickCoord([-1, 0, 0]), BrickCoord([0, 0, 0])]);
-        assert_eq!(refresh.remade, 2 * 4);
-        // Four children of one parent are one chain.
+        assert_eq!(refresh.remade, 6);
+        // Four children of one parent, its lower layer: that parent and the one beyond each of
+        // its faces but the top, which the upper layer of children is in.
         let refresh =
             store.refresh_lod([[0, 0, 0], [1, 0, 0], [0, 1, 0], [1, 1, 0]].map(BrickCoord));
-        assert_eq!(refresh.remade, 4);
-        // Twenty-seven neighbours span two parents per axis at each level.
+        assert_eq!(refresh.remade, 6);
+        // Twenty-seven neighbours span two parents per axis: eight, and twelve more that only
+        // the bricks touching the cube are in (a brick 2 along one axis, and not along two).
         let cube = (0..27).map(|i| BrickCoord([i % 3 - 1, i / 3 % 3 - 1, i / 9 - 1]));
-        assert_eq!(store.refresh_lod(cube).remade, 8 * 4);
+        assert_eq!(store.refresh_lod(cube).remade, 20);
     }
 
     #[test]
@@ -560,6 +619,92 @@ mod tests {
                 rebuilt(&store).lod_hash(),
                 "after {centre:?}"
             );
+        }
+    }
+
+    const SOIL: Material = Material(9);
+    const BEDROCK: Material = Material(2);
+
+    /// Ground up to z = 16 over the 16 Voxel wide square about (8, 8): bedrock with a skin of
+    /// soil at z = 15. Its bricks are the four at z = 1 and four at z = 0, which are the
+    /// children of level 1 brick (0, 0, 0).
+    fn ground() -> BrickStore {
+        let mut store = BrickStore::new();
+        for i in 0..8 {
+            let at = BrickCoord([i & 1, i >> 1 & 1, i >> 2]);
+            let mut brick = Brick::solid(BEDROCK);
+            if at.0[2] == 1 {
+                for v in 0..64 {
+                    brick.set([v % 8, v / 8, 7], Some(SOIL));
+                }
+            }
+            store.insert(at, brick);
+        }
+        store
+    }
+
+    #[test]
+    fn a_coarse_brick_is_remade_when_a_brick_next_to_its_children_changes() {
+        let mut store = ground();
+        store.build_lod(3);
+        // Air over the soil, so that it is the surface.
+        assert_eq!(store.voxel_at(1, VoxelCoord([3, 3, 7])), Some(SOIL));
+        // Level 0 brick (0, 0, 2) is not a child of level 1 brick (0, 0, 0), but it is above
+        // two of them. With bedrock on it the soil is no longer the surface there.
+        store.insert(BrickCoord([0, 0, 2]), Brick::solid(BEDROCK));
+        let refresh = store.refresh_lod([BrickCoord([0, 0, 2])]);
+        assert_eq!(store.voxel_at(1, VoxelCoord([3, 3, 7])), Some(BEDROCK));
+        assert!(
+            refresh.changed.contains(&(1, BrickCoord([0; 3]))),
+            "{refresh:?}"
+        );
+        assert_eq!(store.lod_hash(), rebuilt(&store).lod_hash());
+        // And the same on the way back.
+        store.remove(BrickCoord([0, 0, 2]));
+        store.refresh_lod([BrickCoord([0, 0, 2])]);
+        assert_eq!(store.voxel_at(1, VoxelCoord([3, 3, 7])), Some(SOIL));
+        assert_eq!(store.lod_hash(), rebuilt(&store).lod_hash());
+    }
+
+    /// Ground 128 Voxels across, with its surface at z = `top`: 4 Voxels of soil, and bedrock
+    /// under them as far down as z = -48.
+    fn slab(top: i32) -> BrickStore {
+        let material = |z: i32| match z {
+            z if z >= top => None,
+            z if z >= top - 4 => Some(SOIL),
+            _ => Some(BEDROCK),
+        };
+        let mut store = BrickStore::new();
+        for bz in -6..=(top - 1).div_euclid(8) {
+            let layer: Vec<_> = (0..8).map(|v| material(8 * bz + v)).collect();
+            let mut brick = Brick::AIR;
+            for i in 0..512 {
+                brick.set([i % 8, i / 8 % 8, i / 64].map(|a| a as u8), layer[i / 64]);
+            }
+            for bx in -8..8 {
+                for by in -8..8 {
+                    store.insert(BrickCoord([bx, by, bz]), brick.clone());
+                }
+            }
+        }
+        store
+    }
+
+    #[test]
+    fn soil_four_voxels_thick_over_rock_reads_as_soil_at_every_level_wherever_its_surface_is() {
+        // The surface at every height from 18 to 34, which puts it on every boundary between
+        // coarse Voxels from level 1 to level 4 and on those of bricks (24 and 32), and has it
+        // between them otherwise. Bedrock has the lower ID, so a tie never favours the soil.
+        for top in 18..=34 {
+            let mut store = slab(top);
+            store.build_lod(5);
+            for level in 1..=5 {
+                // The highest solid Voxel in the column over the middle of the slab.
+                let surface = (-8..=(top >> level) + 1)
+                    .rev()
+                    .find_map(|z| store.voxel_at(level, VoxelCoord([0, 0, z])));
+                assert_eq!(surface, Some(SOIL), "surface at {top}, level {level}");
+            }
         }
     }
 
@@ -620,7 +765,8 @@ mod tests {
         // with the rock of the interior around it.
         store.insert(BrickCoord([0; 3]), Brick::AIR);
         let refresh = store.refresh_lod([BrickCoord([0; 3])]);
-        assert_eq!(refresh.remade, 2);
+        // Four a level: the corner of eight parents that the brick is at touches four.
+        assert_eq!(refresh.remade, 2 * 4);
         assert_eq!(
             refresh.changed,
             [(1, BrickCoord([0; 3])), (2, BrickCoord([0; 3]))]
@@ -655,12 +801,12 @@ mod tests {
         // the origin remakes them from the bricks around, which the source says are air.
         store.insert(BrickCoord([0; 3]), Brick::AIR);
         let dug = store.refresh_lod([BrickCoord([0; 3])]);
-        assert_eq!(dug.remade, 9);
+        assert_eq!(dug.remade, 9 * 4);
         assert_ne!(store.lod_hash(), bare);
         assert_eq!(store.lod_hash(), rebuilt(&store).lod_hash());
         store.remove(BrickCoord([0; 3]));
         let undone = store.refresh_lod([BrickCoord([0; 3])]);
-        assert_eq!(undone.remade, 9);
+        assert_eq!(undone.remade, 9 * 4);
         assert_eq!(store.lod_hash(), bare);
         assert_eq!(dug.changed.len(), undone.changed.len());
     }
