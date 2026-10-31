@@ -337,9 +337,9 @@ fn hit_region(
 }
 
 /// The first solid Voxel of mip `level` along the ray, in its box and outside the box of the
-/// level before it, if it is between `from` and `limit`. If the ray starts inside the box of the level
-/// before it and leaves it no nearer than `limit`, then so it does for every level after this
-/// one, and `done` is set.
+/// level before it, if it is between `from` and `limit`. If the ray starts inside the box of the
+/// level before it and leaves it no nearer than `limit`, then so it does for every level after
+/// this one, and `done` is set.
 fn hit_level(
     scene: &Scene,
     ray: &Ray,
@@ -452,8 +452,7 @@ pub fn trace(scene: &Scene, ray: &Ray) -> Option<Hit> {
 
     // Clip the ray to the ball that has the whole Planet in it: nothing is found outside it.
     let (mut from, mut limit) = (0.0, f32::MAX);
-    if let Some(bound) = scene.bound {
-        let radius = bound.clip_radius();
+    if let (Some(bound), Some(radius)) = (scene.bound, scene.clip_radius()) {
         let oc: [f32; 3] = std::array::from_fn(|a| {
             bound.centre[a].wrapping_sub(ray.cell[a]) as f32 - ray.origin[a]
         });

@@ -35,8 +35,9 @@ struct Level {
 
 struct SceneHeader {
     level_count: u32,
-    // The ball that has the whole Planet in it, as `Bound` in scene.rs, with its slack added to
-    // the radius: nothing is found outside it. A radius of 0 means there is no ball.
+    // The ball that has the whole Planet in it, as `Bound` in scene.rs, with the radius that
+    // `Scene::clip_radius` gives (which allows for coarse Voxels that stick out of it): nothing
+    // is found outside it. A radius of 0 means there is no ball.
     bound_radius: f32,
     bound_centre: vec3<i32>,
     levels: array<Level, MAX_LEVELS>,
@@ -357,9 +358,10 @@ fn trace(ray: Ray) -> Hit {
     var limit = 3.4e38;
     if scene.bound_radius > 0.0 {
         let oc = vec3<f32>(scene.bound_centre - ray.cell) - ray.origin;
-        let along = dot(oc, ray.dir);
+        // Summed in the order that reference.rs does; whether the driver fuses them is its own.
+        let along = oc.x * ray.dir.x + oc.y * ray.dir.y + oc.z * ray.dir.z;
         let off = oc - ray.dir * along;
-        let h2 = scene.bound_radius * scene.bound_radius - dot(off, off);
+        let h2 = scene.bound_radius * scene.bound_radius - (off.x * off.x + off.y * off.y + off.z * off.z);
         if h2 < 0.0 {
             return miss();
         }

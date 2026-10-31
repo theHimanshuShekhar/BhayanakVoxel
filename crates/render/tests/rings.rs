@@ -494,6 +494,96 @@ fn clipping_to_the_bounding_ball_changes_no_image() {
     }
 }
 
+/// Rays from `camera` at the limb of the Planet and a little beyond it, where a coarse Voxel
+/// that sticks out of the ball of the finest Voxels is what a ray meets.
+fn limb_rays(camera: [f64; 3], count: usize, rng: &mut Lcg) -> Vec<Ray> {
+    let len = camera.iter().map(|c| c * c).sum::<f64>().sqrt();
+    let to_camera = camera.map(|c| c / len);
+    let mut rays = Vec::new();
+    while rays.len() < count {
+        // A direction at right angles to the one the camera is in, give or take a few degrees.
+        let r = [rng.next() - 0.5, rng.next() - 0.5, rng.next() - 0.5].map(f64::from);
+        let along: f64 = (0..3).map(|a| r[a] * to_camera[a]).sum();
+        let side: [f64; 3] = std::array::from_fn(|a| r[a] - to_camera[a] * along);
+        let side_len = side.iter().map(|c| c * c).sum::<f64>().sqrt();
+        if side_len < 1e-3 {
+            continue;
+        }
+        let tilt = f64::from(rng.next() - 0.5) * 0.12;
+        let radius = f64::from(1300.0 + 500.0 * rng.next());
+        let at: [f64; 3] =
+            std::array::from_fn(|a| (side[a] / side_len + to_camera[a] * tilt) * radius);
+        rays.push(ray(camera, at));
+    }
+    rays
+}
+
+/// Cameras far out and near, so that the limb is met at every distance.
+const FAR_CAMERAS: [[f64; 3]; 6] = [
+    [0.0, 9000.0, 4000.0],
+    [20000.0, 5000.0, -3000.0],
+    [-30000.0, 2000.0, 12000.0],
+    [3000.0, 1700.0, 2500.0],
+    [0.0, 3600.0, 3000.0],
+    [1000.0, -9000.0, 500.0],
+];
+
+/// The ball does not cut into Voxels of the coarse rings, which are drawn whole and stick out of
+/// it by their diagonal, not even at the limb. Without the ball a ring of 64-Voxel cubes is met
+/// out to about 110 Voxels beyond the finest Voxels' greatest radius.
+#[test]
+fn clipping_to_the_bounding_ball_does_not_cut_into_coarse_voxels_at_the_limb() {
+    let outermost = f64::from(planet_gen::MAX_RADIUS);
+    let mut rng = Lcg(808);
+    let (mut rays_in_all, mut sticking_out, mut off_by_an_edge) = (0, 0, 0);
+    for camera in FAR_CAMERAS {
+        let plain = rings_at(camera);
+        let clipped = bounded(rings_at(camera));
+        let (cell, origin) = render::camera::split(camera);
+        let mut rays = limb_rays(camera, 4000, &mut rng);
+        rays.push(Ray {
+            cell,
+            origin,
+            dir: [0.053_175_47, -0.962_329_6, -0.266_634_64],
+        });
+        for ray in rays {
+            rays_in_all += 1;
+            let (a, b) = (trace(&plain, &ray), trace(&clipped, &ray));
+            let (Some(a), Some(b)) = (a, b) else {
+                assert!(
+                    a.is_none() && b.is_none(),
+                    "a hit and a miss: {a:?} {b:?} {ray:?}"
+                );
+                continue;
+            };
+            let at = a.voxel.map(f64::from);
+            sticking_out += usize::from(at.iter().map(|c| c * c).sum::<f64>().sqrt() > outermost);
+            let key = |h: &Hit| (h.voxel, h.normal, h.material);
+            if key(&a) != key(&b) {
+                // A ray along the very edge of a Voxel is in one or the next, by a last bit of
+                // `t`: the same distance, a neighbouring Voxel.
+                let near = (0..3).all(|c| (a.voxel[c] - b.voxel[c]).abs() <= 64);
+                assert!(
+                    near && (a.t - b.t).abs() <= 1e-5 * (1.0 + a.t),
+                    "{a:?} against {b:?}, {ray:?}"
+                );
+                off_by_an_edge += 1;
+            }
+        }
+    }
+    eprintln!(
+        "{rays_in_all} rays, {sticking_out} hits beyond the ball, {off_by_an_edge} on an edge"
+    );
+    assert!(
+        sticking_out > 100,
+        "only {sticking_out} hits beyond the ball"
+    );
+    assert!(
+        off_by_an_edge * 500 < rays_in_all,
+        "{off_by_an_edge} of {rays_in_all}"
+    );
+}
+
 #[test]
 fn the_gpu_and_the_cpu_agree_on_rays_that_are_clipped_to_the_bounding_ball() {
     let mut rng = Lcg(404);
@@ -512,5 +602,11 @@ fn the_gpu_and_the_cpu_agree_on_rays_that_are_clipped_to_the_bounding_ball() {
             });
         }
         assert_agree(&format!("ball, camera {camera:?}"), &rays, &scene);
+    }
+    // And at the limb from far out, where coarse Voxels are what is hit.
+    for camera in FAR_CAMERAS {
+        let scene = bounded(rings_at(camera));
+        let rays = limb_rays(camera, 400, &mut rng);
+        assert_agree(&format!("ball limb, camera {camera:?}"), &rays, &scene);
     }
 }
