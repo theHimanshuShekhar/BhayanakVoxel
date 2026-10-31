@@ -42,11 +42,15 @@ fn read_texture(
         },
     );
     let padded = finish_and_read(device, queue, encoder, &staging, size);
-    padded
-        .chunks(row as usize)
-        .flat_map(|r| &r[..(width * bytes) as usize])
-        .copied()
-        .collect()
+    let tight = (width * bytes) as usize;
+    if tight == row as usize {
+        return padded;
+    }
+    let mut rows = Vec::with_capacity(tight * height as usize);
+    for r in padded.chunks(row as usize) {
+        rows.extend_from_slice(&r[..tight]);
+    }
+    rows
 }
 
 /// A finished frame: tightly packed RGBA8, rows from the top.
@@ -230,6 +234,34 @@ impl Offscreen {
         self.read_image(encoder, &texture, size)
     }
 
+    /// Like [`Offscreen::render_upscaled`], without reading the image back: the frame is drawn and
+    /// its pass times are in when this returns. For a run of frames that is timed and whose
+    /// pictures are not looked at (the bench), where reading back every output image (15 MB at
+    /// 1440p) would be most of the CPU time of a frame and leave the GPU idle between frames.
+    pub fn draw_upscaled(&mut self, camera: &Camera) {
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        self.profiler.begin_frame();
+        self.tracer.encode_upscaled(
+            &self.device,
+            &self.queue,
+            &mut self.profiler,
+            &mut encoder,
+            camera,
+            &self.sun,
+            &self.target,
+        );
+        self.profiler.resolve(&mut encoder);
+        // The uniforms of the next frame are written over these.
+        self.queue.submit([encoder.finish()]);
+        self.profiler.collect(&self.device, true);
+        // Without timers `collect` does not wait, and the frame is not over until it has.
+        self.device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .expect("device poll failed");
+    }
+
     /// The G-buffer of the last frame of primary visibility ([`Offscreen::render`] or
     /// [`Offscreen::render_upscaled`]).
     pub fn gbuffer(&mut self) -> GBuffer {
@@ -247,20 +279,28 @@ impl Offscreen {
                 bytes,
             )
         };
-        let normals = read(self.target.normal(), 4);
-        let normal = normals
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .map(|n| [0, 1, 2].map(|c| f32::from(n[c] as i8) / 127.0))
-            .collect();
-        GBuffer {
+        let words = read(self.target.gbuffer(), 8);
+        let mut gbuffer = GBuffer {
             width,
             height,
-            depth: bytemuck::pod_collect_to_vec(&read(self.target.depth(), 4)),
-            normal,
-            albedo: read(self.target.albedo(), 4),
+            depth: Vec::new(),
+            normal: Vec::new(),
+            albedo: Vec::new(),
+        };
+        for texel in words.as_chunks::<8>().0 {
+            let [d0, d1, d2, d3, r, g, b, face] = *texel;
+            gbuffer.depth.push(f32::from_le_bytes([d0, d1, d2, d3]));
+            gbuffer.albedo.extend_from_slice(&[r, g, b, 255]);
+            gbuffer.normal.push(match face {
+                0 => [0.0; 3],
+                code => {
+                    let mut n = [0.0; 3];
+                    n[usize::from(code - 1) / 2] = if (code - 1) % 2 == 1 { 1.0 } else { -1.0 };
+                    n
+                }
+            });
         }
+        gbuffer
     }
 
     /// Adds `samples` samples of the reference path tracer to the image of `camera` and reads

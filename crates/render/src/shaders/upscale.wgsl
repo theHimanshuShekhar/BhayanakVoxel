@@ -41,13 +41,15 @@ struct Upscale {
 }
 
 @group(0) @binding(0) var<uniform> upscale: Upscale;
-// The traced image (sRGB-encoded) and the G-buffer's hit distance, at the internal resolution.
+// The traced image (sRGB-encoded) and the G-buffer, of which this reads the hit distance (the
+// first word, an f32's bits; see primary.wgsl), at the internal resolution.
 @group(0) @binding(1) var colour: texture_2d<f32>;
-@group(0) @binding(2) var depth: texture_2d<f32>;
+@group(0) @binding(2) var gbuffer: texture_2d<u32>;
 // The history of the last frame, read, and of this one, written; at the output resolution.
 @group(0) @binding(3) var history: texture_2d<f32>;
 @group(0) @binding(4) var history_out: texture_storage_2d<rgba16float, write>;
 @group(0) @binding(5) var image: texture_storage_2d<rgba8unorm, write>;
+@group(0) @binding(6) var history_sampler: sampler;
 
 // Frames after which a pixel's history has the share it keeps: the current frame is then 1/16 of
 // the pixel. Keep this in step with the colour scale of the history length view.
@@ -66,26 +68,33 @@ fn load_colour(p: vec2<i32>, size: vec2<i32>) -> vec3<f32> {
 }
 
 // The history at `position` (in output pixels, a texel's centre being at +0.5), by Catmull-Rom
-// interpolation: a bilinear read would soften the image a little more every frame it moves.
+// interpolation: a bilinear read would soften the image a little more every frame it moves. The
+// sixteen texels that it weighs are read with five bilinear taps instead (the middle four texels
+// in one, and one for each of the four texels' neighbours along an axis), leaving out the four
+// corners, whose weights are small. A position at a texel's centre reads that texel alone.
 fn read_history(position: vec2<f32>, size: vec2<i32>) -> vec3<f32> {
-    let p = position - 0.5;
-    let base = floor(p);
-    let f = p - base;
+    let texel = vec2<f32>(size);
+    let centre = floor(position - 0.5) + 0.5;
+    let f = position - centre;
     let f2 = f * f;
     let f3 = f2 * f;
-    var weights: array<vec2<f32>, 4>;
-    weights[0] = -0.5 * f3 + f2 - 0.5 * f;
-    weights[1] = 1.5 * f3 - 2.5 * f2 + 1.0;
-    weights[2] = -1.5 * f3 + 2.0 * f2 + 0.5 * f;
-    weights[3] = 0.5 * f3 - 0.5 * f2;
+    let w0 = f2 - 0.5 * (f3 + f);
+    let w1 = 1.5 * f3 - 2.5 * f2 + 1.0;
+    let w3 = 0.5 * (f3 - f2);
+    let w2 = 1.0 - w0 - w1 - w3;
+    // The middle two texels as one bilinear tap, at the point that splits them as w1 : w2.
+    let w12 = w1 + w2;
+    let near = (centre + w2 / w12) / texel;
+    let before = (centre - 1.0) / texel;
+    let after = (centre + 2.0) / texel;
     var sum = vec3<f32>(0.0);
-    for (var y = 0; y < 4; y++) {
-        for (var x = 0; x < 4; x++) {
-            let at = clamp(vec2<i32>(base) + vec2<i32>(x - 1, y - 1), vec2<i32>(0), size - 1);
-            sum += textureLoad(history, at, 0).rgb * weights[x].x * weights[y].y;
-        }
-    }
-    return sum;
+    sum += textureSampleLevel(history, history_sampler, vec2<f32>(near.x, before.y), 0.0).rgb * (w12.x * w0.y);
+    sum += textureSampleLevel(history, history_sampler, vec2<f32>(before.x, near.y), 0.0).rgb * (w0.x * w12.y);
+    sum += textureSampleLevel(history, history_sampler, near, 0.0).rgb * (w12.x * w12.y);
+    sum += textureSampleLevel(history, history_sampler, vec2<f32>(after.x, near.y), 0.0).rgb * (w3.x * w12.y);
+    sum += textureSampleLevel(history, history_sampler, vec2<f32>(near.x, after.y), 0.0).rgb * (w12.x * w3.y);
+    let total = w12.x * w0.y + w0.x * w12.y + w12.x * w12.y + w3.x * w12.y + w12.x * w3.y;
+    return sum / total;
 }
 
 // The colour the history length view shows: dark violet for a pixel with a frame, to yellow at
@@ -142,7 +151,7 @@ fn upscale_pass(@builtin(global_invocation_id) id: vec3<u32>) {
         let dir = normalize(upscale.camera.forward.xyz
             + upscale.camera.right.xyz * (ndc.x * aspect * tan_half)
             - upscale.camera.up.xyz * (ndc.y * tan_half));
-        let t = textureLoad(depth, clamp(nearest, vec2<i32>(0), in_size - 1), 0).x;
+        let t = bitcast<f32>(textureLoad(gbuffer, clamp(nearest, vec2<i32>(0), in_size - 1), 0).x);
         var from_previous = dir;
         if t >= 0.0 {
             from_previous = dir * t + upscale.shift.xyz;

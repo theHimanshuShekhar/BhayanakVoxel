@@ -416,3 +416,23 @@ fn near(actual: [u8; 3], expected: [f64; 3]) {
         );
     }
 }
+
+#[test]
+fn drawing_without_reading_back_leaves_the_same_history_and_the_same_times() {
+    let mut drawn = gpu();
+    let mut read = gpu();
+    for frame in 0..4 {
+        drawn.draw_upscaled(&panned(frame));
+        read.render_upscaled(&panned(frame));
+    }
+    assert_eq!(
+        drawn.render_upscaled(&panned(4)),
+        read.render_upscaled(&panned(4))
+    );
+    if drawn.timers_supported() {
+        // Every frame is timed, and the times are in when the call returns.
+        let times = |gpu: &Offscreen, pass| gpu.timings().pass(pass).unwrap().times.count();
+        assert_eq!(times(&drawn, "primary"), times(&read, "primary"));
+        assert_eq!(times(&drawn, "upscale"), times(&read, "upscale"));
+    }
+}

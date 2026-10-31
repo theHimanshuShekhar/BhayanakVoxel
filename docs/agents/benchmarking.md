@@ -59,7 +59,10 @@ file, a bad option).
    not measured: the first frames after a mode switch carry the other mode's state (see the notes
    on #28).
    Primary mode traces at `config.width` x `config.height` and upscales to `output_*` (passes
-   `primary` and `upscale`); reference mode traces at the traced size, with no upscaling.
+   `primary` and `upscale`); reference mode traces at the traced size, with no upscaling. Primary
+   mode reads an image back only for a screenshot (a 1440p image is 15 MB), so that the frame is
+   not mostly readback with the GPU idle in between; `frame_time` is then the CPU time of the
+   frame as drawn, and a screenshot frame is slower.
 3. Writes a screenshot at each keyframe of the path, per mode.
 
 The camera is a function of the frame index only (keyframes, interpolated in a straight line at
@@ -108,8 +111,9 @@ before reading anything into the times.
   of its last. In primary mode that is one frame of the path. In reference mode every sample is a
   profiler frame of its own, so `passes[]` and `gpu_total` are **per sample** there, with
   `frames * spp` samples, and `gpu_total.reference` budgets one sample.
-- `frame_time` is CPU time to draw one frame of the path and read the image back. For reference
-  mode a frame is all its samples. It is context, not a budget.
+- `frame_time` is CPU time to draw one frame of the path, and to read the image back where it is
+  read (reference mode, and primary mode's screenshot frames). For reference mode a frame is all
+  its samples. It is context, not a budget.
 - `budgets.unmatched` lists budgets for passes that did not run (`passes.shadows` before there is
   a shadows pass): they are not an error.
 

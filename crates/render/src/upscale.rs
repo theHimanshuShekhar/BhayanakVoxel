@@ -166,34 +166,43 @@ impl History {
 }
 
 /// The upscale pass: the compute pipeline of `upscale.wgsl` over the traced image, the G-buffer's
-/// depth and the history.
+/// distances and the history.
 pub(crate) struct UpscalePass {
     pipeline: wgpu::ComputePipeline,
     layout: wgpu::BindGroupLayout,
     uniform: wgpu::Buffer,
+    /// Bilinear, clamped to the edge.
+    sampler: wgpu::Sampler,
 }
 
 impl UpscalePass {
     pub fn new(device: &wgpu::Device) -> Self {
-        let texture = |binding| {
+        let texture = |binding, sample_type| {
             layout_entry(
                 binding,
                 wgpu::BindingType::Texture {
-                    sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                    sample_type,
                     view_dimension: wgpu::TextureViewDimension::D2,
                     multisampled: false,
                 },
             )
         };
+        let loaded = wgpu::TextureSampleType::Float { filterable: false };
         let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("upscale"),
             entries: &[
                 layout_entry(0, buffer_binding(wgpu::BufferBindingType::Uniform)),
-                texture(1),
-                texture(2),
-                texture(3),
+                texture(1, loaded),
+                texture(2, wgpu::TextureSampleType::Uint),
+                // The history is read through the sampler, a few bilinear taps standing in for
+                // sixteen texels, and for its alpha, the frames it has been through, as a texel.
+                texture(3, wgpu::TextureSampleType::Float { filterable: true }),
                 layout_entry(4, storage_texture(HISTORY_FORMAT)),
                 layout_entry(5, storage_texture(IMAGE_FORMAT)),
+                layout_entry(
+                    6,
+                    wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                ),
             ],
         });
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -219,14 +228,21 @@ impl UpscalePass {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("upscale"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
         Self {
             pipeline,
             layout,
             uniform,
+            sampler,
         }
     }
 
-    /// Records the pass for `frame`: the lit image and G-buffer depth of `target` and the
+    /// Records the pass for `frame`: the lit image and G-buffer of `target` and the
     /// history in, the image and the next history out. Timed by `profiler` as `upscale`.
     pub fn encode(
         &self,
@@ -253,10 +269,14 @@ impl UpscalePass {
                     resource: self.uniform.as_entire_binding(),
                 },
                 view(1, &target.lit().view),
-                view(2, &target.depth().view),
+                view(2, &target.gbuffer().view),
                 view(3, &target.history(frame.read).view),
                 view(4, &target.history(frame.write).view),
                 view(5, &target.image().view),
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: wgpu::BindingResource::Sampler(&self.sampler),
+                },
             ],
         });
         let (width, height) = target.resolution().output;

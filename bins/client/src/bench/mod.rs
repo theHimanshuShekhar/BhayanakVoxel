@@ -300,10 +300,23 @@ impl Flight {
     }
 }
 
-fn draw(gpu: &mut Offscreen, mode: Mode, camera: &Camera, spp: u32) -> Image {
+/// Draws a frame, and returns its image if `read_back`. Primary mode only reads the image back
+/// for a screenshot: at 1440p it is 15 MB a frame, which would be most of the CPU time of the
+/// frame and leave the GPU idle between frames (and so at lower clocks than a real frame has).
+fn draw(
+    gpu: &mut Offscreen,
+    mode: Mode,
+    camera: &Camera,
+    spp: u32,
+    read_back: bool,
+) -> Option<Image> {
     match mode {
-        Mode::Primary => gpu.render_upscaled(camera),
-        Mode::Reference => gpu.render_reference(camera, spp),
+        Mode::Primary if read_back => Some(gpu.render_upscaled(camera)),
+        Mode::Primary => {
+            gpu.draw_upscaled(camera);
+            None
+        }
+        Mode::Reference => Some(gpu.render_reference(camera, spp)),
     }
 }
 
@@ -334,7 +347,7 @@ fn run_mode(
         .camera_at(share.frames.saturating_sub(1), share.frames);
     flight.follow(gpu, &end)?;
     for _ in 0..share.warmup {
-        draw(gpu, mode, &end, share.spp);
+        draw(gpu, mode, &end, share.spp, false);
     }
     // The timers' histories hold everything since the start of the run, warm-up and the other
     // mode's frames included. From here on is this mode's.
@@ -352,9 +365,10 @@ fn run_mode(
         let camera = plan.path.camera_at(frame, share.frames);
         flight.follow(gpu, &camera)?;
         let began = Instant::now();
-        let image = draw(gpu, mode, &camera, share.spp);
+        let shot = shots.contains(&frame);
+        let image = draw(gpu, mode, &camera, share.spp, shot);
         wall.push(began.elapsed().as_secs_f64() * 1e3);
-        if shots.contains(&frame) {
+        if let (true, Some(image)) = (shot, image) {
             let file = format!("{name}-frame{frame:04}.png");
             write_png(&out.join(&file), &image)?;
             screenshots.push(file);

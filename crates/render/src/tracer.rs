@@ -20,16 +20,12 @@ use crate::{Result, shaders};
 /// Format of the traced image: sRGB-encoded values in a plain unorm texture.
 pub const IMAGE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 
-/// Format of the G-buffer's distance to the hit, in Voxels (negative: no hit).
-pub const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R32Float;
-
-/// Format of the G-buffer's face normal. The normals are along the axes, so 8 bits hold them
-/// exactly.
-pub const NORMAL_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Snorm;
-
-/// Format of the G-buffer's albedo: the colour the hit's surface has before it is lit, encoded
-/// like the image.
-pub const ALBEDO_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
+/// Format of the G-buffer: two words a pixel, written in one store (see `primary.wgsl`). The
+/// first is the distance to the hit, as the bits of an f32 (-1 for no hit). The second has the
+/// albedo of the hit's surface in its first three bytes, encoded like the image, and the face
+/// that was hit in the last (0 for no hit, else 1 + 2 * axis + 1 if it points along the positive
+/// direction). The normals are along the axes, so a byte holds them exactly.
+pub const GBUFFER_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rg32Uint;
 
 /// Format of the upscaler's history: encoded colour, and in alpha the frames it has been through.
 pub const HISTORY_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
@@ -163,9 +159,7 @@ pub(crate) fn storage_texture(format: wgpu::TextureFormat) -> wgpu::BindingType 
 pub struct Target {
     resolution: Resolution,
     lit: Plane,
-    depth: Plane,
-    normal: Plane,
-    albedo: Plane,
+    gbuffer: Plane,
     accum: wgpu::Buffer,
     image: Plane,
     history: [Plane; 2],
@@ -183,9 +177,7 @@ impl Target {
         Self {
             resolution,
             lit: Plane::new(device, "lit image", internal, IMAGE_FORMAT),
-            depth: Plane::new(device, "G-buffer depth", internal, DEPTH_FORMAT),
-            normal: Plane::new(device, "G-buffer normal", internal, NORMAL_FORMAT),
-            albedo: Plane::new(device, "G-buffer albedo", internal, ALBEDO_FORMAT),
+            gbuffer: Plane::new(device, "G-buffer", internal, GBUFFER_FORMAT),
             accum,
             image: Plane::new(device, "upscaled image", output, IMAGE_FORMAT),
             history: [0, 1]
@@ -208,20 +200,10 @@ impl Target {
         &self.image
     }
 
-    /// The G-buffer's distance to the first hit (`DEPTH_FORMAT`), negative where nothing is hit.
-    pub fn depth(&self) -> &Plane {
-        &self.depth
-    }
-
-    /// The G-buffer's face normal of the first hit (`NORMAL_FORMAT`), zero where nothing is hit.
-    pub fn normal(&self) -> &Plane {
-        &self.normal
-    }
-
-    /// The G-buffer's albedo of the first hit (`ALBEDO_FORMAT`), sRGB-encoded as the image is,
-    /// and black where nothing is hit.
-    pub fn albedo(&self) -> &Plane {
-        &self.albedo
+    /// The G-buffer (`GBUFFER_FORMAT`): the distance to the first hit, its albedo and the face of
+    /// its normal.
+    pub fn gbuffer(&self) -> &Plane {
+        &self.gbuffer
     }
 
     /// The upscaler's history image `which` (0 or 1).
@@ -442,9 +424,7 @@ impl Tracer {
                     buffer_binding(wgpu::BufferBindingType::Storage { read_only: false }),
                 ),
                 layout_entry(4, buffer_binding(STORAGE_READ)),
-                layout_entry(5, storage_texture(DEPTH_FORMAT)),
-                layout_entry(6, storage_texture(NORMAL_FORMAT)),
-                layout_entry(7, storage_texture(ALBEDO_FORMAT)),
+                layout_entry(5, storage_texture(GBUFFER_FORMAT)),
             ],
         });
         let materials = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -759,15 +739,7 @@ impl Tracer {
                 },
                 wgpu::BindGroupEntry {
                     binding: 5,
-                    resource: wgpu::BindingResource::TextureView(&target.depth.view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 6,
-                    resource: wgpu::BindingResource::TextureView(&target.normal.view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 7,
-                    resource: wgpu::BindingResource::TextureView(&target.albedo.view),
+                    resource: wgpu::BindingResource::TextureView(&target.gbuffer.view),
                 },
             ],
         });
