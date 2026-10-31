@@ -23,9 +23,9 @@ pub const IMAGE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct LevelHeader {
-    origin: [i32; 3],
+    occupied_first: [i32; 3],
     table_mask: u32,
-    dims: [u32; 3],
+    occupied_end: [i32; 3],
     table_base: u32,
     hole_first: [i32; 3],
     pad0: u32,
@@ -39,7 +39,10 @@ struct LevelHeader {
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct SceneHeader {
     level_count: u32,
-    pad: [u32; 3],
+    bound_radius: f32,
+    pad0: [u32; 2],
+    bound_centre: [i32; 3],
+    pad1: u32,
     levels: [LevelHeader; MAX_LEVELS],
 }
 
@@ -47,12 +50,16 @@ impl SceneHeader {
     fn new(scene: &Scene) -> Self {
         let mut header = SceneHeader::zeroed();
         header.level_count = scene.levels.len() as u32;
+        if let (Some(bound), Some(radius)) = (scene.bound, scene.clip_radius()) {
+            header.bound_radius = radius;
+            header.bound_centre = bound.centre;
+        }
         for (level, (slot, l)) in header.levels.iter_mut().zip(&scene.levels).enumerate() {
             let (hole_first, hole_end) = scene.hole(level);
             *slot = LevelHeader {
-                origin: l.origin,
+                occupied_first: l.occupied_first,
                 table_mask: l.table_mask,
-                dims: l.dims,
+                occupied_end: l.occupied_end,
                 table_base: l.table_base,
                 hole_first,
                 pad0: 0,

@@ -13,6 +13,7 @@ use fly::{Action, Fly};
 use planet_gen::planet::Planet;
 use planet_gen::world_map::{WORLD_MAP_SIZE, WORLD_RADIUS, WorldMap};
 use render::overlay::{self, Controls, SceneMemory};
+use render::scene::Bound;
 use render::{Camera, Mode, Renderer, RingsFull, Scene, SceneUpdate, Sun};
 use sim::{Predictor, ServerHandle};
 use winit::application::ApplicationHandler;
@@ -52,7 +53,14 @@ const RING_LEVELS: usize = 7;
 /// A Planet's bricks packed for the GPU as rings around `camera`. The store must have its
 /// pyramid ([`RING_LEVELS`] of it); its source gives the bricks it does not hold.
 fn planet_scene(store: &BrickStore, camera: [f64; 3]) -> Result<Scene, RingsFull> {
-    Scene::rings(store, camera, RING_LEVELS)
+    let mut scene = Scene::rings(store, camera, RING_LEVELS)?;
+    // Nothing of the Planet is further from its centre than this, so no ray need be walked
+    // beyond it.
+    scene.bound = Some(Bound {
+        centre: [0; 3],
+        radius: planet_gen::MAX_RADIUS,
+    });
+    Ok(scene)
 }
 
 /// The Planet as the client and the in-process server each hold it, the client's packed copy of
