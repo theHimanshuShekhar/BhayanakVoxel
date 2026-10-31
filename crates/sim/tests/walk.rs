@@ -67,7 +67,7 @@ fn take_in(client: &mut Predictor, end: &ClientEnd) -> Option<(u64, BodyState)> 
 }
 
 #[test]
-fn the_client_and_the_server_agree_on_every_bit_of_a_long_walk() {
+fn golden_the_client_and_the_server_agree_on_every_bit_of_a_long_walk() {
     let (end, server_end) = loopback();
     let server = sim::spawn(surface, vec![server_end]);
 

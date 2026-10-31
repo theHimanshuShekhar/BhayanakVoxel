@@ -594,7 +594,6 @@ impl ApplicationHandler for App {
                     } else if pressed && !used_by_overlay {
                         match code {
                             KeyCode::Escape => self.grab(false),
-                            // Cycles through the debug views.
                             // Switches between walking and the debug noclip camera.
                             KeyCode::KeyN if !event.repeat => {
                                 if let Err(err) = self.toggle_noclip() {
@@ -602,6 +601,7 @@ impl ApplicationHandler for App {
                                     event_loop.exit();
                                 }
                             }
+                            // Cycles through the debug views.
                             KeyCode::KeyV if !event.repeat => {
                                 if let Some(renderer) = &mut self.renderer {
                                     renderer.set_debug_view(renderer.debug_view().next());
