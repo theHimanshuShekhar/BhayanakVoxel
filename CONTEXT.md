@@ -14,6 +14,10 @@ _Avoid_: World, map, level
 The smallest unit of matter on the Planet, much smaller than a Minecraft block.
 _Avoid_: Block, cube
 
+**Exposed**:
+Said of a solid Voxel with air against one of its faces. The Planet's surface is made of its exposed Voxels.
+_Avoid_: Visible, surface Voxel
+
 **Material**:
 The kind of matter a Voxel is made of (e.g. rock, sand, water, glass), carrying properties like hardness or emissiveness.
 _Avoid_: Block type, voxel type

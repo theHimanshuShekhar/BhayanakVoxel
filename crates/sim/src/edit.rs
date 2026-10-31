@@ -131,7 +131,7 @@ pub fn apply(store: &mut BrickStore, op: &EditOp) -> Undo {
 mod tests {
     use super::*;
     use brick_store::{Interior, LodRefresh, Material, VoxelCoord};
-    use planet_gen::{CORE, ROCK};
+    use planet_gen::{CORE, ROCK, SOIL};
 
     const STONE: Material = Material(7);
 
@@ -483,11 +483,14 @@ mod tests {
         }
         store.build_lod(4);
 
-        // Inside one brick: one ancestor on each of the four levels.
+        // Inside one brick: its ancestor on level 1, which reads differently, and the three
+        // others that are over bricks beside it (those on its low sides). They are remade
+        // again on level 2, where the hole is too small to show and so nothing changes: that
+        // is the end of it.
         let before = store.clone();
         let undo = dig(&mut store, [4, 4, 4], 3);
         assert_eq!(undo.bricks().count(), 1);
-        assert_eq!(undo.lod().remade, 4);
+        assert_eq!(undo.lod().remade, 2 * 4);
         assert_eq!(undo.lod().changed, differing(&before, &store));
         assert!(undo.lod().changed.contains(&(1, BrickCoord([0; 3]))));
         assert!(
@@ -497,12 +500,13 @@ mod tests {
                 .all(|&(_, c)| c == BrickCoord([0; 3]))
         );
 
-        // On the corner where eight bricks meet: bricks -1 and 0 never share a parent, so each
-        // level has eight ancestors, 32 in all.
+        // On the corner where eight bricks meet: bricks -1 and 0 never share a parent, so level
+        // 1 has eight ancestors. Four of them read differently, and the coarse bricks over those
+        // and the ones beside them are seven. The crater is too small to show on level 2.
         let before = store.clone();
         let undo = dig(&mut store, [0, 0, 0], 2);
         assert_eq!(undo.bricks().count(), 8);
-        assert_eq!(undo.lod().remade, 8 * 4);
+        assert_eq!(undo.lod().remade, 8 + 7);
         let changed = differing(&before, &store);
         assert!(!changed.is_empty());
         assert_eq!(undo.lod().changed, changed);
@@ -637,6 +641,78 @@ mod tests {
             assert_eq!((store.content_hash(), store.lod_hash()), before);
         }
         assert_eq!((store.content_hash(), store.lod_hash()), bare);
+    }
+
+    /// Ground 48 Voxels across, up to z = 20 (so that its layers are not on the boundaries of
+    /// coarse Voxels): rock, with soil on it for the top 4 Voxels (the test Planet's), and its
+    /// pyramid. The Materials differ, so how a coarse Voxel is made
+    /// depends on which of its Voxels are exposed to air, and so on the bricks beside it.
+    fn soil_over_rock(levels: usize) -> BrickStore {
+        let mut store = BrickStore::new();
+        for x in -24..24 {
+            for y in -24..24 {
+                for z in -16..21 {
+                    store.set(
+                        VoxelCoord([x, y, z]),
+                        Some(if z >= 17 { SOIL } else { ROCK }),
+                    );
+                }
+            }
+        }
+        store.build_lod(levels);
+        store
+    }
+
+    #[test]
+    fn random_digs_beside_brick_borders_always_leave_the_levels_a_rebuild_would() {
+        let mut store = soil_over_rock(5);
+        let mut dice = Dice(0x2545_F491_4F6C_DD1D);
+        let mut edits: Vec<(Undo, (u64, u64))> = Vec::new();
+        let (mut digs, mut reverts, mut changed) = (0, 0, 0);
+        for step in 0..150 {
+            if !edits.is_empty() && dice.below(3) == 0 {
+                let (undo, before) = edits.pop().unwrap();
+                undo.revert(&mut store);
+                assert_eq!(
+                    (store.content_hash(), store.lod_hash()),
+                    before,
+                    "revert at step {step}"
+                );
+                reverts += 1;
+            } else {
+                let before = (store.content_hash(), store.lod_hash());
+                // Along each axis the centre is on a brick border (a multiple of 8) or a Voxel
+                // from it, or the sphere ends flush with one, from either side. Then Voxels
+                // change at a border and not past it, and the coarse Voxels over the bricks that
+                // did not change have neighbours that did, in the next brick over.
+                let radius = dice.below(15);
+                let along = |dice: &mut Dice, up: i32| {
+                    let border = 8 * (dice.below(7) - 3) + up;
+                    match dice.below(3) {
+                        0 => border + dice.below(3) - 1,
+                        1 => border - 1 - radius + dice.below(2),
+                        _ => border + radius - dice.below(2),
+                    }
+                };
+                let centre = [
+                    along(&mut dice, 0),
+                    along(&mut dice, 0),
+                    along(&mut dice, 16),
+                ];
+                let undo = dig(&mut store, centre, radius as u16);
+                changed += undo.bricks().count();
+                edits.push((undo, before));
+                digs += 1;
+            }
+            assert_eq!(store.lod_hash(), rebuilt(&store).lod_hash(), "step {step}");
+        }
+        assert!(digs > 70 && reverts > 20, "{digs} digs, {reverts} reverts");
+        assert!(changed > 100, "{changed} bricks changed");
+        while let Some((undo, before)) = edits.pop() {
+            undo.revert(&mut store);
+            assert_eq!((store.content_hash(), store.lod_hash()), before);
+        }
+        assert_eq!(store.lod_hash(), soil_over_rock(5).lod_hash());
     }
 
     #[test]

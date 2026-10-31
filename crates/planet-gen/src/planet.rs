@@ -216,11 +216,27 @@ impl Samples {
     /// coordinate's size, so it is least at the point of the box nearest the centre, and greatest
     /// at a corner.
     fn radii(&self) -> (f64, f64) {
-        let (low, high) = (self.corner([0; 3]), self.corner([1; 3]));
-        let near = distance(std::array::from_fn(|a| 0f64.clamp(low[a], high[a])));
-        let far = distance(std::array::from_fn(|a| low[a].abs().max(high[a].abs())));
-        (near, far)
+        radii_of_box(self.corner([0; 3]), self.corner([1; 3]))
     }
+
+    /// The corners of the box that holds the points sampled and the ones beside them, which are
+    /// one Voxel further out along an axis: those of the Voxels around the brick, and the ones
+    /// in it.
+    fn corners_with_neighbours(&self) -> [[f64; 3]; 8] {
+        let low = self.first.map(|f| f - self.size);
+        let high = self.first.map(|f| f + 8.0 * self.size);
+        std::array::from_fn(|i| {
+            std::array::from_fn(|a| if i >> a & 1 == 0 { low[a] } else { high[a] })
+        })
+    }
+}
+
+/// The least and the greatest distance from the centre of any point in the box between `low`
+/// and `high`.
+fn radii_of_box(low: [f64; 3], high: [f64; 3]) -> (f64, f64) {
+    let near = distance(std::array::from_fn(|a| 0f64.clamp(low[a], high[a])));
+    let far = distance(std::array::from_fn(|a| low[a].abs().max(high[a].abs())));
+    (near, far)
 }
 
 /// The Planet, as bricks. Cloning shares the world map, which carries the seed.
@@ -284,15 +300,19 @@ impl Planet {
 
     /// Generates the brick at `coord` of mip `level` (at least 1) directly, not from the 8 to the
     /// power of `level` bricks of level 0 under it: each of its Voxels is the Planet at the
-    /// middle of the `2^level` cubed Voxels it stands for (see [`Samples`]).
+    /// middle of the `2^level` cubed Voxels it stands for (see [`Samples`]), except the exposed
+    /// ones. A solid Voxel with air at the middle of the Voxel next to it, on a face, takes the
+    /// Material at the top of the ground within it instead, as the pyramid's coarse Voxel takes
+    /// that of its exposed children: otherwise the Voxel with the ground in it reads as what is
+    /// deep under it. Whether a Voxel is solid does not change, and level 0 is not affected.
     ///
-    /// That is approximately what majority downsampling those makes of the Planet (ADR 0002),
-    /// and what the pyramid of a store reads where it holds nothing, in the cost of a level 0
-    /// brick: a test measures how closely, level by level. The two are the same where the
-    /// Planet is uniform, which is nearly everywhere; they differ in the Voxels that a boundary
-    /// between layers, or the ground itself, passes through. Like [`Planet::brick`] it is a
-    /// function of the world map and the coordinate alone, and decides most bricks, the sky and
-    /// the interior's, without looking at their Voxels.
+    /// That is approximately what downsampling those makes of the Planet (ADR 0002), and what
+    /// the pyramid of a store reads where it holds nothing, in the cost of a level 0 brick: tests
+    /// measure how closely, level by level. The two are the same where the Planet is uniform,
+    /// which is nearly everywhere; they differ in the Voxels that a boundary between layers, or
+    /// the ground itself, passes through. Like [`Planet::brick`] it is a function of the world
+    /// map and the coordinate alone, and decides most bricks, the sky and the interior's,
+    /// without looking at their Voxels.
     pub fn coarse_brick(&self, level: usize, coord: BrickCoord) -> Brick {
         debug_assert!(level > 0);
         self.generate(level, coord)
@@ -307,7 +327,15 @@ impl Planet {
         if near >= f64::from(WORLD_RADIUS + PEAK) {
             return Brick::AIR;
         }
-        if let Some(brick) = self.interior_brick(&samples) {
+        // A Voxel of a coarse brick with air beside it takes the Material at the ground's surface
+        // (see [`Planet::evaluate`]), which no shortcut that gives a whole brick the Material of
+        // one layer knows. Those hold where no Voxel has air beside it. The sky and the sea
+        // below are no layer, and have nothing to expose.
+        let sealed = || level == 0 || self.sealed(&samples);
+        if far <= f64::from(INTERIOR_RADIUS)
+            && sealed()
+            && let Some(brick) = self.interior_brick(&samples)
+        {
             return brick;
         }
         let corners: [[f64; 3]; 8] =
@@ -331,19 +359,44 @@ impl Planet {
             {
                 return Brick::solid(WATER);
             }
-        } else if shallowest >= f64::from(STRATA_DEPTH) {
-            return Brick::solid(DEEP_ROCK);
-        } else if shallowest > 0.0 && (low >= 0.0 || high < 0.0) {
-            // Below the ground, all land or all sea floor, and one stratum if it is all in one
-            // biome, which it is if the corners are in one texel.
-            if let Some(texel) = self.single_texel(&corners) {
-                let strata = strata(texel.biome, high < 0.0);
-                if let Some(material) = one_layer(strata, shallowest, deepest) {
-                    return Brick::solid(material);
+        } else if sealed() {
+            if shallowest >= f64::from(STRATA_DEPTH) {
+                return Brick::solid(DEEP_ROCK);
+            }
+            if shallowest > 0.0 && (low >= 0.0 || high < 0.0) {
+                // Below the ground, all land or all sea floor, and one stratum if it is all in
+                // one biome, which it is if the corners are in one texel.
+                if let Some(texel) = self.single_texel(&corners) {
+                    let strata = strata(texel.biome, high < 0.0);
+                    if let Some(material) = one_layer(strata, shallowest, deepest) {
+                        return Brick::solid(material);
+                    }
                 }
             }
         }
         self.evaluate(&samples)
+    }
+
+    /// Whether no Voxel of the brick sampled at `samples` can have air beside it, on one of its
+    /// six faces. See [`Planet::air_floor`].
+    fn sealed(&self, samples: &Samples) -> bool {
+        self.air_floor(samples).is_none()
+    }
+
+    /// The least distance from the centre that air beside a Voxel of the brick sampled at
+    /// `samples` can be at, or `None` if there is none because the brick is too far in. Air is at
+    /// least [`SEA_RADIUS`] from the centre, and above the ground, which is at least the lowest
+    /// of it under the box that holds the brick and the points one Voxel's width beyond it. So
+    /// there is none beside a Voxel if every one of those points is nearer than that.
+    fn air_floor(&self, samples: &Samples) -> Option<f64> {
+        // A point beside a Voxel is a Voxel's width from it.
+        let far = samples.radii().1 + samples.size;
+        if far + SLACK < SEA_RADIUS {
+            return None;
+        }
+        let (lowest, _) = self.map.elevation_range(&samples.corners_with_neighbours());
+        let floor = SEA_RADIUS + lowest.max(0.0);
+        (far + SLACK >= floor).then_some(floor)
     }
 
     /// The brick sampled at `samples` if it lies within the interior, where it takes no more than
@@ -372,6 +425,12 @@ impl Planet {
     }
 
     /// The brick sampled at `samples`, every Voxel worked out.
+    ///
+    /// A Voxel of a coarse brick is the Planet at its middle, except where it is exposed: solid,
+    /// with air beside it on a face, at the middle of the Voxel next to it. Then the middle may
+    /// be deep in the strata, with the ground in the upper part of the Voxel that is what is seen
+    /// of it, so it takes the Material at the shallowest depth the Voxel reaches. That is the
+    /// choice the pyramid makes (ADR 0002). Whether a Voxel is solid is not changed.
     fn evaluate(&self, samples: &Samples) -> Brick {
         #[cfg(test)]
         EVALUATED.with(|made| made.set(made.get() + 1));
@@ -384,7 +443,75 @@ impl Planet {
                 }
             }
         }
+        if samples.size > 1.0
+            && let Some(floor) = self.air_floor(samples)
+        {
+            self.expose(samples, floor, &mut brick);
+        }
         brick
+    }
+
+    /// Gives the Voxels of `brick`, sampled at `samples`, that are exposed the Material at the
+    /// ground's surface within them (see [`Planet::evaluate`]). `floor` is the [`Planet::air_floor`].
+    fn expose(&self, samples: &Samples, floor: f64, brick: &mut Brick) {
+        let size = samples.size;
+        // Solidity as sampled, which the Materials set below leave as it is.
+        let solid = brick.clone();
+        for z in 0..8 {
+            for y in 0..8 {
+                for x in 0..8 {
+                    let local = [x, y, z];
+                    if solid.get(local).is_none() {
+                        continue;
+                    }
+                    let point = samples.at(local);
+                    // A Voxel's neighbour is a Voxel's width away.
+                    if distance(point) + size + SLACK < floor {
+                        continue;
+                    }
+                    let exposed = (0..6).any(|face| {
+                        let step = if face % 2 == 0 { -1 } else { 1 };
+                        let mut next = local.map(i32::from);
+                        next[face / 2] += step;
+                        match next[face / 2] {
+                            // Within the brick, as sampled.
+                            0..8 => solid.get(next.map(|c| c as u8)).is_none(),
+                            // In the next brick over.
+                            _ => {
+                                let mut beside = point;
+                                beside[face / 2] += f64::from(step) * size;
+                                self.material_at(beside).is_none()
+                            }
+                        }
+                    });
+                    if exposed && let Some(surface) = self.top_within(point, size) {
+                        brick.set(local, Some(surface));
+                    }
+                }
+            }
+        }
+    }
+
+    /// The Material at the top of a Voxel whose middle at `point` is below the ground, which is
+    /// what is seen of it from above: the Voxel is `size` Voxels wide, and reaches half of that
+    /// towards the sky along the way the ground faces, which is away from the centre. That is
+    /// half its width only if it faces along an axis, and up to sqrt(3) times more across the
+    /// corner of a cube. If it reaches into the air, the top is the surface: the ground's, or the
+    /// sea's if the ground is under it. `None` if the middle is not below the ground.
+    fn top_within(&self, point: [f64; 3], size: f64) -> Option<Material> {
+        let radius = distance(point);
+        let elevation = self.map.elevation_at(point);
+        let ground = SEA_RADIUS + elevation;
+        if ground <= radius || radius == 0.0 {
+            return None;
+        }
+        let lean = (point[0].abs() + point[1].abs() + point[2].abs()) / radius;
+        // The point of the Voxel's axis at `r` from the centre.
+        let on_axis = |r: f64| point.map(|c| c * r / radius);
+        let top = on_axis(radius + size / 2.0 * lean);
+        // In the air, a little below the highest ground or sea there.
+        self.material_at(top)
+            .or_else(|| self.material_at(on_axis(ground.max(SEA_RADIUS) - 0.5)))
     }
 
     /// Bounds `(lowest, highest)` on the ground's height above sea level within `reach` Voxels
@@ -1058,11 +1185,34 @@ mod tests {
         })
     }
 
-    /// The brick at `coord` of mip `level` as majority downsampling makes it from the Planet's
+    /// What a store reads where it holds no brick, for the tests of the pyramid: the Planet's
+    /// bricks, at the mip level `above` levels over the store's own. The pyramid reads the Voxels
+    /// beside the bricks that it makes a coarse brick from, to tell the ones that are exposed.
+    #[derive(Debug)]
+    struct Ground {
+        above: usize,
+    }
+
+    impl BrickSource for Ground {
+        fn brick(&self, level: usize, coord: BrickCoord) -> Brick {
+            planet_brick(self.above + level, coord)
+        }
+    }
+
+    /// The Planet's brick at `coord` of mip `level`, which may be 0.
+    fn planet_brick(level: usize, coord: BrickCoord) -> Brick {
+        match level {
+            0 => planet().brick(coord),
+            n => planet().coarse_brick(n, coord),
+        }
+    }
+
+    /// The brick at `coord` of mip `level` as the pyramid's downsampling makes it from the Planet's
     /// bricks of level 0 under it, which are 8 to the power of `level`: the real thing.
     fn downsampled(level: usize, coord: BrickCoord) -> Brick {
         let side = 1 << level;
         let mut store = BrickStore::new();
+        store.set_source(Ground { above: 0 });
         for i in 0..side * side * side {
             let child = BrickCoord(std::array::from_fn(|a| {
                 coord.0[a] * side + (i >> (level * a) & (side - 1))
@@ -1092,7 +1242,13 @@ mod tests {
     /// each level.
     fn differing(level: usize) -> f64 {
         let (mut differ, mut total) = (0, 0);
-        for d in lines().into_iter().chain(spread()) {
+        // The lines through every kind of country are enough where a brick costs this much.
+        let more = if level < 2 {
+            spread().collect()
+        } else {
+            Vec::new()
+        };
+        for d in lines().into_iter().chain(more) {
             let surface = planet().map().elevation_at(d);
             let step = f64::from(BRICK_SIZE << level);
             let mut h = surface - 560.0;
@@ -1134,19 +1290,20 @@ mod tests {
 
     /// Most Voxels of the coarse bricks that hold ground that may differ from the majority
     /// downsample of the eight bricks one level finer that [`Planet::coarse_brick`] makes, as a
-    /// fraction, at levels 8, 9, ...: the numbers measured (printed by the test below, 2.9% at
-    /// level 8, a peak of 3.8% at level 9 and down to 1.3% at level 14) with a margin. These are
+    /// fraction, at levels 8, 9, ...: the numbers measured (printed by the test below, 2.5% at
+    /// level 8, 2.7% at level 9 and 1.9% to 2.4% from level 11) with a quarter more. These are
     /// the orbit levels, where the bricks under one are too many to make from the Planet, so this
     /// is the agreement that can be checked there. It is one step, not the whole way down: each
     /// finer brick is already a sample and not the Planet's majority.
-    const ORBIT_TOLERANCE: [f64; 7] = [0.037, 0.048, 0.043, 0.030, 0.025, 0.020, 0.016];
+    const ORBIT_TOLERANCE: [f64; 7] = [0.032, 0.034, 0.033, 0.025, 0.026, 0.024, 0.031];
 
-    /// The brick at `coord` of mip `level` as majority downsampling makes it from the eight
+    /// The brick at `coord` of mip `level` as the pyramid's downsampling makes it from the eight
     /// bricks one level finer that [`Planet::coarse_brick`] generates, by the pyramid's own rule.
     fn downsampled_from_finer(level: usize, coord: BrickCoord) -> Brick {
         let mut store = BrickStore::new();
+        store.set_source(Ground { above: level - 1 });
         for child in coord.children() {
-            let brick = planet().coarse_brick(level - 1, child);
+            let brick = planet_brick(level - 1, child);
             if !brick.is_air() {
                 store.insert(child, brick);
             }
@@ -1155,32 +1312,41 @@ mod tests {
         store.brick_at(1, coord).into_owned()
     }
 
+    /// The bricks of mip `level` over the ground along each of `directions`: the brick over it,
+    /// and the six that touch it, which hold the rest of it.
+    fn bricks_over_the_ground(level: usize, directions: Vec<[f64; 3]>) -> Vec<BrickCoord> {
+        let mut bricks = Vec::new();
+        for d in directions {
+            let surface = planet().map().elevation_at(d);
+            let over = ancestor(along(d, SEA_RADIUS + surface.max(0.0)).brick(), level).0;
+            for i in 0..7_i32 {
+                bricks.push(BrickCoord(std::array::from_fn(|a| {
+                    over[a]
+                        + if i > 0 && (i - 1) / 2 == a as i32 {
+                            i % 2 * 2 - 1
+                        } else {
+                            0
+                        }
+                })));
+            }
+        }
+        bricks
+    }
+
     #[test]
     fn an_orbit_level_brick_is_its_eight_finer_bricks_downsampled_but_for_a_few_voxels() {
         for (n, tolerance) in ORBIT_TOLERANCE.into_iter().enumerate() {
             let level = 8 + n;
             let (mut differ, mut total) = (0, 0);
-            for d in lines().into_iter().chain(spread()) {
-                let surface = planet().map().elevation_at(d);
-                let over = ancestor(along(d, SEA_RADIUS + surface.max(0.0)).brick(), level).0;
-                // The brick over the ground, and the six that touch it, which hold the rest of it.
-                for i in 0..7_i32 {
-                    let coord = BrickCoord(std::array::from_fn(|a| {
-                        over[a]
-                            + if i > 0 && (i - 1) / 2 == a as i32 {
-                                i % 2 * 2 - 1
-                            } else {
-                                0
-                            }
-                    }));
-                    let made = planet().coarse_brick(level, coord);
-                    let real = downsampled_from_finer(level, coord);
-                    if made.is_uniform() && made == real {
-                        continue;
-                    }
-                    differ += locals().filter(|&l| made.get(l) != real.get(l)).count();
-                    total += 512;
+            let directions = lines().into_iter().chain(spread()).collect();
+            for coord in bricks_over_the_ground(level, directions) {
+                let made = planet().coarse_brick(level, coord);
+                let real = downsampled_from_finer(level, coord);
+                if made.is_uniform() && made == real {
+                    continue;
                 }
+                differ += locals().filter(|&l| made.get(l) != real.get(l)).count();
+                total += 512;
             }
             let fraction = differ as f64 / total as f64;
             eprintln!("level {level}: {differ} of {total} Voxels differ, {fraction:.4}");
@@ -1192,43 +1358,210 @@ mod tests {
         }
     }
 
+    /// Most of the exposed Voxels of the coarse bricks that hold ground whose Material may differ
+    /// from the pyramid's for the eight bricks one level finer that [`Planet::coarse_brick`]
+    /// makes, as a fraction, at levels 1, 2, ...: the numbers measured (printed by the test
+    /// below) with a quarter more. The Voxels that are not exposed take the Material at their
+    /// middles, as the pyramid's buried ones take the most common of theirs, and are not what
+    /// this is about. It is one step from the finer level, as `ORBIT_TOLERANCE` is, and a Voxel
+    /// that is air in the pyramid and solid in the Planet counts against it.
+    ///
+    /// The fraction grows with the level, from none at levels 1 and 2 to 22% at level 14, because
+    /// a Voxel then is wider than the ground's relief and the strata, and the two choices differ
+    /// in what they look at: the Voxel's top for one, and for the other the Voxels of the finer
+    /// level that have air beside them, which are lower where the ground slopes or is under
+    /// the Voxel's top (a coarse Voxel's neighbour is far off). Without the surface rule it
+    /// was 9% to 48% from level 3 to level 11, and 13% at level 14, where the Voxel's middle is
+    /// in the deep rock.
+    const EXPOSED_TOLERANCE: [f64; 14] = [
+        0.005, 0.005, 0.038, 0.066, 0.036, 0.031, 0.030, 0.059, 0.099, 0.141, 0.141, 0.155, 0.191,
+        0.277,
+    ];
+
     #[test]
-    fn a_coarse_brick_is_what_the_planet_is_at_the_middle_of_each_of_its_voxels() {
-        // The Voxels of a brick of mip `level` are 2^level wide. Down lines through every kind of
-        // country, and across the interior's boundaries.
-        for level in [1, 3, 7, 12] {
+    fn an_exposed_voxel_is_what_the_pyramid_makes_of_its_eight_finer_voxels_but_for_a_few() {
+        for (n, tolerance) in EXPOSED_TOLERANCE.into_iter().enumerate() {
+            let level = n + 1;
             let size = f64::from(1 << level);
-            let mut coords = Vec::new();
-            for d in lines() {
-                let surface = planet().map().elevation_at(d);
-                let mut h = surface - 560.0 - 8.0 * size;
-                while h < surface.max(0.0) + 40.0 + 8.0 * size {
-                    coords.push(ancestor(along(d, SEA_RADIUS + h).brick(), level));
-                    h += 8.0 * size;
+            let (mut differ, mut solidity, mut total) = (0, 0, 0);
+            let directions = lines().into_iter().chain(spread().step_by(2)).collect();
+            for coord in bricks_over_the_ground(level, directions) {
+                let made = planet().coarse_brick(level, coord);
+                if made.is_air() {
+                    continue;
                 }
-            }
-            for r in [MOLTEN_RADIUS, INTERIOR_RADIUS, 5] {
-                for d in [[1.0, 0.0, 0.0], [1.0, 1.0, 1.0], [-0.3, 0.2, -1.0]] {
-                    for k in -3..=3 {
-                        let at = along(d, f64::from(r) + f64::from(k) * 8.0 * size);
-                        coords.push(ancestor(at.brick(), level));
+                let real = downsampled_from_finer(level, coord);
+                for local in locals().filter(|&l| made.get(l).is_some()) {
+                    let exposed = (0..6).any(|face| {
+                        let step = if face % 2 == 0 { -1 } else { 1 };
+                        let mut next = local.map(i32::from);
+                        next[face / 2] += step;
+                        if (0..8).contains(&next[face / 2]) {
+                            return made.get(next.map(|c| c as u8)).is_none();
+                        }
+                        let mut beside = middle(level, coord, local);
+                        beside[face / 2] += f64::from(step) * size;
+                        planet().material_at(beside).is_none()
+                    });
+                    if exposed {
+                        total += 1;
+                        differ += usize::from(real.get(local) != made.get(local));
+                        solidity += usize::from(real.get(local).is_none());
                     }
                 }
             }
-            for coord in coords {
+            let fraction = differ as f64 / total as f64;
+            eprintln!(
+                "level {level}: {differ} of {total} exposed Voxels differ, {fraction:.4} \
+                 ({solidity} are air in the pyramid)"
+            );
+            assert!(total >= 500, "level {level}: only {total} Voxels compared");
+            assert!(fraction <= tolerance, "level {level}: {fraction}");
+        }
+    }
+
+    /// Bricks of mip `level` down lines through every kind of country, and across the interior's
+    /// boundaries.
+    fn coarse_bricks_to_check(level: usize) -> Vec<BrickCoord> {
+        let size = f64::from(1 << level);
+        let mut coords = Vec::new();
+        for d in lines() {
+            let surface = planet().map().elevation_at(d);
+            let mut h = surface - 560.0 - 8.0 * size;
+            while h < surface.max(0.0) + 40.0 + 8.0 * size {
+                coords.push(ancestor(along(d, SEA_RADIUS + h).brick(), level));
+                h += 8.0 * size;
+            }
+        }
+        for r in [MOLTEN_RADIUS, INTERIOR_RADIUS, 5] {
+            for d in [[1.0, 0.0, 0.0], [1.0, 1.0, 1.0], [-0.3, 0.2, -1.0]] {
+                for k in -3..=3 {
+                    let at = along(d, f64::from(r) + f64::from(k) * 8.0 * size);
+                    coords.push(ancestor(at.brick(), level));
+                }
+            }
+        }
+        coords
+    }
+
+    /// The point the Voxel at `local` of the brick `coord` of mip `level` is sampled at, worked
+    /// out here from the Voxel's own size and not by [`Samples`]: the middle of the `2^level`
+    /// Voxels it stands for.
+    fn middle(level: usize, coord: BrickCoord, local: [u8; 3]) -> [f64; 3] {
+        let size = f64::from(1 << level);
+        let origin = coord.0.map(|c| f64::from(c) * 8.0 * size);
+        [0, 1, 2].map(|a| origin[a] + f64::from(local[a]) * size + (size - 1.0) / 2.0)
+    }
+
+    /// Whether the Planet has air at the middle of one of the Voxels next to the one sampled at
+    /// `point` in mip `level`, on a face of it.
+    fn air_beside(level: usize, point: [f64; 3]) -> bool {
+        let size = f64::from(1 << level);
+        (0..6).any(|face| {
+            let mut next = point;
+            next[face / 2] += if face % 2 == 0 { -size } else { size };
+            planet().material_at(next).is_none()
+        })
+    }
+
+    #[test]
+    fn a_coarse_brick_is_what_the_planet_is_at_the_middle_of_each_of_its_voxels_but_for_the_surface()
+     {
+        // The Voxels of a brick of mip `level` are 2^level wide. A Voxel that is solid with air
+        // beside it can take another Material than the one at its middle; any other is exact,
+        // and the exposed ones are solid at the middle all the same.
+        let (mut exact, mut exposed) = (0, 0);
+        for level in [1, 3, 7, 12] {
+            for coord in coarse_bricks_to_check(level) {
                 let brick = planet().coarse_brick(level, coord);
-                let origin = coord.0.map(|c| f64::from(c) * 8.0 * size);
                 for local in locals() {
-                    let middle = [0, 1, 2]
-                        .map(|a| origin[a] + f64::from(local[a]) * size + (size - 1.0) / 2.0);
-                    assert_eq!(
-                        brick.get(local),
-                        planet().material_at(middle),
+                    let middle = middle(level, coord, local);
+                    let at_middle = planet().material_at(middle);
+                    if brick.get(local) == at_middle {
+                        exact += 1;
+                        continue;
+                    }
+                    exposed += 1;
+                    assert!(at_middle.is_some(), "level {level} {coord:?} {local:?}");
+                    assert!(
+                        brick.get(local).is_some() && air_beside(level, middle),
                         "level {level} {coord:?} {local:?}"
                     );
                 }
             }
         }
+        // And there are some of both: the surface changes some Voxels, and not most.
+        assert!(exposed > 100 && exact > 100 * exposed, "{exact} {exposed}");
+    }
+
+    /// The Material of the topmost solid Voxel, going down a radial line from above the ground,
+    /// in the bricks of mip `level`: the first Voxel that a ray down it enters. The steps are
+    /// short enough not to miss a corner of a Voxel that the line only clips.
+    fn top_of_the_ground(direction: [f64; 3], level: usize) -> Option<Material> {
+        let size = 1 << level;
+        let surface = planet().map().elevation_at(direction);
+        let mut h = surface + 3.0 * f64::from(size);
+        while h > surface - 3.0 * f64::from(size) {
+            let at = along(direction, SEA_RADIUS + h);
+            let voxel = at.0.map(|c| c.div_euclid(size));
+            let brick = BrickCoord(voxel.map(|v| v.div_euclid(8)));
+            let local = voxel.map(|v| v.rem_euclid(8) as u8);
+            if let Some(material) = planet().coarse_brick(level, brick).get(local) {
+                return Some(material);
+            }
+            h -= f64::from(size) / 16.0;
+        }
+        None
+    }
+
+    #[test]
+    fn the_top_layer_of_the_ground_is_what_a_coarse_voxel_over_it_is_at_every_level() {
+        // Temperate land has four Voxels of grassy soil over the soil, clay and rock under them,
+        // and snow, sand and basalt are 6 to 10 thick. A coarse Voxel is wider than all of it
+        // from level 3 or 4, and the middle of one with ground in it is deep in the strata, but
+        // the top of the ground is what is seen of it. This holds up to the level at which the
+        // Voxels are wider than the country that the line goes down: beyond it, the Voxel at
+        // the top is another biome's.
+        let temperate = find(|t| t.biome == Biome::Temperate && (300..600).contains(&t.elevation));
+        let snow = find(|t| t.biome == Biome::Snow && t.elevation >= 100);
+        let desert = find(|t| t.biome == Biome::Desert && t.elevation >= 100);
+        let volcanic = find(|t| t.biome == Biome::Volcanic && t.elevation >= 100);
+        for (direction, top, levels) in [
+            (temperate, GRASSY_SOIL, 10),
+            (snow, SNOW, 10),
+            (desert, SAND, 6),
+            (volcanic, BASALT, 8),
+        ] {
+            for level in 1..=levels {
+                assert_eq!(
+                    top_of_the_ground(direction, level),
+                    Some(top),
+                    "{top:?} at level {level}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_shortcuts_make_the_brick_that_working_out_every_voxel_does() {
+        // `coarse_brick` decides a brick without its Voxels when it can. That must be the
+        // brick its Voxels make, and it is not just by the Material at their middles: the
+        // Voxels beside the air are the surface. Over the ground, the sea and the sky, and the
+        // interior, at every level there is.
+        let mut compared = 0;
+        for level in 1..=14 {
+            // The bricks around the ground are the ones a shortcut can get wrong: a brick that is
+            // all one layer, with the air one Voxel beyond its edge.
+            let around =
+                bricks_over_the_ground(level, lines().into_iter().chain(spread()).collect());
+            for coord in coarse_bricks_to_check(level).into_iter().chain(around) {
+                let brick = planet().coarse_brick(level, coord);
+                let all = planet().evaluate(&Samples::new(level, coord));
+                assert_eq!(brick, all, "level {level} {coord:?}");
+                compared += 1;
+            }
+        }
+        assert!(compared > 3_000, "{compared}");
     }
 
     #[test]
