@@ -39,7 +39,10 @@ struct LevelHeader {
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct SceneHeader {
     level_count: u32,
-    pad: [u32; 3],
+    bound_radius: f32,
+    pad0: [u32; 2],
+    bound_centre: [i32; 3],
+    pad1: u32,
     levels: [LevelHeader; MAX_LEVELS],
 }
 
@@ -47,6 +50,10 @@ impl SceneHeader {
     fn new(scene: &Scene) -> Self {
         let mut header = SceneHeader::zeroed();
         header.level_count = scene.levels.len() as u32;
+        if let Some(bound) = scene.bound {
+            header.bound_radius = bound.clip_radius();
+            header.bound_centre = bound.centre;
+        }
         for (level, (slot, l)) in header.levels.iter_mut().zip(&scene.levels).enumerate() {
             let (hole_first, hole_end) = scene.hole(level);
             *slot = LevelHeader {

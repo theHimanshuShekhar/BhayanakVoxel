@@ -35,6 +35,10 @@ struct Level {
 
 struct SceneHeader {
     level_count: u32,
+    // The ball that has the whole Planet in it, as `Bound` in scene.rs, with its slack added to
+    // the radius: nothing is found outside it. A radius of 0 means there is no ball.
+    bound_radius: f32,
+    bound_centre: vec3<i32>,
     levels: array<Level, MAX_LEVELS>,
 }
 
@@ -262,10 +266,10 @@ fn hit_region(ray: Ray, w: Walk, level: u32, region: u32, rc: vec3<i32>, t_in: f
 }
 
 // The first solid Voxel of `level` along the ray, in its box and outside the box of the level
-// before it, if it is nearer than `limit`, or a miss. If the ray starts inside the box of the
-// level before it and leaves it no nearer than `limit`, then so it does for every level after
-// this one, and `done` is set.
-fn hit_level(ray: Ray, w: Walk, level: u32, limit: f32, done: ptr<function, bool>) -> Hit {
+// before it, if it is between `t_from` and `limit`, or a miss. If the ray starts inside the box of
+// the level before it and leaves it no nearer than `limit`, then so it does for every level
+// after this one, and `done` is set.
+fn hit_level(ray: Ray, w: Walk, level: u32, t_from: f32, limit: f32, done: ptr<function, bool>) -> Hit {
     let lv = scene.levels[level];
     if any(lv.occupied_end <= lv.occupied_first) {
         return miss();
@@ -275,8 +279,9 @@ fn hit_level(ray: Ray, w: Walk, level: u32, limit: f32, done: ptr<function, bool
     let t_a = reach(ray, w, lv.occupied_first << vec3<u32>(shift));
     let t_b = reach(ray, w, lv.occupied_end << vec3<u32>(shift));
     let t_near = min(t_a, t_b);
-    let t_enter = max(max3(t_near), 0.0);
-    if t_enter > min3(max(t_a, t_b)) || t_enter >= limit {
+    let t_enter = max(max3(t_near), t_from);
+    let t_exit = min3(max(t_a, t_b));
+    if t_enter > t_exit || t_enter >= limit {
         return miss();
     }
     // The ray enters through the face it crosses last. If it starts inside the box, the normal
@@ -301,6 +306,10 @@ fn hit_level(ray: Ray, w: Walk, level: u32, limit: f32, done: ptr<function, bool
         normal = select(vec3<f32>(0.0), -vec3<f32>(w.step), first_axis(h_far));
         if t_start >= limit {
             *done = max3(h_near) <= 0.0;
+            return miss();
+        }
+        // The ray may have left the regions that the level lists while it was in the hole.
+        if t_start > t_exit {
             return miss();
         }
     }
@@ -343,16 +352,42 @@ fn trace(ray: Ray) -> Hit {
     w.step = select(vec3<i32>(-1), vec3<i32>(1), w.d > vec3<f32>(0.0));
     w.upper = max(w.step, vec3<i32>(0));
 
+    // Clip the ray to the ball that has the whole Planet in it: nothing is found outside it.
+    var t_from = 0.0;
+    var limit = 3.4e38;
+    if scene.bound_radius > 0.0 {
+        let oc = vec3<f32>(scene.bound_centre - ray.cell) - ray.origin;
+        let along = dot(oc, ray.dir);
+        let off = oc - ray.dir * along;
+        let h2 = scene.bound_radius * scene.bound_radius - dot(off, off);
+        if h2 < 0.0 {
+            return miss();
+        }
+        let h = sqrt(h2);
+        if along + h < 0.0 {
+            return miss();
+        }
+        t_from = max(along - h, 0.0);
+        limit = along + h;
+    }
+
     // Every level is a part of space of its own, so the nearest hit of all is the first one.
     // Once there is one, the levels beyond it only need looking at up to it.
     var nearest = miss();
-    var limit = 3.4e38;
     var done = false;
     for (var level = 0u; level < scene.level_count && !done; level++) {
-        let h = hit_level(ray, w, level, limit, &done);
+        let h = hit_level(ray, w, level, t_from, limit, &done);
         if h.hit && h.t < limit {
             limit = h.t;
             nearest = h;
+            // A ray that starts in the box of this level leaves it, once, and the levels beyond
+            // see only what is outside it: none of them is nearer.
+            if level + 1u < scene.level_count {
+                let beyond = scene.levels[level + 1u];
+                let first = beyond.hole_first << vec3<u32>(7u + level);
+                let end = beyond.hole_end << vec3<u32>(7u + level);
+                done = done || (all(ray.cell >= first) && all(ray.cell < end));
+            }
         }
     }
     return nearest;

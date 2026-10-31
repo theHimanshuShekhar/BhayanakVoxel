@@ -346,7 +346,10 @@ impl Scene {
     /// the scene should show, with the words in order.
     pub fn rebuilt_rings(&self, store: &BrickStore) -> Result<Scene, RingsFull> {
         let room = self.rings.as_ref().map_or_else(Room::default, |r| r.room);
-        Scene::with_boxes(store, &self.box_starts(), room)
+        Ok(Scene {
+            bound: self.bound,
+            ..Scene::with_boxes(store, &self.box_starts(), room)?
+        })
     }
 
     /// Whether this is a scene of rings (see [`Scene::rings`]).
@@ -380,7 +383,10 @@ impl Scene {
             Ok(patch) => SceneUpdate::Rings(patch),
             Err(RingsFull) => {
                 let room = self.rings.as_ref().map_or_else(Room::default, |r| r.room);
-                *self = Scene::with_boxes(store, &wanted, room)?;
+                *self = Scene {
+                    bound: self.bound,
+                    ..Scene::with_boxes(store, &wanted, room)?
+                };
                 SceneUpdate::Rebuilt
             }
         }))
@@ -690,11 +696,11 @@ impl Scene {
         &mut self.rings.as_mut().expect("a scene of rings").patch
     }
 
-    /// Fits the occupied box of every level to the regions it lists now, and says whether any
-    /// changed.
-    fn occupy(&mut self) -> bool {
+    /// Fits the occupied box of each of `levels` to the regions it lists now, and says whether
+    /// any changed.
+    fn occupy(&mut self, levels: &BTreeSet<usize>) -> bool {
         let mut changed = false;
-        for level in 0..self.levels.len() {
+        for &level in levels {
             let Level {
                 table_base,
                 table_mask,
@@ -726,7 +732,10 @@ impl Scene {
     fn take_patch(&mut self) -> RingPatch {
         let mut patch = std::mem::take(self.patch());
         if !patch.table.is_empty() {
-            patch.levels |= self.occupy();
+            // The slots of the table are the same number for every level.
+            let slots = self.levels[0].table_mask as usize + 1;
+            let touched: BTreeSet<usize> = patch.table.iter().map(|slot| slot / slots).collect();
+            patch.levels |= self.occupy(&touched);
         }
         RingPatch {
             regions: patch.regions.into_iter().collect(),
@@ -1336,6 +1345,23 @@ mod tests {
         assert!(patch.levels);
         assert_ne!(before, scene.levels);
         assert_occupied(&scene, "after an Edit into the air");
+    }
+
+    #[test]
+    fn the_bound_of_the_planet_survives_packing_the_scene_again() {
+        let bound = Some(crate::scene::Bound {
+            centre: [0; 3],
+            radius: 1534,
+        });
+        let mut scene = rings_at(ABOVE);
+        scene.bound = bound;
+        assert_eq!(scene.rebuilt_rings(ground()).unwrap().bound, bound);
+        // Too little room for where the rings move to: they are packed again, bound and all.
+        let orbit = [0.0, 3600.0, 3000.0];
+        let mut small =
+            Scene::rings_in(ground(), orbit, LEVELS, room_for(&rings_at(orbit), 300)).unwrap();
+        small.bound = bound;
+        assert_eq!(small.recentre(ground(), ABOVE), Err(RingsFull));
     }
 
     #[test]

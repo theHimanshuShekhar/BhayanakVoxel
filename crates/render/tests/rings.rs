@@ -12,7 +12,7 @@ use std::sync::OnceLock;
 use brick_store::BrickStore;
 use common::{Lcg, PRIMARY, assert_agree, check_golden, ray};
 use render::reference::{Hit, Ray, trace};
-use render::scene::Core;
+use render::scene::{Bound, Core};
 use render::{Camera, Image, Offscreen, Scene, SceneUpdate};
 
 const SEED: u64 = 0xB4A7_A9AC;
@@ -333,57 +333,184 @@ fn primary_rays(camera: &Camera, width: u32) -> Vec<Ray> {
     rays
 }
 
-/// Costs of `scene` along the flyover, by sky, ground and grazing rays, and in all.
-fn flyover_cost(mut scene: Scene, rings: bool) -> [Cost; 4] {
-    let mut costs = [Cost::default(); 4];
+/// The ray that leaves the face `hit` found on `ray`, along `dir`, which the path tracer sends
+/// for the sun's light (`dir` is the sun) or for the light of the next bounce: it starts in the
+/// empty Voxel in front of the face.
+fn leave(hit: &Hit, dir: [f32; 3]) -> Ray {
+    Ray {
+        cell: std::array::from_fn(|a| hit.voxel[a] + hit.normal[a]),
+        origin: [0.5; 3],
+        dir,
+    }
+}
+
+/// Costs of `scene` along the flyover for the three kinds of ray that the renderer casts: those
+/// from the camera (primary), those from where they hit towards the sun (shadow), and those
+/// bounced off it (bounce). Each is a [`Cost`] of sky, ground and grazing rays and of all.
+fn flyover_cost(mut scene: Scene, rings: bool) -> [[Cost; 4]; 3] {
+    let mut costs = [[Cost::default(); 4]; 3];
+    let mut rng = Lcg(9);
+    let sun = {
+        let d: [f32; 3] = [0.4, 0.7, 0.59];
+        let len = d.iter().map(|c| c * c).sum::<f32>().sqrt();
+        d.map(|c| c / len)
+    };
     for frame in 0..24 {
         let camera = flyover_camera(frame * 10, 240);
         if rings {
             scene.recentre(planet(), camera.position).unwrap();
         }
-        for ray in primary_rays(&camera, 64) {
-            let (hit, steps) = render::reference::trace_counting(&scene, &ray);
-            let kind = match hit {
-                None => 0,
-                Some(hit) => {
-                    let facing: f32 = (0..3).map(|a| ray.dir[a] * hit.normal[a] as f32).sum();
-                    if facing.abs() > 0.3 { 1 } else { 2 }
+        for primary in primary_rays(&camera, 48) {
+            let (hit, steps) = render::reference::trace_counting(&scene, &primary);
+            let mut classify = |kind: usize, ray: &Ray, hit: Option<Hit>, steps| {
+                let class = match hit {
+                    None => 0,
+                    Some(hit) => {
+                        let facing: f32 = (0..3).map(|a| ray.dir[a] * hit.normal[a] as f32).sum();
+                        if facing.abs() > 0.3 { 1 } else { 2 }
+                    }
+                };
+                costs[kind][class].add(steps);
+                costs[kind][3].add(steps);
+            };
+            classify(0, &primary, hit, steps);
+            let Some(hit) = hit else { continue };
+            let normal = hit.normal.map(|n| n as f32);
+            // Towards the sun, if the face is lit; and bounced.
+            if (0..3).map(|a| normal[a] * sun[a]).sum::<f32>() > 0.0 {
+                let ray = leave(&hit, sun);
+                let (found, steps) = render::reference::trace_counting(&scene, &ray);
+                classify(1, &ray, found, steps);
+            }
+            let bounce = loop {
+                let d: [f32; 3] = std::array::from_fn(|a| normal[a] + 2.0 * rng.next() - 1.0);
+                let len = d.iter().map(|c| c * c).sum::<f32>().sqrt();
+                if len > 0.2 {
+                    break d.map(|c| c / len);
                 }
             };
-            costs[kind].add(steps);
-            costs[3].add(steps);
+            if (0..3).map(|a| normal[a] * bounce[a]).sum::<f32>() > 0.0 {
+                let ray = leave(&hit, bounce);
+                let (found, steps) = render::reference::trace_counting(&scene, &ray);
+                classify(2, &ray, found, steps);
+            }
         }
     }
     costs
 }
 
+/// The Planet's bounding ball, as the client gives it to the scene.
+fn ball() -> Option<Bound> {
+    Some(Bound {
+        centre: [0; 3],
+        radius: planet_gen::MAX_RADIUS,
+    })
+}
+
+fn bounded(mut scene: Scene) -> Scene {
+    scene.bound = ball();
+    scene
+}
+
 #[test]
 fn the_rings_walk_about_as_many_steps_as_a_single_level_scene_along_the_bench_flight() {
     let single = flyover_cost(whole_planet(), false);
-    let rings = flyover_cost(rings_at(flyover_camera(0, 240).position), true);
-    for (name, (a, b)) in ["sky", "ground", "grazing", "all"]
-        .iter()
-        .zip(single.iter().zip(&rings))
-    {
-        eprintln!(
-            "{name:8} rays {:5}  single: looked-at/walked levels, regions, probes, bricks, voxels {:5.1?} total {:6.1}   rings: {:5.1?} total {:6.1}   x{:.2}",
-            a.rays,
-            a.mean().map(|v| (v * 10.0).round() / 10.0),
-            a.total(),
-            b.mean().map(|v| (v * 10.0).round() / 10.0),
-            b.total(),
-            b.total() / a.total().max(1e-9)
-        );
-        // The rings cost what the one level does, rays that miss included: those cross every
-        // ring, so without the walk's clipping to what each ring lists they cost about three
-        // times as much.
+    let unclipped = flyover_cost(rings_at(flyover_camera(0, 240).position), true);
+    let rings = flyover_cost(bounded(rings_at(flyover_camera(0, 240).position)), true);
+    for (kind, name) in ["primary", "shadow", "bounce"].iter().enumerate() {
+        for (class, what) in ["sky", "ground", "grazing", "all"].iter().enumerate() {
+            let (a, u, b) = (
+                single[kind][class],
+                unclipped[kind][class],
+                rings[kind][class],
+            );
+            let show = |c: &Cost| {
+                let m = c.mean();
+                format!(
+                    "looked {:.1} walked {:.1} steps {:.1} (regions {:.1} probes {:.1} bricks {:.1} voxels {:.1})",
+                    m[0],
+                    m[1],
+                    c.total(),
+                    m[2],
+                    m[3],
+                    m[4],
+                    m[5]
+                )
+            };
+            eprintln!(
+                "{name:8} {what:8} rays {:5}\n   single  {}\n   rings   {}\n   +clip   {}",
+                b.rays,
+                show(&a),
+                show(&u),
+                show(&b)
+            );
+        }
+        // The rings cost what the one level does, whatever the ray: those that miss cross every
+        // ring, and those from a hit cast at every level from the one they start in.
+        let (a, b) = (single[kind][3], rings[kind][3]);
         assert!(
             b.total() <= 1.1 * a.total(),
             "{name}: {} steps a ray, against {}",
             b.total(),
             a.total()
         );
+        // And they look at few levels: a ray that is clipped away, or that hits, stops there.
+        assert!(
+            b.mean()[0] < 3.0,
+            "{name}: looks at {} levels a ray",
+            b.mean()[0]
+        );
     }
-    // A ray that hits does not look at the rings beyond the one it hits in.
-    assert!(rings[1].mean()[0] < 4.0, "{:?}", rings[1].mean());
+}
+
+/// The ball takes nothing that is in it away: what is drawn is the same with it and without it.
+#[test]
+fn clipping_to_the_bounding_ball_changes_no_image() {
+    for view in [SURFACE, HORIZON, ORBIT, ([0.0, 9000.0, 4000.0], [0.0; 3])] {
+        let camera = Camera::looking_at(view.0, view.1);
+        let draw = |scene: &Scene| {
+            Offscreen::new(WIDTH, HEIGHT, scene)
+                .unwrap()
+                .render(&camera)
+        };
+        let plain = rings_at(view.0);
+        let clipped = bounded(rings_at(view.0));
+        assert_eq!(draw(&plain), draw(&clipped), "{view:?}");
+        // The CPU walk agrees with itself too: the same Voxel, face and Material, and the
+        // distance to a rounding (a region is entered where the clip began the walk, or by
+        // crossing from the one before, which rounds differently).
+        let mut rng = Lcg(3);
+        for ray in rays_at_the_planet(view.0, 400, &mut rng) {
+            let (a, b) = (trace(&plain, &ray), trace(&clipped, &ray));
+            assert_eq!(
+                a.map(|h| (h.voxel, h.normal, h.material)),
+                b.map(|h| (h.voxel, h.normal, h.material)),
+                "{ray:?}"
+            );
+            if let (Some(a), Some(b)) = (a, b) {
+                assert!((a.t - b.t).abs() <= 1e-5 * (1.0 + a.t), "{ray:?}");
+            }
+        }
+    }
+}
+
+#[test]
+fn the_gpu_and_the_cpu_agree_on_rays_that_are_clipped_to_the_bounding_ball() {
+    let mut rng = Lcg(404);
+    for camera in CAMERAS {
+        let scene = bounded(rings_at(camera));
+        let mut rays = rays_at_the_planet(camera, 300, &mut rng);
+        // Rays that pass the ball and rays that start in it, pointing every way.
+        for _ in 0..200 {
+            let d = [rng.next() - 0.5, rng.next() - 0.5, rng.next() - 0.5];
+            let len = d.iter().map(|c| c * c).sum::<f32>().sqrt();
+            let (cell, origin) = render::camera::split(camera);
+            rays.push(Ray {
+                cell,
+                origin,
+                dir: d.map(|c| c / len),
+            });
+        }
+        assert_agree(&format!("ball, camera {camera:?}"), &rays, &scene);
+    }
 }

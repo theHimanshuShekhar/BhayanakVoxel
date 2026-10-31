@@ -38,22 +38,24 @@ impl Steps {
 }
 
 thread_local! {
-    static STEPS: Cell<Steps> = const { Cell::new(Steps { examined: 0, levels: 0, regions: 0, probes: 0, bricks: 0, voxels: 0 }) };
+    /// The steps so far of the [`trace_counting`] that is running, if one is.
+    static STEPS: Cell<Option<Steps>> = const { Cell::new(None) };
 }
 
 fn count(add: impl FnOnce(&mut Steps)) {
     STEPS.with(|cell| {
-        let mut steps = cell.get();
-        add(&mut steps);
-        cell.set(steps);
+        if let Some(mut steps) = cell.get() {
+            add(&mut steps);
+            cell.set(Some(steps));
+        }
     });
 }
 
 /// [`trace`], and the steps it took.
 pub fn trace_counting(scene: &Scene, ray: &Ray) -> (Option<Hit>, Steps) {
-    STEPS.with(|cell| cell.set(Steps::default()));
+    STEPS.with(|cell| cell.set(Some(Steps::default())));
     let hit = trace(scene, ray);
-    (hit, STEPS.with(Cell::get))
+    (hit, STEPS.with(|cell| cell.take()).unwrap_or_default())
 }
 
 /// A ray: it starts at `cell` plus `origin`, and goes along the unit vector `dir`. Splitting the
@@ -335,7 +337,7 @@ fn hit_region(
 }
 
 /// The first solid Voxel of mip `level` along the ray, in its box and outside the box of the
-/// level before it, if it is nearer than `limit`. If the ray starts inside the box of the level
+/// level before it, if it is between `from` and `limit`. If the ray starts inside the box of the level
 /// before it and leaves it no nearer than `limit`, then so it does for every level after this
 /// one, and `done` is set.
 fn hit_level(
@@ -343,6 +345,7 @@ fn hit_level(
     ray: &Ray,
     w: &Walk,
     level: u32,
+    from: f32,
     limit: f32,
     done: &mut bool,
 ) -> Option<Hit> {
@@ -358,8 +361,9 @@ fn hit_level(
     let t_b = reach(ray, w, end.map(|e| e << shift));
     let t_near: [f32; 3] = std::array::from_fn(|a| t_a[a].min(t_b[a]));
     let t_far: [f32; 3] = std::array::from_fn(|a| t_a[a].max(t_b[a]));
-    let t_enter = max3(t_near).max(0.0);
-    if t_enter > min3(t_far) || t_enter >= limit {
+    let t_enter = max3(t_near).max(from);
+    let t_exit = min3(t_far);
+    if t_enter > t_exit || t_enter >= limit {
         return None;
     }
     // The ray enters through the face it crosses last. If it starts inside the box, the normal
@@ -385,6 +389,10 @@ fn hit_level(
         normal = face(w, first_axis(h_far));
         if t_enter >= limit {
             *done = max3(h_near) <= 0.0;
+            return None;
+        }
+        // The ray may have left the regions that the level lists while it was in the hole.
+        if t_enter > t_exit {
             return None;
         }
     }
@@ -442,20 +450,51 @@ pub fn trace(scene: &Scene, ray: &Ray) -> Option<Hit> {
         upper: d.map(|d| i32::from(d > 0.0)),
     };
 
+    // Clip the ray to the ball that has the whole Planet in it: nothing is found outside it.
+    let (mut from, mut limit) = (0.0, f32::MAX);
+    if let Some(bound) = scene.bound {
+        let radius = bound.clip_radius();
+        let oc: [f32; 3] = std::array::from_fn(|a| {
+            bound.centre[a].wrapping_sub(ray.cell[a]) as f32 - ray.origin[a]
+        });
+        let along = oc[0] * ray.dir[0] + oc[1] * ray.dir[1] + oc[2] * ray.dir[2];
+        let off: [f32; 3] = std::array::from_fn(|a| oc[a] - ray.dir[a] * along);
+        let h2 = radius * radius - (off[0] * off[0] + off[1] * off[1] + off[2] * off[2]);
+        if h2 < 0.0 {
+            return None;
+        }
+        let h = h2.sqrt();
+        if along + h < 0.0 {
+            return None;
+        }
+        from = (along - h).max(0.0);
+        limit = along + h;
+    }
+
     // Every level is a part of space of its own, so the nearest hit of all is the first one.
     // Once there is one, the levels beyond it only need looking at up to it.
     let mut nearest = None;
-    let mut limit = f32::MAX;
     let mut done = false;
     for level in 0..scene.levels.len() as u32 {
         if done {
             break;
         }
-        if let Some(hit) = hit_level(scene, ray, &w, level, limit, &mut done)
+        if let Some(hit) = hit_level(scene, ray, &w, level, from, limit, &mut done)
             && hit.t < limit
         {
             limit = hit.t;
             nearest = Some(hit);
+            // A ray that starts in the box of this level leaves it, once, and the levels beyond
+            // see only what is outside it: none of them is nearer.
+            let beyond = level as usize + 1;
+            if beyond < scene.levels.len() {
+                let (first, end) = scene.hole(beyond);
+                let (first, end) = (
+                    first.map(|f| f << (7 + level)),
+                    end.map(|e| e << (7 + level)),
+                );
+                done |= (0..3).all(|a| ray.cell[a] >= first[a] && ray.cell[a] < end[a]);
+            }
         }
     }
     nearest
