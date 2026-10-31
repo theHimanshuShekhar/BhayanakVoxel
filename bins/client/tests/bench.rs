@@ -64,7 +64,7 @@ fn check_entry(entry: &Value) {
 }
 
 fn check_schema(report: &Value, out: &Path) {
-    assert_eq!(report["schema_version"], 2);
+    assert_eq!(report["schema_version"], 3);
     assert!(!string(&report["build"]["version"]).is_empty());
     assert!(report["build"]["commit"].is_null() || report["build"]["commit"].is_string());
 
@@ -98,6 +98,11 @@ fn check_schema(report: &Value, out: &Path) {
     assert_eq!(string(&config["scene"]), "patch");
     assert!(!string(&config["path"]).is_empty());
     assert!(config["keyframes"].as_u64().unwrap() >= 2);
+    // The LOD bias is recorded (1 unless asked).
+    assert_eq!(config["bias"], 1.0);
+
+    // The sweep over heights is of the whole Planet; the patch has none.
+    assert_eq!(report["altitudes"], serde_json::json!([]));
 
     for mode in ["primary", "reference"] {
         let run = &report["modes"][mode];
@@ -113,6 +118,11 @@ fn check_schema(report: &Value, out: &Path) {
         let timed = frames * spp;
         check_stats(&run["frame_time"]);
         assert_eq!(run["frame_time"]["samples"], frames);
+        // Following the camera with the Planet is timed on its own, a sample for each frame; the
+        // patch is not drawn in levels, so it has no bricks to say.
+        check_stats(&run["scene_update_ms"]);
+        assert_eq!(run["scene_update_ms"]["samples"], frames);
+        assert_eq!(run["lod_at_keyframes"], serde_json::json!([]));
         check_entry(&run["gpu_total"]);
         if timers {
             assert_eq!(run["gpu_total"]["samples"], timed, "{mode} gpu_total");
@@ -250,4 +260,45 @@ fn a_bad_budgets_file_is_an_error_not_a_pass() {
     assert_eq!(run.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&run.stderr).contains("bad.toml"));
     let _ = std::fs::remove_dir_all(&out);
+}
+
+#[test]
+fn a_diagnostic_run_is_marked_in_its_report_and_is_not_held_to_the_budgets() {
+    let out = scratch("diag");
+    let budgets = out.join("impossible.toml");
+    std::fs::write(&budgets, IMPOSSIBLE).unwrap();
+    let run = bench(&[
+        "--short",
+        "--out",
+        out.join("run").to_str().unwrap(),
+        "--budgets",
+        budgets.to_str().unwrap(),
+        "--diag",
+        "no-flush,gap-ms=1",
+    ]);
+    // The budgets cannot be met, and the exit status is 0 all the same.
+    assert_eq!(
+        run.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let report = read_report(&out.join("run"));
+    assert_eq!(
+        report["config"]["diag"],
+        serde_json::json!(["no-flush", "gap-ms=1"])
+    );
+    assert_eq!(report["budgets"]["ok"], false);
+    assert_eq!(report["budgets"]["failed"], serde_json::json!([]));
+    let reason = report["budgets"]["skipped"].as_str().expect("a reason");
+    assert!(reason.contains("not checked"), "{reason}");
+    assert!(String::from_utf8_lossy(&run.stderr).contains("WARNING: a diagnostic run"));
+    // A measurement has no switches and no reason.
+    let plain = scratch("plain");
+    bench(&["--short", "--out", plain.join("run").to_str().unwrap()]);
+    let report = read_report(&plain.join("run"));
+    assert_eq!(report["config"]["diag"], serde_json::json!([]));
+    assert!(report["budgets"]["skipped"].is_null());
+    let _ = std::fs::remove_dir_all(&out);
+    let _ = std::fs::remove_dir_all(&plain);
 }
