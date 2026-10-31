@@ -6,7 +6,7 @@ use serde::Serialize;
 use super::budget::{Budgets, Status, status};
 use super::stats::Stats;
 
-pub const SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = 3;
 
 /// One timed thing (a pass, or the GPU total of a profiler frame) in one mode, against its
 /// budget. In reference mode a profiler frame is one sample, so the entries of that mode have
@@ -42,6 +42,21 @@ pub struct ModeReport {
     /// What the bands selected at each keyframe of the path. Empty for a scene that is not
     /// drawn in levels (`--short`).
     pub lod_at_keyframes: Vec<KeyframeLod>,
+}
+
+/// A still camera at one height above the test Planet: the times of the passes there, and the
+/// bricks the bands select for it.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct Altitude {
+    /// Above the Planet's mean radius, in metres.
+    pub height_m: f64,
+    /// Bricks drawn at each level, level 0 first.
+    pub bricks: Vec<usize>,
+    /// The `primary` and `upscale` passes of primary mode, and the `reference` pass of reference
+    /// mode (one sample): no budget is held against them.
+    pub primary: Stats,
+    pub upscale: Stats,
+    pub reference: Stats,
 }
 
 /// The bricks drawn at each level of detail from one keyframe of the path.
@@ -212,6 +227,9 @@ pub struct Report {
     pub machine: Machine,
     pub config: Config,
     pub modes: Modes,
+    /// The Planet from a still camera at several heights, one after the other, after the flight;
+    /// empty for `--short`.
+    pub altitudes: Vec<Altitude>,
     /// File names, in the output folder.
     pub screenshots: Vec<String>,
     pub budgets: BudgetSummary,
@@ -362,6 +380,13 @@ mod tests {
                 bias: 1.0,
             },
             modes: modes(0.5),
+            altitudes: vec![Altitude {
+                height_m: 100.0,
+                bricks: vec![5, 6],
+                primary: Stats::of(&[0.2, 0.4]),
+                upscale: Stats::of(&[0.1]),
+                reference: Stats::of(&[1.0]),
+            }],
             screenshots: vec!["primary-0.png".into()],
             budgets: summarize("embedded", &budgets(), &modes(0.5)),
         };
@@ -372,6 +397,7 @@ mod tests {
         assert_eq!(
             keys(&json),
             [
+                "altitudes",
                 "budgets",
                 "build",
                 "config",
@@ -381,7 +407,7 @@ mod tests {
                 "screenshots"
             ]
         );
-        assert_eq!(json["schema_version"], 2);
+        assert_eq!(json["schema_version"], 3);
         assert_eq!(json["build"]["commit"], serde_json::Value::Null);
         assert_eq!(json["machine"]["timers_supported"], true);
         let pass = &json["modes"]["primary"]["passes"][0];

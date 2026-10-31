@@ -635,6 +635,12 @@ impl Planet {
     }
 }
 
+/// Whether the brick at `coord` of mip `level` is wholly in the interior, which is solid all the
+/// way down: what both sources of a store say to [`BrickSource::solid_below`].
+fn inside_interior(level: usize, coord: BrickCoord) -> bool {
+    coord.within_ball_at(level, INTERIOR_RADIUS)
+}
+
 /// What a store reads where it holds no brick, when the Planet is to be drawn at every distance
 /// (the LOD bands, #84): the Planet itself, generated on demand at the level asked for. A brick
 /// of level 0 is [`Planet::brick`] and a coarse one is [`Planet::coarse_brick`], so the ground
@@ -667,7 +673,7 @@ impl BrickSource for PlanetSource {
     }
 
     fn solid_below(&self, level: usize, coord: BrickCoord) -> bool {
-        coord.within_ball_at(level, INTERIOR_RADIUS)
+        inside_interior(level, coord)
     }
 }
 
@@ -734,7 +740,7 @@ impl BrickSource for RegionSource {
     }
 
     fn solid_below(&self, level: usize, coord: BrickCoord) -> bool {
-        coord.within_ball_at(level, INTERIOR_RADIUS)
+        inside_interior(level, coord)
     }
 }
 

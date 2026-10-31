@@ -25,11 +25,12 @@ use std::time::Instant;
 use brick_store::{BrickCoord, BrickStore};
 use render::{Camera, Image, Mode, Offscreen, Resolution, Scene};
 
-use args::{Args, Parsed, USAGE};
+use args::{Args, Diag, Parsed, USAGE};
 use budget::{Budgets, Status};
-use path::CameraPath;
+use path::{CameraPath, Keyframe};
 use report::{
-    Build, Config, KeyframeLod, Machine, Measured, ModeReport, Modes, Report, SCHEMA_VERSION,
+    Altitude, Build, Config, KeyframeLod, Machine, Measured, ModeReport, Modes, Report,
+    SCHEMA_VERSION,
 };
 
 const REPORT_FILE: &str = "report.json";
@@ -159,6 +160,7 @@ fn run(args: &Args) -> Result<u8, Box<dyn Error>> {
         Flight {
             scene: patch_scene(),
             store: None,
+            diag: Diag::default(),
         }
     } else {
         eprintln!("generating the Planet (this takes a while)...");
@@ -175,6 +177,7 @@ fn run(args: &Args) -> Result<u8, Box<dyn Error>> {
         Flight {
             scene,
             store: Some(store),
+            diag: Diag::default(),
         }
     };
     eprintln!("scene ready after {:.1?}", started.elapsed());
@@ -200,26 +203,33 @@ fn run(args: &Args) -> Result<u8, Box<dyn Error>> {
     }
     gpu.set_keep_history(true);
 
+    flight.diag = args.diag;
+    gpu.set_flush_scene_updates(!args.diag.no_flush);
     let mut screenshots = Vec::new();
     let primary = run_mode(
         &mut gpu,
         &mut flight,
-        &plan,
+        &plan.path,
+        plan.primary,
         Mode::Primary,
         &budgets,
-        &args.out,
-        &mut screenshots,
+        Some((&args.out, &mut screenshots)),
     )?;
     let reference = run_mode(
         &mut gpu,
         &mut flight,
-        &plan,
+        &plan.path,
+        plan.reference,
         Mode::Reference,
         &budgets,
-        &args.out,
-        &mut screenshots,
+        Some((&args.out, &mut screenshots)),
     )?;
     let modes = Modes { primary, reference };
+    let altitudes = if plan.patch {
+        Vec::new()
+    } else {
+        sweep(&mut gpu, &mut flight, &budgets)?
+    };
 
     let report = Report {
         schema_version: SCHEMA_VERSION,
@@ -247,6 +257,7 @@ fn run(args: &Args) -> Result<u8, Box<dyn Error>> {
             keyframes: plan.path.keyframes(),
             bias: args.bias,
         },
+        altitudes,
         screenshots,
         budgets: report::summarize(&source, &budgets, &modes),
         modes,
@@ -293,6 +304,8 @@ fn patch_scene() -> Scene {
 struct Flight {
     scene: Scene,
     store: Option<BrickStore>,
+    /// What `--diag` asked for.
+    diag: Diag,
 }
 
 impl Flight {
@@ -300,8 +313,15 @@ impl Flight {
     /// the GPU. A window does the same before it draws a frame; the time it takes is not part
     /// of any pass.
     fn follow(&mut self, gpu: &mut Offscreen, camera: &Camera) -> Result<(), Box<dyn Error>> {
+        if self.diag.gap_ms > 0.0 {
+            std::thread::sleep(std::time::Duration::from_secs_f64(self.diag.gap_ms / 1e3));
+        }
+        if self.diag.no_follow {
+            return Ok(());
+        }
         if let Some(store) = &self.store
             && let Some(update) = self.scene.recentre(store, camera.position)?
+            && !self.diag.no_upload
         {
             gpu.update_scene(&self.scene, &update)?;
         }
@@ -329,20 +349,21 @@ fn draw(
     }
 }
 
-/// Flies the path in one mode: warm-up frames, then the measured ones. Screenshots go to `out`
-/// and their names to `screenshots`.
+/// Flies `path` in one mode: warm-up frames, then the measured ones. With `shots`, a screenshot of
+/// each keyframe goes to the folder, and its name to the list, and the bricks drawn at each
+/// keyframe are noted; without, there are none of either.
 fn run_mode(
     gpu: &mut Offscreen,
     flight: &mut Flight,
-    plan: &Plan,
+    path: &CameraPath,
+    share: ModePlan,
     mode: Mode,
     budgets: &Budgets,
-    out: &Path,
-    screenshots: &mut Vec<String>,
+    mut shots: Option<(&Path, &mut Vec<String>)>,
 ) -> Result<ModeReport, Box<dyn Error>> {
-    let (name, share) = match mode {
-        Mode::Primary => ("primary", plan.primary),
-        Mode::Reference => ("reference", plan.reference),
+    let name = match mode {
+        Mode::Primary => "primary",
+        Mode::Reference => "reference",
     };
     eprintln!(
         "{name}: {} warm-up and {} measured frames...",
@@ -351,9 +372,7 @@ fn run_mode(
     let passes_before = gpu.timings().passes().len();
     // Warm up at the end of the path, away from where the measured frames start, so that frame 0
     // of the reference mode starts a new image.
-    let end = plan
-        .path
-        .camera_at(share.frames.saturating_sub(1), share.frames);
+    let end = path.camera_at(share.frames.saturating_sub(1), share.frames);
     flight.follow(gpu, &end)?;
     for _ in 0..share.warmup {
         draw(gpu, mode, &end, share.spp, false);
@@ -368,16 +387,16 @@ fn run_mode(
         .collect();
     let total_start = timings.total().history().len();
 
-    let shots = plan.path.keyframe_frames(share.frames);
+    let keyframes = path.keyframe_frames(share.frames);
     let mut wall = Vec::new();
     let mut scene_update = Vec::new();
     let mut lod_at_keyframes = Vec::new();
     for frame in 0..share.frames {
-        let camera = plan.path.camera_at(frame, share.frames);
+        let camera = path.camera_at(frame, share.frames);
         let following = Instant::now();
         flight.follow(gpu, &camera)?;
         scene_update.push(following.elapsed().as_secs_f64() * 1e3);
-        if shots.contains(&frame) && flight.scene.is_rings() {
+        if shots.is_some() && keyframes.contains(&frame) && flight.scene.is_rings() {
             let radius = f64::from(planet_gen::PLANET_RADIUS);
             let distance = camera.position.iter().map(|c| c * c).sum::<f64>().sqrt();
             lod_at_keyframes.push(KeyframeLod {
@@ -390,13 +409,13 @@ fn run_mode(
             });
         }
         let began = Instant::now();
-        let shot = shots.contains(&frame);
+        let shot = shots.is_some() && keyframes.contains(&frame);
         let image = draw(gpu, mode, &camera, share.spp, shot);
         wall.push(began.elapsed().as_secs_f64() * 1e3);
-        if let (true, Some(image)) = (shot, image) {
+        if let (true, Some(image), Some((out, names))) = (shot, image, shots.as_mut()) {
             let file = format!("{name}-frame{frame:04}.png");
             write_png(&out.join(&file), &image)?;
-            screenshots.push(file);
+            names.push(file);
         }
     }
 
@@ -428,6 +447,64 @@ fn run_mode(
     ))
 }
 
+/// Heights above the Planet's mean radius that the sweep looks from, in Voxels: 4.8 m (the ground),
+/// 100 m, 500 m and 2 km.
+const SWEEP_HEIGHTS: [f64; 4] = [48.0, 1000.0, 5000.0, 20000.0];
+
+/// The test Planet from a still camera at each of [`SWEEP_HEIGHTS`], looking at the ground that
+/// slopes away towards the horizon: both modes' passes timed there, over a few dozen frames, and
+/// the bricks the bands select. It follows the flight and does not change it.
+fn sweep(
+    gpu: &mut Offscreen,
+    flight: &mut Flight,
+    budgets: &Budgets,
+) -> Result<Vec<Altitude>, Box<dyn Error>> {
+    let primary = ModePlan {
+        frames: 24,
+        warmup: 4,
+        spp: 1,
+    };
+    let reference = ModePlan {
+        frames: 6,
+        warmup: 2,
+        spp: 2,
+    };
+    let radius = f64::from(planet_gen::PLANET_RADIUS);
+    let mut altitudes = Vec::new();
+    for height in SWEEP_HEIGHTS {
+        let at = Keyframe {
+            position: [0.0, radius + height, 250.0],
+            target: [0.0, radius, -1500.0],
+        };
+        let path = CameraPath::new(vec![at, at]);
+        eprintln!("sweep: {:.0} m", height * 0.1);
+        let by_mode = |gpu: &mut Offscreen, flight: &mut Flight, share, mode| {
+            run_mode(gpu, flight, &path, share, mode, budgets, None)
+        };
+        let primary = by_mode(gpu, flight, primary, Mode::Primary)?;
+        let bricks = (0..render::lod::LEVELS)
+            .map(|level| flight.scene.level_bricks(level))
+            .collect();
+        let reference = by_mode(gpu, flight, reference, Mode::Reference)?;
+        let pass = |report: &ModeReport, name: &str| {
+            report
+                .passes
+                .iter()
+                .find(|e| e.name == name)
+                .map(|e| e.stats.clone())
+                .unwrap_or_default()
+        };
+        altitudes.push(Altitude {
+            height_m: height * 0.1,
+            bricks,
+            primary: pass(&primary, "primary"),
+            upscale: pass(&primary, "upscale"),
+            reference: pass(&reference, "reference"),
+        });
+    }
+    Ok(altitudes)
+}
+
 fn write_png(path: &Path, image: &Image) -> Result<(), Box<dyn Error>> {
     let file = BufWriter::new(
         File::create(path).map_err(|e| format!("cannot write {}: {e}", path.display()))?,
@@ -441,6 +518,19 @@ fn write_png(path: &Path, image: &Image) -> Result<(), Box<dyn Error>> {
 
 /// The report in brief, for whoever is watching the run.
 fn print_summary(report: &Report) {
+    for a in &report.altitudes {
+        let ms = |v: Option<f64>| v.map_or("n/a".to_string(), |v| format!("{v:.3}"));
+        eprintln!(
+            "at {:>7.1} m: primary {} (p95 {}), upscale {}, reference {} (p95 {}) ms; bricks {:?}",
+            a.height_m,
+            ms(a.primary.mean_ms),
+            ms(a.primary.p95_ms),
+            ms(a.upscale.mean_ms),
+            ms(a.reference.mean_ms),
+            ms(a.reference.p95_ms),
+            a.bricks
+        );
+    }
     let ms = |v: Option<f64>| v.map_or("n/a".to_string(), |v| format!("{v:.3}"));
     for (mode, run) in [
         ("primary", &report.modes.primary),

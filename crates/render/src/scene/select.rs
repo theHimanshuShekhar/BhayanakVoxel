@@ -25,7 +25,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::hash::{BuildHasherDefault, Hasher};
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
-use brick_store::{Brick, BrickCoord, BrickStore, BrickView};
+use brick_store::{Brick, BrickCoord, BrickStore};
 
 use crate::lod::{Bands, LEVELS, brick_distance};
 
@@ -33,7 +33,7 @@ use crate::lod::{Bands, LEVELS, brick_distance};
 /// selection looks nodes up thousands of times a frame. It is not a defence against anything; the
 /// keys are brick coordinates.
 #[derive(Default)]
-pub struct FastHasher(u64);
+pub(super) struct FastHasher(u64);
 
 impl Hasher for FastHasher {
     fn finish(&self) -> u64 {
@@ -96,8 +96,8 @@ const BUCKET: f64 = 4.0;
 /// that were drawn and are not. A brick that came and went in the same change is in neither.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Diff {
-    pub added: HashSet<Key>,
-    pub removed: HashSet<Key>,
+    pub(super) added: HashSet<Key>,
+    pub(super) removed: HashSet<Key>,
 }
 
 impl Diff {
@@ -129,15 +129,6 @@ struct Probe {
     solid: bool,
 }
 
-/// Whether every Voxel of `brick` is solid.
-fn is_full(brick: &Brick) -> bool {
-    match brick.view() {
-        BrickView::Air => false,
-        BrickView::Solid(_) => true,
-        BrickView::Mixed { occupancy, .. } => occupancy.iter().all(|&w| w == u64::MAX),
-    }
-}
-
 /// The bricks that share a face with `coord`.
 fn faces(coord: BrickCoord) -> impl Iterator<Item = BrickCoord> {
     (0..6).map(move |face| {
@@ -155,10 +146,12 @@ fn faces(coord: BrickCoord) -> impl Iterator<Item = BrickCoord> {
 /// may not be air (a coarse brick is air if under half its Voxels are solid).
 ///
 /// A brick that is full, with full bricks on all six faces, is *buried*: no ray from outside
-/// reaches it. It is out of the tree for good if every Voxel under it is solid ([`BrickStore::solid_below`]).
-/// Otherwise (at a coarse level a full brick can hide a tunnel that is under half a Voxel wide) it
-/// stays, drawing nothing, so that a camera in the tunnel splits it down to the bricks that have
-/// the tunnel's walls. Only the bricks around a hollow are such nodes, not the volume of rock.
+/// reaches it, and it is not drawn. It is out of the tree for good only if it and all six of those
+/// bricks are solid all the way down ([`BrickStore::solid_below`]). A full coarse brick can hide a
+/// hollow up to half a coarse Voxel wide, and then either the hollow is in the brick, and a camera
+/// in it splits the brick down to the bricks that have its walls (so it stays, drawing nothing), or
+/// it is in a neighbour, against a face, and the wall across the face is Voxels of this brick (so it
+/// stays too). Only the bricks round a hollow are such nodes, not the volume of rock.
 ///
 /// An Edit that opens a brick is one that changes class, which [`Selection::refresh`] sees: it
 /// looks again at the bricks changed and those beside them.
@@ -179,12 +172,14 @@ fn classify(
     }
     let full_at = |n: BrickCoord| match known.iter().find(|(c, _)| *c == n) {
         Some(&(_, full)) => full,
-        None => is_full(&store.brick_at(level, n)),
+        None => store.brick_at(level, n).is_full(),
     };
-    let buried = is_full(brick) && faces(coord).all(full_at);
+    let buried = brick.is_full() && faces(coord).all(full_at);
     if buried {
+        let sealed =
+            store.solid_below(level, coord) && faces(coord).all(|n| store.solid_below(level, n));
         return Probe {
-            present: !store.solid_below(level, coord),
+            present: !sealed,
             draws: false,
             solid: true,
         };
@@ -211,7 +206,7 @@ fn probe_children(store: &BrickStore, level: usize, coord: BrickCoord) -> Vec<(B
     let known: Vec<(BrickCoord, bool)> = children
         .iter()
         .zip(&bricks)
-        .map(|(&c, b)| (c, is_full(b)))
+        .map(|(&c, b)| (c, b.is_full()))
         .collect();
     children
         .iter()
@@ -325,9 +320,20 @@ pub fn top_bricks(
         .unwrap_or_default()
         .into_iter()
         .collect();
-    if let Some((centre, radius)) = ball
-        && ball_bricks(top, radius) <= MOST_ROOTS
+    if let Some((_, radius)) = ball
+        && ball_bricks(top, radius) > MOST_ROOTS
     {
+        // Content that is only in the store's source, which is all of a Planet that the store
+        // holds no bricks of, is not found: say so, once.
+        static WARNED: std::sync::Once = std::sync::Once::new();
+        WARNED.call_once(|| {
+            eprintln!(
+                "warning: the ball of radius {radius} Voxels has {} bricks of level {top}, over the {MOST_ROOTS} \
+                 that are looked at: only the bricks the store holds at level {top} are drawn from it",
+                ball_bricks(top, radius)
+            );
+        });
+    } else if let Some((centre, radius)) = ball {
         let size = 8i64 << top;
         let span = |a: usize| {
             let (c, r) = (i64::from(centre[a]), i64::from(radius));
@@ -1056,13 +1062,19 @@ mod tests {
         store
     }
 
-    /// Digs a tunnel `width` Voxels square along x, through the middle of the block, with its
-    /// floor at height `floor`. Returns the bricks of level 0 it changed.
-    fn tunnel(store: &mut BrickStore, floor: i32, width: i32) -> Vec<BrickCoord> {
+    /// Digs a tunnel along x through the block, `height` Voxels tall from `floor` and `width`
+    /// wide from `z0`. Returns the bricks of level 0 it changed.
+    fn tunnel_box(
+        store: &mut BrickStore,
+        floor: i32,
+        height: i32,
+        z0: i32,
+        width: i32,
+    ) -> Vec<BrickCoord> {
         let mut changed = BTreeSet::new();
         for x in 0..320 {
-            for y in floor..floor + width {
-                for z in 160..160 + width {
+            for y in floor..floor + height {
+                for z in z0..z0 + width {
                     let voxel = brick_store::VoxelCoord([x, y, z]);
                     changed.insert(voxel.brick());
                     store.set(voxel, None);
@@ -1072,9 +1084,34 @@ mod tests {
         changed.into_iter().collect()
     }
 
-    /// The bricks of level 0 that are neither air nor full, within `reach` Voxels of `camera`:
-    /// the tunnel's walls, as the store has them.
+    /// A tunnel `width` Voxels square, through the middle of the block, with its floor at
+    /// height `floor`.
+    fn tunnel(store: &mut BrickStore, floor: i32, width: i32) -> Vec<BrickCoord> {
+        tunnel_box(store, floor, width, 160, width)
+    }
+
+    /// The bricks of level 0 that a ray can reach from the air, within `reach` Voxels of
+    /// `camera`, as the store has them: those that are neither air nor full, and the full ones
+    /// with a Voxel of air against a face. A tunnel's walls are these, and the wall across a
+    /// face of a coarse brick, in a brick that is itself full, is among them.
     fn walls(store: &BrickStore, camera: [f64; 3], reach: f64) -> Vec<BrickCoord> {
+        let air_against = |c: BrickCoord| {
+            (0..6).any(|face| {
+                let (axis, upper) = (face / 2, face % 2 == 1);
+                let mut n = c;
+                n.0[axis] += if upper { 1 } else { -1 };
+                let side = if upper { 0 } else { 7 };
+                // The layer of the neighbour that touches `c`.
+                (0..64).any(|i| {
+                    let (u, v) = (i % 8, i / 8);
+                    let mut local = [0u8; 3];
+                    local[axis] = side;
+                    local[(axis + 1) % 3] = u;
+                    local[(axis + 2) % 3] = v;
+                    store.brick_at(0, n).get(local).is_none()
+                })
+            })
+        };
         store
             .level(0)
             .unwrap()
@@ -1082,7 +1119,9 @@ mod tests {
             .into_iter()
             .filter(|&c| {
                 let brick = store.brick_at(0, c);
-                !brick.is_air() && !is_full(&brick) && brick_distance(camera, 0, c) <= reach
+                !brick.is_air()
+                    && brick_distance(camera, 0, c) <= reach
+                    && (!brick.is_full() || air_against(c))
             })
             .collect()
     }
@@ -1139,6 +1178,60 @@ mod tests {
                     selection.draws(0, wall),
                     "refreshed: floor {floor} width {width}: {wall:?}"
                 );
+            }
+        }
+    }
+
+    /// A hollow that touches a face of a coarse brick has its wall across that face, in the brick on
+    /// the other side. A coarse brick reads as full while it hides a hollow up to half a coarse
+    /// Voxel wide, so a brick that reads full with full neighbours is not out of reach unless
+    /// they, too, are solid all the way down. The tunnel here is against the faces of bricks of
+    /// levels 4 (z = 128), 2 (z = 160) and 3 (z = 192), on either side of them, and the wall
+    /// Voxels on both sides of the face must be drawn.
+    #[test]
+    fn the_wall_across_the_face_of_a_coarse_brick_is_drawn_from_a_tunnel_against_it() {
+        let mut cases = Vec::new();
+        for face in [128, 160, 192] {
+            for (floor, height, width) in [(120, 18, 6), (100, 8, 16), (110, 18, 1), (90, 12, 3)] {
+                // The air against the face from below, and from above it.
+                cases.push((floor, height, face - width, width));
+                cases.push((floor, height, face, width));
+            }
+        }
+        let bands = Bands::standard(1.0);
+        let top = top_level(&rock());
+        for (floor, height, z0, width) in cases {
+            let camera = [
+                100.0,
+                f64::from(floor) + f64::from(height) / 2.0,
+                f64::from(z0) + f64::from(width) / 2.0,
+            ];
+            let label = format!("floor {floor} height {height} z {z0} width {width}");
+            let mut dug = rock();
+            tunnel_box(&mut dug, floor, height, z0, width);
+            dug.build_lod(4);
+            let wanted = walls(&dug, camera, 200.0);
+            // The bricks across the face are among them.
+            let across = |z: i32| {
+                wanted
+                    .iter()
+                    .any(|c| c.0[2] == z.div_euclid(8) && c.0[1] >= 0)
+            };
+            assert!(across(z0 - 1) && across(z0 + width), "{label}");
+            let roots = top_bricks(&dug, top, None);
+            let (fresh, _) = Selection::new(&dug, camera, bands, top, roots);
+            for &wall in &wanted {
+                assert!(fresh.draws(0, wall), "fresh: {label}: {wall:?}");
+            }
+
+            let mut store = rock();
+            let roots = top_bricks(&store, top, None);
+            let (mut selection, _) = Selection::new(&store, camera, bands, top, roots);
+            let changed = tunnel_box(&mut store, floor, height, z0, width);
+            store.refresh_lod(changed.iter().copied());
+            selection.refresh(&store, &changed);
+            for &wall in &wanted {
+                assert!(selection.draws(0, wall), "refreshed: {label}: {wall:?}");
             }
         }
     }

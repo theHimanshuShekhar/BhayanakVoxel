@@ -56,6 +56,9 @@ pub const REGION_BRICKS: i32 = 8;
 pub const REGION_VOXELS: i32 = 64;
 /// Words per region record: 16 mask words and the offset of its first brick entry.
 pub const REGION_WORDS: usize = 17;
+/// Where the offset of the first brick entry is in a region record, after the 16 words of the mask
+/// (so also how many words the mask has).
+pub const REGION_FIRST_REF: usize = REGION_WORDS - 1;
 /// Set in a brick entry for a brick that is one Material throughout.
 pub const SOLID_FLAG: u32 = 0x8000_0000;
 /// Most levels a scene can have. Level `n` has regions `64 << n` Voxels across, which must stay

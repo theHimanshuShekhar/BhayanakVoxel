@@ -299,7 +299,16 @@ fn displacements(bias: f64, held: bool, rng: &mut Lcg) -> Vec<(usize, Vec<f64>)>
             let mut scene = rings_with([0.0, top + from, 0.0], bands);
             let camera = [0.0, top + to, 0.0];
             if held {
-                scene.recentre(planet(), camera).unwrap();
+                // In steps that are patches, not jumps that make the scene again (see `JUMP`),
+                // so that the bricks are the ones that stayed at their level on the way in.
+                let step = bands.d0();
+                let distance = from - to;
+                let steps = (distance / step).ceil() as u32;
+                for i in 1..=steps {
+                    let at = from - distance * f64::from(i) / f64::from(steps);
+                    let update = scene.recentre(planet(), [0.0, top + at, 0.0]).unwrap();
+                    assert_ne!(update, Some(SceneUpdate::Rebuilt), "level {level}");
+                }
             }
             let mut errors = Vec::new();
             for ray in rays_at_the_disc(camera, 1500, rng) {
@@ -320,8 +329,10 @@ fn percentile(sorted: &[f64], p: f64) -> f64 {
 /// The surface at the switch distance is within a pixel of the Voxels of level 0 for 95% of rays
 /// (the catalogue's gate, #81): measured, and printed for the report, with the worst ray. A fresh
 /// selection switches at the boundary itself; the hysteresis lets a brick stay at its level down
-/// to 0.95 of it, where its Voxels are a twentieth of a pixel bigger, so that is measured too,
-/// and may be that much over.
+/// to 0.95 of it, where its Voxels are a twentieth of a pixel bigger, so that is measured too: the
+/// camera comes in from 1.06 times the boundary in steps that patch the scene (it would make it
+/// again for a jump), and p95 is under a pixel at every level either way. The worst ray is not:
+/// 1.7 px fresh and 4.3 px held, at level 1.
 #[test]
 fn the_surface_moves_by_under_a_pixel_at_the_switch_distances() {
     let mut rng = Lcg(81);
@@ -336,7 +347,7 @@ fn the_surface_moves_by_under_a_pixel_at_the_switch_distances() {
                 if held { "at 0.95" } else { "at 1.00" },
                 errors.len()
             );
-            let limit = if held { 1.05 } else { 1.0 };
+            let limit = 1.0;
             assert!(p95 <= limit, "level {level}: p95 is {p95:.2} px");
         }
     }

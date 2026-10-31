@@ -39,8 +39,8 @@ use brick_store::{Brick, BrickCoord, BrickStore, BrickView};
 
 use super::select::{self, Selection};
 use super::{
-    Bound, Level, MAX_LEVELS, REGION_BRICKS, REGION_VOXELS, REGION_WORDS, SOLID_FLAG, Scene,
-    SceneUpdate, bit_of, encode_mixed, region_of,
+    Bound, Level, MAX_LEVELS, REGION_BRICKS, REGION_FIRST_REF, REGION_VOXELS, REGION_WORDS,
+    SOLID_FLAG, Scene, SceneUpdate, bit_of, encode_mixed, region_of,
 };
 use crate::lod::Bands;
 
@@ -228,7 +228,7 @@ fn group(keys: impl IntoIterator<Item = (usize, BrickCoord)>) -> ByRegion {
 /// patched. Patching costs about in proportion to the distance (8 ms for 100 Voxels, 90 ms for
 /// 1000, 170 ms for 2000 on the test Planet), a new scene about 200 ms wherever it is, and less
 /// the further out the camera is, and they meet at about two `d0` (2056 Voxels).
-const JUMP: f64 = 1.5;
+const JUMP: f64 = 2.0;
 
 /// Regions of bricks read on the threads before they are packed.
 const PREFETCH_REGIONS: usize = 256;
@@ -540,6 +540,8 @@ impl Scene {
 
     /// Packs the scene again from scratch, bigger if it was sized by its bricks.
     fn pack_again(&mut self, store: &BrickStore) -> Result<SceneUpdate, RingsFull> {
+        // Four times what is needed, not two: a flight from orbit to the ground overflows again and
+        // again as the bricks multiply, and each overflow is a new scene and a new upload.
         *self = self.repacked(store, Some(4.0))?;
         Ok(SceneUpdate::Rebuilt)
     }
@@ -644,13 +646,13 @@ impl Scene {
         // The usual case: the same bricks are in the region, and some of them read differently.
         // Then the list of entries stays where it is, and only those words are written.
         if let (Some(index), Some(old)) = (found, &old_entries) {
-            let uniform = self.regions[index * REGION_WORDS + 16] & SOLID_FLAG != 0;
+            let uniform = self.regions[index * REGION_WORDS + REGION_FIRST_REF] & SOLID_FLAG != 0;
             if !uniform
                 && wanted
                     .iter()
                     .all(|&(bit, entry)| entry.is_some() == old[bit].is_some())
             {
-                let first_ref = self.regions[index * REGION_WORDS + 16] as usize;
+                let first_ref = self.regions[index * REGION_WORDS + REGION_FIRST_REF] as usize;
                 let rank = |bit: usize| old[..bit].iter().filter(|e| e.is_some()).count();
                 for &(bit, entry) in &wanted {
                     let (Some(entry), Some(before)) = (entry, old[bit]) else {
@@ -704,8 +706,8 @@ impl Scene {
         let first = bricks[0].1;
         let at = index * REGION_WORDS;
         if bricks.len() == 512 && first & SOLID_FLAG != 0 && bricks.iter().all(|b| b.1 == first) {
-            self.regions[at..at + 16].fill(u32::MAX);
-            self.regions[at + 16] = first;
+            self.regions[at..at + REGION_FIRST_REF].fill(u32::MAX);
+            self.regions[at + REGION_FIRST_REF] = first;
         } else {
             self.write_entries(index, &bricks)?;
         }
@@ -722,7 +724,7 @@ impl Scene {
     /// pass over its mask.
     fn region_entries(&self, index: usize) -> Vec<Option<u32>> {
         let record = &self.regions[index * REGION_WORDS..][..REGION_WORDS];
-        let first_ref = record[16];
+        let first_ref = record[REGION_FIRST_REF];
         if first_ref & SOLID_FLAG != 0 {
             return vec![Some(first_ref); 512];
         }
@@ -766,8 +768,8 @@ impl Scene {
             self.brick_refs[first_ref + i] = entry;
         }
         let at = index * REGION_WORDS;
-        self.regions[at..at + 16].copy_from_slice(&mask);
-        self.regions[at + 16] = first_ref as u32;
+        self.regions[at..at + REGION_FIRST_REF].copy_from_slice(&mask);
+        self.regions[at + REGION_FIRST_REF] = first_ref as u32;
         Ok(())
     }
 
@@ -822,7 +824,7 @@ impl Scene {
     fn release_refs(&mut self, index: usize) {
         let refs = self.region_refs(index);
         if refs > 0 {
-            let first_ref = self.regions[index * REGION_WORDS + 16] as usize;
+            let first_ref = self.regions[index * REGION_WORDS + REGION_FIRST_REF] as usize;
             let rings = self.rings.as_mut().expect("a scene of rings");
             rings.refs.give(first_ref, refs);
         }
@@ -1039,7 +1041,7 @@ mod tests {
                 }
                 let key = [entry[0], entry[1], entry[2]].map(|k| k as i32);
                 let index = entry[3] as usize - 1;
-                let first_ref = scene.regions[index * REGION_WORDS + 16];
+                let first_ref = scene.regions[index * REGION_WORDS + REGION_FIRST_REF];
                 let region = if first_ref & SOLID_FLAG != 0 {
                     (Some(first_ref & 0xffff), Vec::new())
                 } else {
