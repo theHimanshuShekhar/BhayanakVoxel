@@ -84,8 +84,15 @@ pub struct Level {
     /// Level 0 Voxel coordinate of the box's minimum corner: a multiple of the level's region
     /// size.
     pub origin: [i32; 3],
-    /// Extent of the box in regions of this level.
+    /// Extent of the box in regions of this level. The walk goes by the occupied box, which is
+    /// inside it.
     pub dims: [u32; 3],
+    /// The smallest box of regions of this level, from the first to the one after the last, that
+    /// has every region the level lists: the walk goes no further than it, so a ray that is
+    /// clear of it, or a level with nothing, costs no steps. The two are equal for a level that
+    /// lists nothing.
+    pub occupied_first: [i32; 3],
+    pub occupied_end: [i32; 3],
     /// First slot of the level's part of [`Scene::table`], and its slot count minus one. Slots
     /// are a power of two.
     pub table_base: u32,
@@ -99,6 +106,28 @@ impl Level {
     }
 }
 
+/// A ball that has the whole Planet in it: nothing is outside it. The walk goes no further than
+/// where a ray is in the ball, which is exact for any Planet that is inside it.
+///
+/// The ball bounds the Voxels of level 0. A Voxel of a coarser level is drawn as a whole cube,
+/// and is solid when half of its children are, so it can stick out of the ball by its diagonal;
+/// [`Scene::clip_radius`] allows for that. An Edit that adds matter beyond the ball (building,
+/// #60) must grow `radius` to hold it: digging only takes matter away, so it never does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Bound {
+    /// The ball's centre, in Voxels.
+    pub centre: [i32; 3],
+    /// Its radius in Voxels: at least 1, and below 2^24 so that the GPU has it exactly. The
+    /// Planet's mean radius plus the highest it goes (`planet_gen::MAX_RADIUS` for the test
+    /// Planet), worked out from the world, and not from the box of regions that it fills.
+    pub radius: i32,
+}
+
+/// Voxels added to the radius that rays are clipped to, which are more than the clip's rounding
+/// can come to: a ray at the edge of the ball is a hair to either side of it in f32, never a
+/// Voxel.
+pub const BOUND_SLACK: f32 = 8.0;
+
 /// Packed bricks and the index over them. Built by [`Scene::new`] or [`Scene::rings`], uploaded
 /// as-is.
 #[derive(Debug, Default)]
@@ -109,6 +138,8 @@ pub struct Scene {
     pub regions: Vec<u32>,
     pub brick_refs: Vec<u32>,
     pub bricks: Vec<u32>,
+    /// Where nothing is beyond, if that is known. Rebuilding a scene keeps it.
+    pub bound: Option<Bound>,
     /// What [`Scene::update`] resolves bricks the store does not hold against. Rings ask the
     /// store instead, which has its own source (see [`brick_store::BrickSource`]).
     core: Option<Core>,
@@ -288,6 +319,8 @@ impl Scene {
             levels: vec![Level {
                 origin: min.map(|m| m * REGION_VOXELS),
                 dims: [0, 1, 2].map(|axis| (max[axis] - min[axis] + 1) as u32),
+                occupied_first: min,
+                occupied_end: max.map(|m| m + 1),
                 table_base: 0,
                 table_mask: slots as u32 - 1,
             }],
@@ -446,7 +479,10 @@ impl Scene {
         let mut by_region: BTreeMap<usize, Vec<BrickCoord>> = BTreeMap::new();
         for &brick in changed {
             let Some(index) = self.find_region(0, region_of(brick)) else {
-                *self = Scene::new(store, self.core);
+                *self = Scene {
+                    bound: self.bound,
+                    ..Scene::new(store, self.core)
+                };
                 return SceneUpdate::Rebuilt;
             };
             by_region.entry(index).or_default().push(brick);
@@ -479,7 +515,10 @@ impl Scene {
         }
         let live = self.brick_refs.len() + self.bricks.len() - self.garbage;
         if self.garbage > spare_words(live) {
-            *self = Scene::new(store, self.core);
+            *self = Scene {
+                bound: self.bound,
+                ..Scene::new(store, self.core)
+            };
             return SceneUpdate::Rebuilt;
         }
         SceneUpdate::Patched {
@@ -539,26 +578,47 @@ impl Scene {
         Some(self.brick_refs[(first_ref + lower) as usize])
     }
 
+    /// The radius that rays are clipped to, if the scene has a [`Bound`]: its radius, and the
+    /// diagonal of a Voxel of the coarsest level the scene has (which is as far as such a Voxel
+    /// can stick out), and [`BOUND_SLACK`].
+    pub fn clip_radius(&self) -> Option<f32> {
+        let bound = self.bound?;
+        let coarsest = (1u32 << self.levels.len().saturating_sub(1)) as f32;
+        Some(bound.radius as f32 + coarsest * 3f32.sqrt() + BOUND_SLACK)
+    }
+
     /// Index in `regions` of the region at absolute region coordinate `key` of mip `level`.
     pub fn find_region(&self, level: usize, key: [i32; 3]) -> Option<usize> {
-        let Level {
+        self.find_region_probes(level, key).0
+    }
+
+    /// [`Scene::find_region`], and how many slots of `table` it looked at.
+    pub fn find_region_probes(&self, level: usize, key: [i32; 3]) -> (Option<usize>, u32) {
+        let Some(&Level {
             table_base,
             table_mask: mask,
             ..
-        } = *self.levels.get(level)?;
+        }) = self.levels.get(level)
+        else {
+            return (None, 0);
+        };
         let mut slot = hash_region(key) & mask;
+        let mut probes = 0;
         for _ in 0..=mask {
+            probes += 1;
             let at = (table_base + slot) as usize * 4;
-            let index = *self.table.get(at + 3)?;
+            let Some(&index) = self.table.get(at + 3) else {
+                return (None, probes);
+            };
             if index == 0 {
-                return None;
+                return (None, probes);
             }
             if self.table[at..at + 3] == key.map(|k| k as u32) {
-                return Some(index as usize - 1);
+                return (Some(index as usize - 1), probes);
             }
             slot = (slot + 1) & mask;
         }
-        None
+        (None, probes)
     }
 }
 
