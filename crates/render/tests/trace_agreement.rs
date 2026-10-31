@@ -295,3 +295,38 @@ fn rings_of_a_patch_of_the_test_planet_agree_with_mixed_bricks_at_every_level() 
     }
     assert_eq!(scenes, 3);
 }
+
+/// A floor inside the hole of ring 1 (the box of ring 0) and a short line of Voxels just outside
+/// the hole, on the top row of regions of ring 1's box of occupied regions.
+fn floor_and_a_line() -> BrickStore {
+    let mut store = BrickStore::new();
+    for x in -64..64 {
+        for z in -8..8 {
+            store.insert(BrickCoord([x, -1, z]), Brick::solid(STONE));
+        }
+    }
+    for (x, y) in [(512, 126), (513, 126), (512, 127), (513, 127)] {
+        store.set(VoxelCoord([x, y, 0]), Some(STONE));
+    }
+    store.build_lod(1);
+    store
+}
+
+#[test]
+fn a_ray_that_leaves_the_occupied_box_of_a_ring_before_it_leaves_the_hole_finds_nothing() {
+    let store = floor_and_a_line();
+    let camera = [0.5, 50.5, 0.5];
+    let scene = Scene::rings(&store, camera, 2).unwrap();
+    // Rising too steeply to be under the line when it gets as far along as the line is: no ray
+    // meets it, or anything else, and none may be said to.
+    let rays: Vec<Ray> = (0..40)
+        .map(|i| {
+            let slope = 0.16 + 0.011 * f64::from(i);
+            ray(camera, [camera[0] + 1.0, camera[1] + slope, camera[2]])
+        })
+        .collect();
+    for r in &rays {
+        assert_eq!(trace(&scene, r), None, "cpu {r:?}");
+    }
+    assert_eq!(assert_agree("line", &rays, &scene), 0);
+}
