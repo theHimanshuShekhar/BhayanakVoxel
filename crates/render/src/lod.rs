@@ -245,9 +245,9 @@ mod tests {
     #[test]
     fn the_slack_is_how_far_the_camera_must_go_to_reach_the_edge_of_the_hysteresis() {
         let bands = Bands::with_d0(100.0);
-        // Whole at 300 (level 2 starts at 400, whole until 380 is crossed): 80 to go.
+        // Whole at 460 (level 2 starts at 400, and it is whole until 380 is crossed): 80 to go.
         assert!((bands.slack(2, 460.0, false) - 80.0).abs() < 1e-9);
-        // Split at 300: it merges at 420, 120 away.
+        // Split, at 300: it merges at 420, 120 away.
         assert!((bands.slack(2, 300.0, true) - 120.0).abs() < 1e-9);
         assert!(bands.slack(0, 5.0, false).is_infinite());
     }

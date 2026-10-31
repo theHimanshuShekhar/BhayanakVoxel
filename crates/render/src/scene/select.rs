@@ -21,13 +21,50 @@
 //! travel at which that is first possible, and [`Selection::update`] looks only at those that
 //! are due: the work in a frame is the bricks that may change level, not all of them.
 
-use std::cmp::{Ordering, Reverse};
-use std::collections::{BTreeSet, BinaryHeap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
+use std::hash::{BuildHasherDefault, Hasher};
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
 use brick_store::{Brick, BrickCoord, BrickStore, BrickView};
 
 use crate::lod::{Bands, LEVELS, brick_distance};
+
+/// A fast hash for the small integer keys of the maps here, which SipHash is slow for: the
+/// selection looks nodes up thousands of times a frame. It is not a defence against anything; the
+/// keys are brick coordinates.
+#[derive(Default)]
+pub struct FastHasher(u64);
+
+impl Hasher for FastHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.write_u64(u64::from(b));
+        }
+    }
+
+    fn write_u64(&mut self, word: u64) {
+        self.0 = (self.0.rotate_left(5) ^ word).wrapping_mul(0x517c_c1b7_2722_0a95);
+    }
+
+    fn write_u32(&mut self, word: u32) {
+        self.write_u64(u64::from(word));
+    }
+
+    fn write_i32(&mut self, word: i32) {
+        self.write_u64(word as u32 as u64);
+    }
+
+    fn write_usize(&mut self, word: usize) {
+        self.write_u64(word as u64);
+    }
+}
+
+type HashMap<K, V> = std::collections::HashMap<K, V, BuildHasherDefault<FastHasher>>;
+type HashSet<K> = std::collections::HashSet<K, BuildHasherDefault<FastHasher>>;
 
 /// A brick of the pyramid: its level, and its coordinate in bricks of that level.
 pub type Key = (usize, BrickCoord);
@@ -50,23 +87,10 @@ struct Node {
     due: f64,
 }
 
-/// An entry of the queue: when to look at a node.
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct Due(f64, Key);
-
-impl Eq for Due {}
-
-impl PartialOrd for Due {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for Due {
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.0.total_cmp(&other.0).then(self.1.cmp(&other.1))
-    }
-}
+/// Camera travel, in Voxels, that nodes due within it of each other are queued together for. A
+/// node is looked at no later than it is due, and at most this early, which costs a look and is
+/// never wrong.
+const BUCKET: f64 = 4.0;
 
 /// What changed in what is drawn: the bricks that are drawn now and were not, and the bricks
 /// that were drawn and are not. A brick that came and went in the same change is in neither.
@@ -99,8 +123,10 @@ impl Diff {
 struct Probe {
     /// In the tree: not buried, and not air with nothing under it.
     present: bool,
-    /// Drawn if it is whole: not air.
+    /// Drawn if it is whole: not air, and not buried.
     draws: bool,
+    /// Not air: it has solid Voxels, which may be buried, and so not drawn.
+    solid: bool,
 }
 
 /// Whether every Voxel of `brick` is solid.
@@ -121,32 +147,80 @@ fn faces(coord: BrickCoord) -> impl Iterator<Item = BrickCoord> {
     })
 }
 
-/// What the brick at `coord` of `level` is to the tree.
+/// What the brick at `coord` of `level` is to the tree, given the brick (`brick`, whether the
+/// store `held` it) and which of the bricks of its level are known to be full (`known`: the others
+/// are looked up).
 ///
 /// Air is out of it, unless the store holds the brick, which means it holds bricks under it that
-/// may not be air (a coarse brick is air if under half its Voxels are solid). A brick that is
-/// solid with solid bricks on all six faces is out of it too, held or not: no ray can reach it,
-/// and what is under it is out of reach in the same way. An Edit that opens a brick is one that
-/// changes class, which [`Selection::refresh`] sees: it looks again at the bricks changed and
-/// those beside them.
+/// may not be air (a coarse brick is air if under half its Voxels are solid).
 ///
-/// At a coarse level "solid" means a majority of each Voxel's children are, so a brick can hide
-/// air thinner than half a Voxel of its level: a cave that narrow, wholly inside buried bricks,
-/// is not drawn from within. It is under a pixel wide at the distance the level is used from.
-fn probe(store: &BrickStore, level: usize, coord: BrickCoord) -> Probe {
-    let held = store.level(level).is_some_and(|l| l.brick(coord).is_some());
-    let brick = store.brick_at(level, coord);
+/// A brick that is full, with full bricks on all six faces, is *buried*: no ray from outside
+/// reaches it. It is out of the tree for good if every Voxel under it is solid ([`BrickStore::solid_below`]).
+/// Otherwise (at a coarse level a full brick can hide a tunnel that is under half a Voxel wide) it
+/// stays, drawing nothing, so that a camera in the tunnel splits it down to the bricks that have
+/// the tunnel's walls. Only the bricks around a hollow are such nodes, not the volume of rock.
+///
+/// An Edit that opens a brick is one that changes class, which [`Selection::refresh`] sees: it
+/// looks again at the bricks changed and those beside them.
+fn classify(
+    store: &BrickStore,
+    level: usize,
+    coord: BrickCoord,
+    brick: &Brick,
+    held: bool,
+    known: &[(BrickCoord, bool)],
+) -> Probe {
     if brick.is_air() {
         return Probe {
             present: held,
             draws: false,
+            solid: false,
         };
     }
-    let buried = is_full(&brick) && faces(coord).all(|n| is_full(&store.brick_at(level, n)));
-    Probe {
-        present: !buried,
-        draws: true,
+    let full_at = |n: BrickCoord| match known.iter().find(|(c, _)| *c == n) {
+        Some(&(_, full)) => full,
+        None => is_full(&store.brick_at(level, n)),
+    };
+    let buried = is_full(brick) && faces(coord).all(full_at);
+    if buried {
+        return Probe {
+            present: !store.solid_below(level, coord),
+            draws: false,
+            solid: true,
+        };
     }
+    Probe {
+        present: true,
+        draws: true,
+        solid: true,
+    }
+}
+
+fn probe(store: &BrickStore, level: usize, coord: BrickCoord) -> Probe {
+    let held = store.level(level).is_some_and(|l| l.brick(coord).is_some());
+    let brick = store.brick_at(level, coord);
+    classify(store, level, coord, &brick, held, &[])
+}
+
+/// The eight bricks under `coord` of `level`, and what each is to the tree. They are read once,
+/// and a brick beside a sibling does not read it again.
+fn probe_children(store: &BrickStore, level: usize, coord: BrickCoord) -> Vec<(BrickCoord, Probe)> {
+    let below = level - 1;
+    let children = coord.children();
+    let bricks: Vec<_> = children.iter().map(|&c| store.brick_at(below, c)).collect();
+    let known: Vec<(BrickCoord, bool)> = children
+        .iter()
+        .zip(&bricks)
+        .map(|(&c, b)| (c, is_full(b)))
+        .collect();
+    children
+        .iter()
+        .zip(&bricks)
+        .map(|(&c, b)| {
+            let held = store.level(below).is_some_and(|l| l.brick(c).is_some());
+            (c, classify(store, below, c, b, held, &known))
+        })
+        .collect()
 }
 
 /// What a brick of `level` that is to be split is split into, given that it is `p`.
@@ -156,16 +230,15 @@ fn probe(store: &BrickStore, level: usize, coord: BrickCoord) -> Probe {
 /// are air, or the store has nothing under it, and it is not air, it stays whole, which is a
 /// coarser frame than the rule asks for, rather than a hole.
 fn decide(store: &BrickStore, level: usize, coord: BrickCoord, p: Probe) -> Plan {
-    let all: Vec<(BrickCoord, Probe)> = coord
-        .children()
-        .into_iter()
-        .map(|child| (child, probe(store, level - 1, child)))
-        .collect();
+    let all = probe_children(store, level, coord);
     let present: Vec<_> = all.iter().filter(|(_, c)| c.present).copied().collect();
-    if !present.is_empty() || all.iter().any(|(_, c)| c.draws) || !p.draws {
-        Plan::Split(present)
-    } else {
+    // Nothing under it is in the tree, but a brick under it is something that is not air: it
+    // stays whole, which is a coarser frame than the rule asks for, rather than a hole.
+    let hidden_only = present.is_empty() && !all.iter().any(|(_, c)| c.solid) && p.solid;
+    if hidden_only {
         Plan::Whole
+    } else {
+        Plan::Split(present)
     }
 }
 
@@ -227,6 +300,17 @@ pub fn top_level(store: &BrickStore) -> usize {
     (LEVELS - 1).min(store.level_count() - 1)
 }
 
+/// Most bricks of the top level that a ball is searched for. A store whose pyramid stops short of
+/// orbit has a top level of fine bricks, and a ball the size of the Planet has more of them than
+/// can be looked at: it has the bricks that it holds, and nothing is looked for in the rest.
+const MOST_ROOTS: u64 = 4_000_000;
+
+/// Bricks of level `top` in the cube that holds a ball of `radius` Voxels.
+fn ball_bricks(top: usize, radius: i32) -> u64 {
+    let across = (2 * i64::from(radius)) / (8i64 << top) + 2;
+    (across as u64).saturating_pow(3)
+}
+
 /// The bricks of level `top` to look from: those the store holds, and, if the Planet is known to
 /// be inside a ball (its centre in Voxels and its radius), every one that the ball touches, since
 /// a brick that is not held can still be something (see [`brick_store::BrickSource`]).
@@ -241,7 +325,9 @@ pub fn top_bricks(
         .unwrap_or_default()
         .into_iter()
         .collect();
-    if let Some((centre, radius)) = ball {
+    if let Some((centre, radius)) = ball
+        && ball_bricks(top, radius) <= MOST_ROOTS
+    {
         let size = 8i64 << top;
         let span = |a: usize| {
             let (c, r) = (i64::from(centre[a]), i64::from(radius));
@@ -275,9 +361,15 @@ pub struct Selection {
     /// Total length of the camera's path since the selection began.
     travelled: f64,
     nodes: HashMap<Key, Node>,
-    queue: BinaryHeap<Reverse<Due>>,
+    /// The nodes to look at, by the bucket of the camera's travel that they are due in, with the
+    /// travel they were queued for (an entry for a node that was queued again since is stale).
+    queue: BTreeMap<u64, Vec<(f64, Key)>>,
     /// Bricks drawn at each level.
     drawn: [usize; LEVELS],
+    /// Bricks that are drawn whole although they are nearer than their level is used from, since
+    /// there is nothing under them to be split into. Those that are not any more are dropped
+    /// from it when it is looked at.
+    stuck: HashSet<Key>,
 }
 
 impl Selection {
@@ -297,9 +389,10 @@ impl Selection {
             top,
             camera,
             travelled: 0.0,
-            nodes: HashMap::new(),
-            queue: BinaryHeap::new(),
+            nodes: HashMap::default(),
+            queue: BTreeMap::new(),
             drawn: [0; LEVELS],
+            stuck: HashSet::default(),
         };
         let mut diff = Diff::default();
         // Level by level, from the top, so that the bricks of a level are looked at on all the
@@ -369,6 +462,28 @@ impl Selection {
             .map(|(&key, _)| key)
     }
 
+    /// For each level, how near the camera the nearest brick drawn at it is, if nearer than the
+    /// level is used from: a brick that is drawn whole because there is nothing under it to be
+    /// split into (the store holds no Voxels of level 0 there, say). `None` for a level with no
+    /// such brick.
+    pub fn nearest_stuck(&mut self) -> [Option<f64>; LEVELS] {
+        let (bands, camera) = (self.bands, self.camera);
+        let nodes = &self.nodes;
+        self.stuck.retain(|key| {
+            nodes
+                .get(key)
+                .is_some_and(|n| n.state == State::Whole && n.draws)
+        });
+        let mut nearest = [None::<f64>; LEVELS];
+        for &(level, coord) in &self.stuck {
+            let d = brick_distance(camera, level, coord);
+            if d < bands.clear_radius(level) && nearest[level].is_none_or(|n| d < n) {
+                nearest[level] = Some(d);
+            }
+        }
+        nearest
+    }
+
     /// Nodes of the tree: the bricks drawn, those split, and air that may have something in it.
     pub fn nodes(&self) -> usize {
         self.nodes.len()
@@ -376,7 +491,7 @@ impl Selection {
 
     /// Nodes waiting in the queue, the stale ones included.
     pub fn queued(&self) -> usize {
-        self.queue.len()
+        self.queue.values().map(Vec::len).sum()
     }
 
     /// Adds `key`, which is in the tree and whose parent is split (or is the top), and what is
@@ -430,6 +545,9 @@ impl Selection {
         if p.draws {
             self.drawn[key.0] += 1;
             diff.add(key);
+            if self.bands.split(key.0, distance, Some(false)) {
+                self.stuck.insert(key);
+            }
         }
         self.queue_node(key, distance, false);
     }
@@ -442,7 +560,10 @@ impl Selection {
             node.due = due;
         }
         if due.is_finite() {
-            self.queue.push(Reverse(Due(due, key)));
+            self.queue
+                .entry((due / BUCKET) as u64)
+                .or_default()
+                .push((due, key));
         }
     }
 
@@ -477,10 +598,7 @@ impl Selection {
         match node.state {
             State::Whole => {
                 if self.bands.split(level, distance, Some(false)) {
-                    let p = Probe {
-                        present: true,
-                        draws: node.draws,
-                    };
+                    let p = probe(store, level, coord);
                     if let Plan::Split(children) = decide(store, level, coord, p) {
                         if node.draws {
                             self.drawn[level] -= 1;
@@ -488,6 +606,9 @@ impl Selection {
                         }
                         self.split(store, key, distance, children, diff);
                         return;
+                    }
+                    if node.draws {
+                        self.stuck.insert(key);
                     }
                 }
                 self.queue_node(key, distance, false);
@@ -518,13 +639,19 @@ impl Selection {
         self.camera = camera;
         self.travelled += moved;
         let mut diff = Diff::default();
-        while let Some(&Reverse(Due(due, key))) = self.queue.peek() {
-            if due > self.travelled {
+        // Everything due by now, taken out first: what is looked at and queued again is due after
+        // the camera has moved some more, not in this call.
+        let now = (self.travelled / BUCKET) as u64;
+        let mut due = Vec::new();
+        while let Some(entry) = self.queue.first_entry() {
+            if *entry.key() > now {
                 break;
             }
-            self.queue.pop();
+            due.extend(entry.remove());
+        }
+        for (when, key) in due {
             // An entry for a node that has gone, or has been queued again since, is stale.
-            if self.nodes.get(&key).is_some_and(|n| n.due == due) {
+            if self.nodes.get(&key).is_some_and(|n| n.due == when) {
                 self.revisit(store, key, &mut diff);
             }
         }
@@ -913,5 +1040,129 @@ mod tests {
         );
         assert!(selection.draws(1, BrickCoord([0, 0, 0])));
         assert_eq!(selection.bricks().count(), 1);
+    }
+
+    /// A block of solid rock, 40 bricks (320 Voxels) on a side, with a pyramid of five levels.
+    fn rock() -> BrickStore {
+        let mut store = BrickStore::new();
+        for x in 0..40 {
+            for y in 0..40 {
+                for z in 0..40 {
+                    store.insert(BrickCoord([x, y, z]), Brick::solid(ROCK));
+                }
+            }
+        }
+        store.build_lod(4);
+        store
+    }
+
+    /// Digs a tunnel `width` Voxels square along x, through the middle of the block, with its
+    /// floor at height `floor`. Returns the bricks of level 0 it changed.
+    fn tunnel(store: &mut BrickStore, floor: i32, width: i32) -> Vec<BrickCoord> {
+        let mut changed = BTreeSet::new();
+        for x in 0..320 {
+            for y in floor..floor + width {
+                for z in 160..160 + width {
+                    let voxel = brick_store::VoxelCoord([x, y, z]);
+                    changed.insert(voxel.brick());
+                    store.set(voxel, None);
+                }
+            }
+        }
+        changed.into_iter().collect()
+    }
+
+    /// The bricks of level 0 that are neither air nor full, within `reach` Voxels of `camera`:
+    /// the tunnel's walls, as the store has them.
+    fn walls(store: &BrickStore, camera: [f64; 3], reach: f64) -> Vec<BrickCoord> {
+        store
+            .level(0)
+            .unwrap()
+            .sorted_coords()
+            .into_iter()
+            .filter(|&c| {
+                let brick = store.brick_at(0, c);
+                !brick.is_air() && !is_full(&brick) && brick_distance(camera, 0, c) <= reach
+            })
+            .collect()
+    }
+
+    /// A camera inside a tunnel sees its walls, however deep in solid rock it is and however
+    /// narrow it is: at a coarse level the bricks round it read as solid (a coarse Voxel is solid
+    /// when half its children are), but they are split by the camera in them, down to level 0.
+    #[test]
+    fn a_tunnel_through_solid_rock_is_drawn_from_inside_it_whatever_its_depth_and_width() {
+        let cases = [
+            (40, 10),
+            (40, 20),
+            (120, 10),
+            (160, 10),
+            (200, 20),
+            (236, 36),
+            (150, 4),
+            (156, 6),
+            (100, 8),
+        ];
+        for (floor, width) in cases {
+            let camera = [
+                100.0,
+                f64::from(floor) + f64::from(width) / 2.0,
+                160.0 + f64::from(width) / 2.0,
+            ];
+            let bands = Bands::standard(1.0);
+            let top = top_level(&rock());
+
+            // Fresh: the tunnel is dug, and then the selection is made.
+            let mut dug = rock();
+            tunnel(&mut dug, floor, width);
+            dug.build_lod(4);
+            let roots = top_bricks(&dug, top, None);
+            let (fresh, _) = Selection::new(&dug, camera, bands, top, roots);
+            let wanted = walls(&dug, camera, 200.0);
+            assert!(wanted.len() > 4, "floor {floor} width {width}");
+            for &wall in &wanted {
+                assert!(
+                    fresh.draws(0, wall),
+                    "fresh: floor {floor} width {width}: {wall:?}"
+                );
+            }
+
+            // Refreshed: the selection is of solid rock, and then the tunnel is dug.
+            let mut store = rock();
+            let roots = top_bricks(&store, top, None);
+            let (mut selection, _) = Selection::new(&store, camera, bands, top, roots);
+            let changed = tunnel(&mut store, floor, width);
+            store.refresh_lod(changed.iter().copied());
+            selection.refresh(&store, &changed);
+            for &wall in &wanted {
+                assert!(
+                    selection.draws(0, wall),
+                    "refreshed: floor {floor} width {width}: {wall:?}"
+                );
+            }
+        }
+    }
+
+    /// The rock far from a tunnel is not drawn, so the camera in the tunnel is not paying for the
+    /// volume: the bricks in the tree are those round the tunnel and the surface.
+    #[test]
+    fn the_rock_round_a_tunnel_is_not_in_the_tree() {
+        let mut store = rock();
+        tunnel(&mut store, 120, 10);
+        store.build_lod(4);
+        let top = top_level(&store);
+        let roots = top_bricks(&store, top, None);
+        let (selection, _) = Selection::new(
+            &store,
+            [100.0, 125.0, 165.0],
+            Bands::standard(1.0),
+            top,
+            roots,
+        );
+        assert!(
+            selection.nodes() < 20_000,
+            "{} nodes for 64000 bricks",
+            selection.nodes()
+        );
     }
 }

@@ -177,7 +177,12 @@ fn bricks_are_selected_by_level_where_the_bands_say_and_the_bias_changes_them() 
     let near = rings_at(SURFACE.0);
     assert!(near.level_bricks(0) > 10_000);
     // The far side is over 2 * d0 (2056 Voxels) away, and under 4 * d0.
-    assert!(near.level_bricks(1) > 0 && near.level_bricks(2) == 0);
+    let counts: Vec<usize> = (0..LEVELS).map(|l| near.level_bricks(l)).collect();
+    eprintln!("surface bricks per level {counts:?}");
+    assert!(
+        near.level_bricks(1) > 0 && near.level_bricks(2) == 0,
+        "{counts:?}"
+    );
     let far = rings_at(ORBIT.0);
     let used: Vec<_> = (0..LEVELS).filter(|&l| far.level_bricks(l) > 0).collect();
     eprintln!("orbit uses levels {used:?}");
@@ -275,16 +280,27 @@ fn rays_that_hit_at_level_0_still_hit_after_selection_at_every_switch_distance()
 /// at level 0 and the bands' selection, the difference of the distances along the ray, in
 /// output pixels (a Voxel of size 1 covers one pixel at `t` of `f_out`, so a distance of `d`
 /// Voxels covers `d * f_out / t` of them).
-fn displacements(bias: f64, rng: &mut Lcg) -> Vec<(usize, Vec<f64>)> {
+fn displacements(bias: f64, held: bool, rng: &mut Lcg) -> Vec<(usize, Vec<f64>)> {
     let truth = whole_planet();
     let bands = Bands::standard(bias);
     let focal = bands.d0() * bias;
     let top = f64::from(planet_gen::MAX_RADIUS);
     (1..=6)
         .map(|level| {
-            // The nearest surface is at the inner edge of the level's band: as near as it goes.
-            let camera = [0.0, top + bands.floor(level) * 1.001, 0.0];
-            let scene = rings_with(camera, bands);
+            // The nearest surface is at the inner edge of the level's band: as near as a fresh
+            // selection goes. With `held`, the camera came in from further out, and the bricks
+            // stay at their level down to 0.95 of the distance (the hysteresis): as near as any
+            // brick goes.
+            let (from, to) = if held {
+                (bands.floor(level) * 1.06, bands.floor(level) * 0.951)
+            } else {
+                (bands.floor(level) * 1.001, bands.floor(level) * 1.001)
+            };
+            let mut scene = rings_with([0.0, top + from, 0.0], bands);
+            let camera = [0.0, top + to, 0.0];
+            if held {
+                scene.recentre(planet(), camera).unwrap();
+            }
             let mut errors = Vec::new();
             for ray in rays_at_the_disc(camera, 1500, rng) {
                 let (Some(want), Some(got)) = (trace(&truth, &ray), trace(&scene, &ray)) else {
@@ -302,20 +318,27 @@ fn percentile(sorted: &[f64], p: f64) -> f64 {
 }
 
 /// The surface at the switch distance is within a pixel of the Voxels of level 0 for 95% of rays
-/// (the catalogue's gate, #81): measured, and printed for the report.
+/// (the catalogue's gate, #81): measured, and printed for the report, with the worst ray. A fresh
+/// selection switches at the boundary itself; the hysteresis lets a brick stay at its level down
+/// to 0.95 of it, where its Voxels are a twentieth of a pixel bigger, so that is measured too,
+/// and may be that much over.
 #[test]
 fn the_surface_moves_by_under_a_pixel_at_the_switch_distances() {
     let mut rng = Lcg(81);
-    for (level, mut errors) in displacements(1.0, &mut rng) {
-        assert!(errors.len() > 400, "level {level}: {} rays", errors.len());
-        errors.sort_by(f64::total_cmp);
-        let mean = errors.iter().sum::<f64>() / errors.len() as f64;
-        let (p95, max) = (percentile(&errors, 0.95), errors[errors.len() - 1]);
-        eprintln!(
-            "level {level}: displacement {mean:.2} px mean, {p95:.2} p95, {max:.2} max ({} rays)",
-            errors.len()
-        );
-        assert!(p95 <= 1.0, "level {level}: p95 is {p95:.2} px");
+    for held in [false, true] {
+        for (level, mut errors) in displacements(1.0, held, &mut rng) {
+            assert!(errors.len() > 400, "level {level}: {} rays", errors.len());
+            errors.sort_by(f64::total_cmp);
+            let mean = errors.iter().sum::<f64>() / errors.len() as f64;
+            let (p95, max) = (percentile(&errors, 0.95), errors[errors.len() - 1]);
+            eprintln!(
+                "{} level {level}: displacement {mean:.2} px mean, {p95:.2} p95, {max:.2} max ({} rays)",
+                if held { "at 0.95" } else { "at 1.00" },
+                errors.len()
+            );
+            let limit = if held { 1.05 } else { 1.0 };
+            assert!(p95 <= limit, "level {level}: p95 is {p95:.2} px");
+        }
     }
 }
 
@@ -743,5 +766,62 @@ fn the_gpu_and_the_cpu_agree_on_rays_that_are_clipped_to_the_bounding_ball() {
         let scene = rings_at(camera);
         let rays = limb_rays(camera, 400, &mut rng);
         assert_agree(&format!("ball limb, camera {camera:?}"), &rays, &scene);
+    }
+}
+
+/// What following the bench's flight costs the CPU, frame by frame: `Scene::recentre` along
+/// `planet-flyover-v1` (240 frames), after the first frame's scene was made, and then the jump from
+/// the end of the path back to its start, which is what the bench's warm-up does. Run in release:
+/// `cargo t --release -p render --test rings -- --ignored --nocapture flight_cpu_cost`.
+#[test]
+#[ignore = "a measurement, for a release build"]
+fn flight_cpu_cost() {
+    use std::time::Instant;
+    let first = flyover_camera(0, 240).position;
+    let built = Instant::now();
+    let mut scene = rings_at(first);
+    eprintln!("first scene: {:.1?}", built.elapsed());
+    let (mut times, mut words, mut rebuilt) = (Vec::new(), 0usize, 0);
+    for frame in 1..240 {
+        let at = flyover_camera(frame, 240).position;
+        let started = Instant::now();
+        let update = scene.recentre(planet(), at).unwrap();
+        times.push(started.elapsed().as_secs_f64() * 1e3);
+        match update {
+            Some(SceneUpdate::Rings(patch)) => words += patch.words(),
+            Some(SceneUpdate::Rebuilt) => rebuilt += 1,
+            _ => {}
+        }
+    }
+    let mut sorted = times.clone();
+    sorted.sort_by(f64::total_cmp);
+    eprintln!(
+        "flight: mean {:.2} ms, median {:.2}, p95 {:.2}, max {:.2}; {} KiB patched in all, {rebuilt} rebuilds",
+        times.iter().sum::<f64>() / times.len() as f64,
+        sorted[sorted.len() / 2],
+        sorted[sorted.len() * 95 / 100],
+        sorted[sorted.len() - 1],
+        words * 4 / 1024
+    );
+    // Jumps of several sizes from the first camera: patched where the camera goes, and a new
+    // scene made there.
+    let start = flyover_camera(0, 240).position;
+    for jump in [100.0, 300.0, 1000.0, 2000.0, 4000.0, 8000.0] {
+        let mut scene = rings_at(start);
+        let to = [start[0] + jump, start[1], start[2]];
+        let started = Instant::now();
+        let update = scene.recentre(planet(), to).unwrap();
+        let moved = started.elapsed();
+        let started = Instant::now();
+        let _ = rings_at(to);
+        eprintln!(
+            "jump of {jump:6}: {moved:8.1?} ({}), a new scene there {:.1?}",
+            match update {
+                Some(SceneUpdate::Rebuilt) => "rebuilt",
+                Some(_) => "patched",
+                None => "nothing",
+            },
+            started.elapsed()
+        );
     }
 }

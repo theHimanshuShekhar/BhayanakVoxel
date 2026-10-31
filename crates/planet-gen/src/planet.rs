@@ -641,7 +641,8 @@ impl Planet {
 /// far from where the store holds bricks is drawn at the level its distance asks for, and
 /// costs a brick's worth of Voxels for each brick that holds ground. Measured on the client's
 /// first view of the full-size Planet (#84): 3.0 million bricks, 228 s on eight cores, so it is
-/// for a streaming loader (#86, #49) to ask for, not for a frame to wait on.
+/// for a streaming loader (#86, #49) to ask for, not for a frame to wait on. Nothing calls it yet
+/// but its test: it is here for that loader.
 ///
 /// A store holds the bricks that Edits changed and the region around the spawn; everything else
 /// is this. Unedited bricks are a cache that can be regenerated from the seed (ADR 0002).
@@ -663,6 +664,10 @@ impl BrickSource for PlanetSource {
         } else {
             self.planet.coarse_brick(level, coord)
         }
+    }
+
+    fn solid_below(&self, level: usize, coord: BrickCoord) -> bool {
+        coord.within_ball_at(level, INTERIOR_RADIUS)
     }
 }
 
@@ -726,6 +731,10 @@ impl BrickSource for RegionSource {
             .iter()
             .find(|&&(outer, _)| coord.within_ball_at(level, outer))
             .map_or(Brick::AIR, |&(_, material)| Brick::solid(material))
+    }
+
+    fn solid_below(&self, level: usize, coord: BrickCoord) -> bool {
+        coord.within_ball_at(level, INTERIOR_RADIUS)
     }
 }
 

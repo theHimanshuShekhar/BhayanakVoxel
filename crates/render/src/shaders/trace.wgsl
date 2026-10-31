@@ -320,7 +320,7 @@ fn hit_level(ray: Ray, w: Walk, level: u32, t_from: f32, limit: f32) -> Hit {
         if t >= limit {
             break;
         }
-        // The regions of the hole are the finer level's.
+        // The regions of the hole have no brick of this level.
         if any(rc < lv.hole_first) || any(rc > hole_last) {
             let region = find_region(level, rc);
             if region >= 0 {

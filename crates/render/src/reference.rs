@@ -402,7 +402,7 @@ fn hit_level(scene: &Scene, ray: &Ray, w: &Walk, level: u32, from: f32, limit: f
             break;
         }
         count(|s| s.regions += 1);
-        // The regions of the hole are the finer level's.
+        // The regions of the hole have no brick of this level.
         if outside(rc, hole_first, hole_last)
             && let Some(region) = {
                 let (found, probes) = scene.find_region_probes(level as usize, rc);

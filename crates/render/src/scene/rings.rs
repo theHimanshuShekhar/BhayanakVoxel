@@ -224,8 +224,25 @@ fn group(keys: impl IntoIterator<Item = (usize, BrickCoord)>) -> ByRegion {
     by_region
 }
 
+/// How far the camera can go in one move, in `d0`, before the scene is made again instead of
+/// patched. Patching costs about in proportion to the distance (8 ms for 100 Voxels, 90 ms for
+/// 1000, 170 ms for 2000 on the test Planet), a new scene about 200 ms wherever it is, and less
+/// the further out the camera is, and they meet at about two `d0` (2056 Voxels).
+const JUMP: f64 = 1.5;
+
 /// Regions of bricks read on the threads before they are packed.
 const PREFETCH_REGIONS: usize = 256;
+
+/// Regions that the bricks of one level can be in, at the most, wherever the camera is: those of
+/// its band, which is about as many at every level (a ring twice as wide has bricks twice as wide;
+/// see ADR 0002), three times over for the layers of the crust; or those of the ball the Planet
+/// is in, if that is less.
+fn shell_regions(bands: Bands, bound: Bound, level: usize) -> usize {
+    let size = f64::from(REGION_VOXELS << level);
+    let band = std::f64::consts::PI * (2.0 * bands.d0() / f64::from(REGION_VOXELS)).powi(2);
+    let ball = 4.0 * std::f64::consts::PI * ((f64::from(bound.radius) / size) + 2.0).powi(2);
+    (3.0 * band.min(ball)) as usize
+}
 
 /// Regions to leave room for in a table of a level that lists `regions`.
 fn regions_for(regions: usize, headroom: f64) -> usize {
@@ -299,13 +316,17 @@ impl Scene {
             // that grow, and the room is made after.
             // A level that has few regions now may have many once the camera has moved (each level
             // is about as full as the others at the surface of a Planet), so none is sized by
-            // less than half of what the busiest has.
+            // less than half of what the busiest has, nor by less than what its band can hold
+            // (see [`shell_regions`]).
             Sizing::Fitted(headroom) => (
                 {
                     let most = wanted.iter().copied().max().unwrap_or(0);
-                    wanted
-                        .iter()
-                        .map(|&n| regions_for(n.max(most / 2), headroom))
+                    let bands = selection.bands();
+                    (0..levels)
+                        .map(|level| {
+                            let n = wanted[level].max(most / 2);
+                            regions_for(n.max(shell_regions(bands, bound, level)), headroom)
+                        })
                         .collect()
                 },
                 0,
@@ -448,13 +469,23 @@ impl Scene {
         if rings.selection.bands() == bands {
             return Ok(None);
         }
-        let ball = rings.ball;
-        let clipped = self.bound.is_some();
         let camera = rings.selection.camera();
-        let sizing = rings.sizing;
+        self.rebuilt_at(store, camera, bands).map(Some)
+    }
+
+    /// The scene made again for `camera` and `bands`, in place, from nothing: what a jump of the
+    /// camera or another bias asks for. Reported as [`SceneUpdate::Rebuilt`].
+    fn rebuilt_at(
+        &mut self,
+        store: &BrickStore,
+        camera: [f64; 3],
+        bands: Bands,
+    ) -> Result<SceneUpdate, RingsFull> {
+        let rings = self.rings.as_ref().expect("a scene of rings");
+        let (ball, sizing, clipped) = (rings.ball, rings.sizing, self.bound.is_some());
         *self = Scene::rings_sized(store, camera, bands, ball, sizing)?;
         self.bound = clipped.then_some(ball);
-        Ok(Some(SceneUpdate::Rebuilt))
+        Ok(SceneUpdate::Rebuilt)
     }
 
     /// Bricks drawn at `level` (see [`Selection::count`]): the part of the scene that the level
@@ -480,6 +511,17 @@ impl Scene {
         let Some(rings) = &mut self.rings else {
             return Ok(None);
         };
+        // A camera that has gone far has most of the bricks to change, which patching does
+        // slower than making the scene again: past about two d0 (measured on the test Planet).
+        let bands = rings.selection.bands();
+        let from = rings.selection.camera();
+        let jumped = (0..3)
+            .map(|a| (camera[a] - from[a]).powi(2))
+            .sum::<f64>()
+            .sqrt();
+        if jumped > JUMP * bands.d0() {
+            return self.rebuilt_at(store, camera, bands).map(Some);
+        }
         let diff = rings.selection.update(store, camera);
         let attempt = self
             .apply(
@@ -498,7 +540,7 @@ impl Scene {
 
     /// Packs the scene again from scratch, bigger if it was sized by its bricks.
     fn pack_again(&mut self, store: &BrickStore) -> Result<SceneUpdate, RingsFull> {
-        *self = self.repacked(store, Some(2.0))?;
+        *self = self.repacked(store, Some(4.0))?;
         Ok(SceneUpdate::Rebuilt)
     }
 
@@ -575,29 +617,59 @@ impl Scene {
         read: Option<&HashMap<BrickCoord, Brick>>,
     ) -> Result<(), RingsFull> {
         let found = self.find_region(level, key);
-        let old: Vec<Option<u32>> = match found {
-            Some(index) => (0..512).map(|bit| self.entry(index, bit)).collect(),
-            None => vec![None; 512],
-        };
-        let mut new = old.clone();
+        // What each touched brick is to be: its entry in `brick_refs`, or none.
+        let mut wanted: Vec<(usize, Option<u32>)> = Vec::with_capacity(touch.len());
+        let old_entries = found.map(|index| self.region_entries(index));
+        let old_at = |bit: usize| old_entries.as_ref().and_then(|e| e[bit]);
         for &coord in touch {
             let bit = bit_of(coord);
             let drawn = self
                 .rings
                 .as_ref()
                 .is_some_and(|r| r.selection.draws(level, coord));
-            new[bit] = if drawn {
+            let entry = if drawn {
                 let brick = match read.and_then(|r| r.get(&coord)) {
                     Some(brick) => Cow::Borrowed(brick),
                     None => store.brick_at(level, coord),
                 };
                 match brick.view() {
                     BrickView::Air => None,
-                    view => Some(self.put_brick(view, old[bit])?),
+                    view => Some(self.put_brick(view, old_at(bit))?),
                 }
             } else {
                 None
             };
+            wanted.push((bit, entry));
+        }
+        // The usual case: the same bricks are in the region, and some of them read differently.
+        // Then the list of entries stays where it is, and only those words are written.
+        if let (Some(index), Some(old)) = (found, &old_entries) {
+            let uniform = self.regions[index * REGION_WORDS + 16] & SOLID_FLAG != 0;
+            if !uniform
+                && wanted
+                    .iter()
+                    .all(|&(bit, entry)| entry.is_some() == old[bit].is_some())
+            {
+                let first_ref = self.regions[index * REGION_WORDS + 16] as usize;
+                let rank = |bit: usize| old[..bit].iter().filter(|e| e.is_some()).count();
+                for &(bit, entry) in &wanted {
+                    let (Some(entry), Some(before)) = (entry, old[bit]) else {
+                        continue;
+                    };
+                    if entry != before {
+                        self.release_brick(before);
+                        let at = first_ref + rank(bit);
+                        self.brick_refs[at] = entry;
+                        self.patch().brick_refs.push(at..at + 1);
+                    }
+                }
+                return Ok(());
+            }
+        }
+        let old: Vec<Option<u32>> = old_entries.unwrap_or_else(|| vec![None; 512]);
+        let mut new = old.clone();
+        for &(bit, entry) in &wanted {
+            new[bit] = entry;
         }
         if new == old {
             return Ok(());
@@ -644,6 +716,25 @@ impl Scene {
         patch.regions.insert(index);
         patch.table.extend(new_slot);
         Ok(())
+    }
+
+    /// The `brick_refs` entry of each of the 512 bricks of the region record at `index`, in one
+    /// pass over its mask.
+    fn region_entries(&self, index: usize) -> Vec<Option<u32>> {
+        let record = &self.regions[index * REGION_WORDS..][..REGION_WORDS];
+        let first_ref = record[16];
+        if first_ref & SOLID_FLAG != 0 {
+            return vec![Some(first_ref); 512];
+        }
+        let mut rank = 0;
+        (0..512)
+            .map(|bit| {
+                (record[bit / 32] >> (bit % 32) & 1 != 0).then(|| {
+                    rank += 1;
+                    self.brick_refs[(first_ref + rank - 1) as usize]
+                })
+            })
+            .collect()
     }
 
     /// Takes the region at `key` of mip `level` out of the table, and its record `index` back.
@@ -756,13 +847,19 @@ impl Scene {
     /// holes, and the ball that rays are clipped to (which depends on the coarsest level with a
     /// brick). Marks the patch if either changed.
     fn sync_header(&mut self) {
-        let rings = self.rings.as_ref().expect("a scene of rings");
+        let rings = self.rings.as_mut().expect("a scene of rings");
         let camera = rings.selection.camera();
         let bands = rings.selection.bands();
+        // The ball that no brick of a level is in: as far as its band says, or as far as the
+        // nearest brick that is drawn whole though it is nearer than that.
+        let stuck = rings.selection.nearest_stuck();
+        let radii: Vec<f64> = (0..self.levels.len())
+            .map(|level| stuck[level].unwrap_or(bands.clear_radius(level)))
+            .collect();
         let mut changed = false;
-        for level in 0..self.levels.len() {
-            // The cube inside the ball of radius `clear_radius`, in whole regions of the level.
-            let half = bands.clear_radius(level) / 3f64.sqrt();
+        for (level, radius) in radii.into_iter().enumerate() {
+            // The cube inside that ball, in whole regions of the level.
+            let half = radius / 3f64.sqrt();
             let size = f64::from(REGION_VOXELS << level);
             let first: [i32; 3] =
                 std::array::from_fn(|a| ((camera[a] - half) / size).ceil() as i32);
@@ -1271,5 +1368,73 @@ mod tests {
             merged(vec![10..20, 0..5, 5..8, 18..25, 30..30]),
             [0..8, 10..25]
         );
+    }
+
+    /// A brick that is whole because there is nothing under it to split it into is found by a ray
+    /// even when it is nearer than its level is used from, where its level's hole would be.
+    #[test]
+    fn a_brick_that_cannot_be_split_is_not_in_the_hole_of_its_level() {
+        #[derive(Debug)]
+        struct Odd;
+        impl brick_store::BrickSource for Odd {
+            fn brick(&self, level: usize, coord: BrickCoord) -> brick_store::Brick {
+                if level == 1 && coord == BrickCoord([0, 0, 0]) {
+                    brick_store::Brick::solid(Material(1))
+                } else {
+                    brick_store::Brick::AIR
+                }
+            }
+        }
+        let mut store = BrickStore::new();
+        store.set_source(Odd);
+        store.build_lod(1);
+        let bound = Bound {
+            centre: [0; 3],
+            radius: 100,
+        };
+        // 40 Voxels above the brick (which is 16 across), and level 1 is used from 2000 away.
+        let camera = [8.5, 40.5, 8.5];
+        let scene = Scene::rings(&store, camera, Bands::with_d0(1000.0), bound).unwrap();
+        assert_eq!(scene.level_bricks(1), 1);
+        let (first, end) = scene.hole(1);
+        assert!(
+            (0..3).any(|a| end[a] <= first[a]) || first[1] > 0 || end[1] <= 0,
+            "{first:?} {end:?}"
+        );
+        let (cell, origin) = crate::camera::split(camera);
+        let ray = crate::reference::Ray {
+            cell,
+            origin,
+            dir: [0.0, -1.0, 0.0],
+        };
+        let hit = crate::reference::trace(&scene, &ray).expect("the brick is hit");
+        assert_eq!(hit.voxel[1], 15);
+    }
+
+    #[test]
+    fn a_camera_that_jumps_gets_a_new_scene_and_one_that_walks_gets_a_patch() {
+        let mut scene = rings_at(ABOVE);
+        // d0 is 64 Voxels here: a jump is more than 96.
+        let near = [60.0, 1560.0, 0.0];
+        assert!(matches!(
+            scene.recentre(ground(), near),
+            Ok(None | Some(SceneUpdate::Rings(_)))
+        ));
+        let far = [400.0, 1600.0, 0.0];
+        assert_eq!(
+            scene.recentre(ground(), far),
+            Ok(Some(SceneUpdate::Rebuilt))
+        );
+        assert_eq!(
+            shown(&scene),
+            shown(&Scene::rings(ground(), far, bands(), bound()).unwrap())
+        );
+        // The ball that rays are clipped to is as it was.
+        assert_eq!(scene.bound, Some(bound()));
+        // And it carries on from there.
+        assert!(matches!(
+            scene.recentre(ground(), [410.0, 1600.0, 0.0]),
+            Ok(None | Some(SceneUpdate::Rings(_)))
+        ));
     }
 }

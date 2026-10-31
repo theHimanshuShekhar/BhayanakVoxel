@@ -35,6 +35,24 @@ pub struct ModeReport {
     /// CPU time to draw one frame of the path and read the image back; in reference mode, a
     /// frame is all of its samples.
     pub frame_time: Stats,
+    /// CPU time per frame to follow the camera with the Planet: select the bricks the LOD bands
+    /// ask for, pack the ones that changed, and hand them to the GPU. It is done before the
+    /// frame is timed, so it is in no pass and not in `frame_time`.
+    pub scene_update_ms: Stats,
+    /// What the bands selected at each keyframe of the path. Empty for a scene that is not
+    /// drawn in levels (`--short`).
+    pub lod_at_keyframes: Vec<KeyframeLod>,
+}
+
+/// The bricks drawn at each level of detail from one keyframe of the path.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct KeyframeLod {
+    /// The frame of the run the camera is at the keyframe.
+    pub frame: u32,
+    /// How high the camera is above the Planet's mean radius, in metres.
+    pub height_m: f64,
+    /// Bricks drawn at each level, level 0 first.
+    pub bricks: Vec<usize>,
 }
 
 /// The times that one mode's measured frames recorded, as the GPU timers kept them.
@@ -46,6 +64,9 @@ pub struct Measured<'a> {
     pub passes: Vec<(String, &'a [f64])>,
     pub gpu_total: &'a [f64],
     pub wall: &'a [f64],
+    /// CPU milliseconds to follow the camera, for each frame.
+    pub scene_update: &'a [f64],
+    pub lod_at_keyframes: Vec<KeyframeLod>,
 }
 
 fn entry(name: &str, times: &[f64], budget_ms: Option<f64>) -> Entry {
@@ -75,6 +96,8 @@ pub fn mode_report(mode: &str, measured: &Measured, budgets: &Budgets) -> ModeRe
             budgets.gpu_total.get(mode).copied(),
         ),
         frame_time: Stats::of(measured.wall),
+        scene_update_ms: Stats::of(measured.scene_update),
+        lod_at_keyframes: measured.lod_at_keyframes.clone(),
     }
 }
 
@@ -173,9 +196,6 @@ pub struct Config {
     pub keyframes: usize,
     /// The LOD bias: output pixels one Voxel may cover (`--bias`).
     pub bias: f64,
-    /// Bricks drawn at each level of detail (0 first) from the path's first camera. Empty for a
-    /// scene that is not drawn in levels (`--short`).
-    pub bricks_per_level: Vec<usize>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -216,6 +236,12 @@ mod tests {
             passes,
             gpu_total: total,
             wall: &[16.0, 18.0],
+            scene_update: &[2.0, 4.0],
+            lod_at_keyframes: vec![KeyframeLod {
+                frame: 0,
+                height_m: 12.5,
+                bricks: vec![10, 0, 4],
+            }],
         }
     }
 
@@ -245,6 +271,8 @@ mod tests {
         assert_eq!(report.gpu_total.stats.mean_ms, Some(1.5));
         assert_eq!(report.gpu_total.budget_ms, Some(8.6));
         assert_eq!(report.frame_time.mean_ms, Some(17.0));
+        assert_eq!(report.scene_update_ms.mean_ms, Some(3.0));
+        assert_eq!(report.lod_at_keyframes[0].bricks, [10, 0, 4]);
     }
 
     #[test]
@@ -332,7 +360,6 @@ mod tests {
                 path: "flyover".into(),
                 keyframes: 3,
                 bias: 1.0,
-                bricks_per_level: vec![10, 0, 4],
             },
             modes: modes(0.5),
             screenshots: vec!["primary-0.png".into()],
@@ -378,7 +405,9 @@ mod tests {
                 "frame_time",
                 "frames",
                 "gpu_total",
+                "lod_at_keyframes",
                 "passes",
+                "scene_update_ms",
                 "spp",
                 "warmup_frames"
             ]

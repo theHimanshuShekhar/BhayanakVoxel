@@ -143,7 +143,11 @@ impl Offscreen {
     /// [`Scene::update`]) changed it. This starts the reference image over.
     pub fn update_scene(&mut self, scene: &Scene, update: &SceneUpdate) -> Result<()> {
         self.tracer
-            .update_scene(&self.device, &self.queue, scene, update)
+            .update_scene(&self.device, &self.queue, scene, update)?;
+        // The writes are queued until the next submit: send them now, so that their cost is the
+        // update's and not that of the frame drawn next.
+        self.queue.submit(std::iter::empty());
+        Ok(())
     }
 
     /// Changes the sun that both ways of rendering light the Planet with.

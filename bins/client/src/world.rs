@@ -227,12 +227,17 @@ mod tests {
         let deeper = centre_hit(world.scene(), &camera()).unwrap();
         assert!(deeper.voxel[2] < -1, "{deeper:?}");
 
-        // Where the camera is, the rings stay; far away, they move.
+        // Where the camera is, the bands stay; a little way off, the bricks that change level are
+        // patched; and a jump of more than a band's width makes the scene again.
         assert_eq!(world.recentre(camera().position), Ok(None));
-        let far = [camera().position[0] + 900.0, 16.5, 20.5];
+        let [x, y, z] = camera().position;
         assert!(matches!(
-            world.recentre(far),
-            Ok(Some(SceneUpdate::Rings(_)))
+            world.recentre([x + 60.0, y, z]),
+            Ok(None | Some(SceneUpdate::Rings(_)))
+        ));
+        assert!(matches!(
+            world.recentre([x + 900.0, y, z]),
+            Ok(Some(SceneUpdate::Rebuilt))
         ));
     }
 
