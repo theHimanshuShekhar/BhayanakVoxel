@@ -25,10 +25,10 @@ pub const WORLD_RADIUS: i32 = 160_000;
 pub const SEA_LEVEL: i16 = 0;
 
 /// Height of the highest peak above sea level, in Voxels (2 km).
-const PEAK: i64 = 20_000;
+pub const PEAK: i32 = 20_000;
 
 /// Depth of the deepest trench below sea level, in Voxels (1 km).
-const TRENCH: i64 = 10_000;
+pub const TRENCH: i32 = 10_000;
 
 /// Faces as (normal, u axis, v axis), each a signed unit vector along one of x, y and z. A face
 /// is the set of cube points `normal + a * u + b * v` for `a` and `b` in `[-1, 1]`. The order
@@ -207,6 +207,65 @@ impl WorldMap {
             (false, true) => across_j(),
             (true, true) => (inner + across_i() + across_j()) / 3.0,
         }
+    }
+
+    /// The unit vector from the Planet's centre through the middle of texel `(i, j)` of `face`.
+    /// Panics if one is out of range.
+    pub fn texel_direction(&self, face: usize, i: u32, j: u32) -> [f64; 3] {
+        assert!(face < 6 && i < self.size && j < self.size);
+        centre(self.size, face, i, j)
+    }
+
+    /// Bounds `(lowest, highest)` on [`WorldMap::elevation_at`] over every direction in the hull
+    /// of `directions`, as rays from the Planet's centre, which must not be empty.
+    ///
+    /// A face's cube coordinates map straight to its texels, so the hull is within the box of
+    /// them that the directions are in. Elevation is interpolated between texel centres: if the
+    /// box is in one cell, between four, the interpolation is bilinear there and so the extremes
+    /// are at the box's corners, and the bounds are tight. If it is not, they are the extremes
+    /// of all the texels the cells use. Directions on different faces give the whole map's
+    /// bounds, since the hull is then not known to be on one face. Cheap, if they are near each
+    /// other.
+    pub fn elevation_range(&self, directions: &[[f64; 3]]) -> (f64, f64) {
+        // The face the directions are on, and the extremes of where they are on it.
+        let mut places = directions.iter().map(|&d| position(self.size, d));
+        let (face, x, y) = places.next().expect("directions must not be empty");
+        let (mut xs, mut ys) = ((x, x), (y, y));
+        for (f, x, y) in places {
+            if f != face {
+                return (-f64::from(TRENCH), f64::from(PEAK));
+            }
+            xs = (xs.0.min(x), xs.1.max(x));
+            ys = (ys.0.min(y), ys.1.max(y));
+        }
+        // Texel centres are at whole numbers, half a texel in from the edges of `position`. A
+        // point is interpolated between the texels from (floor(x), floor(y)) to one more along
+        // each.
+        let span = |(lo, hi): (f64, f64)| {
+            let (lo, hi) = (lo - 0.5, hi - 0.5);
+            (lo, hi, lo.floor() as i32, hi.floor() as i32 + 1)
+        };
+        let ((x0, x1, i0, i1), (y0, y1, j0, j1)) = (span(xs), span(ys));
+        let texel = |i, j| self.elevation_beyond(face, i, j);
+        let (mut low, mut high) = (f64::INFINITY, f64::NEG_INFINITY);
+        if i1 - i0 == 1 && j1 - j0 == 1 {
+            let lerp = |a: f64, b: f64, t: f64| a + (b - a) * t;
+            let [a00, a10, a01, a11] =
+                [(0, 0), (1, 0), (0, 1), (1, 1)].map(|(di, dj)| texel(i0 + di, j0 + dj));
+            for (x, y) in [(x0, y0), (x1, y0), (x0, y1), (x1, y1)] {
+                let (fx, fy) = (x - f64::from(i0), y - f64::from(j0));
+                let e = lerp(lerp(a00, a10, fx), lerp(a01, a11, fx), fy);
+                (low, high) = (low.min(e), high.max(e));
+            }
+        } else {
+            for j in j0..=j1 {
+                for i in i0..=i1 {
+                    let e = texel(i, j);
+                    (low, high) = (low.min(e), high.max(e));
+                }
+            }
+        }
+        (low, high)
     }
 
     /// FNV-1a hash of the size and every texel, face by face, row by row.
@@ -403,9 +462,9 @@ fn normalise(raw: &[i32], size: u32) -> Vec<i16> {
         .map(|&v| {
             let above = i64::from(v - median);
             (if above >= 0 {
-                above * PEAK / rise
+                above * i64::from(PEAK) / rise
             } else {
-                above * TRENCH / fall
+                above * i64::from(TRENCH) / fall
             }) as i16
         })
         .collect()
@@ -444,7 +503,7 @@ fn erode(heights: &mut Vec<i16>, size: u32, threads: usize) {
 fn biome(seed: u64, direction: [f64; 3], elevation: i16) -> Biome {
     let latitude = direction[1].abs();
     let land = elevation >= SEA_LEVEL;
-    let height = f64::from(elevation.max(SEA_LEVEL)) / PEAK as f64;
+    let height = f64::from(elevation.max(SEA_LEVEL)) / f64::from(PEAK);
     let warmth = 1.0 - latitude - 0.8 * height + 0.1 * fractal(seed ^ WARMTH, direction, 15, 3);
     let subtropics = (1.0 - (latitude - 0.35).abs() / 0.35).max(0.0);
     let aridity = fractal(seed ^ ARIDITY, direction, 15, 3) + 0.7 * subtropics;
@@ -658,6 +717,67 @@ mod tests {
         let cube: [f64; 3] = std::array::from_fn(|k| n[k] + a * u[k] + b * v[k]);
         let mean = (here + f64::from(map.texel(face, i + 1, j).elevation)) / 2.0;
         assert!((map.elevation_at(cube) - mean).abs() < 0.01);
+    }
+
+    #[test]
+    fn a_texel_direction_is_in_its_own_texel() {
+        let map = map();
+        for (face, i, j) in [(0, 0, 0), (3, 255, 0), (5, 17, 200), (2, 128, 128)] {
+            assert_eq!(map.locate(map.texel_direction(face, i, j)), (face, i, j));
+        }
+    }
+
+    #[test]
+    fn the_elevation_range_of_some_directions_holds_the_elevation_of_every_direction_between() {
+        let map = map();
+        let e = 1e-3;
+        // Directions scattered around a texel centre, a face edge and a cube corner.
+        for around in [
+            map.texel_direction(1, 100, 60),
+            map.texel_direction(2, 255, 3),
+            map.texel_direction(4, 0, 0),
+            [1.0, 1.0, 1.0],
+        ] {
+            let at = |s: f64, t: f64| [around[0] + e * s, around[1] + e * t, around[2] - e * s];
+            let corners = [at(-2.0, -2.0), at(2.0, -2.0), at(-2.0, 2.0), at(2.0, 2.0)];
+            let (low, high) = map.elevation_range(&corners);
+            assert!(low <= high);
+            for k in 0..25 {
+                let p = at(f64::from(k % 5) - 2.0, f64::from(k / 5) - 2.0);
+                let elevation = map.elevation_at(p);
+                assert!(
+                    (low..=high).contains(&elevation),
+                    "{low} {elevation} {high}"
+                );
+            }
+        }
+        // Directions on different faces say nothing about where, and so cover the whole map.
+        let (low, high) = map.elevation_range(&[[1.0, 0.0, 0.0], [-1.0, 0.0, 0.0]]);
+        assert!(low <= -f64::from(TRENCH) && high >= f64::from(PEAK));
+        // Within one cell the bounds are tight: a hair's breadth of directions is a hair's
+        // breadth of elevations, though the texels around differ by much more.
+        let near = |s: f64| {
+            // The middle of the cell between four texel centres.
+            let (p, q) = (
+                map.texel_direction(3, 40, 40),
+                map.texel_direction(3, 41, 41),
+            );
+            let c = [0, 1, 2].map(|k| p[k] + q[k]);
+            [c[0] + 1e-7 * s, c[1], c[2] - 1e-7 * s]
+        };
+        let (low, high) = map.elevation_range(&[near(-1.0), near(1.0)]);
+        assert!(high - low < 0.01, "{low} {high}");
+        assert!(low <= map.elevation_at(near(0.0)) && map.elevation_at(near(0.0)) <= high);
+        // At a texel's centre the range is that of a cell, which is among the texels around it.
+        let centre = map.texel_direction(0, 100, 100);
+        let (low, high) = map.elevation_range(&[centre]);
+        let here = map.elevation_at(centre);
+        assert!(low <= here + 1e-9 && here <= high + 1e-9);
+        let all: Vec<f64> = (0..9)
+            .map(|k| f64::from(map.texel(0, 99 + k % 3, 99 + k / 3).elevation))
+            .collect();
+        assert!(low >= all.iter().copied().fold(f64::INFINITY, f64::min) - 1e-9);
+        assert!(high <= all.iter().copied().fold(f64::NEG_INFINITY, f64::max) + 1e-9);
     }
 
     #[test]
