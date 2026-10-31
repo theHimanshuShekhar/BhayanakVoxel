@@ -19,6 +19,8 @@ struct Frame {
     // The index of this sample among those accumulated (0 starts a new image), the seed of the
     // random numbers, the debug view (0 is the lit image), then one unused.
     params: vec4<u32>,
+    // Where in its pixel primary visibility traces its ray, (0, 0) to (1, 1), then two unused.
+    jitter: vec4<f32>,
 }
 
 @group(1) @binding(0) var<uniform> camera: Camera;
@@ -118,13 +120,16 @@ const VIEW_NORMALS = 1u;
 const VIEW_ALBEDO = 2u;
 const VIEW_DEPTH = 3u;
 const VIEW_SAMPLE_COUNT = 4u;
+// Drawn by the upscaler (upscale.wgsl) in primary mode; in the reference image the history is its
+// samples.
+const VIEW_HISTORY_LENGTH = 5u;
 // Voxels at which the depth view is half as bright as at the camera.
 const DEPTH_HALF = 64.0;
 // The sample count at which the sample count view reaches its brightest colour.
 const SAMPLES_BRIGHTEST = 1024.0;
 
 fn debug_colour(view: u32, hit: Hit, sample_index: u32) -> vec3<f32> {
-    if view == VIEW_SAMPLE_COUNT {
+    if view == VIEW_SAMPLE_COUNT || view == VIEW_HISTORY_LENGTH {
         let scale = clamp(log2(f32(sample_index + 1u)) / log2(SAMPLES_BRIGHTEST), 0.0, 1.0);
         return mix(vec3<f32>(0.10, 0.0, 0.30), vec3<f32>(1.0, 0.90, 0.20), scale);
     }

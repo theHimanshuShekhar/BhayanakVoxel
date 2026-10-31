@@ -18,15 +18,20 @@ pub enum DebugView {
     /// violet to yellow over a thousand samples on a logarithmic scale. In primary mode nothing
     /// accumulates, so it is the colour of one sample.
     SampleCount,
+    /// How many frames the upscaler has carried each pixel's history through, from dark violet
+    /// (just one: a new camera, or history that the clamp threw away) to yellow (16, the most).
+    /// In the reference image it is the sample count.
+    HistoryLength,
 }
 
 impl DebugView {
-    pub const ALL: [DebugView; 5] = [
+    pub const ALL: [DebugView; 6] = [
         Self::Lit,
         Self::Normals,
         Self::Albedo,
         Self::Depth,
         Self::SampleCount,
+        Self::HistoryLength,
     ];
 
     /// The number the shaders switch on.
@@ -41,6 +46,7 @@ impl DebugView {
             Self::Albedo => "Albedo",
             Self::Depth => "Depth",
             Self::SampleCount => "Sample count",
+            Self::HistoryLength => "History length",
         }
     }
 

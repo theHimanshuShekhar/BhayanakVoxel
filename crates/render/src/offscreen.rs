@@ -7,8 +7,51 @@ use crate::reference::{Hit, Ray};
 use crate::scene::{Scene, SceneUpdate};
 use crate::sun::Sun;
 use crate::timing::Timings;
-use crate::tracer::{Target, Tracer};
+use crate::tracer::{Plane, Target, Tracer};
+use crate::upscale::Resolution;
 use crate::{Result, create_instance, finish_and_read, request_gpu, staging_buffer};
+
+/// Copies a `width` x `height` texture of `bytes` per texel to the CPU after the work in
+/// `encoder`, tightly packed, rows from the top.
+fn read_texture(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    mut encoder: wgpu::CommandEncoder,
+    texture: &wgpu::Texture,
+    (width, height): (u32, u32),
+    bytes: u32,
+) -> Vec<u8> {
+    // Rows in a texture-to-buffer copy start at multiples of 256 bytes.
+    let row = (width * bytes).next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
+    let size = u64::from(row) * u64::from(height);
+    let staging = staging_buffer(device, size);
+    encoder.copy_texture_to_buffer(
+        texture.as_image_copy(),
+        wgpu::TexelCopyBufferInfo {
+            buffer: &staging,
+            layout: wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(row),
+                rows_per_image: Some(height),
+            },
+        },
+        wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+    );
+    let padded = finish_and_read(device, queue, encoder, &staging, size);
+    let tight = (width * bytes) as usize;
+    if tight == row as usize {
+        return padded;
+    }
+    let mut rows = Vec::with_capacity(tight * height as usize);
+    for r in padded.chunks(row as usize) {
+        rows.extend_from_slice(&r[..tight]);
+    }
+    rows
+}
 
 /// A finished frame: tightly packed RGBA8, rows from the top.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -16,6 +59,20 @@ pub struct Image {
     pub width: u32,
     pub height: u32,
     pub rgba: Vec<u8>,
+}
+
+/// What primary visibility wrote beside the image, at the traced resolution, rows from the top.
+#[derive(Clone, Debug, PartialEq)]
+pub struct GBuffer {
+    pub width: u32,
+    pub height: u32,
+    /// Distance along the ray to the first hit, in Voxels; negative where it hit nothing.
+    pub depth: Vec<f32>,
+    /// The first hit's face normal, a unit vector along an axis; zero where nothing was hit.
+    pub normal: Vec<[f32; 3]>,
+    /// The first hit's surface colour before it is lit, as RGBA8 like an [`Image`]; black where
+    /// nothing was hit.
+    pub albedo: Vec<u8>,
 }
 
 /// Which GPU and driver a device is on, for tools that report where they ran.
@@ -41,18 +98,24 @@ pub struct Offscreen {
 }
 
 impl Offscreen {
-    /// Needs a Vulkan device; CI and local tests use lavapipe.
+    /// Traces and presents at the same size. Needs a Vulkan device; CI and local tests use
+    /// lavapipe.
     pub fn new(width: u32, height: u32, scene: &Scene) -> Result<Self> {
-        Self::create(width, height, scene, true)
+        Self::with_resolution(Resolution::native(width, height), scene)
+    }
+
+    /// Traces at `resolution.internal` and presents at `resolution.output`.
+    pub fn with_resolution(resolution: Resolution, scene: &Scene) -> Result<Self> {
+        Self::create(resolution, scene, true)
     }
 
     /// Like [`Offscreen::new`], on a device without timestamp queries, as on a GPU that lacks
     /// them: passes are not timed. For testing that path wherever the driver has them.
     pub fn without_timers(width: u32, height: u32, scene: &Scene) -> Result<Self> {
-        Self::create(width, height, scene, false)
+        Self::create(Resolution::native(width, height), scene, false)
     }
 
-    fn create(width: u32, height: u32, scene: &Scene, timers: bool) -> Result<Self> {
+    fn create(resolution: Resolution, scene: &Scene, timers: bool) -> Result<Self> {
         let (adapter, device, queue) = request_gpu(&create_instance(), None, timers)?;
         let info = adapter.get_info();
         let info = GpuInfo {
@@ -64,7 +127,7 @@ impl Offscreen {
         };
         let tracer = Tracer::new(&device, scene)?;
         let profiler = Profiler::new(&device, &queue);
-        let target = Target::new(&device, width, height);
+        let target = Target::new(&device, resolution);
         Ok(Self {
             info,
             device,
@@ -125,7 +188,9 @@ impl Offscreen {
         self.profiler.set_keep_history(keep);
     }
 
-    /// Renders primary visibility from `camera` and reads it back.
+    /// Renders primary visibility from `camera` at the traced resolution and reads it back: one
+    /// ray through the centre of each pixel, with nothing carried over from earlier frames and no
+    /// upscaling. This is also what [`Offscreen::gbuffer`] then holds.
     pub fn render(&mut self, camera: &Camera) -> Image {
         let mut encoder = self
             .device
@@ -140,7 +205,102 @@ impl Offscreen {
             &self.sun,
             &self.target,
         );
-        self.read_image(encoder)
+        let size = self.target.resolution().internal;
+        let texture = self.target.lit().texture.clone();
+        self.read_image(encoder, &texture, size)
+    }
+
+    /// Renders one frame of what the window shows in primary mode, and reads back the image at
+    /// the output resolution: primary visibility traced at the internal resolution, through a
+    /// different point of each pixel every frame, upscaled together with the frames before. Call
+    /// it every frame with the camera of that frame: a still camera converges. A new size or a
+    /// debug view that is not the lit image or the history length starts the sequence over.
+    pub fn render_upscaled(&mut self, camera: &Camera) -> Image {
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        self.profiler.begin_frame();
+        self.tracer.encode_upscaled(
+            &self.device,
+            &self.queue,
+            &mut self.profiler,
+            &mut encoder,
+            camera,
+            &self.sun,
+            &self.target,
+        );
+        let size = self.target.resolution().output;
+        let texture = self.target.image().texture.clone();
+        self.read_image(encoder, &texture, size)
+    }
+
+    /// Like [`Offscreen::render_upscaled`], without reading the image back: the frame is drawn and
+    /// its pass times are in when this returns. For a run of frames that is timed and whose
+    /// pictures are not looked at (the bench), where reading back every output image (15 MB at
+    /// 1440p) would be most of the CPU time of a frame and leave the GPU idle between frames.
+    pub fn draw_upscaled(&mut self, camera: &Camera) {
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        self.profiler.begin_frame();
+        self.tracer.encode_upscaled(
+            &self.device,
+            &self.queue,
+            &mut self.profiler,
+            &mut encoder,
+            camera,
+            &self.sun,
+            &self.target,
+        );
+        self.profiler.resolve(&mut encoder);
+        // The uniforms of the next frame are written over these.
+        self.queue.submit([encoder.finish()]);
+        self.profiler.collect(&self.device, true);
+        // Without timers `collect` does not wait, and the frame is not over until it has.
+        self.device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .expect("device poll failed");
+    }
+
+    /// The G-buffer of the last frame of primary visibility ([`Offscreen::render`] or
+    /// [`Offscreen::render_upscaled`]).
+    pub fn gbuffer(&mut self) -> GBuffer {
+        let (width, height) = self.target.resolution().internal;
+        let read = |plane: &Plane, bytes: u32| {
+            let encoder = self
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+            read_texture(
+                &self.device,
+                &self.queue,
+                encoder,
+                &plane.texture,
+                (width, height),
+                bytes,
+            )
+        };
+        let words = read(self.target.gbuffer(), 8);
+        let mut gbuffer = GBuffer {
+            width,
+            height,
+            depth: Vec::new(),
+            normal: Vec::new(),
+            albedo: Vec::new(),
+        };
+        for texel in words.as_chunks::<8>().0 {
+            let [d0, d1, d2, d3, r, g, b, face] = *texel;
+            gbuffer.depth.push(f32::from_le_bytes([d0, d1, d2, d3]));
+            gbuffer.albedo.extend_from_slice(&[r, g, b, 255]);
+            gbuffer.normal.push(match face {
+                0 => [0.0; 3],
+                code => {
+                    let mut n = [0.0; 3];
+                    n[usize::from(code - 1) / 2] = if (code - 1) % 2 == 1 { 1.0 } else { -1.0 };
+                    n
+                }
+            });
+        }
+        gbuffer
     }
 
     /// Adds `samples` samples of the reference path tracer to the image of `camera` and reads
@@ -166,44 +326,32 @@ impl Offscreen {
             self.queue.submit([encoder.finish()]);
             self.profiler.collect(&self.device, true);
         }
-        self.read_image(
-            self.device
-                .create_command_encoder(&wgpu::CommandEncoderDescriptor::default()),
-        )
+        let size = self.target.resolution().internal;
+        let texture = self.target.lit().texture.clone();
+        let encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        self.read_image(encoder, &texture, size)
     }
 
-    /// Reads back the image, after the work recorded in `encoder`, which ends the frame the
-    /// profiler is timing (if any).
-    fn read_image(&mut self, mut encoder: wgpu::CommandEncoder) -> Image {
+    /// Reads back `texture`, an image `(width, height)` big, after the work recorded in `encoder`,
+    /// which ends the frame the profiler is timing (if any).
+    fn read_image(
+        &mut self,
+        mut encoder: wgpu::CommandEncoder,
+        texture: &wgpu::Texture,
+        (width, height): (u32, u32),
+    ) -> Image {
         self.profiler.resolve(&mut encoder);
-        let (width, height) = self.target.size();
-        // Rows in a texture-to-buffer copy start at multiples of 256 bytes.
-        let row = (width * 4).next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
-        let size = u64::from(row) * u64::from(height);
-        let staging = staging_buffer(&self.device, size);
-        encoder.copy_texture_to_buffer(
-            self.target.texture().as_image_copy(),
-            wgpu::TexelCopyBufferInfo {
-                buffer: &staging,
-                layout: wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(row),
-                    rows_per_image: Some(height),
-                },
-            },
-            wgpu::Extent3d {
-                width,
-                height,
-                depth_or_array_layers: 1,
-            },
+        let rgba = read_texture(
+            &self.device,
+            &self.queue,
+            encoder,
+            texture,
+            (width, height),
+            4,
         );
-        let padded = finish_and_read(&self.device, &self.queue, encoder, &staging, size);
         self.profiler.collect(&self.device, true);
-        let rgba = padded
-            .chunks(row as usize)
-            .flat_map(|r| &r[..width as usize * 4])
-            .copied()
-            .collect();
         Image {
             width,
             height,

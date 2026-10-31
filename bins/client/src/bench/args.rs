@@ -12,7 +12,8 @@ is over its budget.
 Options:
   --out DIR        Output folder, created if need be [default: bench-out]
   --budgets FILE   Budgets (TOML) to use instead of the ones built into the executable
-  --size WxH       Resolution of the traced image [default: 1280x720]
+  --size WxH       Resolution of the traced image [default: 1280x720]; the upscaled image
+                   is twice as big in each direction
   --short          A tiny run on a patch of the Planet at low resolution: for a smoke test,
                    not for timings
   --no-fail        Exit with status 0 even if a pass is over its budget

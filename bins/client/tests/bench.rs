@@ -64,7 +64,7 @@ fn check_entry(entry: &Value) {
 }
 
 fn check_schema(report: &Value, out: &Path) {
-    assert_eq!(report["schema_version"], 1);
+    assert_eq!(report["schema_version"], 2);
     assert!(!string(&report["build"]["version"]).is_empty());
     assert!(report["build"]["commit"].is_null() || report["build"]["commit"].is_string());
 
@@ -86,6 +86,15 @@ fn check_schema(report: &Value, out: &Path) {
 
     let config = &report["config"];
     assert!(config["width"].is_u64() && config["height"].is_u64());
+    // The upscaled image is twice the traced one in each direction.
+    assert_eq!(
+        config["output_width"],
+        config["width"].as_u64().unwrap() * 2
+    );
+    assert_eq!(
+        config["output_height"],
+        config["height"].as_u64().unwrap() * 2
+    );
     assert_eq!(string(&config["scene"]), "patch");
     assert!(!string(&config["path"]).is_empty());
     assert!(config["keyframes"].as_u64().unwrap() >= 2);
@@ -114,6 +123,13 @@ fn check_schema(report: &Value, out: &Path) {
             passes.iter().any(|p| string(&p["name"]) == mode),
             "{mode}: {passes:?}"
         );
+        // Primary mode also upscales.
+        if mode == "primary" {
+            assert!(
+                passes.iter().any(|p| string(&p["name"]) == "upscale"),
+                "{passes:?}"
+            );
+        }
         for pass in passes {
             check_entry(pass);
             if timers {
@@ -139,12 +155,19 @@ fn check_schema(report: &Value, out: &Path) {
         let decoder =
             png::Decoder::new(std::io::BufReader::new(std::fs::File::open(&file).unwrap()));
         let reader = decoder.read_info().expect("a PNG");
+        // Primary mode presents the upscaled image; reference mode the traced one.
+        let (width, height) = if string(shot).starts_with("primary") {
+            (&config["output_width"], &config["output_height"])
+        } else {
+            (&config["width"], &config["height"])
+        };
         assert_eq!(
             (reader.info().width, reader.info().height),
             (
-                config["width"].as_u64().unwrap() as u32,
-                config["height"].as_u64().unwrap() as u32
-            )
+                width.as_u64().unwrap() as u32,
+                height.as_u64().unwrap() as u32
+            ),
+            "{shot}"
         );
     }
 }
