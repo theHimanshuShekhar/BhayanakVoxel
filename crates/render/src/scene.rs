@@ -123,7 +123,8 @@ pub struct Bound {
     pub centre: [i32; 3],
     /// Its radius in Voxels: at least 1, and below 2^24 so that the GPU has it exactly. The
     /// Planet's mean radius plus the highest it goes (`planet_gen::MAX_RADIUS` for the test
-    /// Planet), worked out from the world, and not from the box of regions that it fills.
+    /// Planet, `planet_gen::planet::MAX_RADIUS` for the full-size one), worked out from the
+    /// world, and not from the box of regions that it fills.
     pub radius: i32,
 }
 

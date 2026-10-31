@@ -12,7 +12,7 @@ use brick_store::BrickStore;
 use fly::{Action, Fly};
 use net::Leash;
 use planet_gen::planet::Planet;
-use planet_gen::world_map::{PEAK, WORLD_MAP_SIZE, WORLD_RADIUS, WorldMap};
+use planet_gen::world_map::{WORLD_MAP_SIZE, WORLD_RADIUS, WorldMap};
 use render::lod::{self, Bands};
 use render::overlay::{self, Controls, LodInfo, SceneMemory};
 use render::scene::Bound;
@@ -59,19 +59,16 @@ const RING_LEVELS: usize = lod::LEVELS;
 /// The LOD bias the client starts with: output pixels one Voxel may cover. The overlay changes it.
 const DEFAULT_BIAS: f32 = 1.0;
 
-/// Every Voxel of the Planet of the world map is within this many Voxels of its centre: its
-/// radius, and the highest its relief goes.
-const PLANET_REACH: i32 = WORLD_RADIUS + PEAK;
-
 /// A Planet's bricks, packed for the GPU as the bricks the LOD `bands` select from `camera`. The
 /// store must have its pyramid ([`RING_LEVELS`] of it); its source gives the bricks it does not
-/// hold. `reach` is a distance from the origin that nothing of the Planet is beyond, so that no
-/// ray need be walked beyond it.
+/// hold. Nothing of the Planet is further from the centre than `radius`, the Planet's maximum
+/// radius (the full-size Planet's is [`planet_gen::planet::MAX_RADIUS`], the test one's
+/// [`planet_gen::MAX_RADIUS`]), so no ray need be walked beyond it.
 fn planet_scene(
     store: &BrickStore,
     camera: [f64; 3],
     bands: Bands,
-    reach: i32,
+    radius: i32,
 ) -> Result<Scene, RingsFull> {
     Scene::rings(
         store,
@@ -79,7 +76,7 @@ fn planet_scene(
         bands,
         Bound {
             centre: [0; 3],
-            radius: reach,
+            radius,
         },
     )
 }
@@ -177,7 +174,7 @@ fn load(map: WorldMap, reach: i32) -> Result<Loaded, RingsFull> {
         &store,
         camera.position,
         Bands::standard(f64::from(DEFAULT_BIAS)),
-        PLANET_REACH,
+        planet_gen::planet::MAX_RADIUS,
     )?;
     let bricks: Vec<usize> = (0..RING_LEVELS).map(|l| scene.level_bricks(l)).collect();
     eprintln!(
@@ -855,6 +852,43 @@ mod tests {
         assert_eq!(
             loaded.server_store.content_hash(),
             loaded.store.content_hash()
+        );
+    }
+
+    #[test]
+    fn the_ground_is_reachable_from_the_spawn() {
+        // The full-size Planet reaches far beyond the test Planet's radius, so the sphere the
+        // client clips rays to must be the full-size Planet's. With the test Planet's, every ray
+        // from the spawn misses and there is only sky.
+        let loaded = generate_ground(WorldMap::generate(SEED, 512), 100, 1);
+        let (cell, origin) = render::camera::split(loaded.camera.position);
+        let ray = render::reference::Ray {
+            cell,
+            origin,
+            // Straight down at the ground under the spawn.
+            dir: loaded.camera.horizon_up.map(|c| -c as f32),
+        };
+        let scene = planet_scene(
+            &loaded.store,
+            loaded.camera.position,
+            Bands::standard(1.0),
+            planet_gen::planet::MAX_RADIUS,
+        )
+        .expect("a patch of the Planet fits the rings");
+        assert!(
+            render::reference::trace(&scene, &ray).is_some(),
+            "the ground under the spawn is inside the sphere rays are clipped to"
+        );
+        let clipped = planet_scene(
+            &loaded.store,
+            loaded.camera.position,
+            Bands::standard(1.0),
+            planet_gen::MAX_RADIUS,
+        )
+        .expect("a patch of the Planet fits the rings");
+        assert!(
+            render::reference::trace(&clipped, &ray).is_none(),
+            "the test Planet's radius is far inside the spawn, so it clips the ground away"
         );
     }
 
