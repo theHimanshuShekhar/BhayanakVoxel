@@ -6,8 +6,10 @@
 //! order, thread count or hash-map iteration order. Randomness is a stateless integer hash of
 //! the lattice coordinates, and the only float operations are `+ - * /` and conversions, which
 //! IEEE 754 makes exact on every platform (Rust never fuses `a * b + c`). No std transcendentals
-//! or `powi`/`powf` are used; `clippy.toml` bans them. Any change to the output of this crate
-//! must bump [`GENERATOR_VERSION`] and update the golden hashes in `tests/golden.rs`.
+//! or `powi`/`powf` are used; `clippy.toml` bans them. Any change to the level-0 bricks this
+//! crate makes must bump [`GENERATOR_VERSION`], since those are what saves and the cache rest on;
+//! a change that only reaches coarser levels (never persisted) just updates the golden hashes in
+//! `tests/golden.rs`.
 
 use std::sync::atomic::{AtomicI32, Ordering};
 

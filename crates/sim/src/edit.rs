@@ -643,8 +643,9 @@ mod tests {
         assert_eq!((store.content_hash(), store.lod_hash()), bare);
     }
 
-    /// Ground 48 Voxels across, up to z = 20 (so that its layers are not on the boundaries of coarse Voxels): rock, with soil on it for the top 4 Voxels (the
-    /// test Planet's), and its pyramid. The Materials differ, so how a coarse Voxel is made
+    /// Ground 48 Voxels across, up to z = 20 (so that its layers are not on the boundaries of
+    /// coarse Voxels): rock, with soil on it for the top 4 Voxels (the test Planet's), and its
+    /// pyramid. The Materials differ, so how a coarse Voxel is made
     /// depends on which of its Voxels are exposed to air, and so on the bricks beside it.
     fn soil_over_rock(levels: usize) -> BrickStore {
         let mut store = BrickStore::new();

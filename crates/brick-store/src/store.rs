@@ -50,7 +50,8 @@ fn touching(coord: BrickCoord) -> impl Iterator<Item = BrickCoord> {
 pub struct LodRefresh {
     /// How many coarse bricks it remade: the ancestors of the bricks it was told had changed,
     /// and those of the bricks touching them, since a coarse brick reads the Voxels beside the
-    /// bricks it is made from. It stops at the first level at which no brick reads differently.
+    /// bricks it is made from. It stops at the first level at which no brick reads differently or
+    /// changes whether it is held.
     pub remade: usize,
     /// The coarse bricks that read differently afterwards, as `(level, coordinate)`, finest
     /// level first and ascending within a level. These are the ones to send on to wherever

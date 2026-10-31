@@ -1207,7 +1207,7 @@ mod tests {
         }
     }
 
-    /// The brick at `coord` of mip `level` as majority downsampling makes it from the Planet's
+    /// The brick at `coord` of mip `level` as the pyramid's downsampling makes it from the Planet's
     /// bricks of level 0 under it, which are 8 to the power of `level`: the real thing.
     fn downsampled(level: usize, coord: BrickCoord) -> Brick {
         let side = 1 << level;
@@ -1297,7 +1297,7 @@ mod tests {
     /// finer brick is already a sample and not the Planet's majority.
     const ORBIT_TOLERANCE: [f64; 7] = [0.032, 0.034, 0.033, 0.025, 0.026, 0.024, 0.031];
 
-    /// The brick at `coord` of mip `level` as majority downsampling makes it from the eight
+    /// The brick at `coord` of mip `level` as the pyramid's downsampling makes it from the eight
     /// bricks one level finer that [`Planet::coarse_brick`] generates, by the pyramid's own rule.
     fn downsampled_from_finer(level: usize, coord: BrickCoord) -> Brick {
         let mut store = BrickStore::new();
