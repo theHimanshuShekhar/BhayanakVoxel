@@ -162,7 +162,11 @@ fn run(args: &Args) -> Result<u8, Box<dyn Error>> {
         eprintln!("generating the Planet (this takes a while)...");
         let mut store = planet_gen::generate_planet(crate::SEED);
         store.build_lod(crate::RING_LEVELS - 1);
-        let scene = crate::planet_scene(&store, plan.path.camera_at(0, 2).position)?;
+        let scene = crate::planet_scene(
+            &store,
+            plan.path.camera_at(0, 2).position,
+            planet_gen::MAX_RADIUS,
+        )?;
         Flight {
             scene,
             store: Some(store),

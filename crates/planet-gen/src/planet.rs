@@ -53,6 +53,11 @@ pub const STRATA_DEPTH: i32 = 480;
 /// lowest ground's strata.
 pub const INTERIOR_RADIUS: i32 = WORLD_RADIUS - TRENCH - STRATA_DEPTH;
 
+/// Every Voxel of the Planet is within this many Voxels of its centre: sea level's radius plus
+/// the highest its relief goes. Nothing is generated beyond it, so a ray need not be walked
+/// further.
+pub const MAX_RADIUS: i32 = WORLD_RADIUS + PEAK;
+
 /// The interior's layers, innermost first, as (outer radius in Voxels, Material).
 const INTERIOR: [(i32, Material); 2] = [(MOLTEN_RADIUS, MOLTEN_CORE), (INTERIOR_RADIUS, DEEP_ROCK)];
 
@@ -324,7 +329,7 @@ impl Planet {
         BRICKS_MADE.with(|made| made.set(made.get() + 1));
         let samples = Samples::new(level, coord);
         let (near, far) = samples.radii();
-        if near >= f64::from(WORLD_RADIUS + PEAK) {
+        if near >= f64::from(MAX_RADIUS) {
             return Brick::AIR;
         }
         // A Voxel of a coarse brick with air beside it takes the Material at the ground's surface

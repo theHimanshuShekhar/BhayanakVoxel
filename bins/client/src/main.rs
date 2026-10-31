@@ -57,14 +57,15 @@ const SUN_STEP: f32 = 0.05;
 const RING_LEVELS: usize = 7;
 
 /// A Planet's bricks packed for the GPU as rings around `camera`. The store must have its
-/// pyramid ([`RING_LEVELS`] of it); its source gives the bricks it does not hold.
-fn planet_scene(store: &BrickStore, camera: [f64; 3]) -> Result<Scene, RingsFull> {
+/// pyramid ([`RING_LEVELS`] of it); its source gives the bricks it does not hold. Nothing of the
+/// Planet is further from the centre than `radius`, the Planet's maximum radius (the full-size
+/// Planet's is [`planet_gen::planet::MAX_RADIUS`], the test one's [`planet_gen::MAX_RADIUS`]),
+/// so no ray need be walked beyond it.
+fn planet_scene(store: &BrickStore, camera: [f64; 3], radius: i32) -> Result<Scene, RingsFull> {
     let mut scene = Scene::rings(store, camera, RING_LEVELS)?;
-    // Nothing of the Planet is further from its centre than this, so no ray need be walked
-    // beyond it.
     scene.bound = Some(Bound {
         centre: [0; 3],
-        radius: planet_gen::MAX_RADIUS,
+        radius,
     });
     Ok(scene)
 }
@@ -153,7 +154,7 @@ fn load(map: WorldMap, reach: i32) -> Result<Loaded, RingsFull> {
         camera,
         ground,
     } = generate_ground(map, reach, RING_LEVELS);
-    let scene = planet_scene(&store, camera.position)?;
+    let scene = planet_scene(&store, camera.position, planet_gen::planet::MAX_RADIUS)?;
     eprintln!("planet ready after {:.1?}", started.elapsed());
     Ok(Loaded {
         store,
@@ -792,6 +793,41 @@ mod tests {
         assert_eq!(
             loaded.server_store.content_hash(),
             loaded.store.content_hash()
+        );
+    }
+
+    #[test]
+    fn the_ground_is_reachable_from_the_spawn() {
+        // The full-size Planet reaches far beyond the test Planet's radius, so the sphere the
+        // client clips rays to must be the full-size Planet's. With the test Planet's, every ray
+        // from the spawn misses and there is only sky.
+        let loaded = generate_ground(WorldMap::generate(SEED, 512), 100, 1);
+        let (cell, origin) = render::camera::split(loaded.camera.position);
+        let ray = render::reference::Ray {
+            cell,
+            origin,
+            // Straight down at the ground under the spawn.
+            dir: loaded.camera.horizon_up.map(|c| -c as f32),
+        };
+        let scene = planet_scene(
+            &loaded.store,
+            loaded.camera.position,
+            planet_gen::planet::MAX_RADIUS,
+        )
+        .expect("a patch of the Planet fits the rings");
+        assert!(
+            render::reference::trace(&scene, &ray).is_some(),
+            "the ground under the spawn is inside the sphere rays are clipped to"
+        );
+        let clipped = planet_scene(
+            &loaded.store,
+            loaded.camera.position,
+            planet_gen::MAX_RADIUS,
+        )
+        .expect("a patch of the Planet fits the rings");
+        assert!(
+            render::reference::trace(&clipped, &ray).is_none(),
+            "the test Planet's radius is far inside the spawn, so it clips the ground away"
         );
     }
 
