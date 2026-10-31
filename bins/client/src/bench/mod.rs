@@ -160,7 +160,7 @@ fn run(args: &Args) -> Result<u8, Box<dyn Error>> {
         Flight {
             scene: patch_scene(),
             store: None,
-            diag: Diag::default(),
+            diag: args.diag,
         }
     } else {
         eprintln!("generating the Planet (this takes a while)...");
@@ -177,7 +177,7 @@ fn run(args: &Args) -> Result<u8, Box<dyn Error>> {
         Flight {
             scene,
             store: Some(store),
-            diag: Diag::default(),
+            diag: args.diag,
         }
     };
     eprintln!("scene ready after {:.1?}", started.elapsed());
@@ -203,7 +203,6 @@ fn run(args: &Args) -> Result<u8, Box<dyn Error>> {
     }
     gpu.set_keep_history(true);
 
-    flight.diag = args.diag;
     gpu.set_flush_scene_updates(!args.diag.no_flush);
     let mut screenshots = Vec::new();
     let primary = run_mode(
@@ -256,10 +255,11 @@ fn run(args: &Args) -> Result<u8, Box<dyn Error>> {
             path: plan.path_name.to_string(),
             keyframes: plan.path.keyframes(),
             bias: args.bias,
+            diag: args.diag.switches(),
         },
         altitudes,
         screenshots,
-        budgets: report::summarize(&source, &budgets, &modes),
+        budgets: report::summarize(&source, &budgets, &modes, &args.diag.switches()),
         modes,
     };
     let json = serde_json::to_string_pretty(&report)?;
@@ -270,7 +270,12 @@ fn run(args: &Args) -> Result<u8, Box<dyn Error>> {
     // The report is also the only thing on stdout, to paste or to pipe.
     println!("{json}");
 
-    let code = budget::exit_code(&report.modes.statuses(), args.no_fail);
+    // A diagnostic run is not held to the budgets: it exits 0 whatever they say.
+    let code = if report.config.diag.is_empty() {
+        budget::exit_code(&report.modes.statuses(), args.no_fail)
+    } else {
+        0
+    };
     if code != 0 {
         let (no_data, over) = failures(&report.modes);
         if !over.is_empty() {
@@ -309,13 +314,18 @@ struct Flight {
 }
 
 impl Flight {
+    /// The pause `--diag gap-ms=F` puts before a frame, standing in for the CPU's time spent on
+    /// following the camera. It is not part of `scene_update_ms`.
+    fn pause(&self) {
+        if self.diag.gap_ms > 0.0 {
+            std::thread::sleep(std::time::Duration::from_secs_f64(self.diag.gap_ms / 1e3));
+        }
+    }
+
     /// Moves the rings to the camera, if the scene has rings, and copies what that changed to
     /// the GPU. A window does the same before it draws a frame; the time it takes is not part
     /// of any pass.
     fn follow(&mut self, gpu: &mut Offscreen, camera: &Camera) -> Result<(), Box<dyn Error>> {
-        if self.diag.gap_ms > 0.0 {
-            std::thread::sleep(std::time::Duration::from_secs_f64(self.diag.gap_ms / 1e3));
-        }
         if self.diag.no_follow {
             return Ok(());
         }
@@ -393,6 +403,7 @@ fn run_mode(
     let mut lod_at_keyframes = Vec::new();
     for frame in 0..share.frames {
         let camera = path.camera_at(frame, share.frames);
+        flight.pause();
         let following = Instant::now();
         flight.follow(gpu, &camera)?;
         scene_update.push(following.elapsed().as_secs_f64() * 1e3);
@@ -401,8 +412,7 @@ fn run_mode(
             let distance = camera.position.iter().map(|c| c * c).sum::<f64>().sqrt();
             lod_at_keyframes.push(KeyframeLod {
                 frame,
-                // 10 cm Voxels.
-                height_m: (distance - radius) * 0.1,
+                height_m: (distance - radius) / sim::VOXELS_PER_METRE,
                 bricks: (0..render::lod::LEVELS)
                     .map(|level| flight.scene.level_bricks(level))
                     .collect(),
@@ -447,7 +457,8 @@ fn run_mode(
     ))
 }
 
-/// Heights above the Planet's mean radius that the sweep looks from, in Voxels: 4.8 m (the ground),
+/// Heights above the Planet's mean radius that the sweep looks from, in Voxels, straight above
+/// its pole: 4.8 m (the ground),
 /// 100 m, 500 m and 2 km.
 const SWEEP_HEIGHTS: [f64; 4] = [48.0, 1000.0, 5000.0, 20000.0];
 
@@ -473,11 +484,11 @@ fn sweep(
     let mut altitudes = Vec::new();
     for height in SWEEP_HEIGHTS {
         let at = Keyframe {
-            position: [0.0, radius + height, 250.0],
+            position: [0.0, radius + height, 0.0],
             target: [0.0, radius, -1500.0],
         };
         let path = CameraPath::new(vec![at, at]);
-        eprintln!("sweep: {:.0} m", height * 0.1);
+        eprintln!("sweep: {:.0} m", height / sim::VOXELS_PER_METRE);
         let by_mode = |gpu: &mut Offscreen, flight: &mut Flight, share, mode| {
             run_mode(gpu, flight, &path, share, mode, budgets, None)
         };
@@ -495,7 +506,7 @@ fn sweep(
                 .unwrap_or_default()
         };
         altitudes.push(Altitude {
-            height_m: height * 0.1,
+            height_m: height / sim::VOXELS_PER_METRE,
             bricks,
             primary: pass(&primary, "primary"),
             upscale: pass(&primary, "upscale"),
@@ -518,8 +529,15 @@ fn write_png(path: &Path, image: &Image) -> Result<(), Box<dyn Error>> {
 
 /// The report in brief, for whoever is watching the run.
 fn print_summary(report: &Report) {
+    let ms = |v: Option<f64>| v.map_or("n/a".to_string(), |v| format!("{v:.3}"));
+    if !report.config.diag.is_empty() {
+        eprintln!(
+            "\nWARNING: a diagnostic run (--diag {}), not a measurement: the budgets were not \
+             checked, and these times are for finding out where time goes",
+            report.config.diag.join(",")
+        );
+    }
     for a in &report.altitudes {
-        let ms = |v: Option<f64>| v.map_or("n/a".to_string(), |v| format!("{v:.3}"));
         eprintln!(
             "at {:>7.1} m: primary {} (p95 {}), upscale {}, reference {} (p95 {}) ms; bricks {:?}",
             a.height_m,
@@ -531,7 +549,6 @@ fn print_summary(report: &Report) {
             a.bricks
         );
     }
-    let ms = |v: Option<f64>| v.map_or("n/a".to_string(), |v| format!("{v:.3}"));
     for (mode, run) in [
         ("primary", &report.modes.primary),
         ("reference", &report.modes.reference),

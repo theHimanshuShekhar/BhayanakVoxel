@@ -36,6 +36,21 @@ pub struct Diag {
     pub gap_ms: f64,
 }
 
+impl Diag {
+    /// The switches that are on, as `--diag` spells them: empty for a measurement.
+    pub fn switches(&self) -> Vec<String> {
+        [
+            (self.no_follow, "no-follow".to_string()),
+            (self.no_upload, "no-upload".to_string()),
+            (self.no_flush, "no-flush".to_string()),
+            (self.gap_ms > 0.0, format!("gap-ms={}", self.gap_ms)),
+        ]
+        .into_iter()
+        .filter_map(|(on, name)| on.then_some(name))
+        .collect()
+    }
+}
+
 #[derive(Debug, PartialEq)]
 pub struct Args {
     pub out: PathBuf,
@@ -187,6 +202,16 @@ mod tests {
         for bad in ["fast", "gap-ms=x", "gap-ms=-1", "no-follow,"] {
             assert!(parse_all(&["--diag", bad]).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn the_switches_that_are_on_are_listed_as_they_are_spelled() {
+        assert!(Diag::default().switches().is_empty());
+        let diag = run(&["--diag", "gap-ms=2.5,no-flush,no-follow,no-upload"]).diag;
+        assert_eq!(
+            diag.switches(),
+            ["no-follow", "no-upload", "no-flush", "gap-ms=2.5"]
+        );
     }
 
     #[test]

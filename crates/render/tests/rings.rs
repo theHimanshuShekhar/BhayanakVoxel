@@ -331,8 +331,8 @@ fn percentile(sorted: &[f64], p: f64) -> f64 {
 /// selection switches at the boundary itself; the hysteresis lets a brick stay at its level down
 /// to 0.95 of it, where its Voxels are a twentieth of a pixel bigger, so that is measured too: the
 /// camera comes in from 1.06 times the boundary in steps that patch the scene (it would make it
-/// again for a jump), and p95 is under a pixel at every level either way. The worst ray is not:
-/// 1.7 px fresh and 4.3 px held, at level 1.
+/// again for a jump), and p95 is under a pixel at every level either way. The worst ray can be
+/// over (the figures are printed).
 #[test]
 fn the_surface_moves_by_under_a_pixel_at_the_switch_distances() {
     let mut rng = Lcg(81);

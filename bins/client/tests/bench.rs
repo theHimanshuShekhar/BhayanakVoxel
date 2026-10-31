@@ -261,3 +261,44 @@ fn a_bad_budgets_file_is_an_error_not_a_pass() {
     assert!(String::from_utf8_lossy(&run.stderr).contains("bad.toml"));
     let _ = std::fs::remove_dir_all(&out);
 }
+
+#[test]
+fn a_diagnostic_run_is_marked_in_its_report_and_is_not_held_to_the_budgets() {
+    let out = scratch("diag");
+    let budgets = out.join("impossible.toml");
+    std::fs::write(&budgets, IMPOSSIBLE).unwrap();
+    let run = bench(&[
+        "--short",
+        "--out",
+        out.join("run").to_str().unwrap(),
+        "--budgets",
+        budgets.to_str().unwrap(),
+        "--diag",
+        "no-flush,gap-ms=1",
+    ]);
+    // The budgets cannot be met, and the exit status is 0 all the same.
+    assert_eq!(
+        run.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let report = read_report(&out.join("run"));
+    assert_eq!(
+        report["config"]["diag"],
+        serde_json::json!(["no-flush", "gap-ms=1"])
+    );
+    assert_eq!(report["budgets"]["ok"], false);
+    assert_eq!(report["budgets"]["failed"], serde_json::json!([]));
+    let reason = report["budgets"]["skipped"].as_str().expect("a reason");
+    assert!(reason.contains("not checked"), "{reason}");
+    assert!(String::from_utf8_lossy(&run.stderr).contains("WARNING: a diagnostic run"));
+    // A measurement has no switches and no reason.
+    let plain = scratch("plain");
+    bench(&["--short", "--out", plain.join("run").to_str().unwrap()]);
+    let report = read_report(&plain.join("run"));
+    assert_eq!(report["config"]["diag"], serde_json::json!([]));
+    assert!(report["budgets"]["skipped"].is_null());
+    let _ = std::fs::remove_dir_all(&out);
+    let _ = std::fs::remove_dir_all(&plain);
+}

@@ -38,7 +38,7 @@ release: a debug build's CPU side is slow enough to distort the frame times.
 | `--budgets FILE` | Use this budgets file instead of the one built into the executable. |
 | `--size WxH` | Resolution of the traced (internal) image. Default `1280x720`, the internal resolution behind 1440p output that the budgets are for; primary mode upscales it to twice that in each direction (2560x1440). Do not change it for a report you paste. |
 | `--bias F` | LOD bias: output pixels one Voxel may cover, default 1. Every switch distance between levels of detail scales with it (see `CONTEXT.md`, LOD band); 2 does about a quarter of the work for up to a pixel more of error. The report records it. A report with another bias is not comparable with the budgets. |
-| `--diag LIST` | Switches for finding out where time goes, separated by commas: `no-follow` (the Planet does not follow the camera), `no-upload` (it does, on the CPU, but the GPU is not told), `no-flush` (writes to the GPU go with the next frame's commands, not at once) and `gap-ms=F` (sleep F ms before each frame, as the CPU work of following would). A report made with any of them is not a measurement. See "Reading a regression" below. |
+| `--diag LIST` | Switches for finding out where time goes, separated by commas: `no-follow` (the Planet does not follow the camera), `no-upload` (it does, on the CPU, but the GPU is not told), `no-flush` (writes to the GPU go with the next frame's commands, not at once) and `gap-ms=F` (sleep F ms before each frame, as the CPU work of following would). The report lists them in `config.diag`, the summary warns, and the budgets are not checked (`budgets.skipped` says why; the exit status is 0). See "Reading a regression" below. |
 | `--short` | A tiny run (160x90, a handful of frames, a patch of the Planet): the CI smoke test. |
 | `--no-fail` | Exit with status 0 even if a pass is over budget. |
 
@@ -67,7 +67,7 @@ file, a bad option).
    not mostly readback with the GPU idle in between; `frame_time` is then the CPU time of the
    frame as drawn, and a screenshot frame is slower.
 3. Writes a screenshot at each keyframe of the path, per mode.
-4. Then, after the flight, holds the camera still at four heights above the Planet's mean radius
+4. Then, after the flight, holds the camera still at four heights above the Planet's pole, over its mean radius
    (4.8 m, which is the ground, 100 m, 500 m and 2 km), looking at the ground that slopes away
    towards the horizon, and times both modes there for a few dozen frames each (24 primary frames
    and 6 reference frames of 2 samples). That is the report's `altitudes`. It takes a few seconds
@@ -96,7 +96,7 @@ before reading anything into the times.
   "machine": { "gpu", "device_type", "driver", "driver_info", "backend", "os", "arch",
                "timers_supported" },
   "config":  { "width", "height", "output_width", "output_height", "scene", "path",
-               "keyframes", "bias" },          // width, height: traced; output_*: upscaled
+               "keyframes", "bias", "diag" },          // width, height: traced; output_*: upscaled
   "modes": {
     "primary":   { "frames", "warmup_frames", "spp", "passes": [ENTRY...], "gpu_total": ENTRY,
                    "frame_time": STATS, "scene_update_ms": STATS,

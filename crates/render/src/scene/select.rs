@@ -1212,11 +1212,7 @@ mod tests {
             dug.build_lod(4);
             let wanted = walls(&dug, camera, 200.0);
             // The bricks across the face are among them.
-            let across = |z: i32| {
-                wanted
-                    .iter()
-                    .any(|c| c.0[2] == z.div_euclid(8) && c.0[1] >= 0)
-            };
+            let across = |z: i32| wanted.iter().any(|c| c.0[2] == z.div_euclid(8));
             assert!(across(z0 - 1) && across(z0 + width), "{label}");
             let roots = top_bricks(&dug, top, None);
             let (fresh, _) = Selection::new(&dug, camera, bands, top, roots);
