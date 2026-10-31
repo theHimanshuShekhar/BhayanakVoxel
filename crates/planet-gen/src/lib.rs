@@ -1,4 +1,6 @@
-//! Deterministic Planet generation, shared by client and server.
+//! Deterministic Planet generation, shared by client and server. The root of this crate is the
+//! small test Planet (a sphere of 1500 Voxels), which tests and goldens use; [`planet`] is the
+//! real one.
 //!
 //! A brick depends only on `(seed, GENERATOR_VERSION, brick coordinate)`; never on generation
 //! order, thread count or hash-map iteration order. Randomness is a stateless integer hash of
@@ -11,10 +13,11 @@ use std::sync::atomic::{AtomicI32, Ordering};
 
 use brick_store::{BRICK_SIZE, Brick, BrickCoord, BrickStore, Interior, Material, VoxelCoord};
 
+pub mod planet;
 pub mod world_map;
 
 /// Identifies the generation algorithm. Bump it whenever generated bricks change.
-pub const GENERATOR_VERSION: u32 = 1;
+pub const GENERATOR_VERSION: u32 = 2;
 
 /// Mean radius of the test Planet in Voxels: 150 m at 10 cm Voxels, so 300 m across.
 pub const PLANET_RADIUS: i32 = 1500;
@@ -170,7 +173,7 @@ pub fn generate_region(seed: u64, min: BrickCoord, max: BrickCoord) -> BrickStor
     generate_box(seed, min, max, false)
 }
 
-/// Generates the whole Planet except its core: every non-air brick that is not wholly inside
+/// Generates the whole test Planet except its core: every non-air brick that is not wholly inside
 /// [`CORE_RADIUS`]. The core is a ball of uniform [`ROCK`] about 24 million bricks big, which
 /// the store represents as its source [`CORE`], without a brick per cell. About 2.6 million
 /// bricks remain; generating them takes about 20 seconds on eight cores in a release build.
@@ -191,6 +194,29 @@ pub fn generate_planet(seed: u64) -> BrickStore {
 /// Slabs of constant x are generated on all available cores. A brick depends only on its
 /// coordinate, so the result does not depend on the thread count or on scheduling.
 fn generate_box(seed: u64, min: BrickCoord, max: BrickCoord, skip_core: bool) -> BrickStore {
+    let found = par_bricks(min, max, |coord| {
+        if skip_core && coord.within_ball(CORE_RADIUS) {
+            return None;
+        }
+        Some(generate_brick(seed, coord)).filter(|brick| !brick.is_air())
+    });
+    let mut store = BrickStore::new();
+    for (coord, brick) in found {
+        store.insert(coord, brick);
+    }
+    if skip_core {
+        store.set_source(CORE);
+    }
+    store
+}
+
+/// The bricks that `keep` returns for each coordinate in the box from `min` to `max` inclusive,
+/// in no particular order. Slabs of constant x are done on all available cores.
+fn par_bricks(
+    min: BrickCoord,
+    max: BrickCoord,
+    keep: impl Fn(BrickCoord) -> Option<Brick> + Sync,
+) -> Vec<(BrickCoord, Brick)> {
     let next_x = AtomicI32::new(min.0[0]);
     let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
     let slabs: Vec<Vec<(BrickCoord, Brick)>> = std::thread::scope(|scope| {
@@ -206,11 +232,7 @@ fn generate_box(seed: u64, min: BrickCoord, max: BrickCoord, skip_core: bool) ->
                         for y in min.0[1]..=max.0[1] {
                             for z in min.0[2]..=max.0[2] {
                                 let coord = BrickCoord([x, y, z]);
-                                if skip_core && coord.within_ball(CORE_RADIUS) {
-                                    continue;
-                                }
-                                let brick = generate_brick(seed, coord);
-                                if !brick.is_air() {
+                                if let Some(brick) = keep(coord) {
                                     found.push((coord, brick));
                                 }
                             }
@@ -224,14 +246,7 @@ fn generate_box(seed: u64, min: BrickCoord, max: BrickCoord, skip_core: bool) ->
             .map(|worker| worker.join().expect("generator thread panicked"))
             .collect()
     });
-    let mut store = BrickStore::new();
-    for (coord, brick) in slabs.into_iter().flatten() {
-        store.insert(coord, brick);
-    }
-    if skip_core {
-        store.set_source(CORE);
-    }
-    store
+    slabs.into_iter().flatten().collect()
 }
 
 #[cfg(test)]
