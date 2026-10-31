@@ -17,4 +17,4 @@ We chose this because turning, not flying, is the hard case. A 180°/s turn swee
 - A 1.25× radial margin and a 20 m vertical margin are residency, not prefetch.
 - Eviction is distance-band first, then LRU inside the band, with 10–20% overflow and no eviction of the guard, the current frame's set, in-flight work or a live Edit chain.
 - The shell is the precondition for the horizon cap and the LOD claims: culling without a complete shell is a hole, and LOD without prefetch is a pop.
-- The price is paid in M1a-2, not M1a-1: the walk slice ships a simpler ring loader, and the shell lands with flight and orbit.
+- Most of the price is paid in M1a-2, not M1a-1: the walk slice ships a simpler ring loader, and the shell lands with flight and orbit. The guard is the exception (2026-10-31): the walk slice's loader (#86) generates it right after the spawn ring, so nothing beyond the spawn ring is ever sky.
