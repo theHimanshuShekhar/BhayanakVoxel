@@ -11,6 +11,7 @@ use std::time::Instant;
 use brick_store::BrickStore;
 use fly::{Action, Fly};
 use render::overlay::{self, Controls, SceneMemory};
+use render::scene::Bound;
 use render::{Camera, Mode, Renderer, RingsFull, Scene, SceneUpdate, Sun};
 use sim::{Predictor, ServerHandle};
 use winit::application::ApplicationHandler;
@@ -43,7 +44,14 @@ const RING_LEVELS: usize = 7;
 /// The test Planet's bricks packed for the GPU as rings around `camera`. The store must have its
 /// pyramid ([`RING_LEVELS`] of it), and its source gives the rock core.
 fn planet_scene(store: &BrickStore, camera: [f64; 3]) -> Result<Scene, RingsFull> {
-    Scene::rings(store, camera, RING_LEVELS)
+    let mut scene = Scene::rings(store, camera, RING_LEVELS)?;
+    // Nothing of the Planet is further from its centre than this, so no ray need be walked
+    // beyond it.
+    scene.bound = Some(Bound {
+        centre: [0; 3],
+        radius: planet_gen::MAX_RADIUS,
+    });
+    Ok(scene)
 }
 
 /// The test Planet as the client and the in-process server each hold it, and the client's packed

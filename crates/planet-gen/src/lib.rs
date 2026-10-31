@@ -19,6 +19,10 @@ pub const GENERATOR_VERSION: u32 = 1;
 /// Mean radius of the test Planet in Voxels: 150 m at 10 cm Voxels, so 300 m across.
 pub const PLANET_RADIUS: i32 = 1500;
 
+/// Every Voxel of the test Planet is within this many Voxels of its centre: its mean radius plus
+/// the highest its relief goes.
+pub const MAX_RADIUS: i32 = PLANET_RADIUS + MAX_RELIEF as i32;
+
 pub const ROCK: Material = Material(1);
 pub const SOIL: Material = Material(2);
 
