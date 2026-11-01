@@ -290,6 +290,7 @@ dependencies = [
  "brick-store",
  "egui",
  "egui-winit",
+ "libc",
  "net",
  "planet-gen",
  "png",
@@ -298,6 +299,7 @@ dependencies = [
  "serde_json",
  "sim",
  "toml",
+ "windows-sys 0.61.2",
  "winit",
 ]
 

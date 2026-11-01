@@ -187,6 +187,25 @@ pub struct RingPatch {
 }
 
 impl RingPatch {
+    /// This patch followed by `next`, made after it: copying the one patch has the effect of
+    /// copying both in turn.
+    pub fn then(self, next: RingPatch) -> RingPatch {
+        let union = |a: Vec<usize>, b: Vec<usize>| -> Vec<usize> {
+            a.into_iter()
+                .chain(b)
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect()
+        };
+        RingPatch {
+            regions: union(self.regions, next.regions),
+            table: union(self.table, next.table),
+            brick_refs: merged(self.brick_refs.into_iter().chain(next.brick_refs).collect()),
+            bricks: merged(self.bricks.into_iter().chain(next.bricks).collect()),
+            levels: self.levels || next.levels,
+        }
+    }
+
     /// Words that copying this patch to the GPU writes, apart from the header.
     pub fn words(&self) -> usize {
         let ranges = |r: &[Range<usize>]| r.iter().map(Range::len).sum::<usize>();
@@ -266,6 +285,19 @@ impl Scene {
         bound: Bound,
     ) -> Result<Scene, RingsFull> {
         Scene::rings_sized(store, camera, bands, bound, Sizing::Fitted(2.0))
+    }
+
+    /// [`Scene::rings`] with buffers `headroom` times the size the bricks need (2 for
+    /// [`Scene::rings`]), for a scene that is going to grow a lot without being packed again
+    /// (see [`Scene::arrive`]).
+    pub fn rings_with_headroom(
+        store: &BrickStore,
+        camera: [f64; 3],
+        bands: Bands,
+        bound: Bound,
+        headroom: f64,
+    ) -> Result<Scene, RingsFull> {
+        Scene::rings_sized(store, camera, bands, bound, Sizing::Fitted(headroom))
     }
 
     /// [`Scene::rings`] with buffers of the size `room` says. That is all the room there will
@@ -496,6 +528,16 @@ impl Scene {
             .map_or(0, |rings| rings.selection.count(level))
     }
 
+    /// The level of the brick that is drawn where the Voxel of level 0 at `voxel` is, if one is.
+    pub fn level_at(&self, voxel: [i32; 3]) -> Option<usize> {
+        let rings = self.rings.as_ref()?;
+        (0..self.levels.len()).find(|&level| {
+            rings
+                .selection
+                .draws(level, BrickCoord(voxel.map(|v| v >> (level + 3))))
+        })
+    }
+
     /// Follows the camera to `camera`, a position in Voxels: the bricks that the bands select
     /// change as it moves, and only the regions that lose or gain one are packed again. Returns
     /// what changed, or `None` if nothing did (and if this is not a scene of rings).
@@ -523,6 +565,16 @@ impl Scene {
             return self.rebuilt_at(store, camera, bands).map(Some);
         }
         let diff = rings.selection.update(store, camera);
+        self.show_diff(store, &diff)
+    }
+
+    /// Packs again the regions that `diff` (what the selection changed) touches. Returns what
+    /// changed, or `None` if nothing did; packs the scene again if the regions do not fit.
+    fn show_diff(
+        &mut self,
+        store: &BrickStore,
+        diff: &select::Diff,
+    ) -> Result<Option<SceneUpdate>, RingsFull> {
         let attempt = self
             .apply(
                 store,
@@ -536,6 +588,45 @@ impl Scene {
             Ok(patch) => Ok(patch.map(SceneUpdate::Rings)),
             Err(RingsFull) => self.pack_again(store).map(Some),
         }
+    }
+
+    /// The bricks that are drawn whole although the bands split them, because the bricks under
+    /// them are not loaded (see [`BrickStore::stream_from`]), that became so since this was last
+    /// called, as `(level, coordinate)`. Load their eight children, mark them with
+    /// [`BrickStore::set_children_loaded`], and tell the scene with [`Scene::arrive`]. Empty for
+    /// a scene that is not rings.
+    pub fn take_wanted(&mut self) -> Vec<(usize, BrickCoord)> {
+        self.rings
+            .as_mut()
+            .map_or_else(Vec::new, |r| r.selection.take_wanted())
+    }
+
+    /// How many bricks wait for the bricks under them to be loaded.
+    pub fn waiting(&self) -> usize {
+        self.rings.as_ref().map_or(0, |r| r.selection.waiting())
+    }
+
+    /// Gives up waiting for the children of `key`, one of the bricks of [`Scene::take_wanted`],
+    /// because they will not be loaded: it is listed again when the bands split it again.
+    pub fn unwant(&mut self, key: (usize, BrickCoord)) {
+        if let Some(rings) = &mut self.rings {
+            rings.selection.unwant(key);
+        }
+    }
+
+    /// Splits the bricks `parents`, whose children have been loaded, as the bands say. Returns
+    /// what changed, or `None` if nothing did; like [`Scene::recentre`] it packs the scene again
+    /// if the regions do not fit.
+    pub fn arrive(
+        &mut self,
+        store: &BrickStore,
+        parents: &[(usize, BrickCoord)],
+    ) -> Result<Option<SceneUpdate>, RingsFull> {
+        let Some(rings) = &mut self.rings else {
+            return Ok(None);
+        };
+        let diff = rings.selection.arrived(store, parents.iter().copied());
+        self.show_diff(store, &diff)
     }
 
     /// Packs the scene again from scratch, bigger if it was sized by its bricks.
@@ -925,6 +1016,32 @@ impl Scene {
             .saturating_sub(1)
     }
 
+    /// Grows the occupied box of `level` to hold the regions in the table `slots`, which are
+    /// listed, and says whether it changed. The box is what [`Scene::occupy`] would find if no
+    /// region was unlisted since it last did.
+    fn occupy_more(&mut self, level: usize, slots: &[usize]) -> bool {
+        let l = &self.levels[level];
+        let empty = l.occupied_first == l.occupied_end;
+        let (mut first, mut end) = if empty {
+            ([i32::MAX; 3], [i32::MIN; 3])
+        } else {
+            (l.occupied_first, l.occupied_end)
+        };
+        for &slot in slots {
+            let entry = &self.table[slot * 4..][..4];
+            for a in 0..3 {
+                first[a] = first[a].min(entry[a] as i32);
+                end[a] = end[a].max(entry[a] as i32 + 1);
+            }
+        }
+        let l = &mut self.levels[level];
+        let changed = (l.occupied_first, l.occupied_end) != (first, end);
+        (l.occupied_first, l.occupied_end) = (first, end);
+        l.origin = first.map(|f| f << (6 + level));
+        l.dims = std::array::from_fn(|a| (end[a] - first[a]) as u32);
+        changed
+    }
+
     /// Fits the occupied box of each of `levels` to the regions it lists now, and says whether
     /// any changed.
     fn occupy(&mut self, levels: &BTreeSet<usize>) -> bool {
@@ -963,12 +1080,24 @@ impl Scene {
     fn take_patch(&mut self) -> RingPatch {
         let mut patch = std::mem::take(self.patch());
         if !patch.table.is_empty() {
-            let touched: BTreeSet<usize> = patch
-                .table
-                .iter()
-                .map(|&slot| self.level_of_slot(slot))
-                .collect();
-            patch.levels |= self.occupy(&touched);
+            // A level whose slots written are all regions listed, none unlisted, has only gained:
+            // its box grows to hold them, and the table need not be searched for the new one.
+            let mut grown: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+            let mut rescan = BTreeSet::new();
+            for &slot in &patch.table {
+                let level = self.level_of_slot(slot);
+                if self.table[slot * 4 + 3] == 0 {
+                    rescan.insert(level);
+                } else {
+                    grown.entry(level).or_default().push(slot);
+                }
+            }
+            for (level, slots) in grown {
+                if !rescan.contains(&level) {
+                    patch.levels |= self.occupy_more(level, &slots);
+                }
+            }
+            patch.levels |= self.occupy(&rescan);
         }
         RingPatch {
             regions: patch.regions.into_iter().collect(),

@@ -7,5 +7,5 @@ mod store;
 
 pub use brick::{BRICK_VOXELS, Brick, BrickView, Material};
 pub use coord::{BRICK_SIZE, BrickCoord, LocalCoord, VoxelCoord};
-pub use lod::{BrickSource, Interior};
+pub use lod::{BrickSource, Interior, children_from};
 pub use store::{BrickStore, LodRefresh};

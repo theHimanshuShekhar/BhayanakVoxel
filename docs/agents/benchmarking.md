@@ -74,6 +74,12 @@ file, a bad option).
    and leaves the flight alone, so the flight stays comparable with the reports of main. `--short`
    has no sweep.
 
+The bench does not stream: it draws a Planet that is generated whole, so the ring loader (#86)
+and its uploads are not in these numbers. The loader's own costs (the spawn ring, the Guard, how
+long the bands take to fill, and the frame thread's scene work per frame while walking, worst and
+p99) are read from the ignored full-size test:
+`cargo test --release -p client -- --ignored --nocapture full_size`.
+
 The camera is a function of the frame index only (keyframes, interpolated in a straight line at
 constant speed), never of the clock, so every run on every machine shows the GPU the same views.
 The path has a version in its name (`planet-flyover-v1`); if the path ever changes, the version

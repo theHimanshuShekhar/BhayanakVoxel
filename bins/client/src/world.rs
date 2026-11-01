@@ -8,6 +8,16 @@ use render::reference::{Hit, Ray, trace};
 use render::{Camera, RingsFull, Scene, SceneUpdate, camera};
 use sim::Predictor;
 
+use crate::loader::{Arrival, Loader};
+
+/// What the frame thread aims to spend taking in bricks from the loader in one frame. A band that
+/// is filling takes more frames, not longer ones. How many families it takes in at once follows
+/// how long the last frame's took ([`World::stream`]).
+pub const STREAM_BUDGET: std::time::Duration = std::time::Duration::from_millis(3);
+/// Most families of eight bricks taken in one frame, and the number to begin with.
+const MOST_FAMILIES: usize = 4096;
+const FIRST_FAMILIES: usize = 16;
+
 /// Radius of the sphere a click digs: 1 m at 10 cm Voxels.
 const DIG_RADIUS: u16 = 10;
 
@@ -43,14 +53,54 @@ impl From<RingsFull> for Stopped {
     }
 }
 
+/// How long the frame thread spent on the scene each frame (following the camera, taking in
+/// bricks, copying the changes to the GPU), for reporting the worst and the 99th percentile.
+#[derive(Debug, Default)]
+pub struct SceneWork {
+    millis: Vec<f64>,
+}
+
+impl SceneWork {
+    pub fn record(&mut self, took: std::time::Duration) {
+        self.millis.push(took.as_secs_f64() * 1000.0);
+    }
+
+    /// The longest frame, in milliseconds.
+    pub fn worst(&self) -> Option<f64> {
+        self.millis.iter().copied().max_by(f64::total_cmp)
+    }
+
+    /// The 99th percentile (nearest rank): the time that 99% of the frames did not exceed.
+    pub fn p99(&self) -> Option<f64> {
+        let mut sorted = self.millis.clone();
+        sorted.sort_by(f64::total_cmp);
+        let rank = (sorted.len() * 99).div_ceil(100);
+        rank.checked_sub(1).map(|i| sorted[i])
+    }
+
+    /// One line for a log, if any frame was recorded.
+    pub fn summary(&self) -> Option<String> {
+        Some(format!(
+            "scene work on the frame thread: {} frames, p99 {:.2} ms, worst {:.2} ms",
+            self.millis.len(),
+            self.p99()?,
+            self.worst()?
+        ))
+    }
+}
+
 pub struct World {
     scene: Scene,
     predictor: Predictor,
     link: ClientEnd,
+    /// Generates the bricks that the scene is waiting for, if the Planet is streamed in.
+    loader: Option<Loader>,
+    /// How many families the next [`World::stream`] takes in.
+    families: usize,
 }
 
 /// The first solid Voxel along the camera's view through the middle of the screen.
-fn centre_hit(scene: &Scene, camera: &Camera) -> Option<Hit> {
+pub(crate) fn centre_hit(scene: &Scene, camera: &Camera) -> Option<Hit> {
     let (cell, origin) = camera::split(camera.position);
     trace(
         scene,
@@ -69,11 +119,37 @@ impl World {
             scene,
             predictor,
             link,
+            loader: None,
+            families: FIRST_FAMILIES,
         }
+    }
+
+    /// Streams the Planet in with `loader`: see [`World::stream`]. The scene must have been made
+    /// from the predictor's store, which must stream ([`brick_store::BrickStore::stream_from`]).
+    pub fn with_loader(mut self, loader: Loader) -> Self {
+        self.loader = Some(loader);
+        self
+    }
+
+    /// The loader, if there is one.
+    pub fn loader(&self) -> Option<&Loader> {
+        self.loader.as_ref()
+    }
+
+    /// Bricks that wait for the bricks under them to be loaded. Zero, and nothing pending with
+    /// the loader, once the bands are complete.
+    pub fn waiting(&self) -> usize {
+        self.scene.waiting()
     }
 
     pub fn scene(&self) -> &Scene {
         &self.scene
+    }
+
+    /// The Planet's bricks as the client holds them.
+    #[cfg(test)]
+    pub fn store(&self) -> &brick_store::BrickStore {
+        self.predictor.store()
     }
 
     /// Puts the character on the Planet at `position` (Voxels), and tells the server. It falls
@@ -102,6 +178,52 @@ impl World {
     /// the scene changed, if it did.
     pub fn recentre(&mut self, camera: [f64; 3]) -> Result<Option<SceneUpdate>, RingsFull> {
         self.scene.recentre(self.predictor.store(), camera)
+    }
+
+    /// Asks the loader for what the bands are waiting for, nearest `camera` first, and takes in
+    /// what it has generated, for [`STREAM_BUDGET`] at the most: the families of bricks are held,
+    /// and the scene splits the bricks they are under. Returns how the scene changed, if it did.
+    /// This is all the frame thread does of loading: the bricks are generated on the loader's
+    /// threads, and what is not taken in this frame waits for the next.
+    pub fn stream(&mut self, camera: [f64; 3]) -> Result<Option<SceneUpdate>, RingsFull> {
+        let Self {
+            scene,
+            predictor,
+            loader: Some(loader),
+            families,
+            ..
+        } = self
+        else {
+            return Ok(None);
+        };
+        let Some(bands) = scene.bands() else {
+            return Ok(None);
+        };
+        loader.request(predictor.store(), scene.take_wanted(), camera);
+        loader.sync(camera, bands);
+        let started = std::time::Instant::now();
+        let mut loaded = Vec::new();
+        for arrival in loader.receive(*families) {
+            match arrival {
+                Arrival::Family { key, bricks } => {
+                    predictor
+                        .store_for_loading()
+                        .load_children(key.0, key.1, bricks);
+                    loaded.push(key);
+                }
+                Arrival::Dropped(key) => scene.unwant(key),
+            }
+        }
+        if loaded.is_empty() {
+            return Ok(None);
+        }
+        let update = scene.arrive(predictor.store(), &loaded)?;
+        // The next frame takes in as many as would have taken the budget, but no more than twice
+        // as many as this one did: a family costs what it costs, and the frame has its own cost.
+        let took = started.elapsed().as_secs_f64().max(1e-6);
+        let fit = loaded.len() as f64 * STREAM_BUDGET.as_secs_f64() / took;
+        *families = (fit.min(2.0 * loaded.len() as f64) as usize).clamp(1, MOST_FAMILIES);
+        Ok(update)
     }
 
     /// Selects the bricks again for other LOD `bands` (a new bias). Returns how the scene

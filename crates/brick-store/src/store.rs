@@ -33,6 +33,18 @@ pub struct BrickStore {
     /// no pyramid or source of their own.
     coarse: Vec<BrickStore>,
     source: Option<Arc<dyn BrickSource>>,
+    /// Set for a store whose bricks are streamed in (see [`Self::stream_from`]).
+    streaming: Option<Streaming>,
+}
+
+/// What a store that is streamed in keeps of what has been loaded.
+#[derive(Clone, Debug)]
+struct Streaming {
+    /// Levels above this one are always loaded: the Guard.
+    floor: usize,
+    /// The bricks `(level, coord)` whose eight children (the bricks of the level below that they
+    /// cover) have been loaded.
+    loaded: HashSet<(usize, BrickCoord)>,
 }
 
 /// The six bricks that share a face with `coord`.
@@ -132,6 +144,109 @@ impl BrickStore {
         self.source
             .as_ref()
             .is_some_and(|source| source.solid_below(level, coord))
+    }
+
+    /// Holds `brick` as the brick at `coord` of mip `level`, replacing any held there: the way a
+    /// coarse brick that was generated directly (see [`BrickSource`]) gets into the pyramid, as
+    /// [`Self::insert`] does for level 0. Like it, this does not touch the levels above: the
+    /// brick is what the caller says it is. Whether it is solid all the way down is what the
+    /// source says. Panics if there is no such level.
+    pub fn insert_at(&mut self, level: usize, coord: BrickCoord, brick: Brick) {
+        if level == 0 {
+            return self.insert(coord, brick);
+        }
+        let solid = self.source_solid_below(level, coord);
+        let store = &mut self.coarse[level - 1];
+        store.bricks.insert(coord, brick);
+        if solid {
+            store.solid_below.insert(coord);
+        } else {
+            store.solid_below.remove(&coord);
+        }
+    }
+
+    /// Makes this a store whose bricks are streamed in: the eight bricks under a brick of a level
+    /// above `floor` are always loaded (the Guard is every brick of the levels from `floor` up),
+    /// and those under a brick of `floor` or below are loaded once
+    /// [`Self::set_children_loaded`] says so. A renderer splits a brick only when its children
+    /// are loaded ([`Self::children_loaded`]), and draws it whole, a coarser frame, until then. A
+    /// store that does not stream has everything loaded.
+    pub fn stream_from(&mut self, floor: usize) {
+        self.streaming = Some(Streaming {
+            floor,
+            loaded: HashSet::new(),
+        });
+    }
+
+    /// Whether the eight bricks under the brick at `coord` of `level` are loaded, so that they
+    /// can be read without generating anything. Always true unless the store streams.
+    pub fn children_loaded(&self, level: usize, coord: BrickCoord) -> bool {
+        self.streaming
+            .as_ref()
+            .is_none_or(|s| level > s.floor || s.loaded.contains(&(level, coord)))
+    }
+
+    /// Records that the eight bricks under the brick at `coord` of `level` are loaded: the ones
+    /// that are not air are held. Does nothing unless the store streams.
+    pub fn set_children_loaded(&mut self, level: usize, coord: BrickCoord) {
+        if let Some(s) = &mut self.streaming {
+            s.loaded.insert((level, coord));
+        }
+    }
+
+    /// Holds the bricks of `bricks` as the bricks under the brick at `coord` of `level` (at least
+    /// 1), except those already held, which are never replaced (an Edit's are among them), and
+    /// records that its children are loaded (see [`Self::children_loaded`]). The others read as
+    /// the source gives them, so `bricks` is what [`crate::children_from`] returned for them. Returns
+    /// how many it held.
+    pub fn load_children(
+        &mut self,
+        level: usize,
+        coord: BrickCoord,
+        bricks: Vec<(BrickCoord, Brick)>,
+    ) -> usize {
+        let below = level - 1;
+        let mut held = 0;
+        for (child, brick) in bricks {
+            if self.holds(below, child) {
+                continue;
+            }
+            self.insert_at(below, child, brick);
+            held += 1;
+        }
+        self.set_children_loaded(level, coord);
+        held
+    }
+
+    /// What a brick that is not held reads as: a handle to the source, which a thread that
+    /// generates bricks for this store can use without the store.
+    pub fn source(&self) -> Option<Arc<dyn BrickSource>> {
+        self.source.clone()
+    }
+
+    /// Whether the brick at `coord` of mip `level` is held. Only whether it is: a brick that is
+    /// not held reads as the source gives it.
+    pub fn holds(&self, level: usize, coord: BrickCoord) -> bool {
+        self.level(level)
+            .is_some_and(|l| l.bricks.contains_key(&coord))
+    }
+
+    /// Stops the store streaming (see [`Self::stream_from`]): everything counts as loaded, and
+    /// what is not held reads as the source gives it, generated when it is read.
+    pub fn end_streaming(&mut self) {
+        self.streaming = None;
+    }
+
+    /// Whether the brick at `coord` of mip `level` is full (see [`Brick::is_full`]), as far as is
+    /// known without generating it: in a store that streams, a brick that is not held is full
+    /// only if the source says it is solid all the way down. Otherwise the same as
+    /// `brick_at(level, coord).is_full()`.
+    pub fn is_full_known(&self, level: usize, coord: BrickCoord) -> bool {
+        match self.level(level).and_then(|l| l.bricks.get(&coord)) {
+            Some(brick) => brick.is_full(),
+            None if self.streaming.is_some() => self.source_solid_below(level, coord),
+            None => self.brick_at(level, coord).is_full(),
+        }
     }
 
     /// Whether every Voxel of level 0 under the brick at `coord` of mip `level` is solid, exactly.
@@ -306,6 +421,16 @@ impl BrickStore {
     /// What the brick at `coord` of mip `level` reads as where none is held there.
     fn unheld(&self, level: usize, coord: BrickCoord) -> Brick {
         match &self.source {
+            // In a store that streams, the bricks under a parent that has been loaded are all
+            // held but the air and what the source proves solid (see
+            // [`Self::load_children`]): to read the rest is not to generate them.
+            Some(source)
+                if self.streaming.is_some()
+                    && self.children_loaded(level + 1, coord.parent())
+                    && !source.solid_below(level, coord) =>
+            {
+                Brick::AIR
+            }
             Some(source) => source.brick(level, coord),
             None => Brick::AIR,
         }
@@ -1011,5 +1136,106 @@ mod tests {
         ball.build_lod(2);
         assert!(ball.solid_below(2, BrickCoord([0, 0, 0])));
         assert!(!ball.solid_below(2, BrickCoord([5, 5, 5])));
+    }
+
+    #[test]
+    fn a_coarse_brick_inserted_directly_is_held_and_solid_below_is_what_the_source_says() {
+        let mut store = BrickStore::new();
+        store.set_source(Interior {
+            radius: 100,
+            material: ROCK,
+        });
+        store.build_lod(2);
+        let (inside, outside) = (BrickCoord([0, 0, 0]), BrickCoord([5, 5, 5]));
+        store.insert_at(2, inside, Brick::solid(Material(4)));
+        store.insert_at(2, outside, Brick::solid(Material(4)));
+        assert_eq!(*store.brick_at(2, inside), Brick::solid(Material(4)));
+        assert_eq!(store.level(2).unwrap().len(), 2);
+        assert!(store.solid_below(2, inside));
+        assert!(!store.solid_below(2, outside));
+        // Level 0 is the store's own.
+        store.insert_at(0, outside, Brick::solid(ROCK));
+        assert_eq!(store.get(VoxelCoord([40, 40, 40])), Some(ROCK));
+    }
+
+    #[test]
+    fn a_store_that_streams_has_the_children_of_its_guard_loaded_and_the_rest_when_told() {
+        let mut store = BrickStore::new();
+        let c = BrickCoord([1, 2, 3]);
+        assert!(
+            store.children_loaded(5, c),
+            "a store that does not stream has all"
+        );
+        store.stream_from(3);
+        assert!(store.children_loaded(4, c), "above the floor is the Guard");
+        assert!(!store.children_loaded(3, c));
+        assert!(!store.children_loaded(1, c));
+        store.set_children_loaded(1, c);
+        assert!(store.children_loaded(1, c));
+        assert!(!store.children_loaded(1, BrickCoord([1, 2, 4])));
+    }
+
+    #[test]
+    fn a_store_that_streams_does_not_generate_to_know_whether_a_neighbour_is_full() {
+        use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+
+        #[derive(Debug, Default)]
+        struct Counting(AtomicUsize);
+        impl BrickSource for Counting {
+            fn brick(&self, _: usize, _: BrickCoord) -> Brick {
+                self.0.fetch_add(1, Relaxed);
+                Brick::solid(ROCK)
+            }
+            fn solid_below(&self, _: usize, coord: BrickCoord) -> bool {
+                coord.0[1] < 0
+            }
+        }
+        let source = Arc::new(Counting::default());
+        let mut store = BrickStore::new();
+        store.source = Some(source.clone());
+        let (deep, shallow) = (BrickCoord([0, -1, 0]), BrickCoord([0, 1, 0]));
+        // Not streaming: it reads the brick, which is full.
+        assert!(store.is_full_known(0, shallow));
+        assert_eq!(source.0.load(Relaxed), 1);
+        store.stream_from(0);
+        assert!(store.is_full_known(0, deep), "the source proves it");
+        assert!(!store.is_full_known(0, shallow), "not known, not read");
+        assert_eq!(source.0.load(Relaxed), 1);
+        store.insert(shallow, Brick::solid(ROCK));
+        assert!(store.is_full_known(0, shallow), "held bricks are known");
+    }
+
+    #[test]
+    fn loading_the_children_of_a_brick_holds_the_ones_not_air_and_never_replaces_a_held_one() {
+        let mut store = BrickStore::new();
+        store.set_source(Interior {
+            radius: 100,
+            material: ROCK,
+        });
+        store.build_lod(2);
+        store.stream_from(2);
+        let parent = BrickCoord([1, 0, 0]);
+        let edited = parent.children()[3];
+        store.insert_at(1, edited, Brick::solid(Material(9)));
+        let source = store.source().unwrap();
+        // The skipped one is the edited one, as a loader that checks what is held does.
+        let bricks = crate::children_from(&*source, 2, parent, |c| store.holds(1, c));
+        assert!(bricks.iter().all(|(c, _)| *c != edited));
+        assert!(!store.children_loaded(2, parent));
+        // Loaded late, with the edited one in the list too: it stays as it is.
+        let mut all = bricks.clone();
+        all.push((edited, Brick::solid(ROCK)));
+        let held = store.load_children(2, parent, all);
+        assert_eq!(held, bricks.len());
+        assert!(store.children_loaded(2, parent));
+        assert_eq!(*store.brick_at(1, edited), Brick::solid(Material(9)));
+        for (c, b) in &bricks {
+            assert!(store.holds(1, *c));
+            assert_eq!(*store.brick_at(1, *c), *b);
+        }
+        // A parent over air has nothing to hold, and is loaded.
+        let sky = BrickCoord([50, 50, 50]);
+        assert_eq!(store.load_children(2, sky, Vec::new()), 0);
+        assert!(store.children_loaded(2, sky));
     }
 }

@@ -10,6 +10,13 @@
 //! apart from a sliver beside each boundary where a brick's parent is nearer than the boundary
 //! and it is not, and is drawn at the finer level, never a hole.
 //!
+//! **Streaming.** In a store whose bricks are streamed in ([`BrickStore::stream_from`]) a brick is
+//! split only when the bricks under it are loaded. Until they are it is drawn whole, a coarser
+//! frame than the rule asks for and never a hole, and it is *wanted* ([`Selection::take_wanted`]):
+//! a loader reads those bricks, and [`Selection::arrived`] splits it when they are there. What a
+//! store that streams has not loaded is never read, so the selection never waits for a brick to
+//! be generated.
+//!
 //! Space that cannot be seen is left out. A brick that is air is not drawn, and a brick that is
 //! solid, with solid bricks on all six faces, is *buried*: no ray reaches it, so it and
 //! everything under it is out of the tree. That is what keeps the bricks drawn to a skin
@@ -86,6 +93,10 @@ struct Node {
     /// The total camera travel at which its state is next looked at, infinite for none.
     due: f64,
 }
+
+/// Bricks that are stuck above which [`Selection::nearest_stuck`] keeps a bound instead of looking
+/// at them all each time.
+const MANY_STUCK: usize = 4096;
 
 /// Camera travel, in Voxels, that nodes due within it of each other are queued together for. A
 /// node is looked at no later than it is due, and at most this early, which costs a look and is
@@ -172,7 +183,7 @@ fn classify(
     }
     let full_at = |n: BrickCoord| match known.iter().find(|(c, _)| *c == n) {
         Some(&(_, full)) => full,
-        None => store.brick_at(level, n).is_full(),
+        None => store.is_full_known(level, n),
     };
     let buried = brick.is_full() && faces(coord).all(full_at);
     if buried {
@@ -225,6 +236,9 @@ fn probe_children(store: &BrickStore, level: usize, coord: BrickCoord) -> Vec<(B
 /// are air, or the store has nothing under it, and it is not air, it stays whole, which is a
 /// coarser frame than the rule asks for, rather than a hole.
 fn decide(store: &BrickStore, level: usize, coord: BrickCoord, p: Probe) -> Plan {
+    if !store.children_loaded(level, coord) {
+        return Plan::Wait;
+    }
     let all = probe_children(store, level, coord);
     let present: Vec<_> = all.iter().filter(|(_, c)| c.present).copied().collect();
     // Nothing under it is in the tree, but a brick under it is something that is not air: it
@@ -275,6 +289,8 @@ pub fn par_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec
 enum Plan {
     /// Draw it whole.
     Whole,
+    /// Draw it whole, since the bricks it is to be split into are not loaded yet.
+    Wait,
     /// Split it into these bricks of the level below, which are in the tree.
     Split(Vec<(BrickCoord, Probe)>),
 }
@@ -376,6 +392,19 @@ pub struct Selection {
     /// there is nothing under them to be split into. Those that are not any more are dropped
     /// from it when it is looked at.
     stuck: HashSet<Key>,
+    /// For a `stuck` that is large (see [`Selection::nearest_stuck`]): a lower bound on how near
+    /// the nearest brick of it at each level was from `bound_at`, when it was last looked at in
+    /// full; the bricks added to `stuck` since, which are not in the bound yet; and how many.
+    bound: [Option<f64>; LEVELS],
+    bound_at: Option<[f64; 3]>,
+    since: Vec<Key>,
+    /// How many stuck bricks make `stuck` large: [`MANY_STUCK`].
+    many: usize,
+    /// Bricks that are whole because the bricks under them are not loaded (see
+    /// [`Selection::take_wanted`]).
+    waiting: HashSet<Key>,
+    /// Those of `waiting` that nobody has been told of yet.
+    fresh: Vec<Key>,
 }
 
 impl Selection {
@@ -399,6 +428,12 @@ impl Selection {
             queue: BTreeMap::new(),
             drawn: [0; LEVELS],
             stuck: HashSet::default(),
+            bound: [None; LEVELS],
+            bound_at: None,
+            since: Vec::new(),
+            many: MANY_STUCK,
+            waiting: HashSet::default(),
+            fresh: Vec::new(),
         };
         let mut diff = Diff::default();
         // Level by level, from the top, so that the bricks of a level are looked at on all the
@@ -419,6 +454,10 @@ impl Selection {
                 let distance = brick_distance(camera, key.0, key.1);
                 match plan {
                     Plan::Whole => selection.make_whole(key, distance, p, &mut diff),
+                    Plan::Wait => {
+                        selection.make_whole(key, distance, p, &mut diff);
+                        selection.want(key);
+                    }
                     Plan::Split(children) => {
                         selection.mark_split(key, distance);
                         next.extend(children.into_iter().map(|(c, p)| ((key.0 - 1, c), p)));
@@ -472,7 +511,44 @@ impl Selection {
     /// level is used from: a brick that is drawn whole because there is nothing under it to be
     /// split into (the store holds no Voxels of level 0 there, say). `None` for a level with no
     /// such brick.
+    ///
+    /// A Planet that is streaming in has hundreds of thousands of such bricks while they wait for
+    /// the bricks under them, and looking at all of them for each change would cost more than the
+    /// change. Then the answer is a lower bound, which is exact when nothing but additions have
+    /// happened with the camera where it was: it is never further than the nearest, so a hole made
+    /// from it is never too big. It is found again in full when the camera has gone some way from
+    /// where the bound is from (the bound loses what the camera went), or when as many bricks have
+    /// been added as there were: a brick that stopped being stuck only makes the bound smaller
+    /// than it could be.
     pub fn nearest_stuck(&mut self) -> [Option<f64>; LEVELS] {
+        if self.stuck.len() > self.many
+            && let Some(at) = self.bound_at
+        {
+            let drift = (0..3)
+                .map(|a| (self.camera[a] - at[a]).powi(2))
+                .sum::<f64>()
+                .sqrt();
+            if drift <= self.bands.d0() / 4.0 && self.since.len() <= self.stuck.len() / 2 {
+                for (level, coord) in std::mem::take(&mut self.since) {
+                    // Its distance now is at least this less than it was from `at`.
+                    let d = brick_distance(self.camera, level, coord) - drift;
+                    self.bound[level] = Some(self.bound[level].map_or(d, |b| b.min(d)));
+                }
+                return self.bound.map(|b| b.map(|b| (b - drift).max(0.0)));
+            }
+        }
+        let nearest = self.nearest_stuck_in_full();
+        if self.stuck.len() > self.many {
+            self.bound = nearest;
+            self.bound_at = Some(self.camera);
+            self.since.clear();
+        } else {
+            self.bound_at = None;
+        }
+        nearest
+    }
+
+    fn nearest_stuck_in_full(&mut self) -> [Option<f64>; LEVELS] {
         let (bands, camera) = (self.bands, self.camera);
         let nodes = &self.nodes;
         self.stuck.retain(|key| {
@@ -488,6 +564,12 @@ impl Selection {
             }
         }
         nearest
+    }
+
+    fn add_stuck(&mut self, key: Key) {
+        if self.stuck.insert(key) && self.bound_at.is_some() {
+            self.since.push(key);
+        }
     }
 
     /// Nodes of the tree: the bricks drawn, those split, and air that may have something in it.
@@ -506,12 +588,77 @@ impl Selection {
         let distance = brick_distance(self.camera, key.0, key.1);
         match plan(store, self.bands, self.camera, key, p) {
             Plan::Whole => self.make_whole(key, distance, p, diff),
+            Plan::Wait => {
+                self.make_whole(key, distance, p, diff);
+                self.want(key);
+            }
             Plan::Split(children) => self.split(store, key, distance, children, diff),
         }
     }
 
+    /// Notes that the whole brick `key` waits for the bricks under it to be loaded.
+    fn want(&mut self, key: Key) {
+        if self.waiting.insert(key) {
+            self.fresh.push(key);
+        }
+    }
+
+    /// The bricks that are whole although the bands split them, because the bricks under them
+    /// are not loaded: the ones that became so since this was last called. Each has its eight
+    /// children to be loaded (and marked, with [`BrickStore::set_children_loaded`]), after which
+    /// [`Selection::arrived`] splits it. A brick is only listed again if it is
+    /// [`unwanted`](Selection::unwant) first.
+    pub fn take_wanted(&mut self) -> Vec<Key> {
+        std::mem::take(&mut self.fresh)
+            .into_iter()
+            .filter(|key| self.waiting.contains(key))
+            .collect()
+    }
+
+    /// Bricks waiting for the bricks under them to be loaded.
+    pub fn waiting(&self) -> usize {
+        self.waiting.len()
+    }
+
+    /// Takes `key` off the bricks that wait, because its children will not be loaded after all (the
+    /// camera has gone from it): it is listed again if the bands want it split later.
+    pub fn unwant(&mut self, key: Key) {
+        self.waiting.remove(&key);
+    }
+
+    /// Splits the bricks `parents` that were waiting, now that the bricks under them are loaded.
+    /// Returns what changed in what is drawn.
+    pub fn arrived(&mut self, store: &BrickStore, parents: impl IntoIterator<Item = Key>) -> Diff {
+        let mut diff = Diff::default();
+        let mut beside = BTreeSet::new();
+        for key in parents {
+            if self.waiting.remove(&key) {
+                // It was whole as a new brick that the rule splits is, so it is split as one is.
+                self.revisit_whole_as(store, key, None, &mut diff);
+            }
+            // The bricks that touch the children just loaded were told, when they were looked
+            // at, that these were not known to be full (see [`BrickStore::is_full_known`]), so
+            // they may be buried after all.
+            let (level, coord) = key;
+            for child in coord.children() {
+                beside.extend(
+                    faces(child)
+                        .filter(|n| n.parent() != coord)
+                        .map(|n| (level - 1, n)),
+                );
+            }
+        }
+        for key in beside {
+            if self.nodes.contains_key(&key) {
+                self.recheck(store, key, &mut diff);
+            }
+        }
+        diff
+    }
+
     /// Makes `key` a node that is split.
     fn mark_split(&mut self, key: Key, distance: f64) {
+        self.waiting.remove(&key);
         self.nodes.insert(
             key,
             Node {
@@ -552,7 +699,7 @@ impl Selection {
             self.drawn[key.0] += 1;
             diff.add(key);
             if self.bands.split(key.0, distance, Some(false)) {
-                self.stuck.insert(key);
+                self.add_stuck(key);
             }
         }
         self.queue_node(key, distance, false);
@@ -583,6 +730,7 @@ impl Selection {
         for child in coord.children() {
             let key = (level - 1, child);
             if let Some(node) = self.nodes.remove(&key) {
+                self.waiting.remove(&key);
                 if node.draws {
                     self.drawn[level - 1] -= 1;
                     diff.remove(key);
@@ -596,6 +744,18 @@ impl Selection {
 
     /// Looks again at `key`, which is due.
     fn revisit(&mut self, store: &BrickStore, key: Key, diff: &mut Diff) {
+        self.revisit_whole_as(store, key, Some(false), diff);
+    }
+
+    /// [`Selection::revisit`], where a whole brick is split by the rule as `whole_was` says (see
+    /// [`Bands::split`]): `None` for a brick that is looked at as if it were new.
+    fn revisit_whole_as(
+        &mut self,
+        store: &BrickStore,
+        key: Key,
+        whole_was: Option<bool>,
+        diff: &mut Diff,
+    ) {
         let Some(node) = self.nodes.get(&key).copied() else {
             return;
         };
@@ -603,18 +763,22 @@ impl Selection {
         let distance = brick_distance(self.camera, level, coord);
         match node.state {
             State::Whole => {
-                if self.bands.split(level, distance, Some(false)) {
+                if self.bands.split(level, distance, whole_was) {
                     let p = probe(store, level, coord);
-                    if let Plan::Split(children) = decide(store, level, coord, p) {
-                        if node.draws {
-                            self.drawn[level] -= 1;
-                            diff.remove(key);
+                    match decide(store, level, coord, p) {
+                        Plan::Split(children) => {
+                            if node.draws {
+                                self.drawn[level] -= 1;
+                                diff.remove(key);
+                            }
+                            self.split(store, key, distance, children, diff);
+                            return;
                         }
-                        self.split(store, key, distance, children, diff);
-                        return;
+                        Plan::Wait => self.want(key),
+                        Plan::Whole => {}
                     }
                     if node.draws {
-                        self.stuck.insert(key);
+                        self.add_stuck(key);
                     }
                 }
                 self.queue_node(key, distance, false);
@@ -630,6 +794,7 @@ impl Selection {
                     self.make_whole(key, distance, p, diff);
                 } else {
                     self.nodes.remove(&key);
+                    self.waiting.remove(&key);
                 }
             }
         }
@@ -695,6 +860,7 @@ impl Selection {
         match self.nodes.get(&key).copied() {
             Some(_) if !p.present => {
                 let node = self.nodes.remove(&key).expect("it was just found");
+                self.waiting.remove(&key);
                 if node.draws {
                     self.drawn[level] -= 1;
                     diff.remove(key);
@@ -1253,5 +1419,168 @@ mod tests {
             "{} nodes for 64000 bricks",
             selection.nodes()
         );
+    }
+
+    /// A flat world whose pyramid is held all the way up but streams from `floor`: the bricks
+    /// under a brick of `floor` or below are loaded only when told.
+    fn streamed(n: i32, levels: usize, floor: usize) -> BrickStore {
+        let mut store = flat(n, levels);
+        store.stream_from(floor);
+        store
+    }
+
+    /// Loads what the selection waits for, and what that makes it wait for, until it waits for
+    /// nothing. Returns how many rounds it took.
+    fn load_everything(store: &mut BrickStore, selection: &mut Selection) -> usize {
+        let mut rounds = 0;
+        loop {
+            let wanted = selection.take_wanted();
+            if wanted.is_empty() {
+                return rounds;
+            }
+            rounds += 1;
+            for &(level, coord) in &wanted {
+                store.set_children_loaded(level, coord);
+            }
+            selection.arrived(store, wanted);
+        }
+    }
+
+    #[test]
+    fn a_brick_whose_children_are_not_loaded_is_drawn_whole_and_wanted_once() {
+        let store = streamed(64, 4, 2);
+        let mut selection = select(&store, [0.5, 20.0, 0.5], D0);
+        // Level 2 is the finest that is drawn: there is no hole, and nothing finer than the
+        // Guard's children.
+        for (x, z) in [(3, 3), (30, 3), (85, 3), (330, 3), (-505, 3)] {
+            let levels = covering(&selection, x, z);
+            assert_eq!(levels.len(), 1, "{x} {z}: {levels:?}");
+            assert!(levels[0] >= 2, "{x} {z}: {levels:?}");
+        }
+        let wanted = selection.take_wanted();
+        assert!(!wanted.is_empty());
+        assert!(wanted.iter().all(|&(level, _)| level == 2), "{wanted:?}");
+        assert_eq!(selection.waiting(), wanted.len());
+        assert!(selection.take_wanted().is_empty(), "each is listed once");
+        // Those under the camera are among them; far ones are wanted only if they split.
+        let near = BrickCoord([0, -1, 0]).parent().parent();
+        assert!(wanted.contains(&(2, near)), "{near:?}");
+        assert!(wanted.len() < 200, "{}", wanted.len());
+    }
+
+    #[test]
+    fn loading_what_is_wanted_ends_with_what_a_store_that_does_not_stream_draws() {
+        let mut store = streamed(64, 4, 2);
+        for camera in [[0.5, 20.0, 0.5], [300.0, 5.0, -200.0], [127.9, 3.0, 128.1]] {
+            let mut selection = select(&store, camera, D0);
+            let rounds = load_everything(&mut store, &mut selection);
+            assert!(
+                rounds >= 2,
+                "level 2 down to level 0 takes rounds: {rounds}"
+            );
+            assert_eq!(selection.waiting(), 0);
+            let loaded: BTreeSet<Key> = selection.bricks().collect();
+            let whole: BTreeSet<Key> = select(&flat(64, 4), camera, D0).bricks().collect();
+            assert_eq!(loaded, whole, "{camera:?}");
+        }
+    }
+
+    #[test]
+    fn there_is_no_hole_while_a_band_fills_and_the_camera_moves() {
+        let mut store = streamed(64, 4, 2);
+        let mut camera = [0.5, 20.0, 0.5];
+        let mut selection = select(&store, camera, D0);
+        for step in 0..60 {
+            camera[0] += 9.0;
+            camera[2] -= 4.0;
+            selection.update(&store, camera);
+            // Some of what is wanted arrives each step, the nearest few.
+            let mut wanted = selection.take_wanted();
+            wanted.sort_by(|a, b| {
+                let d = |&(l, c): &Key| brick_distance(camera, l, c);
+                d(a).total_cmp(&d(b))
+            });
+            let (now, later) = wanted.split_at(wanted.len().min(3));
+            for &(level, coord) in now {
+                store.set_children_loaded(level, coord);
+            }
+            selection.arrived(&store, now.iter().copied());
+            // What was not loaded is still wanted.
+            for key in later {
+                selection.unwant(*key);
+                selection.fresh.push(*key);
+                selection.waiting.insert(*key);
+            }
+            for x in (-400..500).step_by(23) {
+                for z in (-500..400).step_by(29) {
+                    assert_eq!(
+                        covering(&selection, x, z).len(),
+                        1,
+                        "step {step} {camera:?} {x} {z}"
+                    );
+                }
+            }
+        }
+        load_everything(&mut store, &mut selection);
+        assert_eq!(selection.waiting(), 0);
+    }
+
+    #[test]
+    fn a_wanted_brick_that_is_taken_off_is_wanted_again_when_the_bands_split_it_again() {
+        let store = streamed(64, 4, 2);
+        let mut selection = select(&store, [0.5, 20.0, 0.5], D0);
+        let wanted = selection.take_wanted();
+        for &key in &wanted {
+            selection.unwant(key);
+        }
+        assert_eq!(selection.waiting(), 0);
+        // Out of reach, and back: the bricks that split are looked at, and are wanted again.
+        selection.update(&store, [5000.0, 20.0, 0.5]);
+        selection.update(&store, [0.5, 20.0, 0.5]);
+        let again = selection.take_wanted();
+        assert!(again.contains(&(2, BrickCoord([0, -1, 0]).parent().parent())));
+    }
+
+    #[test]
+    fn the_nearest_stuck_of_a_large_set_is_a_bound_that_is_never_further_than_the_nearest() {
+        let mut store = streamed(64, 4, 2);
+        let mut selection = select(&store, [0.5, 20.0, 0.5], D0);
+        selection.many = 0;
+        let mut camera = [0.5, 20.0, 0.5];
+        let mut tight = 0;
+        for step in 0..80 {
+            camera[0] += 2.5;
+            camera[2] -= 1.0;
+            selection.update(&store, camera);
+            // Some of what is wanted arrives, the nearest few.
+            let mut wanted = selection.take_wanted();
+            wanted.sort_by(|a, b| {
+                let d = |&(l, c): &Key| brick_distance(camera, l, c);
+                d(a).total_cmp(&d(b))
+            });
+            let (now, later) = wanted.split_at(wanted.len().min(2));
+            for &(level, coord) in now {
+                store.set_children_loaded(level, coord);
+            }
+            selection.arrived(&store, now.iter().copied());
+            for key in later {
+                selection.unwant(*key);
+                selection.fresh.push(*key);
+                selection.waiting.insert(*key);
+            }
+            let bound = selection.nearest_stuck();
+            let exact = selection.nearest_stuck_in_full();
+            for level in 0..LEVELS {
+                match (bound[level], exact[level]) {
+                    (Some(b), Some(e)) => {
+                        assert!(b <= e + 1e-9, "step {step} level {level}: {b} past {e}");
+                        tight += usize::from(e - b < 1e-6);
+                    }
+                    (None, Some(e)) => panic!("step {step} level {level}: no bound for {e}"),
+                    _ => {}
+                }
+            }
+        }
+        assert!(tight > 50, "the bound is not just zero: {tight}");
     }
 }

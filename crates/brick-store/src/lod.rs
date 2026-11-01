@@ -37,6 +37,25 @@ pub trait BrickSource: Debug + Send + Sync {
     }
 }
 
+/// The bricks under the brick at `coord` of mip `level` (at least 1) as `source` gives them, in
+/// [`BrickCoord::children`] order, except air and the ones `skip` says to leave out (those the
+/// store holds already): what [`crate::BrickStore::load_children`] takes. It reads only the
+/// source, so it can run on any thread.
+pub fn children_from(
+    source: &dyn BrickSource,
+    level: usize,
+    coord: BrickCoord,
+    skip: impl Fn(BrickCoord) -> bool,
+) -> Vec<(BrickCoord, Brick)> {
+    coord
+        .children()
+        .into_iter()
+        .filter(|&child| !skip(child))
+        .map(|child| (child, source.brick(level - 1, child)))
+        .filter(|(_, brick)| !brick.is_air())
+        .collect()
+}
+
 /// A ball at the Planet's centre made of one Material, so that none of its bricks need be held.
 /// A brick wholly inside `radius` Voxels of the centre reads as `material`, and any other as
 /// air, at every level.

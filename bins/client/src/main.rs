@@ -1,5 +1,9 @@
 mod bench;
 mod fly;
+mod loader;
+mod priority;
+#[cfg(test)]
+mod streaming_tests;
 mod world;
 
 use std::error::Error;
@@ -10,6 +14,7 @@ use std::time::{Duration, Instant};
 
 use brick_store::BrickStore;
 use fly::{Action, Fly};
+use loader::{GUARD_FIRST, Loader};
 use net::Leash;
 use planet_gen::planet::Planet;
 use planet_gen::world_map::{WORLD_MAP_SIZE, WORLD_RADIUS, WorldMap};
@@ -23,7 +28,7 @@ use winit::event::{DeviceEvent, DeviceId, ElementState, MouseButton, WindowEvent
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{CursorGrabMode, Window, WindowId};
-use world::World;
+use world::{SceneWork, World};
 
 const SEED: u64 = 0xB4A7_A9AC;
 
@@ -37,12 +42,11 @@ const TITLE: &str = "BhayanakVoxel";
 const SPAWN_PITCH: f64 = -25.0;
 /// How far above the ground the client spawns, in Voxels: 4 m.
 const SPAWN_HEIGHT: f64 = 40.0;
-/// Voxels from the spawn point that the client generates the Planet's ground to, along the
-/// ground (see [`Planet::region_around`]). Beyond it the rings draw the ground only where it is
-/// generated on demand, a ring's width from the camera, and otherwise only the deep rock and the
-/// core, until the Planet can be streamed (#47, #49): the test Planet's 2.6 million bricks of
-/// ground took 20 seconds, and this Planet has ten thousand times the ground.
-const SPAWN_REACH: i32 = 640;
+/// Voxels from the spawn point that the client generates the full crust to, along the ground (see
+/// [`Planet::crust_around`]): the spawn ring, 40 m, which takes about 1.5 s on eight cores. The
+/// loader generates the rest of what the LOD bands draw (#86), and the character cannot leave the
+/// ring until the shell and its prefetch can keep ground under it (#49).
+const SPAWN_REACH: i32 = 400;
 
 /// How far above the ground the character is set down, in Voxels: it drops the last few.
 const DROP_HEIGHT: f64 = 3.0;
@@ -70,7 +74,10 @@ fn planet_scene(
     bands: Bands,
     radius: i32,
 ) -> Result<Scene, RingsFull> {
-    Scene::rings(
+    // The scene starts as the Guard and grows by an order of magnitude as the bands fill in, and
+    // packing it again for room is a stall of seconds at the end: so it is given the room to
+    // begin with (a few hundred MiB, which the bands fill).
+    Scene::rings_with_headroom(
         store,
         camera,
         bands,
@@ -78,8 +85,13 @@ fn planet_scene(
             centre: [0; 3],
             radius,
         },
+        STREAM_HEADROOM,
     )
 }
+
+/// How many times the room that the Guard needs the scene's buffers have when the Planet streams
+/// in: the full bands are about ten times the Guard.
+const STREAM_HEADROOM: f64 = 12.0;
 
 /// The Planet as the client and the in-process server each hold it, the client's packed copy of
 /// it, and where the client starts.
@@ -87,41 +99,43 @@ struct Loaded {
     store: BrickStore,
     server_store: BrickStore,
     scene: Scene,
+    /// Generates what the scene is waiting for, on threads of its own.
+    loader: Loader,
     camera: Camera,
     /// A point on the ground to put the character down on.
     ground: [f64; 3],
 }
 
-/// The Planet's ground as the client and the in-process server each hold it, before it is
-/// packed for the GPU.
+/// The Planet's spawn ring as the client and the in-process server each hold it, before the
+/// Guard and before it is packed for the GPU.
 struct Ground {
+    planet: Planet,
     store: BrickStore,
     server_store: BrickStore,
     camera: Camera,
     ground: [f64; 3],
 }
 
-/// Generates the ground around a spawn on gentle land of the Planet of `map`, with a pyramid of
-/// `levels` levels for the client's copy of it.
+/// Generates the spawn ring on gentle land of the Planet of `map`: the full crust at level 0
+/// within `reach` Voxels, on all the cores, in a store with a pyramid of `levels` levels that
+/// reads the Planet itself where it holds nothing ([`Planet::crust_around`]).
 fn generate_ground(map: WorldMap, reach: i32, levels: usize) -> Ground {
-    let started = Instant::now();
     let planet = Planet::new(map);
     let ground = planet.spawn(reach);
-    let mut store = planet.region_around(ground, reach);
+    let started = Instant::now();
+    let store = planet.crust_around(ground, reach, levels - 1);
     eprintln!(
-        "generated {} bricks around the spawn in {:.1?}",
+        "spawn ring ({} m): {} bricks in {:.2?}",
+        reach / 10,
         store.len(),
         started.elapsed()
     );
     // Generation is deterministic, so the server's Planet is what generating it again would
-    // give; copying it is quicker. The server draws nothing, so it needs no coarse levels.
+    // give; copying it is quicker. The server draws nothing, so it needs no coarse levels, and
+    // it reads the Planet itself beyond the ring, which the character cannot leave.
     let server_store = store.clone();
-    // Beyond the region the store still reads the region's source: the deep rock and the air.
-    // `planet_gen::planet::PlanetSource` would draw the whole Planet at the level the bands ask
-    // for, but it generates the bricks on the thread that asks: 3.0 million bricks and 228 s
-    // for the first view, and a second a metre while walking. It waits for streaming (#86, #49).
-    store.build_lod(levels - 1);
     Ground {
+        planet,
         store,
         server_store,
         camera: spawn_camera(ground),
@@ -159,23 +173,40 @@ fn landing(eye: [f64; 3], leash: &Leash, ground: [f64; 3]) -> [f64; 3] {
     }
 }
 
-/// Makes the Planet of `map` into what the client starts with: the ground around a spawn on
-/// gentle land, its pyramid, and the rings around the spawn.
+/// Makes the Planet of `map` into what the client starts with: the spawn ring on gentle land,
+/// then the Guard, and the scene of the bands drawn from them, with a loader to fill the bands in
+/// (#86). The ring and the Guard are timed, and reported, apart.
 fn load(map: WorldMap, reach: i32) -> Result<Loaded, RingsFull> {
     let started = Instant::now();
     let Ground {
-        store,
+        planet,
+        mut store,
         server_store,
         camera,
         ground,
     } = generate_ground(map, reach, RING_LEVELS);
+    let guarded = Instant::now();
+    let held = loader::hold_guard(&mut store, &planet, GUARD_FIRST);
+    eprintln!(
+        "Guard (levels {GUARD_FIRST} to {}, the whole Planet): {held} bricks in {:.2?}",
+        RING_LEVELS - 1,
+        guarded.elapsed()
+    );
     let selected = Instant::now();
+    let bands = Bands::standard(f64::from(DEFAULT_BIAS));
     let scene = planet_scene(
         &store,
         camera.position,
-        Bands::standard(f64::from(DEFAULT_BIAS)),
+        bands,
         planet_gen::planet::MAX_RADIUS,
     )?;
+    let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let loader = Loader::new(
+        store.source().expect("the ring's store has a source"),
+        camera.position,
+        bands,
+        loader::workers_for(cores),
+    );
     let bricks: Vec<usize> = (0..RING_LEVELS).map(|l| scene.level_bricks(l)).collect();
     eprintln!(
         "selected and packed {} bricks in {:.1?} (per level {bricks:?}, {:.1} MiB)",
@@ -188,6 +219,7 @@ fn load(map: WorldMap, reach: i32) -> Result<Loaded, RingsFull> {
         store,
         server_store,
         scene,
+        loader,
         camera,
         ground,
     })
@@ -220,6 +252,10 @@ struct App {
     world: Option<World>,
     /// The in-process server, which runs the same simulation as the dedicated one.
     server: Option<ServerHandle>,
+    /// When the Planet was handed over, until the bands are first complete.
+    filling_since: Option<Instant>,
+    /// The frame thread's time on the scene, frame by frame.
+    scene_work: SceneWork,
     camera: Camera,
     fly: Fly,
     /// Walking as the character (the default), or flying the camera through everything as a
@@ -273,6 +309,8 @@ impl App {
             loading: Some(receiver),
             world: None,
             server: None,
+            filling_since: None,
+            scene_work: SceneWork::default(),
             // Until the Planet arrives there is only sky to look at, wherever from.
             camera: spawn_camera([0.0, 0.0, f64::from(WORLD_RADIUS)]),
             fly: Fly::default(),
@@ -335,11 +373,13 @@ impl App {
                 let (client_end, server_end) = net::loopback();
                 let server_store = loaded.server_store;
                 self.server = Some(sim::spawn(move || server_store, vec![server_end]));
-                let mut world = World::new(loaded.scene, Predictor::new(loaded.store), client_end);
+                let mut world = World::new(loaded.scene, Predictor::new(loaded.store), client_end)
+                    .with_loader(loaded.loader);
                 let leash = leash_for(loaded.ground, SPAWN_REACH);
                 world.spawn(drop_point(loaded.ground), leash)?;
                 self.spawn = Some((loaded.ground, leash));
                 self.world = Some(world);
+                self.filling_since = Some(Instant::now());
                 self.clock =
                     FixedTimestep::new(Duration::from_secs(1) / TICK_RATE_HZ, MAX_TICKS_PER_FRAME);
             }
@@ -411,6 +451,29 @@ impl App {
         };
         let update = world.recentre(self.camera.position)?;
         self.show(update)
+    }
+
+    /// Takes in the bricks the loader has generated, a bounded number a frame, and copies what
+    /// that changed to the GPU. Reports once, when the bands are first complete: nothing waits for
+    /// bricks and nothing is queued.
+    fn stream(&mut self) -> Result<(), Box<dyn Error>> {
+        let Some(world) = &mut self.world else {
+            return Ok(());
+        };
+        let update = world.stream(self.camera.position)?;
+        self.show(update)?;
+        if let (Some(since), Some(world)) = (self.filling_since, &self.world)
+            && world.waiting() == 0
+            && world.loader().is_some_and(|l| l.pending() == 0)
+        {
+            eprintln!(
+                "bands complete {:.1?} after the first frame: {} bricks generated",
+                since.elapsed(),
+                world.loader().map_or(0, Loader::generated)
+            );
+            self.filling_since = None;
+        }
+        Ok(())
     }
 
     /// Selects the bricks again for a LOD bias of `bias`, and copies the result to the GPU.
@@ -721,9 +784,13 @@ impl ApplicationHandler for App {
                 } else {
                     self.fly.update(&mut self.camera, dt);
                 }
-                if let Err(err) = self.recentre() {
+                let scene_started = Instant::now();
+                if let Err(err) = self.recentre().and_then(|()| self.stream()) {
                     self.error = Some(err);
                     event_loop.exit();
+                }
+                if self.world.is_some() {
+                    self.scene_work.record(scene_started.elapsed());
                 }
                 let overlay = self.run_overlay();
                 let ctx = self.gui.as_ref().map(|gui| gui.ctx.clone());
@@ -757,6 +824,9 @@ impl ApplicationHandler for App {
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
         // Dropping the handle tells the server thread to stop; it is not waited for, since it
         // may still be starting up. Its end of the loopback goes when the thread does.
+        if let Some(summary) = self.scene_work.summary() {
+            eprintln!("{summary}");
+        }
         self.world = None;
         self.server = None;
         // Drop the renderer (and its surface) before the window it draws to.
@@ -890,41 +960,6 @@ mod tests {
             render::reference::trace(&clipped, &ray).is_none(),
             "the test Planet's radius is far inside the spawn, so it clips the ground away"
         );
-    }
-
-    /// Walks 200 m over the full-size Planet in steps of 1 m, moving the rings at each as the
-    /// client does, and reports how long each move took. Takes about 40 seconds in a release
-    /// build: `cargo test --release -p client -- --ignored --nocapture full_size`.
-    #[test]
-    #[ignore = "generates the full-size world map"]
-    fn the_full_size_planet_loads_into_the_rings_and_walking_over_it_does_not_stall() {
-        let started = Instant::now();
-        let mut loaded = load_planet();
-        eprintln!(
-            "{} bricks held, {} bytes in the rings, camera at {:?}, {:.1?} in all",
-            loaded.store.len(),
-            loaded.scene.used_bytes(),
-            loaded.camera.position,
-            started.elapsed()
-        );
-        assert!(loaded.scene.is_rings());
-        let (heading, _) = planet_gen::planet::tangents(loaded.camera.horizon_up);
-        let mut position = loaded.camera.position;
-        let (mut worst, mut total, mut moves) =
-            (std::time::Duration::ZERO, std::time::Duration::ZERO, 0);
-        for _ in 0..200 {
-            position = std::array::from_fn(|a| position[a] + heading[a] * 10.0);
-            let started = Instant::now();
-            let moved = loaded.scene.recentre(&loaded.store, position).unwrap();
-            let took = started.elapsed();
-            if moved.is_some() {
-                (worst, total, moves) = (worst.max(took), total + took, moves + 1);
-            }
-        }
-        eprintln!(
-            "200 steps of 1 m: {moves} moves of the rings, longest {worst:.1?}, in all {total:.1?}"
-        );
-        assert!(worst < std::time::Duration::from_millis(500), "{worst:?}");
     }
 
     #[test]
