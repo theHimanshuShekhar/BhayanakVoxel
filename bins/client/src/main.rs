@@ -15,7 +15,6 @@ use std::time::{Duration, Instant};
 use brick_store::BrickStore;
 use fly::{Action, Fly};
 use loader::{GUARD_FIRST, Loader};
-use net::Leash;
 use planet_gen::planet::Planet;
 use planet_gen::world_map::{WORLD_MAP_SIZE, WORLD_RADIUS, WorldMap};
 use render::lod::{self, Bands};
@@ -44,8 +43,8 @@ const SPAWN_PITCH: f64 = -25.0;
 const SPAWN_HEIGHT: f64 = 40.0;
 /// Voxels from the spawn point that the client generates the full crust to, along the ground (see
 /// [`Planet::crust_around`]): the spawn ring, 40 m, which takes about 1.5 s on eight cores. The
-/// loader generates the rest of what the LOD bands draw (#86), and the character cannot leave the
-/// ring until the shell and its prefetch can keep ground under it (#49).
+/// loader generates the rest of what the LOD bands draw (#86). The character does not walk on
+/// the ring: it walks on the ground that the predictor makes around it (see [`sim::Ground`]).
 const SPAWN_REACH: i32 = 400;
 
 /// How far above the ground the character is set down, in Voxels: it drops the last few.
@@ -207,23 +206,15 @@ fn drop_point(ground: [f64; 3]) -> [f64; 3] {
     std::array::from_fn(|a| ground[a] + ground[a] / length * DROP_HEIGHT)
 }
 
-/// What bounds the character: the ground around `ground` that is generated, `reach` Voxels
-/// from the line through the Planet's centre (see [`Planet::region_around`]). Beyond it there
-/// is no ground yet (#49), so the character stops at the edge rather than fall through.
-fn leash_for(ground: [f64; 3], reach: i32) -> Leash {
-    let length = ground.iter().map(|c| c * c).sum::<f64>().sqrt();
-    Leash {
-        axis: ground.map(|c| c / length),
-        radius: f64::from(reach),
-    }
-}
-
 /// Where to put the character down when it leaves noclip with the camera at `eye`: under it, on
-/// the ground, or at the spawn if the camera is outside the leash or too low to know.
-fn landing(eye: [f64; 3], leash: &Leash, ground: [f64; 3]) -> [f64; 3] {
-    let along: f64 = (0..3).map(|a| eye[a] * leash.axis[a]).sum();
+/// the ground, or at the spawn if the camera is farther from the spawn's line through the
+/// Planet's centre than [`SPAWN_REACH`], where the ground is known to be near the camera's height.
+fn landing(eye: [f64; 3], ground: [f64; 3]) -> [f64; 3] {
+    let length = ground.iter().map(|c| c * c).sum::<f64>().sqrt();
+    let axis = ground.map(|c| c / length);
+    let along: f64 = (0..3).map(|a| eye[a] * axis[a]).sum();
     let square: f64 = eye.iter().map(|c| c * c).sum::<f64>() - along * along;
-    let margin = leash.radius - 2.0 * sim::Movement::default().radius;
+    let margin = f64::from(SPAWN_REACH) - 2.0 * sim::Movement::default().radius;
     if square.is_nan() || square >= margin * margin {
         drop_point(ground)
     } else {
@@ -343,8 +334,8 @@ struct App {
     walking: bool,
     /// Runs the character at the server's tick rate, whatever the frame rate.
     clock: FixedTimestep,
-    /// Where the character was set down and what bounds it, once the Planet is loaded.
-    spawn: Option<([f64; 3], Leash)>,
+    /// Where the character was set down, once the Planet is loaded.
+    spawn: Option<[f64; 3]>,
     /// The eyes after the previous and the latest character tick, which the camera is drawn
     /// between so that it moves smoothly at any frame rate.
     eyes: Option<([f64; 3], [f64; 3])>,
@@ -455,9 +446,8 @@ impl App {
                 self.server = Some(sim::spawn(move || server_store, vec![server_end]));
                 let mut world = World::new(loaded.scene, Predictor::new(loaded.store), client_end)
                     .with_loader(loaded.loader);
-                let leash = leash_for(loaded.ground, SPAWN_REACH);
-                world.spawn(drop_point(loaded.ground), leash)?;
-                self.spawn = Some((loaded.ground, leash));
+                world.spawn(drop_point(loaded.ground))?;
+                self.spawn = Some(loaded.ground);
                 self.world = Some(world);
                 self.filling_since = Some(Instant::now());
                 self.clock =
@@ -516,10 +506,8 @@ impl App {
     fn toggle_noclip(&mut self) -> Result<(), Box<dyn Error>> {
         self.walking = !self.walking;
         self.eyes = None;
-        if let (true, Some(world), Some((ground, leash))) =
-            (self.walking, &mut self.world, &self.spawn)
-        {
-            world.spawn(landing(self.camera.position, leash, *ground), *leash)?;
+        if let (true, Some(world), Some(ground)) = (self.walking, &mut self.world, &self.spawn) {
+            world.spawn(landing(self.camera.position, *ground))?;
         }
         Ok(())
     }
@@ -963,22 +951,19 @@ mod tests {
     }
 
     #[test]
-    fn the_character_is_set_down_just_above_the_ground_and_leashed_to_the_generated_ground() {
+    fn the_character_is_set_down_just_above_the_ground_and_lands_under_the_camera_near_the_spawn() {
         let ground = [-93_000.0, 90_000.0, 94_000.0];
         let length = dot(ground, ground).sqrt();
         let up = ground.map(|c| c / length);
         let drop = drop_point(ground);
         assert!((dot(drop, up) - length - DROP_HEIGHT).abs() < 1e-6);
-        let leash = leash_for(ground, SPAWN_REACH);
-        assert_eq!(leash.axis, up);
-        assert_eq!(leash.radius, f64::from(SPAWN_REACH));
-        // Out of noclip over the ground, it lands under the camera; off the generated ground
-        // it goes back to the spawn.
+        // Out of noclip over the spawn, it lands under the camera; far from it, it goes back to
+        // the spawn.
         let over = drop.map(|c| c + 1.0);
-        assert_eq!(landing(over, &leash, ground), over);
+        assert_eq!(landing(over, ground), over);
         let far = std::array::from_fn(|a| drop[a] + up[a] * 5.0 + [1.0, 0.0, 0.0][a] * 1e4);
-        assert_eq!(landing(far, &leash, ground), drop);
-        assert_eq!(landing([f64::NAN; 3], &leash, ground), drop);
+        assert_eq!(landing(far, ground), drop);
+        assert_eq!(landing([f64::NAN; 3], ground), drop);
     }
 
     #[test]

@@ -44,6 +44,16 @@ _Avoid_: Liquid (sand is a Fluid too)
 The continuous camera transition from a player's first/third-person view out to an orbital view of the whole Planet and back.
 _Avoid_: Map view, space view
 
+### Walking
+
+**Ground**:
+The level-0 bricks around one character, generated from the seed by both the client's predictor and the server, so that a collision query reads them and never generates one. Evicted behind the character. Not the Resident set, which is the camera's, and which collision never reads.
+_Avoid_: Terrain cache, collision set
+
+**Leash**:
+The ball of Voxels that a character may be in, which the server moves as the Ground around the character becomes ready, and tells the client from which input it holds. Space beyond it is solid.
+_Avoid_: Tether, bounds
+
 ### Visibility and streaming
 
 **Visible set**:

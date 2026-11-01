@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use brick_store::BrickStore;
 use net::{ClientMessage, EditOp, Leash, MoveInput, RejectReason, ServerEnd, ServerMessage};
 
-use crate::{Character, FixedTimestep, Movement, apply, validate};
+use crate::{Character, FixedTimestep, Ground, Movement, Terrain, apply, validate};
 
 /// The server simulates at this rate (issue 11).
 pub const TICK_RATE_HZ: u32 = 60;
@@ -36,10 +36,48 @@ pub enum Outcome {
     },
 }
 
-/// One client's character and how many of its inputs the server has applied.
+/// How far inside a leash the character must be for the server to hold it to that leash, in
+/// Voxels: its height (1.8 m) and some to spare, so that a leash never takes the ground from under
+/// or over it.
+const CLEARANCE: f64 = 24.0;
+
+/// One client's character, how many of its inputs the server has applied, and the ground it
+/// walks on.
 struct Avatar {
     character: Character,
     applied: u64,
+    ground: Ground,
+    /// Leashes decided since the client was last told, each with the input it first holds for.
+    fresh: Vec<(u64, Leash)>,
+}
+
+impl Avatar {
+    /// Fills the ground around the character, and moves the leash to the ground that is ready if
+    /// the character is well inside it and it is a change: another centre, or a bigger ball. The
+    /// character is held to the leash from the next input it applies.
+    ///
+    /// This runs once per input applied, so what the leash is when the character has applied `n`
+    /// inputs does not depend on the clock, nor on how the inputs were spread over ticks.
+    fn keep_ground(&mut self) {
+        let position = self.character.state().position;
+        self.ground.follow(position);
+        self.ground.fill();
+        let Some(ready) = self.ground.ready() else {
+            return;
+        };
+        let away = (0..3)
+            .map(|a| (position[a] - ready.centre[a]) * (position[a] - ready.centre[a]))
+            .sum::<f64>()
+            .sqrt();
+        let change = self
+            .character
+            .leash()
+            .is_none_or(|now| now.centre != ready.centre || now.radius < ready.radius);
+        if change && away + CLEARANCE <= ready.radius {
+            self.character.set_leash(Some(ready));
+            self.fresh.push((self.applied, ready));
+        }
+    }
 }
 
 /// The authoritative Planet, the order of the Edits made to it, and the characters on it.
@@ -48,6 +86,8 @@ pub struct Server {
     /// Global sequence number of the latest Edit; the first Edit is 1.
     global_seq: u64,
     movement: Movement,
+    /// New ground generated per input applied, for a character's ground.
+    ground_rate: Option<usize>,
     /// The character of each client, by its index in the list given to [`Server::tick`].
     avatars: Vec<Option<Avatar>>,
 }
@@ -58,8 +98,15 @@ impl Server {
             store,
             global_seq: 0,
             movement: Movement::default(),
+            ground_rate: None,
             avatars: Vec::new(),
         }
+    }
+
+    /// Generates at most `rate` bricks of ground per input applied, instead of the usual.
+    pub fn with_ground_rate(mut self, rate: usize) -> Self {
+        self.ground_rate = Some(rate);
+        self
     }
 
     pub fn store(&self) -> &BrickStore {
@@ -70,6 +117,11 @@ impl Server {
     /// has spawned.
     pub fn character(&self, index: usize) -> Option<&Character> {
         self.avatars.get(index)?.as_ref().map(|a| &a.character)
+    }
+
+    /// The ground that client `index`'s character walks on, if it has spawned.
+    pub fn ground(&self, index: usize) -> Option<&Ground> {
+        self.avatars.get(index)?.as_ref().map(|a| &a.ground)
     }
 
     /// Validates the request and, if it passes, applies it and gives it the next global
@@ -87,36 +139,48 @@ impl Server {
         }
     }
 
-    /// (Re)places client `index`'s character, standing at `position` with no inputs applied.
-    fn spawn_character(&mut self, index: usize, position: [f64; 3], leash: Option<Leash>) {
+    /// (Re)places client `index`'s character, standing at `position` with no inputs applied. It
+    /// has no leash until the ground around it is ready, and applies no input until then.
+    fn spawn_character(&mut self, index: usize, position: [f64; 3]) {
         if self.avatars.len() <= index {
             self.avatars.resize_with(index + 1, || None);
         }
+        let mut ground = Ground::new(self.store.source());
+        if let Some(rate) = self.ground_rate {
+            ground = ground.with_rate(rate);
+        }
+        ground.reset(position);
         self.avatars[index] = Some(Avatar {
-            character: Character::spawn(self.movement, position, leash),
+            character: Character::spawn(self.movement, position, None),
             applied: 0,
+            ground,
+            fresh: Vec::new(),
         });
     }
 
-    /// Applies one tick of input to client `index`'s character, if it has one and `seq` is the
-    /// input that is due (the channel is ordered, so any other is a repeat or a gap and is
-    /// ignored). Returns whether it was applied.
+    /// Applies one tick of input to client `index`'s character, if it has one, it has a leash, and
+    /// `seq` is the input that is due (the channel is ordered, so any other is a repeat or a gap
+    /// and is ignored). Returns whether it was applied.
     fn apply_input(&mut self, index: usize, seq: u64, input: &MoveInput) -> bool {
         let Some(Some(avatar)) = self.avatars.get_mut(index) else {
             return false;
         };
-        if seq != avatar.applied {
+        if seq != avatar.applied || avatar.character.leash().is_none() {
             return false;
         }
-        avatar.character.tick(&self.store, input);
+        avatar
+            .character
+            .tick(&Terrain::new(&self.store, &avatar.ground), input);
         avatar.applied += 1;
+        avatar.keep_ground();
         true
     }
 
     /// One tick: handles every request that has arrived, clients in order and each client's
     /// requests in the order it sent them. Each accepted Edit goes to every client, with the
     /// ack only for the one that asked; a reject goes to the one that asked. A client whose
-    /// character moved is told where it is, once, after its requests.
+    /// character moved is told where it is, once, after its requests, and before that of any new
+    /// leash. A character with no leash yet is waiting for its ground, which is filled each tick.
     pub fn tick(&mut self, clients: &[ServerEnd]) {
         for (asker, client) in clients.iter().enumerate() {
             let mut moved = false;
@@ -143,8 +207,8 @@ impl Server {
                             }
                         }
                     }
-                    ClientMessage::Spawn { position, leash } => {
-                        self.spawn_character(asker, position, leash);
+                    ClientMessage::Spawn { position } => {
+                        self.spawn_character(asker, position);
                         moved = true;
                     }
                     ClientMessage::Input { seq, input } => {
@@ -152,7 +216,16 @@ impl Server {
                     }
                 }
             }
-            if moved && let Some(Some(avatar)) = self.avatars.get(asker) {
+            let Some(Some(avatar)) = self.avatars.get_mut(asker) else {
+                continue;
+            };
+            if avatar.character.leash().is_none() {
+                avatar.keep_ground();
+            }
+            for (from, leash) in avatar.fresh.drain(..) {
+                let _ = client.send(ServerMessage::Leash { from, leash });
+            }
+            if moved {
                 let _ = client.send(ServerMessage::Body {
                     applied: avatar.applied,
                     state: *avatar.character.state(),
@@ -383,5 +456,134 @@ mod tests {
         assert!((15..=45).contains(&ran), "{ran} ticks in half a second");
         let server = handle.stop();
         assert_eq!(server.store().get(VoxelCoord([3, 3, 3])), None);
+    }
+
+    /// Stone below y = 0: a flat Planet, as a source.
+    #[derive(Debug)]
+    struct Flat;
+
+    impl brick_store::BrickSource for Flat {
+        fn brick(&self, _level: usize, coord: BrickCoord) -> Brick {
+            if coord.0[1] < 0 {
+                Brick::solid(STONE)
+            } else {
+                Brick::AIR
+            }
+        }
+    }
+
+    fn flat_store() -> BrickStore {
+        let mut store = BrickStore::new();
+        store.set_source(Flat);
+        store
+    }
+
+    fn forward() -> MoveInput {
+        MoveInput {
+            forward: 1,
+            heading: [1.0, 0.0, 0.0],
+            ..MoveInput::default()
+        }
+    }
+
+    #[test]
+    fn a_character_applies_no_input_until_its_ground_is_ready_and_is_then_told_its_leash() {
+        let (client, end) = loopback();
+        let mut server = Server::new(flat_store());
+        let input = |seq| ClientMessage::Input {
+            seq,
+            input: forward(),
+        };
+        client
+            .send(ClientMessage::Spawn {
+                position: [0.0, 3.0, 0.0],
+            })
+            .unwrap();
+        client.send(input(0)).unwrap();
+        server.tick(std::slice::from_ref(&end));
+        // The Spawn is answered. The input waits for the ground and is dropped.
+        let told = received(&client);
+        assert!(
+            matches!(told[..], [ServerMessage::Body { applied: 0, .. }]),
+            "{told:?}"
+        );
+
+        // Each tick fills some more, until there is room to stand in: then the leash is told,
+        // from the first input.
+        let mut leash = None;
+        for _ in 0..100 {
+            server.tick(std::slice::from_ref(&end));
+            let told = received(&client);
+            if let [
+                ServerMessage::Leash {
+                    from: 0,
+                    leash: got,
+                },
+            ] = told[..]
+            {
+                leash = Some(got);
+                break;
+            }
+            assert!(told.is_empty(), "{told:?}");
+        }
+        let leash = leash.expect("the ground became ready");
+        assert_eq!(server.character(0).unwrap().leash(), Some(leash));
+        assert!((32.0..=80.0).contains(&leash.radius), "{leash:?}");
+
+        client.send(input(0)).unwrap();
+        server.tick(std::slice::from_ref(&end));
+        let told = received(&client);
+        assert!(
+            matches!(told[..], [ServerMessage::Body { applied: 1, .. }]),
+            "{told:?}"
+        );
+    }
+
+    #[test]
+    fn a_new_leash_is_told_ahead_of_the_body_it_was_decided_in_and_from_the_input_after_it() {
+        let (client, end) = loopback();
+        let mut server = Server::new(flat_store());
+        client
+            .send(ClientMessage::Spawn {
+                position: [0.0, 3.0, 0.0],
+            })
+            .unwrap();
+        let (mut seq, mut leashes) = (0, Vec::new());
+        for _ in 0..200 {
+            if server.character(0).and_then(Character::leash).is_some() {
+                client
+                    .send(ClientMessage::Input {
+                        seq,
+                        input: forward(),
+                    })
+                    .unwrap();
+                seq += 1;
+            }
+            server.tick(std::slice::from_ref(&end));
+            let told = received(&client);
+            // A Leash is never behind the Body of its tick.
+            if let Some(body) = told
+                .iter()
+                .position(|m| matches!(m, ServerMessage::Body { .. }))
+            {
+                assert!(
+                    told[body..]
+                        .iter()
+                        .all(|m| !matches!(m, ServerMessage::Leash { .. })),
+                    "{told:?}"
+                );
+            }
+            for message in told {
+                if let ServerMessage::Leash { from, leash } = message {
+                    assert!(from <= seq, "{from} of {seq}");
+                    leashes.push((from, leash));
+                }
+            }
+        }
+        // The ground grew as it was walked on: a leash for each step of its radius, from the
+        // inputs applied then, never from the past.
+        assert!(leashes.len() > 5, "{leashes:?}");
+        assert!(leashes.windows(2).all(|w| w[0].0 <= w[1].0));
+        assert!(leashes.last().unwrap().1.radius > leashes[0].1.radius);
     }
 }

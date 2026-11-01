@@ -96,14 +96,15 @@ impl BodyState {
     }
 }
 
-/// How far from its spawn a character may go: the Planet's ground is generated only that far
-/// (until it can be streamed, #49), so beyond it the controller treats space as solid rather
-/// than let the character fall through the missing ground. It is the cylinder of `radius`
-/// Voxels around the line from the Planet's centre through the spawn.
+/// How far a character may go: the ball of `radius` Voxels around `centre`. The ground is
+/// held only that far (see `sim::Ground`), so beyond it the controller treats space as solid
+/// rather than let the character fall through the missing ground. The server decides it, moving
+/// it as the ground around the character fills in, and tells the client (see
+/// [`ServerMessage::Leash`]).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Leash {
-    /// Unit vector from the Planet's centre through the spawn.
-    pub axis: [f64; 3],
+    /// The ball's centre, in Voxels.
+    pub centre: [f64; 3],
     pub radius: f64,
 }
 
@@ -114,11 +115,10 @@ pub enum ClientMessage {
     /// the reply names it.
     Edit { client_seq: u64, op: EditOp },
     /// Puts this client's character on the Planet, standing at `position` in Voxels. The server
-    /// answers with [`ServerMessage::Body`] for no inputs applied yet.
-    Spawn {
-        position: [f64; 3],
-        leash: Option<Leash>,
-    },
+    /// answers with [`ServerMessage::Body`] for no inputs applied yet, and with its first
+    /// [`ServerMessage::Leash`] once the ground around the character is ready: until then the
+    /// client sends no inputs.
+    Spawn { position: [f64; 3] },
     /// The character's input for one tick. `seq` numbers the client's inputs from 0 upwards;
     /// the server applies them in order, each as one tick.
     Input { seq: u64, input: MoveInput },
@@ -146,6 +146,13 @@ pub enum ServerMessage {
     /// after a spawn), and this is where the character is then. Sent once per server tick in
     /// which any arrived.
     Body { applied: u64, state: BodyState },
+    /// The character is leashed to `leash` from its input number `from` on (the `from + 1`th it
+    /// sends), and until the next one says otherwise. `from` is the number of inputs the server
+    /// had applied when it decided, so it is the tick, as the server counts it, at which the
+    /// leash starts to hold. The client has usually run ahead of it by then, and applies it to
+    /// the same inputs when it runs them again. Sent ahead of the [`ServerMessage::Body`] of the
+    /// tick it was decided in.
+    Leash { from: u64, leash: Leash },
 }
 
 /// The other end is gone.

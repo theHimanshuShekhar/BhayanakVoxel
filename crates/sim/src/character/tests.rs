@@ -450,16 +450,16 @@ fn it_is_stopped_at_the_end_of_its_leash() {
     for direction in SITES {
         let site = Site::at(direction);
         let leash = Leash {
-            axis: site.up,
+            centre: site.origin,
             radius: 50.0,
         };
         let mut c = Character::spawn(Movement::default(), site.point(0.0, 0.0, 6.0), Some(leash));
         run(&mut c, &site, &site.walk(), 360);
-        let [s, t, _] = feet(&c, &site);
-        let from_axis = (s * s + t * t).sqrt();
+        let [s, t, h] = feet(&c, &site);
+        let from_centre = (s * s + t * t + h * h).sqrt();
         assert!(
-            (44.0..=47.5).contains(&from_axis),
-            "{direction:?}: stopped {from_axis} from the axis, leash 50"
+            (42.0..=50.0).contains(&from_centre),
+            "{direction:?}: stopped {from_centre} from the centre, leash 50"
         );
     }
 }

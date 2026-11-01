@@ -34,7 +34,7 @@
 //! Standing still, nothing moves it sideways: the fall is straight down along up, so it does
 //! not slide down a slope of the Voxel staircase it stands on.
 
-use brick_store::{BrickStore, VoxelCoord};
+use brick_store::VoxelCoord;
 use net::{BodyState, Leash, MoveInput};
 
 use crate::Movement;
@@ -72,23 +72,11 @@ pub enum Cell {
     Unloaded,
 }
 
-/// The seam between the controller and wherever the Voxels are held: the client's store and the
-/// server's both provide it, and the controller reads nothing else of the Planet.
+/// The seam between the controller and wherever the Voxels are held: the ground that a client
+/// and the server hold ([`crate::Terrain`]) provides it, and the controller reads nothing else of
+/// the Planet. It must answer from what is held, and never generate anything.
 pub trait Occupancy {
     fn cell(&self, voxel: VoxelCoord) -> Cell;
-}
-
-impl Occupancy for BrickStore {
-    /// Any Material at level 0 is solid (water too, until swimming exists). The store knows
-    /// every Voxel it is asked about, so none is unloaded: where a client holds only part of the
-    /// Planet it says so with a [`Leash`].
-    fn cell(&self, voxel: VoxelCoord) -> Cell {
-        if self.voxel_at(0, voxel).is_some() {
-            Cell::Solid
-        } else {
-            Cell::Air
-        }
-    }
 }
 
 fn dot(a: [f64; 3], b: [f64; 3]) -> f64 {
@@ -213,8 +201,8 @@ impl<W: Occupancy> Capsule<'_, W> {
     fn solid(&self, voxel: [i32; 3]) -> bool {
         if let Some(leash) = &self.leash {
             let centre = voxel.map(|c| f64::from(c) + 0.5);
-            let along = dot(centre, leash.axis);
-            if dot(centre, centre) - along * along > leash.radius * leash.radius {
+            let from_centre = sub(centre, leash.centre);
+            if dot(from_centre, from_centre) > leash.radius * leash.radius {
                 return true;
             }
         }
@@ -410,6 +398,15 @@ impl Character {
 
     pub fn state(&self) -> &BodyState {
         &self.state
+    }
+
+    pub fn leash(&self) -> Option<Leash> {
+        self.leash
+    }
+
+    /// Changes what bounds the character, from its next tick on.
+    pub fn set_leash(&mut self, leash: Option<Leash>) {
+        self.leash = leash;
     }
 
     /// Replaces the state, as the server's word replaces a client's prediction.
