@@ -44,6 +44,16 @@ _Avoid_: Liquid (sand is a Fluid too)
 The continuous camera transition from a player's first/third-person view out to an orbital view of the whole Planet and back.
 _Avoid_: Map view, space view
 
+### Walking
+
+**Ground**:
+The part of the Planet around a character that both client and server have generated, which the character stands on and touches. It follows the character; what lies beyond it is not yet known.
+_Avoid_: Terrain cache, collision set
+
+**Leash**:
+The region a character is confined to. The server keeps it within the Ground and moves it as the character walks; beyond it the character is blocked.
+_Avoid_: Tether, bounds
+
 ### Visibility and streaming
 
 **Visible set**:

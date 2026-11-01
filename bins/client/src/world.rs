@@ -3,7 +3,7 @@
 //! [`sim::Predictor`], which calls [`sim::apply`].
 
 use brick_store::VoxelCoord;
-use net::{ClientEnd, Disconnected, EditOp, Leash, MoveInput, TryRecvError};
+use net::{ClientEnd, Disconnected, EditOp, MoveInput, TryRecvError};
 use render::reference::{Hit, Ray, trace};
 use render::{Camera, RingsFull, Scene, SceneUpdate, camera};
 use sim::Predictor;
@@ -154,20 +154,25 @@ impl World {
     }
 
     /// Puts the character on the Planet at `position` (Voxels), and tells the server. It falls
-    /// from there, and cannot leave `leash`.
-    pub fn spawn(&mut self, position: [f64; 3], leash: Leash) -> Result<(), Stopped> {
-        self.link
-            .send(self.predictor.spawn(position, Some(leash)))?;
+    /// from there once the ground around it is ready here and the server has said how far it
+    /// may go (see [`sim::Predictor::walk`]).
+    pub fn spawn(&mut self, position: [f64; 3]) -> Result<(), Stopped> {
+        self.link.send(self.predictor.spawn(position))?;
         Ok(())
     }
 
     /// Runs one tick of the character on `input` here and on the server. Does nothing before
-    /// the character has spawned.
+    /// the character has spawned, and while it waits for its ground.
     pub fn walk(&mut self, input: MoveInput) -> Result<(), Stopped> {
         if let Some(request) = self.predictor.walk(input) {
             self.link.send(request)?;
         }
         Ok(())
+    }
+
+    /// What bounds the character, once the server has said.
+    pub fn leash(&self) -> Option<net::Leash> {
+        self.predictor.character().and_then(sim::Character::leash)
     }
 
     /// Where the character's eyes are, if it has spawned.
@@ -295,7 +300,7 @@ impl World {
 mod tests {
     use super::*;
     use brick_store::{Brick, BrickCoord, BrickStore, Material};
-    use net::{ClientMessage, RejectReason, ServerEnd, ServerMessage, loopback};
+    use net::{ClientMessage, Leash, RejectReason, ServerEnd, ServerMessage, loopback};
 
     const STONE: Material = Material(7);
 
@@ -383,7 +388,7 @@ mod tests {
     }
 
     #[test]
-    fn the_character_lands_on_the_wall_and_the_server_is_sent_its_spawn_and_every_tick() {
+    fn the_character_waits_for_the_leash_then_lands_on_the_wall() {
         let (mut world, server) = world();
         assert_eq!(world.eye(), None);
         world.walk(MoveInput::default()).unwrap();
@@ -393,14 +398,30 @@ mod tests {
             "not spawned yet"
         );
 
-        let leash = Leash {
-            axis: [1.0, 0.0, 0.0],
-            // Wide enough for the whole wall: it is 16 Voxels off the axis.
-            radius: 40.0,
-        };
         // Above the middle of the wall's +x face (x = 4032).
-        world.spawn([4036.0, 16.0, -16.0], leash).unwrap();
-        for _ in 0..120 {
+        let spawn = [4036.0, 16.0, -16.0];
+        world.spawn(spawn).unwrap();
+        for _ in 0..10 {
+            world.walk(MoveInput::default()).unwrap();
+        }
+        // Standing where it was put, eyes 1.6 m up: it waits.
+        let eye = world.eye().unwrap();
+        assert!((eye[0] - (4036.0 + 16.0)).abs() < 0.1, "{eye:?}");
+
+        // The server's word: a ball round the spawn's brick, wide enough for the whole wall. The
+        // wall's bricks are in the store, and the rest of the ground is air.
+        server
+            .send(ServerMessage::Leash {
+                spawn: 1,
+                from: 0,
+                leash: Leash {
+                    centre: [4036.0, 20.0, -12.0],
+                    radius: 40.0,
+                },
+            })
+            .unwrap();
+        world.poll().unwrap();
+        for _ in 0..200 {
             world.walk(MoveInput::default()).unwrap();
         }
         let eye = world.eye().unwrap();
@@ -409,16 +430,17 @@ mod tests {
         assert_eq!(
             server.try_recv(),
             Ok(ClientMessage::Spawn {
-                position: [4036.0, 16.0, -16.0],
-                leash: Some(leash)
+                spawn: 1,
+                position: spawn
             })
         );
-        for seq in 0..120 {
-            let Ok(ClientMessage::Input { seq: got, .. }) = server.try_recv() else {
-                panic!("input {seq} missing");
-            };
-            assert_eq!(got, seq);
+        let mut inputs = 0;
+        while let Ok(ClientMessage::Input { seq, .. }) = server.try_recv() {
+            assert_eq!(seq, inputs);
+            inputs += 1;
         }
+        // The ten ticks that waited for the server's word were not sent: all the others were.
+        assert_eq!(inputs, 200);
     }
 
     #[test]

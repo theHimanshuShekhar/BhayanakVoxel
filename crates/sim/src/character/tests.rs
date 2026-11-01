@@ -450,16 +450,19 @@ fn it_is_stopped_at_the_end_of_its_leash() {
     for direction in SITES {
         let site = Site::at(direction);
         let leash = Leash {
-            axis: site.up,
+            centre: site.origin,
             radius: 50.0,
         };
         let mut c = Character::spawn(Movement::default(), site.point(0.0, 0.0, 6.0), Some(leash));
         run(&mut c, &site, &site.walk(), 360);
-        let [s, t, _] = feet(&c, &site);
-        let from_axis = (s * s + t * t).sqrt();
+        let [s, t, h] = feet(&c, &site);
+        let from_centre = (s * s + t * t + h * h).sqrt();
+        // The wall is a ball, so the head, 18 Voxels up, meets it before the feet do: the capsule
+        // (radius 3) stops where its top sphere, 15 up, is 3 inside the ball. The feet are then
+        // sqrt(47 * 47 - 15 * 15) = 44.5 from the centre, less the controller's tolerance.
         assert!(
-            (44.0..=47.5).contains(&from_axis),
-            "{direction:?}: stopped {from_axis} from the axis, leash 50"
+            (43.0..=44.6).contains(&from_centre),
+            "{direction:?}: stopped {from_centre} from the centre, leash 50"
         );
     }
 }
