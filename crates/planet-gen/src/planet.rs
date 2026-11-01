@@ -9,6 +9,12 @@
 //! - **deep rock**, below the strata, and
 //! - the glowing **molten core**, within [`MOLTEN_RADIUS`] of the centre.
 //!
+//! **Caves** (see `crate::caves`) are carved out of the strata and the deep rock under land,
+//! less than 300 m below the ground: tunnels and chambers at most 8 m across, in systems that
+//! reach 1 km, some of which open to the surface. They are the one thing that makes a Voxel air
+//! that the ground does not, so the ground's bounds on a brick (below) decide a brick only
+//! where the caves have no tube near it.
+//!
 //! The lowest the ground gets is [`TRENCH`] below sea level, so everything within
 //! [`INTERIOR_RADIUS`] of the centre is core or deep rock whatever the world map says. That is
 //! most of the Planet, and its bricks are uniform: one flag each, not memory. Only the bricks
@@ -25,8 +31,9 @@ use std::sync::Arc;
 use brick_store::{BRICK_SIZE, Brick, BrickCoord, BrickSource, BrickStore, Material, VoxelCoord};
 
 pub use crate::SOIL;
+use crate::caves::{self, Caves, Tube};
 use crate::world_map::{Biome, PEAK, SEA_LEVEL, TRENCH, Texel, WORLD_RADIUS, WorldMap};
-use crate::{distance, par_bricks};
+use crate::{Corners, distance, par_bricks};
 
 pub const GRASSY_SOIL: Material = Material(3);
 pub const CLAY: Material = Material(4);
@@ -134,7 +141,7 @@ fn interior(radius: f64) -> Option<Material> {
 }
 
 /// The sea's surface, as a distance in Voxels from the centre.
-const SEA_RADIUS: f64 = (WORLD_RADIUS + SEA_LEVEL as i32) as f64;
+pub(crate) const SEA_RADIUS: f64 = (WORLD_RADIUS + SEA_LEVEL as i32) as f64;
 
 /// Thickness of the ice on the top of polar seas, those the world map marks as snow, in Voxels:
 /// 60 cm.
@@ -244,10 +251,12 @@ fn radii_of_box(low: [f64; 3], high: [f64; 3]) -> (f64, f64) {
     (near, far)
 }
 
-/// The Planet, as bricks. Cloning shares the world map, which carries the seed.
+/// The Planet, as bricks. Cloning shares the world map, which carries the seed, and the caves
+/// made from it.
 #[derive(Clone)]
 pub struct Planet {
     map: Arc<WorldMap>,
+    caves: Arc<Caves>,
 }
 
 impl fmt::Debug for Planet {
@@ -257,8 +266,19 @@ impl fmt::Debug for Planet {
 }
 
 impl Planet {
+    /// The Planet of `map`, with the caves its seed grows under it (a few milliseconds).
     pub fn new(map: WorldMap) -> Planet {
-        Planet { map: Arc::new(map) }
+        let caves = Arc::new(Caves::new(&map));
+        Planet {
+            map: Arc::new(map),
+            caves,
+        }
+    }
+
+    /// FNV-1a hash of the caves' tubes, bit for bit: what the golden test holds the walk that
+    /// grows them to, on every platform.
+    pub fn caves_hash(&self) -> u64 {
+        self.caves.content_hash()
     }
 
     pub fn map(&self) -> &WorldMap {
@@ -270,8 +290,62 @@ impl Planet {
         self.material_at(coord.0.map(f64::from))
     }
 
-    /// The Material at `point`, in Voxels from the centre: `None` for air.
+    /// The Material at `point`, in Voxels from the centre, caves and all: `None` for air.
     fn material_at(&self, point: [f64; 3]) -> Option<Material> {
+        let ground = self.ground_at(point);
+        if ground.is_none() {
+            return ground;
+        }
+        let tubes = self.caves.near(point, point, 1.0);
+        if !tubes.is_empty() && self.carved(point, 0.0, &tubes, &mut None) {
+            return None;
+        }
+        ground
+    }
+
+    /// Whether the Voxel sampled at `point`, a solid one of the ground, is a cave: inside one of
+    /// `tubes` (see [`Caves::carves`], where `half` is explained) and under land, less than
+    /// [`caves::MAX_DEPTH`] below the ground. Under the sea, and above the ground, a tube is not
+    /// carved.
+    fn carved(
+        &self,
+        point: [f64; 3],
+        half: f64,
+        tubes: &[Tube],
+        cache: &mut Option<Corners>,
+    ) -> bool {
+        if !self.caves.carves(tubes, point, half, cache) {
+            return false;
+        }
+        let elevation = self.map.elevation_at(point);
+        let depth = SEA_RADIUS + elevation - distance(point);
+        elevation >= f64::from(SEA_LEVEL) && depth > 0.0 && depth < caves::MAX_DEPTH
+    }
+
+    /// The tubes that may carve a Voxel of the brick sampled at `samples`, given bounds on the
+    /// ground there (see [`Planet::generate`]): none for the many bricks that are above the cave
+    /// band, under the sea, or have no tube near.
+    fn tubes_near(&self, samples: &Samples, shallowest: f64, highest: f64) -> Vec<Tube> {
+        if !self.may_have_caves(samples, shallowest, highest) {
+            return Vec::new();
+        }
+        let (low, high) = (samples.corner([0; 3]), samples.corner([1; 3]));
+        self.caves.near(low, high, 1.0)
+    }
+
+    /// Whether a Voxel of the brick sampled at `samples`, which is at least `shallowest` Voxels
+    /// below the ground and where the ground is at most `highest` above sea level, may be a
+    /// cave: not if it is too far under the ground or the ground is the sea floor, nor if the
+    /// Voxels are so wide that no tube carves one (see [`Caves::carves`]).
+    fn may_have_caves(&self, samples: &Samples, shallowest: f64, highest: f64) -> bool {
+        shallowest < caves::MAX_DEPTH
+            && highest >= f64::from(SEA_LEVEL)
+            && caves::carves_voxels_of((samples.size - 1.0) / 2.0)
+    }
+
+    /// The Material of the ground at `point`, in Voxels from the centre, which is the Planet's
+    /// without its caves: `None` for air.
+    fn ground_at(&self, point: [f64; 3]) -> Option<Material> {
         let radius = distance(point);
         if let Some(material) = interior(radius) {
             return Some(material);
@@ -296,9 +370,11 @@ impl Planet {
     /// Most bricks are decided without looking at their Voxels: those in the interior by their
     /// distance from the centre, those above the highest peak, and the rest by bounds on the
     /// ground's height under the brick, from the few texels of the world map that it is over.
-    /// Those say whether the brick is wholly sky, sea, deep rock or one stratum. A test checks
-    /// that this agrees with [`Planet::voxel`] for every Voxel, which only a brick over a
-    /// boundary between layers, or over the ground itself, needs.
+    /// Those say whether the brick is wholly sky, sea, deep rock or one stratum, unless a tube
+    /// of the caves is near it (see `crate::caves`), which is a lookup in a table and only a
+    /// brick within 300 m of the ground has any. A test checks that this agrees with
+    /// [`Planet::voxel`] for every Voxel, which only a brick over a boundary between layers, or
+    /// over the ground itself, or by a cave, needs.
     pub fn brick(&self, coord: BrickCoord) -> Brick {
         self.generate(0, coord)
     }
@@ -318,6 +394,11 @@ impl Planet {
     /// the ground itself, passes through. Like [`Planet::brick`] it is a function of the world
     /// map and the coordinate alone, and decides most bricks, the sky and the interior's,
     /// without looking at their Voxels.
+    ///
+    /// Caves are in the bricks of levels 1 to 6: a Voxel is a cave if a tube holds most of it
+    /// (see `Caves::carves`), and from level 7, whose Voxels are 12.8 m across, none is, since no
+    /// tube is as wide as that. So the Guard has no caves, and the levels that the horizon cap
+    /// (#81) applies to, 7 and up, never show one.
     pub fn coarse_brick(&self, level: usize, coord: BrickCoord) -> Brick {
         debug_assert!(level > 0);
         self.generate(level, coord)
@@ -350,6 +431,13 @@ impl Planet {
         // The brick's Voxels are between these many Voxels below the ground.
         let shallowest = SEA_RADIUS + low - far - SLACK;
         let deepest = SEA_RADIUS + high - near + SLACK;
+        // The caves are what the bounds on the ground know nothing of: where a tube is near, the
+        // brick is not what they say, so the shortcuts below are not for it.
+        let tubes = if deepest > 0.0 {
+            self.tubes_near(&samples, shallowest, high)
+        } else {
+            Vec::new()
+        };
         if deepest <= 0.0 {
             // All above the ground: sky, or sea if it is below sea level.
             if low >= 0.0 || near >= SEA_RADIUS {
@@ -364,7 +452,7 @@ impl Planet {
             {
                 return Brick::solid(WATER);
             }
-        } else if sealed() {
+        } else if tubes.is_empty() && sealed() {
             if shallowest >= f64::from(STRATA_DEPTH) {
                 return Brick::solid(DEEP_ROCK);
             }
@@ -379,7 +467,7 @@ impl Planet {
                 }
             }
         }
-        self.evaluate(&samples)
+        self.evaluate_with(&samples, &tubes)
     }
 
     /// Whether no Voxel of the brick sampled at `samples` can have air beside it, on one of its
@@ -418,7 +506,8 @@ impl Planet {
             }
             inner = f64::from(outer);
         }
-        Some(self.evaluate(samples))
+        // No tube is in the interior: it is deeper than any cave goes.
+        Some(self.evaluate_with(samples, &[]))
     }
 
     /// The texel that all of a brick's corners are in, if they are in one. Then so is the whole
@@ -436,7 +525,21 @@ impl Planet {
     /// be deep in the strata, with the ground in the upper part of the Voxel that is what is seen
     /// of it, so it takes the Material at the shallowest depth the Voxel reaches. That is the
     /// choice the pyramid makes (ADR 0002). Whether a Voxel is solid is not changed.
+    ///
+    /// Caves are made after all that, and do not take part in it: a Voxel with a cave beside it
+    /// is not exposed, as the surface is (see [`Planet::carve`]).
+    #[cfg(test)]
     fn evaluate(&self, samples: &Samples) -> Brick {
+        let corners: [[f64; 3]; 8] =
+            std::array::from_fn(|i| samples.corner([i & 1, i >> 1 & 1, i >> 2]));
+        let (low, high) = self.map.elevation_range(&corners);
+        let shallowest = SEA_RADIUS + low - samples.radii().1 - SLACK;
+        let tubes = self.tubes_near(samples, shallowest, high);
+        self.evaluate_with(samples, &tubes)
+    }
+
+    /// [`Planet::evaluate`], with the `tubes` that may carve its Voxels.
+    fn evaluate_with(&self, samples: &Samples, tubes: &[Tube]) -> Brick {
         #[cfg(test)]
         EVALUATED.with(|made| made.set(made.get() + 1));
         let mut brick = Brick::AIR;
@@ -444,7 +547,7 @@ impl Planet {
             for y in 0..8 {
                 for x in 0..8 {
                     let local = [x, y, z];
-                    brick.set(local, self.material_at(samples.at(local)));
+                    brick.set(local, self.ground_at(samples.at(local)));
                 }
             }
         }
@@ -453,7 +556,28 @@ impl Planet {
         {
             self.expose(samples, floor, &mut brick);
         }
+        if !tubes.is_empty() {
+            self.carve(samples, tubes, &mut brick);
+        }
         brick
+    }
+
+    /// Makes air of the Voxels of `brick`, sampled at `samples`, that the `tubes` carve.
+    fn carve(&self, samples: &Samples, tubes: &[Tube], brick: &mut Brick) {
+        let half = (samples.size - 1.0) / 2.0;
+        let mut cache = None;
+        for z in 0..8 {
+            for y in 0..8 {
+                for x in 0..8 {
+                    let local = [x, y, z];
+                    if brick.get(local).is_some()
+                        && self.carved(samples.at(local), half, tubes, &mut cache)
+                    {
+                        brick.set(local, None);
+                    }
+                }
+            }
+        }
     }
 
     /// Gives the Voxels of `brick`, sampled at `samples`, that are exposed the Material at the
@@ -485,7 +609,7 @@ impl Planet {
                             _ => {
                                 let mut beside = point;
                                 beside[face / 2] += f64::from(step) * size;
-                                self.material_at(beside).is_none()
+                                self.ground_at(beside).is_none()
                             }
                         }
                     });
@@ -515,8 +639,8 @@ impl Planet {
         let on_axis = |r: f64| point.map(|c| c * r / radius);
         let top = on_axis(radius + size / 2.0 * lean);
         // In the air, a little below the highest ground or sea there.
-        self.material_at(top)
-            .or_else(|| self.material_at(on_axis(ground.max(SEA_RADIUS) - 0.5)))
+        self.ground_at(top)
+            .or_else(|| self.ground_at(on_axis(ground.max(SEA_RADIUS) - 0.5)))
     }
 
     /// Bounds `(lowest, highest)` on the ground's height above sea level within `reach` Voxels
@@ -540,7 +664,17 @@ impl Planet {
     /// world map has one. Gentle, temperate land is the first, going through the world map's
     /// texels on a lattice, where the ground is 20 to 100 m above the sea and varies by 40 m at
     /// most within `reach` Voxels (see [`Planet::region_around`]). The same for the same map.
+    ///
+    /// Except for the last, every choice is clear of the caves: no tube of them is within `reach`
+    /// and a brick or two of the line from the centre through the spawn, at any depth. So the
+    /// character is not set down in a cave or over a mouth that it could fall into, nor in the
+    /// ring around it, and the ring has none of the caves that would be deeper than the strata.
     pub fn spawn(&self, reach: i32) -> [f64; 3] {
+        self.spawn_where(reach, |point| self.clear_of_caves(*point, reach))
+    }
+
+    /// [`Planet::spawn`], with `clear` to say which points are clear of the caves.
+    fn spawn_where(&self, reach: i32, clear: impl Fn(&[f64; 3]) -> bool) -> [f64; 3] {
         let size = self.map.size();
         let stride = (size / 32).max(1) as usize;
         let spots = || {
@@ -573,15 +707,16 @@ impl Planet {
                 texel.biome == Biome::Temperate
                     && SPAWN_ELEVATIONS.contains(&texel.elevation)
                     && relief(*point) <= GENTLE
+                    && clear(point)
             })
             .or_else(|| {
                 (spots().map(|spot| ground(&spot)))
-                    .find(|(texel, point)| land(texel) && relief(*point) <= GENTLE)
+                    .find(|(texel, point)| land(texel) && relief(*point) <= GENTLE && clear(point))
             })
             .or_else(|| {
                 (spots()
                     .map(|spot| ground(&spot))
-                    .filter(|(texel, _)| land(texel)))
+                    .filter(|(texel, point)| land(texel) && clear(point)))
                 .min_by(|a, b| relief(a.1).total_cmp(&relief(b.1)))
             })
             .or_else(|| {
@@ -589,6 +724,44 @@ impl Planet {
             })
             .expect("a world map has texels")
             .1
+    }
+
+    /// Points on the ground, in Voxels from the centre, where a cave opens to the surface: one
+    /// for each tube that comes within four fifths of its radius of the ground from below, at the
+    /// first such place along it. For a debug camera to go to, and for tests. Takes a few
+    /// milliseconds.
+    pub fn cave_mouths(&self) -> Vec<[f64; 3]> {
+        let mut mouths = Vec::new();
+        for tube in self.caves.tubes() {
+            let length = distance(std::array::from_fn(|a| tube.b[a] - tube.a[a]));
+            // A step is 2 m, which no tube is narrower than.
+            let steps = (length / 20.0).ceil().max(1.0) as u32;
+            let mouth = (0..=steps).find_map(|k| {
+                let along = f64::from(k) / f64::from(steps);
+                let at: [f64; 3] =
+                    std::array::from_fn(|a| tube.a[a] + (tube.b[a] - tube.a[a]) * along);
+                let radius = tube.ra + (tube.rb - tube.ra) * along;
+                let height = distance(at);
+                let elevation = self.map.elevation_at(at);
+                let depth = SEA_RADIUS + elevation - height;
+                (elevation >= f64::from(SEA_LEVEL) && (0.0..=0.8 * radius).contains(&depth))
+                    .then(|| at.map(|c| c / height * (SEA_RADIUS + elevation)))
+            });
+            mouths.extend(mouth);
+        }
+        mouths
+    }
+
+    /// Whether no cave is within `reach` Voxels and two bricks of the line from the centre through
+    /// `ground`, a point on the ground, from the bottom of the caves to above the ground.
+    fn clear_of_caves(&self, ground: [f64; 3], reach: i32) -> bool {
+        let up = ground.map(|c| c / distance(ground));
+        let at = |height: f64| -> [f64; 3] { std::array::from_fn(|a| ground[a] + up[a] * height) };
+        self.caves.clear_of(
+            at(-(caves::MAX_DEPTH + 2.0 * caves::MAX_TUBE_RADIUS)),
+            at(f64::from(BRICK_SIZE)),
+            f64::from(reach + 2 * BRICK_SIZE),
+        )
     }
 
     /// A store of the ground within `reach` Voxels of the line from the centre through `spawn`
@@ -665,10 +838,18 @@ impl Planet {
     /// Whether every Voxel of level 0 under the brick at `coord` of mip `level` is solid, for
     /// certain: it is wholly in the interior, or wholly below the lowest the ground can be
     /// within its box (from the few texels of the world map that the box is over, as
-    /// [`Planet::brick`] decides most bricks). `false` means that it is not known, not that it
-    /// has air. The strata and everything below them are solid, so this holds for every brick
-    /// that is a brick or so under the ground, which is nearly all of the crust.
+    /// [`Planet::brick`] decides most bricks), and no cave can be in it: it is deeper than the
+    /// caves go, under the sea, or has no tube of the caves near it. `false` means that it is
+    /// not known, not that it has air. The strata and everything below them are solid, so this
+    /// holds for every brick that is a brick or so under the ground and not near a cave, which
+    /// is nearly all of the crust.
     pub fn solid_below(&self, level: usize, coord: BrickCoord) -> bool {
+        self.solid_below_with(level, coord, true)
+    }
+
+    /// [`Planet::solid_below`], with or without the caves: without, it is what the ground alone
+    /// proves.
+    fn solid_below_with(&self, level: usize, coord: BrickCoord, caves: bool) -> bool {
         if inside_interior(level, coord) {
             return true;
         }
@@ -679,8 +860,18 @@ impl Planet {
         let corners: [[f64; 3]; 8] = std::array::from_fn(|i| {
             std::array::from_fn(|a| if i >> a & 1 == 0 { low[a] } else { high[a] })
         });
-        let (lowest, _) = self.map.elevation_range(&corners);
-        SEA_RADIUS + lowest - far - SLACK > 0.0
+        let (lowest, highest) = self.map.elevation_range(&corners);
+        let shallowest = SEA_RADIUS + lowest - far - SLACK;
+        if shallowest <= 0.0 {
+            return false;
+        }
+        // The Voxels are at `low` to `high` less one, so the box holds them all. A tube near
+        // the box is a cave that may be in it, however wide the Voxels, since this is about
+        // Voxels of level 0.
+        !caves
+            || shallowest >= caves::MAX_DEPTH
+            || highest < f64::from(SEA_LEVEL)
+            || !self.caves.touches(low, high, 1.0)
     }
 
     /// The Guard: the bricks of the whole Planet at the mip levels `levels` (8 to 12, the top of
@@ -770,7 +961,8 @@ impl BrickSource for PlanetSource {
 /// - at level 0, a brick that lies within the interior is the Planet's own, which is a flag
 ///   except where it is over the edge of the core;
 /// - at level 0, a brick below the region (along the cylinder, under its bottom) is deep rock,
-///   as the Planet's strata end above it;
+///   as the Planet's strata end above it (but the caves go 300 m down: under a spawn that is
+///   so only where there are none, which [`Planet::spawn`] sees to);
 /// - any other brick is air, though the Planet has ground beyond the region;
 /// - at the coarse levels, a brick wholly within one layer of the interior is that layer, and
 ///   every other brick is air.
@@ -1943,4 +2135,6 @@ mod tests {
             assert!(expected > 100, "level {level} has {expected}");
         }
     }
+
+    mod cave_tests;
 }
