@@ -118,7 +118,7 @@ pub fn apply(store: &mut BrickStore, op: &EditOp) -> Undo {
                     undo.bricks.push((brick, before));
                 } else if before.is_none() {
                     // Nothing was dug here, so a core brick stored above goes back to implied.
-                    store.remove(brick);
+                    store.discard(brick);
                 }
             }
         }
@@ -723,5 +723,65 @@ mod tests {
         assert_eq!(*undo.lod(), LodRefresh::default());
         assert_eq!(store.level_count(), 1);
         assert_eq!(undo.revert(&mut store), LodRefresh::default());
+    }
+
+    /// The client streams the Planet in and the server does not; an Edit taken back must leave
+    /// them reading the same Voxels, whether or not the bricks it touched have been resident.
+    #[test]
+    fn an_edit_taken_back_after_its_bricks_became_resident_leaves_client_and_server_agreeing() {
+        use planet_gen::planet::{Planet, tangents};
+        use planet_gen::world_map::WorldMap;
+
+        let planet = Planet::new(WorldMap::generate(0xB4A7_A9AC, 512));
+        let ground = planet.spawn(100);
+        let length = ground.iter().map(|c| c * c).sum::<f64>().sqrt();
+        let up = ground.map(|c| c / length);
+        let (ahead, _) = tangents(up);
+        // Ground 300 Voxels from the spawn, outside the ring of 100 that is generated.
+        let point: [f64; 3] = std::array::from_fn(|a| ground[a] + ahead[a] * 300.0);
+        let radius = point.iter().map(|c| c * c).sum::<f64>().sqrt();
+        let at = |r: f64| VoxelCoord(point.map(|c| (c / radius * r).round() as i32));
+        let surface = (0..4000)
+            .map(|d| radius + 800.0 - f64::from(d) * 0.5)
+            .find(|&r| planet.voxel(at(r)).is_some())
+            .expect("ground under the point");
+        let centre = at(surface).0;
+
+        let mut client = planet.crust_around(ground, 100, 2);
+        client.stream_from(1);
+        let mut server = planet.crust_around(ground, 100, 0);
+
+        let op = EditOp::dig_sphere(VoxelCoord(centre), 6);
+        // The Edit comes before the bricks under its parent are resident...
+        let undo_client = apply(&mut client, &op);
+        let undo_server = apply(&mut server, &op);
+        // ...then they are, a brick's children at a time, as the loader does (never over a held brick).
+        let source = client.source().unwrap();
+        for brick in undo_client.bricks().collect::<Vec<_>>() {
+            let parent = brick.parent();
+            let bricks = brick_store::children_from(&*source, 1, parent, |c| client.holds(0, c));
+            client.hold_children(1, parent, bricks);
+            assert!(client.children_resident(1, parent));
+        }
+        // Then it is taken back.
+        undo_client.revert(&mut client);
+        undo_server.revert(&mut server);
+
+        let first = VoxelCoord(centre).brick();
+        for dx in -2..=2 {
+            for dy in -2..=2 {
+                for dz in -2..=2 {
+                    let brick = BrickCoord([first.0[0] + dx, first.0[1] + dy, first.0[2] + dz]);
+                    for i in 0..512 {
+                        let v = brick.voxel([(i & 7) as u8, (i >> 3 & 7) as u8, (i >> 6) as u8]);
+                        assert_eq!(
+                            client.voxel_at(0, v),
+                            server.voxel_at(0, v),
+                            "{v:?} in {brick:?}"
+                        );
+                    }
+                }
+            }
+        }
     }
 }

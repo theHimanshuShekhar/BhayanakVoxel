@@ -117,6 +117,13 @@ impl Predictor {
         &self.store
     }
 
+    /// The Planet's bricks, for a loader to hold more of them: bricks the generator makes, never
+    /// an Edit (those come through [`Predictor::edit`] and the server's word, which keep the
+    /// history to take them back). It must not replace a brick that is held.
+    pub fn store_for_loading(&mut self) -> &mut BrickStore {
+        &mut self.store
+    }
+
     /// Edits that the server has not answered yet.
     pub fn pending(&self) -> usize {
         self.pending.len()

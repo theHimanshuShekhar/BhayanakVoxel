@@ -598,6 +598,21 @@ impl Planet {
     /// time (see [`RegionSource`]): so the deep rock under the region costs a flag, not memory,
     /// and the ground just outside it is not there until it is streamed (#49).
     pub fn region_around(&self, spawn: [f64; 3], reach: i32) -> BrickStore {
+        let (source, found) = self.region_bricks(spawn, reach);
+        let mut store = BrickStore::new();
+        store.set_source(source);
+        for (coord, brick) in found {
+            store.insert(coord, brick);
+        }
+        store
+    }
+
+    /// The bricks of [`Planet::region_around`] and what that store reads where it holds none.
+    fn region_bricks(
+        &self,
+        spawn: [f64; 3],
+        reach: i32,
+    ) -> (RegionSource, Vec<(BrickCoord, Brick)>) {
         let (low, high) = self.heights_near(spawn, reach);
         let up = spawn.map(|c| c / distance(spawn));
         // Along `up`, from two bricks below the lowest strata (the sphere curves up at the sides
@@ -626,12 +641,81 @@ impl Planet {
             }
             Some(self.brick(coord)).filter(|brick| !brick.is_air())
         });
+        (source, found)
+    }
+
+    /// The spawn ring: the full crust at level 0 within `reach` Voxels of the line from the
+    /// centre through `spawn`, as [`Planet::region_around`] has it, in a store that reads the
+    /// Planet itself ([`PlanetSource`]) where it holds nothing, instead of the region's cheap
+    /// stand-ins. So the store is the Planet everywhere, the ring is the part of it that is
+    /// already generated, and a brick outside the ring costs a generation to read. It has a
+    /// pyramid of `levels` levels above level 0 that holds no brick yet.
+    pub fn crust_around(&self, spawn: [f64; 3], reach: i32, levels: usize) -> BrickStore {
+        let (_, found) = self.region_bricks(spawn, reach);
         let mut store = BrickStore::new();
-        store.set_source(source);
+        store.set_source(PlanetSource::new(self.clone()));
+        // The pyramid is made of nothing: its bricks are generated and held as they are wanted.
+        store.build_lod(levels);
         for (coord, brick) in found {
             store.insert(coord, brick);
         }
         store
+    }
+
+    /// Whether every Voxel of level 0 under the brick at `coord` of mip `level` is solid, for
+    /// certain: it is wholly in the interior, or wholly below the lowest the ground can be
+    /// within its box (from the few texels of the world map that the box is over, as
+    /// [`Planet::brick`] decides most bricks). `false` means that it is not known, not that it
+    /// has air. The strata and everything below them are solid, so this holds for every brick
+    /// that is a brick or so under the ground, which is nearly all of the crust.
+    pub fn solid_below(&self, level: usize, coord: BrickCoord) -> bool {
+        if inside_interior(level, coord) {
+            return true;
+        }
+        let width = f64::from(BRICK_SIZE) * f64::from(1u32 << level);
+        let low = coord.0.map(|c| f64::from(c) * width);
+        let high = low.map(|l| l + width);
+        let (_, far) = radii_of_box(low, high);
+        let corners: [[f64; 3]; 8] = std::array::from_fn(|i| {
+            std::array::from_fn(|a| if i >> a & 1 == 0 { low[a] } else { high[a] })
+        });
+        let (lowest, _) = self.map.elevation_range(&corners);
+        SEA_RADIUS + lowest - far - SLACK > 0.0
+    }
+
+    /// The Guard: the bricks of the whole Planet at the mip levels `levels` (8 to 12, the top of
+    /// the pyramid, in the client), each as [`Planet::coarse_brick`] makes it, except air and the
+    /// bricks wholly in the interior (a source gives those; see [`PlanetSource`]). Generated on
+    /// all the cores. Returned as `(level, coordinate, brick, solid_below)`, coarsest level first,
+    /// where `solid_below` is [`Planet::solid_below`] of the brick, worked out on those cores too.
+    pub fn guard(
+        &self,
+        levels: std::ops::RangeInclusive<usize>,
+    ) -> Vec<(usize, BrickCoord, Brick, bool)> {
+        let mut out = Vec::new();
+        for level in levels.rev() {
+            assert!(level > 0, "level 0 is not coarse");
+            // The bricks of this level that the ball the Planet is in touches.
+            let size = f64::from(BRICK_SIZE) * f64::from(1u32 << level);
+            let reach = (f64::from(MAX_RADIUS) / size).floor() as i32 + 1;
+            let found = par_bricks(BrickCoord([-reach; 3]), BrickCoord([reach; 3]), |coord| {
+                let low = coord.0.map(|c| f64::from(c) * size);
+                let high = low.map(|l| l + size);
+                if radii_of_box(low, high).0 >= f64::from(MAX_RADIUS)
+                    || inside_interior(level, coord)
+                {
+                    return None;
+                }
+                let brick = self.coarse_brick(level, coord);
+                (!brick.is_air()).then(|| (brick, self.solid_below(level, coord)))
+            });
+            out.extend(
+                found
+                    .into_iter()
+                    .map(|(coord, (brick, solid))| (level, coord, brick, solid)),
+            );
+        }
+        out
     }
 }
 
@@ -646,9 +730,11 @@ fn inside_interior(level: usize, coord: BrickCoord) -> bool {
 /// of level 0 is [`Planet::brick`] and a coarse one is [`Planet::coarse_brick`], so the ground
 /// far from where the store holds bricks is drawn at the level its distance asks for, and
 /// costs a brick's worth of Voxels for each brick that holds ground. Measured on the client's
-/// first view of the full-size Planet (#84): 3.0 million bricks, 228 s on eight cores, so it is
-/// for a streaming loader (#86, #49) to ask for, not for a frame to wait on. Nothing calls it yet
-/// but its test: it is here for that loader.
+/// first view of the full-size Planet (#84): 3.0 million bricks, 228 s on eight cores, so a frame
+/// must not wait on it: the client's store streams (`BrickStore::stream_from`), and the ring
+/// loader (#86) reads the bricks of the first view on worker threads, a brick's children at a time, before
+/// the scene asks the store for them. What reads this on the frame thread is an Edit, which
+/// remakes the bricks over it, and the ones beside them, from their children.
 ///
 /// A store holds the bricks that Edits changed and the region around the spawn; everything else
 /// is this. Unedited bricks are a cache that can be regenerated from the seed (ADR 0002).
@@ -673,7 +759,7 @@ impl BrickSource for PlanetSource {
     }
 
     fn solid_below(&self, level: usize, coord: BrickCoord) -> bool {
-        inside_interior(level, coord)
+        self.planet.solid_below(level, coord)
     }
 }
 
@@ -1751,6 +1837,110 @@ mod tests {
                     planet().coarse_brick(level, coarse)
                 );
             }
+        }
+    }
+
+    #[test]
+    fn solid_below_is_never_claimed_for_a_brick_with_air_under_it_and_holds_a_little_under_the_ground()
+     {
+        let spawn = planet().spawn(SPAWN_REACH);
+        let ground = spawn.iter().map(|c| c * c).sum::<f64>().sqrt();
+        let mut proven = 0;
+        for direction in [spawn, [0.3, 0.8, 0.5], [-1.0, 0.2, -0.4], [0.1, -0.9, 0.2]] {
+            for level in 0..5 {
+                // From deep in the strata up to the sky, a brick at a time along the radial.
+                let step = 4.0 * f64::from(BRICK_SIZE << level);
+                let mut radius = ground - 6000.0;
+                while radius < ground + 3000.0 {
+                    let coord = BrickCoord(along(direction, radius).brick().0.map(|c| c >> level));
+                    if planet().solid_below(level, coord) {
+                        proven += 1;
+                        // Every Voxel of level 0 under it, or a lattice of them for the big ones.
+                        let stride = 1 << level.saturating_sub(1);
+                        let first = coord.0.map(|c| c * (BRICK_SIZE << level));
+                        for z in (0..BRICK_SIZE << level).step_by(stride as usize) {
+                            for y in (0..BRICK_SIZE << level).step_by(stride as usize) {
+                                for x in (0..BRICK_SIZE << level).step_by(stride as usize) {
+                                    let at = VoxelCoord([first[0] + x, first[1] + y, first[2] + z]);
+                                    assert!(
+                                        planet().voxel(at).is_some(),
+                                        "level {level} {coord:?} has air at {at:?}"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    radius += step;
+                }
+            }
+        }
+        assert!(proven > 100, "{proven}");
+        // A brick well under the ground is proven, one that has the ground in it is not. (Not at
+        // the spawn, which is the middle of a texel of the map, where the bounds are the widest.)
+        let direction = [0.3, 0.8, 0.5];
+        let radius = f64::from(SEA_RADIUS as i32)
+            + planet()
+                .map()
+                .elevation_at(along(direction, SEA_RADIUS).0.map(f64::from));
+        let at = |dr: f64, level: usize| {
+            BrickCoord(along(direction, radius + dr).brick().0.map(|c| c >> level))
+        };
+        assert!(planet().solid_below(0, at(-400.0, 0)));
+        assert!(planet().solid_below(3, at(-800.0, 3)));
+        assert!(!planet().solid_below(0, at(0.0, 0)));
+        assert!(!planet().solid_below(3, at(0.0, 3)));
+        assert!(!planet().solid_below(0, at(100.0, 0)));
+    }
+
+    #[test]
+    fn the_crust_around_the_spawn_is_the_region_with_the_planet_for_a_source() {
+        let spawn = planet().spawn(SPAWN_REACH);
+        let crust = planet().crust_around(spawn, SPAWN_REACH, 3);
+        assert_eq!(crust.content_hash(), region().content_hash());
+        // Under the ring and beside it, a brick reads as the Planet's own.
+        let radius = spawn.iter().map(|c| c * c).sum::<f64>().sqrt();
+        for dr in [-3000.0, -700.0, 20.0, 500.0] {
+            let coord = along(spawn, radius + dr).brick();
+            assert_eq!(*crust.brick_at(0, coord), planet().brick(coord), "{dr}");
+        }
+        let far = along([0.3, 0.8, 0.5], radius).brick();
+        assert_eq!(*crust.brick_at(0, far), planet().brick(far));
+        assert!(crust.source_solid_below(0, along(spawn, radius - 600.0).brick()));
+    }
+
+    #[test]
+    fn the_guard_is_every_brick_of_its_levels_that_is_not_air_and_not_the_interior() {
+        let guard = planet().guard(11..=12);
+        assert!(guard.windows(2).all(|w| w[0].0 >= w[1].0), "coarsest first");
+        let found: std::collections::BTreeMap<_, _> = guard
+            .into_iter()
+            .map(|(level, coord, brick, solid)| {
+                assert_eq!(solid, planet().solid_below(level, coord));
+                ((level, coord), brick)
+            })
+            .collect();
+        for level in 11..=12 {
+            let reach = MAX_RADIUS / (BRICK_SIZE << level) + 2;
+            let mut expected = 0;
+            for x in -reach..=reach {
+                for y in -reach..=reach {
+                    for z in -reach..=reach {
+                        let coord = BrickCoord([x, y, z]);
+                        let brick = planet().coarse_brick(level, coord);
+                        let wanted = !brick.is_air() && !inside_interior(level, coord);
+                        assert_eq!(
+                            found.contains_key(&(level, coord)),
+                            wanted,
+                            "{level} {coord:?}"
+                        );
+                        if let Some(held) = found.get(&(level, coord)) {
+                            assert_eq!(*held, brick);
+                            expected += 1;
+                        }
+                    }
+                }
+            }
+            assert!(expected > 100, "level {level} has {expected}");
         }
     }
 }

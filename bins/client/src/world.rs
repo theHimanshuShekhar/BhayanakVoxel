@@ -8,8 +8,19 @@ use render::reference::{Hit, Ray, trace};
 use render::{Camera, RingsFull, Scene, SceneUpdate, camera};
 use sim::Predictor;
 
+use crate::loader::{Arrival, Loader};
+
+/// What the frame thread aims to spend taking in bricks from the loader in one frame, the upload
+/// to the GPU included. A resident set that is filling takes more frames, not longer ones.
+pub const STREAM_BUDGET: std::time::Duration = std::time::Duration::from_micros(2000);
+/// Bricks' children taken in at a time, between looks at the clock.
+const BATCH: usize = 8;
+/// Most bricks asked of the loader in one frame (the rest wait for the next): the first call has
+/// every brick the Guard leaves to split, and the table that holds them is not made in a frame.
+const WANTED_PER_FRAME: usize = 20_000;
+
 /// Radius of the sphere a click digs: 1 m at 10 cm Voxels.
-const DIG_RADIUS: u16 = 10;
+pub(crate) const DIG_RADIUS: u16 = 10;
 
 /// Why the Planet cannot be kept going.
 #[derive(Debug, PartialEq, Eq)]
@@ -43,14 +54,54 @@ impl From<RingsFull> for Stopped {
     }
 }
 
+/// How long the frame thread spent on the scene each frame (following the camera, taking in
+/// bricks, copying the changes to the GPU), for reporting the worst and the 99th percentile.
+#[derive(Debug, Default)]
+pub struct SceneWork {
+    millis: Vec<f64>,
+}
+
+impl SceneWork {
+    pub fn record(&mut self, took: std::time::Duration) {
+        self.millis.push(took.as_secs_f64() * 1000.0);
+    }
+
+    /// The longest frame, in milliseconds.
+    pub fn worst(&self) -> Option<f64> {
+        self.millis.iter().copied().max_by(f64::total_cmp)
+    }
+
+    /// The 99th percentile (nearest rank): the time that 99% of the frames did not exceed.
+    pub fn p99(&self) -> Option<f64> {
+        let mut sorted = self.millis.clone();
+        sorted.sort_by(f64::total_cmp);
+        let rank = (sorted.len() * 99).div_ceil(100);
+        rank.checked_sub(1).map(|i| sorted[i])
+    }
+
+    /// One line for a log, if any frame was recorded.
+    pub fn summary(&self) -> Option<String> {
+        Some(format!(
+            "scene work on the frame thread: {} frames, p99 {:.2} ms, worst {:.2} ms",
+            self.millis.len(),
+            self.p99()?,
+            self.worst()?
+        ))
+    }
+}
+
 pub struct World {
     scene: Scene,
     predictor: Predictor,
     link: ClientEnd,
+    /// Generates the bricks that the scene is waiting for, if the Planet is streamed in.
+    loader: Option<Loader>,
+    /// What [`World::stream`] expects taking in a batch to cost.
+    batch_cost: std::time::Duration,
 }
 
 /// The first solid Voxel along the camera's view through the middle of the screen.
-fn centre_hit(scene: &Scene, camera: &Camera) -> Option<Hit> {
+pub(crate) fn centre_hit(scene: &Scene, camera: &Camera) -> Option<Hit> {
     let (cell, origin) = camera::split(camera.position);
     trace(
         scene,
@@ -69,11 +120,37 @@ impl World {
             scene,
             predictor,
             link,
+            loader: None,
+            batch_cost: std::time::Duration::ZERO,
         }
+    }
+
+    /// Streams the Planet in with `loader`: see [`World::stream`]. The scene must have been made
+    /// from the predictor's store, which must stream ([`brick_store::BrickStore::stream_from`]).
+    pub fn with_loader(mut self, loader: Loader) -> Self {
+        self.loader = Some(loader);
+        self
+    }
+
+    /// The loader, if there is one.
+    pub fn loader(&self) -> Option<&Loader> {
+        self.loader.as_ref()
+    }
+
+    /// Bricks that wait for the bricks under them to be resident. Zero, and nothing pending with
+    /// the loader, once the resident set is complete for the bands.
+    pub fn waiting(&self) -> usize {
+        self.scene.waiting()
     }
 
     pub fn scene(&self) -> &Scene {
         &self.scene
+    }
+
+    /// The Planet's bricks as the client holds them.
+    #[cfg(test)]
+    pub fn store(&self) -> &brick_store::BrickStore {
+        self.predictor.store()
     }
 
     /// Puts the character on the Planet at `position` (Voxels), and tells the server. It falls
@@ -102,6 +179,70 @@ impl World {
     /// the scene changed, if it did.
     pub fn recentre(&mut self, camera: [f64; 3]) -> Result<Option<SceneUpdate>, RingsFull> {
         self.scene.recentre(self.predictor.store(), camera)
+    }
+
+    /// Asks the loader for what the bands are waiting for, nearest `camera` first, and takes in
+    /// what it has generated, for [`STREAM_BUDGET`] at the most: a few bricks' children at a time
+    /// are held, the scene splits the bricks they are under, and `show` copies what that changed
+    /// to the GPU (its time is in the budget). This is all the frame thread does of loading: the
+    /// bricks are generated on the loader's threads, at most [`crate::loader::MAX_AHEAD`] ahead
+    /// of what is taken in here, and what is not taken in this frame waits for the next.
+    pub fn stream<E: From<RingsFull>>(
+        &mut self,
+        camera: [f64; 3],
+        mut show: impl FnMut(&Scene, &SceneUpdate) -> Result<(), E>,
+    ) -> Result<(), E> {
+        let Self {
+            scene,
+            predictor,
+            loader: Some(loader),
+            batch_cost,
+            ..
+        } = self
+        else {
+            return Ok(());
+        };
+        let Some(bands) = scene.bands() else {
+            return Ok(());
+        };
+        let started = std::time::Instant::now();
+        loader.cancel(scene.take_cancelled());
+        loader.request(
+            predictor.store(),
+            scene.take_wanted_up_to(WANTED_PER_FRAME),
+            camera,
+        );
+        loader.sync(camera, bands);
+        let mut worst = std::time::Duration::ZERO;
+        while started.elapsed() + *batch_cost <= STREAM_BUDGET {
+            let batch_started = std::time::Instant::now();
+            let mut resident = Vec::new();
+            for arrival in loader.receive(BATCH) {
+                match arrival {
+                    Arrival::Children { key, bricks } => {
+                        predictor
+                            .store_for_loading()
+                            .hold_children(key.0, key.1, bricks);
+                        resident.push(key);
+                    }
+                    Arrival::Dropped(key) => scene.unwant(key),
+                }
+            }
+            if resident.is_empty() {
+                break;
+            }
+            if let Some(update) = scene.arrive(predictor.store(), &resident)? {
+                show(scene, &update)?;
+            }
+            worst = worst.max(batch_started.elapsed());
+        }
+        // What the next frame expects a batch to cost: a running mean of the worst of each frame,
+        // and never more than a third of the budget, so that one slow batch (a table that grew)
+        // does not stop taking bricks in for the frames after it.
+        if !worst.is_zero() {
+            *batch_cost = (batch_cost.mul_f64(0.8) + worst.mul_f64(0.2)).min(STREAM_BUDGET / 3);
+        }
+        Ok(())
     }
 
     /// Selects the bricks again for other LOD `bands` (a new bias). Returns how the scene
