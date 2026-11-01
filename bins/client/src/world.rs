@@ -170,6 +170,11 @@ impl World {
         Ok(())
     }
 
+    /// What bounds the character, once the server has said.
+    pub fn leash(&self) -> Option<net::Leash> {
+        self.predictor.character().and_then(sim::Character::leash)
+    }
+
     /// Where the character's eyes are, if it has spawned.
     pub fn eye(&self) -> Option<[f64; 3]> {
         self.predictor.character().map(sim::Character::eye)
@@ -383,8 +388,7 @@ mod tests {
     }
 
     #[test]
-    fn the_character_waits_for_the_servers_leash_then_lands_on_the_wall_and_the_server_is_sent_its_spawn_and_every_tick()
-     {
+    fn the_character_waits_for_the_leash_then_lands_on_the_wall() {
         let (mut world, server) = world();
         assert_eq!(world.eye(), None);
         world.walk(MoveInput::default()).unwrap();
@@ -408,6 +412,7 @@ mod tests {
         // wall's bricks are in the store, and the rest of the ground is air.
         server
             .send(ServerMessage::Leash {
+                spawn: 1,
                 from: 0,
                 leash: Leash {
                     centre: [4036.0, 20.0, -12.0],
@@ -424,7 +429,10 @@ mod tests {
 
         assert_eq!(
             server.try_recv(),
-            Ok(ClientMessage::Spawn { position: spawn })
+            Ok(ClientMessage::Spawn {
+                spawn: 1,
+                position: spawn
+            })
         );
         let mut inputs = 0;
         while let Ok(ClientMessage::Input { seq, .. }) = server.try_recv() {

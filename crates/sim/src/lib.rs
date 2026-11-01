@@ -11,7 +11,7 @@ use std::time::Duration;
 
 pub use character::{Cell, Character, Occupancy, TICK_DT};
 pub use edit::{MAX_BRUSH_RADIUS, Undo, apply, validate};
-pub use ground::{Ground, Terrain};
+pub use ground::{Footing, Ground};
 pub use movement::{ConfigError, Movement, MovementConfig, VOXELS_PER_METRE};
 pub use prediction::Predictor;
 pub use server::{Outcome, Server, ServerHandle, TICK_RATE_HZ, spawn};

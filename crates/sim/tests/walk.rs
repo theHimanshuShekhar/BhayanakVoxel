@@ -148,6 +148,12 @@ impl Pair {
 
     /// The client's tick, the server's, and the delivery of what the server said `lag` ticks ago.
     fn tick(&mut self, input: MoveInput) {
+        self.client_tick(input);
+        self.serve();
+    }
+
+    /// The client's tick alone: it sends an input, or waits.
+    fn client_tick(&mut self, input: MoveInput) {
         let started = Instant::now();
         let request = self.client.walk(input);
         self.client_costs.0.push(started.elapsed());
@@ -158,7 +164,6 @@ impl Pair {
             }
             None => self.waited += u64::from(self.sent > 0),
         }
-        self.serve();
     }
 
     /// The server's tick, and the delivery of what it said `lag` ticks ago.
@@ -246,16 +251,24 @@ fn fingerprint(state: &BodyState, leash: Leash) -> u64 {
     hash
 }
 
-/// A scripted walk along the great circle round the test Planet's +z axis, running, jumping and
-/// crouching at times, and drifting a little to either side. It goes by the number of the input,
-/// so that it is the same however long the character waited for its ground.
-fn script(pair: &Pair, _tick: u64) -> MoveInput {
-    let i = pair.sent;
-    let [x, y, _] = pair.client_state().position;
+/// A scripted walk of legs of 100 inputs, each in another heading across the ground (world
+/// directions, which the controller flattens onto the ground at the spawn on the +x axis), running, jumping and
+/// crouching at times, and drifting a little to either side. It goes by the number of the input
+/// and by nothing the character does, so that it is the same however long the character waited
+/// for its ground and whoever has been corrected.
+fn script(i: u64) -> MoveInput {
+    let heading = [
+        [0.0, 1.0, 0.0],
+        [0.0, 1.0, 1.0],
+        [0.0, 1.0, 0.0],
+        [0.0, 1.0, -1.0],
+        [0.0, 0.0, 1.0],
+        [0.0, 1.0, 0.0],
+    ][(i / 100 % 6) as usize];
     MoveInput {
         forward: 1,
         right: [0, 0, 1, 0, -1][(i / 70 % 5) as usize],
-        heading: [-y, x, 0.0],
+        heading,
         jump: i.is_multiple_of(83),
         run: i % 200 > 120,
         crouch: i % 310 > 270,
@@ -263,34 +276,68 @@ fn script(pair: &Pair, _tick: u64) -> MoveInput {
 }
 
 const TICKS: u64 = 600;
-const GOLDEN: u64 = 0xcdf2_c703_d4ca_2ca8;
+const GOLDEN: u64 = 0x456e_48e7_5898_859e;
+/// Bricks of ground per input, so slow that the character is held at the edge of its leash.
+const SLOW: usize = 8;
+const GOLDEN_AT_THE_EDGE: u64 = 0x2abe_ab1a_1140_ac35;
 
-/// The scripted walk, with the server's replies `lag` ticks late: where the server ends, and its
-/// leash.
-fn scripted_walk(lag: usize) -> (BodyState, Leash) {
-    let mut pair = Pair::new(test_planet, None, lag);
+/// Runs the scripted walk for `inputs` inputs, with the server's replies `lag` ticks late and
+/// `batch` inputs reaching the server in each of its ticks, and `rate` new bricks of ground per
+/// input if not the usual. Returns where the server ends and its leash, and how close to the edge
+/// of it the character got, as a fraction of the leash's radius.
+fn scripted_walk(
+    inputs: u64,
+    lag: usize,
+    batch: u64,
+    rate: Option<usize>,
+) -> (BodyState, Leash, f64) {
+    let mut pair = Pair::new(test_planet, rate, lag);
     pair.spawn([1530.0, 0.0, 0.0]);
     // The character waits for its ground and the server's word, and then walks.
-    pair.run(TICKS, 5 * TICKS, script);
-    assert_eq!(pair.sent, TICKS);
-    pair.assert_agree();
+    let mut edge: f64 = 0.0;
+    for _ in 0..50 * inputs {
+        if pair.sent >= inputs {
+            break;
+        }
+        for _ in 0..batch {
+            if pair.sent < inputs {
+                pair.client_tick(script(pair.sent));
+            }
+        }
+        pair.serve();
+        if let Some(leash) = pair.server.character(0).and_then(sim::Character::leash) {
+            let from_centre = distance(pair.server_state().position, leash.centre);
+            edge = edge.max(from_centre / leash.radius);
+        }
+    }
+    assert_eq!(pair.sent, inputs);
+    for _ in 0..=pair.lag {
+        pair.serve();
+    }
+    if batch == 1 && rate.is_none() {
+        pair.assert_agree();
+    } else {
+        // Held at the edge, or with the inputs bunched, the client runs ahead of the leashes it has
+        // heard of and is corrected (the server never is): it ends in step all the same.
+        assert!(pair.server_state().identical(&pair.client_state()));
+    }
     let leash = pair.server.character(0).unwrap().leash();
-    (pair.server_state(), leash.expect("leashed"))
+    (pair.server_state(), leash.expect("leashed"), edge)
 }
 
 #[test]
 fn golden_the_client_and_the_server_agree_on_every_bit_of_a_walk_past_the_spawn() {
-    let (state, leash) = scripted_walk(3);
+    let (state, leash, _) = scripted_walk(TICKS, 3, 1, None);
     // Pinned, so that CI (Linux and Windows, debug and release) fails if any machine's
     // arithmetic differs: if the controller changes on purpose, replace it with the `actual`.
     let fingerprint = fingerprint(&state, leash);
     assert_eq!(fingerprint, GOLDEN, "actual {fingerprint:#018x}");
 
-    // It really walked: down onto the ground and then 50 m or so along it, far past the 8 m of
-    // ground that the server makes first (and the 40 m ring that the game's client generates),
-    // and the leash went with it.
+    // It really walked: down onto the ground and then 50 m or so along it, in several headings,
+    // far past the 8 m of ground that the server makes first (and the 40 m ring that the game's
+    // client generates), and the leash went with it.
     let went = distance(state.position, [1530.0, 0.0, 0.0]);
-    assert!(went > 450.0, "went {went} Voxels");
+    assert!(went > 300.0, "went {went} Voxels");
     let height = distance(state.position, [0.0; 3]);
     assert!(
         (1480.0..1540.0).contains(&height),
@@ -300,11 +347,40 @@ fn golden_the_client_and_the_server_agree_on_every_bit_of_a_walk_past_the_spawn(
 }
 
 #[test]
+fn golden_the_client_and_the_server_agree_on_every_bit_of_a_walk_held_at_the_edge_of_the_leash() {
+    let (state, leash, edge) = scripted_walk(400, 2, 1, Some(SLOW));
+    let fingerprint = fingerprint(&state, leash);
+    assert_eq!(
+        fingerprint, GOLDEN_AT_THE_EDGE,
+        "actual {fingerprint:#018x}"
+    );
+    // The ground came slower than the character walked, so that it pushed against the wall.
+    assert!(edge > 0.9, "got to {edge} of the leash");
+}
+
+#[test]
 fn what_the_server_does_with_the_inputs_does_not_depend_on_how_late_the_client_hears_of_it() {
-    let (state, leash) = scripted_walk(0);
-    assert_eq!(fingerprint(&state, leash), GOLDEN);
-    let (state, leash) = scripted_walk(11);
-    assert_eq!(fingerprint(&state, leash), GOLDEN);
+    for lag in [0, 11] {
+        let (state, leash, _) = scripted_walk(TICKS, lag, 1, None);
+        assert_eq!(fingerprint(&state, leash), GOLDEN, "lag {lag}");
+    }
+}
+
+/// The ground is made once per input the server applies, not once per tick of its own: so with
+/// several inputs reaching it in one tick, it holds the character to the same leashes as with
+/// one, and the client (which makes its ground once per input too) stays in step.
+#[test]
+fn the_server_makes_ground_once_per_input_not_once_per_tick() {
+    for batch in [3, 8] {
+        let (state, leash, _) = scripted_walk(TICKS, 3, batch, None);
+        assert_eq!(fingerprint(&state, leash), GOLDEN, "{batch} inputs a tick");
+        let (state, leash, _) = scripted_walk(400, 2, batch, Some(SLOW));
+        assert_eq!(
+            fingerprint(&state, leash),
+            GOLDEN_AT_THE_EDGE,
+            "{batch} inputs a tick, held at the edge"
+        );
+    }
 }
 
 /// The real Planet's gentle land around its spawn: where the spawn is, the way ahead along the
@@ -551,4 +627,67 @@ fn a_character_falls_into_a_hole_dug_under_it_beyond_the_spawn_and_both_sides_ag
     let after = height(pair.server_state().position);
     assert!(after < before - 6.0, "fell {} Voxels", before - after);
     pair.assert_agree();
+}
+
+#[test]
+fn a_leash_from_before_a_respawn_that_arrives_after_it_is_ignored_and_the_walk_goes_on() {
+    let (link, server_end) = loopback();
+    let mut client = Predictor::new(test_planet());
+    let mut server = Server::new(test_planet());
+    // Spawns at A, and the server's first word about it is held back...
+    link.send(client.spawn([1530.0, 0.0, 0.0])).unwrap();
+    let mut held = Vec::new();
+    while !held
+        .iter()
+        .any(|m| matches!(m, ServerMessage::Leash { .. }))
+    {
+        // The client makes the ground round A meanwhile.
+        client.walk(MoveInput::default());
+        server.tick(std::slice::from_ref(&server_end));
+        held.extend(std::iter::from_fn(|| link.try_recv().ok()));
+    }
+    // ...while the client respawns at B, nearby (noclip off and on), and then it arrives.
+    link.send(client.spawn([1530.0, 40.0, 0.0])).unwrap();
+    for message in held {
+        client.receive(message);
+    }
+    let mut sent = 0;
+    for _ in 0..1500 {
+        if sent == 300 {
+            break;
+        }
+        let [x, y, _] = client.character().unwrap().state().position;
+        let input = MoveInput {
+            forward: 1,
+            heading: [-y, x, 0.0],
+            ..MoveInput::default()
+        };
+        if let Some(request) = client.walk(input) {
+            sent += 1;
+            link.send(request).unwrap();
+        }
+        server.tick(std::slice::from_ref(&server_end));
+        while let Ok(message) = link.try_recv() {
+            client.receive(message);
+        }
+    }
+    eprintln!(
+        "applied {:?} desyncs {}",
+        client.character().unwrap().state().position,
+        client.body_desyncs()
+    );
+    assert_eq!(sent, 300);
+    server.tick(std::slice::from_ref(&server_end));
+    while let Ok(message) = link.try_recv() {
+        client.receive(message);
+    }
+    let (server, client_state) = (
+        *server.character(0).unwrap().state(),
+        *client.character().unwrap().state(),
+    );
+    assert!(
+        server.identical(&client_state),
+        "{server:?}\n{client_state:?}"
+    );
+    assert!(server.position[1] > 100.0, "the server's character walked");
 }

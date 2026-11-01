@@ -47,11 +47,11 @@ _Avoid_: Map view, space view
 ### Walking
 
 **Ground**:
-The level-0 bricks around one character, generated from the seed by both the client's predictor and the server, so that a collision query reads them and never generates one. Evicted behind the character. Not the Resident set, which is the camera's, and which collision never reads.
+The part of the Planet around a character that both client and server have generated, which the character stands on and touches. It follows the character; what lies beyond it is not yet known.
 _Avoid_: Terrain cache, collision set
 
 **Leash**:
-The ball of Voxels that a character may be in, which the server moves as the Ground around the character becomes ready, and tells the client from which input it holds. Space beyond it is solid.
+The region a character is confined to. The server keeps it within the Ground and moves it as the character walks; beyond it the character is blocked.
 _Avoid_: Tether, bounds
 
 ### Visibility and streaming

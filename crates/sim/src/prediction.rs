@@ -13,7 +13,7 @@ use std::collections::{BTreeSet, VecDeque};
 use brick_store::{BrickCoord, BrickStore};
 use net::{BodyState, ClientMessage, EditOp, Leash, MoveInput, ServerMessage};
 
-use crate::{Character, Ground, Movement, Terrain, Undo, apply};
+use crate::{Character, Footing, Ground, Movement, Undo, apply};
 
 struct Pending {
     client_seq: u64,
@@ -54,6 +54,9 @@ pub struct Predictor {
     leashes: VecDeque<(u64, Leash)>,
     /// The leash last found to be covered by the ground, so that it is looked for once.
     covered: Option<Leash>,
+    /// How many times the character has been spawned: the number of the current spawn, which the
+    /// server's words about the character carry.
+    spawns: u64,
 }
 
 impl Predictor {
@@ -72,6 +75,7 @@ impl Predictor {
             ground,
             leashes: VecDeque::new(),
             covered: None,
+            spawns: 0,
         }
     }
 
@@ -106,7 +110,11 @@ impl Predictor {
         self.leashes.clear();
         self.covered = None;
         self.ground.reset(position);
-        ClientMessage::Spawn { position }
+        self.spawns += 1;
+        ClientMessage::Spawn {
+            spawn: self.spawns,
+            position,
+        }
     }
 
     /// Runs one tick of the character on the local Planet, which shows it at once. Returns the
@@ -130,7 +138,7 @@ impl Predictor {
         });
         let request = leash.map(|leash| {
             character.set_leash(Some(leash));
-            character.tick(&Terrain::new(&self.store, &self.ground), &input);
+            character.tick(&Footing::new(&self.store, &self.ground), &input);
             self.next_input_seq += 1;
             self.pending_inputs.push_back(PendingInput {
                 seq,
@@ -171,8 +179,23 @@ impl Predictor {
         self.body_desyncs += 1;
         character.set_state(state);
         for pending in &mut self.pending_inputs {
-            character.set_leash(leash_at(&self.leashes, pending.seq));
-            character.tick(&Terrain::new(&self.store, &self.ground), &pending.input);
+            let leash = leash_at(&self.leashes, pending.seq);
+            if let Some(leash) = leash
+                && self.covered != Some(leash)
+            {
+                // Run again under a leash that the ground here does not reach yet: make the
+                // ground (this is rare, and the one time that a tick is spent on it) so that the
+                // inputs meet what the server's did.
+                if !self.ground.covers(&leash) {
+                    self.ground.centre_on(&leash);
+                    while !self.ground.is_complete() {
+                        self.ground.fill();
+                    }
+                }
+                self.covered = Some(leash);
+            }
+            character.set_leash(leash);
+            character.tick(&Footing::new(&self.store, &self.ground), &pending.input);
             pending.after = *character.state();
         }
     }
@@ -236,11 +259,18 @@ impl Predictor {
                 self.apply_authoritative(op, Some(client_seq))
             }
             ServerMessage::Applied { op, ack: None, .. } => self.apply_authoritative(op, None),
-            ServerMessage::Body { applied, state } => {
+            // What the server said about a character this client has since replaced is not about
+            // this one.
+            ServerMessage::Body { spawn, .. } | ServerMessage::Leash { spawn, .. }
+                if spawn != self.spawns =>
+            {
+                Vec::new()
+            }
+            ServerMessage::Body { applied, state, .. } => {
                 self.receive_body(applied, state);
                 Vec::new()
             }
-            ServerMessage::Leash { from, leash } => {
+            ServerMessage::Leash { from, leash, .. } => {
                 self.leashes.push_back((from, leash));
                 Vec::new()
             }
@@ -526,6 +556,7 @@ mod tests {
         client.spawn(START);
         assert!(client.walk(forward()).is_none(), "no leash yet");
         client.receive(ServerMessage::Leash {
+            spawn: 1,
             from: 0,
             leash: ball(80.0),
         });
@@ -555,16 +586,16 @@ mod tests {
         let rerun = |client: &Predictor, inputs: &[MoveInput], from: usize| {
             let applied = 10;
             let mut character = Character::spawn(Movement::default(), START, Some(ball(80.0)));
-            let terrain = Terrain::new(client.store(), client.ground());
+            let footing = Footing::new(client.store(), client.ground());
             for input in &inputs[..applied] {
-                character.tick(&terrain, input);
+                character.tick(&footing, input);
             }
             let mut told = *character.state();
             told.position[0] += 1.0;
             character.set_state(told);
             for (seq, input) in inputs.iter().enumerate().skip(applied) {
                 character.set_leash(Some(ball(if seq < from { 80.0 } else { 14.0 })));
-                character.tick(&terrain, input);
+                character.tick(&footing, input);
             }
             (told, *character.state())
         };
@@ -572,6 +603,7 @@ mod tests {
         let mut client = Predictor::new(flat_store());
         client.spawn(START);
         client.receive(ServerMessage::Leash {
+            spawn: 1,
             from: 0,
             leash: ball(80.0),
         });
@@ -587,15 +619,82 @@ mod tests {
         assert!(!rerun(&client, &inputs, 21).1.identical(&want));
 
         client.receive(ServerMessage::Leash {
+            spawn: 1,
             from: 20,
             leash: ball(14.0),
         });
         client.receive(ServerMessage::Body {
+            spawn: 1,
             applied: 10,
             state: told,
         });
         assert_eq!(client.body_desyncs(), 1);
         let now = client.character().unwrap().state();
         assert!(now.identical(&want), "{now:?}\n{want:?}");
+    }
+
+    #[test]
+    fn what_the_server_said_about_an_earlier_spawn_is_ignored() {
+        let mut client = Predictor::new(flat_store());
+        client.spawn(START);
+        client.spawn(START);
+        // In flight for the first spawn when the second was made.
+        client.receive(ServerMessage::Leash {
+            spawn: 1,
+            from: 0,
+            leash: ball(80.0),
+        });
+        let mut elsewhere = *client.character().unwrap().state();
+        elsewhere.position[0] += 9.0;
+        client.receive(ServerMessage::Body {
+            spawn: 1,
+            applied: 0,
+            state: elsewhere,
+        });
+        assert_eq!(client.body_desyncs(), 0);
+        for _ in 0..200 {
+            assert!(client.walk(forward()).is_none(), "no leash for this spawn");
+        }
+        client.receive(ServerMessage::Leash {
+            spawn: 2,
+            from: 0,
+            leash: ball(80.0),
+        });
+        assert!((0..200).any(|_| client.walk(forward()).is_some()));
+    }
+
+    #[test]
+    fn inputs_run_again_under_a_leash_the_ground_does_not_reach_yet_make_the_ground_first() {
+        let mut client = Predictor::new(flat_store());
+        client.spawn(START);
+        client.receive(ServerMessage::Leash {
+            spawn: 1,
+            from: 0,
+            leash: ball(24.0),
+        });
+        let mut sent = 0;
+        while sent < 6 {
+            sent += i32::from(client.walk(forward()).is_some());
+        }
+        // The server turned out to have moved the leash a long way, from the fourth input.
+        let far = Leash {
+            centre: [200.0, 4.0, 4.0],
+            radius: 40.0,
+        };
+        client.receive(ServerMessage::Leash {
+            spawn: 1,
+            from: 3,
+            leash: far,
+        });
+        assert!(!client.ground().covers(&far));
+        let mut elsewhere = *client.character().unwrap().state();
+        elsewhere.position[0] += 1.0;
+        client.receive(ServerMessage::Body {
+            spawn: 1,
+            applied: 2,
+            state: elsewhere,
+        });
+        assert_eq!(client.body_desyncs(), 1);
+        assert!(client.ground().covers(&far));
     }
 }

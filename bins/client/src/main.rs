@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 use brick_store::BrickStore;
 use fly::{Action, Fly};
 use loader::{GUARD_FIRST, Loader};
+use net::Leash;
 use planet_gen::planet::Planet;
 use planet_gen::world_map::{WORLD_MAP_SIZE, WORLD_RADIUS, WorldMap};
 use render::lod::{self, Bands};
@@ -206,16 +207,31 @@ fn drop_point(ground: [f64; 3]) -> [f64; 3] {
     std::array::from_fn(|a| ground[a] + ground[a] / length * DROP_HEIGHT)
 }
 
-/// Where to put the character down when it leaves noclip with the camera at `eye`: under it, on
-/// the ground, or at the spawn if the camera is farther from the spawn's line through the
-/// Planet's centre than [`SPAWN_REACH`], where the ground is known to be near the camera's height.
-fn landing(eye: [f64; 3], ground: [f64; 3]) -> [f64; 3] {
+/// Where to put the character down when it leaves noclip with the camera at `eye`: under the
+/// camera, on the ground, if the camera is within or near the character's `leash` (the ball it
+/// last walked in), else at the leash's centre. Before it has walked, the camera is near enough
+/// if it is within [`SPAWN_REACH`] of the spawn's line through the Planet's centre, and else the
+/// character goes back to the spawn.
+fn landing(eye: [f64; 3], leash: Option<Leash>, ground: [f64; 3]) -> [f64; 3] {
+    let distance = |a: [f64; 3], b: [f64; 3]| {
+        (0..3)
+            .map(|k| (a[k] - b[k]) * (a[k] - b[k]))
+            .sum::<f64>()
+            .sqrt()
+    };
+    let near = f64::from(SPAWN_REACH) - 2.0 * sim::Movement::default().radius;
+    if let Some(leash) = leash {
+        return if distance(eye, leash.centre) < leash.radius + near {
+            eye
+        } else {
+            leash.centre
+        };
+    }
     let length = ground.iter().map(|c| c * c).sum::<f64>().sqrt();
     let axis = ground.map(|c| c / length);
     let along: f64 = (0..3).map(|a| eye[a] * axis[a]).sum();
     let square: f64 = eye.iter().map(|c| c * c).sum::<f64>() - along * along;
-    let margin = f64::from(SPAWN_REACH) - 2.0 * sim::Movement::default().radius;
-    if square.is_nan() || square >= margin * margin {
+    if square.is_nan() || square >= near * near {
         drop_point(ground)
     } else {
         eye
@@ -507,7 +523,8 @@ impl App {
         self.walking = !self.walking;
         self.eyes = None;
         if let (true, Some(world), Some(ground)) = (self.walking, &mut self.world, &self.spawn) {
-            world.spawn(landing(self.camera.position, *ground))?;
+            let leash = world.leash();
+            world.spawn(landing(self.camera.position, leash, *ground))?;
         }
         Ok(())
     }
@@ -960,10 +977,28 @@ mod tests {
         // Out of noclip over the spawn, it lands under the camera; far from it, it goes back to
         // the spawn.
         let over = drop.map(|c| c + 1.0);
-        assert_eq!(landing(over, ground), over);
+        assert_eq!(landing(over, None, ground), over);
         let far = std::array::from_fn(|a| drop[a] + up[a] * 5.0 + [1.0, 0.0, 0.0][a] * 1e4);
-        assert_eq!(landing(far, ground), drop);
-        assert_eq!(landing([f64::NAN; 3], ground), drop);
+        assert_eq!(landing(far, None, ground), drop);
+        assert_eq!(landing([f64::NAN; 3], None, ground), drop);
+    }
+
+    #[test]
+    fn out_of_noclip_the_character_lands_under_the_camera_near_its_leash_and_at_its_centre_otherwise()
+     {
+        // A kilometre from the spawn, where it walked to.
+        let ground = [-93_000.0, 90_000.0, 94_000.0];
+        let leash = Leash {
+            centre: [-92_000.0, 90_500.0, 94_200.0],
+            radius: 48.0,
+        };
+        let over = leash.centre.map(|c| c + 30.0);
+        assert_eq!(landing(over, Some(leash), ground), over);
+        let past = leash.centre.map(|c| c + 400.0);
+        assert_eq!(landing(past, Some(leash), ground), leash.centre);
+        assert_eq!(landing([f64::NAN; 3], Some(leash), ground), leash.centre);
+        // Not the spawn, which is far from it.
+        assert_ne!(landing(past, Some(leash), ground), drop_point(ground));
     }
 
     #[test]

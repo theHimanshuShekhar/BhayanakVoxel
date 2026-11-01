@@ -73,7 +73,7 @@ pub enum Cell {
 }
 
 /// The seam between the controller and wherever the Voxels are held: the ground that a client
-/// and the server hold ([`crate::Terrain`]) provides it, and the controller reads nothing else of
+/// and the server hold ([`crate::Footing`]) provides it, and the controller reads nothing else of
 /// the Planet. It must answer from what is held, and never generate anything.
 pub trait Occupancy {
     fn cell(&self, voxel: VoxelCoord) -> Cell;

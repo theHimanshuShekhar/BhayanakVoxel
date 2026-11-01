@@ -457,8 +457,11 @@ fn it_is_stopped_at_the_end_of_its_leash() {
         run(&mut c, &site, &site.walk(), 360);
         let [s, t, h] = feet(&c, &site);
         let from_centre = (s * s + t * t + h * h).sqrt();
+        // The wall is a ball, so the head, 18 Voxels up, meets it before the feet do: the capsule
+        // (radius 3) stops where its top sphere, 15 up, is 3 inside the ball. The feet are then
+        // sqrt(47 * 47 - 15 * 15) = 44.5 from the centre, less the controller's tolerance.
         assert!(
-            (42.0..=50.0).contains(&from_centre),
+            (43.0..=44.6).contains(&from_centre),
             "{direction:?}: stopped {from_centre} from the centre, leash 50"
         );
     }

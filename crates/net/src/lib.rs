@@ -114,11 +114,18 @@ pub enum ClientMessage {
     /// Asks to make an Edit. `client_seq` numbers the client's requests from 0 upwards, and
     /// the reply names it.
     Edit { client_seq: u64, op: EditOp },
-    /// Puts this client's character on the Planet, standing at `position` in Voxels. The server
-    /// answers with [`ServerMessage::Body`] for no inputs applied yet, and with its first
-    /// [`ServerMessage::Leash`] once the ground around the character is ready: until then the
-    /// client sends no inputs.
-    Spawn { position: [f64; 3] },
+    /// Puts this client's character on the Planet, standing at `position` in Voxels. `spawn`
+    /// numbers the client's spawns, and every [`ServerMessage::Body`] and
+    /// [`ServerMessage::Leash`] about this character names the one it is for, so that a client
+    /// that spawns again ignores what was still in flight for the last. The server answers with
+    /// a `Body` for no inputs applied yet, and with the first `Leash` once the ground around the
+    /// character is ready.
+    ///
+    /// **Inputs before the first leash.** A client sends no input until it has that first
+    /// leash. If one arrives anyway (a stale leash let it go early), the server holds it, in
+    /// order, up to a bound, and applies it when the leash exists: it is neither applied
+    /// without a leash nor dropped, which would leave every later input a gap.
+    Spawn { spawn: u64, position: [f64; 3] },
     /// The character's input for one tick. `seq` numbers the client's inputs from 0 upwards;
     /// the server applies them in order, each as one tick.
     Input { seq: u64, input: MoveInput },
@@ -144,15 +151,19 @@ pub enum ServerMessage {
     },
     /// The server has applied the first `applied` inputs of this client's character (none, just
     /// after a spawn), and this is where the character is then. Sent once per server tick in
-    /// which any arrived.
-    Body { applied: u64, state: BodyState },
+    /// which any arrived. `spawn` is the [`ClientMessage::Spawn`] it is for.
+    Body {
+        spawn: u64,
+        applied: u64,
+        state: BodyState,
+    },
     /// The character is leashed to `leash` from its input number `from` on (the `from + 1`th it
     /// sends), and until the next one says otherwise. `from` is the number of inputs the server
     /// had applied when it decided, so it is the tick, as the server counts it, at which the
     /// leash starts to hold. The client has usually run ahead of it by then, and applies it to
     /// the same inputs when it runs them again. Sent ahead of the [`ServerMessage::Body`] of the
-    /// tick it was decided in.
-    Leash { from: u64, leash: Leash },
+    /// tick it was decided in. `spawn` is the [`ClientMessage::Spawn`] it is for.
+    Leash { spawn: u64, from: u64, leash: Leash },
 }
 
 /// The other end is gone.
