@@ -15,11 +15,12 @@ use std::sync::atomic::{AtomicI32, Ordering};
 
 use brick_store::{BRICK_SIZE, Brick, BrickCoord, BrickStore, Interior, Material, VoxelCoord};
 
+mod caves;
 pub mod planet;
 pub mod world_map;
 
 /// Identifies the generation algorithm. Bump it whenever generated bricks change.
-pub const GENERATOR_VERSION: u32 = 2;
+pub const GENERATOR_VERSION: u32 = 3;
 
 /// Mean radius of the test Planet in Voxels: 150 m at 10 cm Voxels, so 300 m across.
 pub const PLANET_RADIUS: i32 = 1500;
