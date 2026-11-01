@@ -1,6 +1,6 @@
-//! A Planet whose bricks are streamed in (`BrickStore::stream_from`) is drawn from what is loaded,
+//! A Planet whose bricks are streamed in (`BrickStore::stream_from`) is drawn from what is resident,
 //! with a coarser level standing in for what is not, and never a hole. A CPU oracle, the same
-//! Planet with everything loaded, says what a ray should hit. No GPU needed.
+//! Planet with everything resident, says what a ray should hit. No GPU needed.
 
 use std::sync::OnceLock;
 
@@ -50,7 +50,7 @@ fn bound() -> Bound {
     }
 }
 
-/// The Planet with everything loaded: the ring, and every other brick read as the Planet gives it
+/// The Planet with everything resident: the ring, and every other brick read as the Planet gives it
 /// when it is asked for.
 fn oracle_store() -> BrickStore {
     let w = world();
@@ -59,11 +59,12 @@ fn oracle_store() -> BrickStore {
 
 /// The Planet as the client has it right after the spawn: the ring and the Guard, and nothing else.
 fn spawned_store() -> BrickStore {
-    static GUARD_BRICKS: OnceLock<Vec<(usize, BrickCoord, brick_store::Brick)>> = OnceLock::new();
+    static GUARD_BRICKS: OnceLock<Vec<(usize, BrickCoord, brick_store::Brick, bool)>> =
+        OnceLock::new();
     let w = world();
     let mut store = oracle_store();
-    for (level, coord, brick) in GUARD_BRICKS.get_or_init(|| w.planet.guard(GUARD)) {
-        store.insert_at(*level, *coord, brick.clone());
+    for (level, coord, brick, solid) in GUARD_BRICKS.get_or_init(|| w.planet.guard(GUARD)) {
+        store.hold(*level, *coord, brick.clone(), *solid);
     }
     store.stream_from(FLOOR);
     store
@@ -74,12 +75,13 @@ fn spawned_store() -> BrickStore {
 #[derive(Default)]
 struct Loader {
     pending: Vec<(usize, BrickCoord)>,
-    loaded: Vec<(usize, BrickCoord)>,
+    resident: Vec<(usize, BrickCoord)>,
     generated: usize,
 }
 
 impl Loader {
-    /// Loads the `most` nearest families `camera` has asked for. Returns how many it loaded.
+    /// Holds the children of the `most` nearest bricks `camera` has asked for. Returns how many
+    /// bricks it did that for.
     fn pump(
         &mut self,
         store: &mut BrickStore,
@@ -91,19 +93,19 @@ impl Loader {
         let near = |&(l, c): &(usize, BrickCoord)| brick_distance(camera, l, c);
         self.pending.sort_by(|a, b| near(b).total_cmp(&near(a)));
         let source = store.source().expect("a source");
-        let mut loaded = Vec::new();
+        let mut done = Vec::new();
         for _ in 0..most {
             let Some((level, coord)) = self.pending.pop() else {
                 break;
             };
             let bricks = children_from(&*source, level, coord, |c| store.holds(level - 1, c));
             self.generated += 8;
-            store.load_children(level, coord, bricks);
-            loaded.push((level, coord));
+            store.hold_children(level, coord, bricks);
+            done.push((level, coord));
         }
-        scene.arrive(store, &loaded).unwrap();
-        self.loaded.extend(&loaded);
-        loaded.len()
+        scene.arrive(store, &done).unwrap();
+        self.resident.extend(&done);
+        done.len()
     }
 
     fn idle(&self, scene: &Scene) -> bool {
@@ -267,11 +269,11 @@ fn with_the_camera_still_the_loader_fills_the_bands_and_then_has_nothing_to_do()
         assert!(scene.take_wanted().is_empty());
     }
     assert_eq!(loader.generated, generated);
-    // It never loaded beyond the bands: every family that was loaded is of a brick that the
+    // It never went beyond the bands: every brick whose children were made resident is one that the
     // bands split, nearer than its level is used from.
     let b = bands();
-    assert!(!loader.loaded.is_empty());
-    for &(level, coord) in &loader.loaded {
+    assert!(!loader.resident.is_empty());
+    for &(level, coord) in &loader.resident {
         let d = brick_distance(camera.position, level, coord);
         assert!(d < b.floor(level), "level {level} {coord:?} at {d}");
     }

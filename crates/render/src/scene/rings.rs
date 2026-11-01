@@ -132,8 +132,9 @@ enum Sizing {
     /// By a [`Room`] that was given: a scene that does not fit is an error.
     Given(Room),
     /// By what the bricks selected need, and this many times as much, so that the camera can go
-    /// on to where there are more. A scene that does not fit is packed again, bigger.
-    Fitted(f64),
+    /// on to where there are more, and at least this many words of `brick_refs` and of `bricks`.
+    /// A scene that does not fit is packed again, bigger.
+    Fitted(f64, (usize, usize)),
 }
 
 /// What a scene of rings keeps besides the buffers.
@@ -162,6 +163,9 @@ pub(super) struct Rings {
 /// A [`RingPatch`] in the making.
 #[derive(Debug, Default)]
 struct Patch {
+    /// Regions unlisted since the last patch, by level and key: a level whose box one of them
+    /// was on the edge of may have a smaller one now.
+    unlisted: Vec<(usize, [i32; 3])>,
     regions: BTreeSet<usize>,
     table: BTreeSet<usize>,
     brick_refs: Vec<Range<usize>>,
@@ -187,25 +191,6 @@ pub struct RingPatch {
 }
 
 impl RingPatch {
-    /// This patch followed by `next`, made after it: copying the one patch has the effect of
-    /// copying both in turn.
-    pub fn then(self, next: RingPatch) -> RingPatch {
-        let union = |a: Vec<usize>, b: Vec<usize>| -> Vec<usize> {
-            a.into_iter()
-                .chain(b)
-                .collect::<BTreeSet<_>>()
-                .into_iter()
-                .collect()
-        };
-        RingPatch {
-            regions: union(self.regions, next.regions),
-            table: union(self.table, next.table),
-            brick_refs: merged(self.brick_refs.into_iter().chain(next.brick_refs).collect()),
-            bricks: merged(self.bricks.into_iter().chain(next.bricks).collect()),
-            levels: self.levels || next.levels,
-        }
-    }
-
     /// Words that copying this patch to the GPU writes, apart from the header.
     pub fn words(&self) -> usize {
         let ranges = |r: &[Range<usize>]| r.iter().map(Range::len).sum::<usize>();
@@ -284,20 +269,27 @@ impl Scene {
         bands: Bands,
         bound: Bound,
     ) -> Result<Scene, RingsFull> {
-        Scene::rings_sized(store, camera, bands, bound, Sizing::Fitted(2.0))
+        Scene::rings_sized(store, camera, bands, bound, Sizing::Fitted(2.0, (0, 0)))
     }
 
-    /// [`Scene::rings`] with buffers `headroom` times the size the bricks need (2 for
-    /// [`Scene::rings`]), for a scene that is going to grow a lot without being packed again
-    /// (see [`Scene::arrive`]).
-    pub fn rings_with_headroom(
+    /// [`Scene::rings`] with buffers of at least `refs` words of `brick_refs` and `words` of
+    /// `bricks`, for a scene that is going to grow a lot without being packed again (see
+    /// [`Scene::arrive`]): the size it is expected to reach, which the caller knows.
+    pub fn rings_reserving(
         store: &BrickStore,
         camera: [f64; 3],
         bands: Bands,
         bound: Bound,
-        headroom: f64,
+        refs: usize,
+        words: usize,
     ) -> Result<Scene, RingsFull> {
-        Scene::rings_sized(store, camera, bands, bound, Sizing::Fitted(headroom))
+        Scene::rings_sized(
+            store,
+            camera,
+            bands,
+            bound,
+            Sizing::Fitted(2.0, (refs, words)),
+        )
     }
 
     /// [`Scene::rings`] with buffers of the size `room` says. That is all the room there will
@@ -350,7 +342,7 @@ impl Scene {
             // is about as full as the others at the surface of a Planet), so none is sized by
             // less than half of what the busiest has, nor by less than what its band can hold
             // (see [`shell_regions`]).
-            Sizing::Fitted(headroom) => (
+            Sizing::Fitted(headroom, _) => (
                 {
                     let most = wanted.iter().copied().max().unwrap_or(0);
                     let bands = selection.bands();
@@ -365,7 +357,7 @@ impl Scene {
                 0,
             ),
         };
-        let fitted = matches!(sizing, Sizing::Fitted(_));
+        let fitted = matches!(sizing, Sizing::Fitted(..));
         let mut scene = Scene::empty_rings(selection, bound, sizing, capacity, refs, words);
         // Reading the bricks is what takes the time (they may be generated), so a chunk of regions
         // is read on all the threads, and then packed.
@@ -381,8 +373,8 @@ impl Scene {
                 scene.repack_region(store, *level, *key, bricks, Some(read))?;
             }
         }
-        if let (true, Sizing::Fitted(headroom)) = (fitted, sizing) {
-            scene.make_room(headroom);
+        if let (true, Sizing::Fitted(headroom, at_least)) = (fitted, sizing) {
+            scene.make_room(headroom, at_least);
         }
         scene.sync_header();
         scene.take_patch();
@@ -417,7 +409,7 @@ impl Scene {
         let records: usize = capacity.iter().sum();
         // Fitted rings pack into buffers that grow, with room taken from the pools as if there
         // were no end to them.
-        let unbounded = matches!(sizing, Sizing::Fitted(_));
+        let unbounded = matches!(sizing, Sizing::Fitted(..));
         let pool = |words: usize| Pool::new(if unbounded { usize::MAX / 4 } else { words });
         Scene {
             levels: level_headers,
@@ -444,11 +436,15 @@ impl Scene {
     }
 
     /// Makes the buffers of a scene that was packed into growing ones the size they will stay:
-    /// what is used, and `headroom` times as much.
-    fn make_room(&mut self, headroom: f64) {
+    /// what is used, and `headroom` times as much, but not less than `at_least`.
+    fn make_room(&mut self, headroom: f64, at_least: (usize, usize)) {
         let rings = self.rings.as_mut().expect("a scene of rings");
-        let room = |used: usize| (used as f64 * headroom) as usize + 4096;
-        let (refs, words) = (room(self.brick_refs.len()), room(self.bricks.len()));
+        let room =
+            |used: usize, least: usize| ((used as f64 * headroom) as usize + 4096).max(least);
+        let (refs, words) = (
+            room(self.brick_refs.len(), at_least.0),
+            room(self.bricks.len(), at_least.1),
+        );
         rings.refs = Pool::new(refs);
         rings.refs.take(self.brick_refs.len());
         rings.data = Pool::new(words);
@@ -463,7 +459,7 @@ impl Scene {
     fn repacked(&self, store: &BrickStore, headroom: Option<f64>) -> Result<Scene, RingsFull> {
         let rings = self.rings.as_ref().expect("a scene of rings");
         let sizing = match (rings.sizing, headroom) {
-            (Sizing::Fitted(_), Some(headroom)) => Sizing::Fitted(headroom),
+            (Sizing::Fitted(_, at_least), Some(headroom)) => Sizing::Fitted(headroom, at_least),
             (sizing, _) => sizing,
         };
         let bound = self.bound.is_some().then_some(rings.ball);
@@ -591,9 +587,9 @@ impl Scene {
     }
 
     /// The bricks that are drawn whole although the bands split them, because the bricks under
-    /// them are not loaded (see [`BrickStore::stream_from`]), that became so since this was last
+    /// them are not resident (see [`BrickStore::stream_from`]), that became so since this was last
     /// called, as `(level, coordinate)`. Load their eight children, mark them with
-    /// [`BrickStore::set_children_loaded`], and tell the scene with [`Scene::arrive`]. Empty for
+    /// [`BrickStore::set_children_resident`], and tell the scene with [`Scene::arrive`]. Empty for
     /// a scene that is not rings.
     pub fn take_wanted(&mut self) -> Vec<(usize, BrickCoord)> {
         self.rings
@@ -601,20 +597,28 @@ impl Scene {
             .map_or_else(Vec::new, |r| r.selection.take_wanted())
     }
 
-    /// How many bricks wait for the bricks under them to be loaded.
+    /// How many bricks wait for the bricks under them to be resident.
     pub fn waiting(&self) -> usize {
         self.rings.as_ref().map_or(0, |r| r.selection.waiting())
     }
 
+    /// The bricks of [`Scene::take_wanted`] that are not wanted any more: their nodes are gone
+    /// (merged into a coarser brick, or buried) before their children arrived.
+    pub fn take_cancelled(&mut self) -> Vec<(usize, BrickCoord)> {
+        self.rings
+            .as_mut()
+            .map_or_else(Vec::new, |r| r.selection.take_cancelled())
+    }
+
     /// Gives up waiting for the children of `key`, one of the bricks of [`Scene::take_wanted`],
-    /// because they will not be loaded: it is listed again when the bands split it again.
+    /// because they will not be generated: it is listed again when the bands split it again.
     pub fn unwant(&mut self, key: (usize, BrickCoord)) {
         if let Some(rings) = &mut self.rings {
             rings.selection.unwant(key);
         }
     }
 
-    /// Splits the bricks `parents`, whose children have been loaded, as the bands say. Returns
+    /// Splits the bricks `parents`, whose children are resident, as the bands say. Returns
     /// what changed, or `None` if nothing did; like [`Scene::recentre`] it packs the scene again
     /// if the regions do not fit.
     pub fn arrive(
@@ -837,6 +841,7 @@ impl Scene {
         let rings = self.rings.as_mut().expect("a scene of rings");
         rings.listed[level] -= 1;
         rings.patch.table.extend(slots);
+        rings.patch.unlisted.push((level, key));
         rings.patch.regions.remove(&index);
         rings.free.push(index);
     }
@@ -975,6 +980,29 @@ impl Scene {
         }
     }
 
+    /// Words of `brick_refs` and of `bricks` that a scene of rings has in use, if it is one.
+    pub fn used_words(&self) -> Option<(usize, usize)> {
+        let rings = self.rings.as_ref()?;
+        let free = |pool: &Pool, len: usize| {
+            len - pool
+                .free
+                .iter()
+                .map(|r| r.end.min(len).saturating_sub(r.start.min(len)))
+                .sum::<usize>()
+        };
+        Some((
+            free(&rings.refs, self.brick_refs.len()),
+            free(&rings.data, self.bricks.len()),
+        ))
+    }
+
+    /// Bytes the scene's buffers take, used or not: what the GPU copy of a scene of rings
+    /// reserves, and the host holds as well.
+    pub fn reserved_bytes(&self) -> u64 {
+        (self.table.len() + self.regions.len() + self.brick_refs.len() + self.bricks.len()) as u64
+            * 4
+    }
+
     /// Bytes of the scene's buffers that hold something. The buffers of rings are allocated
     /// whole, so for them this is how full they are, and the size of the GPU copy is that of the
     /// buffers.
@@ -1083,13 +1111,21 @@ impl Scene {
             // A level whose slots written are all regions listed, none unlisted, has only gained:
             // its box grows to hold them, and the table need not be searched for the new one.
             let mut grown: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+            // A region taken out only changes the box if it was on its edge.
             let mut rescan = BTreeSet::new();
-            for &slot in &patch.table {
-                let level = self.level_of_slot(slot);
-                if self.table[slot * 4 + 3] == 0 {
+            for &(level, key) in &patch.unlisted {
+                let l = &self.levels[level];
+                if (0..3).any(|a| key[a] <= l.occupied_first[a] || key[a] >= l.occupied_end[a] - 1)
+                {
                     rescan.insert(level);
-                } else {
-                    grown.entry(level).or_default().push(slot);
+                }
+            }
+            for &slot in &patch.table {
+                if self.table[slot * 4 + 3] != 0 {
+                    grown
+                        .entry(self.level_of_slot(slot))
+                        .or_default()
+                        .push(slot);
                 }
             }
             for (level, slots) in grown {

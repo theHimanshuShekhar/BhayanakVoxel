@@ -6,13 +6,13 @@ use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use brick_store::{BrickStore, VoxelCoord};
-use net::{ServerEnd, loopback};
+use net::{EditOp, ServerEnd, loopback};
 use planet_gen::planet::{Planet, tangents};
 use planet_gen::world_map::WorldMap;
 use render::lod::Bands;
 use render::reference::{Ray, trace};
 use render::scene::Bound;
-use render::{Camera, Scene, camera};
+use render::{Camera, RingsFull, Scene, SceneUpdate, camera};
 use sim::Predictor;
 
 use crate::loader::{Arrival, Loader, hold_guard};
@@ -62,22 +62,34 @@ fn spawned_world(workers: usize) -> (World, ServerEnd, Camera) {
     (world, server, camera)
 }
 
+/// [`World::stream`] with no GPU to copy to, and the updates it made.
+fn stream(world: &mut World, camera: [f64; 3]) -> Vec<SceneUpdate> {
+    let mut updates = Vec::new();
+    world
+        .stream::<RingsFull>(camera, |_, update| {
+            updates.push(update.clone());
+            Ok(())
+        })
+        .unwrap();
+    updates
+}
+
 fn idle(world: &World) -> bool {
     world.waiting() == 0 && world.loader().is_some_and(|l| l.pending() == 0)
 }
 
-/// Streams with the camera at `camera` until the bands are complete. Returns how many frames
-/// that took.
+/// Streams with the camera at `camera` until the resident set is complete for the bands. Returns
+/// how many frames that took.
 fn fill(world: &mut World, camera: [f64; 3]) -> usize {
     let started = Instant::now();
     for frame in 0.. {
-        world.stream(camera).unwrap();
+        stream(world, camera);
         if idle(world) {
             return frame;
         }
         assert!(
             started.elapsed() < Duration::from_secs(180),
-            "the bands do not fill"
+            "the resident set does not fill"
         );
         std::thread::sleep(Duration::from_millis(1));
     }
@@ -85,7 +97,7 @@ fn fill(world: &mut World, camera: [f64; 3]) -> usize {
 }
 
 #[test]
-fn with_the_camera_still_the_loader_fills_the_bands_and_then_has_no_work() {
+fn with_the_camera_still_the_loader_makes_the_resident_set_complete_and_then_has_no_work() {
     let (mut world, _server, camera) = spawned_world(2);
     assert!(world.waiting() > 0, "the Guard stands in for everything");
     let frames = fill(&mut world, camera.position);
@@ -97,7 +109,7 @@ fn with_the_camera_still_the_loader_fills_the_bands_and_then_has_no_work() {
     assert!(generated > 1000, "{generated}");
     // Standing still, nothing more is asked for and nothing more is generated.
     for _ in 0..20 {
-        assert!(world.stream(camera.position).unwrap().is_none());
+        assert!(stream(&mut world, camera.position).is_empty());
         std::thread::sleep(Duration::from_millis(10));
     }
     assert_eq!(world.loader().unwrap().generated(), generated);
@@ -106,7 +118,7 @@ fn with_the_camera_still_the_loader_fills_the_bands_and_then_has_no_work() {
 }
 
 #[test]
-fn a_family_the_camera_has_left_is_dropped_not_generated() {
+fn a_brick_the_camera_has_left_has_its_children_dropped_not_generated() {
     let store = spawned_store();
     let camera = crate::spawn_camera(ground()).position;
     let mut loader = Loader::new(store.source().unwrap(), camera, bands(), 1);
@@ -132,11 +144,11 @@ fn a_family_the_camera_has_left_is_dropped_not_generated() {
     );
     assert!(
         got.iter()
-            .any(|a| matches!(a, Arrival::Family { key, .. } if *key == near))
+            .any(|a| matches!(a, Arrival::Children { key, .. } if *key == near))
     );
     assert!(
         loader.generated() <= 8,
-        "only the near family was generated"
+        "only the near brick's children were generated"
     );
 }
 
@@ -182,10 +194,13 @@ fn a_dig_near_the_camera_shows_at_every_band_that_covers_it() {
         let ray = ray_through(from, target);
         let shown = trace(world.scene(), &ray);
 
-        // The Planet with everything loaded, dug and not: the dug store's bricks, and the rest
-        // as the Planet gives them.
-        let mut dug = world_store(&world);
-        dug.end_streaming();
+        // The Planet with everything resident, dug and not: the Planet's own bricks, with the
+        // same Edit applied to one.
+        let mut dug = planet().crust_around(ground(), RING, 12);
+        sim::apply(
+            &mut dug,
+            &EditOp::dig_sphere(VoxelCoord(at), crate::world::DIG_RADIUS),
+        );
         let dug_scene = Scene::rings(&dug, from, bands(), bound()).unwrap();
         let whole = planet().crust_around(ground(), RING, 12);
         let whole_scene = Scene::rings(&whole, from, bands(), bound()).unwrap();
@@ -241,10 +256,6 @@ fn over_the_ground(store: &BrickStore, point: [f64; 3]) -> [f64; 3] {
     at(below + 40.0)
 }
 
-fn world_store(world: &World) -> BrickStore {
-    world.store().clone()
-}
-
 #[test]
 fn walking_at_5_m_per_s_while_the_loader_runs_reports_the_scene_work_of_every_frame() {
     let (mut world, _server, mut camera) = spawned_world(2);
@@ -259,7 +270,7 @@ fn walking_at_5_m_per_s_while_the_loader_runs_reports_the_scene_work_of_every_fr
         camera.carry_up(position);
         let started = Instant::now();
         world.recentre(position).unwrap();
-        world.stream(position).unwrap();
+        stream(&mut world, position);
         work.record(started.elapsed());
         std::thread::sleep(Duration::from_millis(3));
     }
@@ -306,28 +317,37 @@ fn scene_frame(world: &mut World, position: [f64; 3], work: &mut SceneWork, upda
     let moved = world.recentre(position).unwrap();
     let recentred = started.elapsed();
     let streaming = Instant::now();
-    let streamed = world.stream(position).unwrap();
+    let mut streamed = Vec::new();
+    world
+        .stream::<RingsFull>(position, |_, update| {
+            streamed.push(update.clone());
+            Ok(())
+        })
+        .unwrap();
     updates.recentre.record(recentred);
     updates.stream.record(streaming.elapsed());
     work.record(started.elapsed());
-    if started.elapsed() > Duration::from_millis(250) {
+    if started.elapsed() > Duration::from_millis(16) {
         eprintln!(
-            "  slow frame: {:.0?} (recentre {recentred:.0?}), {:?} {:?}",
+            "  slow frame: {:.1?} (recentre {recentred:.1?}), {:?} {:?}",
             started.elapsed(),
             moved
                 .as_ref()
                 .map(|u| matches!(u, render::SceneUpdate::Rebuilt)),
             streamed
-                .as_ref()
+                .iter()
                 .map(|u| matches!(u, render::SceneUpdate::Rebuilt))
+                .collect::<Vec<_>>()
         );
     }
     updates.add(moved);
-    updates.add(streamed);
+    for update in streamed {
+        updates.add(Some(update));
+    }
 }
 
 /// The Planet at full size, streamed in as the client does it: the spawn ring and the Guard are
-/// timed by `load`, then the bands fill with the camera still (timed), and then the camera
+/// timed by `load`, then the resident set fills with the camera still (timed), and then the camera
 /// walks at 5 m/s with the loader running (scene work per frame, worst and p99). Takes about two
 /// minutes and a lot of memory in a release build:
 /// `cargo test --release -p client -- --ignored --nocapture full_size`.
@@ -349,7 +369,9 @@ fn the_full_size_planet_streams_in_and_walking_over_it_does_not_stall() {
     let mut camera = loaded.camera;
     let frame = Duration::from_micros(16_667);
 
-    // The bands fill with the camera still.
+    // The resident set fills with the camera still. Reported on the way: when the ground under the
+    // camera is first drawn at level 0, which the spawn ring has held since it was generated.
+    let mut level_0_at = None;
     let (mut fill_work, mut fill_updates) = (SceneWork::default(), Updates::default());
     let began = Instant::now();
     let mut frames = 0;
@@ -363,6 +385,21 @@ fn the_full_size_planet_streams_in_and_walking_over_it_does_not_stall() {
             &mut fill_updates,
         );
         frames += 1;
+        if level_0_at.is_none() {
+            let down = ray_through(
+                camera.position,
+                std::array::from_fn(|a| camera.position[a] - camera.horizon_up[a]),
+            );
+            if let Some(hit) = trace(world.scene(), &down)
+                && world.scene().level_at(hit.voxel) == Some(0)
+            {
+                level_0_at = Some(began.elapsed());
+                eprintln!(
+                    "  the ground under the camera is level 0 after {:.2?}",
+                    began.elapsed()
+                );
+            }
+        }
         if idle(&world) {
             break;
         }
@@ -390,13 +427,16 @@ fn the_full_size_planet_streams_in_and_walking_over_it_does_not_stall() {
     }
     let bricks: Vec<usize> = (0..13).map(|l| world.scene().level_bricks(l)).collect();
     eprintln!(
-        "bands complete {:.1?} after the first frame ({frames} frames): {} bricks generated, {} \
-         drawn (per level {bricks:?}), scene {:.0} MiB; {} patches, {} rebuilds, the largest \
-         patch {} words",
+        "resident set complete for the bands {:.1?} after the first frame ({frames} frames): {} \
+         bricks generated, {} drawn (per level {bricks:?}), scene {:.0} MiB used of {:.0} MiB \
+         reserved (brick_refs, bricks words used: {:?}); {} patches, {} rebuilds, the largest \
+         patch {} words; level 0 under the camera at {level_0_at:?}",
         began.elapsed(),
         world.loader().unwrap().generated(),
         bricks.iter().sum::<usize>(),
         world.scene().used_bytes() as f64 / (1024.0 * 1024.0),
+        world.scene().reserved_bytes() as f64 / (1024.0 * 1024.0),
+        world.scene().used_words(),
         fill_updates.patched,
         fill_updates.rebuilt,
         fill_updates.worst_words,
@@ -441,4 +481,34 @@ fn the_full_size_planet_streams_in_and_walking_over_it_does_not_stall() {
         walk_updates.recentre.summary().unwrap(),
         walk_updates.stream.summary().unwrap()
     );
+}
+
+#[test]
+fn the_spawn_ring_is_drawn_at_level_0_within_seconds_and_before_the_far_bricks_are_resident() {
+    let (mut world, _server, camera) = spawned_world(2);
+    let down = ray_through(
+        camera.position,
+        std::array::from_fn(|a| camera.position[a] - camera.horizon_up[a]),
+    );
+    let begun = Instant::now();
+    let level_0_at = loop {
+        stream(&mut world, camera.position);
+        let hit = trace(world.scene(), &down).expect("ground under the camera");
+        if world.scene().level_at(hit.voxel) == Some(0) {
+            break begun.elapsed();
+        }
+        assert!(
+            begun.elapsed() < Duration::from_secs(20),
+            "still level {:?} under the camera",
+            world.scene().level_at(hit.voxel)
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    };
+    // The ground under the camera comes before the set is complete: nearest first, end to end.
+    assert!(
+        world.waiting() > 100,
+        "{} waiting after {level_0_at:?}",
+        world.waiting()
+    );
+    eprintln!("level 0 under the camera after {level_0_at:?} (debug build)");
 }

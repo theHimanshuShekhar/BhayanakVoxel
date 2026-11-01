@@ -37,14 +37,14 @@ pub struct BrickStore {
     streaming: Option<Streaming>,
 }
 
-/// What a store that is streamed in keeps of what has been loaded.
+/// What a store that is streamed in keeps of what is resident.
 #[derive(Clone, Debug)]
 struct Streaming {
-    /// Levels above this one are always loaded: the Guard.
+    /// Levels above this one are always resident: the Guard.
     floor: usize,
     /// The bricks `(level, coord)` whose eight children (the bricks of the level below that they
-    /// cover) have been loaded.
-    loaded: HashSet<(usize, BrickCoord)>,
+    /// cover) are resident.
+    resident: HashSet<(usize, BrickCoord)>,
 }
 
 /// The six bricks that share a face with `coord`.
@@ -58,6 +58,11 @@ fn touching(coord: BrickCoord) -> impl Iterator<Item = BrickCoord> {
         };
         BrickCoord(next)
     })
+}
+
+/// The parents of `bricks`.
+fn moved_parents(bricks: &BTreeSet<BrickCoord>) -> BTreeSet<BrickCoord> {
+    bricks.iter().map(|c| c.parent()).collect()
 }
 
 /// What [`BrickStore::refresh_lod`] did.
@@ -97,9 +102,24 @@ impl BrickStore {
         self.bricks.insert(coord, brick);
     }
 
-    /// Removes the brick at `coord`, which then reads as air.
+    /// Removes the brick at `coord`, which then reads as the source gives it, or as air with none.
+    ///
+    /// In a store that streams, a brick that is not held and not provably solid reads as air once
+    /// its parent's children are resident (all of them that are not air are held), so removing
+    /// one there puts back what the source makes of it: this is how an Edit is taken back.
     pub fn remove(&mut self, coord: BrickCoord) -> Option<Brick> {
-        self.bricks.remove(&coord)
+        let removed = self.bricks.remove(&coord);
+        if self.streaming.is_some()
+            && self.children_resident(1, coord.parent())
+            && let Some(source) = &self.source
+            && !source.solid_below(0, coord)
+        {
+            let generated = source.brick(0, coord);
+            if !generated.is_air() {
+                self.bricks.insert(coord, generated);
+            }
+        }
+        removed
     }
 
     /// FNV-1a hash of the Planet's content: the coordinate and [`Brick::content_hash`] of every
@@ -152,10 +172,17 @@ impl BrickStore {
     /// brick is what the caller says it is. Whether it is solid all the way down is what the
     /// source says. Panics if there is no such level.
     pub fn insert_at(&mut self, level: usize, coord: BrickCoord, brick: Brick) {
+        let solid = level > 0 && self.source_solid_below(level, coord);
+        self.hold(level, coord, brick, solid);
+    }
+
+    /// [`Self::insert_at`], with whether every Voxel of level 0 under the brick is solid given
+    /// (what the source says, see [`BrickSource::solid_below`]), for a caller that worked it out
+    /// on several threads.
+    pub fn hold(&mut self, level: usize, coord: BrickCoord, brick: Brick, solid: bool) {
         if level == 0 {
             return self.insert(coord, brick);
         }
-        let solid = self.source_solid_below(level, coord);
         let store = &mut self.coarse[level - 1];
         store.bricks.insert(coord, brick);
         if solid {
@@ -166,40 +193,40 @@ impl BrickStore {
     }
 
     /// Makes this a store whose bricks are streamed in: the eight bricks under a brick of a level
-    /// above `floor` are always loaded (the Guard is every brick of the levels from `floor` up),
-    /// and those under a brick of `floor` or below are loaded once
-    /// [`Self::set_children_loaded`] says so. A renderer splits a brick only when its children
-    /// are loaded ([`Self::children_loaded`]), and draws it whole, a coarser frame, until then. A
-    /// store that does not stream has everything loaded.
+    /// above `floor` are always resident (the Guard is every brick of the levels from `floor` up),
+    /// and those under a brick of `floor` or below are resident once
+    /// [`Self::set_children_resident`] says so. A renderer splits a brick only when its children
+    /// are resident ([`Self::children_resident`]), and draws it whole, a coarser frame, until then. A
+    /// store that does not stream has everything resident.
     pub fn stream_from(&mut self, floor: usize) {
         self.streaming = Some(Streaming {
             floor,
-            loaded: HashSet::new(),
+            resident: HashSet::new(),
         });
     }
 
-    /// Whether the eight bricks under the brick at `coord` of `level` are loaded, so that they
+    /// Whether the eight bricks under the brick at `coord` of `level` are resident, so that they
     /// can be read without generating anything. Always true unless the store streams.
-    pub fn children_loaded(&self, level: usize, coord: BrickCoord) -> bool {
+    pub fn children_resident(&self, level: usize, coord: BrickCoord) -> bool {
         self.streaming
             .as_ref()
-            .is_none_or(|s| level > s.floor || s.loaded.contains(&(level, coord)))
+            .is_none_or(|s| level > s.floor || s.resident.contains(&(level, coord)))
     }
 
-    /// Records that the eight bricks under the brick at `coord` of `level` are loaded: the ones
+    /// Records that the eight bricks under the brick at `coord` of `level` are resident: the ones
     /// that are not air are held. Does nothing unless the store streams.
-    pub fn set_children_loaded(&mut self, level: usize, coord: BrickCoord) {
+    pub fn set_children_resident(&mut self, level: usize, coord: BrickCoord) {
         if let Some(s) = &mut self.streaming {
-            s.loaded.insert((level, coord));
+            s.resident.insert((level, coord));
         }
     }
 
     /// Holds the bricks of `bricks` as the bricks under the brick at `coord` of `level` (at least
     /// 1), except those already held, which are never replaced (an Edit's are among them), and
-    /// records that its children are loaded (see [`Self::children_loaded`]). The others read as
+    /// records that its children are resident (see [`Self::children_resident`]). The others read as
     /// the source gives them, so `bricks` is what [`crate::children_from`] returned for them. Returns
     /// how many it held.
-    pub fn load_children(
+    pub fn hold_children(
         &mut self,
         level: usize,
         coord: BrickCoord,
@@ -214,7 +241,7 @@ impl BrickStore {
             self.insert_at(below, child, brick);
             held += 1;
         }
-        self.set_children_loaded(level, coord);
+        self.set_children_resident(level, coord);
         held
     }
 
@@ -229,12 +256,6 @@ impl BrickStore {
     pub fn holds(&self, level: usize, coord: BrickCoord) -> bool {
         self.level(level)
             .is_some_and(|l| l.bricks.contains_key(&coord))
-    }
-
-    /// Stops the store streaming (see [`Self::stream_from`]): everything counts as loaded, and
-    /// what is not held reads as the source gives it, generated when it is read.
-    pub fn end_streaming(&mut self) {
-        self.streaming = None;
     }
 
     /// Whether the brick at `coord` of mip `level` is full (see [`Brick::is_full`]), as far as is
@@ -342,10 +363,11 @@ impl BrickStore {
                 .map(BrickCoord::parent)
                 .collect();
             let flags: BTreeSet<_> = flipped.iter().map(|c| c.parent()).collect();
+            let direct = moved_parents(&moved);
             moved = BTreeSet::new();
             flipped = BTreeSet::new();
             for &coord in &over {
-                let held = self.remake(level, coord);
+                let held = self.remake(level, coord, direct.contains(&coord));
                 refresh.remade += 1;
                 let (was_held, before) = match held {
                     Some(brick) => (true, brick),
@@ -374,22 +396,39 @@ impl BrickStore {
 
     /// Remakes brick `coord` of coarse level `level` from the eight bricks of the level below:
     /// held if any of them is held, and not held otherwise. Returns the brick that was held.
-    fn remake(&mut self, level: usize, coord: BrickCoord) -> Option<Brick> {
+    ///
+    /// In a store that streams, a coarse brick may be held with none of its children held: the
+    /// source made it (the Guard, and the bricks of a streamed band). Then it is not remade from
+    /// them, which would read them as air. If `direct` (it is over a brick that changed, say one
+    /// that an Edit taken back is not held any more) it is made as the source makes it, and
+    /// otherwise it is left as it is.
+    fn remake(&mut self, level: usize, coord: BrickCoord, direct: bool) -> Option<Brick> {
         let finer = self.level(level - 1).expect("the level below exists");
         let children = coord.children();
-        let brick = children
-            .iter()
-            .any(|c| finer.bricks.contains_key(c))
-            .then(|| {
-                let read = children.map(|child| self.brick_at(level - 1, child));
-                let around = |at: [i32; 3]| {
-                    self.brick_at(
-                        level - 1,
-                        BrickCoord([0, 1, 2].map(|a| children[0].0[a] + at[a])),
-                    )
-                };
-                downsample(read.each_ref().map(|c| &**c), around)
-            });
+        let any_held = children.iter().any(|c| finer.bricks.contains_key(c));
+        if !any_held && self.streaming.is_some() {
+            let kept = self.coarse[level - 1].bricks.get(&coord).cloned();
+            if direct && let Some(source) = &self.source {
+                let made = source.brick(level, coord);
+                let coarse = &mut self.coarse[level - 1].bricks;
+                if made.is_air() {
+                    coarse.remove(&coord);
+                } else {
+                    coarse.insert(coord, made);
+                }
+            }
+            return kept;
+        }
+        let brick = any_held.then(|| {
+            let read = children.map(|child| self.brick_at(level - 1, child));
+            let around = |at: [i32; 3]| {
+                self.brick_at(
+                    level - 1,
+                    BrickCoord([0, 1, 2].map(|a| children[0].0[a] + at[a])),
+                )
+            };
+            downsample(read.each_ref().map(|c| &**c), around)
+        });
         let coarse = &mut self.coarse[level - 1].bricks;
         match brick {
             Some(brick) => coarse.insert(coord, brick),
@@ -421,12 +460,12 @@ impl BrickStore {
     /// What the brick at `coord` of mip `level` reads as where none is held there.
     fn unheld(&self, level: usize, coord: BrickCoord) -> Brick {
         match &self.source {
-            // In a store that streams, the bricks under a parent that has been loaded are all
+            // In a store that streams, the bricks under a parent whose children are resident are all
             // held but the air and what the source proves solid (see
-            // [`Self::load_children`]): to read the rest is not to generate them.
+            // [`Self::hold_children`]): to read the rest is not to generate them.
             Some(source)
                 if self.streaming.is_some()
-                    && self.children_loaded(level + 1, coord.parent())
+                    && self.children_resident(level + 1, coord.parent())
                     && !source.solid_below(level, coord) =>
             {
                 Brick::AIR
@@ -1159,20 +1198,23 @@ mod tests {
     }
 
     #[test]
-    fn a_store_that_streams_has_the_children_of_its_guard_loaded_and_the_rest_when_told() {
+    fn a_store_that_streams_has_the_children_of_its_guard_resident_and_the_rest_when_told() {
         let mut store = BrickStore::new();
         let c = BrickCoord([1, 2, 3]);
         assert!(
-            store.children_loaded(5, c),
+            store.children_resident(5, c),
             "a store that does not stream has all"
         );
         store.stream_from(3);
-        assert!(store.children_loaded(4, c), "above the floor is the Guard");
-        assert!(!store.children_loaded(3, c));
-        assert!(!store.children_loaded(1, c));
-        store.set_children_loaded(1, c);
-        assert!(store.children_loaded(1, c));
-        assert!(!store.children_loaded(1, BrickCoord([1, 2, 4])));
+        assert!(
+            store.children_resident(4, c),
+            "above the floor is the Guard"
+        );
+        assert!(!store.children_resident(3, c));
+        assert!(!store.children_resident(1, c));
+        store.set_children_resident(1, c);
+        assert!(store.children_resident(1, c));
+        assert!(!store.children_resident(1, BrickCoord([1, 2, 4])));
     }
 
     #[test]
@@ -1221,21 +1263,82 @@ mod tests {
         // The skipped one is the edited one, as a loader that checks what is held does.
         let bricks = crate::children_from(&*source, 2, parent, |c| store.holds(1, c));
         assert!(bricks.iter().all(|(c, _)| *c != edited));
-        assert!(!store.children_loaded(2, parent));
-        // Loaded late, with the edited one in the list too: it stays as it is.
+        assert!(!store.children_resident(2, parent));
+        // Held late, with the edited one in the list too: it stays as it is.
         let mut all = bricks.clone();
         all.push((edited, Brick::solid(ROCK)));
-        let held = store.load_children(2, parent, all);
+        let held = store.hold_children(2, parent, all);
         assert_eq!(held, bricks.len());
-        assert!(store.children_loaded(2, parent));
+        assert!(store.children_resident(2, parent));
         assert_eq!(*store.brick_at(1, edited), Brick::solid(Material(9)));
         for (c, b) in &bricks {
             assert!(store.holds(1, *c));
             assert_eq!(*store.brick_at(1, *c), *b);
         }
-        // A parent over air has nothing to hold, and is loaded.
+        // A parent over air has nothing to hold, and is resident.
         let sky = BrickCoord([50, 50, 50]);
-        assert_eq!(store.load_children(2, sky, Vec::new()), 0);
-        assert!(store.children_loaded(2, sky));
+        assert_eq!(store.hold_children(2, sky, Vec::new()), 0);
+        assert!(store.children_resident(2, sky));
+    }
+
+    /// Rock under y = 0 at every level, and air above: a source that is not provably solid anywhere.
+    #[derive(Debug)]
+    struct Slab;
+
+    impl BrickSource for Slab {
+        fn brick(&self, _: usize, coord: BrickCoord) -> Brick {
+            if coord.0[1] < 0 {
+                Brick::solid(ROCK)
+            } else {
+                Brick::AIR
+            }
+        }
+    }
+
+    #[test]
+    fn an_edit_leaves_a_coarse_brick_that_was_streamed_in_beside_it_held_as_it_was() {
+        let mut store = BrickStore::new();
+        store.set_source(Slab);
+        store.build_lod(3);
+        store.stream_from(3);
+        // A level 1 brick held with none of its children held, as a streamed band holds them,
+        // beside the one over the brick that is edited.
+        let beside = BrickCoord([1, -1, 0]);
+        let streamed = Brick::solid(Material(9));
+        store.insert_at(1, beside, streamed.clone());
+        let edited = BrickCoord([1, -1, 0]);
+        store.insert(edited, Brick::solid(ROCK));
+        store.set(VoxelCoord([8, -8, 0]), None);
+        store.refresh_lod([edited]);
+        assert!(
+            store.holds(1, beside),
+            "the brick beside the Edit is still held"
+        );
+        assert_eq!(*store.brick_at(1, beside), streamed);
+        // The one over the Edit was remade from the brick that is held.
+        assert!(store.holds(1, edited.parent()));
+        assert_ne!(*store.brick_at(1, edited.parent()), Brick::AIR);
+    }
+
+    #[test]
+    fn taking_back_a_brick_in_a_streamed_store_puts_back_what_the_source_makes_of_it() {
+        let mut store = BrickStore::new();
+        store.set_source(Slab);
+        store.build_lod(2);
+        store.stream_from(1);
+        let coord = BrickCoord([3, -2, 0]);
+        // An Edit made the brick before its parent's children were resident...
+        store.insert(coord, Brick::AIR);
+        store.set_children_resident(1, coord.parent());
+        // ...and the brick not held reads as air in a parent that is resident.
+        assert!(store.brick_at(0, BrickCoord([3, -1, 0])).is_air());
+        // Taken back, it reads as the source makes it, as it does where nothing streams.
+        store.remove(coord);
+        assert_eq!(*store.brick_at(0, coord), Brick::solid(ROCK));
+        // A brick that is air to the source stays air.
+        let sky = BrickCoord([3, 5, 0]);
+        store.insert(sky, Brick::solid(ROCK));
+        store.remove(sky);
+        assert!(store.brick_at(0, sky).is_air());
     }
 }

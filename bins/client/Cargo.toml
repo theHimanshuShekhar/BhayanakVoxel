@@ -21,7 +21,7 @@ toml = { version = "1.1.6", default-features = false, features = ["std", "serde"
 
 # The loader's worker threads run at the lowest priority (src/priority.rs), which the standard
 # library cannot ask for. Both crates are in the build already, through winit.
-[target.'cfg(unix)'.dependencies]
+[target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]

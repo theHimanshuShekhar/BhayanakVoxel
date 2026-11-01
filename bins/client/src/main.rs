@@ -74,10 +74,11 @@ fn planet_scene(
     bands: Bands,
     radius: i32,
 ) -> Result<Scene, RingsFull> {
-    // The scene starts as the Guard and grows by an order of magnitude as the bands fill in, and
-    // packing it again for room is a stall of seconds at the end: so it is given the room to
-    // begin with (a few hundred MiB, which the bands fill).
-    Scene::rings_with_headroom(
+    // The scene starts as the Guard and grows by an order of magnitude as the resident set fills
+    // in, and packing it again for room is a stall of seconds: so it is given the room that the
+    // bands are expected to fill to begin with.
+    let (refs, words) = expected_words(bands);
+    Scene::rings_reserving(
         store,
         camera,
         bands,
@@ -85,13 +86,29 @@ fn planet_scene(
             centre: [0; 3],
             radius,
         },
-        STREAM_HEADROOM,
+        refs,
+        words,
     )
 }
 
-/// How many times the room that the Guard needs the scene's buffers have when the Planet streams
-/// in: the full bands are about ten times the Guard.
-const STREAM_HEADROOM: f64 = 12.0;
+/// Bricks that the bands draw, at most, at a bias of 1 (`d0` of 1028 Voxels): measured on the
+/// full-size Planet, 3.1 million, 0.36 d0² for each of the levels 0 to 7 and the Guard's 176 000
+/// of level 8. A level's bricks are the surface within its band, so they go with d0².
+const BRICKS_PER_D0_SQUARED: f64 = 3.0;
+/// Words of `brick_refs` and of `bricks` per brick drawn, as measured when the resident set
+/// was complete.
+const REFS_PER_BRICK: f64 = 1.0;
+const WORDS_PER_BRICK: f64 = 28.0;
+
+/// Words of `brick_refs` and `bricks` to reserve for a scene that is going to fill to what the
+/// `bands` draw: what that is expected to take, a tenth over.
+fn expected_words(bands: Bands) -> (usize, usize) {
+    let bricks = BRICKS_PER_D0_SQUARED * bands.d0() * bands.d0() * 1.1 + 200_000.0;
+    (
+        (bricks * REFS_PER_BRICK) as usize,
+        (bricks * WORDS_PER_BRICK) as usize,
+    )
+}
 
 /// The Planet as the client and the in-process server each hold it, the client's packed copy of
 /// it, and where the client starts.
@@ -131,9 +148,11 @@ fn generate_ground(map: WorldMap, reach: i32, levels: usize) -> Ground {
         started.elapsed()
     );
     // Generation is deterministic, so the server's Planet is what generating it again would
-    // give; copying it is quicker. The server draws nothing, so it needs no coarse levels, and
-    // it reads the Planet itself beyond the ring, which the character cannot leave.
-    let server_store = store.clone();
+    // give; copying it is quicker. The server draws nothing, so it has no pyramid (an Edit there
+    // would remake its coarse bricks for nothing, on the simulation thread), and it reads the
+    // Planet itself beyond the ring, which the character cannot leave.
+    let mut server_store = store.clone();
+    server_store.build_lod(0);
     Ground {
         planet,
         store,
@@ -174,7 +193,7 @@ fn landing(eye: [f64; 3], leash: &Leash, ground: [f64; 3]) -> [f64; 3] {
 }
 
 /// Makes the Planet of `map` into what the client starts with: the spawn ring on gentle land,
-/// then the Guard, and the scene of the bands drawn from them, with a loader to fill the bands in
+/// then the Guard, and the scene of the bands drawn from them, with a loader to make the resident set complete
 /// (#86). The ring and the Guard are timed, and reported, apart.
 fn load(map: WorldMap, reach: i32) -> Result<Loaded, RingsFull> {
     let started = Instant::now();
@@ -453,21 +472,22 @@ impl App {
         self.show(update)
     }
 
-    /// Takes in the bricks the loader has generated, a bounded number a frame, and copies what
-    /// that changed to the GPU. Reports once, when the bands are first complete: nothing waits for
-    /// bricks and nothing is queued.
+    /// Takes in the bricks the loader has generated, for a bounded time a frame, and copies what
+    /// that changed to the GPU. Reports once, when the resident set is first complete for the
+    /// bands: nothing waits for bricks and nothing is queued.
     fn stream(&mut self) -> Result<(), Box<dyn Error>> {
-        let Some(world) = &mut self.world else {
+        let (Some(world), Some(renderer)) = (&mut self.world, &mut self.renderer) else {
             return Ok(());
         };
-        let update = world.stream(self.camera.position)?;
-        self.show(update)?;
+        world.stream(self.camera.position, |scene, update| {
+            renderer.update_scene(scene, update)
+        })?;
         if let (Some(since), Some(world)) = (self.filling_since, &self.world)
             && world.waiting() == 0
             && world.loader().is_some_and(|l| l.pending() == 0)
         {
             eprintln!(
-                "bands complete {:.1?} after the first frame: {} bricks generated",
+                "resident set complete for the bands {:.1?} after the first frame: {} bricks generated",
                 since.elapsed(),
                 world.loader().map_or(0, Loader::generated)
             );
@@ -919,6 +939,17 @@ mod tests {
             "{below:?}"
         );
         // The server holds the same ground.
+        assert_eq!(
+            loaded.server_store.content_hash(),
+            loaded.store.content_hash()
+        );
+    }
+
+    #[test]
+    fn the_server_holds_the_ground_without_a_pyramid_so_an_edit_there_remakes_no_coarse_brick() {
+        let loaded = generate_ground(WorldMap::generate(SEED, 512), 100, 3);
+        assert_eq!(loaded.store.level_count(), 3);
+        assert_eq!(loaded.server_store.level_count(), 1);
         assert_eq!(
             loaded.server_store.content_hash(),
             loaded.store.content_hash()

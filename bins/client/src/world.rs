@@ -10,16 +10,14 @@ use sim::Predictor;
 
 use crate::loader::{Arrival, Loader};
 
-/// What the frame thread aims to spend taking in bricks from the loader in one frame. A band that
-/// is filling takes more frames, not longer ones. How many families it takes in at once follows
-/// how long the last frame's took ([`World::stream`]).
-pub const STREAM_BUDGET: std::time::Duration = std::time::Duration::from_millis(3);
-/// Most families of eight bricks taken in one frame, and the number to begin with.
-const MOST_FAMILIES: usize = 4096;
-const FIRST_FAMILIES: usize = 16;
+/// What the frame thread aims to spend taking in bricks from the loader in one frame, the upload
+/// to the GPU included. A resident set that is filling takes more frames, not longer ones.
+pub const STREAM_BUDGET: std::time::Duration = std::time::Duration::from_micros(2500);
+/// Bricks' children taken in at a time, between looks at the clock.
+const CHUNK: usize = 8;
 
 /// Radius of the sphere a click digs: 1 m at 10 cm Voxels.
-const DIG_RADIUS: u16 = 10;
+pub(crate) const DIG_RADIUS: u16 = 10;
 
 /// Why the Planet cannot be kept going.
 #[derive(Debug, PartialEq, Eq)]
@@ -95,8 +93,8 @@ pub struct World {
     link: ClientEnd,
     /// Generates the bricks that the scene is waiting for, if the Planet is streamed in.
     loader: Option<Loader>,
-    /// How many families the next [`World::stream`] takes in.
-    families: usize,
+    /// What [`World::stream`] expects taking in a chunk to cost.
+    chunk_cost: std::time::Duration,
 }
 
 /// The first solid Voxel along the camera's view through the middle of the screen.
@@ -120,7 +118,7 @@ impl World {
             predictor,
             link,
             loader: None,
-            families: FIRST_FAMILIES,
+            chunk_cost: std::time::Duration::ZERO,
         }
     }
 
@@ -136,8 +134,8 @@ impl World {
         self.loader.as_ref()
     }
 
-    /// Bricks that wait for the bricks under them to be loaded. Zero, and nothing pending with
-    /// the loader, once the bands are complete.
+    /// Bricks that wait for the bricks under them to be resident. Zero, and nothing pending with
+    /// the loader, once the resident set is complete for the bands.
     pub fn waiting(&self) -> usize {
         self.scene.waiting()
     }
@@ -181,49 +179,59 @@ impl World {
     }
 
     /// Asks the loader for what the bands are waiting for, nearest `camera` first, and takes in
-    /// what it has generated, for [`STREAM_BUDGET`] at the most: the families of bricks are held,
-    /// and the scene splits the bricks they are under. Returns how the scene changed, if it did.
-    /// This is all the frame thread does of loading: the bricks are generated on the loader's
-    /// threads, and what is not taken in this frame waits for the next.
-    pub fn stream(&mut self, camera: [f64; 3]) -> Result<Option<SceneUpdate>, RingsFull> {
+    /// what it has generated, for [`STREAM_BUDGET`] at the most: a few bricks' children at a time
+    /// are held, the scene splits the bricks they are under, and `show` copies what that changed
+    /// to the GPU (its time is in the budget). This is all the frame thread does of loading: the
+    /// bricks are generated on the loader's threads, at most [`crate::loader::MAX_AHEAD`] ahead
+    /// of what is taken in here, and what is not taken in this frame waits for the next.
+    pub fn stream<E: From<RingsFull>>(
+        &mut self,
+        camera: [f64; 3],
+        mut show: impl FnMut(&Scene, &SceneUpdate) -> Result<(), E>,
+    ) -> Result<(), E> {
         let Self {
             scene,
             predictor,
             loader: Some(loader),
-            families,
+            chunk_cost,
             ..
         } = self
         else {
-            return Ok(None);
+            return Ok(());
         };
         let Some(bands) = scene.bands() else {
-            return Ok(None);
+            return Ok(());
         };
+        let started = std::time::Instant::now();
+        loader.cancel(scene.take_cancelled());
         loader.request(predictor.store(), scene.take_wanted(), camera);
         loader.sync(camera, bands);
-        let started = std::time::Instant::now();
-        let mut loaded = Vec::new();
-        for arrival in loader.receive(*families) {
-            match arrival {
-                Arrival::Family { key, bricks } => {
-                    predictor
-                        .store_for_loading()
-                        .load_children(key.0, key.1, bricks);
-                    loaded.push(key);
+        let mut worst = std::time::Duration::ZERO;
+        while started.elapsed() + *chunk_cost <= STREAM_BUDGET {
+            let chunk_started = std::time::Instant::now();
+            let mut resident = Vec::new();
+            for arrival in loader.receive(CHUNK) {
+                match arrival {
+                    Arrival::Children { key, bricks } => {
+                        predictor
+                            .store_for_loading()
+                            .hold_children(key.0, key.1, bricks);
+                        resident.push(key);
+                    }
+                    Arrival::Dropped(key) => scene.unwant(key),
                 }
-                Arrival::Dropped(key) => scene.unwant(key),
             }
+            if resident.is_empty() {
+                break;
+            }
+            if let Some(update) = scene.arrive(predictor.store(), &resident)? {
+                show(scene, &update)?;
+            }
+            worst = worst.max(chunk_started.elapsed());
         }
-        if loaded.is_empty() {
-            return Ok(None);
-        }
-        let update = scene.arrive(predictor.store(), &loaded)?;
-        // The next frame takes in as many as would have taken the budget, but no more than twice
-        // as many as this one did: a family costs what it costs, and the frame has its own cost.
-        let took = started.elapsed().as_secs_f64().max(1e-6);
-        let fit = loaded.len() as f64 * STREAM_BUDGET.as_secs_f64() / took;
-        *families = (fit.min(2.0 * loaded.len() as f64) as usize).clamp(1, MOST_FAMILIES);
-        Ok(update)
+        // What the next frame expects a chunk to cost: the worst of this one, forgetting slowly.
+        *chunk_cost = worst.max(chunk_cost.mul_f64(0.9));
+        Ok(())
     }
 
     /// Selects the bricks again for other LOD `bands` (a new bias). Returns how the scene

@@ -683,14 +683,15 @@ impl Planet {
         SEA_RADIUS + lowest - far - SLACK > 0.0
     }
 
-    /// The Guard: the bricks of the whole Planet at the mip levels `levels`, each as
-    /// [`Planet::coarse_brick`] makes it, except air and the bricks wholly in the interior
-    /// (a source gives those; see [`PlanetSource`]). Generated on all the cores. Returned as
-    /// `(level, coordinate, brick)`, coarsest level first.
+    /// The Guard: the bricks of the whole Planet at the mip levels `levels` (8 to 12, the top of
+    /// the pyramid, in the client), each as [`Planet::coarse_brick`] makes it, except air and the
+    /// bricks wholly in the interior (a source gives those; see [`PlanetSource`]). Generated on
+    /// all the cores. Returned as `(level, coordinate, brick, solid_below)`, coarsest level first,
+    /// where `solid_below` is [`Planet::solid_below`] of the brick, worked out on those cores too.
     pub fn guard(
         &self,
         levels: std::ops::RangeInclusive<usize>,
-    ) -> Vec<(usize, BrickCoord, Brick)> {
+    ) -> Vec<(usize, BrickCoord, Brick, bool)> {
         let mut out = Vec::new();
         for level in levels.rev() {
             assert!(level > 0, "level 0 is not coarse");
@@ -705,12 +706,13 @@ impl Planet {
                 {
                     return None;
                 }
-                Some(self.coarse_brick(level, coord)).filter(|brick| !brick.is_air())
+                let brick = self.coarse_brick(level, coord);
+                (!brick.is_air()).then(|| (brick, self.solid_below(level, coord)))
             });
             out.extend(
                 found
                     .into_iter()
-                    .map(|(coord, brick)| (level, coord, brick)),
+                    .map(|(coord, (brick, solid))| (level, coord, brick, solid)),
             );
         }
         out
@@ -730,7 +732,7 @@ fn inside_interior(level: usize, coord: BrickCoord) -> bool {
 /// costs a brick's worth of Voxels for each brick that holds ground. Measured on the client's
 /// first view of the full-size Planet (#84): 3.0 million bricks, 228 s on eight cores, so a frame
 /// must not wait on it: the client's store streams (`BrickStore::stream_from`), and the ring
-/// loader (#86) reads the bricks of the first view on worker threads, a family at a time, before
+/// loader (#86) reads the bricks of the first view on worker threads, a brick's children at a time, before
 /// the scene asks the store for them. What reads this on the frame thread is an Edit, which
 /// remakes the bricks over it, and the ones beside them, from their children.
 ///
@@ -1912,7 +1914,10 @@ mod tests {
         assert!(guard.windows(2).all(|w| w[0].0 >= w[1].0), "coarsest first");
         let found: std::collections::BTreeMap<_, _> = guard
             .into_iter()
-            .map(|(level, coord, brick)| ((level, coord), brick))
+            .map(|(level, coord, brick, solid)| {
+                assert_eq!(solid, planet().solid_below(level, coord));
+                ((level, coord), brick)
+            })
             .collect();
         for level in 11..=12 {
             let reach = MAX_RADIUS / (BRICK_SIZE << level) + 2;

@@ -214,14 +214,14 @@ fn generate_box(seed: u64, min: BrickCoord, max: BrickCoord, skip_core: bool) ->
 
 /// The bricks that `keep` returns for each coordinate in the box from `min` to `max` inclusive,
 /// in no particular order. Slabs of constant x are done on all available cores.
-fn par_bricks(
+fn par_bricks<T: Send>(
     min: BrickCoord,
     max: BrickCoord,
-    keep: impl Fn(BrickCoord) -> Option<Brick> + Sync,
-) -> Vec<(BrickCoord, Brick)> {
+    keep: impl Fn(BrickCoord) -> Option<T> + Sync,
+) -> Vec<(BrickCoord, T)> {
     let next_x = AtomicI32::new(min.0[0]);
     let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
-    let slabs: Vec<Vec<(BrickCoord, Brick)>> = std::thread::scope(|scope| {
+    let slabs: Vec<Vec<(BrickCoord, T)>> = std::thread::scope(|scope| {
         let workers: Vec<_> = (0..threads)
             .map(|_| {
                 scope.spawn(|| {

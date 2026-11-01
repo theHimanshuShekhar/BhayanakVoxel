@@ -39,7 +39,7 @@ pub trait BrickSource: Debug + Send + Sync {
 
 /// The bricks under the brick at `coord` of mip `level` (at least 1) as `source` gives them, in
 /// [`BrickCoord::children`] order, except air and the ones `skip` says to leave out (those the
-/// store holds already): what [`crate::BrickStore::load_children`] takes. It reads only the
+/// store holds already): what [`crate::BrickStore::hold_children`] takes. It reads only the
 /// source, so it can run on any thread.
 pub fn children_from(
     source: &dyn BrickSource,
