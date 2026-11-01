@@ -139,8 +139,9 @@ pub(crate) fn downsample<'a>(
         if solid.count_ones() < 4 {
             continue;
         }
-        // The palette has an entry for every Material that is in the brick, and never fewer, so
-        // a brick of one has nothing to choose, and so nothing to look at the air for.
+        // The palette has an entry for every Material in the brick (it can also keep ones that were
+        // overwritten), so a palette of one is a brick of one Material: nothing to choose, and so
+        // nothing to look at the air for.
         let winner = if let [only] = *palette {
             only
         } else {
@@ -149,10 +150,14 @@ pub(crate) fn downsample<'a>(
                     occupancy_beside(&children, &outside, index, face)
                 })
             });
-            let surface = block_bits(mask, first);
+            let exposed_here = block_bits(mask, first);
             let mut tally = Tally::new();
             // The exposed Voxels decide if there are any, and else all the solid ones do.
-            let decide = if surface != 0 { surface } else { solid };
+            let decide = if exposed_here != 0 {
+                exposed_here
+            } else {
+                solid
+            };
             for j in (0..8).filter(|j| decide >> j & 1 == 1) {
                 let found = [0, 1, 2].map(|a| (first[a] + (j >> a & 1)) as u8);
                 tally.add(child.get(found).expect("a solid Voxel has a Material"));
@@ -251,7 +256,8 @@ struct Tally {
     counts: [(Material, u8); 8],
     /// How many Materials are tallied.
     len: usize,
-    /// How many children are tallied, which is how many are solid.
+    /// How many children are tallied, which is how many are solid. Only the per-Voxel rule in
+    /// the tests reads it now.
     count: u8,
 }
 
@@ -547,7 +553,9 @@ mod tests {
 
     /// The rule as it was before exposure was read from the occupancy masks: each Voxel of a block
     /// read through `Brick::get`, and the air beside it looked for Voxel by Voxel. Kept so that
-    /// tests can show that the masks give the same coarse bricks, not only the same goldens.
+    /// tests can show that the masks give the same coarse bricks, not only the same goldens. Its
+    /// `downsample` is the old one; its `Around` is simpler than the old one (no cache of the
+    /// bricks it has read), which gives the same answers because `outside` has no side effects.
     mod per_voxel {
         use super::*;
 
