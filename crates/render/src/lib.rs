@@ -45,6 +45,7 @@ pub use profiler::Profiler;
 pub use scene::{RingsFull, Room, Scene, SceneUpdate};
 pub use sun::Sun;
 pub use timing::Timings;
+pub use tracer::Variant;
 pub use upscale::Resolution;
 pub use window::{Mode, Renderer};
 

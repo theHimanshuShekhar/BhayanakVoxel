@@ -1,6 +1,7 @@
 mod bench;
 mod fly;
 mod loader;
+mod measure;
 mod priority;
 #[cfg(test)]
 mod streaming_tests;
@@ -919,8 +920,12 @@ impl ApplicationHandler for App {
 
 fn main() -> Result<ExitCode, Box<dyn Error>> {
     let mut args = std::env::args().skip(1);
-    if args.next().as_deref() == Some("bench") {
+    let first = args.next();
+    if first.as_deref() == Some("bench") {
         return Ok(bench::main(args));
+    }
+    if first.as_deref() == Some("measure-reference") {
+        return Ok(measure::main(args));
     }
     let event_loop = EventLoop::new()?;
     event_loop.set_control_flow(ControlFlow::Poll);

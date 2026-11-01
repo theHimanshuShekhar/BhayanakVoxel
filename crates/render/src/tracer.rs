@@ -171,7 +171,8 @@ impl Target {
         let accum = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("accumulation"),
             size: u64::from(internal.0) * u64::from(internal.1) * 16,
-            usage: wgpu::BufferUsages::STORAGE,
+            // COPY_SRC: #99's measurement tooling reads the float mean back.
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
         Self {
@@ -237,7 +238,14 @@ pub struct Tracer {
     debug_view: DebugView,
     /// Bytes of the Planet that have been written to the GPU, creating its buffers included.
     uploaded: u64,
+    /// The reference's random seed (#99 measurement tooling: `RNG_SEED` unless changed).
+    seed: u32,
+    /// Temporary shader variants of the reference pass (#99 measurement tooling).
+    variants: std::collections::HashMap<measure::Variant, wgpu::ComputePipeline>,
 }
+
+mod measure;
+pub use measure::Variant;
 
 pub(crate) fn layout_entry(binding: u32, ty: wgpu::BindingType) -> wgpu::BindGroupLayoutEntry {
     wgpu::BindGroupLayoutEntry {
@@ -486,6 +494,8 @@ impl Tracer {
             accumulator: Accumulator::new(),
             debug_view: DebugView::default(),
             uploaded: scene_bytes,
+            seed: RNG_SEED,
+            variants: Default::default(),
         })
     }
 
@@ -706,7 +716,7 @@ impl Tracer {
         );
         let frame = FrameUniform {
             sun: sun.uniform(),
-            params: [sample_index, RNG_SEED, self.debug_view.index(), 0],
+            params: [sample_index, self.seed, self.debug_view.index(), 0],
             jitter: [jitter[0], jitter[1], 0.0, 0.0],
         };
         queue.write_buffer(&self.frame_buffer, 0, bytemuck::bytes_of(&frame));

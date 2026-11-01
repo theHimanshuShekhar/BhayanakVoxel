@@ -1,0 +1,11 @@
+[package]
+name = "measure-ref-analyze"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+# THROWAWAY (#99): analyses the captures of `client measure-reference`. Never merged.
+[dependencies]
+flip-rs = "0.1.2"
+png = "0.18.1"
+serde_json = "1.0.151"

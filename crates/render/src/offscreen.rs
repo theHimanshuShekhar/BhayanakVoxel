@@ -11,6 +11,8 @@ use crate::tracer::{Plane, Target, Tracer};
 use crate::upscale::Resolution;
 use crate::{Result, create_instance, finish_and_read, request_gpu, staging_buffer};
 
+mod measure;
+
 /// Copies a `width` x `height` texture of `bytes` per texel to the CPU after the work in
 /// `encoder`, tightly packed, rows from the top.
 fn read_texture(
@@ -97,6 +99,8 @@ pub struct Offscreen {
     sun: Sun,
     /// Whether `update_scene` sends its writes at once; see `set_flush_scene_updates`.
     flush_scene_updates: bool,
+    /// Reference samples submitted and not waited for (#99 measurement tooling).
+    in_flight: std::collections::VecDeque<wgpu::SubmissionIndex>,
 }
 
 impl Offscreen {
@@ -139,6 +143,7 @@ impl Offscreen {
             target,
             sun: Sun::default(),
             flush_scene_updates: true,
+            in_flight: Default::default(),
         })
     }
 
