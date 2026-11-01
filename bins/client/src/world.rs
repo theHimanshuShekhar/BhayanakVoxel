@@ -12,9 +12,12 @@ use crate::loader::{Arrival, Loader};
 
 /// What the frame thread aims to spend taking in bricks from the loader in one frame, the upload
 /// to the GPU included. A resident set that is filling takes more frames, not longer ones.
-pub const STREAM_BUDGET: std::time::Duration = std::time::Duration::from_micros(2500);
+pub const STREAM_BUDGET: std::time::Duration = std::time::Duration::from_micros(2000);
 /// Bricks' children taken in at a time, between looks at the clock.
-const CHUNK: usize = 8;
+const BATCH: usize = 8;
+/// Most bricks asked of the loader in one frame (the rest wait for the next): the first call has
+/// every brick the Guard leaves to split, and the table that holds them is not made in a frame.
+const WANTED_PER_FRAME: usize = 20_000;
 
 /// Radius of the sphere a click digs: 1 m at 10 cm Voxels.
 pub(crate) const DIG_RADIUS: u16 = 10;
@@ -93,8 +96,8 @@ pub struct World {
     link: ClientEnd,
     /// Generates the bricks that the scene is waiting for, if the Planet is streamed in.
     loader: Option<Loader>,
-    /// What [`World::stream`] expects taking in a chunk to cost.
-    chunk_cost: std::time::Duration,
+    /// What [`World::stream`] expects taking in a batch to cost.
+    batch_cost: std::time::Duration,
 }
 
 /// The first solid Voxel along the camera's view through the middle of the screen.
@@ -118,7 +121,7 @@ impl World {
             predictor,
             link,
             loader: None,
-            chunk_cost: std::time::Duration::ZERO,
+            batch_cost: std::time::Duration::ZERO,
         }
     }
 
@@ -193,7 +196,7 @@ impl World {
             scene,
             predictor,
             loader: Some(loader),
-            chunk_cost,
+            batch_cost,
             ..
         } = self
         else {
@@ -204,13 +207,17 @@ impl World {
         };
         let started = std::time::Instant::now();
         loader.cancel(scene.take_cancelled());
-        loader.request(predictor.store(), scene.take_wanted(), camera);
+        loader.request(
+            predictor.store(),
+            scene.take_wanted_up_to(WANTED_PER_FRAME),
+            camera,
+        );
         loader.sync(camera, bands);
         let mut worst = std::time::Duration::ZERO;
-        while started.elapsed() + *chunk_cost <= STREAM_BUDGET {
-            let chunk_started = std::time::Instant::now();
+        while started.elapsed() + *batch_cost <= STREAM_BUDGET {
+            let batch_started = std::time::Instant::now();
             let mut resident = Vec::new();
-            for arrival in loader.receive(CHUNK) {
+            for arrival in loader.receive(BATCH) {
                 match arrival {
                     Arrival::Children { key, bricks } => {
                         predictor
@@ -227,10 +234,14 @@ impl World {
             if let Some(update) = scene.arrive(predictor.store(), &resident)? {
                 show(scene, &update)?;
             }
-            worst = worst.max(chunk_started.elapsed());
+            worst = worst.max(batch_started.elapsed());
         }
-        // What the next frame expects a chunk to cost: the worst of this one, forgetting slowly.
-        *chunk_cost = worst.max(chunk_cost.mul_f64(0.9));
+        // What the next frame expects a batch to cost: a running mean of the worst of each frame,
+        // and never more than a third of the budget, so that one slow batch (a table that grew)
+        // does not stop taking bricks in for the frames after it.
+        if !worst.is_zero() {
+            *batch_cost = (batch_cost.mul_f64(0.8) + worst.mul_f64(0.2)).min(STREAM_BUDGET / 3);
+        }
         Ok(())
     }
 

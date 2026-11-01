@@ -100,6 +100,45 @@ const BRICKS_PER_D0_SQUARED: f64 = 3.0;
 const REFS_PER_BRICK: f64 = 1.0;
 const WORDS_PER_BRICK: f64 = 28.0;
 
+/// What the tables that hold the Planet are made roomy for at the start, for the full bands at a
+/// bias of 1, measured on the full-size Planet (the bricks the store holds are more than are
+/// drawn: the ones buried are held too). Scaled with `d0` squared like the bricks drawn. A table
+/// that grows in the middle of a frame moves every entry, 25 to 60 ms for these; this is
+/// address space until the resident set fills it.
+struct Room {
+    /// Bricks held at each level, from level 0.
+    held: Vec<usize>,
+    /// Bricks whose children are resident.
+    resident: usize,
+    /// Nodes of the selection, and bricks waiting and stuck, and asked of the loader at once.
+    nodes: usize,
+    waiting: usize,
+}
+
+fn room_for(bands: Bands) -> Room {
+    let s = (bands.d0() / 1028.2).powi(2);
+    let scaled = |n: f64| (n * s) as usize + 1024;
+    // The Guard's levels hold what they hold whatever the bands are.
+    let mut held = vec![800_000 + scaled(1_300_000.0)];
+    held.extend((1..RING_LEVELS).map(|level| match level {
+        1..GUARD_FIRST => scaled(750_000.0),
+        GUARD_FIRST => 600_000 + scaled(100_000.0),
+        _ => 100_000,
+    }));
+    Room {
+        held,
+        resident: scaled(1_200_000.0),
+        nodes: scaled(5_000_000.0) + 400_000,
+        waiting: scaled(1_200_000.0) + 200_000,
+    }
+}
+
+/// Bytes of address space a table of `entries` entries of `size` bytes takes: its buckets are the
+/// next power of two over eight sevenths of that, with a byte of control each.
+fn table_bytes(entries: usize, size: usize) -> usize {
+    (entries * 8 / 7).next_power_of_two() * (size + 1)
+}
+
 /// Words of `brick_refs` and `bricks` to reserve for a scene that is going to fill to what the
 /// `bands` draw: what that is expected to take, a tenth over.
 fn expected_words(bands: Bands) -> (usize, usize) {
@@ -204,6 +243,9 @@ fn load(map: WorldMap, reach: i32) -> Result<Loaded, RingsFull> {
         camera,
         ground,
     } = generate_ground(map, reach, RING_LEVELS);
+    let bands = Bands::standard(f64::from(DEFAULT_BIAS));
+    let room = room_for(bands);
+    store.reserve(&room.held, room.resident);
     let guarded = Instant::now();
     let held = loader::hold_guard(&mut store, &planet, GUARD_FIRST);
     eprintln!(
@@ -212,19 +254,38 @@ fn load(map: WorldMap, reach: i32) -> Result<Loaded, RingsFull> {
         guarded.elapsed()
     );
     let selected = Instant::now();
-    let bands = Bands::standard(f64::from(DEFAULT_BIAS));
-    let scene = planet_scene(
+    let mut scene = planet_scene(
         &store,
         camera.position,
         bands,
         planet_gen::planet::MAX_RADIUS,
     )?;
     let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
-    let loader = Loader::new(
+    scene.reserve(room.nodes, room.waiting);
+    let mut loader = Loader::new(
         store.source().expect("the ring's store has a source"),
         camera.position,
         bands,
         loader::workers_for(cores),
+    );
+    loader.reserve(room.waiting);
+    // The bricks the Guard leaves to split are asked for here, as load time, and not in the first
+    // frame: there are 178 thousand.
+    let asked = Instant::now();
+    let first = scene.take_wanted();
+    let first_count = first.len();
+    loader.request(&store, first, camera.position);
+    loader.sync(camera.position, bands);
+    eprintln!(
+        "asked for the children of {first_count} bricks in {:.2?}; tables made roomy for the \
+         full bands: about {:.0} MiB of address space",
+        asked.elapsed(),
+        (room.held.iter().map(|&n| table_bytes(n, 32)).sum::<usize>()
+            + table_bytes(room.resident, 32)
+            + table_bytes(room.nodes, 41)
+            + 2 * table_bytes(room.waiting, 25)
+            + table_bytes(room.waiting, 40)) as f64
+            / (1024.0 * 1024.0)
     );
     let bricks: Vec<usize> = (0..RING_LEVELS).map(|l| scene.level_bricks(l)).collect();
     eprintln!(

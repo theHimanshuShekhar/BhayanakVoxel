@@ -73,8 +73,9 @@ struct Job {
     key: Key,
     /// Which request this is: a brick can be asked for again after it was given up on.
     ticket: u64,
-    /// The children that are held already, which are not generated.
-    held: Vec<BrickCoord>,
+    /// The children that are held already, which are not generated: bit `i` for the `i`th of
+    /// [`BrickCoord::children`].
+    held: u8,
 }
 
 impl PartialEq for Job {
@@ -218,6 +219,14 @@ impl Loader {
         );
     }
 
+    /// Makes room for `n` bricks asked for at once, in the tables and the queue, so that they do
+    /// not double in the middle of a frame.
+    pub fn reserve(&mut self, n: usize) {
+        self.requested.reserve(n);
+        self.outbox.reserve(n.min(1 << 16));
+        self.shared.lock().queue.reserve(n);
+    }
+
     /// Asks for the children of `keys`, the bricks that [`render::Scene::take_wanted`] says wait
     /// for them. The nearest to the camera are generated first. A brick already asked for is not
     /// asked for again.
@@ -238,8 +247,9 @@ impl Loader {
             let held = coord
                 .children()
                 .into_iter()
-                .filter(|&child| store.holds(level - 1, child))
-                .collect();
+                .enumerate()
+                .filter(|&(_, child)| store.holds(level - 1, child))
+                .fold(0u8, |mask, (i, _)| mask | 1 << i);
             self.outbox.push(Job {
                 distance: brick_distance(camera, level, coord),
                 key,
@@ -420,10 +430,16 @@ fn work(shared: &Shared, arrivals: &Sender<(u64, Arrival)>) {
         // brick that is split keeps (see `Bands::split`), so that a job is only dropped for a
         // brick that the camera has really left.
         let arrival = if bands.split(level, brick_distance(camera, level, coord), Some(true)) {
-            let bricks = children_from(&*shared.source, level, coord, |c| job.held.contains(&c));
+            let kids = coord.children();
+            let held = |c: BrickCoord| {
+                kids.iter()
+                    .position(|&k| k == c)
+                    .is_some_and(|i| job.held >> i & 1 == 1)
+            };
+            let bricks = children_from(&*shared.source, level, coord, held);
             shared
                 .generated
-                .fetch_add(8 - job.held.len() as u64, Atomic::Relaxed);
+                .fetch_add(u64::from(8 - job.held.count_ones()), Atomic::Relaxed);
             Arrival::Children {
                 key: job.key,
                 bricks,
@@ -446,7 +462,7 @@ mod tests {
             distance,
             key: (3, BrickCoord([x, 0, 0])),
             ticket: 0,
-            held: Vec::new(),
+            held: 0,
         }
     }
 

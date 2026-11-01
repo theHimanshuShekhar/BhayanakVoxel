@@ -597,6 +597,21 @@ impl Scene {
             .map_or_else(Vec::new, |r| r.selection.take_wanted())
     }
 
+    /// [`Scene::take_wanted`], but at most `limit` of them; the rest are for the next call.
+    pub fn take_wanted_up_to(&mut self, limit: usize) -> Vec<(usize, BrickCoord)> {
+        self.rings
+            .as_mut()
+            .map_or_else(Vec::new, |r| r.selection.take_wanted_up_to(limit))
+    }
+
+    /// Makes room for `nodes` nodes of the selection and `waiting` bricks waiting (see
+    /// [`Selection::reserve`]).
+    pub fn reserve(&mut self, nodes: usize, waiting: usize) {
+        if let Some(rings) = &mut self.rings {
+            rings.selection.reserve(nodes, waiting);
+        }
+    }
+
     /// How many bricks wait for the bricks under them to be resident.
     pub fn waiting(&self) -> usize {
         self.rings.as_ref().map_or(0, |r| r.selection.waiting())

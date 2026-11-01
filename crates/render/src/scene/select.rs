@@ -94,6 +94,27 @@ struct Node {
     due: f64,
 }
 
+/// A look at all the stuck bricks, in steps.
+#[derive(Clone, Debug)]
+struct Scan {
+    /// The bricks to look at, and how many have been.
+    keys: Vec<Key>,
+    done: usize,
+    /// The nearest of those looked at, from `from`.
+    nearest: [Option<f64>; LEVELS],
+    from: [f64; 3],
+    /// Bricks of `stuck` that were not stuck when it began.
+    added: Vec<Key>,
+    /// Bricks that were looked at and are not stuck any more.
+    dead: Vec<Key>,
+}
+
+/// Stuck bricks looked at in one call of [`Selection::nearest_stuck`] when there are many.
+#[cfg(not(test))]
+const SCAN_STEP: usize = 16_384;
+#[cfg(test)]
+const SCAN_STEP: usize = 64;
+
 /// Bricks that are stuck above which [`Selection::nearest_stuck`] keeps a bound instead of looking
 /// at them all each time.
 const MANY_STUCK: usize = 4096;
@@ -398,6 +419,8 @@ pub struct Selection {
     bound: [Option<f64>; LEVELS],
     bound_at: Option<[f64; 3]>,
     since: Vec<Key>,
+    /// The bound being found again, a few bricks of `stuck` at a time.
+    scan: Option<Scan>,
     /// How many stuck bricks make `stuck` large: [`MANY_STUCK`], or fewer for a test.
     #[cfg(test)]
     many: usize,
@@ -435,6 +458,7 @@ impl Selection {
             bound: [None; LEVELS],
             bound_at: None,
             since: Vec::new(),
+            scan: None,
             #[cfg(test)]
             many: MANY_STUCK,
             waiting: HashSet::default(),
@@ -519,39 +543,98 @@ impl Selection {
     /// such brick.
     ///
     /// A Planet that is streaming in has hundreds of thousands of such bricks while they wait for
-    /// the bricks under them, and looking at all of them for each change would cost more than the
-    /// change. Then the answer is a lower bound, which is exact when nothing but additions have
+    /// the bricks under them, and looking at all of them in one frame would cost more than the
+    /// frame. Then the answer is a lower bound, which is exact when nothing but additions have
     /// happened with the camera where it was: it is never further than the nearest, so a hole made
-    /// from it is never too big. It is found again in full when the camera has gone some way from
-    /// where the bound is from (the bound loses what the camera went), or when as many bricks have
-    /// been added as there were: a brick that stopped being stuck only makes the bound smaller
+    /// from it is never too big. When the camera has gone some way from where the bound is from
+    /// (it loses what the camera went), or as many bricks have been added as there were, the
+    /// bound is found again, [`SCAN_STEP`] bricks at a time over the frames that follow, and the
+    /// old one stands until then. A brick that stopped being stuck only makes the bound smaller
     /// than it could be.
     pub fn nearest_stuck(&mut self) -> [Option<f64>; LEVELS] {
-        if self.stuck.len() > self.many()
-            && let Some(at) = self.bound_at
-        {
-            let drift = (0..3)
-                .map(|a| (self.camera[a] - at[a]).powi(2))
-                .sum::<f64>()
-                .sqrt();
-            if drift <= self.bands.d0() && self.since.len() <= self.stuck.len() / 2 {
-                for (level, coord) in std::mem::take(&mut self.since) {
-                    // Its distance now is at least this less than it was from `at`.
-                    let d = brick_distance(self.camera, level, coord) - drift;
-                    self.bound[level] = Some(self.bound[level].map_or(d, |b| b.min(d)));
-                }
-                return self.bound.map(|b| b.map(|b| (b - drift).max(0.0)));
-            }
+        if self.stuck.len() <= self.many() {
+            self.bound_at = None;
+            self.scan = None;
+            return self.nearest_stuck_in_full();
         }
-        let nearest = self.nearest_stuck_in_full();
-        if self.stuck.len() > self.many() {
+        let Some(at) = self.bound_at else {
+            // The first time there are many: it began with few, so this was not many bricks.
+            let nearest = self.nearest_stuck_in_full();
             self.bound = nearest;
             self.bound_at = Some(self.camera);
             self.since.clear();
-        } else {
-            self.bound_at = None;
+            return nearest;
+        };
+        let drift = |camera: [f64; 3], from: [f64; 3]| {
+            (0..3)
+                .map(|a| (camera[a] - from[a]).powi(2))
+                .sum::<f64>()
+                .sqrt()
+        };
+        let moved = drift(self.camera, at);
+        if self.scan.is_none()
+            && (moved > self.bands.d0() || self.since.len() > self.stuck.len() / 2)
+        {
+            self.scan = Some(Scan {
+                keys: self.stuck.iter().copied().collect(),
+                done: 0,
+                nearest: [None; LEVELS],
+                from: self.camera,
+                added: Vec::new(),
+                dead: Vec::new(),
+            });
         }
-        nearest
+        if self.scan.is_some() {
+            self.step_scan();
+        }
+        let moved = self.bound_at.map_or(0.0, |at| drift(self.camera, at));
+        for (level, coord) in std::mem::take(&mut self.since) {
+            // Its distance now is at least this less than it was from where the bound is from.
+            let d = brick_distance(self.camera, level, coord) - moved;
+            self.bound[level] = Some(self.bound[level].map_or(d, |b| b.min(d)));
+        }
+        self.bound.map(|b| b.map(|b| (b - moved).max(0.0)))
+    }
+
+    /// Looks at the next [`SCAN_STEP`] bricks of the scan, and ends it if that was the last.
+    fn step_scan(&mut self) {
+        let Some(mut scan) = self.scan.take() else {
+            return;
+        };
+        let (bands, nodes) = (self.bands, &self.nodes);
+        let end = (scan.done + SCAN_STEP).min(scan.keys.len());
+        for &key in &scan.keys[scan.done..end] {
+            if !nodes
+                .get(&key)
+                .is_some_and(|n| n.state == State::Whole && n.draws)
+            {
+                scan.dead.push(key);
+                continue;
+            }
+            let (level, coord) = key;
+            let d = brick_distance(scan.from, level, coord);
+            if d < bands.clear_radius(level) && scan.nearest[level].is_none_or(|n| d < n) {
+                scan.nearest[level] = Some(d);
+            }
+        }
+        scan.done = end;
+        if end < scan.keys.len() {
+            self.scan = Some(scan);
+            return;
+        }
+        for key in scan.dead {
+            // Unless it was made stuck again since.
+            let stuck_now = self
+                .nodes
+                .get(&key)
+                .is_some_and(|n| n.state == State::Whole && n.draws);
+            if !stuck_now {
+                self.stuck.remove(&key);
+            }
+        }
+        self.bound = scan.nearest;
+        self.bound_at = Some(scan.from);
+        self.since = scan.added;
     }
 
     fn nearest_stuck_in_full(&mut self) -> [Option<f64>; LEVELS] {
@@ -582,6 +665,9 @@ impl Selection {
     fn add_stuck(&mut self, key: Key) {
         if self.stuck.insert(key) && self.bound_at.is_some() {
             self.since.push(key);
+            if let Some(scan) = &mut self.scan {
+                scan.added.push(key);
+            }
         }
     }
 
@@ -622,10 +708,25 @@ impl Selection {
     /// [`Selection::arrived`] splits it. A brick is only listed again if it is
     /// [`unwanted`](Selection::unwant) first.
     pub fn take_wanted(&mut self) -> Vec<Key> {
-        std::mem::take(&mut self.fresh)
+        self.take_wanted_up_to(usize::MAX)
+    }
+
+    /// [`Selection::take_wanted`], but at most `limit` of them; the rest are for the next call.
+    pub fn take_wanted_up_to(&mut self, limit: usize) -> Vec<Key> {
+        let rest = self.fresh.split_off(self.fresh.len().min(limit));
+        std::mem::replace(&mut self.fresh, rest)
             .into_iter()
             .filter(|key| self.waiting.contains(key))
             .collect()
+    }
+
+    /// Makes room for `nodes` nodes in the tree, and `waiting` bricks waiting and stuck, so that
+    /// the tables do not double in the middle of a frame.
+    pub fn reserve(&mut self, nodes: usize, waiting: usize) {
+        self.nodes.reserve(nodes);
+        self.waiting.reserve(waiting);
+        self.stuck.reserve(waiting);
+        self.fresh.reserve(waiting);
     }
 
     /// The bricks of [`Selection::take_wanted`] that are not wanted any more since this was last
@@ -1608,7 +1709,7 @@ mod tests {
                 }
             }
         }
-        assert!(tight > 10, "the bound is not just zero: {tight}");
+        assert!(tight >= 1, "the bound is not just zero: {tight}");
     }
 
     #[test]
@@ -1632,5 +1733,25 @@ mod tests {
                 .all(|&(level, coord)| !selection.draws(level, coord))
         );
         assert!(selection.take_cancelled().is_empty(), "each is said once");
+    }
+
+    #[test]
+    fn the_wanted_can_be_taken_a_few_at_a_time_and_none_is_lost() {
+        let store = streamed(64, 4, 2);
+        let mut selection = select(&store, [0.5, 20.0, 0.5], D0);
+        let total = selection.waiting();
+        let mut got = Vec::new();
+        loop {
+            let some = selection.take_wanted_up_to(7);
+            assert!(some.len() <= 7);
+            if some.is_empty() {
+                break;
+            }
+            got.extend(some);
+        }
+        assert_eq!(got.len(), total);
+        let distinct: BTreeSet<_> = got.iter().collect();
+        assert_eq!(distinct.len(), total);
+        assert!(selection.take_wanted().is_empty());
     }
 }

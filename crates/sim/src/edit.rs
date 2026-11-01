@@ -118,7 +118,7 @@ pub fn apply(store: &mut BrickStore, op: &EditOp) -> Undo {
                     undo.bricks.push((brick, before));
                 } else if before.is_none() {
                     // Nothing was dug here, so a core brick stored above goes back to implied.
-                    store.remove(brick);
+                    store.discard(brick);
                 }
             }
         }

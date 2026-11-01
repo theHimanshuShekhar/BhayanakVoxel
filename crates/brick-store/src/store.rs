@@ -104,13 +104,14 @@ impl BrickStore {
 
     /// Removes the brick at `coord`, which then reads as the source gives it, or as air with none.
     ///
-    /// In a store that streams, a brick that is not held and not provably solid reads as air once
-    /// its parent's children are resident (all of them that are not air are held), so removing
-    /// one there puts back what the source makes of it: this is how an Edit is taken back.
+    /// In a store that streams, a brick that is not held reads as air once its parent's children
+    /// are resident (all of them that are not air are held), so removing one there puts back what
+    /// the source makes of it, whether or not they are resident yet (they may arrive after, and
+    /// not hold a brick that was held when they were asked for): this is how an Edit is taken
+    /// back. [`Self::discard`] removes without that.
     pub fn remove(&mut self, coord: BrickCoord) -> Option<Brick> {
         let removed = self.bricks.remove(&coord);
         if self.streaming.is_some()
-            && self.children_resident(1, coord.parent())
             && let Some(source) = &self.source
             && !source.solid_below(0, coord)
         {
@@ -120,6 +121,12 @@ impl BrickStore {
             }
         }
         removed
+    }
+
+    /// Removes the brick at `coord` and nothing else, for a brick that was only held for a moment
+    /// to work on, and was known to read as the source gives it when it was.
+    pub fn discard(&mut self, coord: BrickCoord) -> Option<Brick> {
+        self.bricks.remove(&coord)
     }
 
     /// FNV-1a hash of the Planet's content: the coordinate and [`Brick::content_hash`] of every
@@ -189,6 +196,24 @@ impl BrickStore {
             store.solid_below.insert(coord);
         } else {
             store.solid_below.remove(&coord);
+        }
+    }
+
+    /// Makes room for `held[level]` bricks held at each level (as many entries as there are
+    /// levels given, from level 0) and for `resident` bricks whose children are resident, so that
+    /// the tables do not double, and move every entry, in the middle of a frame. The memory is
+    /// address space until it is used.
+    pub fn reserve(&mut self, held: &[usize], resident: usize) {
+        for (level, &n) in held.iter().enumerate() {
+            if level == 0 {
+                self.bricks.reserve(n);
+            } else if let Some(store) = self.coarse.get_mut(level - 1) {
+                store.bricks.reserve(n);
+                store.solid_below.reserve(n);
+            }
+        }
+        if let Some(streaming) = &mut self.streaming {
+            streaming.resident.reserve(resident);
         }
     }
 
@@ -1340,5 +1365,28 @@ mod tests {
         store.insert(sky, Brick::solid(ROCK));
         store.remove(sky);
         assert!(store.brick_at(0, sky).is_air());
+    }
+
+    #[test]
+    fn an_edit_taken_back_while_its_parents_children_are_still_being_made_is_put_back_all_the_same()
+    {
+        let mut store = BrickStore::new();
+        store.set_source(Slab);
+        store.build_lod(2);
+        store.stream_from(1);
+        let (parent, coord) = (BrickCoord([1, -1, 0]), BrickCoord([3, -2, 0]));
+        assert_eq!(coord.parent(), parent);
+        // An Edit holds the brick; the loader skips it, being held when the job was made.
+        store.insert(coord, Brick::AIR);
+        let others = crate::children_from(&*store.source().unwrap(), 1, parent, |c| c == coord);
+        // The Edit is taken back before the children arrive...
+        store.remove(coord);
+        // ...and then they do.
+        store.hold_children(1, parent, others);
+        assert_eq!(*store.brick_at(0, coord), Brick::solid(ROCK));
+        // A raw removal puts nothing back.
+        store.insert(coord, Brick::AIR);
+        store.discard(coord);
+        assert!(!store.holds(0, coord));
     }
 }
