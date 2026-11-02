@@ -19,7 +19,7 @@ Said of a solid Voxel with air against one of its faces. The Planet's surface is
 _Avoid_: Visible, surface Voxel
 
 **Cave**:
-Air that the generator carves under the Planet's land: tunnels and chambers at most 8 m across, less than 300 m below the ground, and reaching about 1 km, some of which open to the surface as cave mouths. A part of the Planet's generated terrain, not an Edit.
+Air that the generator carves under the Planet's land, in tunnels and chambers, some of which open to the surface as cave mouths. A part of the Planet's generated terrain, not an Edit.
 _Avoid_: Dungeon, hole (a hole is dug)
 
 **Material**:

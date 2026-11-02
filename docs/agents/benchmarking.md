@@ -73,6 +73,16 @@ file, a bad option).
    and 6 reference frames of 2 samples). That is the report's `altitudes`. It takes a few seconds
    and leaves the flight alone, so the flight stays comparable with the reports of main. `--short`
    has no sweep.
+5. Then, for the caves (#46), holds the camera still at a **cave mouth on a slope** and **inside a
+   tunnel**, times both modes there like the sweep (24 primary frames, 6 reference frames of 2
+   samples), and takes a screenshot of each mode (`primary-cave-mouth.png`,
+   `reference-cave-tunnel.png`, ...). That is the report's `caves`. The caves are the real
+   Planet's, and the flight is over the small test sphere, which has none: so the stills are of
+   the real Planet on a coarse world map (512 texels a face, about a second to make), round the
+   steepest mouth with a good deal of cave by it (`Planet::cave_mouths`), with a ring of level 0,
+   the Guard from level 10 and the bands for a `d0` of 10 m, a tenth of the flight's. That keeps
+   the view to seconds to make, and the numbers say what the cave costs, not the far ground. The
+   flight and the sweep are left alone. `--short` has no stills.
 
 The bench does not stream: it draws a Planet that is generated whole, so the ring loader (#86)
 and its uploads are not in these numbers. The loader's own costs (the spawn ring, the Guard, how
@@ -96,7 +106,7 @@ before reading anything into the times.
 
 ```
 {
-  "schema_version": 3,
+  "schema_version": 4,
   "build":   { "version", "commit" },          // commit: CI builds only, else null; on a PR
                                                // build it is GitHub's merge commit, not the head
   "machine": { "gpu", "device_type", "driver", "driver_info", "backend", "os", "arch",
@@ -111,7 +121,9 @@ before reading anything into the times.
   },
   "altitudes": [ { "height_m", "bricks": [n...], "primary": STATS, "upscale": STATS,
                    "reference": STATS }... ],
-  "screenshots": [ "primary-frame0000.png", ... ],
+  "caves":   [ { "name": "mouth" | "tunnel", "bricks": [n...], "primary": STATS,
+                 "upscale": STATS, "reference": STATS }... ],
+  "screenshots": [ "primary-frame0000.png", ..., "primary-cave-mouth.png", ... ],
   "budgets": { "source", "ok", "failed": ["primary/primary"], "unmatched": [] }
 }
 ```
@@ -144,6 +156,9 @@ before reading anything into the times.
   `upscale` passes of primary mode and the `reference` pass of reference mode (one sample), with
   no budget held against them. It is how the cost of the LOD bands is read at the ground, 100 m,
   500 m and 2 km.
+- `caves` is the same for the two cave stills (the camera at the mouth, and the one inside),
+  with the bricks of the bands at a tenth of the flight's `d0`, so far fewer than the sweep's. Empty
+  for `--short`. Their screenshots are in `screenshots`.
 - `budgets.unmatched` lists budgets for passes that did not run (`passes.shadows` before there is
   a shadows pass): they are not an error.
 

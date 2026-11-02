@@ -76,9 +76,15 @@ const PITCH: f64 = 0.35;
 const BALL: f64 = 0.6;
 /// Whether a tube can carve a coarse Voxel whose `half` is as [`Caves::carves`] says: not one of
 /// level 7 or up, which is 12.8 m across, wider than any tube.
-pub(crate) fn carves_voxels_of(half: f64) -> bool {
+pub(crate) const fn carves_voxels_of(half: f64) -> bool {
     half * BALL < MAX_TUBE_RADIUS
 }
+
+// No tube carves a Voxel of level 7 (12.8 m: `half` 63.5) or coarser: the Guard, and the levels the
+// horizon cap applies to, have no caves in them.
+const _: () = assert!(!carves_voxels_of(63.5));
+// ...and one of level 6 can be carved, which the agreement tests at levels 5 and 6 rely on.
+const _: () = assert!(carves_voxels_of(31.5));
 
 /// Distance, in Voxels, of the cells of the noise that makes the walls rough.
 const ROUGH_CELL: i32 = 16;

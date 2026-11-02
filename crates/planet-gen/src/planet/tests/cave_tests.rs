@@ -465,6 +465,53 @@ fn a_coarse_brick_with_caves_is_the_planets_downsampled_but_for_a_few_voxels() {
     }
 }
 
+/// Most Voxels of the coarse bricks of levels 5 and 6 with caves in them that may differ from the
+/// downsample of the eight finer bricks that [`Planet::coarse_brick`] makes, as a fraction: the
+/// numbers measured (printed by the test below) with a margin. It is one step from the finer
+/// level, as `ORBIT_TOLERANCE` is, because the 8^5 and 8^6 bricks of level 0 under them are too
+/// many to make.
+const CAVE_STEP_TOLERANCE: [f64; 2] = [0.012, 0.035];
+
+#[test]
+fn a_coarse_brick_with_caves_at_levels_5_and_6_is_its_eight_finer_bricks_downsampled_but_for_a_few_voxels()
+ {
+    for level in 5..=6 {
+        let (mut differ, mut total, mut caves_made, mut caves_real, mut bricks) = (0, 0, 0, 0, 0);
+        for coord in coarse_bricks_with_caves(level, 7, 400) {
+            let made = planet().coarse_brick(level, coord);
+            let ground = planet().evaluate_with(&Samples::new(level, coord), &[]);
+            let cave =
+                |brick: &Brick, l: [u8; 3]| ground.get(l).is_some() && brick.get(l).is_none();
+            // Only the bricks that have a cave in them: the rest are the ground's, which the
+            // tests above the ground's check.
+            if !locals().any(|l| cave(&made, l)) {
+                continue;
+            }
+            let real = downsampled_from_finer(level, coord);
+            bricks += 1;
+            for local in locals() {
+                caves_made += usize::from(cave(&made, local));
+                caves_real += usize::from(cave(&real, local));
+                differ += usize::from(made.get(local) != real.get(local));
+                total += 1;
+            }
+        }
+        let fraction = differ as f64 / total as f64;
+        eprintln!(
+            "level {level}: {differ} of {total} Voxels of {bricks} bricks with caves differ, \
+             {fraction:.4}; caves are {caves_made} Voxels of ours and {caves_real} of the pyramid's"
+        );
+        assert!(
+            bricks >= 10 && caves_made > 20,
+            "level {level}: {bricks} bricks, {caves_made} Voxels"
+        );
+        assert!(
+            fraction <= CAVE_STEP_TOLERANCE[level - 5],
+            "level {level}: {fraction}"
+        );
+    }
+}
+
 #[test]
 fn a_coarse_voxel_is_a_cave_only_where_a_tube_holds_most_of_it() {
     // At level 7 and up (12.8 m Voxels and wider) no tube is wide enough: the caves are not in
@@ -529,4 +576,45 @@ fn the_spawn_moves_to_clear_ground_when_the_first_spot_is_by_a_cave() {
     assert!(planet.map().elevation_at(spawn) >= 0.0);
     let (low, high) = planet.heights_near(spawn, 100);
     assert!(high - low <= GENTLE);
+}
+
+#[test]
+fn a_spawn_is_never_clear_when_a_cave_is_carved_within_the_reach_whatever_the_ground_does() {
+    // The line that the spawn must be clear of runs from under the lowest ground within the reach
+    // to over the highest, not from 307 m under the ground at the spawn to over it: the ground
+    // rises and falls across the ring, and a tube is as far under the ground as it is there. So
+    // wherever the axis of a tube is carved, at the edge of the ring or not, a spawn within the
+    // reach of it is not clear. (No place on this map is steep enough to have got past the
+    // shorter line, so this holds the property, not that line's failure.)
+    let reach = 400;
+    let mut checked = 0;
+    for tube in tubes_stepping(3) {
+        let at = on(tube, 0.5);
+        let (depth, elevation) = depth_and_elevation(at);
+        if elevation < 0.0 || !(20.0..caves::MAX_DEPTH).contains(&depth) {
+            continue;
+        }
+        let up = at.map(|c| c / distance(at));
+        let (ahead, aside) = tangents(up);
+        for (along, across) in [
+            (0.0, 0.0),
+            (350.0, 0.0),
+            (-350.0, 0.0),
+            (0.0, 350.0),
+            (0.0, -350.0),
+        ] {
+            let side: [f64; 3] =
+                std::array::from_fn(|a| at[a] + ahead[a] * along + aside[a] * across);
+            let dir = side.map(|c| c / distance(side));
+            let ground = planet().map().elevation_at(dir);
+            let spawn = dir.map(|d| d * (SEA_RADIUS + ground));
+            assert!(
+                !planet().clear_of_caves(spawn, reach),
+                "{spawn:?} has a cave at {at:?}"
+            );
+            checked += 1;
+        }
+    }
+
+    assert!(checked > 10_000, "{checked}");
 }

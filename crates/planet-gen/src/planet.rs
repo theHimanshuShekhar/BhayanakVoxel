@@ -665,10 +665,11 @@ impl Planet {
     /// texels on a lattice, where the ground is 20 to 100 m above the sea and varies by 40 m at
     /// most within `reach` Voxels (see [`Planet::region_around`]). The same for the same map.
     ///
-    /// Except for the last, every choice is clear of the caves: no tube of them is within `reach`
-    /// and a brick or two of the line from the centre through the spawn, at any depth. So the
-    /// character is not set down in a cave or over a mouth that it could fall into, nor in the
-    /// ring around it, and the ring has none of the caves that would be deeper than the strata.
+    /// Except for the last two, every choice is clear of the caves: no tube of them is within
+    /// `reach` and a brick or two of the line from the centre through the spawn, at any depth.
+    /// So the character is not set down in a cave or over a mouth that it could fall into, nor in
+    /// the ring around it, and the ring has none of the caves that would be deeper than the
+    /// strata. Where no land is clear, the land that varies least is chosen, caves or not.
     pub fn spawn(&self, reach: i32) -> [f64; 3] {
         self.spawn_where(reach, |point| self.clear_of_caves(*point, reach))
     }
@@ -720,6 +721,14 @@ impl Planet {
                 .min_by(|a, b| relief(a.1).total_cmp(&relief(b.1)))
             })
             .or_else(|| {
+                // Land with the least relief, caves or not: a cave is a better reason to go
+                // elsewhere than to go to a peak.
+                (spots()
+                    .map(|spot| ground(&spot))
+                    .filter(|(texel, _)| land(texel)))
+                .min_by(|a, b| relief(a.1).total_cmp(&relief(b.1)))
+            })
+            .or_else(|| {
                 (spots().map(|spot| ground(&spot))).max_by_key(|(texel, _)| texel.elevation)
             })
             .expect("a world map has texels")
@@ -753,13 +762,16 @@ impl Planet {
     }
 
     /// Whether no cave is within `reach` Voxels and two bricks of the line from the centre through
-    /// `ground`, a point on the ground, from the bottom of the caves to above the ground.
+    /// `ground`, a point on the ground, from the bottom of the caves under the lowest ground
+    /// within `reach` to a brick over the highest (the ground rises and falls across the ring,
+    /// and a tube is as far under the ground as the ground there is).
     fn clear_of_caves(&self, ground: [f64; 3], reach: i32) -> bool {
         let up = ground.map(|c| c / distance(ground));
-        let at = |height: f64| -> [f64; 3] { std::array::from_fn(|a| ground[a] + up[a] * height) };
+        let (lowest, highest) = self.heights_near(ground, reach);
+        let at = |height: f64| -> [f64; 3] { up.map(|u| u * (SEA_RADIUS + height)) };
         self.caves.clear_of(
-            at(-(caves::MAX_DEPTH + 2.0 * caves::MAX_TUBE_RADIUS)),
-            at(f64::from(BRICK_SIZE)),
+            at(lowest - (caves::MAX_DEPTH + 2.0 * caves::MAX_TUBE_RADIUS)),
+            at(highest + f64::from(BRICK_SIZE)),
             f64::from(reach + 2 * BRICK_SIZE),
         )
     }
@@ -1401,9 +1413,26 @@ mod tests {
     #[test]
     fn the_spawn_has_a_fallback_for_a_planet_without_gentle_temperate_land() {
         // A reach so wide that the ground is no longer over one face of the map says nothing is
-        // gentle, and then the land that varies least is the first of it.
+        // gentle, and then the land that varies least is the first of it. The caves are no reason
+        // to go to the highest ground instead: with none clear of them (the clearance of a reach
+        // this wide is the whole Planet), it is the least varied land that the caves ignored.
         let spawn = planet().spawn(1_000_000);
-        assert!(planet().map().elevation_at(spawn) >= 0.0);
+        assert_eq!(spawn, planet().spawn_where(1_000_000, |_| true));
+        assert!(!planet().clear_of_caves(spawn, 1_000_000));
+        let elevation = planet().map().elevation_at(spawn);
+        assert!(elevation >= 0.0);
+        let highest = (0..6)
+            .flat_map(|f| {
+                (0..planet().map().size())
+                    .flat_map(move |j| (0..planet().map().size()).map(move |i| (f, i, j)))
+            })
+            .map(|(f, i, j)| planet().map().texel(f, i, j).elevation)
+            .max()
+            .unwrap();
+        assert!(
+            elevation < f64::from(highest) / 2.0,
+            "{elevation} of {highest}"
+        );
         let radius = spawn.iter().map(|c| c * c).sum::<f64>().sqrt();
         let voxel = |dr| planet().voxel(along(spawn, radius + dr));
         assert!(voxel(-3.0).is_some_and(|m| m != WATER));
