@@ -6,6 +6,8 @@ publish.workspace = true
 
 [dependencies]
 brick-store.workspace = true
+# Placing needs the Material table, to turn down a Material that it does not define.
+materials.workspace = true
 net.workspace = true
 planet-gen.workspace = true
 # The movement config is TOML read through serde, as the Material table is. Neither touches the

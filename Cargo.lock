@@ -291,6 +291,7 @@ dependencies = [
  "egui",
  "egui-winit",
  "libc",
+ "materials",
  "net",
  "planet-gen",
  "png",
@@ -2087,6 +2088,7 @@ name = "sim"
 version = "0.1.0"
 dependencies = [
  "brick-store",
+ "materials",
  "net",
  "planet-gen",
  "serde",

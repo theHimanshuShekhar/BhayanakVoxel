@@ -3,24 +3,60 @@
 //! the ones the server sends. All of them must end with identical bricks (ADR 0003), so
 //! everything here is integer maths in a fixed order, and `clippy.toml` bans what is not.
 
-use brick_store::{BRICK_SIZE, BRICK_VOXELS, Brick, BrickCoord, BrickStore, LodRefresh};
-use net::{Brush, EditMode, EditOp, RejectReason};
+use brick_store::{Brick, BrickCoord, BrickStore, LodRefresh, VoxelCoord};
+use materials::MaterialTable;
+use net::{EditMode, EditOp, RejectReason};
 
-/// Largest sphere a player may dig: 2 m at 10 cm Voxels (issue 15).
+use crate::brush::{self, Change};
+
+/// Largest Brush a player may use: 2 m at 10 cm Voxels (issue 15).
 pub const MAX_BRUSH_RADIUS: u16 = 20;
 
-/// What the server checks of an Edit before applying it. Reach and rate limits come later.
+/// How far from a player's eyes an Edit's centre may be: 8 m (issue 15), in Voxels.
+pub const EDIT_REACH: f64 = 80.0;
+
+/// Edits a player may make per second, and at once after a rest (issue 15).
+pub const OPS_PER_SECOND: u32 = 20;
+
+/// Voxels a player's Edits may change per second: 8 m^3 (issue 15).
+pub const VOXELS_PER_SECOND: u32 = 8_000;
+
+/// Voxels a player may change at once after a rest: nine seconds' worth, which is enough for the
+/// biggest Brush there is (a cube of 41 Voxels a side, 68 921) to be used on its own.
+pub const VOXEL_BURST: u32 = 9 * VOXELS_PER_SECOND;
+
+/// What the server checks of an Edit before it applies it, apart from the limits that depend on
+/// who asked and when (reach and rates: see [`within_reach`] and the server): that the Brush is
+/// no bigger than a player may use, that it has Voxel coordinates to be in, and that the Material
+/// it fills with is one that the table defines.
 pub fn validate(op: &EditOp) -> Result<(), RejectReason> {
-    let Brush::Sphere { radius } = op.brush;
-    if radius > MAX_BRUSH_RADIUS {
+    if op.brush.radius > MAX_BRUSH_RADIUS {
         return Err(RejectReason::BrushTooLarge);
     }
-    let radius = i32::from(radius);
-    let fits = |c: i32| c.checked_sub(radius).is_some() && c.checked_add(radius).is_some();
+    let extent = brush::extent(op.brush);
+    let fits = |c: i32| {
+        i64::from(c) - extent >= i64::from(i32::MIN) && i64::from(c) + extent <= i64::from(i32::MAX)
+    };
     if !op.centre.0.into_iter().all(fits) {
         return Err(RejectReason::OutOfRange);
     }
+    let fills = matches!(op.mode, EditMode::Place | EditMode::Flatten);
+    if fills && MaterialTable::built_in().get(op.material).is_none() {
+        return Err(RejectReason::UnknownMaterial);
+    }
     Ok(())
+}
+
+/// Whether `centre` is within [`EDIT_REACH`] of `eye`, a position in Voxels.
+pub fn within_reach(eye: [f64; 3], centre: VoxelCoord) -> bool {
+    // The middle of the Voxel. A NaN eye is out of reach, as the comparison is false.
+    let distance2: f64 = (0..3)
+        .map(|a| {
+            let d = f64::from(centre.0[a]) + 0.5 - eye[a];
+            d * d
+        })
+        .sum();
+    distance2 <= EDIT_REACH * EDIT_REACH
 }
 
 /// What an applied Edit overwrote: the bricks as they were before, so that it can be taken back.
@@ -59,69 +95,39 @@ impl Undo {
     }
 }
 
-/// Applies `op` to `store`. The Edit should have passed [`validate`].
+/// Applies `op` to `store`: writes the Voxels that [`brush::plan`] lists for it. The Edit should
+/// have passed [`validate`].
 ///
-/// A dig removes every Voxel whose coordinate is within the radius of the centre, measured by
-/// squared integer distance. The Planet's core is not in the store (see
-/// [`planet_gen::generate_planet`]); it is what the store's [`brick_store::BrickSource`] says a
-/// brick that is not held is. So a brick that the dig touches is first stored as that, if it is
-/// not air. Bricks that end up uniform collapse to a flag, and one that ends up all air stays in
-/// the store as air, so that the core does not show through where it was dug out.
+/// The Planet's core is not in the store (see [`planet_gen::generate_planet`]); it is what the
+/// store's [`brick_store::BrickSource`] says a brick that is not held is. So a brick that the
+/// Edit changes is first stored as that, if it is not air. Bricks that end up uniform collapse to
+/// a flag, and one that ends up all air stays in the store as air, so that the core does not show
+/// through where it was dug out.
 ///
 /// Every coarse level of the store's LOD pyramid, if it has one, is brought up to date before
 /// this returns, remaking only the coarse bricks over the bricks that changed. The returned
 /// [`Undo::lod`] lists the coarse bricks whose content changed.
 pub fn apply(store: &mut BrickStore, op: &EditOp) -> Undo {
-    let EditMode::Dig = op.mode;
-    let Brush::Sphere { radius } = op.brush;
-    let radius = i64::from(radius);
-    let centre = op.centre.0.map(i64::from);
-    // The bricks that the sphere's bounding cube touches, clamped to the Voxel range.
-    let bound = |sign: i64| {
-        [0, 1, 2].map(|a| {
-            let voxel = (centre[a] + sign * radius).clamp(i64::from(i32::MIN), i64::from(i32::MAX));
-            (voxel as i32).div_euclid(BRICK_SIZE)
-        })
-    };
-    let (first, last) = (bound(-1), bound(1));
+    let changes = brush::plan(store, op);
+    apply_changes(store, &changes)
+}
 
+/// Writes `changes`, which [`brush::plan`] made from `store` as it is now.
+pub fn apply_changes(store: &mut BrickStore, changes: &[Change]) -> Undo {
     let mut undo = Undo::default();
-    for x in first[0]..=last[0] {
-        for y in first[1]..=last[1] {
-            for z in first[2]..=last[2] {
-                let brick = BrickCoord([x, y, z]);
-                let in_sphere = |local: [u8; 3]| {
-                    let voxel = brick.voxel(local).0;
-                    let dist_sq: i64 = [0, 1, 2]
-                        .map(|a| (i64::from(voxel[a]) - centre[a]).pow(2))
-                        .iter()
-                        .sum();
-                    dist_sq <= radius * radius
-                };
-                let before = store.brick(brick).cloned();
-                if before.is_none() {
-                    let implied = store.brick_at(0, brick).into_owned();
-                    if !implied.is_air() {
-                        store.insert(brick, implied);
-                    }
-                }
-                let mut changed = false;
-                for i in 0..BRICK_VOXELS {
-                    let local = [(i & 7) as u8, (i >> 3 & 7) as u8, (i >> 6) as u8];
-                    let voxel = brick.voxel(local);
-                    if in_sphere(local) && store.get(voxel).is_some() {
-                        store.set(voxel, None);
-                        changed = true;
-                    }
-                }
-                if changed {
-                    undo.bricks.push((brick, before));
-                } else if before.is_none() {
-                    // Nothing was dug here, so a core brick stored above goes back to implied.
-                    store.discard(brick);
-                }
+    for group in changes.chunk_by(|a, b| a.voxel.brick() == b.voxel.brick()) {
+        let brick = group[0].voxel.brick();
+        let before = store.brick(brick).cloned();
+        if before.is_none() {
+            let implied = store.brick_at(0, brick).into_owned();
+            if !implied.is_air() {
+                store.insert(brick, implied);
             }
         }
+        for change in group {
+            store.set(change.voxel, change.to);
+        }
+        undo.bricks.push((brick, before));
     }
     undo.lod = store.refresh_lod(undo.bricks());
     undo
@@ -131,6 +137,7 @@ pub fn apply(store: &mut BrickStore, op: &EditOp) -> Undo {
 mod tests {
     use super::*;
     use brick_store::{Interior, LodRefresh, Material, VoxelCoord};
+    use net::{Alignment, Brush, EditMode, Shape};
     use planet_gen::{CORE, ROCK, SOIL};
 
     const STONE: Material = Material(7);
@@ -353,6 +360,18 @@ mod tests {
             dig(&mut store, centre, 20);
         }
         assert!(store.is_empty());
+        // Nor does any other kind, though a Brush there places what fits in the range.
+        for op in every_kind() {
+            for centre in [[i32::MAX; 3], [i32::MIN; 3], [i32::MAX, 0, i32::MIN]] {
+                apply(
+                    &mut store,
+                    &EditOp {
+                        centre: VoxelCoord(centre),
+                        ..op
+                    },
+                );
+            }
+        }
     }
 
     #[test]
@@ -384,6 +403,119 @@ mod tests {
             validate(&op([0, i32::MIN + 19, 0], 20)),
             Err(RejectReason::OutOfRange)
         );
+    }
+
+    #[test]
+    fn validate_turns_down_a_place_or_flatten_of_a_material_the_table_does_not_define() {
+        let place = |mode, material| EditOp {
+            mode,
+            material: Material(material),
+            ..EditOp::dig_sphere(VoxelCoord([0; 3]), 3)
+        };
+        // 1 is rock and 55 the last light, both in the table; 0 and 56 are not.
+        for mode in [EditMode::Place, EditMode::Flatten] {
+            assert_eq!(validate(&place(mode, 1)), Ok(()));
+            assert_eq!(validate(&place(mode, 55)), Ok(()));
+            assert_eq!(
+                validate(&place(mode, 0)),
+                Err(RejectReason::UnknownMaterial)
+            );
+            assert_eq!(
+                validate(&place(mode, 56)),
+                Err(RejectReason::UnknownMaterial)
+            );
+        }
+        // A dig and a smooth fill with nothing, so what the field says is ignored.
+        for mode in [EditMode::Dig, EditMode::Smooth] {
+            assert_eq!(validate(&place(mode, 60_000)), Ok(()));
+        }
+    }
+
+    #[test]
+    fn validate_keeps_a_tilted_cube_and_cylinder_inside_the_voxel_range_by_their_corners() {
+        // A cube reaches its radius times the square root of 3 along an axis when it is tilted,
+        // and a cylinder times the square root of 2: 34 and 28 Voxels at the largest radius.
+        let at = |shape, x: i32| EditOp {
+            brush: Brush { shape, radius: 20 },
+            ..EditOp::dig_sphere(VoxelCoord([x, 0, 0]), 0)
+        };
+        assert_eq!(validate(&at(Shape::Cube, i32::MAX - 34)), Ok(()));
+        assert_eq!(
+            validate(&at(Shape::Cube, i32::MAX - 33)),
+            Err(RejectReason::OutOfRange)
+        );
+        assert_eq!(validate(&at(Shape::Cylinder, i32::MAX - 28)), Ok(()));
+        assert_eq!(
+            validate(&at(Shape::Cylinder, i32::MAX - 27)),
+            Err(RejectReason::OutOfRange)
+        );
+    }
+
+    #[test]
+    fn reach_is_8_m_from_the_eyes_to_the_middle_of_the_centre_voxel() {
+        let eye = [10.0, 20.0, 30.0];
+        assert!(within_reach(eye, VoxelCoord([89, 19, 29])));
+        assert!(!within_reach(eye, VoxelCoord([90, 19, 29])));
+        assert!(!within_reach([f64::NAN; 3], VoxelCoord([0; 3])));
+    }
+
+    /// Every kind of Edit, at places that are in the air, in solid rock and across the two.
+    fn every_kind() -> Vec<EditOp> {
+        let mut ops = Vec::new();
+        for mode in [
+            EditMode::Dig,
+            EditMode::Place,
+            EditMode::Smooth,
+            EditMode::Flatten,
+        ] {
+            for shape in [Shape::Sphere, Shape::Cube, Shape::Cylinder] {
+                for alignment in [Alignment::Local, Alignment::World] {
+                    for centre in [[1, 2, 3], [-9, 4, -5], [300, 280, 3], [-7, -7, -7]] {
+                        ops.push(EditOp {
+                            mode,
+                            brush: Brush { shape, radius: 6 },
+                            centre: VoxelCoord(centre),
+                            material: STONE,
+                            alignment,
+                        });
+                    }
+                }
+            }
+        }
+        ops
+    }
+
+    #[test]
+    fn the_voxels_an_edit_changes_are_exactly_the_ones_the_preview_lists() {
+        // The core with a hole dug at the origin: rock, air and the surface between.
+        let mut base = core_store();
+        dig(&mut base, [0, 0, 0], 10);
+        for op in every_kind() {
+            let mut store = base.clone();
+            let listed = crate::plan(&store, &op);
+            apply(&mut store, &op);
+            let reach = 14;
+            let mut seen = 0;
+            for x in -reach..=reach {
+                for y in -reach..=reach {
+                    for z in -reach..=reach {
+                        let voxel = VoxelCoord([
+                            op.centre.0[0] + x,
+                            op.centre.0[1] + y,
+                            op.centre.0[2] + z,
+                        ]);
+                        let (was, now) = (base.voxel_at(0, voxel), store.voxel_at(0, voxel));
+                        let change = listed.iter().find(|c| c.voxel == voxel);
+                        assert_eq!(was != now, change.is_some(), "{op:?} at {voxel:?}");
+                        if let Some(change) = change {
+                            assert_eq!(now, change.to, "{op:?} at {voxel:?}");
+                            seen += 1;
+                        }
+                    }
+                }
+            }
+            assert_eq!(seen, listed.len(), "{op:?} lists Voxels beyond its reach");
+        }
     }
 
     /// Solid STONE bricks from brick `lo` to brick `hi` inclusive, with `levels` coarse levels.

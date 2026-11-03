@@ -3,12 +3,14 @@
 //! [`sim::Predictor`], which calls [`sim::apply`].
 
 use brick_store::VoxelCoord;
-use net::{ClientEnd, Disconnected, EditOp, MoveInput, TryRecvError};
+use net::{ClientEnd, Disconnected, EditMode, EditOp, MoveInput, TryRecvError};
 use render::reference::{Hit, Ray, trace};
 use render::{Camera, RingsFull, Scene, SceneUpdate, camera};
 use sim::Predictor;
 
+use crate::ghost::Ghost;
 use crate::loader::{Arrival, Loader};
+use crate::tool::Tool;
 
 /// What the frame thread aims to spend taking in bricks from the loader in one frame, the upload
 /// to the GPU included. A resident set that is filling takes more frames, not longer ones.
@@ -19,8 +21,10 @@ const BATCH: usize = 8;
 /// every brick the Guard leaves to split, and the table that holds them is not made in a frame.
 const WANTED_PER_FRAME: usize = 20_000;
 
-/// Radius of the sphere a click digs: 1 m at 10 cm Voxels.
-pub(crate) const DIG_RADIUS: u16 = 10;
+/// How far the player aims an Edit, in Voxels: 7.5 m, which leaves half a metre of the server's
+/// reach ([`sim::EDIT_REACH`], measured from where the server has the character) for the character
+/// to have moved on from where the client saw it.
+pub(crate) const AIM_REACH: f64 = sim::EDIT_REACH - 5.0;
 
 /// Why the Planet cannot be kept going.
 #[derive(Debug, PartialEq, Eq)]
@@ -98,6 +102,9 @@ pub struct World {
     loader: Option<Loader>,
     /// What [`World::stream`] expects taking in a batch to cost.
     batch_cost: std::time::Duration,
+    /// What the next click would change, while there is something under the cursor to apply the
+    /// tool to. Made again when the aim, the tool or the Planet changes.
+    ghost: Option<Ghost>,
 }
 
 /// The first solid Voxel along the camera's view through the middle of the screen.
@@ -122,6 +129,7 @@ impl World {
             link,
             loader: None,
             batch_cost: std::time::Duration::ZERO,
+            ghost: None,
         }
     }
 
@@ -259,13 +267,50 @@ impl World {
         self.scene.set_bands(self.predictor.store(), bands)
     }
 
-    /// Digs a sphere where the camera looks: shows it at once, and asks the server for it.
-    /// Returns how the scene changed, if there was anything to dig.
-    pub fn dig(&mut self, camera: &Camera) -> Result<Option<SceneUpdate>, Stopped> {
-        let Some(hit) = centre_hit(&self.scene, camera) else {
+    /// The Edit that `tool` makes where the camera looks: at the first solid Voxel along the view,
+    /// or, to place, at the air Voxel in front of it. `None` if there is none within
+    /// [`AIM_REACH`].
+    pub fn aim(&self, camera: &Camera, tool: &Tool) -> Option<EditOp> {
+        let hit = centre_hit(&self.scene, camera)?;
+        if f64::from(hit.t) > AIM_REACH {
+            return None;
+        }
+        let centre = match tool.mode {
+            EditMode::Place => std::array::from_fn(|a| hit.voxel[a] + hit.normal[a]),
+            _ => hit.voxel,
+        };
+        Some(tool.op(VoxelCoord(centre)))
+    }
+
+    /// Makes the ghost for where the camera looks, if there is a Voxel to apply `tool` to. It is
+    /// kept while the aim, the tool and the Planet stay as they are.
+    pub fn show_ghost(&mut self, camera: &Camera, tool: &Tool) {
+        let Some(op) = self.aim(camera, tool) else {
+            self.ghost = None;
+            return;
+        };
+        if self.ghost.as_ref().is_none_or(|ghost| ghost.op != op) {
+            let changes = sim::plan(self.predictor.store(), &op);
+            self.ghost = Some(Ghost::new(op, changes));
+        }
+    }
+
+    /// Stops showing the ghost.
+    pub fn hide_ghost(&mut self) {
+        self.ghost = None;
+    }
+
+    /// The Voxels the next click would change, as [`World::show_ghost`] last found them.
+    pub fn ghost(&self) -> Option<&Ghost> {
+        self.ghost.as_ref()
+    }
+
+    /// Applies `tool` where the camera looks: shows the Edit at once, and asks the server for it.
+    /// Returns how the scene changed, if there was anything to apply it to.
+    pub fn edit(&mut self, camera: &Camera, tool: &Tool) -> Result<Option<SceneUpdate>, Stopped> {
+        let Some(op) = self.aim(camera, tool) else {
             return Ok(None);
         };
-        let op = EditOp::dig_sphere(VoxelCoord(hit.voxel), DIG_RADIUS);
         let (request, changed) = self.predictor.edit(op);
         self.link.send(request)?;
         Ok(self.refresh(&changed)?)
@@ -292,6 +337,8 @@ impl World {
         if changed.is_empty() {
             return Ok(None);
         }
+        // What the ghost would change has changed with them.
+        self.ghost = None;
         self.scene.update(self.predictor.store(), changed).map(Some)
     }
 }
@@ -300,7 +347,9 @@ impl World {
 mod tests {
     use super::*;
     use brick_store::{Brick, BrickCoord, BrickStore, Material};
-    use net::{ClientMessage, Leash, RejectReason, ServerEnd, ServerMessage, loopback};
+    use net::{
+        ClientMessage, EditMode, Leash, RejectReason, ServerEnd, ServerMessage, Shape, loopback,
+    };
 
     const STONE: Material = Material(7);
 
@@ -332,7 +381,7 @@ mod tests {
     #[test]
     fn a_click_digs_at_the_voxel_in_the_middle_of_the_view_and_asks_the_server() {
         let (mut world, server) = world();
-        let update = world.dig(&camera()).unwrap();
+        let update = world.edit(&camera(), &Tool::default()).unwrap();
         assert!(
             matches!(update, Some(SceneUpdate::Patched { .. })),
             "{update:?}"
@@ -342,7 +391,7 @@ mod tests {
             server.try_recv(),
             Ok(ClientMessage::Edit {
                 client_seq: 0,
-                op: EditOp::dig_sphere(VoxelCoord([4016, 16, -1]), DIG_RADIUS)
+                op: EditOp::dig_sphere(VoxelCoord([4016, 16, -1]), crate::tool::DEFAULT_RADIUS)
             })
         );
         // The hole is drawn at once: the same ray now reaches deeper than the front face.
@@ -368,7 +417,7 @@ mod tests {
         let (client, _server) = loopback();
         let mut world = World::new(scene, Predictor::new(store), client);
 
-        let update = world.dig(&camera()).unwrap();
+        let update = world.edit(&camera(), &Tool::default()).unwrap();
         assert!(matches!(update, Some(SceneUpdate::Rings(_))), "{update:?}");
         let deeper = centre_hit(world.scene(), &camera()).unwrap();
         assert!(deeper.voxel[2] < -1, "{deeper:?}");
@@ -443,11 +492,165 @@ mod tests {
         assert_eq!(inputs, 200);
     }
 
+    fn place_cube() -> Tool {
+        Tool {
+            mode: EditMode::Place,
+            shape: Shape::Cube,
+            radius: 4,
+            material: Material(35),
+            ..Tool::default()
+        }
+    }
+
+    #[test]
+    fn placing_builds_in_the_air_voxel_in_front_of_the_one_that_is_aimed_at() {
+        let (mut world, server) = world();
+        let update = world.edit(&camera(), &place_cube()).unwrap();
+        assert!(update.is_some());
+        // The wall's front face is z = -1, so the air Voxel in front of it is z = 0.
+        let sent = server.try_recv();
+        let Ok(ClientMessage::Edit { op, .. }) = sent else {
+            panic!("{sent:?}");
+        };
+        assert_eq!(op.centre, VoxelCoord([4016, 16, 0]));
+        assert_eq!((op.mode, op.material), (EditMode::Place, Material(35)));
+        // A cube of 9 Voxels a side, half of it in the wall already: z = 0 to 4 are new.
+        let built = world.store().get(VoxelCoord([4016, 16, 4]));
+        assert_eq!(built, Some(Material(35)));
+        assert_eq!(world.store().get(VoxelCoord([4016, 16, 5])), None);
+        // And it is drawn: the same ray now stops 5 Voxels sooner.
+        let hit = centre_hit(world.scene(), &camera()).unwrap();
+        assert_eq!(hit.voxel[2], 4);
+    }
+
+    #[test]
+    fn nothing_is_aimed_at_beyond_the_reach() {
+        let (mut world, server) = world();
+        let far = Camera::looking_at([4016.5, 16.5, 120.5], [4016.5, 16.5, 0.0]);
+        assert_eq!(world.aim(&far, &Tool::default()), None);
+        assert!(world.edit(&far, &Tool::default()).unwrap().is_none());
+        assert_eq!(server.try_recv(), Err(TryRecvError::Empty));
+        // Just inside it, there is.
+        let near = Camera::looking_at([4016.5, 16.5, 70.5], [4016.5, 16.5, 0.0]);
+        assert!(world.aim(&near, &Tool::default()).is_some());
+    }
+
+    #[test]
+    fn the_ghost_is_exactly_the_voxels_the_click_changes_and_the_op_it_sends() {
+        let mut non_empty = 0;
+        for mode in [
+            EditMode::Dig,
+            EditMode::Place,
+            EditMode::Smooth,
+            EditMode::Flatten,
+        ] {
+            for shape in [Shape::Sphere, Shape::Cube, Shape::Cylinder] {
+                let (mut world, server) = world();
+                let tool = Tool {
+                    mode,
+                    shape,
+                    radius: 6,
+                    material: Material(35),
+                    ..Tool::default()
+                };
+                world.show_ghost(&camera(), &tool);
+                let ghost = world.ghost().expect("something is aimed at").clone();
+                let before = world.store().clone();
+
+                world.edit(&camera(), &tool).unwrap();
+                let Ok(ClientMessage::Edit { op, .. }) = server.try_recv() else {
+                    panic!("no Edit sent");
+                };
+                assert_eq!(ghost.op, op, "the ghost is of the op that is sent");
+                let after = world.store();
+                // The Voxels that differ now are the ghost's, and are what it said they become.
+                let mut differing = 0;
+                for x in 4016 - 20..=4016 + 20 {
+                    for y in -4..=36 {
+                        for z in -26..=26 {
+                            let voxel = VoxelCoord([x, y, z]);
+                            let now = after.get(voxel);
+                            let change = ghost.changes.iter().find(|c| c.voxel == voxel);
+                            assert_eq!(before.get(voxel) != now, change.is_some(), "{op:?}");
+                            differing += usize::from(change.is_some());
+                            if let Some(change) = change {
+                                assert_eq!(change.to, now);
+                            }
+                        }
+                    }
+                }
+                assert_eq!(differing, ghost.changes.len(), "{op:?}");
+                non_empty += usize::from(differing > 0);
+                // An Edit that changed the Planet calls for a new ghost; one that did not leaves it.
+                assert_eq!(world.ghost().is_none(), differing > 0);
+            }
+        }
+        // Rounding off a flat wall has nothing to do, but the others do.
+        assert!(non_empty >= 9, "{non_empty}");
+    }
+
+    #[test]
+    fn the_ghost_follows_the_aim_and_goes_when_nothing_is_aimed_at() {
+        let (mut world, _server) = world();
+        let tool = Tool::default();
+        assert!(world.ghost().is_none());
+        world.show_ghost(&camera(), &tool);
+        let first = world.ghost().unwrap().op;
+        // Aimed a little to the side, it is a different Edit.
+        let aside = Camera::looking_at([4016.5, 16.5, 20.5], [4026.5, 16.5, 0.0]);
+        world.show_ghost(&aside, &tool);
+        assert_ne!(world.ghost().unwrap().op, first);
+        let up = Camera::looking_at([4016.5, 16.5, 20.5], [4016.5, 100.0, 20.5]);
+        world.show_ghost(&up, &tool);
+        assert!(world.ghost().is_none());
+        world.show_ghost(&camera(), &tool);
+        world.hide_ghost();
+        assert!(world.ghost().is_none());
+    }
+
+    #[test]
+    fn placing_beyond_the_ball_the_scene_is_clipped_to_grows_it_and_the_new_voxels_are_drawn() {
+        let mut store = wall();
+        store.build_lod(4);
+        // The wall reaches to x = 4031, and the ball a little past that.
+        let bound = render::scene::Bound {
+            centre: [0; 3],
+            radius: 4040,
+        };
+        let eye = Camera::looking_at([4060.5, 16.5, -15.5], [4000.0, 16.5, -15.5]);
+        let scene = Scene::rings(
+            &store,
+            eye.position,
+            render::lod::Bands::with_d0(64.0),
+            bound,
+        )
+        .unwrap();
+        let (client, _server) = loopback();
+        let mut world = World::new(scene, Predictor::new(store), client);
+        let far = Camera::looking_at([4100.5, 16.5, -15.5], [4000.0, 16.5, -15.5]);
+        let stops = |world: &World| centre_hit(world.scene(), &far).map(|hit| hit.voxel[0]);
+        assert_eq!(stops(&world), Some(4031));
+
+        // A cube of 41 Voxels a side on the wall's +x face: its far side is at x = 4052.
+        let tool = Tool {
+            radius: 20,
+            ..place_cube()
+        };
+        world.edit(&eye, &tool).unwrap();
+        let grown = world.scene().bound.unwrap();
+        assert!(grown.radius > 4052, "{grown:?}");
+        assert_eq!(
+            stops(&world),
+            Some(4052),
+            "the new Voxels are not clipped away"
+        );
+    }
+
     #[test]
     fn a_click_on_the_sky_does_nothing() {
         let (mut world, server) = world();
         let up = Camera::looking_at([4016.5, 16.5, 20.5], [4016.5, 100.0, 20.5]);
-        assert!(world.dig(&up).unwrap().is_none());
+        assert!(world.edit(&up, &Tool::default()).unwrap().is_none());
         assert_eq!(server.try_recv(), Err(TryRecvError::Empty));
     }
 
@@ -456,9 +659,9 @@ mod tests {
         let (mut world, server) = world();
         let hit = |world: &World| centre_hit(world.scene(), &camera()).unwrap().voxel;
         let whole = hit(&world);
-        world.dig(&camera()).unwrap();
+        world.edit(&camera(), &Tool::default()).unwrap();
         let first = hit(&world);
-        world.dig(&camera()).unwrap();
+        world.edit(&camera(), &Tool::default()).unwrap();
         let second = hit(&world);
         assert!(whole != first && first != second);
         let Ok(ClientMessage::Edit { op, .. }) = server.try_recv() else {
@@ -491,6 +694,9 @@ mod tests {
         let (mut world, server) = world();
         drop(server);
         assert_eq!(world.poll().err(), Some(Stopped::Disconnected));
-        assert_eq!(world.dig(&camera()).err(), Some(Stopped::Disconnected));
+        assert_eq!(
+            world.edit(&camera(), &Tool::default()).err(),
+            Some(Stopped::Disconnected)
+        );
     }
 }

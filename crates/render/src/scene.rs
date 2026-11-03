@@ -118,8 +118,9 @@ impl Level {
 ///
 /// The ball bounds the Voxels of level 0. A Voxel of a coarser level is drawn as a whole cube,
 /// and is solid when half of its children are, so it can stick out of the ball by its diagonal;
-/// [`Scene::clip_radius`] allows for that. An Edit that adds matter beyond the ball (building,
-/// #60) must grow `radius` to hold it: digging only takes matter away, so it never does.
+/// [`Scene::clip_radius`] allows for that. An Edit that adds matter beyond the ball (building)
+/// grows `radius` to hold it, which [`Scene::update`] does; digging only takes matter away, so it
+/// never does.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Bound {
     /// The ball's centre, in Voxels.
@@ -131,10 +132,53 @@ pub struct Bound {
     pub radius: i32,
 }
 
+/// Largest radius a [`Bound`] can have: below 2^24, so that the GPU has it exactly.
+const MAX_BOUND_RADIUS: i32 = (1 << 24) - 1;
+
 /// Voxels added to the radius that rays are clipped to, which are more than the clip's rounding
 /// can come to: a ray at the edge of the ball is a hair to either side of it in f32, never a
 /// Voxel.
 pub const BOUND_SLACK: f32 = 8.0;
+
+/// How far from the centre of `ball` the far corner of the farthest solid Voxel of the brick at
+/// `coord` is, rounded up, if that is beyond the ball's radius, and else 0.
+fn farthest_matter(store: &BrickStore, coord: BrickCoord, ball: Bound) -> i32 {
+    let Some(brick) = store.brick(coord).filter(|b| !b.is_air()) else {
+        return 0;
+    };
+    let centre = ball.centre.map(i64::from);
+    let origin = coord.origin().0.map(i64::from);
+    // The far corner of a Voxel, along an axis: the farther of its two faces.
+    let far = |voxel: [i64; 3]| -> i64 {
+        (0..3)
+            .map(|a| {
+                let d = (voxel[a] - centre[a])
+                    .abs()
+                    .max((voxel[a] + 1 - centre[a]).abs());
+                d * d
+            })
+            .sum()
+    };
+    let radius2 = i64::from(ball.radius) * i64::from(ball.radius);
+    // Most bricks are well inside: look at the Voxels only if a corner of the brick is not.
+    let corners = (0..8).map(|c| far(std::array::from_fn(|a| origin[a] + 7 * (c >> a & 1))));
+    if corners.max().is_some_and(|f| f <= radius2) {
+        return 0;
+    }
+    let mut farthest = 0;
+    for i in 0..brick_store::BRICK_VOXELS {
+        let local = [(i & 7) as u8, (i >> 3 & 7) as u8, (i >> 6) as u8];
+        if brick.get(local).is_some() {
+            let voxel: [i64; 3] = std::array::from_fn(|a| origin[a] + i64::from(local[a]));
+            farthest = farthest.max(far(voxel));
+        }
+    }
+    if farthest <= radius2 {
+        return 0;
+    }
+    let root = farthest.isqrt();
+    (root + i64::from(root * root < farthest)).min(i64::from(i32::MAX)) as i32
+}
 
 /// Packed bricks and the index over them. Built by [`Scene::new`] or [`Scene::rings`], uploaded
 /// as-is.
@@ -477,10 +521,32 @@ impl Scene {
         store: &BrickStore,
         changed: &[BrickCoord],
     ) -> Result<SceneUpdate, RingsFull> {
+        self.grow_bound(store, changed);
         if self.rings.is_some() {
             return self.update_rings(store, changed);
         }
         Ok(self.update_flat(store, changed))
+    }
+
+    /// Grows the ball that rays are clipped to, and the one a scene made again starts from, to
+    /// hold the matter in the `changed` bricks, which an Edit that places may have put beyond it.
+    /// It only grows: matter dug out again leaves the ball as it was.
+    fn grow_bound(&mut self, store: &BrickStore, changed: &[BrickCoord]) {
+        let Some(ball) = self.rings_ball().or(self.bound) else {
+            return;
+        };
+        let radius = changed
+            .iter()
+            .map(|&coord| farthest_matter(store, coord, ball))
+            .fold(ball.radius, i32::max)
+            .min(MAX_BOUND_RADIUS);
+        if radius > ball.radius {
+            let grown = Bound { radius, ..ball };
+            self.set_rings_ball(grown);
+            if self.bound.is_some() {
+                self.bound = Some(grown);
+            }
+        }
     }
 
     /// [`Scene::update`] for a scene that is not rings.
@@ -987,6 +1053,36 @@ mod tests {
         let patch = scene.update(&store, &[BrickCoord([100, 0, 0])]).unwrap();
         assert_eq!(patch, SceneUpdate::Rebuilt);
         assert_eq!(material_at(&scene, [800, 3, 3]), Some(2));
+    }
+
+    #[test]
+    fn matter_placed_beyond_the_bound_grows_it_in_a_flat_scene_too() {
+        let mut store = BrickStore::new();
+        store.insert(BrickCoord([0, 0, 0]), Brick::solid(SOIL));
+        let mut scene = Scene::new(&store, None);
+        let bound = Bound {
+            centre: [0; 3],
+            radius: 20,
+        };
+        scene.bound = Some(bound);
+        // Within the bound: in a region the scene has, which is patched.
+        store.set(VoxelCoord([4, 4, 4]), Some(ROCK));
+        scene.update(&store, &[BrickCoord([0, 0, 0])]).unwrap();
+        assert_eq!(scene.bound, Some(bound));
+        // Past it, in a region the scene lacks, which makes the scene again. 300 along x, and the
+        // Voxel is 1 wide, so the far corner of it is at a distance of at least 301.
+        store.set(VoxelCoord([300, 0, 0]), Some(ROCK));
+        let patch = scene.update(&store, &[VoxelCoord([300, 0, 0]).brick()]);
+        assert_eq!(patch, Ok(SceneUpdate::Rebuilt));
+        let grown = scene.bound.unwrap();
+        assert!((301..310).contains(&grown.radius), "{grown:?}");
+        assert!(scene.clip_radius().unwrap() > 301.0);
+        // A Voxel dug out again does not shrink it.
+        store.set(VoxelCoord([300, 0, 0]), None);
+        scene
+            .update(&store, &[VoxelCoord([300, 0, 0]).brick()])
+            .unwrap();
+        assert_eq!(scene.bound, Some(grown));
     }
 
     #[test]

@@ -6,6 +6,7 @@ publish.workspace = true
 
 [dependencies]
 brick-store.workspace = true
+materials.workspace = true
 egui.workspace = true
 egui-winit.workspace = true
 net.workspace = true

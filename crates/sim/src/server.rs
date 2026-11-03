@@ -15,7 +15,10 @@ use std::time::{Duration, Instant};
 use brick_store::BrickStore;
 use net::{ClientMessage, EditOp, Leash, MoveInput, RejectReason, ServerEnd, ServerMessage};
 
-use crate::{Character, FixedTimestep, Footing, Ground, Movement, apply, validate};
+use crate::{
+    Character, FixedTimestep, Footing, Ground, Movement, OPS_PER_SECOND, VOXEL_BURST,
+    VOXELS_PER_SECOND, apply_changes, plan, validate, within_reach,
+};
 
 /// The server simulates at this rate (issue 11).
 pub const TICK_RATE_HZ: u32 = 60;
@@ -45,6 +48,49 @@ const CLEARANCE: f64 = 24.0;
 /// Inputs held for a character that has no leash yet, at the most (ten seconds of them): see
 /// [`ClientMessage::Spawn`].
 const MAX_QUEUED: usize = 600;
+
+/// What one player may still ask of the server in Edits: a token bucket for each limit, in integers
+/// so that it does not depend on a clock. Credit is counted in 1/[`TICK_RATE_HZ`] of an Edit or a
+/// Voxel, so that each tick adds a whole number (the rate per second) and an Edit or a Voxel costs
+/// [`TICK_RATE_HZ`].
+struct Budget {
+    ops: u32,
+    voxels: u64,
+}
+
+impl Budget {
+    /// What a player has after a rest: a second of Edits, and [`VOXEL_BURST`] Voxels.
+    fn full() -> Self {
+        Self {
+            ops: OPS_PER_SECOND * TICK_RATE_HZ,
+            voxels: u64::from(VOXEL_BURST) * u64::from(TICK_RATE_HZ),
+        }
+    }
+
+    /// One tick's credit.
+    fn refill(&mut self) {
+        let full = Self::full();
+        self.ops = (self.ops + OPS_PER_SECOND).min(full.ops);
+        self.voxels = (self.voxels + u64::from(VOXELS_PER_SECOND)).min(full.voxels);
+    }
+
+    /// Spends one Edit's credit, if there is that much.
+    fn take_op(&mut self) -> bool {
+        self.ops
+            .checked_sub(TICK_RATE_HZ)
+            .map(|ops| self.ops = ops)
+            .is_some()
+    }
+
+    /// Spends `voxels` Voxels' credit, if there is that much.
+    fn take_voxels(&mut self, voxels: usize) -> bool {
+        let cost = voxels as u64 * u64::from(TICK_RATE_HZ);
+        self.voxels
+            .checked_sub(cost)
+            .map(|left| self.voxels = left)
+            .is_some()
+    }
+}
 
 /// One client's character, how many of its inputs the server has applied, and the ground it
 /// walks on.
@@ -107,6 +153,9 @@ pub struct Server {
     ground_rate: Option<usize>,
     /// The character of each client, by its index in the list given to [`Server::tick`].
     avatars: Vec<Option<Avatar>>,
+    /// What each client may still ask in Edits, by the same index. It outlasts a spawn, so that
+    /// spawning again is no way round a limit.
+    budgets: Vec<Budget>,
 }
 
 impl Server {
@@ -117,6 +166,7 @@ impl Server {
             movement: Movement::default(),
             ground_rate: None,
             avatars: Vec::new(),
+            budgets: Vec::new(),
         }
     }
 
@@ -141,13 +191,34 @@ impl Server {
         self.avatars.get(index)?.as_ref().map(|a| &a.ground)
     }
 
-    /// Validates the request and, if it passes, applies it and gives it the next global
-    /// sequence number. A rejected request changes nothing and takes no number.
-    fn handle_edit(&mut self, client_seq: u64, op: EditOp) -> Outcome {
-        if let Err(reason) = validate(&op) {
-            return Outcome::Rejected { client_seq, reason };
+    /// Checks the request against client `asker`'s limits and the rules of an Edit and, if it
+    /// passes, applies it and gives it the next global sequence number. A rejected request changes
+    /// nothing and takes no number. The checks are, in this order: the rate (every request
+    /// counts, however it ends), the reach from the character's eyes (no character, no reach),
+    /// the Brush itself ([`validate`]) and the Voxels it changes, which [`plan`] counts before
+    /// anything is written.
+    fn handle_edit(&mut self, asker: usize, client_seq: u64, op: EditOp) -> Outcome {
+        let reject = |reason| Outcome::Rejected { client_seq, reason };
+        if self.budgets.len() <= asker {
+            self.budgets.resize_with(asker + 1, Budget::full);
         }
-        apply(&mut self.store, &op);
+        if !self.budgets[asker].take_op() {
+            return reject(RejectReason::RateLimited);
+        }
+        let in_reach = self
+            .character(asker)
+            .is_some_and(|character| within_reach(character.eye(), op.centre));
+        if !in_reach {
+            return reject(RejectReason::OutOfReach);
+        }
+        if let Err(reason) = validate(&op) {
+            return reject(reason);
+        }
+        let changes = plan(&self.store, &op);
+        if !self.budgets[asker].take_voxels(changes.len()) {
+            return reject(RejectReason::VolumeLimited);
+        }
+        apply_changes(&mut self.store, &changes);
         self.global_seq += 1;
         Outcome::Applied {
             global_seq: self.global_seq,
@@ -198,18 +269,23 @@ impl Server {
         true
     }
 
-    /// One tick: handles every request that has arrived, clients in order and each client's
-    /// requests in the order it sent them. Each accepted Edit goes to every client, with the
-    /// ack only for the one that asked; a reject goes to the one that asked. A client whose
-    /// character moved is told where it is, once, after its requests, and before that of any new
-    /// leash. A character with no leash yet is waiting for its ground, which is filled each tick.
+    /// One tick: tops up each client's Edit allowance, then handles every request that has
+    /// arrived, clients in order and each client's requests in the order it sent them. Each
+    /// accepted Edit goes to every client, with the ack only for the one that asked; a reject goes
+    /// to the one that asked. A client whose character moved is told where it is, once, after its
+    /// requests, and before that of any new leash. A character with no leash yet is waiting for
+    /// its ground, which is filled each tick.
     pub fn tick(&mut self, clients: &[ServerEnd]) {
+        if self.budgets.len() < clients.len() {
+            self.budgets.resize_with(clients.len(), Budget::full);
+        }
+        self.budgets.iter_mut().for_each(Budget::refill);
         for (asker, client) in clients.iter().enumerate() {
             let mut moved = false;
             while let Ok(message) = client.try_recv() {
                 match message {
                     ClientMessage::Edit { client_seq, op } => {
-                        match self.handle_edit(client_seq, op) {
+                        match self.handle_edit(asker, client_seq, op) {
                             Outcome::Applied {
                                 global_seq,
                                 op,
@@ -359,15 +435,32 @@ mod tests {
         std::iter::from_fn(|| client.try_recv().ok()).collect()
     }
 
+    /// What the server said about Edits, and not about the character.
+    fn edits_heard(client: &ClientEnd) -> Vec<ServerMessage> {
+        let mut heard = received(client);
+        heard.retain(|m| !matches!(m, ServerMessage::Body { .. } | ServerMessage::Leash { .. }));
+        heard
+    }
+
+    /// The request that puts a character at the origin, among the stone the tests edit: Edits need
+    /// a character to be in reach of.
+    fn stand() -> ClientMessage {
+        ClientMessage::Spawn {
+            spawn: 1,
+            position: [0.0; 3],
+        }
+    }
+
     #[test]
     fn a_request_is_applied_numbered_and_acked() {
         let (client, end) = loopback();
         let mut server = Server::new(stone_store());
+        client.send(stand()).unwrap();
         client.send(dig(0, [3, 3, 3], 2)).unwrap();
         server.tick(&[end]);
         let op = EditOp::dig_sphere(VoxelCoord([3, 3, 3]), 2);
         assert_eq!(
-            received(&client),
+            edits_heard(&client),
             [ServerMessage::Applied {
                 global_seq: 1,
                 op,
@@ -382,11 +475,12 @@ mod tests {
     fn global_sequence_numbers_follow_the_order_the_server_handled_requests() {
         let (client, end) = loopback();
         let mut server = Server::new(stone_store());
+        client.send(stand()).unwrap();
         for seq in 0..4 {
             client.send(dig(seq, [seq as i32 * 4, 0, 0], 1)).unwrap();
         }
         server.tick(&[end]);
-        let seqs: Vec<_> = received(&client)
+        let seqs: Vec<_> = edits_heard(&client)
             .into_iter()
             .map(|m| match m {
                 ServerMessage::Applied {
@@ -406,10 +500,11 @@ mod tests {
         let (client, end) = loopback();
         let mut server = Server::new(stone_store());
         let before = server.store().content_hash();
+        client.send(stand()).unwrap();
         client.send(dig(0, [0, 0, 0], 200)).unwrap();
         client.send(dig(1, [0, 0, 0], 1)).unwrap();
         server.tick(&[end]);
-        let replies = received(&client);
+        let replies = edits_heard(&client);
         assert_eq!(
             replies[0],
             ServerMessage::Rejected {
@@ -432,11 +527,13 @@ mod tests {
     fn every_client_hears_every_edit_but_only_the_asker_is_acked() {
         let ((a, a_end), (b, b_end)) = (loopback(), loopback());
         let mut server = Server::new(stone_store());
+        a.send(stand()).unwrap();
+        b.send(stand()).unwrap();
         a.send(dig(5, [0, 0, 0], 1)).unwrap();
         b.send(dig(9, [8, 0, 0], 1)).unwrap();
         server.tick(&[a_end, b_end]);
         let acks = |client: &ClientEnd| -> Vec<_> {
-            received(client)
+            edits_heard(client)
                 .into_iter()
                 .map(|m| match m {
                     ServerMessage::Applied {
@@ -454,20 +551,23 @@ mod tests {
     fn a_client_that_left_does_not_stop_the_others_hearing() {
         let ((a, a_end), (b, b_end)) = (loopback(), loopback());
         let mut server = Server::new(stone_store());
+        b.send(stand()).unwrap();
         b.send(dig(0, [0, 0, 0], 1)).unwrap();
         drop(a);
         server.tick(&[a_end, b_end]);
-        assert_eq!(received(&b).len(), 1);
+        assert_eq!(edits_heard(&b).len(), 1);
     }
 
     #[test]
     fn on_its_own_thread_it_ticks_at_about_60_hz_and_answers() {
         let (client, end) = loopback();
         let handle = spawn(stone_store, vec![end]);
+        client.send(stand()).unwrap();
         client.send(dig(0, [3, 3, 3], 2)).unwrap();
         let started = Instant::now();
         let reply = loop {
             match client.try_recv() {
+                Ok(ServerMessage::Body { .. }) => {}
                 Ok(reply) => break reply,
                 Err(TryRecvError::Empty) if started.elapsed() < Duration::from_secs(5) => {
                     std::thread::sleep(Duration::from_millis(1));
@@ -490,6 +590,217 @@ mod tests {
         assert!((15..=45).contains(&ran), "{ran} ticks in half a second");
         let server = handle.stop();
         assert_eq!(server.store().get(VoxelCoord([3, 3, 3])), None);
+    }
+
+    /// The kinds of Edit, one request each, as the server answers them in one tick.
+    fn answers(
+        server: &mut Server,
+        end: &ServerEnd,
+        client: &ClientEnd,
+        asks: &[EditOp],
+    ) -> Vec<Option<RejectReason>> {
+        for (seq, &op) in asks.iter().enumerate() {
+            client
+                .send(ClientMessage::Edit {
+                    client_seq: seq as u64,
+                    op,
+                })
+                .unwrap();
+        }
+        server.tick(std::slice::from_ref(end));
+        edits_heard(client)
+            .into_iter()
+            .map(|m| match m {
+                ServerMessage::Applied { .. } => None,
+                ServerMessage::Rejected { reason, .. } => Some(reason),
+                other => panic!("{other:?}"),
+            })
+            .collect()
+    }
+
+    /// A server with a character standing at the origin of a store of stone.
+    fn standing() -> (Server, ServerEnd, ClientEnd) {
+        let (client, end) = loopback();
+        let mut server = Server::new(stone_store());
+        client.send(stand()).unwrap();
+        server.tick(std::slice::from_ref(&end));
+        received(&client);
+        (server, end, client)
+    }
+
+    fn place(centre: [i32; 3], shape: net::Shape, radius: u16) -> EditOp {
+        EditOp {
+            mode: net::EditMode::Place,
+            brush: net::Brush { shape, radius },
+            centre: VoxelCoord(centre),
+            material: Material(7),
+            alignment: net::Alignment::World,
+        }
+    }
+
+    #[test]
+    fn every_mode_and_shape_is_applied_by_the_server() {
+        use net::{EditMode, Shape};
+        let (mut server, end, client) = standing();
+        for shape in [Shape::Sphere, Shape::Cube, Shape::Cylinder] {
+            for mode in [
+                EditMode::Dig,
+                EditMode::Place,
+                EditMode::Smooth,
+                EditMode::Flatten,
+            ] {
+                let op = EditOp {
+                    mode,
+                    ..place([2, 3, 4], shape, 3)
+                };
+                let before = server.store().content_hash();
+                assert_eq!(answers(&mut server, &end, &client, &[op]), [None]);
+                // The first of each shape's digs and places changes something, and the smoothing
+                // of what is left may find nothing to round off: only the others are checked.
+                if matches!(mode, EditMode::Dig) {
+                    assert_ne!(server.store().content_hash(), before, "{op:?}");
+                }
+                // Let the allowance of Edits fill up again between requests.
+                for _ in 0..TICK_RATE_HZ {
+                    server.tick(std::slice::from_ref(&end));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn an_edit_from_a_client_with_no_character_is_out_of_reach() {
+        let (client, end) = loopback();
+        let mut server = Server::new(stone_store());
+        let before = server.store().content_hash();
+        let answers = answers(
+            &mut server,
+            &end,
+            &client,
+            &[EditOp::dig_sphere(VoxelCoord([3, 3, 3]), 2)],
+        );
+        assert_eq!(answers, [Some(RejectReason::OutOfReach)]);
+        assert_eq!(server.store().content_hash(), before);
+    }
+
+    #[test]
+    fn an_edit_is_in_reach_up_to_8_m_from_the_eyes_and_not_beyond() {
+        let (mut server, end, client) = standing();
+        let eye = server.character(0).unwrap().eye();
+        // Along y, which is the way up at the origin's own, odd spot, and so is the eyes' way.
+        let at = |voxels: f64| {
+            let y = (eye[1] + voxels).floor() as i32;
+            EditOp::dig_sphere(VoxelCoord([0, y, 0]), 1)
+        };
+        assert_eq!(
+            answers(&mut server, &end, &client, &[at(79.0), at(-79.0)]),
+            [None, None]
+        );
+        let far = answers(&mut server, &end, &client, &[at(81.0), at(-81.0)]);
+        assert_eq!(far, [Some(RejectReason::OutOfReach); 2]);
+    }
+
+    #[test]
+    fn a_brush_bigger_than_2_m_and_a_material_that_is_not_defined_are_turned_down() {
+        let (mut server, end, client) = standing();
+        let big = place([0, 0, 0], net::Shape::Cube, 21);
+        let unknown = EditOp {
+            material: Material(60_000),
+            ..place([0, 0, 0], net::Shape::Sphere, 2)
+        };
+        let nothing = EditOp {
+            material: Material(0),
+            ..place([0, 0, 0], net::Shape::Sphere, 2)
+        };
+        let flatten = EditOp {
+            mode: net::EditMode::Flatten,
+            ..unknown
+        };
+        let dig_ignores_it = EditOp {
+            mode: net::EditMode::Dig,
+            ..unknown
+        };
+        assert_eq!(
+            answers(
+                &mut server,
+                &end,
+                &client,
+                &[big, unknown, nothing, flatten, dig_ignores_it]
+            ),
+            [
+                Some(RejectReason::BrushTooLarge),
+                Some(RejectReason::UnknownMaterial),
+                Some(RejectReason::UnknownMaterial),
+                Some(RejectReason::UnknownMaterial),
+                None,
+            ]
+        );
+    }
+
+    #[test]
+    fn a_player_may_make_20_edits_a_second() {
+        let (mut server, end, client) = standing();
+        let ops = vec![EditOp::dig_sphere(VoxelCoord([0, 0, 0]), 0); 25];
+        let told = answers(&mut server, &end, &client, &ops);
+        assert_eq!(told.iter().filter(|r| r.is_none()).count(), 20);
+        assert!(
+            told[20..]
+                .iter()
+                .all(|r| *r == Some(RejectReason::RateLimited))
+        );
+
+        // The allowance comes back at 20 a second: one Edit every third tick of the 60.
+        for _ in 0..2 {
+            server.tick(std::slice::from_ref(&end));
+        }
+        let soon = answers(&mut server, &end, &client, &ops[..2]);
+        assert_eq!(soon, [None, Some(RejectReason::RateLimited)]);
+        for _ in 0..TICK_RATE_HZ {
+            server.tick(std::slice::from_ref(&end));
+        }
+        let later = answers(&mut server, &end, &client, &ops);
+        assert_eq!(later.iter().filter(|r| r.is_none()).count(), 20);
+    }
+
+    #[test]
+    fn a_player_may_change_8_m3_of_voxels_a_second() {
+        // A mass of stone 80 Voxels (8 m) across, with a character standing in the middle of it.
+        let mut store = BrickStore::new();
+        for x in -5..5 {
+            for y in -5..5 {
+                for z in -5..5 {
+                    store.insert(BrickCoord([x, y, z]), Brick::solid(STONE));
+                }
+            }
+        }
+        let (client, end) = loopback();
+        let mut server = Server::new(store);
+        client.send(stand()).unwrap();
+        server.tick(std::slice::from_ref(&end));
+        received(&client);
+
+        // Nine cubes of 21 Voxels a side, 9 261 Voxels each, side by side.
+        let dig = |i: i32| EditOp {
+            mode: net::EditMode::Dig,
+            ..place(
+                [(i % 3 - 1) * 22, 0, (i / 3 - 1) * 22],
+                net::Shape::Cube,
+                10,
+            )
+        };
+        let nine: Vec<_> = (0..9).map(dig).collect();
+        // The burst is 72 000 Voxels, which is seven of them. The two that did not fit changed
+        // nothing and cost nothing.
+        let told = answers(&mut server, &end, &client, &nine);
+        assert_eq!(told[..7], [None; 7]);
+        assert_eq!(told[7..], [Some(RejectReason::VolumeLimited); 2]);
+
+        // A second brings back 8 000 Voxels, which is room for one more, and not for two.
+        for _ in 0..TICK_RATE_HZ {
+            server.tick(std::slice::from_ref(&end));
+        }
+        let told = answers(&mut server, &end, &client, &nine[7..]);
+        assert_eq!(told, [None, Some(RejectReason::VolumeLimited)]);
     }
 
     /// Stone below y = 0: a flat Planet, as a source.

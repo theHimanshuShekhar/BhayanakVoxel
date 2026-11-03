@@ -30,6 +30,10 @@ _Avoid_: Modification, build
 The shape and size an Edit applies to the Planet (e.g. a 1 m sphere).
 _Avoid_: Tool size, cursor
 
+**Ghost**:
+The preview of a Brush where the next click would apply it, showing exactly the Voxels the Edit would change.
+_Avoid_: Cursor, outline
+
 **Debris**:
 A group of Voxels detached from the Planet by Edits that moves as a physical rigid body.
 _Avoid_: Fragment, chunk (reserved for storage, if used at all)

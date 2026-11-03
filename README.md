@@ -78,7 +78,12 @@ window title says when it is done.
 
 | Input | Action |
 | --- | --- |
-| Click | Capture the mouse; click again to dig |
+| Click | Capture the mouse; click again to apply the Brush |
+| `1` `2` `3` `4` | Brush mode: dig, place, smooth, flatten |
+| `B` | Brush shape: sphere, cube, cylinder |
+| `[` `]` | Smaller or bigger Brush, from 1 Voxel up to 4 m across |
+| `-` `=` | Previous or next Material (placed by place and flatten) |
+| `G` | Brush axes on the local up (snapped to 45 degrees) or on the world grid |
 | `W` `A` `S` `D` | Walk |
 | `Shift` | Run |
 | `Space` | Jump |
@@ -94,6 +99,11 @@ The client walks the Planet as a character (1.8 m tall, walks 4.5 m/s, runs 7, c
 about 1.2 m, steps up to 0.5 m; numbers in `crates/sim/movement.toml`). In noclip, `W` `A` `S` `D`
 fly along the view, `Space` and `Ctrl`/`C` go up and down, and `Shift` flies faster; nothing
 collides. Coming out of noclip sets the character down where the camera is.
+
+The Brush is shown as a ghost where the click would apply it: exactly the Voxels it would change.
+The server holds each player to 20 Edits a second, 8 m^3 of Voxels a second, a Brush of at most
+2 m radius and a reach of 8 m from the eyes (the client aims at 7.5 m), so Edits are made as the
+walking character and not from noclip; an Edit over a limit is taken back.
 
 ## Benchmarks
 

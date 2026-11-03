@@ -169,9 +169,23 @@ fn a_dig_near_the_camera_shows_at_every_band_that_covers_it() {
     let (mut world, _server, spawn) = spawned_world(2);
     fill(&mut world, spawn.position);
 
-    // Dig where the camera looks, as a click does.
-    let before = crate::world::centre_hit(world.scene(), &spawn);
-    world.dig(&spawn).unwrap().expect("there is ground to dig");
+    // Dig where the camera looks, as a click does, from a point of the view that is within reach
+    // of the ground (the spawn is 4 m up, and the ground it looks at is further than 7.5 m).
+    let forward = spawn.forward();
+    let distance = crate::world::centre_hit(world.scene(), &spawn)
+        .expect("the camera looks at the ground")
+        .t;
+    let aim = Camera {
+        position: std::array::from_fn(|a| {
+            spawn.position[a] + forward[a] * f64::from(distance - 40.0)
+        }),
+        ..spawn
+    };
+    let before = crate::world::centre_hit(world.scene(), &aim);
+    world
+        .edit(&aim, &crate::tool::Tool::default())
+        .unwrap()
+        .expect("there is ground to dig");
     let at = before.expect("the camera looks at the ground").voxel;
     let target = at.map(f64::from);
 
@@ -199,7 +213,7 @@ fn a_dig_near_the_camera_shows_at_every_band_that_covers_it() {
         let mut dug = planet().crust_around(ground(), RING, 12);
         sim::apply(
             &mut dug,
-            &EditOp::dig_sphere(VoxelCoord(at), crate::world::DIG_RADIUS),
+            &EditOp::dig_sphere(VoxelCoord(at), crate::tool::DEFAULT_RADIUS),
         );
         let dug_scene = Scene::rings(&dug, from, bands(), bound()).unwrap();
         let whole = planet().crust_around(ground(), RING, 12);
