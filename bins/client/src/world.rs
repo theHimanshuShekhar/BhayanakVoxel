@@ -2,12 +2,14 @@
 //! and the loopback to the server. All Edits come through here, and reach the Voxels only via
 //! [`sim::Predictor`], which calls [`sim::apply`].
 
-use brick_store::VoxelCoord;
+use brick_store::{Material, VoxelCoord};
+use materials::MaterialTable;
 use net::{ClientEnd, Disconnected, EditMode, EditOp, MoveInput, TryRecvError};
 use render::reference::{Hit, Ray, trace};
 use render::{Camera, RingsFull, Scene, SceneUpdate, camera};
 use sim::Predictor;
 
+use crate::dig::dig_seconds;
 use crate::ghost::Ghost;
 use crate::loader::{Arrival, Loader};
 use crate::tool::{Tool, rotation_for};
@@ -281,6 +283,25 @@ impl World {
     /// the way the camera looks (see [`rotation_for`]). `None` if there is no Voxel, or the centre
     /// is further than [`AIM_REACH`] from the camera.
     pub fn aim(&self, camera: &Camera, tool: &Tool) -> Option<EditOp> {
+        self.aim_hit(camera, tool).map(|(op, _)| op)
+    }
+
+    /// The Dig that holding the button would make, and how long it takes: by the hardness of the
+    /// Material at the Voxel aimed at (see [`dig_seconds`]). `None` if the tool is not a Dig, or
+    /// there is nothing to aim at.
+    pub fn dig_aim(&self, camera: &Camera, tool: &Tool) -> Option<(EditOp, f64)> {
+        if tool.mode != EditMode::Dig {
+            return None;
+        }
+        let (op, hit) = self.aim_hit(camera, tool)?;
+        let hardness = MaterialTable::built_in()
+            .get(Material(hit.material))
+            .map_or(0.0, |def| def.hardness);
+        Some((op, dig_seconds(hardness)))
+    }
+
+    /// [`World::aim`] with the Voxel that the view hit.
+    fn aim_hit(&self, camera: &Camera, tool: &Tool) -> Option<(EditOp, Hit)> {
         let hit = centre_hit(&self.scene, camera)?;
         let out = if tool.mode == EditMode::Place {
             i32::from(tool.radius) + 1
@@ -299,7 +320,7 @@ impl World {
         }
         let centre = VoxelCoord(centre);
         let rotation = rotation_for(centre, tool.alignment, camera.forward());
-        Some(tool.op(centre, rotation))
+        Some((tool.op(centre, rotation), hit))
     }
 
     /// Makes the ghost for where the camera looks, if there is a Voxel to apply `tool` to. It is
@@ -605,6 +626,24 @@ mod tests {
             ..tool
         };
         assert_eq!(world.aim(&side, &grid).unwrap().rotation, 0);
+    }
+
+    #[test]
+    fn a_dig_takes_the_time_of_the_hardness_of_the_material_aimed_at() {
+        let table = MaterialTable::built_in();
+        let (world, _server) = world();
+        let tool = Tool::default();
+        let (op, seconds) = world.dig_aim(&camera(), &tool).unwrap();
+        assert_eq!(Some(op), world.aim(&camera(), &tool));
+        let hit = centre_hit(world.scene(), &camera()).unwrap();
+        let hardness = table.get(Material(hit.material)).unwrap().hardness;
+        assert_eq!(seconds, dig_seconds(hardness));
+        // The other tools are instant: a hold does not dig for them.
+        let place = Tool {
+            mode: EditMode::Place,
+            ..tool
+        };
+        assert_eq!(world.dig_aim(&camera(), &place), None);
     }
 
     #[test]

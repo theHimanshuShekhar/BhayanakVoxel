@@ -245,6 +245,20 @@ impl MaterialTable {
     pub fn defs(&self) -> &[MaterialDef] {
         &self.defs
     }
+
+    /// The Materials whose name contains `query`, ignoring case and any space round the query: the
+    /// ones whose name starts with it first, then the rest, each group ascending by id. An empty
+    /// query finds them all. This is the palette's search.
+    pub fn search(&self, query: &str) -> Vec<&MaterialDef> {
+        let query = query.trim().to_lowercase();
+        let (mut found, rest): (Vec<_>, Vec<_>) = self
+            .defs
+            .iter()
+            .filter(|d| d.name.to_lowercase().contains(&query))
+            .partition(|d| d.name.to_lowercase().starts_with(&query));
+        found.extend(rest);
+        found
+    }
 }
 
 #[cfg(test)]

@@ -1,10 +1,22 @@
-//! The Brush the player has picked: what the mouse applies, and the keys that change it.
+//! The Brush the player has picked: what the mouse applies, and the hotbar of tools it comes from.
 
 use brick_store::{Material, VoxelCoord};
 use materials::MaterialTable;
 use net::{Alignment, Brush, EditMode, EditOp, Shape};
 use sim::{MAX_BRUSH_RADIUS, MAX_SMOOTH_RADIUS};
-use winit::keyboard::KeyCode;
+
+/// The tools of the hotbar, which the number keys `1` to `9` pick: a mode and a shape each.
+pub const HOTBAR: [(EditMode, Shape); 9] = [
+    (EditMode::Dig, Shape::Sphere),
+    (EditMode::Dig, Shape::Cube),
+    (EditMode::Dig, Shape::Cylinder),
+    (EditMode::Place, Shape::Sphere),
+    (EditMode::Place, Shape::Cube),
+    (EditMode::Place, Shape::Cylinder),
+    (EditMode::Smooth, Shape::Sphere),
+    (EditMode::Flatten, Shape::Cube),
+    (EditMode::Flatten, Shape::Cylinder),
+];
 
 /// The radius the client starts with: 1 m at 10 cm Voxels.
 pub(crate) const DEFAULT_RADIUS: u16 = 10;
@@ -50,38 +62,43 @@ impl Tool {
         }
     }
 
-    /// Changes the tool for `key`, if it is one of the tool's. `1` to `4` pick the mode, `B` the
-    /// next shape, `[` and `]` a smaller or bigger Brush (a Voxel at the least, and the 2 m radius
-    /// that the server allows at the most), `-` and `=` the previous or next Material, and `G`
-    /// switches between a Brush on the local up and one on the grid. Returns whether it was.
-    pub fn key(&mut self, key: KeyCode) -> bool {
-        match key {
-            KeyCode::Digit1 => self.mode = EditMode::Dig,
-            KeyCode::Digit2 => self.mode = EditMode::Place,
-            KeyCode::Digit3 => self.mode = EditMode::Smooth,
-            KeyCode::Digit4 => self.mode = EditMode::Flatten,
-            KeyCode::KeyB => {
-                self.shape = match self.shape {
-                    Shape::Sphere => Shape::Cube,
-                    Shape::Cube => Shape::Cylinder,
-                    Shape::Cylinder => Shape::Sphere,
-                }
-            }
-            KeyCode::BracketLeft => self.radius = self.radius.saturating_sub(1),
-            KeyCode::BracketRight => self.radius += 1,
-            KeyCode::Minus => self.step_material(false),
-            KeyCode::Equal => self.step_material(true),
-            KeyCode::KeyG => {
-                self.alignment = match self.alignment {
-                    Alignment::Local => Alignment::World,
-                    Alignment::World => Alignment::Local,
-                }
-            }
-            _ => return false,
+    /// Picks the tool in hotbar slot `slot` (0 to 8; one past the last is ignored): its mode and
+    /// its shape. The size is kept, down to what the server allows the mode.
+    pub fn select(&mut self, slot: usize) {
+        if let Some(&(mode, shape)) = HOTBAR.get(slot) {
+            self.mode = mode;
+            self.shape = shape;
+            self.radius = self.radius.min(self.largest());
         }
-        // A Smooth or a Flatten is a smaller Brush than a Dig or a Place may be.
-        self.radius = self.radius.min(self.largest());
-        true
+    }
+
+    /// The hotbar slot the tool is in.
+    pub fn slot(&self) -> usize {
+        HOTBAR
+            .iter()
+            .position(|&(mode, shape)| mode == self.mode && shape == self.shape)
+            .unwrap_or(0)
+    }
+
+    /// Moves along the hotbar by `steps` slots, wrapping round.
+    pub fn step_slot(&mut self, steps: i32) {
+        let n = HOTBAR.len() as i32;
+        self.select((self.slot() as i32 + steps).rem_euclid(n) as usize);
+    }
+
+    /// Makes the Brush `steps` radii bigger, or smaller if negative: a Voxel at the least, and at
+    /// the most what the server allows the mode.
+    pub fn resize(&mut self, steps: i32) {
+        let radius = (i32::from(self.radius) + steps).clamp(0, i32::from(self.largest()));
+        self.radius = radius as u16;
+    }
+
+    /// Switches between a Brush on the local up and one on the grid.
+    pub fn toggle_alignment(&mut self) {
+        self.alignment = match self.alignment {
+            Alignment::Local => Alignment::World,
+            Alignment::World => Alignment::Local,
+        }
     }
 
     /// The biggest radius that the server allows this tool's mode.
@@ -93,7 +110,7 @@ impl Tool {
     }
 
     /// The next Material of the table, or the previous, wrapping round.
-    fn step_material(&mut self, forward: bool) {
+    pub fn step_material(&mut self, forward: bool) {
         let defs = MaterialTable::built_in().defs();
         let at = defs
             .iter()
@@ -109,17 +126,7 @@ impl Tool {
 
     /// What the tool is, for the window title.
     pub fn describe(&self) -> String {
-        let mode = match self.mode {
-            EditMode::Dig => "dig",
-            EditMode::Place => "place",
-            EditMode::Smooth => "smooth",
-            EditMode::Flatten => "flatten",
-        };
-        let shape = match self.shape {
-            Shape::Sphere => "sphere",
-            Shape::Cube => "cube",
-            Shape::Cylinder => "cylinder",
-        };
+        let (mode, shape) = (mode_name(self.mode), shape_name(self.shape));
         let fill = match (self.mode, MaterialTable::built_in().get(self.material)) {
             (EditMode::Place | EditMode::Flatten, Some(def)) => format!(", {}", def.name),
             _ => String::new(),
@@ -132,6 +139,34 @@ impl Tool {
             "{mode} {shape} {} cm{fill}, {grid}",
             (u32::from(self.radius) * 2 + 1) * 10
         )
+    }
+}
+
+/// The label of each hotbar slot: its number, mode and shape on a line each.
+pub fn slot_labels() -> Vec<String> {
+    HOTBAR
+        .iter()
+        .enumerate()
+        .map(|(i, &(mode, shape))| format!("{}\n{}\n{}", i + 1, mode_name(mode), shape_name(shape)))
+        .collect()
+}
+
+/// What a mode is called.
+pub fn mode_name(mode: EditMode) -> &'static str {
+    match mode {
+        EditMode::Dig => "dig",
+        EditMode::Place => "place",
+        EditMode::Smooth => "smooth",
+        EditMode::Flatten => "flatten",
+    }
+}
+
+/// What a shape is called.
+pub fn shape_name(shape: Shape) -> &'static str {
+    match shape {
+        Shape::Sphere => "sphere",
+        Shape::Cube => "cube",
+        Shape::Cylinder => "cylinder",
     }
 }
 
@@ -179,40 +214,39 @@ mod tests {
     }
 
     #[test]
-    fn the_number_keys_pick_the_mode_and_b_cycles_the_shape() {
+    fn every_hotbar_slot_is_a_tool_of_its_own_and_picks_its_mode_and_shape() {
         let mut tool = Tool::default();
-        for (key, mode) in [
-            (KeyCode::Digit2, EditMode::Place),
-            (KeyCode::Digit3, EditMode::Smooth),
-            (KeyCode::Digit4, EditMode::Flatten),
-            (KeyCode::Digit1, EditMode::Dig),
-        ] {
-            assert!(tool.key(key));
-            assert_eq!(tool.mode, mode);
+        assert_eq!(tool.slot(), 0, "the tool starts in the first slot");
+        for (slot, &(mode, shape)) in HOTBAR.iter().enumerate() {
+            tool.select(slot);
+            assert_eq!((tool.mode, tool.shape, tool.slot()), (mode, shape, slot));
         }
-        let shapes: Vec<_> = (0..4)
-            .map(|_| {
-                tool.key(KeyCode::KeyB);
-                tool.shape
-            })
+        let distinct: std::collections::BTreeSet<_> = HOTBAR
+            .iter()
+            .map(|&(m, s)| (mode_name(m), shape_name(s)))
             .collect();
-        assert_eq!(
-            shapes,
-            [Shape::Cube, Shape::Cylinder, Shape::Sphere, Shape::Cube]
-        );
-        assert!(!tool.key(KeyCode::KeyW), "W is the character's");
+        assert_eq!(distinct.len(), HOTBAR.len());
+        tool.select(9);
+        assert_eq!(tool.slot(), 8, "a slot past the last is ignored");
     }
 
     #[test]
-    fn the_brackets_size_the_brush_from_a_voxel_to_2_m() {
+    fn the_hotbar_wraps_round_in_both_directions() {
         let mut tool = Tool::default();
-        for _ in 0..30 {
-            tool.key(KeyCode::BracketLeft);
-        }
+        tool.step_slot(-1);
+        assert_eq!(tool.slot(), 8);
+        tool.step_slot(1);
+        assert_eq!(tool.slot(), 0);
+        tool.step_slot(10);
+        assert_eq!(tool.slot(), 1);
+    }
+
+    #[test]
+    fn resizing_goes_from_a_voxel_to_2_m() {
+        let mut tool = Tool::default();
+        tool.resize(-30);
         assert_eq!(tool.radius, 0);
-        for _ in 0..30 {
-            tool.key(KeyCode::BracketRight);
-        }
+        tool.resize(30);
         assert_eq!(tool.radius, MAX_BRUSH_RADIUS);
         assert!(sim::validate(&tool.op(VoxelCoord([0; 3]), 0)).is_ok());
     }
@@ -220,42 +254,36 @@ mod tests {
     #[test]
     fn a_smooth_or_a_flatten_is_held_to_radius_10_and_a_dig_or_a_place_to_20() {
         let mut tool = Tool::default();
-        for _ in 0..30 {
-            tool.key(KeyCode::BracketRight);
-        }
+        tool.resize(30);
         assert_eq!(tool.radius, MAX_BRUSH_RADIUS);
         // Picking Smooth takes it down to what the server allows, and it does not go up again.
-        tool.key(KeyCode::Digit3);
+        tool.select(6);
+        assert_eq!(tool.mode, EditMode::Smooth);
         assert_eq!(tool.radius, MAX_SMOOTH_RADIUS);
-        tool.key(KeyCode::BracketRight);
+        tool.resize(1);
         assert_eq!(tool.radius, MAX_SMOOTH_RADIUS);
-        tool.key(KeyCode::Digit4);
+        tool.select(7);
         assert_eq!(tool.radius, MAX_SMOOTH_RADIUS);
-        tool.key(KeyCode::Digit2);
-        tool.key(KeyCode::BracketRight);
+        tool.select(3);
+        tool.resize(1);
         assert_eq!(tool.radius, MAX_SMOOTH_RADIUS + 1);
-        for mode in [
-            KeyCode::Digit1,
-            KeyCode::Digit2,
-            KeyCode::Digit3,
-            KeyCode::Digit4,
-        ] {
-            tool.key(mode);
+        for slot in 0..HOTBAR.len() {
+            tool.select(slot);
             assert_eq!(sim::validate(&tool.op(VoxelCoord([0; 3]), 0)), Ok(()));
         }
     }
 
     #[test]
-    fn the_material_keys_walk_the_table_and_wrap() {
+    fn stepping_the_material_walks_the_table_and_wraps() {
         let table = MaterialTable::built_in();
         let (first, last) = (table.defs()[0].id, table.defs().last().unwrap().id);
         let mut tool = Tool::default();
-        tool.key(KeyCode::Digit2);
-        tool.key(KeyCode::Minus);
+        tool.select(3);
+        tool.step_material(false);
         assert_eq!(tool.material, Material(last), "wraps back to the last");
-        tool.key(KeyCode::Equal);
+        tool.step_material(true);
         assert_eq!(tool.material, Material(first));
-        tool.key(KeyCode::Equal);
+        tool.step_material(true);
         assert_eq!(tool.material, Material(table.defs()[1].id));
         // Every Material it offers is one the server accepts.
         let op = tool.op(VoxelCoord([0; 3]), 0);
@@ -264,16 +292,16 @@ mod tests {
     }
 
     #[test]
-    fn only_the_modes_that_fill_carry_a_material_and_g_switches_to_the_grid() {
+    fn only_the_modes_that_fill_carry_a_material_and_the_alignment_toggles() {
         let mut tool = Tool::default();
-        tool.key(KeyCode::Equal);
+        tool.step_material(true);
         assert_eq!(tool.op(VoxelCoord([0; 3]), 0).material, Material(0), "dig");
-        tool.key(KeyCode::Digit4);
+        tool.select(7);
         assert_eq!(tool.op(VoxelCoord([0; 3]), 0).material, tool.material);
         assert_eq!(tool.op(VoxelCoord([0; 3]), 0).alignment, Alignment::Local);
-        tool.key(KeyCode::KeyG);
+        tool.toggle_alignment();
         assert_eq!(tool.op(VoxelCoord([0; 3]), 0).alignment, Alignment::World);
-        tool.key(KeyCode::KeyG);
+        tool.toggle_alignment();
         assert_eq!(tool.alignment, Alignment::Local);
     }
 
@@ -281,9 +309,8 @@ mod tests {
     fn the_title_says_what_the_tool_does() {
         let mut tool = Tool::default();
         assert_eq!(tool.describe(), "dig sphere 210 cm, local up");
-        tool.key(KeyCode::Digit2);
-        tool.key(KeyCode::KeyB);
-        tool.key(KeyCode::KeyG);
+        tool.select(4);
+        tool.toggle_alignment();
         assert_eq!(tool.describe(), "place cube 210 cm, rock, grid");
     }
 
@@ -328,7 +355,7 @@ mod tests {
     #[test]
     fn the_turn_it_picks_is_one_the_server_allows() {
         let mut tool = Tool::default();
-        tool.key(KeyCode::Digit2);
+        tool.select(3);
         let centre = VoxelCoord([123, -456, 789]);
         for step in 0..16 {
             let a = f64::from(step) * 0.4;

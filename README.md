@@ -78,10 +78,12 @@ window title says when it is done.
 
 | Input | Action |
 | --- | --- |
-| Click | Capture the mouse; click again to apply the Brush |
-| `1` `2` `3` `4` | Brush mode: dig, place, smooth, flatten |
-| `B` | Brush shape: sphere, cube, cylinder |
-| `[` `]` | Smaller or bigger Brush, from 1 Voxel up to 4 m across |
+| Click | Capture the mouse; click again to apply the tool. A Dig is made by holding the button |
+| `1`-`9` | Pick a hotbar tool (mode and shape): dig sphere / cube / cylinder, place sphere / cube / cylinder, smooth sphere, flatten cube / cylinder |
+| Wheel | Step along the hotbar (mouse captured) |
+| `Alt` + wheel | Smaller or bigger Brush, from 1 Voxel up to 4 m across |
+| `[` `]` | The same, from the keyboard |
+| `Tab` | Open or close the Material palette: type to search by name, click a Material or press `Enter` for the first match. Opening it releases the mouse, closing it captures it again; every key goes to the search box while it is open |
 | `-` `=` | Previous or next Material (placed by place and flatten) |
 | `G` | Brush axes on the local up (snapped to 45 degrees) or on the world grid |
 | `W` `A` `S` `D` | Walk |
@@ -99,6 +101,14 @@ The client walks the Planet as a character (1.8 m tall, walks 4.5 m/s, runs 7, c
 about 1.2 m, steps up to 0.5 m; numbers in `crates/sim/movement.toml`). In noclip, `W` `A` `S` `D`
 fly along the view, `Space` and `Ctrl`/`C` go up and down, and `Shift` flies faster; nothing
 collides. Coming out of noclip sets the character down where the camera is.
+
+The hotbar is along the bottom of the window and is clickable while the mouse is released (`Esc`, or
+the palette); the palette has the Brush size buttons too. The Materials are all there for the
+taking: no inventory. Placing, smoothing and flattening are instant. A Dig takes as long as the
+hardness of the Material at the Voxel aimed at says, 0.15 s per unit of hardness in
+`crates/materials/materials.toml` (sand 0.15 s, soil 0.3 s, rock 0.9 s, obsidian 1.2 s, at least
+0.05 s), and a bar by the middle of the window shows the hold; looking at another Voxel starts it
+over. The client times it and then sends the one ordinary Edit; the server does not check the time.
 
 The Brush is shown as a ghost where the click would apply it: exactly the Voxels it would change
 (grey when the server will turn it down). A placed Brush sits on the face that was aimed at, is

@@ -1,4 +1,6 @@
 mod bench;
+mod dig;
+mod editor;
 mod fly;
 mod ghost;
 mod loader;
@@ -15,19 +17,22 @@ use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 
 use brick_store::BrickStore;
+use dig::Dig;
+use editor::{Editor, Grab, Input};
 use fly::{Action, Fly};
 use loader::{GUARD_FIRST, Loader};
-use net::Leash;
+use net::{EditMode, Leash};
 use planet_gen::planet::Planet;
 use planet_gen::world_map::{WORLD_MAP_SIZE, WORLD_RADIUS, WorldMap};
 use render::lod::{self, Bands};
-use render::overlay::{self, Controls, LodInfo, SceneMemory};
+use render::overlay::{self, Controls, Hud, HudEvent, LodInfo, SceneMemory};
 use render::scene::Bound;
 use render::{Camera, Mode, Renderer, RingsFull, Scene, SceneUpdate, Sun};
 use sim::{FixedTimestep, Predictor, ServerHandle, TICK_RATE_HZ};
-use tool::Tool;
 use winit::application::ApplicationHandler;
-use winit::event::{DeviceEvent, DeviceId, ElementState, MouseButton, WindowEvent};
+use winit::event::{
+    DeviceEvent, DeviceId, ElementState, MouseButton, MouseScrollDelta, WindowEvent,
+};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{CursorGrabMode, Window, WindowId};
@@ -62,6 +67,9 @@ const SUN_STEP: f32 = 0.05;
 /// Mip levels the client draws the Planet in: the LOD bands pick one for each brick from its
 /// distance (see [`render::lod`]), 0 to 12, which reaches orbit at 50 Planet radii.
 const RING_LEVELS: usize = lod::LEVELS;
+
+/// Pixels of a touchpad's scrolling that make one line of a wheel.
+const PIXELS_PER_LINE: f32 = 20.0;
 
 /// The LOD bias the client starts with: output pixels one Voxel may cover. The overlay changes it.
 const DEFAULT_BIAS: f32 = 1.0;
@@ -358,8 +366,16 @@ struct App {
     /// The eyes after the previous and the latest character tick, which the camera is drawn
     /// between so that it moves smoothly at any frame rate.
     eyes: Option<([f64; 3], [f64; 3])>,
-    /// The Brush that a click applies, which the tool keys change.
-    tool: Tool,
+    /// The tool and Material that a click applies, and the palette that picks them.
+    editor: Editor,
+    /// The button is held on a Dig, which is made once the hold has lasted as long as the
+    /// Material's hardness says.
+    digging: bool,
+    dig: Dig,
+    /// How long the Dig being held takes, for the bar that shows it.
+    dig_seconds: f64,
+    /// Whether `Alt` is held, which makes the wheel size the Brush.
+    alt: bool,
     /// The sun as an azimuth and an elevation, which the arrow keys turn.
     sun: (f32, f32),
     /// The LOD bias in use: output pixels one Voxel may cover. The overlay changes it.
@@ -410,7 +426,11 @@ impl App {
             clock: FixedTimestep::new(Duration::from_secs(1) / TICK_RATE_HZ, MAX_TICKS_PER_FRAME),
             spawn: None,
             eyes: None,
-            tool: Tool::default(),
+            editor: Editor::default(),
+            digging: false,
+            dig: Dig::default(),
+            dig_seconds: 0.0,
+            alt: false,
             sun: Sun::default().angles(),
             bias: DEFAULT_BIAS,
             title: String::new(),
@@ -500,8 +520,33 @@ impl App {
         if !self.walking {
             return Ok(());
         }
-        let update = world.edit(&self.camera, &self.tool)?;
+        let update = world.edit(&self.camera, &self.editor.tool)?;
         self.show(update)
+    }
+
+    /// Holds a Dig for `dt` seconds, while the button is down on one: it is made, as an ordinary
+    /// Edit, once the Material aimed at has been held on for as long as its hardness says.
+    fn dig_step(&mut self, dt: f64) -> Result<(), Box<dyn Error>> {
+        let holding = self.digging && self.walking && self.grabbed && !self.editor.palette_open;
+        let aim = self
+            .world
+            .as_ref()
+            .filter(|_| holding)
+            .and_then(|world| world.dig_aim(&self.camera, &self.editor.tool));
+        if let Some((_, seconds)) = aim {
+            self.dig_seconds = seconds;
+        }
+        if self.dig.hold(dt, aim) {
+            self.edit()?;
+        }
+        Ok(())
+    }
+
+    /// Captures or releases the mouse as the editor asks, and lets go of a Dig.
+    fn apply_grab(&mut self, grab: Option<Grab>) {
+        if let Some(grab) = grab {
+            self.grab(grab == Grab::Capture);
+        }
     }
 
     /// Shows what a click would change, while the character has the mouse. It is the Edit's own
@@ -509,7 +554,7 @@ impl App {
     fn aim(&mut self) {
         let aimed = self.walking && self.grabbed;
         match &mut self.world {
-            Some(world) if aimed => world.show_ghost(&self.camera, &self.tool),
+            Some(world) if aimed => world.show_ghost(&self.camera, &self.editor.tool),
             Some(world) => world.hide_ghost(),
             None => {}
         }
@@ -613,7 +658,7 @@ impl App {
         } else if !self.walking {
             format!("{TITLE} (noclip)")
         } else {
-            format!("{TITLE} [{}]", self.tool.describe())
+            format!("{TITLE} [{}]", self.editor.tool.describe())
         };
         if title != self.title {
             window.set_title(&title);
@@ -639,14 +684,14 @@ impl App {
     }
 
     /// Hands `event` to the overlay and says whether the overlay used it, in which case the
-    /// camera and the dig must ignore it. A hidden overlay sees nothing. While the mouse is
-    /// captured for looking around, the overlay gets no pointer events (the cursor is not on the
-    /// screen) except button releases, so that it never believes a button is still down.
+    /// camera and the dig must ignore it. While the mouse is captured for looking around, the
+    /// overlay gets no pointer events (the cursor is not on the screen) except button releases, so
+    /// that it never believes a button is still down.
     fn overlay_event(&mut self, event: &WindowEvent) -> bool {
         let (Some(window), Some(gui)) = (&self.window, &mut self.gui) else {
             return false;
         };
-        if !gui.visible || matches!(event, WindowEvent::RedrawRequested) {
+        if matches!(event, WindowEvent::RedrawRequested) {
             return false;
         }
         let pointer = matches!(
@@ -679,11 +724,9 @@ impl App {
         else {
             return None;
         };
-        // The ghost is painted by the same pass, so a hidden overlay still runs it for the ghost.
+        // The ghost and the hotbar are painted by the same pass, so a hidden debug panel still
+        // runs it.
         let ghost = self.world.as_ref().and_then(World::ghost);
-        if !gui.visible && ghost.is_none() {
-            return None;
-        }
         let before = Controls {
             mode: renderer.mode(),
             debug_view: renderer.debug_view(),
@@ -703,6 +746,13 @@ impl App {
         };
         let input = gui.state.take_egui_input(window);
         let camera = &self.camera;
+        let slots = tool::slot_labels();
+        let status = self.editor.tool.describe();
+        let (selected, material) = (self.editor.tool.slot(), self.editor.tool.material.0);
+        let dig = self.dig.progress(self.dig_seconds);
+        let palette = self.editor.palette_open.then_some(&mut self.editor.query);
+        let mut palette = palette;
+        let mut events = Vec::new();
         let mut output = gui.ctx.run_pass(input, |ctx| {
             if gui.visible {
                 overlay::show(ctx, &info, &mut controls);
@@ -710,9 +760,27 @@ impl App {
             if let Some(ghost) = ghost {
                 ghost.paint(ctx, camera);
             }
+            events = overlay::hud(
+                ctx,
+                Hud {
+                    slots: &slots,
+                    selected,
+                    status: &status,
+                    material,
+                    dig,
+                    palette: palette.as_deref_mut(),
+                },
+            );
         });
         gui.state
             .handle_platform_output(window, std::mem::take(&mut output.platform_output));
+        for event in events {
+            match event {
+                HudEvent::Slot(slot) => self.editor.tool.select(slot),
+                HudEvent::Size(steps) => self.editor.tool.resize(steps),
+                HudEvent::Material(id) => self.editor.pick_material(id),
+            }
+        }
         if controls.mode != before.mode {
             renderer.set_mode(controls.mode);
         }
@@ -749,6 +817,7 @@ impl App {
         } else {
             let _ = window.set_cursor_grab(CursorGrabMode::None);
             self.grabbed = false;
+            self.digging = false;
         }
         window.set_cursor_visible(!self.grabbed);
     }
@@ -824,13 +893,21 @@ impl ApplicationHandler for App {
                         {
                             gui.visible = !gui.visible;
                         }
+                    } else if pressed
+                        && !event.repeat
+                        && (code == KeyCode::Tab
+                            || (code == KeyCode::Escape && self.editor.palette_open))
+                    {
+                        // The palette's own keys, which its search box would otherwise take.
+                        let grab = self.editor.input(Input::Key(code), self.grabbed);
+                        self.apply_grab(grab);
                     } else if let Some(action) = action_for(code) {
                         // A key the overlay is typing with does not move the camera, but its
                         // release always counts, or the camera would keep going.
                         if !(pressed && used_by_overlay) {
                             self.fly.set(action, pressed);
                         }
-                    } else if pressed && !used_by_overlay {
+                    } else if pressed && !used_by_overlay && !self.editor.palette_open {
                         match code {
                             KeyCode::Escape => self.grab(false),
                             // Switches between walking and the debug noclip camera.
@@ -859,17 +936,9 @@ impl ApplicationHandler for App {
                             KeyCode::ArrowRight => self.turn_sun(SUN_STEP, 0.0),
                             KeyCode::ArrowUp => self.turn_sun(0.0, SUN_STEP),
                             KeyCode::ArrowDown => self.turn_sun(0.0, -SUN_STEP),
-                            // The tool's keys; the ones that size and pick may repeat.
-                            code if !event.repeat
-                                || matches!(
-                                    code,
-                                    KeyCode::BracketLeft
-                                        | KeyCode::BracketRight
-                                        | KeyCode::Minus
-                                        | KeyCode::Equal
-                                ) =>
-                            {
-                                self.tool.key(code);
+                            // The editor's keys; the ones that size and pick may repeat.
+                            code if !event.repeat || editor::repeats(code) => {
+                                self.editor.input(Input::Key(code), self.grabbed);
                             }
                             _ => {}
                         }
@@ -882,15 +951,39 @@ impl ApplicationHandler for App {
                 ..
             } => {
                 // A click on the overlay is not for the camera. The click that captures the mouse
-                // does not dig.
-                if !used_by_overlay {
+                // does not dig, and with the palette open there is nothing to capture it for. A
+                // Dig is made when its hold has lasted, and the other tools at once.
+                if !used_by_overlay && !self.editor.palette_open {
                     if !self.grabbed {
                         self.grab(true);
+                    } else if self.editor.tool.mode == EditMode::Dig {
+                        self.digging = true;
                     } else if let Err(err) = self.edit() {
                         self.error = Some(err);
                         event_loop.exit();
                     }
                 }
+            }
+            WindowEvent::MouseInput {
+                state: ElementState::Released,
+                button: MouseButton::Left,
+                ..
+            } => {
+                self.digging = false;
+                self.dig.release();
+            }
+            WindowEvent::ModifiersChanged(modifiers) => self.alt = modifiers.state().alt_key(),
+            WindowEvent::MouseWheel { delta, .. } if !used_by_overlay => {
+                let lines = match delta {
+                    MouseScrollDelta::LineDelta(_, y) => y,
+                    MouseScrollDelta::PixelDelta(position) => position.y as f32 / PIXELS_PER_LINE,
+                };
+                let wheel = Input::Wheel {
+                    lines,
+                    alt: self.alt,
+                };
+                let grab = self.editor.input(wheel, self.grabbed);
+                self.apply_grab(grab);
             }
             WindowEvent::Focused(false) => {
                 self.grab(false);
@@ -911,6 +1004,10 @@ impl ApplicationHandler for App {
                     }
                 } else {
                     self.fly.update(&mut self.camera, dt);
+                }
+                if let Err(err) = self.dig_step(dt) {
+                    self.error = Some(err);
+                    event_loop.exit();
                 }
                 self.aim();
                 let scene_started = Instant::now();
