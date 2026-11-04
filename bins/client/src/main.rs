@@ -333,7 +333,8 @@ fn load_planet() -> Loaded {
     load(map, SPAWN_REACH).expect("the ground around the spawn fits the rings' buffers")
 }
 
-/// The debug overlay's egui state. While it is hidden, none of it runs.
+/// The overlay's egui state. The hotbar is always shown, so it runs every frame; F1 only hides
+/// the debug panel.
 struct Gui {
     ctx: egui::Context,
     state: egui_winit::State,
@@ -716,8 +717,8 @@ impl App {
         gui.state.on_window_event(window, event).consumed
     }
 
-    /// Lays out the overlay for this frame, if it is shown, and applies what the user changed in
-    /// it. Hidden, this does nothing: no layout, no paint.
+    /// Lays out the overlay for this frame (the hotbar always, the debug panel if it is shown) and
+    /// applies what the user changed in it.
     fn run_overlay(&mut self) -> Option<egui::FullOutput> {
         let (Some(window), Some(renderer), Some(gui)) =
             (&self.window, &mut self.renderer, &mut self.gui)
@@ -750,8 +751,7 @@ impl App {
         let status = self.editor.tool.describe();
         let (selected, material) = (self.editor.tool.slot(), self.editor.tool.material.0);
         let dig = self.dig.progress(self.dig_seconds);
-        let palette = self.editor.palette_open.then_some(&mut self.editor.query);
-        let mut palette = palette;
+        let mut palette = self.editor.palette_open.then_some(&mut self.editor.query);
         let mut events = Vec::new();
         let mut output = gui.ctx.run_pass(input, |ctx| {
             if gui.visible {
@@ -909,7 +909,7 @@ impl ApplicationHandler for App {
                         }
                     } else if pressed && !used_by_overlay && !self.editor.palette_open {
                         match code {
-                            KeyCode::Escape => self.grab(false),
+                            KeyCode::Escape if !event.repeat => self.grab(false),
                             // Switches between walking and the debug noclip camera.
                             KeyCode::KeyN if !event.repeat => {
                                 if let Err(err) = self.toggle_noclip() {

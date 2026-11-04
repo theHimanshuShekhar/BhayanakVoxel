@@ -265,6 +265,23 @@ impl MaterialTable {
 mod tests {
     use super::*;
 
+    #[test]
+    fn search_finds_names_containing_the_query_whatever_the_case_those_starting_with_it_first() {
+        let names = |query: &str| -> Vec<&str> {
+            MaterialTable::built_in()
+                .search(query)
+                .iter()
+                .map(|d| d.name.as_str())
+                .collect()
+        };
+        let sand = names("SAND");
+        assert_eq!(&sand[..2], ["sand", "sandstone"]);
+        assert!(sand.contains(&"red sand"));
+        assert!(sand.iter().position(|&n| n == "red sand") > Some(1));
+        assert_eq!(names("bsid"), ["obsidian"]);
+        assert!(names("zzz").is_empty());
+    }
+
     /// A `[[material]]` table with every property, `extra` lines after them (to test overrides
     /// and unknown properties, which TOML rejects as duplicates or `deny_unknown_fields`).
     fn entry(id: u32, name: &str, extra: &str) -> String {

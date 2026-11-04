@@ -83,7 +83,7 @@ window title says when it is done.
 | Wheel | Step along the hotbar (mouse captured) |
 | `Alt` + wheel | Smaller or bigger Brush, from 1 Voxel up to 4 m across |
 | `[` `]` | The same, from the keyboard |
-| `Tab` | Open or close the Material palette: type to search by name, click a Material or press `Enter` for the first match. Opening it releases the mouse, closing it captures it again; every key goes to the search box while it is open |
+| `Tab` | Open or close the Material palette: type to search by name, click a Material or press `Enter` for the first match. Opening it releases the mouse, closing it captures it again if it was captured before; every key goes to the search box while it is open |
 | `-` `=` | Previous or next Material (placed by place and flatten) |
 | `G` | Brush axes on the local up (snapped to 45 degrees) or on the world grid |
 | `W` `A` `S` `D` | Walk |
@@ -94,7 +94,7 @@ window title says when it is done.
 | Arrow keys | Turn the sun |
 | `R` | Switch between primary visibility and the reference path tracer |
 | `V` | Cycle debug views |
-| `F1` | Show or hide the debug overlay |
+| `F1` | Show or hide the debug panel (the hotbar stays) |
 | `Esc` | Release the mouse |
 
 The client walks the Planet as a character (1.8 m tall, walks 4.5 m/s, runs 7, crouches 2, jumps
