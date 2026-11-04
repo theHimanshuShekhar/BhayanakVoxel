@@ -64,7 +64,7 @@ fn check_entry(entry: &Value) {
 }
 
 fn check_schema(report: &Value, out: &Path) {
-    assert_eq!(report["schema_version"], 3);
+    assert_eq!(report["schema_version"], 4);
     assert!(!string(&report["build"]["version"]).is_empty());
     assert!(report["build"]["commit"].is_null() || report["build"]["commit"].is_string());
 
@@ -101,8 +101,9 @@ fn check_schema(report: &Value, out: &Path) {
     // The LOD bias is recorded (1 unless asked).
     assert_eq!(config["bias"], 1.0);
 
-    // The sweep over heights is of the whole Planet; the patch has none.
+    // The sweep over heights and the cave stills are of the whole Planet; the patch has none.
     assert_eq!(report["altitudes"], serde_json::json!([]));
+    assert_eq!(report["caves"], serde_json::json!([]));
 
     for mode in ["primary", "reference"] {
         let run = &report["modes"][mode];

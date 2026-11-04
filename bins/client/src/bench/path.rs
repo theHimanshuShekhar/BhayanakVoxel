@@ -13,13 +13,26 @@ pub struct Keyframe {
 #[derive(Clone, Debug)]
 pub struct CameraPath {
     keyframes: Vec<Keyframe>,
+    /// Whether the horizon is levelled to the way up where the camera is (away from the Planet's
+    /// centre), not to +y. The flight is over the +y pole, where the two are the same.
+    radial: bool,
 }
 
 impl CameraPath {
     /// A path through `keyframes`, which needs at least two.
     pub fn new(keyframes: Vec<Keyframe>) -> Self {
         assert!(keyframes.len() >= 2, "a path needs at least two keyframes");
-        Self { keyframes }
+        Self {
+            keyframes,
+            radial: false,
+        }
+    }
+
+    /// The same path with the camera's horizon levelled to the Planet's up where it is, for a
+    /// path that is not over the pole.
+    pub fn radial(mut self) -> Self {
+        self.radial = true;
+        self
     }
 
     pub fn keyframes(&self) -> usize {
@@ -44,10 +57,15 @@ impl CameraPath {
         let (from, to) = (&self.keyframes[segment], &self.keyframes[segment + 1]);
         // Written so that t = 0 and t = 1 give exactly `from` and `to`.
         let lerp = |a: [f64; 3], b: [f64; 3]| [0, 1, 2].map(|i| a[i] * (1.0 - t) + b[i] * t);
-        Camera::looking_at(
+        let (position, target) = (
             lerp(from.position, to.position),
             lerp(from.target, to.target),
-        )
+        );
+        if self.radial {
+            level_camera(position, target)
+        } else {
+            Camera::looking_at(position, target)
+        }
     }
 
     /// The frames of a run of `frames` at which the camera is on a keyframe: the fixed points
@@ -61,6 +79,29 @@ impl CameraPath {
         at.dedup();
         at
     }
+}
+
+/// A camera at `position` looking at `target`, its horizon level with the Planet there.
+fn level_camera(position: [f64; 3], target: [f64; 3]) -> Camera {
+    let dot = |a: [f64; 3], b: [f64; 3]| (0..3).map(|i| a[i] * b[i]).sum::<f64>();
+    let unit = |a: [f64; 3]| {
+        let length = dot(a, a).sqrt();
+        a.map(|c| c / length)
+    };
+    let up = unit(position);
+    let (back, _) = planet_gen::planet::tangents(up);
+    let side = [
+        up[1] * back[2] - up[2] * back[1],
+        up[2] * back[0] - up[0] * back[2],
+        up[0] * back[1] - up[1] * back[0],
+    ];
+    let ahead = unit(std::array::from_fn(|a| target[a] - position[a]));
+    let mut camera = Camera::looking_at(position, target);
+    camera.horizon_up = up;
+    camera.back = back;
+    camera.pitch = dot(ahead, up).clamp(-1.0, 1.0).asin();
+    camera.yaw = (-dot(ahead, side)).atan2(-dot(ahead, back));
+    camera
 }
 
 fn key(position: [f64; 3], target: [f64; 3]) -> Keyframe {
@@ -136,6 +177,28 @@ mod tests {
             halfway,
             Camera::looking_at([50.0, 10.0, 0.0], [50.0, 0.0, -100.0])
         );
+    }
+
+    #[test]
+    fn a_radial_path_looks_at_its_target_with_the_horizon_level_to_the_planets_up() {
+        // Far from the +y pole, where looking_at's up is not the Planet's.
+        let position = [90_000.0, -60_000.0, 120_000.0];
+        let target = [90_050.0, -60_080.0, 119_990.0];
+        let path = CameraPath::new(vec![
+            Keyframe { position, target },
+            Keyframe { position, target },
+        ])
+        .radial();
+        let camera = path.camera_at(0, 10);
+        let d: [f64; 3] = std::array::from_fn(|a| target[a] - position[a]);
+        let length = d.iter().map(|c| c * c).sum::<f64>().sqrt();
+        for (got, want) in camera.forward().into_iter().zip(d) {
+            assert!((got - want / length).abs() < 1e-9, "{got} {want}");
+        }
+        let radius = position.iter().map(|c| c * c).sum::<f64>().sqrt();
+        for (got, want) in camera.horizon_up.into_iter().zip(position) {
+            assert!((got - want / radius).abs() < 1e-12);
+        }
     }
 
     #[test]

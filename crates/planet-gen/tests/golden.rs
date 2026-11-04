@@ -56,7 +56,7 @@ const GOLDEN: &[([i32; 3], Kind, u64)] = &[
 #[test]
 fn golden_generator_version() {
     // Changing this means the hashes below were regenerated on purpose.
-    assert_eq!(GENERATOR_VERSION, 2);
+    assert_eq!(GENERATOR_VERSION, 3);
 }
 
 #[test]
@@ -129,7 +129,32 @@ const PLANET_GOLDEN: &[([i32; 3], Kind, u64)] = &[
     ([-12160, 15768, 1866], Mixed, 0x0335af5226415465),
     ([-12161, 15768, 1866], Mixed, 0x9e3e2b2fcc1fa1f1),
     ([-12161, 15769, 1866], Air, 0x6ab05ef9aa8b9b25),
+    // Caves (#46), at a few of the mouths on this map and under it: the sky above a mouth, the
+    // brick that the mouth is in, bricks that are mostly cave, one wholly cave under the ground
+    // (air, where the strata would be), and the strata below, which the caves did not change.
+    ([402, -4416, -20663], Air, 0x6ab05ef9aa8b9b25),
+    ([401, -4414, -20657], Mixed, 0x3aeedc798aea8363),
+    ([401, -4414, -20654], Mixed, 0x10b6fce6722643f3),
+    ([401, -4413, -20649], Solid, 0x6fa64afc62031525),
+    ([-1824, -1990, -20740], Air, 0x6ab05ef9aa8b9b25),
+    ([-1824, -1989, -20738], Mixed, 0x2dcefb50a15b5f19),
+    ([-2238, -1561, -20820], Mixed, 0x6279f76739769dc1),
+    ([-2237, -1560, -20813], Solid, 0x0dc0fd820e036725),
+    // Chambers, which are wide enough to be seen from further away: the brick at the end of a
+    // tube, and at the end of another, both wholly cave.
+    ([-5433, -1881, -19691], Air, 0x6ab05ef9aa8b9b25),
+    ([-5482, -818, -19760], Air, 0x6ab05ef9aa8b9b25),
 ];
+
+/// The hash of the tubes of the caves that the walk makes on this map: the table itself, so that
+/// a change to the walk, or to the floats under it, shows here before it shows in the bricks.
+const CAVES_HASH: u64 = 0x83c77f1a027f7924;
+
+#[test]
+fn golden_caves_hash() {
+    let actual = planet().caves_hash();
+    assert_eq!(actual, CAVES_HASH, "actual {actual:#018x}");
+}
 
 /// Voxels around the ground that the region golden covers, and the ground: the temperate land
 /// above, at the corner of its brick (which is within a brick of the ground).
@@ -200,6 +225,14 @@ const COARSE_GOLDEN: &[(usize, [i32; 3], Kind, u64)] = &[
     (1, [-12160, 15767, 1866], Mixed, 0x9e55f936177ff0d9),
     (3, [-12160, 15767, 1866], Solid, 0xb812ab782d86a725),
     (7, [-12160, 15767, 1866], Mixed, 0x702836b6574c4521),
+    // Under the caves: a Voxel is a cave at the levels where a tube holds most of it, and not
+    // from level 7, so these differ from what the ground makes at levels 1 to 3 and not at 7.
+    (1, [-5433, -1881, -19691], Air, 0x6ab05ef9aa8b9b25),
+    (2, [-5433, -1881, -19691], Mixed, 0xc71222b94a24693f),
+    (3, [-5433, -1881, -19691], Mixed, 0x122d41b723f43201),
+    (2, [-5482, -818, -19760], Mixed, 0xe7fe83c79afea461),
+    (2, [401, -4414, -20657], Mixed, 0x354d26b721ad07d3),
+    (7, [-5433, -1881, -19691], Solid, 0xd97e511494bfdb25),
     // The core's edge, the interior's, and the interior far from either.
     (1, [2309, 2309, 2309], Mixed, 0x237d2d4cb454ecf6),
     (5, [2309, 2309, 2309], Mixed, 0xe2c5cca2e703b85f),

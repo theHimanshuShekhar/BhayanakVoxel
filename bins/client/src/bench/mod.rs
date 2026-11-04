@@ -11,6 +11,7 @@
 
 mod args;
 mod budget;
+mod caves;
 mod path;
 mod report;
 mod stats;
@@ -29,9 +30,10 @@ use args::{Args, Diag, Parsed, USAGE};
 use budget::{Budgets, Status};
 use path::{CameraPath, Keyframe};
 use report::{
-    Altitude, Build, Config, KeyframeLod, Machine, Measured, ModeReport, Modes, Report,
+    Altitude, Build, CaveStill, Config, KeyframeLod, Machine, Measured, ModeReport, Modes, Report,
     SCHEMA_VERSION,
 };
+use stats::Stats;
 
 const REPORT_FILE: &str = "report.json";
 
@@ -229,6 +231,16 @@ fn run(args: &Args) -> Result<u8, Box<dyn Error>> {
     } else {
         sweep(&mut gpu, &mut flight, &budgets)?
     };
+    let timers_supported = gpu.timers_supported();
+    // The cave stills are of another scene, and another GPU context: this one's is done with.
+    drop(gpu);
+    drop(flight);
+    let (caves, cave_shots) = if plan.patch {
+        (Vec::new(), Vec::new())
+    } else {
+        cave_stills(&plan, &budgets, &args.out)?
+    };
+    screenshots.extend(cave_shots);
 
     let report = Report {
         schema_version: SCHEMA_VERSION,
@@ -244,7 +256,7 @@ fn run(args: &Args) -> Result<u8, Box<dyn Error>> {
             backend: info.backend,
             os: std::env::consts::OS.to_string(),
             arch: std::env::consts::ARCH.to_string(),
-            timers_supported: gpu.timers_supported(),
+            timers_supported,
         },
         config: Config {
             width: plan.width,
@@ -258,6 +270,7 @@ fn run(args: &Args) -> Result<u8, Box<dyn Error>> {
             diag: args.diag.switches(),
         },
         altitudes,
+        caves,
         screenshots,
         budgets: report::summarize(&source, &budgets, &modes, &args.diag.switches()),
         modes,
@@ -497,23 +510,57 @@ fn sweep(
             .map(|level| flight.scene.level_bricks(level))
             .collect();
         let reference = by_mode(gpu, flight, reference, Mode::Reference)?;
-        let pass = |report: &ModeReport, name: &str| {
-            report
-                .passes
-                .iter()
-                .find(|e| e.name == name)
-                .map(|e| e.stats.clone())
-                .unwrap_or_default()
-        };
         altitudes.push(Altitude {
             height_m: height / sim::VOXELS_PER_METRE,
             bricks,
-            primary: pass(&primary, "primary"),
-            upscale: pass(&primary, "upscale"),
-            reference: pass(&reference, "reference"),
+            primary: pass_stats(&primary, "primary"),
+            upscale: pass_stats(&primary, "upscale"),
+            reference: pass_stats(&reference, "reference"),
         });
     }
     Ok(altitudes)
+}
+
+/// The times of the pass `name` in `report`: none if no such pass ran.
+fn pass_stats(report: &ModeReport, name: &str) -> Stats {
+    report
+        .passes
+        .iter()
+        .find(|e| e.name == name)
+        .map(|e| e.stats.clone())
+        .unwrap_or_default()
+}
+
+/// The cave stills (see [`caves`]): a camera at a cave mouth on a slope and one inside a
+/// tunnel, each timed over a few dozen frames like the sweep's, and photographed. Returns their
+/// times and the names of the screenshots.
+fn cave_stills(
+    plan: &Plan,
+    budgets: &Budgets,
+    out: &Path,
+) -> Result<(Vec<CaveStill>, Vec<String>), Box<dyn Error>> {
+    eprintln!("cave stills: making a cave of the Planet...");
+    let (planet, site) = caves::site();
+    let shares = caves::Shares {
+        primary: ModePlan {
+            frames: 24,
+            warmup: 4,
+            spp: 1,
+        },
+        reference: ModePlan {
+            frames: 6,
+            warmup: 2,
+            spp: 2,
+        },
+    };
+    caves::run(
+        &planet,
+        &site,
+        (plan.width, plan.height),
+        &shares,
+        budgets,
+        out,
+    )
 }
 
 fn write_png(path: &Path, image: &Image) -> Result<(), Box<dyn Error>> {
@@ -547,6 +594,18 @@ fn print_summary(report: &Report) {
             ms(a.reference.mean_ms),
             ms(a.reference.p95_ms),
             a.bricks
+        );
+    }
+    for c in &report.caves {
+        eprintln!(
+            "cave {:<6}: primary {} (p95 {}), upscale {}, reference {} (p95 {}) ms; bricks {:?}",
+            c.name,
+            ms(c.primary.mean_ms),
+            ms(c.primary.p95_ms),
+            ms(c.upscale.mean_ms),
+            ms(c.reference.mean_ms),
+            ms(c.reference.p95_ms),
+            c.bricks
         );
     }
     for (mode, run) in [

@@ -6,7 +6,7 @@ use serde::Serialize;
 use super::budget::{Budgets, Status, status};
 use super::stats::Stats;
 
-pub const SCHEMA_VERSION: u32 = 3;
+pub const SCHEMA_VERSION: u32 = 4;
 
 /// One timed thing (a pass, or the GPU total of a profiler frame) in one mode, against its
 /// budget. In reference mode a profiler frame is one sample, so the entries of that mode have
@@ -54,6 +54,21 @@ pub struct Altitude {
     pub bricks: Vec<usize>,
     /// The `primary` and `upscale` passes of primary mode, and the `reference` pass of reference
     /// mode (one sample): no budget is held against them.
+    pub primary: Stats,
+    pub upscale: Stats,
+    pub reference: Stats,
+}
+
+/// A still camera at a cave of the Planet: the times of the passes there, as for an
+/// [`Altitude`], and the bricks the bands select for it. The bands are for a tenth of the
+/// flight's `d0`, so the bricks are far fewer than the flight's.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct CaveStill {
+    /// `mouth`: at the cave's mouth on a slope, looking at it. `tunnel`: inside the cave,
+    /// looking down it.
+    pub name: String,
+    /// Bricks drawn at each level, level 0 first.
+    pub bricks: Vec<usize>,
     pub primary: Stats,
     pub upscale: Stats,
     pub reference: Stats,
@@ -250,6 +265,10 @@ pub struct Report {
     /// The Planet from a still camera at several heights, one after the other, after the flight;
     /// empty for `--short`.
     pub altitudes: Vec<Altitude>,
+    /// Still cameras at a cave of the Planet, one after the other, after the sweep; empty for
+    /// `--short`. Their screenshots are in `screenshots`, as `primary-cave-NAME.png` and
+    /// `reference-cave-NAME.png`.
+    pub caves: Vec<CaveStill>,
     /// File names, in the output folder.
     pub screenshots: Vec<String>,
     pub budgets: BudgetSummary,
@@ -421,6 +440,13 @@ mod tests {
                 upscale: Stats::of(&[0.1]),
                 reference: Stats::of(&[1.0]),
             }],
+            caves: vec![CaveStill {
+                name: "tunnel".into(),
+                bricks: vec![7],
+                primary: Stats::of(&[0.3]),
+                upscale: Stats::of(&[0.1]),
+                reference: Stats::of(&[1.5]),
+            }],
             screenshots: vec!["primary-0.png".into()],
             budgets: summarize("embedded", &budgets(), &modes(0.5), &[]),
         };
@@ -434,6 +460,7 @@ mod tests {
                 "altitudes",
                 "budgets",
                 "build",
+                "caves",
                 "config",
                 "machine",
                 "modes",
@@ -441,7 +468,11 @@ mod tests {
                 "screenshots"
             ]
         );
-        assert_eq!(json["schema_version"], 3);
+        assert_eq!(json["schema_version"], 4);
+        assert_eq!(
+            keys(&json["caves"][0]),
+            ["bricks", "name", "primary", "reference", "upscale"]
+        );
         assert_eq!(json["build"]["commit"], serde_json::Value::Null);
         assert_eq!(json["machine"]["timers_supported"], true);
         let pass = &json["modes"]["primary"]["passes"][0];
