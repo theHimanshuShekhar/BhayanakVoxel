@@ -12,11 +12,11 @@ use planet_gen::world_map::WorldMap;
 use render::lod::Bands;
 use render::reference::{Ray, trace};
 use render::scene::Bound;
-use render::{Camera, RingsFull, Scene, SceneUpdate, camera};
+use render::{Camera, Mode, RingsFull, Scene, SceneUpdate, camera};
 use sim::Predictor;
 
 use crate::loader::{Arrival, Loader, hold_guard};
-use crate::world::{STREAM_BUDGET, SceneWork, World};
+use crate::world::{BATCH, STILL_FRAMES, SceneWork, Stillness, World, loading_paused_for};
 
 const SEED: u64 = 0xB4A7_A9AC;
 const RING: i32 = 160;
@@ -533,17 +533,21 @@ fn the_spawn_ring_is_drawn_at_level_0_within_seconds_and_before_the_far_bricks_a
 }
 
 /// Frames, a few milliseconds apart, until the loader's threads have taken `MAX_AHEAD` jobs and
-/// have had time to take more, which they must not. None of them takes anything in.
+/// finished every one they had in flight, which leaves them nothing to do until something is
+/// taken in. None of the frames takes anything in. Then nothing more is generated, however long
+/// it waits: this does not depend on how fast the machine is.
 fn let_the_workers_run_ahead(world: &mut World, camera: [f64; 3]) {
     let started = Instant::now();
-    while world.loader().unwrap().ahead() < crate::loader::MAX_AHEAD {
+    loop {
+        assert!(stream(world, camera).is_empty());
+        let loader = world.loader().unwrap();
+        // `ahead` only goes up while nothing is taken in, so once it is at the most, the jobs in
+        // flight can only finish.
+        if loader.ahead() == crate::loader::MAX_AHEAD && loader.in_flight() == 0 {
+            return;
+        }
         assert!(started.elapsed() < Duration::from_secs(60), "no work ahead");
-        assert!(stream(world, camera).is_empty());
         std::thread::sleep(Duration::from_millis(2));
-    }
-    for _ in 0..20 {
-        assert!(stream(world, camera).is_empty());
-        std::thread::sleep(Duration::from_millis(5));
     }
 }
 
@@ -559,13 +563,18 @@ fn while_loading_is_held_nothing_is_taken_in_and_what_waits_is_bounded() {
     // The scene did not change, and with the camera still nor did the rings.
     assert_eq!(world.waiting(), waiting);
     assert!(world.recentre(camera.position).unwrap().is_none());
-    // What was generated and not taken in is what the workers are ahead by, and they stopped:
-    // nothing more is generated however long it waits.
+    // What was generated and not taken in is what the workers are ahead by, and they have
+    // stopped: nothing more is generated however many frames pass.
     let loader = world.loader().unwrap();
     assert_eq!(loader.ahead(), crate::loader::MAX_AHEAD);
     let generated = loader.generated();
-    std::thread::sleep(Duration::from_millis(100));
-    assert!(stream(&mut world, camera.position).is_empty());
+    // The wait is only for there to be time for a worker that has not stopped to generate: that
+    // none has is not a matter of how long the wait is, so no runner can outlast it.
+    for _ in 0..20 {
+        assert!(stream(&mut world, camera.position).is_empty());
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(world.loader().unwrap().ahead(), crate::loader::MAX_AHEAD);
     assert_eq!(world.loader().unwrap().generated(), generated);
 }
 
@@ -576,18 +585,19 @@ fn letting_go_takes_in_what_was_held_and_the_bands_fill_as_before() {
     let_the_workers_run_ahead(&mut world, camera.position);
     world.pause_loading(false);
     assert!(!world.loading_paused());
-    // What was held is waiting, so the first frame takes some in, and not for much longer than
-    // its budget (a batch may overrun it, and a debug build is slow).
-    let mut took = Duration::ZERO;
+    // What was held is waiting, so the first frame takes some in (and, with a budget, not all:
+    // how long it takes is for a machine that is not a CI runner to say).
     let mut first = Vec::new();
     while first.is_empty() {
-        let started = Instant::now();
         first = stream(&mut world, camera.position);
-        took = started.elapsed();
-        assert!(took < 20 * STREAM_BUDGET, "{took:?}");
         std::thread::sleep(Duration::from_millis(1));
     }
-    eprintln!("the first frame after letting go took {took:?}");
+    // Within its budget, a frame takes in a few batches, not all of what was held.
+    assert!(
+        first.len() < crate::loader::MAX_AHEAD / BATCH,
+        "{}",
+        first.len()
+    );
     assert!(world.waiting() > 0, "not all in one frame");
     fill(&mut world, camera.position);
     assert_eq!(world.waiting(), 0);
@@ -652,4 +662,140 @@ fn flying_far_while_loading_is_paused_does_not_grow_the_queue_without_bound() {
         );
         std::thread::sleep(Duration::from_millis(2));
     }
+}
+
+/// One frame of the App's, with no GPU: loading pauses as [`loading_paused_for`] says for how
+/// long the view (here the camera, which is all that moves) has been still, and what the
+/// loader has generated is taken in, or not.
+fn frame(
+    world: &mut World,
+    still: &mut Stillness<[f64; 3]>,
+    mode: Mode,
+    camera: [f64; 3],
+) -> Vec<SceneUpdate> {
+    world.pause_loading(loading_paused_for(mode, still.observe(camera)));
+    stream(world, camera)
+}
+
+#[test]
+fn loading_pauses_only_for_a_reference_that_has_a_still_view() {
+    assert!(!loading_paused_for(Mode::Reference, 0));
+    assert!(!loading_paused_for(Mode::Reference, STILL_FRAMES - 1));
+    assert!(loading_paused_for(Mode::Reference, STILL_FRAMES));
+    assert!(loading_paused_for(Mode::Reference, 1000));
+    // Primary is the playable view: it loads whatever the view does.
+    assert!(!loading_paused_for(Mode::Primary, 1000));
+}
+
+#[test]
+fn a_still_reference_takes_in_nothing_once_it_has_been_still_for_a_while() {
+    let (mut world, _server, camera) = spawned_world(2);
+    let mut still = Stillness::default();
+    // The first frames of a view are not paused.
+    for _ in 0..=STILL_FRAMES {
+        frame(&mut world, &mut still, Mode::Reference, camera.position);
+    }
+    assert!(world.loading_paused());
+    let_the_workers_run_ahead(&mut world, camera.position);
+    for _ in 0..20 {
+        let updates = frame(&mut world, &mut still, Mode::Reference, camera.position);
+        assert!(updates.is_empty());
+        assert!(world.loading_paused());
+    }
+    assert!(world.loader().unwrap().pending() > 0, "the loader has work");
+}
+
+#[test]
+fn a_moving_reference_takes_in_arrivals_and_the_ground_under_it_reaches_level_0() {
+    let (mut world, _server, camera) = spawned_world(2);
+    let (ahead, _) = tangents(camera.horizon_up);
+    let mut still = Stillness::default();
+    let begun = Instant::now();
+    let mut taken = 0;
+    for step in 0u32.. {
+        // Back and forth over a few metres: never the same view in two frames.
+        let along = 3.0 * (f64::from(step) * 0.05).sin();
+        let position = over_the_ground(
+            world.store(),
+            std::array::from_fn(|a| camera.position[a] + along * ahead[a]),
+        );
+        world.recentre(position).unwrap();
+        taken += frame(&mut world, &mut still, Mode::Reference, position).len();
+        assert!(!world.loading_paused(), "step {step}");
+        let down = ray_through(
+            position,
+            std::array::from_fn(|a| position[a] - camera.horizon_up[a]),
+        );
+        let hit = trace(world.scene(), &down).expect("ground under the camera");
+        if world.scene().level_at(hit.voxel) == Some(0) {
+            break;
+        }
+        assert!(
+            begun.elapsed() < Duration::from_secs(60),
+            "still level {:?} under the camera",
+            world.scene().level_at(hit.voxel)
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert!(taken > 0, "arrivals were taken in");
+}
+
+#[test]
+fn still_then_moving_then_still_pauses_loading_resumes_it_the_frame_it_moves_and_pauses_again() {
+    let (mut world, _server, camera) = spawned_world(2);
+    let (ahead, _) = tangents(camera.horizon_up);
+    let mut still = Stillness::default();
+    let reference = |world: &mut World, still: &mut Stillness<[f64; 3]>, at: [f64; 3]| {
+        frame(world, still, Mode::Reference, at)
+    };
+
+    // Still: paused after the first frames, with the workers run ahead.
+    for _ in 0..=STILL_FRAMES {
+        reference(&mut world, &mut still, camera.position);
+    }
+    let_the_workers_run_ahead(&mut world, camera.position);
+    assert!(reference(&mut world, &mut still, camera.position).is_empty());
+    assert!(world.loading_paused());
+
+    // Moving: from the frame the camera moves, what was held is taken in (in the first frames,
+    // not in the first if the thread is kept from running for a while).
+    let step = |at: [f64; 3]| -> [f64; 3] { std::array::from_fn(|a| at[a] + 0.5 * ahead[a]) };
+    let mut at = camera.position;
+    let started = Instant::now();
+    loop {
+        at = step(at);
+        let updates = reference(&mut world, &mut still, at);
+        assert!(!world.loading_paused());
+        if !updates.is_empty() {
+            break;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(60),
+            "nothing taken in"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let moved_again = at;
+
+    // Still again: loading goes on for the first frames of the new view, then pauses.
+    for _ in 0..STILL_FRAMES {
+        assert!(!world.loading_paused());
+        reference(&mut world, &mut still, moved_again);
+    }
+    assert!(world.loading_paused());
+    let_the_workers_run_ahead(&mut world, moved_again);
+    for _ in 0..10 {
+        assert!(reference(&mut world, &mut still, moved_again).is_empty());
+    }
+}
+
+#[test]
+fn stillness_counts_frames_with_an_equal_key_and_starts_over_for_another() {
+    let mut still = Stillness::default();
+    assert_eq!(still.observe(1), 0);
+    assert_eq!(still.observe(1), 1);
+    assert_eq!(still.observe(1), 2);
+    assert_eq!(still.observe(2), 0);
+    assert_eq!(still.observe(2), 1);
+    assert_eq!(still.observe(1), 0);
 }

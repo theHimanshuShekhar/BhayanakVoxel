@@ -28,6 +28,7 @@ use render::cpu::{CpuBreakdown, Row};
 use render::lod::{self, Bands};
 use render::overlay::{self, Controls, Hud, HudEvent, LodInfo, SceneMemory};
 use render::scene::Bound;
+use render::tracer::View;
 use render::{Camera, Mode, Renderer, RingsFull, Scene, SceneUpdate, Sun};
 use sim::{FixedTimestep, Predictor, ServerHandle, TICK_RATE_HZ};
 use winit::application::ApplicationHandler;
@@ -37,7 +38,7 @@ use winit::event::{
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{CursorGrabMode, Window, WindowId};
-use world::{SceneWork, World};
+use world::{SceneWork, Stillness, World};
 
 const SEED: u64 = 0xB4A7_A9AC;
 
@@ -390,6 +391,9 @@ struct App {
     sun: (f32, f32),
     /// The LOD bias in use: output pixels one Voxel may cover. The overlay changes it.
     bias: f32,
+    /// How long the view the reference image is of (and the bias) has been still: see
+    /// [`world::loading_paused_for`].
+    still: Stillness<(View, f32)>,
     /// The title last set, so that it is only set when it changes.
     title: String,
     grabbed: bool,
@@ -469,6 +473,7 @@ impl App {
             alt: false,
             sun: Sun::default().angles(),
             bias: DEFAULT_BIAS,
+            still: Stillness::default(),
             title: String::new(),
             grabbed: false,
             last_frame: Instant::now(),
@@ -665,9 +670,11 @@ impl App {
         let (Some(world), Some(renderer)) = (&mut self.world, &mut self.renderer) else {
             return Ok(());
         };
-        // Every arrival is a scene update, which restarts the reference image: so it is held
-        // back while that is drawn.
-        world.pause_loading(renderer.mode() == Mode::Reference);
+        // Every arrival is a scene update, which restarts the reference image: so arrivals are
+        // held back while it accumulates a view that is still, and taken in the frame that
+        // anything changes.
+        let still_frames = self.still.observe((renderer.view(&self.camera), self.bias));
+        world.pause_loading(world::loading_paused_for(renderer.mode(), still_frames));
         let cpu = &mut self.cpu;
         world.stream(self.camera.position, |scene, update| {
             upload(cpu, renderer, scene, update)
@@ -1077,6 +1084,12 @@ impl ApplicationHandler for App {
                 let span = self.cpu.start();
                 self.aim();
                 self.cpu.finish(Row::Aim, span, 0.0);
+                // Before the scene is brought up to date, so that what the overlay changes (the
+                // sun, the bias, the mode) is seen by the frame that follows it, not the next.
+                // What it says of loading is as of the frame before.
+                let span = self.cpu.start();
+                let overlay = self.run_overlay();
+                self.cpu.finish(Row::Egui, span, 0.0);
                 let scene_started = Instant::now();
                 let span = self.cpu.start();
                 let recentred = self.recentre();
@@ -1090,9 +1103,6 @@ impl ApplicationHandler for App {
                 if self.world.is_some() {
                     self.scene_work.record(scene_started.elapsed());
                 }
-                let span = self.cpu.start();
-                let overlay = self.run_overlay();
-                self.cpu.finish(Row::Egui, span, 0.0);
                 let ctx = self.gui.as_ref().map(|gui| gui.ctx.clone());
                 if let Some(renderer) = &mut self.renderer {
                     renderer.render(&self.camera, overlay.zip(ctx.as_ref()).map(|(o, c)| (c, o)));
