@@ -2,7 +2,8 @@
 //! switch for the debug views. This only lays the panel out; the window integration (input,
 //! painting) is in the client and in [`Renderer::render`](crate::Renderer::render).
 
-use egui::{Align2, Context, Grid, RichText, Slider, Window};
+use egui::{Align2, Button, Color32, Context, Grid, Key, RichText, Sense, Slider, Window, vec2};
+use materials::MaterialTable;
 
 use crate::debug_view::DebugView;
 use crate::timing::{Series, Timings};
@@ -110,6 +111,139 @@ fn lod_rows(ui: &mut egui::Ui, lod: Option<&LodInfo>, controls: &mut Controls) {
     }
 }
 
+/// The editing controls, as the help line says them (the README's table has the same).
+pub const TOOL_HELP: &str = "Click: apply the Brush (hold to dig), 1-9 or wheel: tool, \
+     Alt+wheel or [ ]: size, Tab: Material palette, - =: step the Material, G: local up / grid";
+
+/// What the editing HUD shows: the hotbar, the dig in progress, and the Material palette.
+pub struct Hud<'a> {
+    /// The label of each hotbar slot.
+    pub slots: &'a [String],
+    pub selected: usize,
+    /// What the selected tool is: its mode, shape, size and Material.
+    pub status: &'a str,
+    /// The id of the Material that is picked.
+    pub material: u16,
+    /// How far the Dig being held has got, 0 to 1.
+    pub dig: Option<f32>,
+    /// The palette's search text, while the palette is open.
+    pub palette: Option<&'a mut String>,
+}
+
+/// What the player did on the HUD with the mouse.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HudEvent {
+    /// Picked a hotbar slot.
+    Slot(usize),
+    /// Made the Brush this many radii bigger (smaller if negative).
+    Size(i32),
+    /// Picked a Material, by id.
+    Material(u16),
+}
+
+/// A colour of the Material table (linear RGB) as the screen shows it.
+pub fn swatch(linear: [f32; 3]) -> Color32 {
+    let [r, g, b] = linear.map(|c| (c.clamp(0.0, 1.0).powf(1.0 / 2.2) * 255.0).round() as u8);
+    Color32::from_rgb(r, g, b)
+}
+
+/// Lays out the editing HUD on `ctx`, which is shown whether the debug panel is or not: the
+/// hotbar along the bottom, a bar for the Dig being held, and the palette when it is open. The
+/// search box of the palette edits `hud.palette`. Returns what the mouse did.
+pub fn hud(ctx: &Context, hud: Hud) -> Vec<HudEvent> {
+    let mut events = Vec::new();
+    egui::Area::new(egui::Id::unique("hotbar"))
+        .anchor(Align2::CENTER_BOTTOM, [0.0, -12.0])
+        .show(ctx, |ui| {
+            egui::Frame::popup(ui.style()).show(ui, |ui| {
+                ui.vertical_centered(|ui| ui.label(hud.status));
+                ui.horizontal(|ui| {
+                    for (slot, label) in hud.slots.iter().enumerate() {
+                        let button = Button::new(label.as_str())
+                            .selected(slot == hud.selected)
+                            .min_size(vec2(60.0, 44.0));
+                        if ui.add(button).clicked() {
+                            events.push(HudEvent::Slot(slot));
+                        }
+                    }
+                });
+            });
+        });
+    if let Some(progress) = hud.dig {
+        egui::Area::new(egui::Id::unique("dig progress"))
+            .anchor(Align2::CENTER_CENTER, [0.0, 56.0])
+            .interactable(false)
+            .show(ctx, |ui| {
+                ui.add(egui::ProgressBar::new(progress).desired_width(120.0));
+            });
+    }
+    if let Some(query) = hud.palette {
+        palette(ctx, query, hud.material, hud.status, &mut events);
+    }
+    events
+}
+
+/// The Material palette: a search box, the Brush size, and the Materials that match. Enter
+/// picks the first one.
+fn palette(
+    ctx: &Context,
+    query: &mut String,
+    picked: u16,
+    status: &str,
+    events: &mut Vec<HudEvent>,
+) {
+    Window::new("Materials (Tab to close)")
+        .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
+        .resizable(false)
+        .collapsible(false)
+        .show(ctx, |ui| {
+            let table = MaterialTable::built_in();
+            let search = ui.add(
+                egui::TextEdit::singleline(query)
+                    .hint_text("search by name")
+                    .desired_width(240.0),
+            );
+            // Typing starts as the palette opens, and keeps going after a click on a row.
+            search.request_focus();
+            let found = table.search(query);
+            if ui.input(|i| i.key_pressed(Key::Enter))
+                && let Some(first) = found.first()
+            {
+                events.push(HudEvent::Material(first.id));
+            }
+            ui.horizontal(|ui| {
+                if ui.button("-").clicked() {
+                    events.push(HudEvent::Size(-1));
+                }
+                ui.label("Brush size");
+                if ui.button("+").clicked() {
+                    events.push(HudEvent::Size(1));
+                }
+                ui.weak(status);
+            });
+            ui.separator();
+            egui::ScrollArea::vertical()
+                .max_height(280.0)
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    if found.is_empty() {
+                        ui.weak("no Material matches");
+                    }
+                    for def in found {
+                        ui.horizontal(|ui| {
+                            let (rect, _) =
+                                ui.allocate_exact_size(vec2(14.0, 14.0), Sense::hover());
+                            ui.painter().rect_filled(rect, 2.0, swatch(def.colour));
+                            let text = format!("{} (hardness {})", def.name, def.hardness);
+                            if ui.selectable_label(def.id == picked, text).clicked() {
+                                events.push(HudEvent::Material(def.id));
+                            }
+                        });
+                    }
+                });
+        });
+}
+
 /// Lays out the panel on `ctx`, and writes the user's changes to the settings in `controls`.
 pub fn show(ctx: &Context, info: &Info, controls: &mut Controls) {
     Window::new("Debug")
@@ -180,10 +314,7 @@ pub fn show(ctx: &Context, info: &Info, controls: &mut Controls) {
                 controls.sun.1 = degrees[1].to_radians();
             }
             ui.weak("N: walk / noclip, arrows: sun, V: view, F1: hide, Esc: free the mouse");
-            ui.weak(
-                "Click: apply the Brush, 1-4: dig / place / smooth / flatten, B: shape, \
-                 [ ]: size, - =: Material, G: local up / grid",
-            );
+            ui.weak(TOOL_HELP);
         });
 }
 
@@ -267,10 +398,11 @@ mod tests {
         };
         let text = draw(&info, &mut controls());
         for key in [
-            "1-4: dig / place / smooth / flatten",
-            "B: shape",
-            "[ ]: size",
-            "- =: Material",
+            "hold to dig",
+            "1-9 or wheel: tool",
+            "Alt+wheel or [ ]: size",
+            "Tab: Material palette",
+            "- =: step the Material",
             "G: local up / grid",
         ] {
             assert!(text.contains(key), "{key} in {text}");
@@ -368,5 +500,101 @@ mod tests {
         assert!(text.contains("Depth"), "{text}");
         // Showing the panel is not an edit.
         assert_eq!(controls, before);
+    }
+
+    fn hud_text(slots: &[String], dig: Option<f32>, query: Option<&mut String>) -> String {
+        let ctx = Context::default();
+        let mut query = query;
+        let mut run = |ctx: &Context| {
+            let palette = query.as_deref_mut();
+            hud(
+                ctx,
+                Hud {
+                    slots,
+                    selected: 1,
+                    status: "dig cube 210 cm",
+                    material: 0,
+                    dig,
+                    palette,
+                },
+            );
+        };
+        for _ in 0..2 {
+            ctx.run_pass(RawInput::default(), &mut run)
+                .drop_without_applying_deltas();
+        }
+        let output = ctx.run_pass(RawInput::default(), &mut run);
+        let text = text_of(&output.shapes);
+        output.drop_without_applying_deltas();
+        text
+    }
+
+    fn slots() -> Vec<String> {
+        vec!["1\ndig\nsphere".into(), "2\ndig\ncube".into()]
+    }
+
+    #[test]
+    fn the_hotbar_and_the_selected_tool_are_always_drawn_and_the_palette_only_when_open() {
+        let text = hud_text(&slots(), None, None);
+        assert!(text.contains("dig cube 210 cm"), "{text}");
+        assert!(
+            text.contains("1\ndig\nsphere") && text.contains("2\ndig\ncube"),
+            "{text}"
+        );
+        assert!(!text.contains("Materials"), "{text}");
+    }
+
+    #[test]
+    fn the_palette_lists_the_materials_that_match_the_search() {
+        let mut all = String::new();
+        let text = hud_text(&slots(), None, Some(&mut all));
+        assert!(text.contains("Materials (Tab to close)"), "{text}");
+        assert!(text.contains("rock (hardness 6)"), "{text}");
+        let mut query = "OBSID".to_string();
+        let text = hud_text(&slots(), None, Some(&mut query));
+        assert!(text.contains("obsidian (hardness 8)"), "{text}");
+        assert!(!text.contains("rock (hardness"), "{text}");
+        let mut query = "zzz".to_string();
+        let text = hud_text(&slots(), None, Some(&mut query));
+        assert!(text.contains("no Material matches"), "{text}");
+    }
+
+    #[test]
+    fn the_palette_picks_a_material_on_enter_and_the_hud_without_input_changes_nothing() {
+        let ctx = Context::default();
+        let mut query = "sand".to_string();
+        let mut run = |input: RawInput| {
+            let mut events = Vec::new();
+            ctx.run_pass(input, |ctx| {
+                events = hud(
+                    ctx,
+                    Hud {
+                        slots: &[],
+                        selected: 0,
+                        status: "",
+                        material: 0,
+                        dig: Some(0.5),
+                        palette: Some(&mut query),
+                    },
+                );
+            })
+            .drop_without_applying_deltas();
+            events
+        };
+        run(RawInput::default());
+        assert!(run(RawInput::default()).is_empty());
+        let enter = egui::Event::Key {
+            key: Key::Enter,
+            physical_key: Some(Key::Enter),
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let events = run(RawInput {
+            events: vec![enter],
+            ..RawInput::default()
+        });
+        let sand = MaterialTable::built_in().by_name("sand").unwrap().id;
+        assert_eq!(events, [HudEvent::Material(sand)]);
     }
 }

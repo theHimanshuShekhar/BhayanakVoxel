@@ -9,8 +9,10 @@
 
 use brick_store::{BRICK_SIZE, BrickCoord};
 use egui::{Color32, Mesh, Pos2};
+use materials::MaterialTable;
 use net::{EditMode, EditOp};
 use render::Camera;
+use render::overlay::swatch;
 use sim::Change;
 
 /// One face of a Voxel that has no changed Voxel against it: part of the ghost's outline.
@@ -119,7 +121,7 @@ impl Ghost {
     /// The faces that look at the camera as triangles on a screen `size` points across, from its
     /// top left corner.
     pub fn mesh(&self, camera: &Camera, size: egui::Vec2) -> Mesh {
-        let colour = tint(self.op.mode, self.blocked);
+        let colour = tint(&self.op, self.blocked);
         let aspect = f64::from(size.x) / f64::from(size.y);
         let mut mesh = Mesh::default();
         for face in &self.faces {
@@ -147,13 +149,16 @@ impl Ghost {
     }
 }
 
-/// How the ghost is tinted: red for what is taken away, green for what is added, and blue and
-/// amber for the two that do both; grey for an Edit that will not be made.
-fn tint(mode: EditMode, blocked: bool) -> Color32 {
-    let (r, g, b) = match (mode, blocked) {
+/// How the ghost is tinted: red for what is taken away, the colour of the Material for what is
+/// placed, and blue and amber for the two that do both; grey for an Edit that will not be made.
+fn tint(op: &EditOp, blocked: bool) -> Color32 {
+    let place = MaterialTable::built_in()
+        .get(op.material)
+        .map_or(Color32::from_rgb(60, 210, 90), |def| swatch(def.colour));
+    let (r, g, b) = match (op.mode, blocked) {
         (_, true) => (150, 150, 150),
         (EditMode::Dig, _) => (230, 50, 50),
-        (EditMode::Place, _) => (60, 210, 90),
+        (EditMode::Place, _) => (place.r(), place.g(), place.b()),
         (EditMode::Smooth, _) => (70, 130, 240),
         (EditMode::Flatten, _) => (240, 170, 40),
     };
@@ -324,6 +329,27 @@ mod tests {
     }
 
     #[test]
+    fn a_placing_ghost_takes_the_colour_of_the_material() {
+        let place = |id| EditOp {
+            mode: EditMode::Place,
+            material: Material(id),
+            ..EditOp::dig_sphere(VoxelCoord([0; 3]), 1)
+        };
+        let table = MaterialTable::built_in();
+        let (a, b) = (table.defs()[0].id, table.by_name("grassy soil").unwrap().id);
+        assert_ne!(tint(&place(a), false), tint(&place(b), false));
+        assert_eq!(
+            tint(&place(a), false),
+            Color32::from_rgba_unmultiplied(
+                swatch(table.defs()[0].colour).r(),
+                swatch(table.defs()[0].colour).g(),
+                swatch(table.defs()[0].colour).b(),
+                70
+            )
+        );
+    }
+
+    #[test]
     fn the_ghost_is_tinted_by_the_mode_and_grey_when_it_will_not_be_made() {
         let modes = [
             EditMode::Dig,
@@ -331,13 +357,18 @@ mod tests {
             EditMode::Smooth,
             EditMode::Flatten,
         ];
+        let op = |mode| EditOp {
+            mode,
+            material: Material(1),
+            ..EditOp::dig_sphere(VoxelCoord([0; 3]), 1)
+        };
         let tints: BTreeSet<_> = modes
-            .map(|m| tint(m, false).to_array())
+            .map(|m| tint(&op(m), false).to_array())
             .into_iter()
             .collect();
         assert_eq!(tints.len(), 4);
         let greys: BTreeSet<_> = modes
-            .map(|m| tint(m, true).to_array())
+            .map(|m| tint(&op(m), true).to_array())
             .into_iter()
             .collect();
         assert_eq!(greys.len(), 1);
