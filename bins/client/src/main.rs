@@ -613,6 +613,9 @@ impl App {
         let (Some(world), Some(renderer)) = (&mut self.world, &mut self.renderer) else {
             return Ok(());
         };
+        // Every arrival is a scene update, which restarts the reference image: so it is held
+        // back while that is drawn.
+        world.pause_loading(renderer.mode() == Mode::Reference);
         world.stream(self.camera.position, |scene, update| {
             renderer.update_scene(scene, update)
         })?;
@@ -739,6 +742,11 @@ impl App {
             timings: renderer.timings(),
             timers_supported: renderer.timers_supported(),
             samples: renderer.samples(),
+            // Only said while there is something that waits.
+            loading_paused: self
+                .world
+                .as_ref()
+                .is_some_and(|w| w.loading_paused() && w.loader().is_some_and(|l| l.pending() > 0)),
             scene_memory: SceneMemory {
                 used: self.world.as_ref().map_or(0, |w| w.scene().used_bytes()),
                 allocated: renderer.scene_bytes(),

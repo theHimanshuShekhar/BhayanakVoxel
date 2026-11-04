@@ -123,6 +123,11 @@ impl Camera {
             return;
         }
         let up = up.map(|c| c / len);
+        // Levelled to this already: carrying again would only flip the last bits of the heading,
+        // which is a different camera to everything that compares them.
+        if up == self.horizon_up {
+            return;
+        }
         let cos = dot(self.horizon_up, up);
         // Rodrigues' rotation taking the old up to the new one, applied to the heading. Exactly
         // opposite ups have no smallest rotation; the levelling below is all they get.
@@ -310,5 +315,33 @@ mod tests {
         // Moving by an eighth of a Voxel moves the upload by an eighth.
         camera.position[0] += 0.125;
         assert_eq!(camera.uniform().origin[0], 0.5);
+    }
+
+    #[test]
+    fn carrying_up_at_a_fixed_position_reaches_a_fixed_point() {
+        // The client levels the camera every frame; a camera that still changed bit for bit
+        // would restart the reference image with the character standing still.
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut unit = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 11) as f64 / (1u64 << 53) as f64
+        };
+        for _ in 0..2000 {
+            let z = 2.0 * unit() - 1.0;
+            let phi = std::f64::consts::TAU * unit();
+            let r = (1.0 - z * z).sqrt();
+            let radius = 160_000.0 + 1.7 + 30.0 * unit();
+            let position = [radius * r * phi.cos(), radius * r * phi.sin(), radius * z];
+            let mut camera = Camera::looking_at(position, [0.0; 3]);
+            camera.turn(6.0 * unit(), 0.5 * unit());
+            camera.carry_up(position);
+            let settled = camera;
+            for _ in 0..150 {
+                camera.carry_up(position);
+            }
+            assert_eq!(camera, settled, "at {position:?}");
+        }
     }
 }

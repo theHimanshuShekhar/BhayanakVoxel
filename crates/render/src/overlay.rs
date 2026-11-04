@@ -48,6 +48,9 @@ pub struct Info<'a> {
     pub timers_supported: bool,
     /// Samples in the reference image so far.
     pub samples: u32,
+    /// Whether bricks that are being generated are kept out of the scene (while the reference
+    /// image accumulates) and some wait.
+    pub loading_paused: bool,
     pub scene_memory: SceneMemory,
     /// What the LOD bands selected, once there is a Planet.
     pub lod: Option<LodInfo>,
@@ -286,6 +289,9 @@ pub fn show(ctx: &Context, info: &Info, controls: &mut Controls) {
             }
             if controls.mode == Mode::Reference {
                 ui.label(format!("samples: {}", info.samples));
+                if info.loading_paused {
+                    ui.label("loading paused");
+                }
             }
 
             egui::ComboBox::from_label("View (V)")
@@ -379,6 +385,7 @@ mod tests {
             timings: &timings,
             timers_supported: true,
             samples: 0,
+            loading_paused: false,
             scene_memory: SceneMemory::default(),
             lod: None,
         };
@@ -393,6 +400,7 @@ mod tests {
             timings: &timings,
             timers_supported: true,
             samples: 0,
+            loading_paused: false,
             scene_memory: SceneMemory::default(),
             lod: None,
         };
@@ -430,6 +438,7 @@ mod tests {
             timings: &timings,
             timers_supported: true,
             samples: 7,
+            loading_paused: false,
             scene_memory: SceneMemory {
                 used: 5 * 1024 * 1024 + 512 * 1024,
                 allocated: 64 * 1024 * 1024,
@@ -470,6 +479,7 @@ mod tests {
             timings: &timings,
             timers_supported: false,
             samples: 0,
+            loading_paused: false,
             scene_memory: SceneMemory::default(),
             lod: None,
         };
@@ -485,6 +495,7 @@ mod tests {
             timings: &timings,
             timers_supported: true,
             samples: 42,
+            loading_paused: true,
             scene_memory: SceneMemory::default(),
             lod: None,
         };
@@ -497,6 +508,7 @@ mod tests {
         let before = controls;
         let text = draw(&info, &mut controls);
         assert!(text.contains("samples: 42"), "{text}");
+        assert!(text.contains("loading paused"), "{text}");
         assert!(text.contains("Depth"), "{text}");
         // Showing the panel is not an edit.
         assert_eq!(controls, before);

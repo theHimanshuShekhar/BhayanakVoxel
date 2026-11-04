@@ -16,7 +16,7 @@ use render::{Camera, RingsFull, Scene, SceneUpdate, camera};
 use sim::Predictor;
 
 use crate::loader::{Arrival, Loader, hold_guard};
-use crate::world::{SceneWork, World};
+use crate::world::{STREAM_BUDGET, SceneWork, World};
 
 const SEED: u64 = 0xB4A7_A9AC;
 const RING: i32 = 160;
@@ -164,23 +164,28 @@ fn ray_through(from: [f64; 3], to: [f64; 3]) -> Ray {
     }
 }
 
+/// `camera` pulled forward along its view to a point within reach of the ground it looks at
+/// (the spawn is 4 m up, and the ground it looks at is further than 7.5 m), for a click.
+fn within_reach(world: &World, camera: &Camera) -> Camera {
+    let forward = camera.forward();
+    let distance = crate::world::centre_hit(world.scene(), camera)
+        .expect("the camera looks at the ground")
+        .t;
+    Camera {
+        position: std::array::from_fn(|a| {
+            camera.position[a] + forward[a] * f64::from(distance - 40.0)
+        }),
+        ..*camera
+    }
+}
+
 #[test]
 fn a_dig_near_the_camera_shows_at_every_band_that_covers_it() {
     let (mut world, _server, spawn) = spawned_world(2);
     fill(&mut world, spawn.position);
 
-    // Dig where the camera looks, as a click does, from a point of the view that is within reach
-    // of the ground (the spawn is 4 m up, and the ground it looks at is further than 7.5 m).
-    let forward = spawn.forward();
-    let distance = crate::world::centre_hit(world.scene(), &spawn)
-        .expect("the camera looks at the ground")
-        .t;
-    let aim = Camera {
-        position: std::array::from_fn(|a| {
-            spawn.position[a] + forward[a] * f64::from(distance - 40.0)
-        }),
-        ..spawn
-    };
+    // Dig where the camera looks, as a click does.
+    let aim = within_reach(&world, &spawn);
     let before = crate::world::centre_hit(world.scene(), &aim);
     world
         .edit(&aim, &crate::tool::Tool::default())
@@ -525,4 +530,126 @@ fn the_spawn_ring_is_drawn_at_level_0_within_seconds_and_before_the_far_bricks_a
         world.waiting()
     );
     eprintln!("level 0 under the camera after {level_0_at:?} (debug build)");
+}
+
+/// Frames, a few milliseconds apart, until the loader's threads have taken `MAX_AHEAD` jobs and
+/// have had time to take more, which they must not. None of them takes anything in.
+fn let_the_workers_run_ahead(world: &mut World, camera: [f64; 3]) {
+    let started = Instant::now();
+    while world.loader().unwrap().ahead() < crate::loader::MAX_AHEAD {
+        assert!(started.elapsed() < Duration::from_secs(60), "no work ahead");
+        assert!(stream(world, camera).is_empty());
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    for _ in 0..20 {
+        assert!(stream(world, camera).is_empty());
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[test]
+fn while_loading_is_held_nothing_is_taken_in_and_what_waits_is_bounded() {
+    let (mut world, _server, camera) = spawned_world(2);
+    let waiting = world.waiting();
+    assert!(waiting > 0, "the Guard stands in for everything");
+    world.pause_loading(true);
+    assert!(world.loading_paused());
+    let_the_workers_run_ahead(&mut world, camera.position);
+
+    // The scene did not change, and with the camera still nor did the rings.
+    assert_eq!(world.waiting(), waiting);
+    assert!(world.recentre(camera.position).unwrap().is_none());
+    // What was generated and not taken in is what the workers are ahead by, and they stopped:
+    // nothing more is generated however long it waits.
+    let loader = world.loader().unwrap();
+    assert_eq!(loader.ahead(), crate::loader::MAX_AHEAD);
+    let generated = loader.generated();
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(stream(&mut world, camera.position).is_empty());
+    assert_eq!(world.loader().unwrap().generated(), generated);
+}
+
+#[test]
+fn letting_go_takes_in_what_was_held_and_the_bands_fill_as_before() {
+    let (mut world, _server, camera) = spawned_world(2);
+    world.pause_loading(true);
+    let_the_workers_run_ahead(&mut world, camera.position);
+    world.pause_loading(false);
+    assert!(!world.loading_paused());
+    // What was held is waiting, so the first frame takes some in, and not for much longer than
+    // its budget (a batch may overrun it, and a debug build is slow).
+    let mut took = Duration::ZERO;
+    let mut first = Vec::new();
+    while first.is_empty() {
+        let started = Instant::now();
+        first = stream(&mut world, camera.position);
+        took = started.elapsed();
+        assert!(took < 20 * STREAM_BUDGET, "{took:?}");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    eprintln!("the first frame after letting go took {took:?}");
+    assert!(world.waiting() > 0, "not all in one frame");
+    fill(&mut world, camera.position);
+    assert_eq!(world.waiting(), 0);
+    assert_eq!(world.loader().unwrap().pending(), 0);
+}
+
+#[test]
+fn an_edit_while_loading_is_held_is_shown() {
+    let (mut world, _server, camera) = spawned_world(2);
+    fill(&mut world, camera.position);
+    let aim = within_reach(&world, &camera);
+    let before = crate::world::centre_hit(world.scene(), &aim).expect("ground to dig");
+    // The camera moves on, which gives the loader work again, and loading is paused.
+    let (ahead, _) = tangents(camera.horizon_up);
+    let moved: [f64; 3] = std::array::from_fn(|a| camera.position[a] + 100.0 * ahead[a]);
+    world.recentre(moved).unwrap();
+    world.pause_loading(true);
+    for _ in 0..20 {
+        assert!(stream(&mut world, moved).is_empty());
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(world.loader().unwrap().pending() > 0, "the loader has work");
+    let update = world
+        .edit(&aim, &crate::tool::Tool::default())
+        .unwrap()
+        .expect("there is ground to dig");
+    assert!(matches!(update, SceneUpdate::Rings(_)));
+    // The Voxels that were dug are gone from the scene: the view hits something further on.
+    let after = crate::world::centre_hit(world.scene(), &aim);
+    assert!(
+        after.is_none_or(|hit| hit.t > before.t),
+        "{:?} then {:?}",
+        before.t,
+        after.map(|h| h.t)
+    );
+}
+
+#[test]
+fn flying_far_while_loading_is_paused_does_not_grow_the_queue_without_bound() {
+    let (mut world, _server, camera) = spawned_world(2);
+    fill(&mut world, camera.position);
+    world.pause_loading(true);
+    let (ahead, _) = tangents(camera.horizon_up);
+    let radius = camera.position.iter().map(|c| c * c).sum::<f64>().sqrt();
+    // Out and back over several bands' worth, in steps that make the rings follow.
+    let steps = 60;
+    for step in 0..2 * steps {
+        let along = if step < steps { step } else { 2 * steps - step };
+        // Round the Planet, at the height of the spawn.
+        let flat: [f64; 3] =
+            std::array::from_fn(|a| camera.position[a] + 0.5 * D0 * along as f64 * ahead[a]);
+        let scale = radius / flat.iter().map(|c| c * c).sum::<f64>().sqrt();
+        let at = flat.map(|c| c * scale);
+        world.recentre(at).unwrap();
+        assert!(stream(&mut world, at).is_empty());
+        let (queued, cancelled) = world.loader().unwrap().queue_sizes();
+        // Jobs given up on are not kept past a share of the queue (with some room for a frame
+        // that could not hand its cancels over).
+        assert!(
+            cancelled <= 2 * (queued / 4).max(256),
+            "step {step}: {queued} queued, {cancelled} cancelled"
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
 }
