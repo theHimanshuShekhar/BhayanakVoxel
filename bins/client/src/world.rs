@@ -109,6 +109,9 @@ pub struct World {
     loader: Option<Loader>,
     /// What [`World::stream`] expects taking in a batch to cost.
     batch_cost: std::time::Duration,
+    /// Whether [`World::stream`] leaves what the loader has generated where it is: see
+    /// [`World::pause_loading`].
+    loading_paused: bool,
     /// What the next click would change, while there is something under the cursor to apply the
     /// tool to. Made again when the Edit it is of changes, or a brick it reads does.
     ghost: Option<Ghost>,
@@ -138,6 +141,7 @@ impl World {
             link,
             loader: None,
             batch_cost: std::time::Duration::ZERO,
+            loading_paused: false,
             ghost: None,
             ghost_next: None,
         }
@@ -153,6 +157,18 @@ impl World {
     /// The loader, if there is one.
     pub fn loader(&self) -> Option<&Loader> {
         self.loader.as_ref()
+    }
+
+    /// Holds back (or lets go of) what the loader generates: while paused, [`World::stream`] does
+    /// not take it in, so the scene stays as it is and the reference image can accumulate. The
+    /// loader's threads stop at [`crate::loader::MAX_AHEAD`] jobs ahead, so what waits is bounded.
+    pub fn pause_loading(&mut self, paused: bool) {
+        self.loading_paused = paused;
+    }
+
+    /// Whether there is a loader and it is paused: see [`World::pause_loading`].
+    pub fn loading_paused(&self) -> bool {
+        self.loading_paused && self.loader.is_some()
     }
 
     /// Bricks that wait for the bricks under them to be resident. Zero, and nothing pending with
@@ -209,7 +225,9 @@ impl World {
     /// are held, the scene splits the bricks they are under, and `show` copies what that changed
     /// to the GPU (its time is in the budget). This is all the frame thread does of loading: the
     /// bricks are generated on the loader's threads, at most [`crate::loader::MAX_AHEAD`] ahead
-    /// of what is taken in here, and what is not taken in this frame waits for the next.
+    /// of what is taken in here, and what is not taken in this frame waits for the next. While
+    /// loading is paused ([`World::pause_loading`]) it still asks for bricks and keeps the loader's
+    /// queue in order for the camera, but takes none in.
     pub fn stream<E: From<RingsFull>>(
         &mut self,
         camera: [f64; 3],
@@ -220,6 +238,7 @@ impl World {
             predictor,
             loader: Some(loader),
             batch_cost,
+            loading_paused,
             ..
         } = self
         else {
@@ -236,6 +255,9 @@ impl World {
             camera,
         );
         loader.sync(camera, bands);
+        if *loading_paused {
+            return Ok(());
+        }
         let mut worst = std::time::Duration::ZERO;
         while started.elapsed() + *batch_cost <= STREAM_BUDGET {
             let batch_started = std::time::Instant::now();
