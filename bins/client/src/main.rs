@@ -24,6 +24,7 @@ use loader::{GUARD_FIRST, Loader};
 use net::{EditMode, Leash};
 use planet_gen::planet::Planet;
 use planet_gen::world_map::{WORLD_MAP_SIZE, WORLD_RADIUS, WorldMap};
+use render::cpu::{CpuBreakdown, Row};
 use render::lod::{self, Bands};
 use render::overlay::{self, Controls, Hud, HudEvent, LodInfo, SceneMemory};
 use render::scene::Bound;
@@ -356,6 +357,8 @@ struct App {
     filling_since: Option<Instant>,
     /// The frame thread's time on the scene, frame by frame.
     scene_work: SceneWork,
+    /// Where the CPU time of each frame goes, for the overlay and the log of slow frames.
+    cpu: CpuBreakdown,
     camera: Camera,
     fly: Fly,
     /// Walking as the character (the default), or flying the camera through everything as a
@@ -408,6 +411,31 @@ fn spawn_camera(ground: [f64; 3]) -> Camera {
     camera
 }
 
+/// Whether a copy that wrote `written` bytes made the scene's buffers again, which `scene_bytes`
+/// is the size of: it wrote all of them. A copy that wrote nothing did not.
+fn is_rebuild(written: u64, scene_bytes: u64) -> bool {
+    written > 0 && written >= scene_bytes
+}
+
+/// Copies what changed in the Planet to the GPU, and counts the time and the bytes it took in
+/// `cpu`. A copy that wrote as much as the buffers hold made them again.
+fn upload(
+    cpu: &mut CpuBreakdown,
+    renderer: &mut Renderer,
+    scene: &Scene,
+    update: &SceneUpdate,
+) -> Result<(), Box<dyn Error>> {
+    let (before, started) = (renderer.uploaded_bytes(), Instant::now());
+    let result = renderer.update_scene(scene, update);
+    cpu.add(Row::UpdateScene, started.elapsed().as_secs_f64() * 1e3);
+    let written = renderer.uploaded_bytes() - before;
+    cpu.add(Row::SceneBytes, written as f64);
+    if is_rebuild(written, renderer.scene_bytes()) {
+        cpu.add(Row::Rebuilds, 1.0);
+    }
+    result
+}
+
 impl App {
     fn new() -> Self {
         let (sender, receiver) = mpsc::channel();
@@ -424,6 +452,7 @@ impl App {
             server: None,
             filling_since: None,
             scene_work: SceneWork::default(),
+            cpu: CpuBreakdown::default(),
             // Until the Planet arrives there is only sky to look at, wherever from.
             camera: spawn_camera([0.0, 0.0, f64::from(WORLD_RADIUS)]),
             fly: Fly::default(),
@@ -512,8 +541,15 @@ impl App {
         let Some(world) = &mut self.world else {
             return Ok(());
         };
+        let (span, fills) = (self.cpu.start(), world.full_fills());
         let update = world.poll()?;
-        self.show(update)
+        self.cpu
+            .add(Row::FullFills, (world.full_fills() - fills) as f64);
+        let resim = world.take_resim().as_secs_f64() * 1e3;
+        self.cpu.add(Row::Resim, resim);
+        let shown = self.show(update);
+        self.cpu.finish(Row::Poll, span, resim);
+        shown
     }
 
     /// Applies the tool where the camera looks. The Edit is drawn at once and confirmed by the
@@ -573,7 +609,10 @@ impl App {
         let Some(world) = &mut self.world else {
             return Ok(());
         };
-        for _ in 0..self.clock.advance(Duration::from_secs_f64(dt)) {
+        let (span, generated) = (self.cpu.start(), world.ground_generated());
+        let ticks = self.clock.advance(Duration::from_secs_f64(dt));
+        self.cpu.add(Row::Ticks, f64::from(ticks));
+        for _ in 0..ticks {
             world.walk(self.fly.move_input(&self.camera))?;
             if let Some(eye) = world.eye() {
                 let before = self.eyes.map_or(eye, |(_, latest)| latest);
@@ -587,6 +626,13 @@ impl App {
                 std::array::from_fn(|a| before[a] + (latest[a] - before[a]) * alpha);
             self.camera.carry_up(self.camera.position);
         }
+        self.cpu.add(
+            Row::GroundBricks,
+            (world.ground_generated() - generated) as f64,
+        );
+        let fill = world.take_fill_time().as_secs_f64() * 1e3;
+        self.cpu.add(Row::GroundFill, fill);
+        self.cpu.finish(Row::SimTicks, span, fill);
         Ok(())
     }
 
@@ -623,8 +669,9 @@ impl App {
         // anything changes.
         let still_frames = self.still.observe((renderer.view(&self.camera), self.bias));
         world.pause_loading(world::loading_paused_for(renderer.mode(), still_frames));
+        let cpu = &mut self.cpu;
         world.stream(self.camera.position, |scene, update| {
-            renderer.update_scene(scene, update)
+            upload(cpu, renderer, scene, update)
         })?;
         if let (Some(since), Some(world)) = (self.filling_since, &self.world)
             && world.waiting() == 0
@@ -655,7 +702,7 @@ impl App {
         if let (Some(update), Some(world), Some(renderer)) =
             (update, &self.world, &mut self.renderer)
         {
-            renderer.update_scene(world.scene(), &update)?;
+            upload(&mut self.cpu, renderer, world.scene(), &update)?;
         }
         Ok(())
     }
@@ -747,6 +794,8 @@ impl App {
         let mut controls = before;
         let info = overlay::Info {
             timings: renderer.timings(),
+            cpu: &self.cpu,
+            present_mode: renderer.present_mode(),
             timers_supported: renderer.timers_supported(),
             samples: renderer.samples(),
             // Only said while there is something that waits.
@@ -1020,28 +1069,46 @@ impl ApplicationHandler for App {
                 } else {
                     self.fly.update(&mut self.camera, dt);
                 }
+                let span = self.cpu.start();
                 if let Err(err) = self.dig_step(dt) {
                     self.error = Some(err);
                     event_loop.exit();
                 }
+                self.cpu.finish(Row::Dig, span, 0.0);
+                let span = self.cpu.start();
                 self.aim();
+                self.cpu.finish(Row::Aim, span, 0.0);
                 // Before the scene is brought up to date, so that what the overlay changes (the
                 // sun, the bias, the mode) is seen by the frame that follows it, not the next.
                 // What it says of loading is as of the frame before.
+                let span = self.cpu.start();
                 let overlay = self.run_overlay();
+                self.cpu.finish(Row::Egui, span, 0.0);
                 let scene_started = Instant::now();
-                if let Err(err) = self.recentre().and_then(|()| self.stream()) {
+                let span = self.cpu.start();
+                let recentred = self.recentre();
+                self.cpu.finish(Row::Recentre, span, 0.0);
+                let span = self.cpu.start();
+                if let Err(err) = recentred.and_then(|()| self.stream()) {
                     self.error = Some(err);
                     event_loop.exit();
                 }
+                self.cpu.finish(Row::Stream, span, 0.0);
                 if self.world.is_some() {
                     self.scene_work.record(scene_started.elapsed());
                 }
                 let ctx = self.gui.as_ref().map(|gui| gui.ctx.clone());
                 if let Some(renderer) = &mut self.renderer {
                     renderer.render(&self.camera, overlay.zip(ctx.as_ref()).map(|(o, c)| (c, o)));
+                    let drawn = renderer.last_cpu();
+                    self.cpu.add(Row::Acquire, drawn.acquire_ms);
+                    self.cpu.add(Row::Encode, drawn.encode_ms);
+                    self.cpu.add(Row::Present, drawn.present_ms);
                 }
                 self.update_title();
+                if let Some(line) = self.cpu.end_frame(Instant::now()) {
+                    eprintln!("{line}");
+                }
             }
             _ => {}
         }
@@ -1230,6 +1297,14 @@ mod tests {
             render::reference::trace(&clipped, &ray).is_none(),
             "the test Planet's radius is far inside the spawn, so it clips the ground away"
         );
+    }
+
+    #[test]
+    fn a_copy_that_wrote_the_whole_scene_made_the_buffers_again() {
+        assert!(is_rebuild(4096, 4096));
+        assert!(is_rebuild(8192, 4096));
+        assert!(!is_rebuild(4095, 4096));
+        assert!(!is_rebuild(0, 0));
     }
 
     #[test]

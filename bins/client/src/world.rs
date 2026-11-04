@@ -160,6 +160,9 @@ pub struct World {
     ghost: Option<Ghost>,
     /// Not before this is the ghost made again for a new Edit: see [`GHOST_BACKOFF`].
     ghost_next: Option<std::time::Instant>,
+    /// Time spent running inputs again after the server and the prediction differed, since
+    /// [`World::take_resim`].
+    resim: std::time::Duration,
 }
 
 /// The first solid Voxel along the camera's view through the middle of the screen.
@@ -187,6 +190,7 @@ impl World {
             loading_paused: false,
             ghost: None,
             ghost_next: None,
+            resim: std::time::Duration::ZERO,
         }
     }
 
@@ -245,6 +249,26 @@ impl World {
             self.link.send(request)?;
         }
         Ok(())
+    }
+
+    /// Bricks the character's ground has generated so far.
+    pub fn ground_generated(&self) -> u64 {
+        self.predictor.ground().generated()
+    }
+
+    /// Times resimulating after a desync has made a whole ball of ground at once.
+    pub fn full_fills(&self) -> u64 {
+        self.predictor.full_fills()
+    }
+
+    /// The time spent running inputs again after a desync since the last call.
+    pub fn take_resim(&mut self) -> std::time::Duration {
+        std::mem::take(&mut self.resim)
+    }
+
+    /// The time the character's ticks have spent making ground since the last call.
+    pub fn take_fill_time(&mut self) -> std::time::Duration {
+        self.predictor.take_fill_time()
     }
 
     /// What bounds the character, once the server has said.
@@ -446,7 +470,15 @@ impl World {
         let mut changed = Vec::new();
         loop {
             match self.link.try_recv() {
-                Ok(message) => changed.extend(self.predictor.receive(message)),
+                Ok(message) => {
+                    let desyncs = self.predictor.body_desyncs();
+                    let started = std::time::Instant::now();
+                    changed.extend(self.predictor.receive(message));
+                    // A message that made the prediction differ ran the inputs again.
+                    if self.predictor.body_desyncs() != desyncs {
+                        self.resim += started.elapsed();
+                    }
+                }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => return Err(Disconnected.into()),
             }

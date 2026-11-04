@@ -133,6 +133,8 @@ pub struct Ground {
     /// How many of [`offsets`] are held around the centre: all those before this one.
     next: usize,
     rate: usize,
+    /// Bricks generated since this ground was made, for the client's frame breakdown.
+    generated: u64,
 }
 
 impl Ground {
@@ -149,6 +151,7 @@ impl Ground {
             centre: None,
             next: 0,
             rate: RATE,
+            generated: 0,
         }
     }
 
@@ -161,6 +164,12 @@ impl Ground {
     /// New bricks one [`Ground::fill`] generates, at the most.
     pub fn rate(&self) -> usize {
         self.rate
+    }
+
+    /// Bricks generated so far (a brick made again after its slot was taken counts again). It
+    /// only counts: nothing in the ground depends on it.
+    pub fn generated(&self) -> u64 {
+        self.generated
     }
 
     /// The brick at `coord`, if the ground holds it.
@@ -241,6 +250,7 @@ impl Ground {
                     .map_or(Brick::AIR, |source| source.brick(0, coord));
                 self.slots[slot_of(coord)] = Some((coord, brick));
                 made += 1;
+                self.generated += 1;
             }
             self.next += 1;
         }
@@ -415,6 +425,19 @@ mod tests {
         assert_eq!(made(&source), offsets().len());
         ground.fill();
         assert_eq!(made(&source), offsets().len());
+    }
+
+    #[test]
+    fn the_ground_counts_the_bricks_it_generates() {
+        let (source, mut ground) = counting(50);
+        assert_eq!(ground.generated(), 0);
+        ground.reset([0.0; 3]);
+        ground.fill();
+        assert_eq!(ground.generated(), 50);
+        complete(&mut ground);
+        assert_eq!(ground.generated(), made(&source) as u64);
+        ground.fill();
+        assert_eq!(ground.generated(), offsets().len() as u64);
     }
 
     #[test]
