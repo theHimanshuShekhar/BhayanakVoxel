@@ -214,11 +214,22 @@ impl Target {
 
 /// Everything that decides what the reference image looks like, bar the scene (a new scene is a
 /// new `Tracer`). Accumulation restarts when any of it changes.
-#[derive(Clone, PartialEq)]
-struct View {
+#[derive(Clone, Debug, PartialEq)]
+pub struct View {
     camera: Camera,
     sun: Sun,
     size: (u32, u32),
+}
+
+impl View {
+    /// The view of `camera` and `sun` into an image of `target`.
+    pub(crate) fn new(camera: &Camera, sun: &Sun, target: &Target) -> Self {
+        Self {
+            camera: *camera,
+            sun: *sun,
+            size: target.resolution.internal,
+        }
+    }
 }
 
 pub struct Tracer {
@@ -556,11 +567,7 @@ impl Tracer {
         sun: &Sun,
         target: &Target,
     ) {
-        let view = View {
-            camera: *camera,
-            sun: *sun,
-            size: target.resolution.internal,
-        };
+        let view = View::new(camera, sun, target);
         let sample_index = self.accumulator.begin_sample(&view);
         self.write_uniforms(queue, camera, sun, sample_index, CENTRE);
         self.dispatch(

@@ -127,6 +127,8 @@ struct Shared {
     generated: AtomicU64,
     /// Jobs taken from the queue that the frame thread has not taken in (see [`MAX_AHEAD`]).
     ahead: AtomicUsize,
+    /// Jobs a worker has taken and not yet sent the arrival of: the ones that are in flight.
+    working: AtomicUsize,
 }
 
 impl Shared {
@@ -191,6 +193,7 @@ impl Loader {
             source,
             generated: AtomicU64::new(0),
             ahead: AtomicUsize::new(0),
+            working: AtomicUsize::new(0),
         });
         let (sender, arrivals) = mpsc::channel();
         let workers = (0..workers.max(1))
@@ -377,7 +380,16 @@ impl Loader {
     /// Jobs that the workers have taken and the frame thread has not taken in.
     #[cfg(test)]
     pub fn ahead(&self) -> usize {
-        self.shared.ahead.load(Atomic::Relaxed)
+        self.shared.ahead.load(Atomic::Acquire)
+    }
+
+    /// Jobs that a worker has taken and has not finished (sent the arrival of). Read it after
+    /// [`Loader::ahead`]: a job that `ahead` counts is in flight from before it is counted until
+    /// its arrival is sent, so zero here, read after `ahead` has reached [`MAX_AHEAD`], means the
+    /// workers have stopped and will not go on until something is taken in.
+    #[cfg(test)]
+    pub fn in_flight(&self) -> usize {
+        self.shared.working.load(Atomic::Acquire)
     }
 
     /// Jobs in the workers' queue, and tickets marked as given up on there.
@@ -437,7 +449,10 @@ fn work(shared: &Shared, arrivals: &Sender<(u64, Arrival)>) {
                     if state.cancelled.remove(&job.ticket) {
                         continue;
                     }
-                    shared.ahead.fetch_add(1, Atomic::Relaxed);
+                    // In flight before ahead, so that no one who sees the job counted in
+                    // `ahead` can see it not in flight (see `Loader::in_flight`).
+                    shared.working.fetch_add(1, Atomic::AcqRel);
+                    shared.ahead.fetch_add(1, Atomic::AcqRel);
                     break (job, state.camera, state.bands);
                 }
                 state = shared
@@ -468,7 +483,9 @@ fn work(shared: &Shared, arrivals: &Sender<(u64, Arrival)>) {
         } else {
             Arrival::Dropped(job.key)
         };
-        if arrivals.send((job.ticket, arrival)).is_err() {
+        let sent = arrivals.send((job.ticket, arrival));
+        shared.working.fetch_sub(1, Atomic::Release);
+        if sent.is_err() {
             return;
         }
     }

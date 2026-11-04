@@ -9,7 +9,7 @@ use crate::profiler::Profiler;
 use crate::scene::{Scene, SceneUpdate};
 use crate::sun::Sun;
 use crate::timing::Timings;
-use crate::tracer::{Target, Tracer};
+use crate::tracer::{Target, Tracer, View};
 use crate::upscale::{DEFAULT_SCALE, Resolution};
 use crate::{Result, create_instance, request_gpu, shaders};
 
@@ -261,6 +261,12 @@ impl Renderer {
     /// Samples in the reference image so far, to show on screen.
     pub fn samples(&self) -> u32 {
         self.tracer.samples()
+    }
+
+    /// What the reference image would be of with the view from `camera`: it starts over when this
+    /// changes (see [`View`]), so comparing it from frame to frame tells whether the view is still.
+    pub fn view(&self, camera: &Camera) -> View {
+        View::new(camera, &self.sun, &self.target)
     }
 
     /// Reconfigures the surface and the images. Zero-sized windows (minimised) are ignored.
