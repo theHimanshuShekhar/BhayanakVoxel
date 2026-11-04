@@ -8,7 +8,7 @@
 //! client arrives ahead of the pending ones in the server's order, so it is applied under them
 //! in the same way.
 
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use brick_store::{BrickCoord, BrickStore};
 use net::{BodyState, ClientMessage, EditOp, Leash, MoveInput, RejectReason, ServerMessage};
@@ -17,6 +17,15 @@ use crate::{
     BrickCache, Change, Character, EditBudget, Footing, Ground, Movement, Reads, Undo, apply,
     apply_changes_from, plan_from, validate, work,
 };
+
+/// What an Edit that is not yet answered took from the allowance, which it is to be given back if
+/// the server turns it down for a reason that did not take it there (see
+/// [`Predictor::receive`]).
+#[derive(Clone, Copy)]
+struct Spent {
+    work: u64,
+    volume: u64,
+}
 
 struct Pending {
     client_seq: u64,
@@ -46,6 +55,8 @@ pub struct Predictor {
     store: BrickStore,
     next_client_seq: u64,
     pending: VecDeque<Pending>,
+    /// What each pending Edit spent of the allowance, by its number.
+    spent: BTreeMap<u64, Spent>,
     desyncs: u64,
     character: Option<Character>,
     next_input_seq: u64,
@@ -75,6 +86,7 @@ impl Predictor {
             store,
             next_client_seq: 0,
             pending: VecDeque::new(),
+            spent: BTreeMap::new(),
             desyncs: 0,
             character: None,
             next_input_seq: 0,
@@ -272,8 +284,8 @@ impl Predictor {
     /// [`Predictor::edit_checked`]).
     pub fn edit(&mut self, op: EditOp) -> (ClientMessage, Vec<BrickCoord>) {
         let changes = self.plan(&op);
-        self.spend(&op, changes.len());
-        self.edit_planned(op, changes)
+        let spent = self.spend(&op, changes.len());
+        self.edit_planned(op, changes, spent)
     }
 
     /// [`Predictor::edit`], but not made if the server is known to turn it down for what
@@ -288,27 +300,37 @@ impl Predictor {
         if !self.can_change(changes.len()) {
             return Err(RejectReason::VolumeLimited);
         }
-        self.spend(&op, changes.len());
-        Ok(self.edit_planned(op, changes))
+        let spent = self.spend(&op, changes.len());
+        Ok(self.edit_planned(op, changes, spent))
     }
 
     /// Counts an Edit that changes `changed` Voxels against the allowance, as the server does: an
     /// Edit and its work, then the Voxels if there are as many left.
-    fn spend(&mut self, op: &EditOp, changed: usize) {
+    /// Returns what was taken besides the Edit.
+    fn spend(&mut self, op: &EditOp, changed: usize) -> Spent {
+        let mut spent = Spent { work: 0, volume: 0 };
         if validate(op).is_ok() {
             self.budget.take_op();
-            self.budget.take_work(work(op));
-            self.budget.take_volume(changed as u64);
+            let asked = work(op);
+            if self.budget.take_work(asked) {
+                spent.work = asked;
+            }
+            if self.budget.take_volume(changed as u64) {
+                spent.volume = changed as u64;
+            }
         }
+        spent
     }
 
     fn edit_planned(
         &mut self,
         op: EditOp,
         changes: Vec<Change>,
+        spent: Spent,
     ) -> (ClientMessage, Vec<BrickCoord>) {
         let client_seq = self.next_client_seq;
         self.next_client_seq += 1;
+        self.spent.insert(client_seq, spent);
         let changed = self.predict_changes(client_seq, op, changes);
         (ClientMessage::Edit { client_seq, op }, changed)
     }
@@ -329,8 +351,10 @@ impl Predictor {
                     .is_some_and(|p| p.client_seq == client_seq && p.op == op);
                 if expected {
                     self.pending.pop_front();
+                    self.spent.remove(&client_seq);
                     return Vec::new();
                 }
+                self.spent.remove(&client_seq);
                 // The server and this client disagree about what has been asked for. Trust the
                 // server, and say so rather than drift unnoticed.
                 debug_assert!(
@@ -357,7 +381,17 @@ impl Predictor {
                 self.leashes.push_back((from, leash));
                 Vec::new()
             }
-            ServerMessage::Rejected { client_seq, .. } => {
+            ServerMessage::Rejected { client_seq, reason } => {
+                // The server takes an Edit's credit, and its work if the Edit is within what it
+                // asks of the server, and the Voxels only for an Edit that it makes. What it did
+                // not take of what the client counted, the client gives back, so that it does not
+                // go short of what the server says it has.
+                if let Some(spent) = self.spent.remove(&client_seq) {
+                    self.budget.refund_volume(spent.volume);
+                    if reason != RejectReason::VolumeLimited {
+                        self.budget.refund_work(spent.work);
+                    }
+                }
                 let Some(index) = self.pending.iter().position(|p| p.client_seq == client_seq)
                 else {
                     return Vec::new();
@@ -567,6 +601,96 @@ mod tests {
             client.walk(MoveInput::default());
         }
         assert!(client.can_change(10_000) && !client.can_change(11_000));
+    }
+
+    /// What the allowance is after making `op` and being told `reason`, worked out as the server
+    /// does: it took the Edit's credit; the work, if the Edit was within what it asks of the
+    /// server; and the Voxels, only if it made the Edit.
+    fn server_took(op: &EditOp, reason: Option<RejectReason>, changed: u64) -> EditBudget {
+        let mut budget = EditBudget::full();
+        budget.take_op();
+        let asked_work = !matches!(
+            reason,
+            Some(
+                RejectReason::RateLimited
+                    | RejectReason::OutOfReach
+                    | RejectReason::BrushTooLarge
+                    | RejectReason::OutOfRange
+                    | RejectReason::BadRotation
+                    | RejectReason::UnknownMaterial
+            )
+        );
+        if asked_work {
+            budget.take_work(work(op));
+        }
+        if reason.is_none() {
+            budget.take_volume(changed);
+        }
+        budget
+    }
+
+    #[test]
+    fn a_reject_gives_the_client_back_what_the_server_did_not_take() {
+        let big = cube(net::EditMode::Dig, 20);
+        for reason in [
+            RejectReason::RateLimited,
+            RejectReason::OutOfReach,
+            RejectReason::VolumeLimited,
+        ] {
+            let mut client = Predictor::new(mass());
+            let (_, changed) = client.edit_checked(big).unwrap();
+            assert!(!changed.is_empty());
+            // The Edit is out of the allowance: the Voxels, the work and the credit.
+            assert!(!client.can_change(10_000));
+            client.receive(rejected_with(0, reason));
+            assert_eq!(
+                client.budget,
+                server_took(&big, Some(reason), 0),
+                "{reason:?}"
+            );
+            assert_eq!(client.pending(), 0);
+        }
+        // For a rate or a reach that is the credit and nothing else, so the client does not hold
+        // back a big Brush for seconds while the server has all of its allowance.
+        let mut client = Predictor::new(mass());
+        client.edit_checked(big).unwrap();
+        client.receive(rejected_with(0, RejectReason::RateLimited));
+        assert!(client.foresee(&big).is_ok() && client.can_change(68_921));
+    }
+
+    #[test]
+    fn what_the_server_made_is_not_given_back_and_a_reject_is_given_back_once() {
+        let big = cube(net::EditMode::Dig, 20);
+        let mut client = Predictor::new(mass());
+        let (_, changed) = client.edit_checked(big).unwrap();
+        let after = client.budget;
+        assert!(!changed.is_empty());
+        // Acked: it was made, and the allowance stays as spent.
+        client.receive(applied(big, 1, Some(0)));
+        assert_eq!(client.budget, after);
+        assert_eq!(client.budget, server_took(&big, None, 68_921));
+        // A reject for an Edit that is no longer pending (or told twice) gives back nothing more.
+        client.receive(rejected_with(0, RejectReason::RateLimited));
+        assert_eq!(client.budget, after);
+        let mut other = Predictor::new(mass());
+        other.edit_checked(big).unwrap();
+        other.receive(rejected_with(0, RejectReason::RateLimited));
+        let once = other.budget;
+        other.receive(rejected_with(0, RejectReason::RateLimited));
+        assert_eq!(other.budget, once);
+        // A rest is more than a full allowance: nothing is given back past it.
+        other.edit_checked(big).unwrap();
+        for _ in 0..600 {
+            other.walk(MoveInput::default());
+        }
+        assert_eq!(other.budget, EditBudget::full());
+        other.receive(rejected_with(1, RejectReason::VolumeLimited));
+        assert_eq!(other.budget, EditBudget::full());
+    }
+
+    /// A reject of Edit number `client_seq`, for `reason`.
+    fn rejected_with(client_seq: u64, reason: RejectReason) -> ServerMessage {
+        ServerMessage::Rejected { client_seq, reason }
     }
 
     #[test]

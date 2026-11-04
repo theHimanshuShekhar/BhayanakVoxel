@@ -52,10 +52,11 @@ const MAX_QUEUED: usize = 600;
 /// The most work, in units ([`crate::work`]), that the Edits of one tick may ask, all clients
 /// together: what the server will spend on Edits in a tick, so that a burst of them from many
 /// clients cannot make a tick late. A unit is about 10 ns (a Smooth's Voxels count six), so this is
-/// a few milliseconds. It is [`crate::WORK_BURST`], what one maximum Brush asks, so that any Edit
-/// that a player's own budget lets through gets its turn when it is alone. An Edit that does not
-/// fit is turned down with [`RejectReason::RateLimited`], and its client may ask again.
-pub const EDIT_WORK_PER_TICK: u64 = crate::WORK_BURST;
+/// a few milliseconds. It is twice [`crate::WORK_BURST`], what one maximum Brush asks, so that a
+/// maximum Brush fits beside as much ordinary work as another one. An Edit that does not fit is
+/// turned down with [`RejectReason::RateLimited`], and its client may ask again; which clients
+/// are served first goes round, a tick at a time, so that it is not always the same ones.
+pub const EDIT_WORK_PER_TICK: u64 = 2 * crate::WORK_BURST;
 
 /// One client's character, how many of its inputs the server has applied, and the ground it
 /// walks on.
@@ -125,6 +126,8 @@ pub struct Server {
     edit_work: u64,
     /// The bricks that Edits read where the store holds none, so that they are made once.
     cache: BrickCache,
+    /// Ticks so far, which decide whose requests are handled first.
+    tick_count: u64,
 }
 
 impl Server {
@@ -138,6 +141,7 @@ impl Server {
             budgets: Vec::new(),
             edit_work: 0,
             cache: BrickCache::new(),
+            tick_count: 0,
         }
     }
 
@@ -267,7 +271,9 @@ impl Server {
     }
 
     /// One tick: tops up each client's Edit allowance, then handles every request that has
-    /// arrived, clients in order and each client's requests in the order it sent them. Each
+    /// arrived, each client's in the order it sent them, and the clients one after another from
+    /// the one that is `tick number mod the number of clients` along (so that the tick's share of
+    /// work, which is first come first served, is not always the first clients'). Each
     /// accepted Edit goes to every client, with the ack only for the one that asked; a reject goes
     /// to the one that asked. A client whose character moved is told where it is, once, after its
     /// requests, and before that of any new leash. A character with no leash yet is waiting for
@@ -278,7 +284,12 @@ impl Server {
         }
         self.budgets.iter_mut().for_each(EditBudget::refill);
         self.edit_work = 0;
-        for (asker, client) in clients.iter().enumerate() {
+        let count = clients.len();
+        let first = (self.tick_count % count.max(1) as u64) as usize;
+        self.tick_count += 1;
+        for step in 0..count {
+            let asker = (first + step) % count;
+            let client = &clients[asker];
             let mut moved = false;
             while let Ok(message) = client.try_recv() {
                 match message {
@@ -929,14 +940,11 @@ mod tests {
         assert_eq!(crate::examined(&nothing), 21 * 21 * 21);
     }
 
-    #[test]
-    fn the_work_of_the_edits_of_a_tick_is_no_more_than_the_servers_share_whoever_asks() {
-        // Seven players with a character each, every one with a full allowance, each asking for
-        // the biggest sphere in the one tick: 68 921 each. Five fit the tick's 360 000, and the
-        // others are told to ask again.
+    /// `players` clients, each with a character at the origin, and a server of `mass`.
+    fn crowd(players: usize) -> (Server, Vec<ClientEnd>, Vec<ServerEnd>) {
         let mut clients = Vec::new();
         let mut ends = Vec::new();
-        for _ in 0..7 {
+        for _ in 0..players {
             let (client, end) = loopback();
             client.send(stand()).unwrap();
             clients.push(client);
@@ -947,47 +955,143 @@ mod tests {
         for client in &clients {
             received(client);
         }
-        let big = EditOp {
+        (server, clients, ends)
+    }
+
+    /// The clients of `who` ask for `op` and the server ticks once: what each is told (its own
+    /// reject, if it has one).
+    fn ask_all(
+        server: &mut Server,
+        clients: &[ClientEnd],
+        ends: &[ServerEnd],
+        who: &[usize],
+        op: EditOp,
+    ) -> Vec<Option<RejectReason>> {
+        for &i in who {
+            clients[i]
+                .send(ClientMessage::Edit {
+                    client_seq: server.tick_count,
+                    op,
+                })
+                .unwrap();
+        }
+        server.tick(ends);
+        let told = who
+            .iter()
+            .map(|&i| {
+                edits_heard(&clients[i]).into_iter().find_map(|m| match m {
+                    ServerMessage::Rejected { reason, .. } => Some(reason),
+                    _ => None,
+                })
+            })
+            .collect();
+        for client in clients {
+            received(client);
+        }
+        told
+    }
+
+    fn big_sphere() -> EditOp {
+        EditOp {
             mode: net::EditMode::Dig,
             ..place([0, 0, 0], net::Shape::Sphere, 20)
-        };
-        let ask = |server: &mut Server, who: &[usize], seq: u64| -> Vec<Option<RejectReason>> {
-            for &i in who {
-                clients[i]
-                    .send(ClientMessage::Edit {
-                        client_seq: seq,
-                        op: big,
-                    })
-                    .unwrap();
+        }
+    }
+
+    fn leaning_cube() -> EditOp {
+        EditOp {
+            alignment: net::Alignment::Local,
+            rotation: 1,
+            ..place([30, 60, 12], net::Shape::Cube, 20)
+        }
+    }
+
+    #[test]
+    fn the_work_of_the_edits_of_a_tick_is_no_more_than_the_servers_share_whoever_asks() {
+        // Fourteen players, every one with a full allowance, each asking for the biggest sphere
+        // in the one tick: 68 921 each. Ten fit the tick's 720 000, and the other four are told
+        // to ask again.
+        let (mut server, clients, ends) = crowd(14);
+        let everyone: Vec<usize> = (0..14).collect();
+        let told = ask_all(&mut server, &clients, &ends, &everyone, big_sphere());
+        assert_eq!(told.iter().filter(|t| t.is_none()).count(), 10);
+        assert!(
+            told.iter()
+                .all(|t| t.is_none() || *t == Some(RejectReason::RateLimited))
+        );
+        assert_eq!(server.edit_work(), 10 * 68_921);
+        assert!(server.edit_work() <= EDIT_WORK_PER_TICK);
+    }
+
+    #[test]
+    fn the_clients_that_are_served_first_go_round_so_that_none_is_left_out() {
+        // The four that are told to ask again are served the tick after.
+        let (mut server, clients, ends) = crowd(14);
+        let everyone: Vec<usize> = (0..14).collect();
+        let told = ask_all(&mut server, &clients, &ends, &everyone, big_sphere());
+        let refused: Vec<usize> = told
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| t.is_some())
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(refused.len(), 4);
+        let told = ask_all(&mut server, &clients, &ends, &refused, big_sphere());
+        assert_eq!(told, [None; 4]);
+
+        // Now all of them ask in every tick for a share that is far too small for them all (a
+        // tilted cube of 4 m, over 300 000 each, of which two fit), each with a full allowance
+        // again after a rest of a second. Whoever is served first goes round: over 14 ticks each
+        // of them is served, and none is turned down by the tick every time.
+        let (mut server, clients, ends) = crowd(14);
+        assert!(crate::work(&leaning_cube()) > 250_000);
+        let mut served = [0; 14];
+        let mut refused = [0; 14];
+        for _ in 0..14 {
+            for _ in 0..60 {
+                server.tick(&ends);
             }
-            server.tick(&ends);
-            // Every client hears the Edits that were made, and its own reject if it has one.
-            let told = clients
-                .iter()
-                .enumerate()
-                .filter(|(i, _)| who.contains(i))
-                .map(|(_, client)| {
-                    edits_heard(client).into_iter().find_map(|m| match m {
-                        ServerMessage::Rejected { reason, .. } => Some(reason),
-                        _ => None,
-                    })
-                })
-                .collect();
             for client in &clients {
                 received(client);
             }
-            told
-        };
-        let told = ask(&mut server, &[0, 1, 2, 3, 4, 5, 6], 0);
-        assert_eq!(told[..5], [None; 5]);
-        assert_eq!(told[5..], [Some(RejectReason::RateLimited); 2]);
-        assert_eq!(server.edit_work(), 5 * 68_921);
-        assert!(server.edit_work() <= EDIT_WORK_PER_TICK);
+            let told = ask_all(&mut server, &clients, &ends, &everyone, leaning_cube());
+            for (i, told) in told.into_iter().enumerate() {
+                match told {
+                    None => served[i] += 1,
+                    Some(RejectReason::RateLimited) => refused[i] += 1,
+                    Some(other) => panic!("{other:?}"),
+                }
+            }
+        }
+        assert!(served.iter().all(|&n| n >= 1), "served {served:?}");
+        assert!(refused.iter().all(|&n| n < 14), "refused {refused:?}");
+    }
 
-        // The next tick has its own share, and the two that were told to ask again are served.
-        let told = ask(&mut server, &[5, 6], 1);
-        assert_eq!(told, [None, None]);
-        assert_eq!(server.edit_work(), 2 * 68_921);
+    #[test]
+    fn a_maximum_brush_is_served_beside_the_ordinary_work_of_the_others_whoever_is_last() {
+        // Nineteen players each make an ordinary Edit (9 261 Voxels' work), and one a cube of 4 m
+        // on a lean (over 300 000): 176 000 and more, within the tick's 720 000, wherever in the
+        // order the cube is.
+        let (mut server, clients, ends) = crowd(20);
+        let ordinary = EditOp {
+            mode: net::EditMode::Dig,
+            ..place([0, 0, 0], net::Shape::Cube, 10)
+        };
+        for (i, client) in clients.iter().enumerate() {
+            let op = if i == 19 { leaning_cube() } else { ordinary };
+            client
+                .send(ClientMessage::Edit { client_seq: 0, op })
+                .unwrap();
+        }
+        server.tick(&ends);
+        for (i, client) in clients.iter().enumerate() {
+            let refused = edits_heard(client)
+                .into_iter()
+                .any(|m| matches!(m, ServerMessage::Rejected { .. }));
+            assert!(!refused, "client {i} was turned down");
+        }
+        assert!(server.edit_work() > 19 * 9_261 + 250_000);
+        assert!(server.edit_work() <= EDIT_WORK_PER_TICK);
     }
 
     #[test]

@@ -105,8 +105,7 @@ pub enum RejectReason {
     /// The player asked for more Edits in the last second than they may, or the server has done
     /// as much Edit work as it will this tick.
     RateLimited,
-    /// The Brush's bounding box is more Voxels than the player has left to edit: the server counts
-    /// what an Edit looks at, whether or not it changes it.
+    /// The Edit would change more Voxels than the player has left to change.
     VolumeLimited,
     /// A rotation that is not 0 to 7.
     BadRotation,

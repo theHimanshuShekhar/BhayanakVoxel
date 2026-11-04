@@ -159,6 +159,18 @@ impl EditBudget {
         spent
     }
 
+    /// Gives back `units` of work that were spent, up to what a rest has.
+    pub fn refund_work(&mut self, units: u64) {
+        let full = Self::full().work;
+        self.work = (self.work + units * u64::from(TICK_RATE_HZ)).min(full);
+    }
+
+    /// Gives back `changed` Voxels that were spent, up to what a rest has.
+    pub fn refund_volume(&mut self, changed: u64) {
+        let full = Self::full().voxels;
+        self.voxels = (self.voxels + changed * u64::from(TICK_RATE_HZ)).min(full);
+    }
+
     /// Whether `changed` Voxels are within what is left.
     pub fn has_volume(&self, changed: u64) -> bool {
         changed

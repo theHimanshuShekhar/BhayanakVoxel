@@ -7,9 +7,10 @@
 //! A Brush's axes are three mutually perpendicular integer vectors of whatever lengths come
 //! out, so that no angle is ever turned into a number. The up axis is the exact radial direction
 //! at the centre: the centre's own vector, as the Planet's centre is the origin (or the grid's +y
-//! in [`Alignment::World`]). One horizontal axis is the cross product of up with the grid axis it
-//! is least along, which cannot be parallel to it, and the other is the cross product of up with
-//! that. The Brush's `rotation` turns it about up in steps of 45 degrees.
+//! in [`Alignment::World`]). One horizontal axis is the cross product of up with the grid's y axis
+//! (east, round the Planet's pole on y), or with x at the two points where up is along y, and the
+//! other is the cross product of up with that. The one pole, and no other seam, is where the
+//! horizontal axes turn quickly; the Brush's `rotation` turns it about up in steps of 45 degrees.
 //!
 //! A Voxel is in a cube or a cylinder when its offset `d` from the centre, dotted with each axis
 //! `e`, is within the radius times that axis's length: `(d . e)^2 <= r^2 |e|^2`, in `i128`, so
@@ -212,12 +213,12 @@ fn up_vector(centre: VoxelCoord, alignment: Alignment) -> Vec3 {
 
 /// The two horizontal axes and then up, as perpendicular integer vectors: `[h0, h1, up]`.
 fn frame(up: Vec3) -> [Vec3; 3] {
-    // The grid axis that up is least along (the first of a tie), which cannot be parallel to it,
-    // so the cross product is not zero.
-    let least = (0..3).min_by_key(|&a| up[a].abs()).expect("three axes");
-    let mut grid = [0; 3];
-    grid[least] = 1;
-    let h0 = cross(up, grid);
+    // East round the y axis, which turns smoothly with up everywhere but at the poles on y, where
+    // the cross product is zero and x is used.
+    let mut h0 = cross(up, [0, 1, 0]);
+    if h0 == [0; 3] {
+        h0 = cross(up, [1, 0, 0]);
+    }
     [h0, cross(up, h0), up]
 }
 
@@ -304,6 +305,68 @@ impl Footprint {
         !square_times_exceeds(twice, up.unsigned_abs(), room.unsigned_abs())
     }
 
+    /// Whether no Voxel of the box that is `low` to `high` from the centre (inclusive, along each
+    /// grid axis) can be in the Brush. Exact in the one direction that matters: when it says yes,
+    /// there is none, so a brick that it says yes of need not be read. It may say no of a box that
+    /// has none. It looks at the box against each of the Brush's slabs (the Voxels between two
+    /// planes square to an axis), which is where the corners of the box that holds the Brush are
+    /// cut off, and against a sphere that holds the Brush.
+    fn misses(&self, low: Vec3, high: Vec3) -> bool {
+        let r2 = i128::from(self.radius * self.radius);
+        let [n0, n1, up] = self.norms;
+        // The Voxels of the box, dotted with `axis`, are between these.
+        let range = |axis: Vec3| -> (i64, i64) {
+            let (mut least, mut most) = (0, 0);
+            for a in 0..3 {
+                let (p, q) = (axis[a] * low[a], axis[a] * high[a]);
+                least += p.min(q);
+                most += p.max(q);
+            }
+            (least, most)
+        };
+        // The slab `(d . axis)^2 <= scale * r^2 |axis|^2` is missed if the range is all outside it.
+        let outside = |axis: Vec3, norm: i128, scale: i128| {
+            let (least, most) = range(axis);
+            let nearest = if least > 0 {
+                least
+            } else if most < 0 {
+                -most
+            } else {
+                return false;
+            };
+            sq(nearest) > scale * r2 * norm
+        };
+        // The nearest the box comes to the centre, squared: more than the sphere that holds the
+        // Brush, of `scale` times r squared.
+        let beyond = |scale: i128| {
+            let near: i128 = (0..3)
+                .map(|a| {
+                    let d = if low[a] > 0 {
+                        low[a]
+                    } else if high[a] < 0 {
+                        high[a]
+                    } else {
+                        0
+                    };
+                    sq(d)
+                })
+                .sum();
+            near > scale * r2
+        };
+        let [h0, h1, axis] = self.axes;
+        match self.shape {
+            Shape::Sphere => beyond(1),
+            Shape::Cube if self.turned => {
+                // The diamond is inside the slabs 2 r^2 wide along both horizontal axes.
+                outside(axis, up, 1) || outside(h0, n0, 2) || outside(h1, n1, 2) || beyond(3)
+            }
+            Shape::Cube => {
+                outside(axis, up, 1) || outside(h0, n0, 1) || outside(h1, n1, 1) || beyond(3)
+            }
+            Shape::Cylinder => outside(axis, up, 1) || beyond(2),
+        }
+    }
+
     /// The most whole Voxels that a Voxel of the Brush can be from its centre along grid axis `a`,
     /// or a little more where it is not known exactly.
     fn half_extent(&self, a: usize) -> i64 {
@@ -312,7 +375,8 @@ impl Footprint {
         let [n0, n1, nu] = self.norms;
         // `16 r |c| / sqrt n`, rounded up, for the part of an axis along the grid axis.
         let along = |c: i64, n: i128| sixteenths(256 * i128::from(r * r) * sq(c), n);
-        // The same for the distance from the axis, `r sqrt (1 - up_a^2 / |up|^2)`, times `k`.
+        // The same for the distance from the axis, `r sqrt (1 - up_a^2 / |up|^2)`, times the square
+        // root of `k`.
         let around = |k: i128| sixteenths(k * 256 * i128::from(r * r) * (nu - sq(up[a])), nu);
         let total = match self.shape {
             Shape::Sphere => return r,
@@ -542,14 +606,25 @@ pub fn plan_from(reads: &mut Reads, op: &EditOp) -> Vec<Change> {
         for y in low[1]..=high[1] {
             for z in low[2]..=high[2] {
                 let coord = BrickCoord([x, y, z]);
-                let brick = reads.brick(coord);
-                // Nothing to dig in air, and nowhere to place in a brick that is full.
-                match op.mode {
-                    EditMode::Dig if brick.is_air() => continue,
-                    EditMode::Place if brick.is_full() => continue,
+                let origin = coord.origin().0.map(i64::from);
+                // A brick that the Brush cannot reach is not read: the box that holds it has
+                // bricks at its corners that the shape does not touch.
+                let from_centre = |a: usize, voxel: i64| voxel - footprint.centre[a];
+                let low: Vec3 = std::array::from_fn(|a| from_centre(a, origin[a].max(first[a])));
+                let high: Vec3 = std::array::from_fn(|a| {
+                    from_centre(a, (origin[a] + i64::from(BRICK_SIZE) - 1).min(last[a]))
+                });
+                if footprint.misses(low, high) {
+                    continue;
+                }
+                // A Smooth reads the snapshot, and the others read the brick: nothing to dig in
+                // air, and nowhere to place in one that is full.
+                let brick = snapshot.is_none().then(|| reads.brick(coord));
+                match (op.mode, &brick) {
+                    (EditMode::Dig, Some(brick)) if brick.is_air() => continue,
+                    (EditMode::Place, Some(brick)) if brick.is_full() => continue,
                     _ => {}
                 }
-                let origin = coord.origin().0.map(i64::from);
                 let locals = locals_within(origin, first, last);
                 for lz in locals[2].clone() {
                     for ly in locals[1].clone() {
@@ -564,9 +639,10 @@ pub fn plan_from(reads: &mut Reads, op: &EditOp) -> Vec<Change> {
                             if !footprint.contains(d) {
                                 continue;
                             }
-                            let now = match &snapshot {
-                                Some(snapshot) => snapshot.get(at),
-                                None => brick.get(local),
+                            let now = match (&snapshot, &brick) {
+                                (Some(snapshot), _) => snapshot.get(at),
+                                (None, Some(brick)) => brick.get(local),
+                                (None, None) => unreachable!("one of the two is made"),
                             };
                             let to = match op.mode {
                                 EditMode::Dig => now.is_some().then_some(None),
@@ -904,9 +980,21 @@ mod tests {
                 upright >= WITHIN_2_DEGREES,
                 "{centre:?}: the cylinder leans, cos^2 {upright}"
             );
-            // And a Voxel on the axis, far up it, is in the Brush where the radial says.
-            let [_, _, up] = axes(VoxelCoord(centre), Alignment::Local);
-            assert_eq!(up, centre.map(i64::from));
+            // And a Voxel on the axis is in the Brush up to its half height, and not past it, on
+            // either side: the axis is the radial.
+            let length = radial.iter().map(|c| c * c).sum::<f64>().sqrt();
+            let on_axis = |steps: f64| -> VoxelCoord {
+                VoxelCoord(std::array::from_fn(|a| {
+                    centre[a] + (radial[a] / length * steps).round() as i32
+                }))
+            };
+            let listed: std::collections::BTreeSet<_> = cells.iter().map(|c| c.voxel).collect();
+            for steps in [19.0, -19.0, 10.0, 0.0] {
+                assert!(listed.contains(&on_axis(steps)), "{centre:?} {steps}");
+            }
+            for steps in [22.0, -22.0] {
+                assert!(!listed.contains(&on_axis(steps)), "{centre:?} {steps}");
+            }
         }
     }
 
@@ -1147,6 +1235,115 @@ mod tests {
             .with_ground(&ground)
             .with_cache(&mut cache);
         assert_eq!(plan_from(&mut reads, &again).len(), 1);
+    }
+
+    /// The Voxels of a Dig, a Place or a Flatten the slow way: every Voxel of the box that holds the
+    /// Brush, read from the store, with no brick left out.
+    fn plan_by_every_voxel(
+        store: &BrickStore,
+        op: &EditOp,
+    ) -> std::collections::BTreeSet<([i32; 3], Option<u16>)> {
+        let footprint = Footprint::of(op).unwrap();
+        let (first, last) = footprint.bounds();
+        let mut changes = std::collections::BTreeSet::new();
+        for x in first[0]..=last[0] {
+            for y in first[1]..=last[1] {
+                for z in first[2]..=last[2] {
+                    let d = [
+                        x - footprint.centre[0],
+                        y - footprint.centre[1],
+                        z - footprint.centre[2],
+                    ];
+                    if !footprint.contains(d) {
+                        continue;
+                    }
+                    let voxel = VoxelCoord([x as i32, y as i32, z as i32]);
+                    let now = store.voxel_at(0, voxel);
+                    let to = match op.mode {
+                        EditMode::Dig => now.is_some().then_some(None),
+                        EditMode::Place => now.is_none().then_some(Some(op.material)),
+                        EditMode::Flatten if dot(footprint.axes[2], d) > 0 => {
+                            now.is_some().then_some(None)
+                        }
+                        EditMode::Flatten => now.is_none().then_some(Some(op.material)),
+                        EditMode::Smooth => continue,
+                    };
+                    if let Some(to) = to {
+                        changes.insert((voxel.0, to.map(|m| m.0)));
+                    }
+                }
+            }
+        }
+        changes
+    }
+
+    #[test]
+    fn leaving_out_the_bricks_the_brush_misses_does_not_change_what_an_edit_does() {
+        // A source that has something in every brick near the surface, so that a brick left out
+        // that should not have been would be seen.
+        let store = rough_store();
+        let mut checked = 0;
+        for centre in [
+            [2000, 0, -300],
+            [3, 4, 12],
+            [1100, 700, 700],
+            [-870, -1, 870],
+            [100, 100, 0],
+        ] {
+            for shape in [Shape::Sphere, Shape::Cube, Shape::Cylinder] {
+                for mode in [EditMode::Dig, EditMode::Place, EditMode::Flatten] {
+                    for (alignment, rotation) in [
+                        (Alignment::Local, 0),
+                        (Alignment::Local, 1),
+                        (Alignment::World, 0),
+                    ] {
+                        let op = EditOp {
+                            mode,
+                            brush: Brush { shape, radius: 13 },
+                            centre: VoxelCoord(centre),
+                            material: STONE,
+                            alignment,
+                            rotation,
+                        };
+                        let planned: std::collections::BTreeSet<_> = plan(&store, &op)
+                            .into_iter()
+                            .map(|c| (c.voxel.0, c.to.map(|m| m.0)))
+                            .collect();
+                        assert_eq!(planned, plan_by_every_voxel(&store, &op), "{op:?}");
+                        checked += planned.len();
+                    }
+                }
+            }
+        }
+        assert!(checked > 100_000, "{checked}");
+    }
+
+    #[test]
+    fn the_bricks_that_are_read_are_a_good_deal_fewer_than_the_box_holds_for_a_tilted_cube() {
+        let op = EditOp {
+            brush: Brush {
+                shape: Shape::Cube,
+                radius: 20,
+            },
+            ..op(EditMode::Dig, Shape::Cube, 20, [1100, 700, 700])
+        };
+        let footprint = Footprint::of(&op).unwrap();
+        let (first, last) = footprint.bounds();
+        let (low, high) = bricks_of(first, last);
+        let (mut all, mut read) = (0, 0);
+        for x in low[0]..=high[0] {
+            for y in low[1]..=high[1] {
+                for z in low[2]..=high[2] {
+                    all += 1;
+                    let origin = BrickCoord([x, y, z]).origin().0.map(i64::from);
+                    let from = |a: usize, v: i64| v - footprint.centre[a];
+                    let lo: Vec3 = std::array::from_fn(|a| from(a, origin[a].max(first[a])));
+                    let hi: Vec3 = std::array::from_fn(|a| from(a, (origin[a] + 7).min(last[a])));
+                    read += usize::from(!footprint.misses(lo, hi));
+                }
+            }
+        }
+        assert!(read * 10 < all * 6, "{read} of {all}");
     }
 
     /// A store with a solid slab of `STONE` below y = 0, from -6 to 5 in x and z.
