@@ -46,6 +46,9 @@ pub const GUARD_FIRST: usize = 8;
 /// most this many to be taken in before it is taken. The frame takes in a hundred or so a frame.
 pub const MAX_AHEAD: usize = 512;
 
+/// How many jobs given up on the loader lets pile up before it takes them out of the queue.
+const PRUNE_FROM: usize = 256;
+
 /// The Guard: the whole Planet at the levels from `first` to the top of `store`'s pyramid, held
 /// in it; from then on the store streams, and a brick of level `first` is split when its children
 /// are resident. Returns how many bricks it holds. The bricks, and whether each is solid all the
@@ -297,6 +300,17 @@ impl Loader {
             state.stale = true;
         }
         state.cancelled.extend(self.cancels.drain(..));
+        // Workers skip a cancelled job only when they come to it, which they do not while they
+        // are as far ahead as they may be: so what was given up on is taken out of the queue
+        // once it is a share of it, in time that is a share of what was queued since. A ticket
+        // of a job that a worker has taken is of no use any more either.
+        if state.cancelled.len() >= PRUNE_FROM && state.cancelled.len() * 4 >= state.queue.len() {
+            let State {
+                queue, cancelled, ..
+            } = &mut *state;
+            queue.retain(|job| !cancelled.contains(&job.ticket));
+            cancelled.clear();
+        }
         let pushed = !self.outbox.is_empty();
         state.queue.extend(self.outbox.drain(..));
         drop(state);
@@ -364,6 +378,13 @@ impl Loader {
     #[cfg(test)]
     pub fn ahead(&self) -> usize {
         self.shared.ahead.load(Atomic::Relaxed)
+    }
+
+    /// Jobs in the workers' queue, and tickets marked as given up on there.
+    #[cfg(test)]
+    pub fn queue_sizes(&self) -> (usize, usize) {
+        let state = self.shared.lock();
+        (state.queue.len(), state.cancelled.len())
     }
 }
 
