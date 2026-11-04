@@ -7,7 +7,9 @@ use brick_store::{Brick, BrickCoord, BrickStore, LodRefresh, VoxelCoord};
 use materials::MaterialTable;
 use net::{EditMode, EditOp, RejectReason};
 
-use crate::brush::{self, Change};
+use crate::Ground;
+use crate::TICK_RATE_HZ;
+use crate::brush::{BrickCache, Change, MAX_COORD, implied_brick};
 
 /// Largest Brush a player may use: 2 m at 10 cm Voxels (issue 15).
 pub const MAX_BRUSH_RADIUS: u16 = 20;
@@ -21,30 +23,157 @@ pub const OPS_PER_SECOND: u32 = 20;
 /// Voxels a player's Edits may change per second: 8 m^3 (issue 15).
 pub const VOXELS_PER_SECOND: u32 = 8_000;
 
-/// Voxels a player may change at once after a rest: nine seconds' worth, which is enough for the
-/// biggest Brush there is (a cube of 41 Voxels a side, 68 921) to be used on its own.
+/// Voxels a player may change in one burst after a rest: nine seconds' worth, which is enough for
+/// the biggest Brush (a cube of 41 Voxels a side, 68 921) to be used on its own.
 pub const VOXEL_BURST: u32 = 9 * VOXELS_PER_SECOND;
 
+/// The biggest Brush that a Smooth or a Flatten may use: 1 m, which is 2 m across. They read
+/// the Voxels beside the ones they change (a Smooth, 27 for each) and are the dearest to work out.
+pub const MAX_SMOOTH_RADIUS: u16 = 10;
+
+/// How many times as dear a Voxel that a Smooth looks at is as one that another Edit does: a
+/// Smooth reads the 27 Voxels round each (35 to 60 ns in release against 4 to 12).
+pub const SMOOTH_WEIGHT: u64 = 6;
+
+/// Units of work a player may ask of the server per second. A unit is what the server spends on
+/// looking at a Voxel for a Dig, Place or Flatten, about 10 ns, so this is 6 ms of the server's
+/// time a second for each player. What an Edit asks is [`work`], which does not depend on what
+/// is in the Planet, and is known before the Edit is worked out.
+pub const WORK_PER_SECOND: u64 = 600_000;
+
+/// Units of work a player may ask for at once after a rest: more than any one Edit that
+/// [`validate`] lets through can be (a leaning cube of 41 Voxels, turned an eighth, has a box of
+/// about 350 000 Voxels), so that any one Brush can be used from rest.
+pub const WORK_BURST: u64 = 360_000;
+
+/// What the server has to spend to work out `op`, in units (see [`WORK_PER_SECOND`]): the Voxels
+/// of the box that holds its Brush ([`crate::examined`]), whatever it ends up changing, and for a
+/// Smooth [`SMOOTH_WEIGHT`] times as many. An op that no box holds costs more than anyone has.
+pub fn work(op: &EditOp) -> u64 {
+    let weight = if op.mode == EditMode::Smooth {
+        SMOOTH_WEIGHT
+    } else {
+        1
+    };
+    crate::examined(op).saturating_mul(weight)
+}
+
 /// What the server checks of an Edit before it applies it, apart from the limits that depend on
-/// who asked and when (reach and rates: see [`within_reach`] and the server): that the Brush is
-/// no bigger than a player may use, that it has Voxel coordinates to be in, and that the Material
-/// it fills with is one that the table defines.
+/// who asked and when (reach, rates and volume: see [`within_reach`], [`EditBudget`] and the
+/// server): that the Brush is no bigger than a player may use (a Smooth or a Flatten no bigger
+/// than [`MAX_SMOOTH_RADIUS`]), that its centre is within [`MAX_COORD`] of the Planet's, that its
+/// rotation is one of the 8, and that the Material it fills with is one that the table defines.
 pub fn validate(op: &EditOp) -> Result<(), RejectReason> {
-    if op.brush.radius > MAX_BRUSH_RADIUS {
+    let shaping = matches!(op.mode, EditMode::Smooth | EditMode::Flatten);
+    let largest = if shaping {
+        MAX_SMOOTH_RADIUS
+    } else {
+        MAX_BRUSH_RADIUS
+    };
+    if op.brush.radius > largest {
         return Err(RejectReason::BrushTooLarge);
     }
-    let extent = brush::extent(op.brush);
-    let fits = |c: i32| {
-        i64::from(c) - extent >= i64::from(i32::MIN) && i64::from(c) + extent <= i64::from(i32::MAX)
-    };
-    if !op.centre.0.into_iter().all(fits) {
+    if op
+        .centre
+        .0
+        .into_iter()
+        .any(|c| c.unsigned_abs() > MAX_COORD.unsigned_abs())
+    {
         return Err(RejectReason::OutOfRange);
+    }
+    if op.rotation >= 8 {
+        return Err(RejectReason::BadRotation);
     }
     let fills = matches!(op.mode, EditMode::Place | EditMode::Flatten);
     if fills && MaterialTable::built_in().get(op.material).is_none() {
         return Err(RejectReason::UnknownMaterial);
     }
     Ok(())
+}
+
+/// What one player may still ask of the server in Edits: a token bucket for each of three limits,
+/// in integers so that it does not depend on a clock. Credit is counted in 1/[`TICK_RATE_HZ`] of
+/// an Edit, a Voxel or a unit of work, so that each tick adds a whole number (the rate per
+/// second) and an Edit, a Voxel or a unit costs [`TICK_RATE_HZ`]. The limits are:
+///
+/// - the Edits made, [`OPS_PER_SECOND`];
+/// - the Voxels changed, [`VOXELS_PER_SECOND`]: what the Planet loses or gains, known once the
+///   Edit is worked out;
+/// - the work asked of the server, [`WORK_PER_SECOND`]: what working it out costs, known from
+///   the op alone, which is what stops an Edit that changes nothing from being free.
+///
+/// The server keeps one for each player, and the player's client keeps another, ticked as its
+/// character is, so that it can tell that an Edit will be turned down and not make it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EditBudget {
+    ops: u32,
+    voxels: u64,
+    work: u64,
+}
+
+impl EditBudget {
+    /// What a player has after a rest: a second of Edits, [`VOXEL_BURST`] Voxels and
+    /// [`WORK_BURST`] units of work.
+    pub fn full() -> Self {
+        Self {
+            ops: OPS_PER_SECOND * TICK_RATE_HZ,
+            voxels: u64::from(VOXEL_BURST) * u64::from(TICK_RATE_HZ),
+            work: WORK_BURST * u64::from(TICK_RATE_HZ),
+        }
+    }
+
+    /// One tick's credit.
+    pub fn refill(&mut self) {
+        let full = Self::full();
+        self.ops = (self.ops + OPS_PER_SECOND).min(full.ops);
+        self.voxels = (self.voxels + u64::from(VOXELS_PER_SECOND)).min(full.voxels);
+        self.work = (self.work + WORK_PER_SECOND).min(full.work);
+    }
+
+    /// Spends one Edit's credit, if there is that much.
+    pub fn take_op(&mut self) -> bool {
+        self.ops
+            .checked_sub(TICK_RATE_HZ)
+            .map(|ops| self.ops = ops)
+            .is_some()
+    }
+
+    /// Whether there is an Edit's credit.
+    pub fn has_op(&self) -> bool {
+        self.ops >= TICK_RATE_HZ
+    }
+
+    /// Whether `units` of work are within what is left.
+    pub fn has_work(&self, units: u64) -> bool {
+        units
+            .checked_mul(u64::from(TICK_RATE_HZ))
+            .is_some_and(|cost| cost <= self.work)
+    }
+
+    /// Spends `units` of work, if there is that much.
+    pub fn take_work(&mut self, units: u64) -> bool {
+        let spent = self.has_work(units);
+        if spent {
+            self.work -= units * u64::from(TICK_RATE_HZ);
+        }
+        spent
+    }
+
+    /// Whether `changed` Voxels are within what is left.
+    pub fn has_volume(&self, changed: u64) -> bool {
+        changed
+            .checked_mul(u64::from(TICK_RATE_HZ))
+            .is_some_and(|cost| cost <= self.voxels)
+    }
+
+    /// Spends `changed` Voxels' credit, if there is that much.
+    pub fn take_volume(&mut self, changed: u64) -> bool {
+        let spent = self.has_volume(changed);
+        if spent {
+            self.voxels -= changed * u64::from(TICK_RATE_HZ);
+        }
+        spent
+    }
 }
 
 /// Whether `centre` is within [`EDIT_REACH`] of `eye`, a position in Voxels.
@@ -95,7 +224,7 @@ impl Undo {
     }
 }
 
-/// Applies `op` to `store`: writes the Voxels that [`brush::plan`] lists for it. The Edit should
+/// Applies `op` to `store`: writes the Voxels that [`crate::plan`] lists for it. The Edit should
 /// have passed [`validate`].
 ///
 /// The Planet's core is not in the store (see [`planet_gen::generate_planet`]); it is what the
@@ -108,18 +237,29 @@ impl Undo {
 /// this returns, remaking only the coarse bricks over the bricks that changed. The returned
 /// [`Undo::lod`] lists the coarse bricks whose content changed.
 pub fn apply(store: &mut BrickStore, op: &EditOp) -> Undo {
-    let changes = brush::plan(store, op);
+    let changes = crate::plan(store, op);
     apply_changes(store, &changes)
 }
 
-/// Writes `changes`, which [`brush::plan`] made from `store` as it is now.
+/// Writes `changes`, which [`crate::plan`] made from `store` as it is now.
 pub fn apply_changes(store: &mut BrickStore, changes: &[Change]) -> Undo {
+    apply_changes_from(store, changes, None, None)
+}
+
+/// [`apply_changes`], finding the bricks that the store does not hold in the character's `ground`
+/// and through the `cache`, as [`crate::plan_from`] does, and not by making them again.
+pub fn apply_changes_from(
+    store: &mut BrickStore,
+    changes: &[Change],
+    ground: Option<&Ground>,
+    mut cache: Option<&mut BrickCache>,
+) -> Undo {
     let mut undo = Undo::default();
     for group in changes.chunk_by(|a, b| a.voxel.brick() == b.voxel.brick()) {
         let brick = group[0].voxel.brick();
         let before = store.brick(brick).cloned();
         if before.is_none() {
-            let implied = store.brick_at(0, brick).into_owned();
+            let implied = implied_brick(store, ground, cache.as_deref_mut(), brick);
             if !implied.is_air() {
                 store.insert(brick, implied);
             }
@@ -394,15 +534,17 @@ mod tests {
             validate(&op([0; 3], MAX_BRUSH_RADIUS + 1)),
             Err(RejectReason::BrushTooLarge)
         );
-        assert_eq!(validate(&op([i32::MAX - 20, 0, 0], 20)), Ok(()));
-        assert_eq!(
-            validate(&op([i32::MAX - 19, 0, 0], 20)),
-            Err(RejectReason::OutOfRange)
-        );
-        assert_eq!(
-            validate(&op([0, i32::MIN + 19, 0], 20)),
-            Err(RejectReason::OutOfRange)
-        );
+        let edge = MAX_COORD;
+        assert_eq!(validate(&op([edge, -edge, edge], 20)), Ok(()));
+        for centre in [[edge + 1, 0, 0], [0, -edge - 1, 0], [0, 0, i32::MAX]] {
+            assert_eq!(validate(&op(centre, 20)), Err(RejectReason::OutOfRange));
+        }
+        let turned = |rotation| EditOp {
+            rotation,
+            ..op([0; 3], 5)
+        };
+        assert_eq!(validate(&turned(7)), Ok(()));
+        assert_eq!(validate(&turned(8)), Err(RejectReason::BadRotation));
     }
 
     #[test]
@@ -432,23 +574,144 @@ mod tests {
     }
 
     #[test]
-    fn validate_keeps_a_tilted_cube_and_cylinder_inside_the_voxel_range_by_their_corners() {
-        // A cube reaches its radius times the square root of 3 along an axis when it is tilted,
-        // and a cylinder times the square root of 2: 34 and 28 Voxels at the largest radius.
-        let at = |shape, x: i32| EditOp {
-            brush: Brush { shape, radius: 20 },
-            ..EditOp::dig_sphere(VoxelCoord([x, 0, 0]), 0)
+    fn the_budget_takes_20_edits_a_burst_of_voxels_and_of_work_and_gives_them_back_by_the_tick() {
+        let mut budget = EditBudget::full();
+        for _ in 0..OPS_PER_SECOND {
+            assert!(budget.has_op() && budget.take_op());
+        }
+        assert!(!budget.take_op() && !budget.has_op());
+        // Three ticks bring back an Edit.
+        for _ in 0..TICK_RATE_HZ / OPS_PER_SECOND {
+            budget.refill();
+        }
+        assert!(budget.take_op() && !budget.take_op());
+
+        // Voxels changed: 72 000 at once, and 8 000 a second.
+        let mut budget = EditBudget::full();
+        assert!(budget.has_volume(u64::from(VOXEL_BURST)));
+        assert!(!budget.has_volume(u64::from(VOXEL_BURST) + 1));
+        assert!(!budget.has_volume(u64::MAX));
+        assert!(budget.take_volume(70_000));
+        assert!(
+            !budget.take_volume(2_001),
+            "only 2 000 left, and nothing was taken"
+        );
+        assert!(budget.take_volume(2_000));
+        assert!(!budget.take_volume(1));
+        for _ in 0..TICK_RATE_HZ {
+            budget.refill();
+        }
+        assert!(budget.take_volume(8_000) && !budget.take_volume(1));
+
+        // Work: a burst that is more than any one Edit can ask, and the rate a second.
+        let mut budget = EditBudget::full();
+        assert!(budget.has_work(WORK_BURST) && !budget.has_work(WORK_BURST + 1));
+        assert!(!budget.has_work(u64::MAX));
+        assert!(budget.take_work(WORK_BURST - 5));
+        assert!(!budget.take_work(6) && budget.take_work(5));
+        // A tick brings back 10 000 units, and a second all of the burst, and no more.
+        budget.refill();
+        assert!(
+            budget.take_work(WORK_PER_SECOND / u64::from(TICK_RATE_HZ)) && !budget.take_work(1)
+        );
+        for _ in 0..TICK_RATE_HZ {
+            budget.refill();
+        }
+        assert!(budget.has_work(WORK_BURST) && !budget.has_work(WORK_BURST + 1));
+        // The three do not draw on each other.
+        let mut budget = EditBudget::full();
+        budget.take_work(WORK_BURST);
+        assert!(budget.take_op() && budget.take_volume(1));
+    }
+
+    #[test]
+    fn what_an_edit_asks_of_the_server_is_its_box_and_a_smooth_asks_six_times_as_much() {
+        let at = |mode, centre, radius| EditOp {
+            mode,
+            ..EditOp::dig_sphere(VoxelCoord(centre), radius)
         };
-        assert_eq!(validate(&at(Shape::Cube, i32::MAX - 34)), Ok(()));
+        let dig = at(EditMode::Dig, [1500, 0, 0], 10);
+        assert_eq!(work(&dig), 21 * 21 * 21);
+        assert_eq!(work(&at(EditMode::Place, [1500, 0, 0], 10)), 21 * 21 * 21);
         assert_eq!(
-            validate(&at(Shape::Cube, i32::MAX - 33)),
-            Err(RejectReason::OutOfRange)
+            work(&at(EditMode::Smooth, [1500, 0, 0], 10)),
+            SMOOTH_WEIGHT * 21 * 21 * 21
         );
-        assert_eq!(validate(&at(Shape::Cylinder, i32::MAX - 28)), Ok(()));
         assert_eq!(
-            validate(&at(Shape::Cylinder, i32::MAX - 27)),
-            Err(RejectReason::OutOfRange)
+            work(&at(EditMode::Dig, [MAX_COORD + 1, 0, 0], 10)),
+            u64::MAX
         );
+    }
+
+    #[test]
+    fn no_edit_that_is_allowed_asks_for_more_work_than_the_burst_and_a_leaning_cube_asks_a_lot() {
+        let mut most = 0;
+        for mode in [
+            EditMode::Dig,
+            EditMode::Place,
+            EditMode::Smooth,
+            EditMode::Flatten,
+        ] {
+            for shape in [Shape::Sphere, Shape::Cube, Shape::Cylinder] {
+                for rotation in 0..8 {
+                    // The centres that lean the most from the grid, and some that do not.
+                    for centre in [
+                        [1100, 700, 700],
+                        [1000, 1000, 1000],
+                        [3, 4, 12],
+                        [-870, 870, 870],
+                        [1500, 0, 0],
+                        [999_983, 777_777, -555_555],
+                        [MAX_COORD, MAX_COORD, MAX_COORD],
+                    ] {
+                        let radius = if matches!(mode, EditMode::Smooth | EditMode::Flatten) {
+                            MAX_SMOOTH_RADIUS
+                        } else {
+                            MAX_BRUSH_RADIUS
+                        };
+                        let op = EditOp {
+                            mode,
+                            brush: Brush { shape, radius },
+                            centre: VoxelCoord(centre),
+                            material: STONE,
+                            alignment: Alignment::Local,
+                            rotation,
+                        };
+                        assert_eq!(validate(&op), Ok(()), "{op:?}");
+                        assert!(work(&op) <= WORK_BURST, "{op:?}: {}", work(&op));
+                        most = most.max(work(&op));
+                    }
+                }
+            }
+        }
+        // A tilted cube of 4 m is most of it.
+        assert!(most > 300_000, "{most}");
+    }
+
+    #[test]
+    fn a_smooth_or_a_flatten_is_no_bigger_than_radius_10_and_a_dig_or_a_place_than_radius_20() {
+        let with = |mode, radius| EditOp {
+            mode,
+            ..EditOp::dig_sphere(VoxelCoord([5, 5, 5]), radius)
+        };
+        let material = |op: EditOp| EditOp {
+            material: STONE,
+            ..op
+        };
+        for mode in [EditMode::Smooth, EditMode::Flatten] {
+            assert_eq!(validate(&material(with(mode, 10))), Ok(()));
+            assert_eq!(
+                validate(&material(with(mode, 11))),
+                Err(RejectReason::BrushTooLarge)
+            );
+        }
+        for mode in [EditMode::Dig, EditMode::Place] {
+            assert_eq!(validate(&material(with(mode, 20))), Ok(()));
+            assert_eq!(
+                validate(&material(with(mode, 21))),
+                Err(RejectReason::BrushTooLarge)
+            );
+        }
     }
 
     #[test]
@@ -477,6 +740,7 @@ mod tests {
                             centre: VoxelCoord(centre),
                             material: STONE,
                             alignment,
+                            rotation: 0,
                         });
                     }
                 }

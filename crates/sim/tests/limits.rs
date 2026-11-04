@@ -22,6 +22,7 @@ fn place(shape: Shape, radius: u16, centre: [i32; 3]) -> EditOp {
         centre: VoxelCoord(centre),
         material: Material(35),
         alignment: Alignment::World,
+        rotation: 0,
     }
 }
 

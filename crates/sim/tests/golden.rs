@@ -124,8 +124,8 @@ fn golden_edits_in_the_core() {
     check("core lod", &lod, &CORE_LOD_GOLDEN);
 }
 
-/// One Edit of the Brush goldens: mode, shape, radius, centre, Material and alignment.
-type Brushed = (EditMode, Shape, u16, [i32; 3], u16, Alignment);
+/// One Edit of the Brush goldens: mode, shape, radius, centre, Material, alignment and rotation.
+type Brushed = (EditMode, Shape, u16, [i32; 3], u16, Alignment, u8);
 
 use Alignment::{Local, World};
 use EditMode::{Dig, Flatten, Place, Smooth};
@@ -135,31 +135,31 @@ use Shape::{Cube, Cylinder, Sphere};
 /// each shape, built on again with each, rounded off and levelled, with the Brush aligned to the
 /// Planet and to the grid.
 const SURFACE_BRUSHES: &[Brushed] = &[
-    (Dig, Cube, 9, [1490, 0, 0], 0, Local),
-    (Dig, Cylinder, 12, [1488, 6, -4], 0, World),
-    (Place, Cylinder, 6, [1494, 0, 0], 35, Local),
-    (Place, Cube, 5, [1498, -3, 2], 42, World),
-    (Place, Sphere, 8, [1492, 4, 4], 7, Local),
-    (Smooth, Sphere, 10, [1490, 2, 0], 0, Local),
-    (Smooth, Cube, 7, [1496, -2, 3], 0, World),
-    (Flatten, Cylinder, 14, [1491, 0, 1], 35, Local),
-    (Flatten, Cube, 8, [1489, -5, -5], 7, World),
-    (Dig, Sphere, 20, [1478, 0, 0], 0, Local),
+    (Dig, Cube, 9, [1490, 0, 0], 0, Local, 1),
+    (Dig, Cylinder, 12, [1488, 6, -4], 0, World, 0),
+    (Place, Cylinder, 6, [1494, 0, 0], 35, Local, 0),
+    (Place, Cube, 5, [1498, -3, 2], 42, World, 1),
+    (Place, Sphere, 8, [1492, 4, 4], 7, Local, 0),
+    (Smooth, Sphere, 10, [1490, 2, 0], 0, Local, 0),
+    (Smooth, Cube, 7, [1496, -2, 3], 0, World, 0),
+    (Flatten, Cylinder, 10, [1491, 0, 1], 35, Local, 0),
+    (Flatten, Cube, 8, [1489, -5, -5], 7, World, 3),
+    (Dig, Sphere, 20, [1478, 0, 0], 0, Local, 0),
 ];
 
 /// Edits in the Planet's core, where up is every other way than +x: tilted cubes and cylinders
 /// dug into the rock, refilled, rounded and levelled against a tangent plane that is not square
 /// to the grid.
 const CORE_BRUSHES: &[Brushed] = &[
-    (Dig, Cube, 8, [20, 20, 3], 0, Local),
-    (Dig, Cylinder, 10, [-12, 13, 14], 0, Local),
-    (Place, Cylinder, 5, [20, 20, 3], 7, Local),
-    (Place, Cube, 6, [-12, 13, 14], 35, Local),
-    (Smooth, Sphere, 9, [18, 18, 2], 0, Local),
-    (Flatten, Cube, 9, [-10, 12, 12], 42, Local),
-    (Flatten, Cylinder, 7, [30, 0, 30], 7, Local),
-    (Dig, Cube, 12, [0, -30, 4], 0, World),
-    (Smooth, Cylinder, 8, [12, -18, 16], 0, World),
+    (Dig, Cube, 8, [20, 20, 3], 0, Local, 1),
+    (Dig, Cylinder, 10, [-12, 13, 14], 0, Local, 0),
+    (Place, Cylinder, 5, [20, 20, 3], 7, Local, 0),
+    (Place, Cube, 6, [-12, 13, 14], 35, Local, 1),
+    (Smooth, Sphere, 9, [18, 18, 2], 0, Local, 0),
+    (Flatten, Cube, 9, [-10, 12, 12], 42, Local, 5),
+    (Flatten, Cylinder, 7, [30, 0, 30], 7, Local, 0),
+    (Dig, Cube, 12, [0, -30, 4], 0, World, 0),
+    (Smooth, Cylinder, 8, [12, -18, 16], 0, World, 0),
 ];
 
 /// One Place in free space for each of the 26 directions the Planet's up snaps to, in turn a cube
@@ -171,13 +171,24 @@ fn free_brushes() -> Vec<Brushed> {
             for z in -1..=1 {
                 if (x, y, z) != (0, 0, 0) {
                     let shape = if ops.len() % 2 == 0 { Cube } else { Cylinder };
-                    ops.push((Place, shape, 5, [x * 1000, y * 1000, z * 1000], 35, Local));
+                    ops.push((
+                        Place,
+                        shape,
+                        5,
+                        [x * 1000, y * 1000, z * 1000],
+                        35,
+                        Local,
+                        0,
+                    ));
                 }
             }
         }
     }
-    ops.push((Flatten, Cube, 9, [1000, 1000, 0], 7, Local));
-    ops.push((Smooth, Sphere, 7, [0, -1000, -1000], 0, Local));
+    ops.push((Flatten, Cube, 9, [1000, 1000, 0], 7, Local, 0));
+    ops.push((Smooth, Sphere, 7, [0, -1000, -1000], 0, Local, 0));
+    // Then the two that turn: a cube and the flatten of one, an eighth of a turn about up.
+    ops.push((Place, Cube, 6, [1000, 1000, 1000], 42, Local, 1));
+    ops.push((Flatten, Cube, 7, [-1000, 0, 1000], 35, Local, 3));
     ops
 }
 
@@ -186,47 +197,50 @@ fn free_brushes() -> Vec<Brushed> {
 fn run_brushes(mut store: BrickStore, levels: usize, ops: &[Brushed]) -> (Vec<u64>, Vec<u64>) {
     store.build_lod(levels);
     ops.iter()
-        .map(|&(mode, shape, radius, centre, material, alignment)| {
-            let op = EditOp {
-                mode,
-                brush: Brush { shape, radius },
-                centre: VoxelCoord(centre),
-                material: Material(material),
-                alignment,
-            };
-            assert_eq!(sim::validate(&op), Ok(()), "{op:?}");
-            sim::apply(&mut store, &op);
-            (store.content_hash(), store.lod_hash())
-        })
+        .map(
+            |&(mode, shape, radius, centre, material, alignment, rotation)| {
+                let op = EditOp {
+                    mode,
+                    brush: Brush { shape, radius },
+                    centre: VoxelCoord(centre),
+                    material: Material(material),
+                    alignment,
+                    rotation,
+                };
+                assert_eq!(sim::validate(&op), Ok(()), "{op:?}");
+                sim::apply(&mut store, &op);
+                (store.content_hash(), store.lod_hash())
+            },
+        )
         .unzip()
 }
 
 #[rustfmt::skip]
 const SURFACE_BRUSHES_GOLDEN: [u64; 10] = [
-    0xde6763a27e20d231, 0x853250e977f1a48d, 0xcba73f3adbc0e270, 0x71205ccdd3e3d363,
-    0xcc8eb58c3636fdfc, 0x3c09bc20dee763fc, 0x2676b77b277d7034, 0xa11c3ce418ccca3e,
-    0x69f0448a60dd2e2d, 0x8f975e9c0360c75b,
+    0xf57145a090bcbe6a, 0x19b320594a6481fc, 0xda8412aa525cfdd3, 0xccaf7e076ae9ee53,
+    0x7d5fe8a2bcca6fa5, 0x97fd42774e3efe8a, 0xa1ab407510330ec3, 0x2357ba32e84a4f37,
+    0x6dab7b729b4a03fc, 0xdc1b4fc7e33c3aca,
 ];
 #[rustfmt::skip]
 const SURFACE_BRUSHES_LOD_GOLDEN: [u64; 10] = [
-    0x29374ae5903b4792, 0x3507e9bdb5b987e1, 0x7c071d968574fa00, 0x47f8d433e46c990c,
-    0x5e7d523c55447234, 0x6ce0953b1e7b09f4, 0x40808873f689fcb7, 0x812c3e3ed6c987c3,
-    0xf6cec76ebae38d9c, 0x4b9798b659f6f443,
+    0xea2421f445a8c61d, 0xf08377e7e8611814, 0x0167f0b4a5621694, 0x262a0dd8dcfcd23b,
+    0x13a29576157f15ee, 0x7965b7e990e2652c, 0x63dafb67542fbee4, 0xc91e103dbfc63e27,
+    0xf496b073ed1f47f3, 0xa8ac88a169e26429,
 ];
 #[rustfmt::skip]
 const CORE_BRUSHES_GOLDEN: [u64; 9] = [
-    0xbb04f09c434fa261, 0xa39212fb0eb2adb4, 0x6553d51e63e45890, 0xcbc5b9d22f9f9a61,
-    0x42e033bf14dbd0c0, 0xb34a294b68e1e3e3, 0xa54190bc95637457, 0x2ff22a4df9aa15e6,
-    0xf3cde748fc53d68e,
+    0x561479085abb3301, 0xa8b6cdfd4807505a, 0x6eda932dc1aafb3b, 0x555633665a3b0064,
+    0xf068d011253a86b1, 0x35a12f47ef570f87, 0x9e6ba592fa24dc57, 0x4af64ad2c22e148a,
+    0xbb67ef3736270416,
 ];
 #[rustfmt::skip]
 const CORE_BRUSHES_LOD_GOLDEN: [u64; 9] = [
-    0x2d388147b8f48653, 0x39f55945b5a8a1c3, 0x1236ca8e465cc70a, 0xc6c8915f455e9c02,
-    0x8a745a96cab6407d, 0xc302160b5822511d, 0xa18aa0a1f8ab278e, 0x595888255985342c,
-    0x595888255985342c,
+    0x9b18dc7a3dfa8849, 0x75a22689c176230f, 0xce82db311c010e57, 0x0ea0595d23a079ce,
+    0xb5cfd343511b4500, 0x32a2de4b8496135f, 0xe4ccad0057a0c332, 0xdb4b2e7bf485ee1c,
+    0xdb4b2e7bf485ee1c,
 ];
 #[rustfmt::skip]
-const FREE_BRUSHES_GOLDEN: [u64; 28] = [
+const FREE_BRUSHES_GOLDEN: [u64; 30] = [
     0xcae4b8069c7674cf, 0x8998d6610ff961ca, 0xbabae5ecc61a7195, 0x284e936d38f7ee92,
     0xe8e2624bf49c51d6, 0x7ef3fdb3e6f0beb2, 0x3882613b92df6e43, 0x8e1ba4ea5e974a19,
     0x469f94e6d557d44a, 0xefbe9173b66f76c9, 0xd53816e2c7a440b1, 0xc42f6aa8d4ee0219,
@@ -234,9 +248,10 @@ const FREE_BRUSHES_GOLDEN: [u64; 28] = [
     0x211dd13404ac624a, 0x10f0705eaf608566, 0xb413bcc2f4698f0e, 0x08330f21330172ee,
     0x01839a35078265ec, 0x21ecc13c8ddb9283, 0x633219b99e442f05, 0x41e7c042ee8c93dd,
     0x405bf64c17494d91, 0xbf31ca4e5e0ae8d8, 0x3d656f346290f173, 0x9292f675274fadc1,
+    0x97f317c2b1b4a1f2, 0x40374760238b5ea5,
 ];
 #[rustfmt::skip]
-const FREE_BRUSHES_LOD_GOLDEN: [u64; 28] = [
+const FREE_BRUSHES_LOD_GOLDEN: [u64; 30] = [
     0x26bca923600eb91f, 0xade2c5cf9a057352, 0x939ed26f2a86b640, 0xe951fa08822795a9,
     0xf1b595c82201a8a8, 0x8893aee484dd1ca9, 0xcf68694ec3247590, 0xf4c16d411a262f07,
     0xb24ae3691df551c9, 0x2717d6e6a4ae9f09, 0xaa2622ceca928b9a, 0xde179549b33aeedc,
@@ -244,6 +259,7 @@ const FREE_BRUSHES_LOD_GOLDEN: [u64; 28] = [
     0xd6d838b8b4ca599d, 0x3963997be449d1af, 0x35bb4d76003c848a, 0xafc44a0a369324a6,
     0x49585d9a5f805ed4, 0x3e60cb702c1b1796, 0xc4d9845e76625c6d, 0x89ae5fdb8d1c69c0,
     0xb23cbc832ea25efe, 0xd315a6e4e9537dfd, 0x90f3c5f65a9c40b0, 0x3bd6331576fc7aff,
+    0xd894777ce17a5bfa, 0x3e13fa4abe268666,
 ];
 
 #[test]

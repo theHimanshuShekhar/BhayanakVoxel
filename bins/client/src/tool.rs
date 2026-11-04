@@ -3,7 +3,7 @@
 use brick_store::{Material, VoxelCoord};
 use materials::MaterialTable;
 use net::{Alignment, Brush, EditMode, EditOp, Shape};
-use sim::MAX_BRUSH_RADIUS;
+use sim::{MAX_BRUSH_RADIUS, MAX_SMOOTH_RADIUS};
 use winit::keyboard::KeyCode;
 
 /// The radius the client starts with: 1 m at 10 cm Voxels.
@@ -32,8 +32,9 @@ impl Default for Tool {
 }
 
 impl Tool {
-    /// The Edit that this tool makes at `centre`.
-    pub fn op(&self, centre: VoxelCoord) -> EditOp {
+    /// The Edit that this tool makes at `centre`, with the Brush turned `rotation` steps of 45
+    /// degrees about up (see [`rotation_for`]).
+    pub fn op(&self, centre: VoxelCoord, rotation: u8) -> EditOp {
         let fills = matches!(self.mode, EditMode::Place | EditMode::Flatten);
         EditOp {
             mode: self.mode,
@@ -45,6 +46,7 @@ impl Tool {
             // The other modes ignore it, and an op is the same whatever was picked last.
             material: if fills { self.material } else { Material(0) },
             alignment: self.alignment,
+            rotation,
         }
     }
 
@@ -66,7 +68,7 @@ impl Tool {
                 }
             }
             KeyCode::BracketLeft => self.radius = self.radius.saturating_sub(1),
-            KeyCode::BracketRight => self.radius = (self.radius + 1).min(MAX_BRUSH_RADIUS),
+            KeyCode::BracketRight => self.radius += 1,
             KeyCode::Minus => self.step_material(false),
             KeyCode::Equal => self.step_material(true),
             KeyCode::KeyG => {
@@ -77,7 +79,17 @@ impl Tool {
             }
             _ => return false,
         }
+        // A Smooth or a Flatten is a smaller Brush than a Dig or a Place may be.
+        self.radius = self.radius.min(self.largest());
         true
+    }
+
+    /// The biggest radius that the server allows this tool's mode.
+    fn largest(&self) -> u16 {
+        match self.mode {
+            EditMode::Smooth | EditMode::Flatten => MAX_SMOOTH_RADIUS,
+            EditMode::Dig | EditMode::Place => MAX_BRUSH_RADIUS,
+        }
     }
 
     /// The next Material of the table, or the previous, wrapping round.
@@ -123,6 +135,36 @@ impl Tool {
     }
 }
 
+/// The length of the part of the view's direction across up, below which the view is looking along
+/// up: the sine of about 11 degrees.
+const LOOKING_ALONG_UP: f64 = 0.2;
+
+/// How many steps of 45 degrees, 0 to 7, to turn a Brush at `centre` about its up axis so that its
+/// sides face `heading` as nearly as they can: the direction in the Planet frame that the camera
+/// looks, measured round from the Brush's first horizontal axis ([`sim::axes`]) towards its
+/// second. A Brush on the grid is not turned.
+pub fn rotation_for(centre: VoxelCoord, alignment: Alignment, heading: [f64; 3]) -> u8 {
+    if alignment == Alignment::World {
+        return 0;
+    }
+    let [h0, h1, _] = sim::axes(centre, alignment);
+    let along = |axis: [i64; 3]| {
+        let axis = axis.map(|c| c as f64);
+        let length = axis.iter().map(|c| c * c).sum::<f64>().sqrt();
+        (0..3).map(|a| heading[a] * axis[a] / length).sum::<f64>()
+    };
+    let (x, y) = (along(h0), along(h1));
+    // Looking along up (within about 11 degrees of it) says nothing of which way the sides
+    // should face, and the least tilt of the view would turn the Brush: it is not turned.
+    let length = heading.iter().map(|c| c * c).sum::<f64>().sqrt();
+    if x.hypot(y) < LOOKING_ALONG_UP * length {
+        return 0;
+    }
+    let eighths = (y.atan2(x) / std::f64::consts::FRAC_PI_4).round();
+    // A heading that is NaN turns it by nothing.
+    (eighths as i32).rem_euclid(8) as u8
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -131,7 +173,7 @@ mod tests {
     fn the_tool_starts_as_the_1_m_dig_sphere() {
         let tool = Tool::default();
         assert_eq!(
-            tool.op(VoxelCoord([1, 2, 3])),
+            tool.op(VoxelCoord([1, 2, 3]), 0),
             EditOp::dig_sphere(VoxelCoord([1, 2, 3]), 10)
         );
     }
@@ -172,7 +214,35 @@ mod tests {
             tool.key(KeyCode::BracketRight);
         }
         assert_eq!(tool.radius, MAX_BRUSH_RADIUS);
-        assert!(sim::validate(&tool.op(VoxelCoord([0; 3]))).is_ok());
+        assert!(sim::validate(&tool.op(VoxelCoord([0; 3]), 0)).is_ok());
+    }
+
+    #[test]
+    fn a_smooth_or_a_flatten_is_held_to_radius_10_and_a_dig_or_a_place_to_20() {
+        let mut tool = Tool::default();
+        for _ in 0..30 {
+            tool.key(KeyCode::BracketRight);
+        }
+        assert_eq!(tool.radius, MAX_BRUSH_RADIUS);
+        // Picking Smooth takes it down to what the server allows, and it does not go up again.
+        tool.key(KeyCode::Digit3);
+        assert_eq!(tool.radius, MAX_SMOOTH_RADIUS);
+        tool.key(KeyCode::BracketRight);
+        assert_eq!(tool.radius, MAX_SMOOTH_RADIUS);
+        tool.key(KeyCode::Digit4);
+        assert_eq!(tool.radius, MAX_SMOOTH_RADIUS);
+        tool.key(KeyCode::Digit2);
+        tool.key(KeyCode::BracketRight);
+        assert_eq!(tool.radius, MAX_SMOOTH_RADIUS + 1);
+        for mode in [
+            KeyCode::Digit1,
+            KeyCode::Digit2,
+            KeyCode::Digit3,
+            KeyCode::Digit4,
+        ] {
+            tool.key(mode);
+            assert_eq!(sim::validate(&tool.op(VoxelCoord([0; 3]), 0)), Ok(()));
+        }
     }
 
     #[test]
@@ -188,7 +258,7 @@ mod tests {
         tool.key(KeyCode::Equal);
         assert_eq!(tool.material, Material(table.defs()[1].id));
         // Every Material it offers is one the server accepts.
-        let op = tool.op(VoxelCoord([0; 3]));
+        let op = tool.op(VoxelCoord([0; 3]), 0);
         assert_eq!(sim::validate(&op), Ok(()));
         assert_eq!(op.material, tool.material);
     }
@@ -197,12 +267,12 @@ mod tests {
     fn only_the_modes_that_fill_carry_a_material_and_g_switches_to_the_grid() {
         let mut tool = Tool::default();
         tool.key(KeyCode::Equal);
-        assert_eq!(tool.op(VoxelCoord([0; 3])).material, Material(0), "dig");
+        assert_eq!(tool.op(VoxelCoord([0; 3]), 0).material, Material(0), "dig");
         tool.key(KeyCode::Digit4);
-        assert_eq!(tool.op(VoxelCoord([0; 3])).material, tool.material);
-        assert_eq!(tool.op(VoxelCoord([0; 3])).alignment, Alignment::Local);
+        assert_eq!(tool.op(VoxelCoord([0; 3]), 0).material, tool.material);
+        assert_eq!(tool.op(VoxelCoord([0; 3]), 0).alignment, Alignment::Local);
         tool.key(KeyCode::KeyG);
-        assert_eq!(tool.op(VoxelCoord([0; 3])).alignment, Alignment::World);
+        assert_eq!(tool.op(VoxelCoord([0; 3]), 0).alignment, Alignment::World);
         tool.key(KeyCode::KeyG);
         assert_eq!(tool.alignment, Alignment::Local);
     }
@@ -215,5 +285,56 @@ mod tests {
         tool.key(KeyCode::KeyB);
         tool.key(KeyCode::KeyG);
         assert_eq!(tool.describe(), "place cube 210 cm, rock, grid");
+    }
+
+    #[test]
+    fn the_brush_turns_to_face_the_way_the_camera_looks_in_steps_of_an_eighth() {
+        // At (1000, 0, 0) the horizontal axes are +z and -y (see sim::axes), up is +x.
+        let centre = VoxelCoord([1000, 0, 0]);
+        let turn = |heading: [f64; 3]| rotation_for(centre, Alignment::Local, heading);
+        let (z, y) = ([0.0, 0.0, 1.0], [0.0, -1.0, 0.0]);
+        let between = |a: [f64; 3], b: [f64; 3], t: f64| -> [f64; 3] {
+            std::array::from_fn(|i| a[i] * (1.0 - t) + b[i] * t)
+        };
+        assert_eq!(turn(z), 0);
+        assert_eq!(turn(y), 2, "a quarter turn");
+        assert_eq!(turn(between(z, y, 0.5)), 1, "an eighth");
+        assert_eq!(turn([0.0, 0.0, -1.0]), 4);
+        assert_eq!(turn([0.0, 1.0, 0.0]), 6, "three quarters");
+        // Within half a step it rounds to the step: 22 degrees is still 0, 23 is 1.
+        let at = |degrees: f64| {
+            let r = degrees.to_radians();
+            turn([0.3, -r.sin(), r.cos()])
+        };
+        assert_eq!((at(22.0), at(23.0), at(-22.0), at(-23.0)), (0, 1, 0, 7));
+        // Looking along up, or nowhere, or NaN, is no turn; and on the grid there is none either.
+        assert_eq!(turn([1.0, 0.0, 0.0]), 0);
+        assert_eq!(
+            turn([1.0, -0.05, 0.1]),
+            0,
+            "within 11 degrees of up, whatever the lean"
+        );
+        assert_eq!(turn([-1.0, -0.19, 0.0]), 0);
+        assert_eq!(
+            turn([-1.0, -0.21, 0.0]),
+            2,
+            "past it, which way it leans decides"
+        );
+        assert_eq!(turn([0.0; 3]), 0);
+        assert_eq!(turn([f64::NAN; 3]), 0);
+        assert_eq!(rotation_for(centre, Alignment::World, y), 0);
+    }
+
+    #[test]
+    fn the_turn_it_picks_is_one_the_server_allows() {
+        let mut tool = Tool::default();
+        tool.key(KeyCode::Digit2);
+        let centre = VoxelCoord([123, -456, 789]);
+        for step in 0..16 {
+            let a = f64::from(step) * 0.4;
+            let heading = [0.2, a.sin(), a.cos()];
+            let op = tool.op(centre, rotation_for(centre, Alignment::Local, heading));
+            assert_eq!(sim::validate(&op), Ok(()), "{op:?}");
+        }
     }
 }

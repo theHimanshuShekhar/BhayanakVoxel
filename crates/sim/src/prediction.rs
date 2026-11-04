@@ -11,9 +11,12 @@
 use std::collections::{BTreeSet, VecDeque};
 
 use brick_store::{BrickCoord, BrickStore};
-use net::{BodyState, ClientMessage, EditOp, Leash, MoveInput, ServerMessage};
+use net::{BodyState, ClientMessage, EditOp, Leash, MoveInput, RejectReason, ServerMessage};
 
-use crate::{Character, Footing, Ground, Movement, Undo, apply};
+use crate::{
+    BrickCache, Change, Character, EditBudget, Footing, Ground, Movement, Reads, Undo, apply,
+    apply_changes_from, plan_from, validate, work,
+};
 
 struct Pending {
     client_seq: u64,
@@ -57,6 +60,11 @@ pub struct Predictor {
     /// How many times the character has been spawned: the number of the current spawn, which the
     /// server's words about the character carry.
     spawns: u64,
+    /// What the server will let this client's Edits cost: its own count of the server's, ticked as
+    /// the character is, so that an Edit that will be turned down is known beforehand.
+    budget: EditBudget,
+    /// The bricks that Edits read where the store holds none (and the ground does not), made once.
+    cache: BrickCache,
 }
 
 impl Predictor {
@@ -76,6 +84,8 @@ impl Predictor {
             leashes: VecDeque::new(),
             covered: None,
             spawns: 0,
+            budget: EditBudget::full(),
+            cache: BrickCache::new(),
         }
     }
 
@@ -123,6 +133,8 @@ impl Predictor {
     /// makes it, as the server does). A tick that waits is not an input, and the server does not
     /// hear of it. The ground around the character is filled either way.
     pub fn walk(&mut self, input: MoveInput) -> Option<ClientMessage> {
+        // Every call is a tick, which gives the Edit allowance its credit, as the server's does.
+        self.budget.refill();
         let character = self.character.as_mut()?;
         let seq = self.next_input_seq;
         let leash = leash_at(&self.leashes, seq).filter(|leash| {
@@ -221,12 +233,83 @@ impl Predictor {
         self.desyncs
     }
 
-    /// Applies `op` to the local Planet right away. Returns the request to send to the server
-    /// and the bricks that changed, in ascending order.
+    /// Whether the server will not turn `op` down for something that is known here from the op
+    /// alone: a Brush that is not allowed (a Smooth or Flatten over radius 10 among them), or more
+    /// Edits or work than the allowance that this client counts as the server's. The Voxels that
+    /// the Edit changes are not known without working it out: see [`Predictor::can_change`]. The
+    /// reach is not counted: it depends on where the server has the character, which is a little
+    /// behind. An Edit that is not made is not counted either.
+    pub fn foresee(&self, op: &EditOp) -> Result<(), RejectReason> {
+        validate(op)?;
+        if !self.budget.has_op() || !self.budget.has_work(work(op)) {
+            return Err(RejectReason::RateLimited);
+        }
+        Ok(())
+    }
+
+    /// The Voxels that `op` changes here: [`crate::plan`], reading the Planet from the store, then
+    /// the ground around the character, then a cache of what the store does not hold, so that the
+    /// bricks are not made again for each Edit or each look of the ghost.
+    pub fn plan(&mut self, op: &EditOp) -> Vec<Change> {
+        plan_from(
+            &mut Reads::new(&self.store)
+                .with_ground(&self.ground)
+                .with_cache(&mut self.cache),
+            op,
+        )
+    }
+
+    /// Whether an Edit that changes `voxels` Voxels is within what this client counts that the
+    /// server will let it change.
+    pub fn can_change(&self, voxels: usize) -> bool {
+        self.budget.has_volume(voxels as u64)
+    }
+
+    /// Applies `op` to the local Planet right away, and counts it against the allowance. Returns
+    /// the request to send to the server and the bricks that changed, in ascending order. An op
+    /// that [`Predictor::foresee`] says is turned down is applied all the same, and taken back
+    /// when the server says so: it is for the caller to not make one (see
+    /// [`Predictor::edit_checked`]).
     pub fn edit(&mut self, op: EditOp) -> (ClientMessage, Vec<BrickCoord>) {
+        let changes = self.plan(&op);
+        self.spend(&op, changes.len());
+        self.edit_planned(op, changes)
+    }
+
+    /// [`Predictor::edit`], but not made if the server is known to turn it down for what
+    /// [`Predictor::foresee`] and [`Predictor::can_change`] say: that is the reason, and nothing is
+    /// applied or counted. The Edit is worked out once.
+    pub fn edit_checked(
+        &mut self,
+        op: EditOp,
+    ) -> Result<(ClientMessage, Vec<BrickCoord>), RejectReason> {
+        self.foresee(&op)?;
+        let changes = self.plan(&op);
+        if !self.can_change(changes.len()) {
+            return Err(RejectReason::VolumeLimited);
+        }
+        self.spend(&op, changes.len());
+        Ok(self.edit_planned(op, changes))
+    }
+
+    /// Counts an Edit that changes `changed` Voxels against the allowance, as the server does: an
+    /// Edit and its work, then the Voxels if there are as many left.
+    fn spend(&mut self, op: &EditOp, changed: usize) {
+        if validate(op).is_ok() {
+            self.budget.take_op();
+            self.budget.take_work(work(op));
+            self.budget.take_volume(changed as u64);
+        }
+    }
+
+    fn edit_planned(
+        &mut self,
+        op: EditOp,
+        changes: Vec<Change>,
+    ) -> (ClientMessage, Vec<BrickCoord>) {
         let client_seq = self.next_client_seq;
         self.next_client_seq += 1;
-        let changed = self.predict(client_seq, op);
+        let changed = self.predict_changes(client_seq, op, changes);
         (ClientMessage::Edit { client_seq, op }, changed)
     }
 
@@ -306,7 +389,23 @@ impl Predictor {
 
     /// Applies `op` as a new pending Edit and returns the bricks it changed.
     fn predict(&mut self, client_seq: u64, op: EditOp) -> Vec<BrickCoord> {
-        let undo = apply(&mut self.store, &op);
+        let changes = self.plan(&op);
+        self.predict_changes(client_seq, op, changes)
+    }
+
+    /// [`Predictor::predict`] for an Edit that is already worked out.
+    fn predict_changes(
+        &mut self,
+        client_seq: u64,
+        op: EditOp,
+        changes: Vec<Change>,
+    ) -> Vec<BrickCoord> {
+        let undo = apply_changes_from(
+            &mut self.store,
+            &changes,
+            Some(&self.ground),
+            Some(&mut self.cache),
+        );
         let changed = undo.bricks().collect();
         self.pending.push_back(Pending {
             client_seq,
@@ -394,6 +493,108 @@ mod tests {
         let (second, _) = client.edit(op([-5, 3, 3]));
         assert!(matches!(second, ClientMessage::Edit { client_seq: 1, .. }));
         assert_eq!(client.pending(), 2);
+    }
+
+    #[test]
+    fn the_client_foresees_the_rate_and_volume_limits_as_the_server_counts_them() {
+        let mut client = Predictor::new(stone_store());
+        let small = EditOp::dig_sphere(VoxelCoord([3, 3, 3]), 1);
+        assert_eq!(client.foresee(&small), Ok(()));
+        // Not allowed at all.
+        let too_big = EditOp::dig_sphere(VoxelCoord([3, 3, 3]), 21);
+        assert_eq!(client.foresee(&too_big), Err(RejectReason::BrushTooLarge));
+        // Twenty Edits in a second, and then no more until the ticks bring credit.
+        for _ in 0..20 {
+            assert_eq!(client.foresee(&small), Ok(()));
+            client.edit(small);
+        }
+        assert_eq!(client.foresee(&small), Err(RejectReason::RateLimited));
+        for _ in 0..3 {
+            client.walk(MoveInput::default());
+        }
+        assert_eq!(client.foresee(&small), Ok(()));
+        client.edit(small);
+        assert_eq!(client.foresee(&small), Err(RejectReason::RateLimited));
+    }
+
+    /// Solid stone 80 Voxels across, round the origin.
+    fn mass() -> BrickStore {
+        let mut store = BrickStore::new();
+        for x in -5..5 {
+            for y in -5..5 {
+                for z in -5..5 {
+                    store.insert(BrickCoord([x, y, z]), Brick::solid(STONE));
+                }
+            }
+        }
+        store
+    }
+
+    fn cube(mode: net::EditMode, radius: u16) -> EditOp {
+        EditOp {
+            mode,
+            brush: net::Brush {
+                shape: net::Shape::Cube,
+                radius,
+            },
+            centre: VoxelCoord([0, 0, 0]),
+            material: STONE,
+            alignment: net::Alignment::World,
+            rotation: 0,
+        }
+    }
+
+    #[test]
+    fn the_client_foresees_that_a_second_big_edit_changes_more_voxels_than_it_may() {
+        let mut client = Predictor::new(mass());
+        // A cube of 41 Voxels a side dug out of the stone: 68 921 Voxels changed, of 72 000.
+        let big = cube(net::EditMode::Dig, 20);
+        assert_eq!(client.foresee(&big), Ok(()));
+        let (_, changed) = client.edit_checked(big).unwrap();
+        assert!(!changed.is_empty());
+        // Another is not made: it is not worked out against the Planet, which stays as it is.
+        let hash = client.store().content_hash();
+        assert_eq!(
+            client.edit_checked(cube(net::EditMode::Place, 20)),
+            Err(RejectReason::VolumeLimited)
+        );
+        assert_eq!(client.store().content_hash(), hash);
+        assert_eq!(client.pending(), 1, "and it is not asked of the server");
+        // A small one fits what is left (3 079 Voxels): a cube of 9 changes 729.
+        assert!(client.edit_checked(cube(net::EditMode::Place, 4)).is_ok());
+        // The ticks bring it back, 8 000 Voxels a second.
+        for _ in 0..60 {
+            client.walk(MoveInput::default());
+        }
+        assert!(client.can_change(10_000) && !client.can_change(11_000));
+    }
+
+    #[test]
+    fn the_client_foresees_the_work_that_a_smooth_asks_and_that_one_over_radius_10_is_too_big() {
+        let mut client = Predictor::new(mass());
+        let smooth = cube(net::EditMode::Smooth, 10);
+        // 6 times 9 261: six of them are 333 000 of the 360 000, and they change nothing.
+        for _ in 0..6 {
+            assert_eq!(client.foresee(&smooth), Ok(()));
+            client.edit(smooth);
+        }
+        assert_eq!(client.foresee(&smooth), Err(RejectReason::RateLimited));
+        // Not Voxels changed: a Dig of a small cube is not afforded for lack of work either, but
+        // that left is 26 000 units.
+        assert_eq!(client.foresee(&cube(net::EditMode::Dig, 4)), Ok(()));
+        assert_eq!(
+            client.foresee(&cube(net::EditMode::Dig, 15)),
+            Err(RejectReason::RateLimited)
+        );
+        assert!(client.can_change(72_000 - 1));
+        assert_eq!(
+            client.foresee(&cube(net::EditMode::Smooth, 11)),
+            Err(RejectReason::BrushTooLarge)
+        );
+        assert_eq!(
+            client.foresee(&cube(net::EditMode::Flatten, 11)),
+            Err(RejectReason::BrushTooLarge)
+        );
     }
 
     #[test]

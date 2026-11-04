@@ -4,11 +4,10 @@
 //!
 //! The ghost is drawn by the overlay's egui pass, as the faces of the Voxels' outline, projected
 //! with the camera and tinted by the mode; it needs no pass of the renderer's own. It is seen
-//! through the terrain, which is what a preview of a dig wants.
+//! through the terrain, which is what a preview of a dig wants. Only the outline is kept: the list
+//! of Voxels, up to some 69 000 of them, is not.
 
-use std::collections::BTreeSet;
-
-use brick_store::VoxelCoord;
+use brick_store::{BRICK_SIZE, BrickCoord};
 use egui::{Color32, Mesh, Pos2};
 use net::{EditMode, EditOp};
 use render::Camera;
@@ -17,47 +16,100 @@ use sim::Change;
 /// One face of a Voxel that has no changed Voxel against it: part of the ghost's outline.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Face {
-    /// The corners, in Voxels, going round the face.
-    pub corners: [[i32; 3]; 4],
-    /// Which way the face looks: a unit step along one axis.
-    pub normal: [i32; 3],
+    pub voxel: [i32; 3],
+    /// The axis the face is square to.
+    pub axis: usize,
+    /// Whether it is on the Voxel's far side along that axis, and looks that way.
+    pub positive: bool,
 }
 
-/// The Edit that a click would make and what it would change.
+impl Face {
+    /// The coordinate of the face's plane along its axis.
+    fn plane(&self) -> i32 {
+        self.voxel[self.axis] + i32::from(self.positive)
+    }
+
+    /// The four corners, in Voxels, going round the face.
+    pub fn corners(&self) -> [[i32; 3]; 4] {
+        let (u, w) = ((self.axis + 1) % 3, (self.axis + 2) % 3);
+        let corner = |du: i32, dw: i32| {
+            let mut c = self.voxel;
+            c[self.axis] = self.plane();
+            c[u] += du;
+            c[w] += dw;
+            c
+        };
+        [corner(0, 0), corner(1, 0), corner(1, 1), corner(0, 1)]
+    }
+}
+
+/// The Edit that a click would make, its outline, and what it is waiting on.
 #[derive(Clone, Debug)]
 pub struct Ghost {
     pub op: EditOp,
-    /// What the Edit changes. Drawing needs only the outline; the tests read the list.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub changes: Vec<Change>,
+    /// The Edit is one that the server will turn down (the client counts its allowance): shown grey.
+    pub blocked: bool,
+    /// A brick that the Edit reads has changed since the outline was made, so it is to be made
+    /// again.
+    pub dirty: bool,
+    /// How many Voxels the Edit changes, which the server holds to the player's allowance.
+    pub changed: usize,
     faces: Vec<Face>,
+    /// The first and last brick of the Voxels that the Edit reads, a Voxel beyond what it
+    /// changes included.
+    reads: Option<([i32; 3], [i32; 3])>,
+    /// The Voxels the Edit changes, for the tests to compare with what the Edit did.
+    #[cfg(test)]
+    pub changes: Vec<Change>,
 }
 
 impl Ghost {
     /// The ghost of `op`, which changes `changes` (see [`sim::plan`]).
     pub fn new(op: EditOp, changes: Vec<Change>) -> Self {
-        let faces = outline(&changes);
-        Self { op, changes, faces }
+        let reads = sim::examined_box(&op).map(|(first, last)| {
+            let brick = |v: [i64; 3]| -> [i32; 3] {
+                std::array::from_fn(|a| {
+                    let c = v[a].clamp(i64::from(i32::MIN), i64::from(i32::MAX));
+                    (c as i32).div_euclid(BRICK_SIZE)
+                })
+            };
+            // The Voxels beside the box, which a Smooth reads.
+            (brick(first.map(|c| c - 1)), brick(last.map(|c| c + 1)))
+        });
+        Self {
+            op,
+            blocked: false,
+            dirty: false,
+            changed: changes.len(),
+            faces: outline(&changes),
+            reads,
+            #[cfg(test)]
+            changes,
+        }
     }
 
-    /// The Voxels the Edit changes.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub fn voxels(&self) -> impl Iterator<Item = VoxelCoord> + '_ {
-        self.changes.iter().map(|c| c.voxel)
+    /// Whether any of the bricks `changed` is one the Edit reads, so that what it would change
+    /// may not be what the ghost shows.
+    pub fn touches(&self, changed: &[BrickCoord]) -> bool {
+        let Some((first, last)) = self.reads else {
+            return false;
+        };
+        changed
+            .iter()
+            .any(|b| (0..3).all(|a| (first[a]..=last[a]).contains(&b.0[a])))
     }
 
     /// The outline of the Voxels.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub fn faces(&self) -> &[Face] {
         &self.faces
     }
 
-    /// Paints the faces that look at `camera`, on a screen `size` points across, under the panels.
+    /// Paints the faces that look at `camera`, on the screen, under the panels.
     pub fn paint(&self, ctx: &egui::Context, camera: &Camera) {
         let rect = ctx.content_rect();
-        let mesh = self.mesh(camera, rect.size());
+        let mut mesh = self.mesh(camera, rect.size());
         if !mesh.is_empty() {
-            let mut mesh = mesh;
             mesh.translate(rect.min.to_vec2());
             ctx.layer_painter(egui::LayerId::background())
                 .add(egui::Shape::mesh(mesh));
@@ -67,22 +119,25 @@ impl Ghost {
     /// The faces that look at the camera as triangles on a screen `size` points across, from its
     /// top left corner.
     pub fn mesh(&self, camera: &Camera, size: egui::Vec2) -> Mesh {
-        let colour = tint(self.op.mode);
+        let colour = tint(self.op.mode, self.blocked);
         let aspect = f64::from(size.x) / f64::from(size.y);
         let mut mesh = Mesh::default();
         for face in &self.faces {
             if !looks_at(face, camera.position) {
                 continue;
             }
-            let screen: Option<Vec<Pos2>> = face
-                .corners
-                .iter()
-                .map(|&c| project(camera, aspect, c.map(f64::from)))
-                .map(|p| p.map(|[x, y]| Pos2::new(x * size.x, y * size.y)))
-                .collect();
-            let Some(corners) = screen else { continue };
+            let mut screen = [Pos2::ZERO; 4];
+            let all_seen = face.corners().iter().zip(&mut screen).all(|(&c, out)| {
+                project(camera, aspect, c.map(f64::from)).is_some_and(|[x, y]| {
+                    *out = Pos2::new(x * size.x, y * size.y);
+                    true
+                })
+            });
+            if !all_seen {
+                continue;
+            }
             let first = mesh.vertices.len() as u32;
-            for corner in corners {
+            for corner in screen {
                 mesh.colored_vertex(corner, colour);
             }
             mesh.add_triangle(first, first + 1, first + 2);
@@ -93,44 +148,55 @@ impl Ghost {
 }
 
 /// How the ghost is tinted: red for what is taken away, green for what is added, and blue and
-/// amber for the two that do both.
-fn tint(mode: EditMode) -> Color32 {
-    let (r, g, b) = match mode {
-        EditMode::Dig => (230, 50, 50),
-        EditMode::Place => (60, 210, 90),
-        EditMode::Smooth => (70, 130, 240),
-        EditMode::Flatten => (240, 170, 40),
+/// amber for the two that do both; grey for an Edit that will not be made.
+fn tint(mode: EditMode, blocked: bool) -> Color32 {
+    let (r, g, b) = match (mode, blocked) {
+        (_, true) => (150, 150, 150),
+        (EditMode::Dig, _) => (230, 50, 50),
+        (EditMode::Place, _) => (60, 210, 90),
+        (EditMode::Smooth, _) => (70, 130, 240),
+        (EditMode::Flatten, _) => (240, 170, 40),
     };
     Color32::from_rgba_unmultiplied(r, g, b, 70)
 }
 
-/// The faces of the changed Voxels that no changed Voxel is against.
+/// The faces of the changed Voxels that no changed Voxel is against. The Voxels are marked in a
+/// box that holds them, so that a face is found by looking at the cells beside it.
 fn outline(changes: &[Change]) -> Vec<Face> {
-    let set: BTreeSet<[i32; 3]> = changes.iter().map(|c| c.voxel.0).collect();
+    let Some(first) = changes.first() else {
+        return Vec::new();
+    };
+    let (mut low, mut high) = (first.voxel.0, first.voxel.0);
+    for change in changes {
+        for a in 0..3 {
+            low[a] = low[a].min(change.voxel.0[a]);
+            high[a] = high[a].max(change.voxel.0[a]);
+        }
+    }
+    // One cell of room all round, so that a face on the edge has a cell to look at.
+    let size: [usize; 3] = std::array::from_fn(|a| (high[a] - low[a]) as usize + 3);
+    let cell = |v: [i32; 3]| -> usize {
+        let at: [usize; 3] = std::array::from_fn(|a| (v[a] - low[a] + 1) as usize);
+        at[0] + size[0] * (at[1] + size[1] * at[2])
+    };
+    let mut marked = vec![false; size[0] * size[1] * size[2]];
+    for change in changes {
+        marked[cell(change.voxel.0)] = true;
+    }
     let mut faces = Vec::new();
-    for &voxel in &set {
+    for change in changes {
+        let voxel = change.voxel.0;
         for axis in 0..3 {
-            for sign in [-1, 1] {
-                let mut normal = [0; 3];
-                normal[axis] = sign;
-                let beside: [i32; 3] = std::array::from_fn(|a| voxel[a] + normal[a]);
-                if set.contains(&beside) {
-                    continue;
+            for positive in [false, true] {
+                let mut beside = voxel;
+                beside[axis] += if positive { 1 } else { -1 };
+                if !marked[cell(beside)] {
+                    faces.push(Face {
+                        voxel,
+                        axis,
+                        positive,
+                    });
                 }
-                // The plane of the face, and the two axes across it.
-                let plane = voxel[axis] + i32::from(sign > 0);
-                let (u, w) = ((axis + 1) % 3, (axis + 2) % 3);
-                let corner = |du: i32, dw: i32| {
-                    let mut c = voxel;
-                    c[axis] = plane;
-                    c[u] += du;
-                    c[w] += dw;
-                    c
-                };
-                faces.push(Face {
-                    corners: [corner(0, 0), corner(1, 0), corner(1, 1), corner(0, 1)],
-                    normal,
-                });
             }
         }
     }
@@ -139,9 +205,8 @@ fn outline(changes: &[Change]) -> Vec<Face> {
 
 /// Whether `face` is on the camera's side of its own plane.
 fn looks_at(face: &Face, eye: [f64; 3]) -> bool {
-    let axis = (0..3).find(|&a| face.normal[a] != 0).expect("a unit step");
-    let plane = f64::from(face.corners[0][axis]);
-    (eye[axis] - plane) * f64::from(face.normal[axis]) > 0.0
+    let side = if face.positive { 1.0 } else { -1.0 };
+    (eye[face.axis] - f64::from(face.plane())) * side > 0.0
 }
 
 /// Nearer than this, in Voxels, a point is not drawn.
@@ -165,7 +230,8 @@ fn project(camera: &Camera, aspect: f64, point: [f64; 3]) -> Option<[f32; 2]> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use brick_store::Material;
+    use brick_store::{Material, VoxelCoord};
+    use std::collections::BTreeSet;
 
     fn change(voxel: [i32; 3]) -> Change {
         Change {
@@ -199,18 +265,27 @@ mod tests {
         let mut hollow = cube(3);
         hollow.retain(|c| c.voxel != VoxelCoord([1, 1, 1]));
         assert_eq!(ghost(hollow).faces().len(), 60);
+        // Voxels apart, and with negative coordinates, are each their own.
+        let apart = vec![change([-9, 4, 0]), change([20, -3, 7])];
+        assert_eq!(ghost(apart).faces().len(), 12);
+        assert!(ghost(Vec::new()).faces().is_empty());
     }
 
     #[test]
     fn every_face_lies_on_the_voxel_it_belongs_to_and_looks_away_from_it() {
         let ghost = ghost(vec![change([0, 0, 0])]);
+        let sides: BTreeSet<_> = ghost.faces().iter().map(|f| (f.axis, f.positive)).collect();
+        assert_eq!(sides.len(), 6);
         for face in ghost.faces() {
-            let axis = (0..3).find(|&a| face.normal[a] != 0).unwrap();
-            let plane = if face.normal[axis] > 0 { 1 } else { 0 };
-            assert!(face.corners.iter().all(|c| c[axis] == plane), "{face:?}");
+            let plane = if face.positive { 1 } else { 0 };
+            assert!(
+                face.corners().iter().all(|c| c[face.axis] == plane),
+                "{face:?}"
+            );
             // The corners are the unit square, each next to the one before.
+            let corners = face.corners();
             for i in 0..4 {
-                let (a, b) = (face.corners[i], face.corners[(i + 1) % 4]);
+                let (a, b) = (corners[i], corners[(i + 1) % 4]);
                 let apart: i32 = (0..3).map(|k| (a[k] - b[k]).abs()).sum();
                 assert_eq!(apart, 1, "{face:?}");
             }
@@ -218,13 +293,10 @@ mod tests {
     }
 
     #[test]
-    fn a_ghost_lists_the_voxels_it_was_given_and_nothing_else() {
+    fn a_ghost_in_the_tests_lists_the_voxels_it_was_given() {
         let changes = cube(2);
         let ghost = ghost(changes.clone());
-        assert_eq!(
-            ghost.voxels().collect::<Vec<_>>(),
-            changes.iter().map(|c| c.voxel).collect::<Vec<_>>()
-        );
+        assert_eq!(ghost.changes, changes);
     }
 
     #[test]
@@ -252,16 +324,104 @@ mod tests {
     }
 
     #[test]
-    fn the_ghost_is_tinted_by_the_mode() {
-        let tints: BTreeSet<_> = [
+    fn the_ghost_is_tinted_by_the_mode_and_grey_when_it_will_not_be_made() {
+        let modes = [
             EditMode::Dig,
             EditMode::Place,
             EditMode::Smooth,
             EditMode::Flatten,
-        ]
-        .map(|m| tint(m).to_array())
-        .into_iter()
-        .collect();
+        ];
+        let tints: BTreeSet<_> = modes
+            .map(|m| tint(m, false).to_array())
+            .into_iter()
+            .collect();
         assert_eq!(tints.len(), 4);
+        let greys: BTreeSet<_> = modes
+            .map(|m| tint(m, true).to_array())
+            .into_iter()
+            .collect();
+        assert_eq!(greys.len(), 1);
+        assert!(!tints.contains(greys.iter().next().unwrap()));
+    }
+
+    #[test]
+    fn a_ghost_is_made_again_only_for_a_change_to_a_brick_it_reads() {
+        // A sphere of 10 about the Voxel 1000, 0, 0 reads the bricks that its box and a Voxel more
+        // are in: 989 to 1011 along x, so bricks 123 to 126, and -11 to 11 in y and z, bricks -2
+        // to 1.
+        let ghost = ghost_of(EditOp::dig_sphere(VoxelCoord([1000, 0, 0]), 10));
+        assert!(ghost.touches(&[BrickCoord([125, 0, 0])]));
+        assert!(ghost.touches(&[BrickCoord([123, -2, 1])]));
+        assert!(!ghost.touches(&[BrickCoord([122, 0, 0])]));
+        assert!(!ghost.touches(&[BrickCoord([127, 0, 0])]));
+        assert!(!ghost.touches(&[BrickCoord([125, 2, 0])]));
+        assert!(!ghost.touches(&[]));
+        assert!(ghost.touches(&[BrickCoord([0, 0, 0]), BrickCoord([124, 0, -1])]));
+        // An op with no box reads nothing.
+        let off = ghost_of(EditOp::dig_sphere(VoxelCoord([i32::MAX, 0, 0]), 10));
+        assert!(!off.touches(&[BrickCoord([125, 0, 0])]));
+    }
+
+    fn ghost_of(op: EditOp) -> Ghost {
+        Ghost::new(op, Vec::new())
+    }
+
+    /// Measures what a ghost of the biggest Brush costs on the frame thread: the Edit worked out,
+    /// the outline made, and the faces projected. Run it in release, with
+    /// `cargo test --release -p client ghost_cost -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "a measurement"]
+    fn ghost_cost_of_the_biggest_brushes() {
+        use brick_store::{Brick, BrickCoord, BrickStore};
+        use net::{Alignment, Brush, Shape};
+        use std::time::Instant;
+
+        let mut store = BrickStore::new();
+        for x in 180..192 {
+            for y in -8..8 {
+                for z in -8..8 {
+                    store.insert(BrickCoord([x, y, z]), Brick::solid(Material(1)));
+                }
+            }
+        }
+        let camera = Camera::looking_at([1530.5, 10.5, 10.5], [1500.0, 3.0, 5.0]);
+        let mut worst = std::time::Duration::ZERO;
+        for centre in [[1500, 0, 0], [1500, 3, 5], [1100, 700, 700]] {
+            for mode in [
+                EditMode::Dig,
+                EditMode::Place,
+                EditMode::Smooth,
+                EditMode::Flatten,
+            ] {
+                for shape in [Shape::Sphere, Shape::Cube, Shape::Cylinder] {
+                    let op = EditOp {
+                        mode,
+                        brush: Brush { shape, radius: 20 },
+                        centre: VoxelCoord(centre),
+                        material: Material(35),
+                        alignment: Alignment::Local,
+                        rotation: 0,
+                    };
+                    let started = Instant::now();
+                    let changes = sim::plan(&store, &op);
+                    let planned = started.elapsed();
+                    let made = Instant::now();
+                    let ghost = Ghost::new(op, changes);
+                    let outlined = made.elapsed();
+                    let drawn = Instant::now();
+                    let mesh = ghost.mesh(&camera, egui::vec2(1920.0, 1080.0));
+                    let projected = drawn.elapsed();
+                    // On a frame that makes it again, all three; on one that does not, the last.
+                    worst = worst.max(planned + outlined + projected);
+                    println!(
+                        "{centre:?} {mode:?} {shape:?}: plan {planned:?}, outline {outlined:?} ({} faces), \
+                         project {projected:?} ({} vertices)",
+                        ghost.faces().len(),
+                        mesh.vertices.len()
+                    );
+                }
+            }
+        }
+        println!("worst frame, making it again: {worst:?}");
     }
 }

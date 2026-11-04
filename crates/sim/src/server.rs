@@ -16,8 +16,8 @@ use brick_store::BrickStore;
 use net::{ClientMessage, EditOp, Leash, MoveInput, RejectReason, ServerEnd, ServerMessage};
 
 use crate::{
-    Character, FixedTimestep, Footing, Ground, Movement, OPS_PER_SECOND, VOXEL_BURST,
-    VOXELS_PER_SECOND, apply_changes, plan, validate, within_reach,
+    BrickCache, Character, EditBudget, FixedTimestep, Footing, Ground, Movement, Reads,
+    apply_changes_from, plan_from, validate, within_reach, work,
 };
 
 /// The server simulates at this rate (issue 11).
@@ -49,48 +49,13 @@ const CLEARANCE: f64 = 24.0;
 /// [`ClientMessage::Spawn`].
 const MAX_QUEUED: usize = 600;
 
-/// What one player may still ask of the server in Edits: a token bucket for each limit, in integers
-/// so that it does not depend on a clock. Credit is counted in 1/[`TICK_RATE_HZ`] of an Edit or a
-/// Voxel, so that each tick adds a whole number (the rate per second) and an Edit or a Voxel costs
-/// [`TICK_RATE_HZ`].
-struct Budget {
-    ops: u32,
-    voxels: u64,
-}
-
-impl Budget {
-    /// What a player has after a rest: a second of Edits, and [`VOXEL_BURST`] Voxels.
-    fn full() -> Self {
-        Self {
-            ops: OPS_PER_SECOND * TICK_RATE_HZ,
-            voxels: u64::from(VOXEL_BURST) * u64::from(TICK_RATE_HZ),
-        }
-    }
-
-    /// One tick's credit.
-    fn refill(&mut self) {
-        let full = Self::full();
-        self.ops = (self.ops + OPS_PER_SECOND).min(full.ops);
-        self.voxels = (self.voxels + u64::from(VOXELS_PER_SECOND)).min(full.voxels);
-    }
-
-    /// Spends one Edit's credit, if there is that much.
-    fn take_op(&mut self) -> bool {
-        self.ops
-            .checked_sub(TICK_RATE_HZ)
-            .map(|ops| self.ops = ops)
-            .is_some()
-    }
-
-    /// Spends `voxels` Voxels' credit, if there is that much.
-    fn take_voxels(&mut self, voxels: usize) -> bool {
-        let cost = voxels as u64 * u64::from(TICK_RATE_HZ);
-        self.voxels
-            .checked_sub(cost)
-            .map(|left| self.voxels = left)
-            .is_some()
-    }
-}
+/// The most work, in units ([`crate::work`]), that the Edits of one tick may ask, all clients
+/// together: what the server will spend on Edits in a tick, so that a burst of them from many
+/// clients cannot make a tick late. A unit is about 10 ns (a Smooth's Voxels count six), so this is
+/// a few milliseconds. It is [`crate::WORK_BURST`], what one maximum Brush asks, so that any Edit
+/// that a player's own budget lets through gets its turn when it is alone. An Edit that does not
+/// fit is turned down with [`RejectReason::RateLimited`], and its client may ask again.
+pub const EDIT_WORK_PER_TICK: u64 = crate::WORK_BURST;
 
 /// One client's character, how many of its inputs the server has applied, and the ground it
 /// walks on.
@@ -155,7 +120,11 @@ pub struct Server {
     avatars: Vec<Option<Avatar>>,
     /// What each client may still ask in Edits, by the same index. It outlasts a spawn, so that
     /// spawning again is no way round a limit.
-    budgets: Vec<Budget>,
+    budgets: Vec<EditBudget>,
+    /// Units of work that the Edits made this tick asked, against [`EDIT_WORK_PER_TICK`].
+    edit_work: u64,
+    /// The bricks that Edits read where the store holds none, so that they are made once.
+    cache: BrickCache,
 }
 
 impl Server {
@@ -167,6 +136,8 @@ impl Server {
             ground_rate: None,
             avatars: Vec::new(),
             budgets: Vec::new(),
+            edit_work: 0,
+            cache: BrickCache::new(),
         }
     }
 
@@ -191,16 +162,25 @@ impl Server {
         self.avatars.get(index)?.as_ref().map(|a| &a.ground)
     }
 
+    /// Units of work that the Edits made in the latest tick asked, which is at most
+    /// [`EDIT_WORK_PER_TICK`].
+    pub fn edit_work(&self) -> u64 {
+        self.edit_work
+    }
+
     /// Checks the request against client `asker`'s limits and the rules of an Edit and, if it
     /// passes, applies it and gives it the next global sequence number. A rejected request changes
     /// nothing and takes no number. The checks are, in this order: the rate (every request
-    /// counts, however it ends), the reach from the character's eyes (no character, no reach),
-    /// the Brush itself ([`validate`]) and the Voxels it changes, which [`plan`] counts before
-    /// anything is written.
+    /// counts, however it ends), the reach from the character's eyes (no character, no reach), the
+    /// Brush itself ([`validate`]), the work that it asks ([`work`], known from the op alone, so
+    /// that the Planet is not read for an Edit that is not afforded): against what the player has
+    /// left and what the server has left of this tick. Then the Edit is worked out ([`plan`]) at a
+    /// cost that those have bounded, and the Voxels it changes are held to what the player may
+    /// change, and if they are over it nothing is applied.
     fn handle_edit(&mut self, asker: usize, client_seq: u64, op: EditOp) -> Outcome {
         let reject = |reason| Outcome::Rejected { client_seq, reason };
         if self.budgets.len() <= asker {
-            self.budgets.resize_with(asker + 1, Budget::full);
+            self.budgets.resize_with(asker + 1, EditBudget::full);
         }
         if !self.budgets[asker].take_op() {
             return reject(RejectReason::RateLimited);
@@ -214,11 +194,28 @@ impl Server {
         if let Err(reason) = validate(&op) {
             return reject(reason);
         }
-        let changes = plan(&self.store, &op);
-        if !self.budgets[asker].take_voxels(changes.len()) {
+        let asked = work(&op);
+        if !self.budgets[asker].has_work(asked) || self.edit_work + asked > EDIT_WORK_PER_TICK {
+            return reject(RejectReason::RateLimited);
+        }
+        self.budgets[asker].take_work(asked);
+        self.edit_work += asked;
+        // The Edit reads the Planet from the store, then from the asker's Ground, which holds what
+        // the generator makes round the character, and then from the cache.
+        let ground = self
+            .avatars
+            .get(asker)
+            .and_then(Option::as_ref)
+            .map(|avatar| &avatar.ground);
+        let mut reads = Reads::new(&self.store).with_cache(&mut self.cache);
+        if let Some(ground) = ground {
+            reads = reads.with_ground(ground);
+        }
+        let changes = plan_from(&mut reads, &op);
+        if !self.budgets[asker].take_volume(changes.len() as u64) {
             return reject(RejectReason::VolumeLimited);
         }
-        apply_changes(&mut self.store, &changes);
+        apply_changes_from(&mut self.store, &changes, ground, Some(&mut self.cache));
         self.global_seq += 1;
         Outcome::Applied {
             global_seq: self.global_seq,
@@ -277,9 +274,10 @@ impl Server {
     /// its ground, which is filled each tick.
     pub fn tick(&mut self, clients: &[ServerEnd]) {
         if self.budgets.len() < clients.len() {
-            self.budgets.resize_with(clients.len(), Budget::full);
+            self.budgets.resize_with(clients.len(), EditBudget::full);
         }
-        self.budgets.iter_mut().for_each(Budget::refill);
+        self.budgets.iter_mut().for_each(EditBudget::refill);
+        self.edit_work = 0;
         for (asker, client) in clients.iter().enumerate() {
             let mut moved = false;
             while let Ok(message) = client.try_recv() {
@@ -635,6 +633,7 @@ mod tests {
             centre: VoxelCoord(centre),
             material: Material(7),
             alignment: net::Alignment::World,
+            rotation: 0,
         }
     }
 
@@ -801,6 +800,216 @@ mod tests {
         }
         let told = answers(&mut server, &end, &client, &nine[7..]);
         assert_eq!(told, [None, Some(RejectReason::VolumeLimited)]);
+    }
+
+    /// A mass of stone 80 Voxels (8 m) across, with room to place in beyond it.
+    fn mass() -> BrickStore {
+        let mut store = BrickStore::new();
+        for x in -5..5 {
+            for y in -5..5 {
+                for z in -5..5 {
+                    store.insert(BrickCoord([x, y, z]), Brick::solid(STONE));
+                }
+            }
+        }
+        store
+    }
+
+    fn smooth(
+        shape: net::Shape,
+        radius: u16,
+        centre: [i32; 3],
+        alignment: net::Alignment,
+    ) -> EditOp {
+        EditOp {
+            mode: net::EditMode::Smooth,
+            alignment,
+            ..place(centre, shape, radius)
+        }
+    }
+
+    #[test]
+    fn twenty_smooths_that_change_nothing_in_one_tick_are_limited_by_the_work_they_ask() {
+        let (client, end) = loopback();
+        let mut server = Server::new(mass());
+        client.send(stand()).unwrap();
+        server.tick(std::slice::from_ref(&end));
+        received(&client);
+
+        // A cube of 21 Voxels a side on the grid, in the middle of solid stone, where a Smooth
+        // changes nothing. It asks 9 261 Voxels' worth, six units each: 55 566. The player's 360 000
+        // are six of those, and no more, though none of them changes a Voxel.
+        let smooth = smooth(net::Shape::Cube, 10, [0, 0, 0], net::Alignment::World);
+        assert_eq!(crate::work(&smooth), 55_566);
+        let told = answers(&mut server, &end, &client, &[smooth; 20]);
+        assert_eq!(told[..6], [None; 6]);
+        assert_eq!(told[6..], [Some(RejectReason::RateLimited); 14]);
+        assert_eq!(server.edit_work(), 6 * 55_566);
+        assert!(server.edit_work() <= EDIT_WORK_PER_TICK);
+
+        // And the work comes back at 600 000 a second: ten thousand a tick, so one Smooth in
+        // six ticks.
+        for _ in 0..4 {
+            server.tick(std::slice::from_ref(&end));
+        }
+        assert_eq!(
+            answers(&mut server, &end, &client, &[smooth; 2]),
+            [None, Some(RejectReason::RateLimited)]
+        );
+    }
+
+    #[test]
+    fn a_leaning_cube_of_4_m_placed_from_rest_is_accepted_and_one_more_has_to_wait() {
+        let (client, end) = loopback();
+        let mut server = Server::new(mass());
+        client.send(stand()).unwrap();
+        server.tick(std::slice::from_ref(&end));
+        received(&client);
+
+        // In the air over the stone, on a lean, and turned an eighth: the box that holds it is
+        // 300 000 Voxels and more, the most that any Brush asks.
+        let cube = EditOp {
+            alignment: net::Alignment::Local,
+            rotation: 1,
+            ..place([30, 60, 12], net::Shape::Cube, 20)
+        };
+        let asked = crate::work(&cube);
+        assert!((250_000..=crate::WORK_BURST).contains(&asked), "{asked}");
+        let changed_before = server.store().content_hash();
+        assert_eq!(answers(&mut server, &end, &client, &[cube]), [None]);
+        assert_ne!(server.store().content_hash(), changed_before);
+        assert_eq!(server.edit_work(), asked);
+        // Placing again changes nothing, and the work for it is not there.
+        assert_eq!(
+            answers(&mut server, &end, &client, &[cube]),
+            [Some(RejectReason::RateLimited)]
+        );
+    }
+
+    #[test]
+    fn a_smooth_or_a_flatten_over_radius_10_is_too_big_and_a_dig_or_a_place_may_be_20() {
+        let (mut server, end, client) = standing();
+        let asked = |mode, radius| EditOp {
+            mode,
+            ..place([0, 0, 0], net::Shape::Sphere, radius)
+        };
+        let told = answers(
+            &mut server,
+            &end,
+            &client,
+            &[
+                asked(net::EditMode::Smooth, 11),
+                asked(net::EditMode::Flatten, 11),
+                asked(net::EditMode::Smooth, 10),
+                asked(net::EditMode::Flatten, 10),
+                asked(net::EditMode::Place, 20),
+                asked(net::EditMode::Dig, 21),
+            ],
+        );
+        assert_eq!(
+            told,
+            [
+                Some(RejectReason::BrushTooLarge),
+                Some(RejectReason::BrushTooLarge),
+                None,
+                None,
+                None,
+                Some(RejectReason::BrushTooLarge)
+            ]
+        );
+    }
+
+    #[test]
+    fn what_an_edit_asks_of_the_server_is_charged_whether_or_not_it_changes_anything() {
+        let (mut server, end, client) = standing();
+        // Placing in air changes nothing in stone, and is charged the same as digging.
+        let nothing = place([0, 0, 0], net::Shape::Sphere, 10);
+        assert_eq!(answers(&mut server, &end, &client, &[nothing]), [None]);
+        assert_eq!(server.edit_work(), crate::examined(&nothing));
+        assert_eq!(crate::examined(&nothing), 21 * 21 * 21);
+    }
+
+    #[test]
+    fn the_work_of_the_edits_of_a_tick_is_no_more_than_the_servers_share_whoever_asks() {
+        // Seven players with a character each, every one with a full allowance, each asking for
+        // the biggest sphere in the one tick: 68 921 each. Five fit the tick's 360 000, and the
+        // others are told to ask again.
+        let mut clients = Vec::new();
+        let mut ends = Vec::new();
+        for _ in 0..7 {
+            let (client, end) = loopback();
+            client.send(stand()).unwrap();
+            clients.push(client);
+            ends.push(end);
+        }
+        let mut server = Server::new(mass());
+        server.tick(&ends);
+        for client in &clients {
+            received(client);
+        }
+        let big = EditOp {
+            mode: net::EditMode::Dig,
+            ..place([0, 0, 0], net::Shape::Sphere, 20)
+        };
+        let ask = |server: &mut Server, who: &[usize], seq: u64| -> Vec<Option<RejectReason>> {
+            for &i in who {
+                clients[i]
+                    .send(ClientMessage::Edit {
+                        client_seq: seq,
+                        op: big,
+                    })
+                    .unwrap();
+            }
+            server.tick(&ends);
+            // Every client hears the Edits that were made, and its own reject if it has one.
+            let told = clients
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| who.contains(i))
+                .map(|(_, client)| {
+                    edits_heard(client).into_iter().find_map(|m| match m {
+                        ServerMessage::Rejected { reason, .. } => Some(reason),
+                        _ => None,
+                    })
+                })
+                .collect();
+            for client in &clients {
+                received(client);
+            }
+            told
+        };
+        let told = ask(&mut server, &[0, 1, 2, 3, 4, 5, 6], 0);
+        assert_eq!(told[..5], [None; 5]);
+        assert_eq!(told[5..], [Some(RejectReason::RateLimited); 2]);
+        assert_eq!(server.edit_work(), 5 * 68_921);
+        assert!(server.edit_work() <= EDIT_WORK_PER_TICK);
+
+        // The next tick has its own share, and the two that were told to ask again are served.
+        let told = ask(&mut server, &[5, 6], 1);
+        assert_eq!(told, [None, None]);
+        assert_eq!(server.edit_work(), 2 * 68_921);
+    }
+
+    #[test]
+    fn a_rotation_that_is_not_one_of_the_8_is_turned_down() {
+        let (mut server, end, client) = standing();
+        let turned = |rotation| EditOp {
+            rotation,
+            ..place([0, 0, 0], net::Shape::Cube, 2)
+        };
+        assert_eq!(
+            answers(
+                &mut server,
+                &end,
+                &client,
+                &[turned(7), turned(8), turned(255)]
+            ),
+            [
+                None,
+                Some(RejectReason::BadRotation),
+                Some(RejectReason::BadRotation)
+            ]
+        );
     }
 
     /// Stone below y = 0: a flat Planet, as a source.

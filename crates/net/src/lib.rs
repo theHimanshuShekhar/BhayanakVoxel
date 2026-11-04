@@ -55,9 +55,10 @@ pub struct Brush {
     pub radius: u16,
 }
 
-/// One Edit, small enough to broadcast Planet-wide: 20 bytes. The Voxels it changes follow from
+/// One Edit, small enough to broadcast Planet-wide: 24 bytes. The Voxels it changes follow from
 /// it and the Planet's bricks by integer maths alone (see `sim::plan`), so the op carries no
-/// Voxel list and no rotation: the orientation follows from `alignment` and `centre`.
+/// Voxel list: the up axis follows from `alignment` and `centre`, and `rotation` turns the Brush
+/// about it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct EditOp {
     pub mode: EditMode,
@@ -67,6 +68,9 @@ pub struct EditOp {
     /// What `Place` and `Flatten` fill with. The other modes ignore it.
     pub material: Material,
     pub alignment: Alignment,
+    /// How far the Brush is turned about its up axis, in steps of 45 degrees: 0 to 7. A cube and
+    /// a cylinder are the same shape after a quarter turn, so for them only odd and even differ.
+    pub rotation: u8,
 }
 
 impl EditOp {
@@ -81,6 +85,7 @@ impl EditOp {
             centre,
             material: Material(0),
             alignment: Alignment::Local,
+            rotation: 0,
         }
     }
 }
@@ -97,10 +102,14 @@ pub enum RejectReason {
     OutOfReach,
     /// A `Place` or `Flatten` of a Material that the Material table does not define.
     UnknownMaterial,
-    /// The player asked for more Edits in the last second than they may.
+    /// The player asked for more Edits in the last second than they may, or the server has done
+    /// as much Edit work as it will this tick.
     RateLimited,
-    /// The player has changed more Voxels lately than they may.
+    /// The Brush's bounding box is more Voxels than the player has left to edit: the server counts
+    /// what an Edit looks at, whether or not it changes it.
     VolumeLimited,
+    /// A rotation that is not 0 to 7.
+    BadRotation,
 }
 
 /// What a player asks of their character for one tick (the sim's fixed step): plain data, so
@@ -275,7 +284,7 @@ mod tests {
         fn plain<T: Copy>() -> usize {
             size_of::<T>()
         }
-        assert_eq!(plain::<EditOp>(), 20);
+        assert_eq!(plain::<EditOp>(), 24);
         // The request that carries it is not much bigger.
         assert!(plain::<ClientMessage>() <= 64);
     }
