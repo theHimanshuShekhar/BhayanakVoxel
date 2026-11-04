@@ -57,17 +57,18 @@ pub fn frame_times(timestamps: &[u64], slots: &[Slot], period_ns: f32) -> FrameT
     times
 }
 
-/// The times of one thing (a pass, or the whole frame) over the last [`WINDOW`] frames.
+/// The values of one thing (a pass's time, the whole frame's, or a count) over the last
+/// [`WINDOW`] frames.
 #[derive(Clone, Debug)]
 pub struct Series {
     window: VecDeque<f64>,
     count: u64,
-    /// Every time ever recorded, if asked for with [`Timings::set_keep_history`].
+    /// Every value ever recorded, if asked for with [`Timings::set_keep_history`].
     history: Option<Vec<f64>>,
 }
 
 impl Series {
-    fn new(keep_history: bool) -> Self {
+    pub(crate) fn new(keep_history: bool) -> Self {
         Self {
             window: VecDeque::with_capacity(WINDOW),
             count: 0,
@@ -75,7 +76,7 @@ impl Series {
         }
     }
 
-    fn record(&mut self, ms: f64) {
+    pub(crate) fn record(&mut self, ms: f64) {
         if self.window.len() == WINDOW {
             self.window.pop_front();
         }
@@ -86,19 +87,19 @@ impl Series {
         }
     }
 
-    /// Mean over the last [`WINDOW`] times, or `None` if there are none (a timer that is
+    /// Mean over the last [`WINDOW`] values, or `None` if there are none (a timer that is
     /// unsupported, or that has not reported yet).
     pub fn average(&self) -> Option<f64> {
         (!self.window.is_empty())
             .then(|| self.window.iter().sum::<f64>() / self.window.len() as f64)
     }
 
-    /// The longest of the last [`WINDOW`] times.
+    /// The largest of the last [`WINDOW`] values.
     pub fn max(&self) -> Option<f64> {
         self.window.iter().copied().reduce(f64::max)
     }
 
-    /// The latest time.
+    /// The latest value.
     pub fn last(&self) -> Option<f64> {
         self.window.back().copied()
     }
