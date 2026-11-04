@@ -116,6 +116,12 @@ const WORDS_PER_BRICK: f64 = 28.0;
 /// drawn: the ones buried are held too). Scaled with `d0` squared like the bricks drawn. A table
 /// that grows in the middle of a frame moves every entry, 25 to 60 ms for these; this is
 /// address space until the resident set fills it.
+///
+/// The tree, the resident set and the waiting bricks include the coarse bricks that read as air
+/// and are not proven to be (see `BrickStore::may_have_ground_below`), which are split and read like any
+/// other: with them the tree, the bricks generated and the bricks waiting measured 11 to 26%
+/// larger, so those three are sized 30% over what they were. The bricks held are not more: air is
+/// not held.
 struct Room {
     /// Bricks held at each level, from level 0.
     held: Vec<usize>,
@@ -138,9 +144,9 @@ fn room_for(bands: Bands) -> Room {
     }));
     Room {
         held,
-        resident: scaled(1_200_000.0),
-        nodes: scaled(5_000_000.0) + 400_000,
-        waiting: scaled(1_200_000.0) + 200_000,
+        resident: scaled(1_560_000.0),
+        nodes: scaled(6_500_000.0) + 400_000,
+        waiting: scaled(1_560_000.0) + 200_000,
     }
 }
 

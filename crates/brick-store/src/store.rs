@@ -173,6 +173,16 @@ impl BrickStore {
             .is_some_and(|source| source.solid_below(level, coord))
     }
 
+    /// Whether the store has a source that does not say that every Voxel of level 0 under the
+    /// brick at `coord` of `level` is air (see [`BrickSource::air_below`]): a brick that reads
+    /// as air may then have ground under it. Without a source a brick that is not held has
+    /// nothing under it.
+    pub fn may_have_ground_below(&self, level: usize, coord: BrickCoord) -> bool {
+        self.source
+            .as_ref()
+            .is_some_and(|source| !source.air_below(level, coord))
+    }
+
     /// Holds `brick` as the brick at `coord` of mip `level`, replacing any held there: the way a
     /// coarse brick that was generated directly (see [`BrickSource`]) gets into the pyramid, as
     /// [`Self::insert`] does for level 0. Like it, this does not touch the levels above: the
@@ -1200,6 +1210,22 @@ mod tests {
         ball.build_lod(2);
         assert!(ball.solid_below(2, BrickCoord([0, 0, 0])));
         assert!(!ball.solid_below(2, BrickCoord([5, 5, 5])));
+    }
+
+    #[test]
+    fn air_is_unproven_unless_there_is_a_source_that_says_it_is_air_below() {
+        let mut ball = BrickStore::new();
+        // Without a source a brick that is not held has nothing under it.
+        assert!(!ball.may_have_ground_below(2, BrickCoord([0, 0, 0])));
+        ball.set_source(Interior {
+            radius: 100,
+            material: ROCK,
+        });
+        // Over the edge of the ball a brick may have some of it under it; wholly outside it, none.
+        assert!(ball.may_have_ground_below(2, BrickCoord([0, 0, 0])));
+        assert!(ball.may_have_ground_below(2, BrickCoord([3, 0, 0])));
+        assert!(!ball.may_have_ground_below(2, BrickCoord([5, 5, 5])));
+        assert!(!ball.may_have_ground_below(0, BrickCoord([20, 0, 0])));
     }
 
     #[test]

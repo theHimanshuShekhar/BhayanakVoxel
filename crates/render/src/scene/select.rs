@@ -153,7 +153,8 @@ impl Diff {
 /// What a brick of the store is to the tree.
 #[derive(Clone, Copy)]
 struct Probe {
-    /// In the tree: not buried, and not air with nothing under it.
+    /// In the tree: not buried, and not air that nothing is under. Air is in it if the store holds
+    /// the brick, or has a source that does not say that all the Voxels under it are air.
     present: bool,
     /// Drawn if it is whole: not air, and not buried.
     draws: bool,
@@ -175,7 +176,12 @@ fn faces(coord: BrickCoord) -> impl Iterator<Item = BrickCoord> {
 /// are looked up).
 ///
 /// Air is out of it, unless the store holds the brick, which means it holds bricks under it that
-/// may not be air (a coarse brick is air if under half its Voxels are solid).
+/// may not be air (a coarse brick is air if under half its Voxels are solid), or the source of the
+/// store does not say that all the Voxels of level 0 under it are air
+/// ([`BrickStore::may_have_ground_below`]): a coarse brick is sampled at the middle of its Voxels, so
+/// ground that pokes up into a brick above a slope leaves it air, with ground under it that must
+/// be drawn. Such a brick is split when its band asks, and drawn as nothing when it is whole. A
+/// brick of level 0 reads as it is.
 ///
 /// A brick that is full, with full bricks on all six faces, is *buried*: no ray from outside
 /// reaches it, and it is not drawn. It is out of the tree for good only if it and all six of those
@@ -197,7 +203,7 @@ fn classify(
 ) -> Probe {
     if brick.is_air() {
         return Probe {
-            present: held,
+            present: held || (level > 0 && store.may_have_ground_below(level, coord)),
             draws: false,
             solid: false,
         };
@@ -1340,6 +1346,86 @@ mod tests {
         );
         assert!(selection.draws(1, BrickCoord([0, 0, 0])));
         assert_eq!(selection.bricks().count(), 1);
+    }
+
+    /// A source whose level 1 brick at the origin reads as air, as a coarse brick sampled at the
+    /// middle of its Voxels does over a slope, with a brick of rock under it at level 0 that
+    /// pokes into it. `sky` is what it says to [`brick_store::BrickSource::air_below`].
+    #[derive(Debug)]
+    struct Poke {
+        sky: bool,
+    }
+
+    impl brick_store::BrickSource for Poke {
+        fn brick(&self, level: usize, coord: BrickCoord) -> Brick {
+            if level == 0 && coord == BrickCoord([1, 0, 1]) {
+                Brick::solid(ROCK)
+            } else {
+                Brick::AIR
+            }
+        }
+
+        fn air_below(&self, _level: usize, _coord: BrickCoord) -> bool {
+            self.sky
+        }
+    }
+
+    fn poke(sky: bool, camera: [f64; 3], d0: f64) -> Selection {
+        let mut store = BrickStore::new();
+        store.set_source(Poke { sky });
+        store.build_lod(1);
+        Selection::new(
+            &store,
+            camera,
+            Bands::with_d0(d0),
+            1,
+            [BrickCoord([0, 0, 0])],
+        )
+        .0
+    }
+
+    #[test]
+    fn a_coarse_brick_that_reads_as_air_with_ground_under_it_is_split_and_the_ground_drawn() {
+        // Near, level 1 is split, and the brick of rock that its air hid is drawn at level 0.
+        let near = poke(false, [3.0, 3.0, 3.0], 1000.0);
+        assert!(near.draws(0, BrickCoord([1, 0, 1])));
+        assert_eq!(near.bricks().count(), 1);
+        // Far, it is whole, and draws nothing, as air does.
+        let far = poke(false, [3000.0, 3.0, 3.0], 1.0);
+        assert_eq!(far.bricks().count(), 0);
+        assert!(
+            far.nodes() > 0,
+            "it is in the tree, to be split when it is near"
+        );
+        // Where the source says that all of it is air, it is not in the tree at all.
+        let sky = poke(true, [3.0, 3.0, 3.0], 1000.0);
+        assert_eq!(sky.nodes(), 0);
+    }
+
+    #[test]
+    fn a_coarse_brick_that_reads_as_air_waits_for_its_children_in_a_store_that_streams() {
+        let mut store = BrickStore::new();
+        store.set_source(Poke { sky: false });
+        store.build_lod(1);
+        store.stream_from(1);
+        let (mut selection, _) = Selection::new(
+            &store,
+            [3.0, 3.0, 3.0],
+            Bands::with_d0(1000.0),
+            1,
+            [BrickCoord([0, 0, 0])],
+        );
+        assert_eq!(selection.bricks().count(), 0);
+        assert_eq!(selection.take_wanted(), [(1, BrickCoord([0, 0, 0]))]);
+        // The loader reads its children from the source, which holds the rock, and the selection
+        // splits it and draws them.
+        let source = store.source().expect("a source");
+        let bricks = brick_store::children_from(&*source, 1, BrickCoord([0, 0, 0]), |_| false);
+        store.hold_children(1, BrickCoord([0, 0, 0]), bricks);
+        let diff = selection.arrived(&store, [(1, BrickCoord([0, 0, 0]))]);
+        assert!(selection.draws(0, BrickCoord([1, 0, 1])));
+        assert!(diff.added.contains(&(0, BrickCoord([1, 0, 1]))));
+        assert_eq!(selection.waiting(), 0);
     }
 
     /// A block of solid rock, 40 bricks (320 Voxels) on a side, with a pyramid of five levels.
