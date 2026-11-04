@@ -6,33 +6,71 @@
 
 use std::sync::mpsc::{self, Receiver, Sender};
 
-use brick_store::VoxelCoord;
+use brick_store::{Material, VoxelCoord};
 
 pub use std::sync::mpsc::TryRecvError;
 
-/// What an Edit does to the Voxels it covers. Place and smooth come with their Materials.
+/// What an Edit does to the Voxels its Brush covers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EditMode {
-    /// Removes the Voxels.
+    /// Removes the solid Voxels.
     Dig,
+    /// Fills the air Voxels with the op's Material.
+    Place,
+    /// Rounds the surface off: a Voxel becomes solid if most of the 3 x 3 x 3 Voxels around it
+    /// are, and air if not.
+    Smooth,
+    /// Levels the Brush against the tangent plane at its centre: the solid Voxels above the
+    /// plane are removed, and the air Voxels on and below it are filled with the op's Material.
+    Flatten,
 }
 
-/// The shape an Edit covers. Cube and cylinder come with their rotation.
+/// The shape of a Brush. Its axis, for those that have one, is the local up (see [`Alignment`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Brush {
-    /// Every Voxel whose coordinate is within `radius` Voxels of the centre, so a radius of 0
-    /// is the centre alone.
-    Sphere { radius: u16 },
+pub enum Shape {
+    /// Every Voxel within `radius` Voxels of the centre.
+    Sphere,
+    /// The box that reaches `radius` Voxels from the centre along each of its three axes.
+    Cube,
+    /// The disc of `radius` Voxels about the axis through the centre, and as far along the axis
+    /// as it is across.
+    Cylinder,
 }
 
-/// One Edit, small enough to broadcast Planet-wide. Fields that Edits do not need yet (a
-/// Material, a rotation, an alignment mode) are added when they do.
+/// How a Brush's axes are laid out against the Voxel grid.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Alignment {
+    /// Up is the local up at the centre (away from the Planet's centre), snapped to the nearest
+    /// 45 degrees: what a Brush on the side of the Planet stands on.
+    Local,
+    /// Up is the grid's +y, and the axes are the grid's.
+    World,
+}
+
+/// The shape and size an Edit applies to the Planet.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Brush {
+    pub shape: Shape,
+    /// In Voxels: 0 is the centre Voxel alone, and 20 (2 m) is the most a player may use.
+    pub radius: u16,
+}
+
+/// One Edit, small enough to broadcast Planet-wide: 24 bytes. The Voxels it changes follow from
+/// it and the Planet's bricks by integer maths alone (see `sim::plan`), so the op carries no
+/// Voxel list: the up axis follows from `alignment` and `centre`, and `rotation` turns the Brush
+/// about it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct EditOp {
     pub mode: EditMode,
     pub brush: Brush,
     /// The Voxel the Brush is centred on.
     pub centre: VoxelCoord,
+    /// What `Place` and `Flatten` fill with. The other modes ignore it.
+    pub material: Material,
+    pub alignment: Alignment,
+    /// How far the Brush is turned about its up axis, in steps of 45 degrees: 0 to 7. A cube and
+    /// a cylinder are the same shape after a quarter turn, so for them only odd and even differ.
+    pub rotation: u8,
 }
 
 impl EditOp {
@@ -40,8 +78,14 @@ impl EditOp {
     pub fn dig_sphere(centre: VoxelCoord, radius: u16) -> Self {
         Self {
             mode: EditMode::Dig,
-            brush: Brush::Sphere { radius },
+            brush: Brush {
+                shape: Shape::Sphere,
+                radius,
+            },
             centre,
+            material: Material(0),
+            alignment: Alignment::Local,
+            rotation: 0,
         }
     }
 }
@@ -53,6 +97,18 @@ pub enum RejectReason {
     BrushTooLarge,
     /// The Brush reaches beyond the Voxel coordinates the Planet has.
     OutOfRange,
+    /// The centre is further from the player's eyes than a player may reach, or the player has no
+    /// character to reach from.
+    OutOfReach,
+    /// A `Place` or `Flatten` of a Material that the Material table does not define.
+    UnknownMaterial,
+    /// The player asked for more Edits in the last second than they may, or the server has done
+    /// as much Edit work as it will this tick.
+    RateLimited,
+    /// The Edit would change more Voxels than the player has left to change.
+    VolumeLimited,
+    /// A rotation that is not 0 to 7.
+    BadRotation,
 }
 
 /// What a player asks of their character for one tick (the sim's fixed step): plain data, so
@@ -218,6 +274,18 @@ mod tests {
             client_seq,
             op: EditOp::dig_sphere(VoxelCoord([client_seq as i32, -1, 0]), 10),
         }
+    }
+
+    #[test]
+    fn an_edit_op_is_a_small_fixed_size_message() {
+        // ADR 0003: about 24 bytes at most, so that Edits broadcast Planet-wide stay cheap. The op has no
+        // list or pointer that could grow: it is `Copy`.
+        fn plain<T: Copy>() -> usize {
+            size_of::<T>()
+        }
+        assert_eq!(plain::<EditOp>(), 24);
+        // The request that carries it is not much bigger.
+        assert!(plain::<ClientMessage>() <= 64);
     }
 
     #[test]

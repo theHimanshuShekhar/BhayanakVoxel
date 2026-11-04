@@ -474,6 +474,18 @@ impl Scene {
         self.repacked(store, None)
     }
 
+    /// The ball the selection of a scene of rings looks in, which a scene made again starts from.
+    pub(super) fn rings_ball(&self) -> Option<Bound> {
+        self.rings.as_ref().map(|r| r.ball)
+    }
+
+    /// Sets the ball of [`Scene::rings_ball`], if this is a scene of rings.
+    pub(super) fn set_rings_ball(&mut self, ball: Bound) {
+        if let Some(rings) = &mut self.rings {
+            rings.ball = ball;
+        }
+    }
+
     /// Whether this is a scene of rings (see [`Scene::rings`]).
     pub fn is_rings(&self) -> bool {
         self.rings.is_some()
@@ -1505,6 +1517,76 @@ mod tests {
             + (1u32 << coarsest) as f32 * 3f32.sqrt()
             + crate::scene::BOUND_SLACK;
         assert_eq!(radius, want);
+    }
+
+    /// The first solid Voxel straight down from above `voxel`, if rays reach it.
+    fn seen_from_above(scene: &Scene, voxel: VoxelCoord) -> Option<[i32; 3]> {
+        let (cell, origin) = crate::camera::split([
+            f64::from(voxel.0[0]) + 0.5,
+            f64::from(voxel.0[1]) + 60.5,
+            f64::from(voxel.0[2]) + 0.5,
+        ]);
+        let ray = crate::reference::Ray {
+            cell,
+            origin,
+            dir: [0.0, -1.0, 0.0],
+        };
+        crate::reference::trace(scene, &ray).map(|hit| hit.voxel)
+    }
+
+    #[test]
+    fn matter_placed_above_the_ball_grows_it_so_that_rays_are_not_clipped_short_of_it() {
+        let mut store = ground().clone();
+        let radius = bound().radius;
+        // A cube of 32 Voxels (4 bricks) a side, aligned to the coarse levels so that it is
+        // solid at each of them, over the ball, with nothing round it.
+        let low = (radius + 24 + 31) / 32 * 32;
+        let camera = [16.0, f64::from(low) + 80.0, 16.0];
+        let mut scene = Scene::rings(&store, camera, bands(), bound()).unwrap();
+        let top = VoxelCoord([16, low + 31, 16]);
+        assert_ne!(seen_from_above(&scene, top), Some(top.0));
+        let mut changed = BTreeSet::new();
+        for x in 0..32 {
+            for y in low..low + 32 {
+                for z in 0..32 {
+                    let voxel = VoxelCoord([x, y, z]);
+                    store.set(voxel, Some(Material(7)));
+                    changed.insert(voxel.brick());
+                }
+            }
+        }
+        let changed: Vec<_> = changed.into_iter().collect();
+        store.refresh_lod(changed.iter().copied());
+        scene.update(&store, &changed).unwrap();
+        // A clip at the ball cuts the cube off; the grown ball does not.
+        assert_eq!(seen_from_above(&scene, top), Some(top.0));
+        let grown = scene.bound.unwrap();
+        assert!(grown.radius >= low + 32, "{grown:?}");
+        assert_eq!(grown.centre, bound().centre);
+        assert!(scene.clip_radius().unwrap() > grown.radius as f32);
+
+        // A scene made again (the camera jumped, or the bias changed) keeps the grown ball.
+        let far = [camera[0] + 900.0, camera[1], camera[2]];
+        assert_eq!(scene.recentre(&store, far), Ok(Some(SceneUpdate::Rebuilt)));
+        assert_eq!(scene.bound, Some(grown));
+        let near = [camera[0], camera[1], camera[2]];
+        assert_eq!(scene.recentre(&store, near), Ok(Some(SceneUpdate::Rebuilt)));
+        assert_eq!(seen_from_above(&scene, top), Some(top.0));
+    }
+
+    #[test]
+    fn digging_and_placing_inside_the_ball_leave_it_as_it_was() {
+        let mut store = ground().clone();
+        let mut scene = rings_at(ABOVE);
+        let top = VoxelCoord([0, bound().radius - 10, 0]);
+        let changed = [top.brick()];
+        store.set(top, Some(Material(7)));
+        store.refresh_lod(changed);
+        scene.update(&store, &changed).unwrap();
+        store.set(top, None);
+        store.refresh_lod(changed);
+        scene.update(&store, &changed).unwrap();
+        assert_eq!(scene.bound, Some(bound()));
     }
 
     #[test]

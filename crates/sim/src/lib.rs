@@ -1,5 +1,6 @@
 //! Simulation logic shared by the server and the in-process single-player server.
 
+mod brush;
 mod character;
 mod edit;
 mod ground;
@@ -9,8 +10,16 @@ mod server;
 
 use std::time::Duration;
 
+pub use brush::{
+    BrickCache, CACHE_BRICKS, Change, MAX_COORD, Reads, axes, examined, examined_box, plan,
+    plan_from,
+};
 pub use character::{Cell, Character, Occupancy, TICK_DT};
-pub use edit::{MAX_BRUSH_RADIUS, Undo, apply, validate};
+pub use edit::{
+    EDIT_REACH, EditBudget, MAX_BRUSH_RADIUS, MAX_SMOOTH_RADIUS, OPS_PER_SECOND, SMOOTH_WEIGHT,
+    Undo, VOXEL_BURST, VOXELS_PER_SECOND, WORK_BURST, WORK_PER_SECOND, apply, apply_changes,
+    apply_changes_from, validate, within_reach, work,
+};
 pub use ground::{Footing, Ground};
 pub use movement::{ConfigError, Movement, MovementConfig, VOXELS_PER_METRE};
 pub use prediction::Predictor;

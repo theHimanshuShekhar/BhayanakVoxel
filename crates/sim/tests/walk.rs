@@ -11,8 +11,12 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
+use brick_store::Material;
 use brick_store::{Brick, BrickCoord, BrickSource, BrickStore, VoxelCoord};
-use net::{BodyState, ClientEnd, EditOp, Leash, MoveInput, ServerEnd, ServerMessage, loopback};
+use net::{
+    Alignment, BodyState, Brush, ClientEnd, EditMode, EditOp, Leash, MoveInput, RejectReason,
+    ServerEnd, ServerMessage, Shape, loopback,
+};
 use planet_gen::generate_brick;
 use planet_gen::planet::{Planet, PlanetSource, tangents};
 use planet_gen::world_map::WorldMap;
@@ -557,58 +561,267 @@ fn read_alike(client: &BrickStore, server: &BrickStore, centre: VoxelCoord) -> b
     })
 }
 
-#[test]
-fn a_dig_200_m_from_the_spawn_is_the_same_on_the_client_and_the_server_and_so_is_taking_it_back() {
-    let (centre, _) = ground_200_m_away();
-    let mut pair = Pair::new(real_planet, None, 2);
-    let pristine = real_planet().content_hash();
+/// One Edit of each mode and of each shape, on the ground at `centre` and up from it, where `up`
+/// is the way up there: they overlap, so that the order they are made in matters.
+fn every_kind_of_edit(centre: VoxelCoord, up: [f64; 3]) -> Vec<EditOp> {
+    let above = |voxels: f64| {
+        VoxelCoord(std::array::from_fn(|a| {
+            centre.0[a] + (up[a] * voxels).round() as i32
+        }))
+    };
+    let op = |mode, shape, radius, at, alignment| EditOp {
+        mode,
+        brush: Brush { shape, radius },
+        centre: at,
+        material: Material(35),
+        alignment,
+        rotation: 0,
+    };
+    vec![
+        op(EditMode::Dig, Shape::Sphere, 10, centre, Alignment::Local),
+        op(
+            EditMode::Place,
+            Shape::Cube,
+            6,
+            above(7.0),
+            Alignment::Local,
+        ),
+        op(
+            EditMode::Smooth,
+            Shape::Sphere,
+            10,
+            centre,
+            Alignment::Local,
+        ),
+        op(
+            EditMode::Flatten,
+            Shape::Cylinder,
+            10,
+            above(4.0),
+            Alignment::Local,
+        ),
+        op(
+            EditMode::Place,
+            Shape::Cylinder,
+            5,
+            above(2.0),
+            Alignment::World,
+        ),
+        op(EditMode::Dig, Shape::Cube, 4, above(-6.0), Alignment::World),
+    ]
+}
 
-    // Made and asked for: the server makes it too, and tells the client, which has no Edit left
-    // to settle.
-    let dug = EditOp::dig_sphere(centre, 10);
-    pair.dig(dug, true);
-    assert_eq!(pair.client.pending(), 1);
-    for _ in 0..4 {
-        pair.serve();
-    }
-    assert_eq!((pair.client.pending(), pair.client.desyncs()), (0, 0));
-    let dug_hash = pair.server.store().content_hash();
-    assert_ne!(dug_hash, pristine);
-    assert_eq!(pair.client.store().content_hash(), dug_hash);
-    assert_eq!(pair.client.store().voxel_at(0, centre), None);
-    assert!(planet().voxel(centre).is_some(), "there was ground to dig");
-    assert!(read_alike(pair.client.store(), pair.server.store(), centre));
-
-    // Made and then turned down: the client takes it back, and the two agree again.
-    let beside = VoxelCoord(centre.0.map(|c| c + 12));
-    pair.dig(EditOp::dig_sphere(beside, 10), false);
-    assert_ne!(pair.client.store().content_hash(), dug_hash);
-    pair.client.receive(ServerMessage::Rejected {
-        client_seq: 1,
-        reason: net::RejectReason::BrushTooLarge,
-    });
-    assert_eq!(pair.client.pending(), 0);
-    assert_eq!(pair.client.store().content_hash(), dug_hash);
-    assert!(read_alike(pair.client.store(), pair.server.store(), centre));
+/// A pair whose character stands on the ground at `centre`, so that Edits there are in reach.
+fn standing_at(pair: &mut Pair, centre: VoxelCoord, up: [f64; 3]) {
+    let feet: [f64; 3] = std::array::from_fn(|a| f64::from(centre.0[a]) + up[a] * 3.0);
+    pair.spawn(feet);
+    pair.run(1, 10, |_, _| MoveInput::default());
 }
 
 #[test]
-fn a_dig_taken_back_beyond_the_spawn_in_a_client_that_streams_leaves_it_reading_as_the_server_does()
-{
-    let (centre, _) = ground_200_m_away();
+fn every_edit_200_m_from_the_spawn_is_the_same_on_the_client_and_the_server_and_so_is_taking_it_back()
+ {
+    let (centre, up) = ground_200_m_away();
+    let mut pair = Pair::new(real_planet, None, 2);
+    standing_at(&mut pair, centre, up);
+    let pristine = real_planet().content_hash();
+    assert!(planet().voxel(centre).is_some(), "there was ground to dig");
+
+    // Made and asked for: the server makes them too, and tells the client, which has no Edit left
+    // to settle.
+    let edits = every_kind_of_edit(centre, up);
+    for &op in &edits {
+        pair.dig(op, true);
+    }
+    assert_eq!(pair.client.pending(), edits.len());
+    for _ in 0..6 {
+        pair.serve();
+    }
+    assert_eq!((pair.client.pending(), pair.client.desyncs()), (0, 0));
+    let edited = pair.server.store().content_hash();
+    assert_ne!(edited, pristine);
+    assert_eq!(pair.client.store().content_hash(), edited);
+    assert_eq!(pair.client.store().voxel_at(0, centre), None);
+    assert!(read_alike(pair.client.store(), pair.server.store(), centre));
+
+    // Made and then turned down by the server, each for a reason that really applies to it: the
+    // client takes each back, and the two agree again. Each is sent to the server, which says no.
+    let above = |voxels: f64| {
+        VoxelCoord(std::array::from_fn(|a| {
+            centre.0[a] + (up[a] * voxels).round() as i32
+        }))
+    };
+    let mut op = EditOp {
+        mode: EditMode::Dig,
+        brush: Brush {
+            shape: Shape::Sphere,
+            radius: 10,
+        },
+        centre,
+        material: Material(35),
+        alignment: Alignment::Local,
+        rotation: 0,
+    };
+    let refused = [
+        // Bigger than 2 m.
+        (
+            "a Brush over 2 m",
+            EditOp {
+                brush: Brush {
+                    shape: Shape::Sphere,
+                    radius: 21,
+                },
+                ..op
+            },
+            RejectReason::BrushTooLarge,
+        ),
+        (
+            "a Material that is not defined",
+            EditOp {
+                mode: EditMode::Place,
+                brush: Brush {
+                    shape: Shape::Cube,
+                    radius: 6,
+                },
+                centre: above(7.0),
+                material: Material(60_000),
+                ..op
+            },
+            RejectReason::UnknownMaterial,
+        ),
+        // 100 Voxels (10 m) up in the air, past the 8 m the character reaches.
+        (
+            "a Flatten out of reach",
+            EditOp {
+                mode: EditMode::Flatten,
+                brush: Brush {
+                    shape: Shape::Cylinder,
+                    radius: 10,
+                },
+                centre: above(100.0),
+                ..op
+            },
+            RejectReason::OutOfReach,
+        ),
+        // A Smooth is held to 1 m radius, and a Dig to 2 m.
+        (
+            "a Smooth over 1 m",
+            EditOp {
+                mode: EditMode::Smooth,
+                brush: Brush {
+                    shape: Shape::Cube,
+                    radius: 11,
+                },
+                ..op
+            },
+            RejectReason::BrushTooLarge,
+        ),
+        (
+            "a rotation that is not one of the 8",
+            EditOp {
+                brush: Brush {
+                    shape: Shape::Cube,
+                    radius: 4,
+                },
+                rotation: 9,
+                ..op
+            },
+            RejectReason::BadRotation,
+        ),
+    ];
+    let mut had_a_change_to_take_back = 0;
+    for (what, op, reason) in refused {
+        pair.dig(op, true);
+        assert_eq!(pair.client.pending(), 1, "{what}");
+        had_a_change_to_take_back += usize::from(pair.client.store().content_hash() != edited);
+        // The server's answer, which is the reason that the Edit deserves.
+        let mut told = Vec::new();
+        for _ in 0..=pair.lag + 1 {
+            pair.server.tick(std::slice::from_ref(&pair.server_end));
+            while let Ok(message) = pair.link.try_recv() {
+                if let ServerMessage::Rejected { reason, .. } = message {
+                    told.push(reason);
+                }
+                pair.client.receive(message);
+            }
+        }
+        assert_eq!(told, [reason], "{what}");
+        assert_eq!(pair.client.pending(), 0, "{what}");
+        assert_eq!(pair.client.store().content_hash(), edited, "{what}");
+        assert_eq!(pair.server.store().content_hash(), edited, "{what}");
+        assert!(read_alike(pair.client.store(), pair.server.store(), centre));
+    }
+    // Most of them changed something to take back (a Flatten in the air fills a slab).
+    assert!(
+        had_a_change_to_take_back >= 4,
+        "only {had_a_change_to_take_back} had a change to take back"
+    );
+
+    // Over the 20 Edits a second: a run of single Voxel digs, all at once, of which the server
+    // takes what the allowance has left and turns the rest down as `RateLimited`; the client ends
+    // with what the server has, the ones it predicted and was refused taken back.
+    let before = pair.server.store().clone();
+    let deep: Vec<_> = (0..40).map(|i| above(-30.0 - f64::from(i))).collect();
+    op.brush.radius = 0;
+    for &at in &deep {
+        pair.dig(EditOp { centre: at, ..op }, true);
+    }
+    assert_eq!(pair.client.pending(), 40);
+    let mut limited = 0;
+    for _ in 0..=pair.lag + 1 {
+        pair.server.tick(std::slice::from_ref(&pair.server_end));
+        let heard: Vec<_> = std::iter::from_fn(|| pair.link.try_recv().ok()).collect();
+        for message in heard {
+            limited += usize::from(matches!(
+                message,
+                ServerMessage::Rejected {
+                    reason: RejectReason::RateLimited,
+                    ..
+                }
+            ));
+            pair.client.receive(message);
+        }
+    }
+    assert_eq!(pair.client.pending(), 0);
+    let dug = |store: &BrickStore| {
+        deep.iter()
+            .filter(|&&v| before.voxel_at(0, v).is_some() && store.voxel_at(0, v).is_none())
+            .count()
+    };
+    assert!(limited > 0 && dug(pair.server.store()) > 0, "{limited}");
+    assert_eq!(
+        dug(pair.server.store()) + limited,
+        40,
+        "each Voxel was solid"
+    );
+    assert_eq!(
+        pair.client.store().content_hash(),
+        pair.server.store().content_hash()
+    );
+}
+
+#[test]
+fn an_edit_taken_back_beyond_the_spawn_in_a_client_that_streams_leaves_it_reading_as_the_server_does()
+ {
+    let (centre, up) = ground_200_m_away();
     // The client streams the Planet in, as the game's does, and the server does not.
     let mut client = real_planet();
     client.build_lod(2);
     client.stream_from(1);
     let mut pair = Pair::with_stores(client, real_planet(), None, 2);
-    pair.dig(EditOp::dig_sphere(centre, 10), false);
-    assert_eq!(pair.client.store().voxel_at(0, centre), None);
-    pair.client.receive(ServerMessage::Rejected {
-        client_seq: 0,
-        reason: net::RejectReason::BrushTooLarge,
-    });
-    assert!(pair.client.store().voxel_at(0, centre).is_some());
-    assert!(read_alike(pair.client.store(), pair.server.store(), centre));
+    for (client_seq, op) in every_kind_of_edit(centre, up).into_iter().enumerate() {
+        pair.dig(op, false);
+        // Any Edit may be turned down for the rate, or for the server being busy: it is not its
+        // fault, and the client takes it back all the same.
+        pair.client.receive(ServerMessage::Rejected {
+            client_seq: client_seq as u64,
+            reason: RejectReason::RateLimited,
+        });
+        assert_eq!(pair.client.pending(), 0);
+        assert!(planet().voxel(centre).is_some());
+        assert!(pair.client.store().voxel_at(0, centre).is_some(), "{op:?}");
+        assert!(read_alike(pair.client.store(), pair.server.store(), centre));
+    }
 }
 
 #[test]
@@ -626,6 +839,43 @@ fn a_character_falls_into_a_hole_dug_under_it_beyond_the_spawn_and_both_sides_ag
     pair.run(240, 1000, |_, _| MoveInput::default());
     let after = height(pair.server_state().position);
     assert!(after < before - 6.0, "fell {} Voxels", before - after);
+    pair.assert_agree();
+}
+
+#[test]
+fn a_character_lands_on_a_block_placed_under_it_beyond_the_spawn_and_both_sides_agree() {
+    let (centre, up) = ground_200_m_away();
+    let at = |voxels: f64| -> [f64; 3] {
+        std::array::from_fn(|a| f64::from(centre.0[a]) + up[a] * voxels)
+    };
+    let height = |position: [f64; 3]| (0..3).map(|a| position[a] * up[a]).sum::<f64>();
+    let mut pair = Pair::new(real_planet, None, 2);
+    pair.spawn(at(30.0));
+    pair.run(1, 10, |_, _| MoveInput::default());
+
+    // A cube of 17 Voxels a side, standing on the local up, between the character and the ground.
+    let block = EditOp {
+        mode: EditMode::Place,
+        brush: Brush {
+            shape: Shape::Cube,
+            radius: 8,
+        },
+        centre: VoxelCoord(at(12.0).map(|c| c.round() as i32)),
+        material: Material(35),
+        alignment: Alignment::Local,
+        rotation: 0,
+    };
+    pair.dig(block, true);
+    pair.run(240, 1000, |_, _| MoveInput::default());
+    assert_eq!((pair.client.pending(), pair.client.desyncs()), (0, 0));
+
+    // It stopped on the block's top, 8 Voxels above its middle at least, and not on the ground.
+    let stopped = height(pair.server_state().position) - height(at(0.0));
+    assert!(
+        (12.0..40.0).contains(&stopped),
+        "stopped {stopped} Voxels up"
+    );
+    assert!(pair.server_state().grounded);
     pair.assert_agree();
 }
 

@@ -1,9 +1,11 @@
 mod bench;
 mod fly;
+mod ghost;
 mod loader;
 mod priority;
 #[cfg(test)]
 mod streaming_tests;
+mod tool;
 mod world;
 
 use std::error::Error;
@@ -23,6 +25,7 @@ use render::overlay::{self, Controls, LodInfo, SceneMemory};
 use render::scene::Bound;
 use render::{Camera, Mode, Renderer, RingsFull, Scene, SceneUpdate, Sun};
 use sim::{FixedTimestep, Predictor, ServerHandle, TICK_RATE_HZ};
+use tool::Tool;
 use winit::application::ApplicationHandler;
 use winit::event::{DeviceEvent, DeviceId, ElementState, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
@@ -355,6 +358,8 @@ struct App {
     /// The eyes after the previous and the latest character tick, which the camera is drawn
     /// between so that it moves smoothly at any frame rate.
     eyes: Option<([f64; 3], [f64; 3])>,
+    /// The Brush that a click applies, which the tool keys change.
+    tool: Tool,
     /// The sun as an azimuth and an elevation, which the arrow keys turn.
     sun: (f32, f32),
     /// The LOD bias in use: output pixels one Voxel may cover. The overlay changes it.
@@ -405,6 +410,7 @@ impl App {
             clock: FixedTimestep::new(Duration::from_secs(1) / TICK_RATE_HZ, MAX_TICKS_PER_FRAME),
             spawn: None,
             eyes: None,
+            tool: Tool::default(),
             sun: Sun::default().angles(),
             bias: DEFAULT_BIAS,
             title: String::new(),
@@ -484,13 +490,29 @@ impl App {
         self.show(update)
     }
 
-    /// Digs where the camera looks. The hole is drawn at once and confirmed by the server.
-    fn dig(&mut self) -> Result<(), Box<dyn Error>> {
+    /// Applies the tool where the camera looks. The Edit is drawn at once and confirmed by the
+    /// server. Only the character edits: the server holds an Edit to the reach of its eyes, and the
+    /// noclip camera is not where they are.
+    fn edit(&mut self) -> Result<(), Box<dyn Error>> {
         let Some(world) = &mut self.world else {
             return Ok(());
         };
-        let update = world.dig(&self.camera)?;
+        if !self.walking {
+            return Ok(());
+        }
+        let update = world.edit(&self.camera, &self.tool)?;
         self.show(update)
+    }
+
+    /// Shows what a click would change, while the character has the mouse. It is the Edit's own
+    /// list of Voxels, so it is what the click does.
+    fn aim(&mut self) {
+        let aimed = self.walking && self.grabbed;
+        match &mut self.world {
+            Some(world) if aimed => world.show_ghost(&self.camera, &self.tool),
+            Some(world) => world.hide_ghost(),
+            None => {}
+        }
     }
 
     /// Runs the character for the time that has passed, as ticks at the server's rate, and puts
@@ -591,7 +613,7 @@ impl App {
         } else if !self.walking {
             format!("{TITLE} (noclip)")
         } else {
-            TITLE.to_string()
+            format!("{TITLE} [{}]", self.tool.describe())
         };
         if title != self.title {
             window.set_title(&title);
@@ -657,7 +679,9 @@ impl App {
         else {
             return None;
         };
-        if !gui.visible {
+        // The ghost is painted by the same pass, so a hidden overlay still runs it for the ghost.
+        let ghost = self.world.as_ref().and_then(World::ghost);
+        if !gui.visible && ghost.is_none() {
             return None;
         }
         let before = Controls {
@@ -678,9 +702,15 @@ impl App {
             lod: self.world.as_ref().and_then(|w| lod_info(w.scene())),
         };
         let input = gui.state.take_egui_input(window);
-        let mut output = gui
-            .ctx
-            .run_pass(input, |ctx| overlay::show(ctx, &info, &mut controls));
+        let camera = &self.camera;
+        let mut output = gui.ctx.run_pass(input, |ctx| {
+            if gui.visible {
+                overlay::show(ctx, &info, &mut controls);
+            }
+            if let Some(ghost) = ghost {
+                ghost.paint(ctx, camera);
+            }
+        });
         gui.state
             .handle_platform_output(window, std::mem::take(&mut output.platform_output));
         if controls.mode != before.mode {
@@ -829,6 +859,18 @@ impl ApplicationHandler for App {
                             KeyCode::ArrowRight => self.turn_sun(SUN_STEP, 0.0),
                             KeyCode::ArrowUp => self.turn_sun(0.0, SUN_STEP),
                             KeyCode::ArrowDown => self.turn_sun(0.0, -SUN_STEP),
+                            // The tool's keys; the ones that size and pick may repeat.
+                            code if !event.repeat
+                                || matches!(
+                                    code,
+                                    KeyCode::BracketLeft
+                                        | KeyCode::BracketRight
+                                        | KeyCode::Minus
+                                        | KeyCode::Equal
+                                ) =>
+                            {
+                                self.tool.key(code);
+                            }
                             _ => {}
                         }
                     }
@@ -844,7 +886,7 @@ impl ApplicationHandler for App {
                 if !used_by_overlay {
                     if !self.grabbed {
                         self.grab(true);
-                    } else if let Err(err) = self.dig() {
+                    } else if let Err(err) = self.edit() {
                         self.error = Some(err);
                         event_loop.exit();
                     }
@@ -870,6 +912,7 @@ impl ApplicationHandler for App {
                 } else {
                     self.fly.update(&mut self.camera, dt);
                 }
+                self.aim();
                 let scene_started = Instant::now();
                 if let Err(err) = self.recentre().and_then(|()| self.stream()) {
                     self.error = Some(err);
