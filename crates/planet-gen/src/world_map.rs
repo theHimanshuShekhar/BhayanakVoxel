@@ -99,6 +99,7 @@ impl Texel {
 
 /// The world map of one seed. See the module documentation.
 pub struct WorldMap {
+    seed: u64,
     size: u32,
     /// Face by face, each row by row (`i` fastest).
     texels: Vec<Texel>,
@@ -142,7 +143,13 @@ impl WorldMap {
                 regions: regions(seed, direction),
             }
         });
-        WorldMap { size, texels }
+        WorldMap { seed, size, texels }
+    }
+
+    /// The seed the map was made from, which per-brick generation draws its own randomness from
+    /// (it is not part of [`WorldMap::content_hash`]: the texels are).
+    pub fn seed(&self) -> u64 {
+        self.seed
     }
 
     /// Texels along one face's edge.
