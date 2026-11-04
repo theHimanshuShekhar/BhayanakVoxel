@@ -6,7 +6,7 @@ use brick_store::{Material, VoxelCoord};
 use materials::MaterialTable;
 use net::{ClientEnd, Disconnected, EditMode, EditOp, MoveInput, TryRecvError};
 use render::reference::{Hit, Ray, trace};
-use render::{Camera, RingsFull, Scene, SceneUpdate, camera};
+use render::{Camera, Mode, RingsFull, Scene, SceneUpdate, camera};
 use sim::Predictor;
 
 use crate::dig::dig_seconds;
@@ -14,11 +14,54 @@ use crate::ghost::Ghost;
 use crate::loader::{Arrival, Loader};
 use crate::tool::{Tool, rotation_for};
 
+/// How many frames in a row the view must be unchanged before the reference image is taken to be
+/// accumulating it, and loading pauses for it.
+pub const STILL_FRAMES: u32 = 2;
+
+/// Whether loading pauses, given the mode and how many frames in a row the view (camera, sun,
+/// size and LOD bias) has been unchanged: only while the reference accumulates a still view.
+/// Anything that changes it, moving included, lets loading go the same frame.
+pub fn loading_paused_for(mode: Mode, still_frames: u32) -> bool {
+    mode == Mode::Reference && still_frames >= STILL_FRAMES
+}
+
+/// How long what is compared has been the same, frame by frame: the view the reference image is
+/// of, held still (the scene is not part of it, as arrivals from the loader that this decides
+/// about change it).
+#[derive(Debug)]
+pub struct Stillness<K> {
+    last: Option<K>,
+    frames: u32,
+}
+
+impl<K> Default for Stillness<K> {
+    fn default() -> Self {
+        Self {
+            last: None,
+            frames: 0,
+        }
+    }
+}
+
+impl<K: PartialEq> Stillness<K> {
+    /// Takes in this frame's `key` and returns how many frames in a row it has equalled the
+    /// frame before's: 0 for a key that is new, then 1, 2, ...
+    pub fn observe(&mut self, key: K) -> u32 {
+        if self.last.as_ref() == Some(&key) {
+            self.frames = self.frames.saturating_add(1);
+        } else {
+            self.last = Some(key);
+            self.frames = 0;
+        }
+        self.frames
+    }
+}
+
 /// What the frame thread aims to spend taking in bricks from the loader in one frame, the upload
 /// to the GPU included. A resident set that is filling takes more frames, not longer ones.
 pub const STREAM_BUDGET: std::time::Duration = std::time::Duration::from_micros(2000);
 /// Bricks' children taken in at a time, between looks at the clock.
-const BATCH: usize = 8;
+pub const BATCH: usize = 8;
 /// Most bricks asked of the loader in one frame (the rest wait for the next): the first call has
 /// every brick the Guard leaves to split, and the table that holds them is not made in a frame.
 const WANTED_PER_FRAME: usize = 20_000;
