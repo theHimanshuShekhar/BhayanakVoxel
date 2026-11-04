@@ -5,6 +5,7 @@
 use egui::{Align2, Button, Color32, Context, Grid, Key, RichText, Sense, Slider, Window, vec2};
 use materials::MaterialTable;
 
+use crate::cpu::{CpuBreakdown, Row};
 use crate::debug_view::DebugView;
 use crate::timing::{Series, Timings};
 use crate::window::Mode;
@@ -44,6 +45,10 @@ pub struct SceneMemory {
 /// What the overlay reports and does not edit.
 pub struct Info<'a> {
     pub timings: &'a Timings,
+    /// Where the CPU time of a frame goes.
+    pub cpu: &'a CpuBreakdown,
+    /// How the window presents frames: with some modes the surface calls wait for vertical sync.
+    pub present_mode: wgpu::PresentMode,
     /// Whether the device can time passes (see [`Profiler::supported`](crate::Profiler)).
     pub timers_supported: bool,
     /// Samples in the reference image so far.
@@ -80,6 +85,25 @@ fn timer_row(ui: &mut egui::Ui, name: &str, series: &Series, active: bool) {
     ui.monospace(ms(series.average()));
     ui.monospace(ms(series.max()));
     ui.end_row();
+}
+
+/// The parts of the frame's CPU time, with the same average and maximum as the rows above.
+fn cpu_rows(ui: &mut egui::Ui, cpu: &CpuBreakdown, present_mode: wgpu::PresentMode) {
+    ui.label(format!("present mode: {present_mode:?}"));
+    Grid::new("cpu parts").num_columns(3).show(ui, |ui| {
+        ui.label("CPU parts");
+        ui.label("avg");
+        ui.label("max");
+        ui.end_row();
+        for row in Row::ALL {
+            let series = cpu.series(row);
+            ui.label(RichText::new(row.name()).monospace());
+            for value in [series.average(), series.max()] {
+                ui.monospace(value.map_or_else(|| "n/a".to_string(), |v| row.format(v)));
+            }
+            ui.end_row();
+        }
+    });
 }
 
 /// The bias slider and what the bands made of it. The slider keeps its own value while it is
@@ -270,6 +294,9 @@ pub fn show(ctx: &Context, info: &Info, controls: &mut Controls) {
                 ui.end_row();
             });
             ui.label(format!("fps: {}", fps(info.timings.wall())));
+            ui.separator();
+            cpu_rows(ui, info.cpu, info.present_mode);
+            ui.separator();
             ui.label(format!(
                 "planet memory: {} of {} MiB",
                 mib(info.scene_memory.used),
@@ -383,6 +410,8 @@ mod tests {
         let timings = Timings::default();
         let info = Info {
             timings: &timings,
+            cpu: &CpuBreakdown::default(),
+            present_mode: wgpu::PresentMode::Fifo,
             timers_supported: true,
             samples: 0,
             loading_paused: false,
@@ -398,6 +427,8 @@ mod tests {
         let timings = Timings::default();
         let info = Info {
             timings: &timings,
+            cpu: &CpuBreakdown::default(),
+            present_mode: wgpu::PresentMode::Fifo,
             timers_supported: true,
             samples: 0,
             loading_paused: false,
@@ -414,6 +445,43 @@ mod tests {
             "G: local up / grid",
         ] {
             assert!(text.contains(key), "{key} in {text}");
+        }
+    }
+
+    #[test]
+    fn the_panel_lists_the_parts_of_the_cpu_frame_with_their_average_and_maximum() {
+        use std::time::{Duration, Instant};
+
+        let base = Instant::now();
+        let mut cpu = CpuBreakdown::default();
+        cpu.end_frame(base);
+        for (i, ticks) in [2.125, 6.375].into_iter().enumerate() {
+            cpu.add(Row::SimTicks, ticks);
+            cpu.add(Row::SceneBytes, 11.5 * 1024.0);
+            cpu.end_frame(base + Duration::from_millis(20 * (i as u64 + 1)));
+        }
+        let timings = Timings::default();
+        let info = Info {
+            timings: &timings,
+            cpu: &cpu,
+            present_mode: wgpu::PresentMode::Mailbox,
+            timers_supported: true,
+            samples: 0,
+            loading_paused: false,
+            scene_memory: SceneMemory::default(),
+            lod: None,
+        };
+        let text = draw(&info, &mut controls());
+        for row in Row::ALL {
+            assert!(text.contains(row.name().trim()), "{row:?} in {text}");
+        }
+        // Values that nothing else in the panel can read as: the ticks average 4.25 and peak at
+        // 6.375 ms, 11.5 KiB are written each frame, the frames are 20 ms and what the ticks
+        // leave of them is 15.75 ms on average and at most 17.875.
+        for expected in [
+            "4.250", "6.375", "11.5", "20.000", "15.750", "17.875", "Mailbox",
+        ] {
+            assert!(text.contains(expected), "{expected} in {text}");
         }
     }
 
@@ -436,6 +504,8 @@ mod tests {
         });
         let info = Info {
             timings: &timings,
+            cpu: &CpuBreakdown::default(),
+            present_mode: wgpu::PresentMode::Fifo,
             timers_supported: true,
             samples: 7,
             loading_paused: false,
@@ -477,6 +547,8 @@ mod tests {
         timings.register("primary");
         let info = Info {
             timings: &timings,
+            cpu: &CpuBreakdown::default(),
+            present_mode: wgpu::PresentMode::Fifo,
             timers_supported: false,
             samples: 0,
             loading_paused: false,
@@ -493,6 +565,8 @@ mod tests {
         let timings = Timings::default();
         let info = Info {
             timings: &timings,
+            cpu: &CpuBreakdown::default(),
+            present_mode: wgpu::PresentMode::Fifo,
             timers_supported: true,
             samples: 42,
             loading_paused: true,

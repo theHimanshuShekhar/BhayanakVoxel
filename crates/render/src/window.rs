@@ -1,6 +1,9 @@
 //! Rendering to a window surface.
 
+use std::time::Instant;
+
 use crate::camera::Camera;
+use crate::cpu::RenderCpu;
 use crate::debug_view::DebugView;
 use crate::profiler::Profiler;
 use crate::scene::{Scene, SceneUpdate};
@@ -30,6 +33,8 @@ pub struct Renderer {
     queue: wgpu::Queue,
     tracer: Tracer,
     profiler: Profiler,
+    /// What the CPU spent drawing the last frame.
+    last_cpu: RenderCpu,
     /// Paints egui's output over the image.
     gui: egui_wgpu::Renderer,
     target: Target,
@@ -139,6 +144,7 @@ impl Renderer {
             queue,
             tracer,
             profiler,
+            last_cpu: RenderCpu::default(),
             gui,
             target,
             scale: DEFAULT_SCALE,
@@ -219,6 +225,22 @@ impl Renderer {
     /// queries there are none ([`Renderer::timers_supported`]).
     pub fn timings(&self) -> &Timings {
         self.profiler.timings()
+    }
+
+    /// Bytes of the Planet written to the GPU so far: what the buffers were made from, and what
+    /// each [`Renderer::update_scene`] wrote.
+    pub fn uploaded_bytes(&self) -> u64 {
+        self.tracer.uploaded_bytes()
+    }
+
+    /// How frames are presented, which says whether acquiring one waits for vertical sync.
+    pub fn present_mode(&self) -> wgpu::PresentMode {
+        self.config.present_mode
+    }
+
+    /// What the CPU spent in the last call to [`Renderer::render`], by part.
+    pub fn last_cpu(&self) -> RenderCpu {
+        self.last_cpu
     }
 
     /// Whether the device can time passes.
@@ -302,7 +324,13 @@ impl Renderer {
     }
 
     fn draw(&mut self, camera: &Camera, gui: Option<(&egui::Context, egui::FullOutput)>) {
-        let (frame, suboptimal) = match self.surface.get_current_texture() {
+        let acquiring = Instant::now();
+        let texture = self.surface.get_current_texture();
+        self.last_cpu = RenderCpu {
+            acquire_ms: acquiring.elapsed().as_secs_f64() * 1e3,
+            ..RenderCpu::default()
+        };
+        let (frame, suboptimal) = match texture {
             wgpu::CurrentSurfaceTexture::Success(frame) => (frame, false),
             wgpu::CurrentSurfaceTexture::Suboptimal(frame) => (frame, true),
             wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
@@ -313,6 +341,7 @@ impl Renderer {
             | wgpu::CurrentSurfaceTexture::Occluded
             | wgpu::CurrentSurfaceTexture::Validation => return,
         };
+        let encoding = Instant::now();
         let view = frame
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
@@ -382,7 +411,10 @@ impl Renderer {
         commands.push(encoder.finish());
         self.queue.submit(commands);
         self.profiler.collect(&self.device, false);
+        self.last_cpu.encode_ms = encoding.elapsed().as_secs_f64() * 1e3;
+        let presenting = Instant::now();
         self.queue.present(frame);
+        self.last_cpu.present_ms = presenting.elapsed().as_secs_f64() * 1e3;
         // The surface cannot be reconfigured while a frame is alive, so this waits until
         // the frame has been presented.
         if suboptimal {

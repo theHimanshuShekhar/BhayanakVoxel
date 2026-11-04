@@ -9,6 +9,7 @@
 //! in the same way.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::time::{Duration, Instant};
 
 use brick_store::{BrickCoord, BrickStore};
 use net::{BodyState, ClientMessage, EditOp, Leash, MoveInput, RejectReason, ServerMessage};
@@ -62,6 +63,11 @@ pub struct Predictor {
     next_input_seq: u64,
     pending_inputs: VecDeque<PendingInput>,
     body_desyncs: u64,
+    /// Times a desync had the ground made whole at once: see [`Predictor::full_fills`].
+    full_fills: u64,
+    /// Time spent in the ground's fill in [`Predictor::walk`] since [`Predictor::take_fill_time`].
+    /// Only written to, for the client's frame breakdown: nothing here reads it.
+    fill_time: Duration,
     /// The ground around the character, generated here from the store's source.
     ground: Ground,
     /// The server's leashes that still matter, each with the input it first holds for.
@@ -92,6 +98,8 @@ impl Predictor {
             next_input_seq: 0,
             pending_inputs: VecDeque::new(),
             body_desyncs: 0,
+            full_fills: 0,
+            fill_time: Duration::ZERO,
             ground,
             leashes: VecDeque::new(),
             covered: None,
@@ -120,6 +128,18 @@ impl Predictor {
     /// Times the server's word on the character differed from the prediction.
     pub fn body_desyncs(&self) -> u64 {
         self.body_desyncs
+    }
+
+    /// Times that running inputs again after a desync had to make the rest of the ground at once,
+    /// which takes as long as a whole ball of bricks.
+    pub fn full_fills(&self) -> u64 {
+        self.full_fills
+    }
+
+    /// The time that [`Predictor::walk`] has spent making ground since the last call. It is
+    /// wall-clock time, for reporting only, and no result of the simulation depends on it.
+    pub fn take_fill_time(&mut self) -> Duration {
+        std::mem::take(&mut self.fill_time)
     }
 
     /// Puts the character on the Planet at `position`, standing there. Returns the request to
@@ -172,7 +192,9 @@ impl Predictor {
             ClientMessage::Input { seq, input }
         });
         self.ground.follow(character.state().position);
+        let filling = Instant::now();
         self.ground.fill();
+        self.fill_time += filling.elapsed();
         request
     }
 
@@ -212,6 +234,7 @@ impl Predictor {
                 // inputs meet what the server's did.
                 if !self.ground.covers(&leash) {
                     self.ground.centre_on(&leash);
+                    self.full_fills += 1;
                     while !self.ground.is_complete() {
                         self.ground.fill();
                     }
@@ -1020,6 +1043,10 @@ mod tests {
             state: elsewhere,
         });
         assert_eq!(client.body_desyncs(), 1);
+        assert_eq!(client.full_fills(), 1);
+        // The ground made in ticks was timed; taking the time empties it.
+        assert!(client.take_fill_time() > Duration::ZERO);
+        assert_eq!(client.take_fill_time(), Duration::ZERO);
         assert!(client.ground().covers(&far));
     }
 }

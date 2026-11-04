@@ -19,6 +19,7 @@
 
 pub mod accumulation;
 pub mod camera;
+pub mod cpu;
 mod debug_view;
 mod gpu_materials;
 pub mod lod;
