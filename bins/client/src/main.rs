@@ -3,6 +3,7 @@ mod dig;
 mod editor;
 mod fly;
 mod ghost;
+mod growth;
 mod loader;
 mod priority;
 #[cfg(test)]
@@ -20,6 +21,7 @@ use brick_store::BrickStore;
 use dig::Dig;
 use editor::{Editor, Grab, Input};
 use fly::{Action, Fly};
+use growth::GrowthWatch;
 use loader::{GUARD_FIRST, Loader};
 use net::{EditMode, Leash};
 use planet_gen::planet::Planet;
@@ -104,58 +106,98 @@ fn planet_scene(
     )
 }
 
-/// Bricks that the bands draw, at most, at a bias of 1 (`d0` of 1028 Voxels): measured on the
-/// full-size Planet, 3.1 million, 0.36 d0² for each of the levels 0 to 7 and the Guard's 176 000
-/// of level 8. A level's bricks are the surface within its band, so they go with d0².
-const BRICKS_PER_D0_SQUARED: f64 = 3.0;
-/// Words of `brick_refs` and of `bricks` per brick drawn, as measured when the resident set
-/// was complete.
+/// How much more room than the most a table held in the measured fill the tables and the scene are
+/// made with, for what the measurement did not see (the camera going elsewhere on the Planet, a
+/// table that is full of deleted entries and cleans itself out).
+const HEADROOM: f64 = 1.25;
+
+/// The measurements that `room_for` and `expected_words` are sized from: the full-size Planet's
+/// uncapped fill (3 321 s, 22.2 million bricks generated) and then a 150 m walk, at a bias of 1
+/// (`d0` of 1028.2 Voxels), on the 8-core dev box on 2026-11-05, after the fix that stopped the
+/// frame thread generating bricks, with the change that keeps coarse air bricks with ground under
+/// them in the LOD tree applied (it was not merged then: it makes the tree, the resident set and
+/// the waiting bricks 13 to 26% bigger, and without it these are over by that much). The
+/// full-size test prints them: `cargo test --release -p client -- --ignored --nocapture full_size`.
+///
+/// Bricks that the bands draw: 3 212 737, which is 3.04 d0² (a level's bricks are the surface
+/// within its band, so they go with d0²), 0.36 d0² for each of the levels 0 to 7 and a few for
+/// the levels above. The Guard's 178 000 bricks that are drawn first are in that count, as they
+/// are split.
+const BRICKS_PER_D0_SQUARED: f64 = 3.04;
+/// Words of `brick_refs` and of `bricks` per brick drawn when the resident set was complete: 3.2
+/// million and 105.2 million words of them. The scene's first reservation, 28 words a brick and a
+/// tenth over, was 103.3 million words and ran out 3.09 million bricks into the fill: the
+/// 10.4 s frame of #119 was the scene packed again (here 12.3 s) with the words that were left
+/// in pieces too small.
 const REFS_PER_BRICK: f64 = 1.0;
-const WORDS_PER_BRICK: f64 = 28.0;
+const WORDS_PER_BRICK: f64 = 33.0;
 
 /// What the tables that hold the Planet are made roomy for at the start, for the full bands at a
-/// bias of 1, measured on the full-size Planet (the bricks the store holds are more than are
-/// drawn: the ones buried are held too). Scaled with `d0` squared like the bricks drawn. A table
-/// that grows in the middle of a frame moves every entry, 25 to 60 ms for these; this is
-/// address space until the resident set fills it.
+/// bias of 1: the most each held in the measurement of [`BRICKS_PER_D0_SQUARED`], with
+/// [`HEADROOM`], and scaled with `d0` squared like the bricks drawn. A table that grows in the
+/// middle of a frame moves every entry: 45 to 190 ms for the store's and the resident set, 0.4 and
+/// 0.9 s for the selection's nodes, and the fill before this grew 16 of them.
+///
+/// Reserving is not free: allocating a table commits only its control bytes on Linux, but hashing
+/// spreads the entries over every page, so a table is in memory in full once a few percent of it
+/// is used; and on Windows the allocation commits all of it at startup. The startup log gives the
+/// total.
 struct Room {
     /// Bricks held at each level, from level 0.
     held: Vec<usize>,
     /// Bricks whose children are resident.
     resident: usize,
-    /// Nodes of the selection, and bricks waiting and stuck, and asked of the loader at once.
+    /// Nodes of the selection, and bricks waiting, stuck, and asked of the loader at once.
     nodes: usize,
     waiting: usize,
+    stuck: usize,
 }
 
 fn room_for(bands: Bands) -> Room {
     let s = (bands.d0() / 1028.2).powi(2);
     let scaled = |n: f64| (n * s) as usize + 1024;
-    // The Guard's levels hold what they hold whatever the bands are.
-    let mut held = vec![800_000 + scaled(1_300_000.0)];
+    // The most each level held, from level 1, with `HEADROOM` (the table of which are solid below
+    // is reserved the same): 1.45, 2.67, 4.06, 4.64, 2.39, 1.59 and 1.33 million bricks.
+    const HELD_AT_LEVELS_1_TO_7: [f64; 7] = [
+        1_820_000.0,
+        3_340_000.0,
+        5_080_000.0,
+        5_800_000.0,
+        2_990_000.0,
+        1_990_000.0,
+        1_660_000.0,
+    ];
+    // The Guard's levels hold what they hold whatever the bands are: level 8 577 000 (all of it
+    // the Guard), level 9 85 000, levels 10 to 12 14 000 and fewer.
+    const GUARD_SECOND: usize = GUARD_FIRST + 1;
+    // Level 0 held 2.08 million bricks, of which 751 000 are the spawn ring, held already when
+    // this is reserved and not scaled, so more is made room for than is held: `HEADROOM` over the
+    // ring is 188 000 more (250 000 here), and 1.25 times the 1.33 million that scale is 1.67
+    // million.
+    let mut held = vec![250_000 + scaled(1_670_000.0)];
     held.extend((1..RING_LEVELS).map(|level| match level {
-        1..GUARD_FIRST => scaled(750_000.0),
-        GUARD_FIRST => 600_000 + scaled(100_000.0),
-        _ => 100_000,
+        1..GUARD_FIRST => scaled(HELD_AT_LEVELS_1_TO_7[level - 1]),
+        GUARD_FIRST => 720_000,
+        GUARD_SECOND => 110_000,
+        _ => 20_000,
     }));
     Room {
         held,
-        resident: scaled(1_200_000.0),
-        nodes: scaled(5_000_000.0) + 400_000,
-        waiting: scaled(1_200_000.0) + 200_000,
+        // 2.79 million bricks had their children resident.
+        resident: scaled(3_480_000.0),
+        // The tree held 16.66 million nodes.
+        nodes: scaled(20_800_000.0),
+        // Waiting, and asked of the loader, were 222 000 from the first request (208 000) to the
+        // end, and stuck 1.88 million.
+        waiting: scaled(277_000.0),
+        stuck: scaled(2_350_000.0),
     }
 }
 
-/// Bytes of address space a table of `entries` entries of `size` bytes takes: its buckets are the
-/// next power of two over eight sevenths of that, with a byte of control each.
-fn table_bytes(entries: usize, size: usize) -> usize {
-    (entries * 8 / 7).next_power_of_two() * (size + 1)
-}
-
 /// Words of `brick_refs` and `bricks` to reserve for a scene that is going to fill to what the
-/// `bands` draw: what that is expected to take, a tenth over.
+/// `bands` draw: what that is expected to take, with [`HEADROOM`].
 fn expected_words(bands: Bands) -> (usize, usize) {
-    let bricks = BRICKS_PER_D0_SQUARED * bands.d0() * bands.d0() * 1.1 + 200_000.0;
+    let bricks = BRICKS_PER_D0_SQUARED * bands.d0() * bands.d0() * HEADROOM;
     (
         (bricks * REFS_PER_BRICK) as usize,
         (bricks * WORDS_PER_BRICK) as usize,
@@ -265,7 +307,8 @@ fn load(map: WorldMap, reach: i32) -> Result<Loaded, RingsFull> {
     } = generate_ground(map, reach, RING_LEVELS);
     let bands = Bands::standard(f64::from(DEFAULT_BIAS));
     let room = room_for(bands);
-    store.reserve(&room.held, room.resident);
+    store.reserve(&room.held);
+    store.reserve_resident(room.resident);
     let guarded = Instant::now();
     let held = loader::hold_guard(&mut store, &planet, GUARD_FIRST);
     eprintln!(
@@ -281,7 +324,7 @@ fn load(map: WorldMap, reach: i32) -> Result<Loaded, RingsFull> {
         planet_gen::planet::MAX_RADIUS,
     )?;
     let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
-    scene.reserve(room.nodes, room.waiting);
+    scene.reserve(room.nodes, room.waiting, room.stuck);
     let mut loader = Loader::new(
         store.source().expect("the ring's store has a source"),
         camera.position,
@@ -296,16 +339,29 @@ fn load(map: WorldMap, reach: i32) -> Result<Loaded, RingsFull> {
     let first_count = first.len();
     loader.request(&store, first, camera.position);
     loader.sync(camera.position, bands);
+    // What the tables and the scene's buffers allocated, from the tables themselves.
+    let (mut tables, mut buffers) = (0, 0);
+    for table in store
+        .table_sizes()
+        .into_iter()
+        .chain(scene.table_sizes())
+        .chain(loader.table_sizes())
+    {
+        if table.name.ends_with(" words") {
+            buffers += table.bytes;
+        } else {
+            tables += table.bytes;
+        }
+    }
+    let mib = |bytes: usize| bytes as f64 / (1024.0 * 1024.0);
     eprintln!(
         "asked for the children of {first_count} bricks in {:.2?}; tables made roomy for the \
-         full bands: about {:.0} MiB of address space",
+         full bands: {:.0} MiB, which is in memory in full once a few percent of each is used \
+         (hashing touches every page), and on Windows is committed now; and the scene's host \
+         buffers {:.0} MiB, with a GPU copy of the same size",
         asked.elapsed(),
-        (room.held.iter().map(|&n| table_bytes(n, 32)).sum::<usize>()
-            + table_bytes(room.resident, 32)
-            + table_bytes(room.nodes, 41)
-            + 2 * table_bytes(room.waiting, 25)
-            + table_bytes(room.waiting, 40)) as f64
-            / (1024.0 * 1024.0)
+        mib(tables),
+        mib(buffers)
     );
     let bricks: Vec<usize> = (0..RING_LEVELS).map(|l| scene.level_bricks(l)).collect();
     eprintln!(
@@ -357,6 +413,8 @@ struct App {
     filling_since: Option<Instant>,
     /// The frame thread's time on the scene, frame by frame.
     scene_work: SceneWork,
+    /// Logs a table that grew or a scene that was packed again (see [`growth`]).
+    growth: GrowthWatch,
     /// Where the CPU time of each frame goes, for the overlay and the log of slow frames.
     cpu: CpuBreakdown,
     camera: Camera,
@@ -420,11 +478,15 @@ fn is_rebuild(written: u64, scene_bytes: u64) -> bool {
 /// Copies what changed in the Planet to the GPU, and counts the time and the bytes it took in
 /// `cpu`. A copy that wrote as much as the buffers hold made them again.
 fn upload(
+    growth: &mut GrowthWatch,
     cpu: &mut CpuBreakdown,
     renderer: &mut Renderer,
     scene: &Scene,
     update: &SceneUpdate,
 ) -> Result<(), Box<dyn Error>> {
+    if matches!(update, SceneUpdate::Rebuilt) {
+        growth.rebuilt(scene.rebuild_reason(), Instant::now());
+    }
     let (before, started) = (renderer.uploaded_bytes(), Instant::now());
     let result = renderer.update_scene(scene, update);
     cpu.add(Row::UpdateScene, started.elapsed().as_secs_f64() * 1e3);
@@ -452,6 +514,7 @@ impl App {
             server: None,
             filling_since: None,
             scene_work: SceneWork::default(),
+            growth: GrowthWatch::default(),
             cpu: CpuBreakdown::default(),
             // Until the Planet arrives there is only sky to look at, wherever from.
             camera: spawn_camera([0.0, 0.0, f64::from(WORLD_RADIUS)]),
@@ -669,10 +732,11 @@ impl App {
         // anything changes.
         let still_frames = self.still.observe((renderer.view(&self.camera), self.bias));
         world.pause_loading(world::loading_paused_for(renderer.mode(), still_frames));
-        let cpu = &mut self.cpu;
+        let (cpu, growth) = (&mut self.cpu, &mut self.growth);
         world.stream(self.camera.position, |scene, update| {
-            upload(cpu, renderer, scene, update)
+            upload(growth, cpu, renderer, scene, update)
         })?;
+        self.growth.check(world, Instant::now());
         if let (Some(since), Some(world)) = (self.filling_since, &self.world)
             && world.waiting() == 0
             && world.loader().is_some_and(|l| l.pending() == 0)
@@ -702,7 +766,13 @@ impl App {
         if let (Some(update), Some(world), Some(renderer)) =
             (update, &self.world, &mut self.renderer)
         {
-            upload(&mut self.cpu, renderer, world.scene(), &update)?;
+            upload(
+                &mut self.growth,
+                &mut self.cpu,
+                renderer,
+                world.scene(),
+                &update,
+            )?;
         }
         Ok(())
     }

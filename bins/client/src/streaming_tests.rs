@@ -2,10 +2,11 @@
 //! the scene that is drawn from it, on the test world map. Bands of `d0` = 64 Voxels make a few
 //! levels fit in a test; the Guard is levels 10 to 12.
 
+use std::collections::HashMap;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
-use brick_store::{BrickStore, VoxelCoord};
+use brick_store::{BrickStore, TableSize, VoxelCoord};
 use net::{EditOp, ServerEnd, loopback};
 use planet_gen::planet::{Planet, tangents};
 use planet_gen::world_map::WorldMap;
@@ -330,8 +331,100 @@ impl Updates {
     }
 }
 
+/// The tables of the client, from the first frame: the room each was reserved with, the most
+/// entries each held, and the growths and rebuilds there were. The tables are made roomy up front
+/// (see `room_for` in `main.rs`), so none should grow.
+struct Tables {
+    /// As they were at the first frame.
+    reserved: Vec<TableSize>,
+    /// The most room each has had, as of the last frame (see `crate::growth::raised`).
+    highest_room: Vec<TableSize>,
+    /// The most entries each held, by name.
+    peak: HashMap<String, usize>,
+    /// `(frame, table, was, is)` for each growth.
+    grown: Vec<(usize, String, usize, usize)>,
+    /// The frames in which the scene was rebuilt.
+    rebuilt: Vec<usize>,
+    frames: usize,
+}
+
+impl Tables {
+    fn new(world: &World) -> Self {
+        let sizes = world.table_sizes();
+        Self {
+            peak: sizes.iter().map(|t| (t.name.clone(), t.len)).collect(),
+            reserved: sizes.clone(),
+            highest_room: sizes,
+            grown: Vec::new(),
+            rebuilt: Vec::new(),
+            frames: 0,
+        }
+    }
+
+    /// Looks at the tables after a frame, and returns the names of the ones that grew in it.
+    fn after_frame(&mut self, world: &World, rebuilt: bool) -> Vec<String> {
+        self.frames += 1;
+        let sizes = world.table_sizes();
+        let grown = crate::growth::grown(&self.highest_room, &sizes);
+        for (name, was, is) in &grown {
+            self.grown.push((self.frames, name.clone(), *was, *is));
+        }
+        for size in &sizes {
+            let peak = self.peak.entry(size.name.clone()).or_insert(0);
+            *peak = (*peak).max(size.len);
+        }
+        if rebuilt {
+            // The scene made its tables again: they are the ones to compare with from now on.
+            self.rebuilt.push(self.frames);
+            self.highest_room = sizes;
+        } else {
+            self.highest_room = crate::growth::raised(&self.highest_room, sizes);
+        }
+        grown.into_iter().map(|(name, ..)| name).collect()
+    }
+
+    /// Prints the room each table was reserved with against the most it held.
+    fn report(&self) {
+        eprintln!("tables: reserved room, peak entries, most room at the end");
+        for reserved in &self.reserved {
+            let room = self
+                .highest_room
+                .iter()
+                .find(|t| t.name == reserved.name)
+                .map_or(0, |t| t.capacity);
+            eprintln!(
+                "  {:<28} {:>11} {:>11} {:>11}",
+                reserved.name,
+                reserved.capacity,
+                self.peak.get(&reserved.name).copied().unwrap_or(0),
+                room
+            );
+        }
+    }
+
+    /// Fails if a table grew or the scene was rebuilt since the first frame.
+    fn assert_none_grew(&self) {
+        assert!(
+            self.grown.is_empty(),
+            "tables grew in the middle of a frame, so their reservations are too small: {:?}",
+            self.grown
+        );
+        assert!(
+            self.rebuilt.is_empty(),
+            "the scene was rebuilt in frames {:?}: its buffers or regions ran out",
+            self.rebuilt
+        );
+    }
+}
+
 /// One frame's scene work, timed, as the client does it.
-fn scene_frame(world: &mut World, position: [f64; 3], work: &mut SceneWork, updates: &mut Updates) {
+fn scene_frame(
+    world: &mut World,
+    position: [f64; 3],
+    work: &mut SceneWork,
+    updates: &mut Updates,
+    tables: &mut Tables,
+) {
     let started = Instant::now();
     let moved = world.recentre(position).unwrap();
     let recentred = started.elapsed();
@@ -346,17 +439,17 @@ fn scene_frame(world: &mut World, position: [f64; 3], work: &mut SceneWork, upda
     updates.recentre.record(recentred);
     updates.stream.record(streaming.elapsed());
     work.record(started.elapsed());
-    if started.elapsed() > Duration::from_millis(16) {
+    let took = started.elapsed();
+    let rebuilt = moved
+        .as_ref()
+        .is_some_and(|u| matches!(u, SceneUpdate::Rebuilt))
+        || streamed.iter().any(|u| matches!(u, SceneUpdate::Rebuilt));
+    let grown = tables.after_frame(world, rebuilt);
+    if took > Duration::from_millis(16) {
         eprintln!(
-            "  slow frame: {:.1?} (recentre {recentred:.1?}), {:?} {:?}",
-            started.elapsed(),
-            moved
-                .as_ref()
-                .map(|u| matches!(u, render::SceneUpdate::Rebuilt)),
-            streamed
-                .iter()
-                .map(|u| matches!(u, render::SceneUpdate::Rebuilt))
-                .collect::<Vec<_>>()
+            "  slow frame: {took:.1?} (recentre {recentred:.1?}), rebuilt {rebuilt}, grew {grown:?}, \
+             {} batches shown",
+            streamed.len()
         );
     }
     updates.add(moved);
@@ -367,9 +460,12 @@ fn scene_frame(world: &mut World, position: [f64; 3], work: &mut SceneWork, upda
 
 /// The Planet at full size, streamed in as the client does it: the spawn ring and the Guard are
 /// timed by `load`, then the resident set fills with the camera still (timed), and then the camera
-/// walks at 5 m/s with the loader running (scene work per frame, worst and p99). Takes about two
-/// minutes and a lot of memory in a release build:
-/// `cargo test --release -p client -- --ignored --nocapture full_size`.
+/// walks at 5 m/s with the loader running (scene work per frame, worst and p99). Takes about an
+/// hour (the fill is capped by `FULLSIZE_FILL_CAP_SECS`, 5400 by default) and a lot of memory in a
+/// release build: `cargo test --release -p client -- --ignored --nocapture full_size`. It prints
+/// each table's reserved room against its peak (`room_for` in `main.rs` is sized from these) and
+/// fails if a table grew or the scene was rebuilt in the fill or the walk, or if the cap cut the
+/// fill short (a capped run is for trying things out, and reports before it fails).
 #[test]
 #[ignore = "generates the full-size world map"]
 fn the_full_size_planet_streams_in_and_walking_over_it_does_not_stall() {
@@ -386,6 +482,7 @@ fn the_full_size_planet_streams_in_and_walking_over_it_does_not_stall() {
     let mut world =
         World::new(loaded.scene, Predictor::new(loaded.store), client).with_loader(loaded.loader);
     let mut camera = loaded.camera;
+    let mut tables = Tables::new(&world);
     let frame = Duration::from_micros(16_667);
 
     // The resident set fills with the camera still. Reported on the way: when the ground under the
@@ -395,6 +492,13 @@ fn the_full_size_planet_streams_in_and_walking_over_it_does_not_stall() {
     let began = Instant::now();
     let mut frames = 0;
     let mut last_report = Instant::now();
+    // For trying things out: stop filling after this many seconds and go on to walking.
+    let cap = std::env::var("FULLSIZE_FILL_CAP_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(5400);
+    // Whether the loader went idle, which is a full fill.
+    let mut filled = false;
     loop {
         let tick = Instant::now();
         scene_frame(
@@ -402,6 +506,7 @@ fn the_full_size_planet_streams_in_and_walking_over_it_does_not_stall() {
             camera.position,
             &mut fill_work,
             &mut fill_updates,
+            &mut tables,
         );
         frames += 1;
         if level_0_at.is_none() {
@@ -420,13 +525,9 @@ fn the_full_size_planet_streams_in_and_walking_over_it_does_not_stall() {
             }
         }
         if idle(&world) {
+            filled = true;
             break;
         }
-        // For trying things out: stop filling after this many seconds and go on to walking.
-        let cap = std::env::var("FULLSIZE_FILL_CAP_SECS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(5400);
         if began.elapsed() > Duration::from_secs(cap) {
             eprintln!("  (filling stopped after {cap} s)");
             break;
@@ -460,6 +561,7 @@ fn the_full_size_planet_streams_in_and_walking_over_it_does_not_stall() {
         fill_updates.rebuilt,
         fill_updates.worst_words,
     );
+    tables.report();
     eprintln!("filling: {}", fill_work.summary().unwrap());
     eprintln!(
         "  of which following the camera: {}; taking in bricks: {}",
@@ -481,6 +583,7 @@ fn the_full_size_planet_streams_in_and_walking_over_it_does_not_stall() {
             camera.position,
             &mut walk_work,
             &mut walk_updates,
+            &mut tables,
         );
         std::thread::sleep(frame.saturating_sub(tick.elapsed()));
     }
@@ -499,6 +602,14 @@ fn the_full_size_planet_streams_in_and_walking_over_it_does_not_stall() {
         "  of which following the camera: {}; taking in bricks: {}",
         walk_updates.recentre.summary().unwrap(),
         walk_updates.stream.summary().unwrap()
+    );
+    tables.report();
+    // The reservations hold over the fill and the walk: no table grew and nothing was packed again.
+    tables.assert_none_grew();
+    assert!(
+        filled,
+        "the fill stopped at the {cap} s cap before the loader went idle, so no growth over a \
+         full fill was checked"
     );
 }
 
