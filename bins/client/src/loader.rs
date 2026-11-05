@@ -32,7 +32,7 @@ use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, TryLockError};
 use std::thread::JoinHandle;
 
-use brick_store::{Brick, BrickCoord, BrickSource, BrickStore, children_from};
+use brick_store::{Brick, BrickCoord, BrickSource, BrickStore, TableSize, children_from};
 use render::lod::{Bands, brick_distance};
 use render::scene::select::Key;
 
@@ -231,6 +231,20 @@ impl Loader {
         self.requested.reserve(n);
         self.outbox.reserve(n.min(1 << 16));
         self.shared.lock().queue.reserve(n);
+    }
+
+    /// The size of the tables [`Loader::reserve`] makes room in: the bricks asked for, and the
+    /// workers' queue.
+    pub fn table_sizes(&self) -> Vec<TableSize> {
+        let state = self.shared.lock();
+        vec![
+            TableSize::hash::<(Key, u64)>(
+                "loader requested",
+                self.requested.len(),
+                self.requested.capacity(),
+            ),
+            TableSize::list::<Job>("loader queue", state.queue.len(), state.queue.capacity()),
+        ]
     }
 
     /// Asks for the children of `keys`, the bricks that [`render::Scene::take_wanted`] says wait

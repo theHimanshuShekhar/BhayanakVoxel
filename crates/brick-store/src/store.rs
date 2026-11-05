@@ -35,6 +35,55 @@ pub struct BrickStore {
     source: Option<Arc<dyn BrickSource>>,
     /// Set for a store whose bricks are streamed in (see [`Self::stream_from`]).
     streaming: Option<Streaming>,
+    /// What [`Self::reserve_resident`] was asked for before the store streamed, which
+    /// [`Self::stream_from`] makes the resident set with room for.
+    resident_room: usize,
+}
+
+/// How full one table is: its entries, and how many it has room for before it grows (and moves
+/// every entry). Tables that are reserved up front are watched with these (see
+/// [`BrickStore::reserve`]); a capacity that is larger than it was is a growth.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TableSize {
+    pub name: String,
+    pub len: usize,
+    pub capacity: usize,
+    /// Bytes the table has allocated for that capacity (zero for what is not memory).
+    pub bytes: usize,
+}
+
+impl TableSize {
+    /// A count that takes no memory of its own.
+    pub fn new(name: impl Into<String>, len: usize, capacity: usize) -> Self {
+        Self {
+            name: name.into(),
+            len,
+            capacity,
+            bytes: 0,
+        }
+    }
+
+    /// A hash table of entries of type `T` (the key and the value of a map): its buckets are the
+    /// next power of two over eight sevenths of its capacity, with a byte of control each.
+    pub fn hash<T>(name: impl Into<String>, len: usize, capacity: usize) -> Self {
+        let buckets = if capacity == 0 {
+            0
+        } else {
+            (capacity * 8 / 7).next_power_of_two()
+        };
+        Self {
+            bytes: buckets * (std::mem::size_of::<T>() + 1),
+            ..Self::new(name, len, capacity)
+        }
+    }
+
+    /// A vector of `T`.
+    pub fn list<T>(name: impl Into<String>, len: usize, capacity: usize) -> Self {
+        Self {
+            bytes: capacity * std::mem::size_of::<T>(),
+            ..Self::new(name, len, capacity)
+        }
+    }
 }
 
 /// What a store that is streamed in keeps of what is resident.
@@ -209,11 +258,12 @@ impl BrickStore {
         }
     }
 
-    /// Makes room for `held[level]` bricks held at each level (as many entries as there are
-    /// levels given, from level 0) and for `resident` bricks whose children are resident, so that
-    /// the tables do not double, and move every entry, in the middle of a frame. The memory is
-    /// address space until it is used.
-    pub fn reserve(&mut self, held: &[usize], resident: usize) {
+    /// Makes room for `held[level]` more bricks held at each level (as many entries as there are
+    /// levels given, from level 0), so that the tables do not double, and move every entry, in
+    /// the middle of a frame. Allocating a table commits little of it (its control bytes, on
+    /// Linux), but hashing spreads the entries over every page, so it is in memory in full once a
+    /// few percent of it is used; on Windows the allocation commits all of it at once.
+    pub fn reserve(&mut self, held: &[usize]) {
         for (level, &n) in held.iter().enumerate() {
             if level == 0 {
                 self.bricks.reserve(n);
@@ -222,9 +272,47 @@ impl BrickStore {
                 store.solid_below.reserve(n);
             }
         }
-        if let Some(streaming) = &mut self.streaming {
-            streaming.resident.reserve(resident);
+    }
+
+    /// Makes room for `resident` more bricks whose children are resident, as [`Self::reserve`]
+    /// does for the bricks held. Before the store streams, the room is kept for the resident set
+    /// that [`Self::stream_from`] starts.
+    pub fn reserve_resident(&mut self, resident: usize) {
+        match &mut self.streaming {
+            Some(streaming) => streaming.resident.reserve(resident),
+            None => self.resident_room = self.resident_room.max(resident),
         }
+    }
+
+    /// The size of every table that [`Self::reserve`] and [`Self::reserve_resident`] make room
+    /// in: the bricks held at each level, the coarse levels' `solid_below`, and the resident set.
+    pub fn table_sizes(&self) -> Vec<TableSize> {
+        let mut sizes = vec![TableSize::hash::<(BrickCoord, Brick)>(
+            "store level 0 bricks",
+            self.bricks.len(),
+            self.bricks.capacity(),
+        )];
+        for (level, store) in self.coarse.iter().enumerate() {
+            let level = level + 1;
+            sizes.push(TableSize::hash::<(BrickCoord, Brick)>(
+                format!("store level {level} bricks"),
+                store.bricks.len(),
+                store.bricks.capacity(),
+            ));
+            sizes.push(TableSize::hash::<BrickCoord>(
+                format!("store level {level} solid_below"),
+                store.solid_below.len(),
+                store.solid_below.capacity(),
+            ));
+        }
+        if let Some(streaming) = &self.streaming {
+            sizes.push(TableSize::hash::<(usize, BrickCoord)>(
+                "store resident",
+                streaming.resident.len(),
+                streaming.resident.capacity(),
+            ));
+        }
+        sizes
     }
 
     /// Makes this a store whose bricks are streamed in: the eight bricks under a brick of a level
@@ -236,7 +324,7 @@ impl BrickStore {
     pub fn stream_from(&mut self, floor: usize) {
         self.streaming = Some(Streaming {
             floor,
-            resident: HashSet::new(),
+            resident: HashSet::with_capacity(self.resident_room),
         });
     }
 
@@ -1283,6 +1371,34 @@ mod tests {
         store.set_children_resident(1, c);
         assert!(store.children_resident(1, c));
         assert!(!store.children_resident(1, BrickCoord([1, 2, 4])));
+    }
+
+    #[test]
+    fn room_for_the_resident_set_is_kept_whether_it_is_asked_for_before_or_after_streaming_starts()
+    {
+        let room = |store: &BrickStore| {
+            let sizes = store.table_sizes();
+            let resident = sizes.iter().find(|t| t.name == "store resident").unwrap();
+            (resident.len, resident.capacity)
+        };
+        let mut store = BrickStore::new();
+        store.build_lod(2);
+        store.reserve(&[1000, 500]);
+        // Asked for before the store streams, the room is kept for the resident set that starts.
+        store.reserve_resident(1000);
+        store.stream_from(1);
+        let (_, capacity) = room(&store);
+        assert!(capacity >= 1000);
+        for i in 0..1000 {
+            store.set_children_resident(1, BrickCoord([i, 0, 0]));
+        }
+        assert_eq!(room(&store), (1000, capacity), "it did not grow");
+        // Asked for after, it is made more roomy.
+        store.reserve_resident(5000);
+        assert!(room(&store).1 >= 6000);
+        let sizes = store.table_sizes();
+        let level_0 = sizes.iter().find(|t| t.name == "store level 0 bricks");
+        assert!(level_0.is_some_and(|t| t.capacity >= 1000));
     }
 
     #[test]

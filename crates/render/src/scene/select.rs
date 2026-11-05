@@ -32,7 +32,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::hash::{BuildHasherDefault, Hasher};
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
-use brick_store::{Brick, BrickCoord, BrickStore};
+use brick_store::{Brick, BrickCoord, BrickStore, TableSize};
 
 use crate::lod::{Bands, LEVELS, brick_distance};
 
@@ -726,13 +726,29 @@ impl Selection {
             .collect()
     }
 
-    /// Makes room for `nodes` nodes in the tree, and `waiting` bricks waiting and stuck, so that
-    /// the tables do not double in the middle of a frame.
-    pub fn reserve(&mut self, nodes: usize, waiting: usize) {
+    /// Makes room for `nodes` nodes in the tree, `waiting` bricks waiting and `stuck` bricks
+    /// stuck, so that the tables do not double in the middle of a frame.
+    pub fn reserve(&mut self, nodes: usize, waiting: usize, stuck: usize) {
         self.nodes.reserve(nodes);
         self.waiting.reserve(waiting);
-        self.stuck.reserve(waiting);
-        self.fresh.reserve(waiting);
+        self.stuck.reserve(stuck);
+    }
+
+    /// The size of every table that [`Selection::reserve`] makes room in.
+    pub fn table_sizes(&self) -> Vec<TableSize> {
+        vec![
+            TableSize::hash::<(Key, Node)>(
+                "selection nodes",
+                self.nodes.len(),
+                self.nodes.capacity(),
+            ),
+            TableSize::hash::<Key>(
+                "selection waiting",
+                self.waiting.len(),
+                self.waiting.capacity(),
+            ),
+            TableSize::hash::<Key>("selection stuck", self.stuck.len(), self.stuck.capacity()),
+        ]
     }
 
     /// The bricks of [`Selection::take_wanted`] that are not wanted any more since this was last
