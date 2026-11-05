@@ -35,7 +35,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::ops::Range;
 
-use brick_store::{Brick, BrickCoord, BrickStore, BrickView};
+use brick_store::{Brick, BrickCoord, BrickStore, BrickView, TableSize};
 
 use super::select::{self, Selection};
 use super::{
@@ -158,6 +158,33 @@ pub(super) struct Rings {
     ball: Bound,
     /// The coarsest level with a brick, as the header last said.
     coarsest: Option<usize>,
+    /// What [`Scene::reserve`] made the selection's tables roomy for (nodes, waiting, stuck), for
+    /// the bands the selection had then: a scene made again starts its selection empty, and is
+    /// given this again.
+    reserved: Option<Reserved>,
+    /// Why the scene was last made again, if it was.
+    rebuilt: Option<Rebuild>,
+}
+
+/// The room [`Scene::reserve`] was asked to make in the selection, and the bands' `d0` it was for.
+#[derive(Clone, Copy, Debug)]
+struct Reserved {
+    nodes: usize,
+    waiting: usize,
+    stuck: usize,
+    d0: f64,
+}
+
+/// Why a scene of rings was packed again and uploaded in full ([`SceneUpdate::Rebuilt`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Rebuild {
+    /// Other LOD bands were asked for (a new bias): expected.
+    Bands,
+    /// The camera jumped further than the rings follow: expected.
+    Jump,
+    /// The words of the buffers, or the regions of a level, ran out: the scene was sized too
+    /// small.
+    OutOfRoom,
 }
 
 /// A [`RingPatch`] in the making.
@@ -430,6 +457,8 @@ impl Scene {
                 selection,
                 ball: bound,
                 coarsest: None,
+                reserved: None,
+                rebuilt: None,
             }),
             ..Scene::default()
         }
@@ -510,22 +539,73 @@ impl Scene {
             return Ok(None);
         }
         let camera = rings.selection.camera();
-        self.rebuilt_at(store, camera, bands).map(Some)
+        self.rebuilt_at(store, camera, bands, Rebuild::Bands)
+            .map(Some)
     }
 
     /// The scene made again for `camera` and `bands`, in place, from nothing: what a jump of the
-    /// camera or another bias asks for. Reported as [`SceneUpdate::Rebuilt`].
+    /// camera or another bias asks for. Reported as [`SceneUpdate::Rebuilt`]. The selection is
+    /// made roomy again as [`Scene::reserve`] did, in proportion to `d0` squared if the bands
+    /// changed.
     fn rebuilt_at(
         &mut self,
         store: &BrickStore,
         camera: [f64; 3],
         bands: Bands,
+        why: Rebuild,
     ) -> Result<SceneUpdate, RingsFull> {
         let rings = self.rings.as_ref().expect("a scene of rings");
         let (ball, sizing, clipped) = (rings.ball, rings.sizing, self.bound.is_some());
+        let reserved = rings.reserved;
         *self = Scene::rings_sized(store, camera, bands, ball, sizing)?;
         self.bound = clipped.then_some(ball);
+        if let (Some(reserved), Some(rings)) = (reserved, &mut self.rings) {
+            let scale = (bands.d0() / reserved.d0).powi(2);
+            let by = |n: usize| (n as f64 * scale) as usize;
+            let now = Reserved {
+                nodes: by(reserved.nodes),
+                waiting: by(reserved.waiting),
+                stuck: by(reserved.stuck),
+                d0: bands.d0(),
+            };
+            rings.selection.reserve(now.nodes, now.waiting, now.stuck);
+            rings.reserved = Some(now);
+        }
+        self.rings.as_mut().expect("a scene of rings").rebuilt = Some(why);
         Ok(SceneUpdate::Rebuilt)
+    }
+
+    /// Why the scene was last packed again ([`SceneUpdate::Rebuilt`]), if it was and is rings.
+    pub fn rebuild_reason(&self) -> Option<Rebuild> {
+        self.rings.as_ref().and_then(|r| r.rebuilt)
+    }
+
+    /// The size of everything of a scene of rings that is made roomy up front: the selection's
+    /// tables, the words of `brick_refs` and of `bricks` in use against what the buffers hold,
+    /// and the regions each level lists against what it can (these are fitted again whenever the
+    /// scene is packed again, not reserved). A scene that is packed again (see
+    /// [`SceneUpdate::Rebuilt`]) makes the words and the regions larger. Empty for a scene that is
+    /// not rings.
+    pub fn table_sizes(&self) -> Vec<TableSize> {
+        let Some(rings) = &self.rings else {
+            return Vec::new();
+        };
+        let mut sizes = rings.selection.table_sizes();
+        let (refs, data) = self.used_words().unwrap_or_default();
+        for (name, used, words) in [
+            ("scene brick_refs words", refs, self.brick_refs.len()),
+            ("scene bricks words", data, self.bricks.len()),
+        ] {
+            sizes.push(TableSize::list::<u32>(name, used, words));
+        }
+        for (level, (listed, capacity)) in rings.listed.iter().zip(&rings.capacity).enumerate() {
+            sizes.push(TableSize::new(
+                format!("scene level {level} regions"),
+                *listed,
+                *capacity,
+            ));
+        }
+        sizes
     }
 
     /// Bricks drawn at `level` (see [`Selection::count`]): the part of the scene that the level
@@ -570,7 +650,9 @@ impl Scene {
             .sum::<f64>()
             .sqrt();
         if jumped > JUMP * bands.d0() {
-            return self.rebuilt_at(store, camera, bands).map(Some);
+            return self
+                .rebuilt_at(store, camera, bands, Rebuild::Jump)
+                .map(Some);
         }
         let diff = rings.selection.update(store, camera);
         self.show_diff(store, &diff)
@@ -616,11 +698,17 @@ impl Scene {
             .map_or_else(Vec::new, |r| r.selection.take_wanted_up_to(limit))
     }
 
-    /// Makes room for `nodes` nodes of the selection and `waiting` bricks waiting (see
-    /// [`Selection::reserve`]).
-    pub fn reserve(&mut self, nodes: usize, waiting: usize) {
+    /// Makes room for `nodes` nodes of the selection, `waiting` bricks waiting and `stuck` bricks
+    /// stuck (see [`Selection::reserve`]).
+    pub fn reserve(&mut self, nodes: usize, waiting: usize, stuck: usize) {
         if let Some(rings) = &mut self.rings {
-            rings.selection.reserve(nodes, waiting);
+            rings.selection.reserve(nodes, waiting, stuck);
+            rings.reserved = Some(Reserved {
+                nodes,
+                waiting,
+                stuck,
+                d0: rings.selection.bands().d0(),
+            });
         }
     }
 
@@ -664,7 +752,12 @@ impl Scene {
     fn pack_again(&mut self, store: &BrickStore) -> Result<SceneUpdate, RingsFull> {
         // Four times what is needed, not two: a flight from orbit to the ground overflows again and
         // again as the bricks multiply, and each overflow is a new scene and a new upload.
+        let reserved = self.rings.as_ref().and_then(|r| r.reserved);
         *self = self.repacked(store, Some(4.0))?;
+        if let Some(rings) = &mut self.rings {
+            rings.reserved = reserved;
+            rings.rebuilt = Some(Rebuild::OutOfRoom);
+        }
         Ok(SceneUpdate::Rebuilt)
     }
 
@@ -1506,6 +1599,53 @@ mod tests {
         let after: usize = (0..LEVELS).map(|l| scene.level_bricks(l)).sum();
         // Half the distances for every level: fewer, coarser bricks.
         assert!(after < before, "{after} against {before}");
+    }
+
+    #[test]
+    fn a_scene_made_again_has_its_selection_made_roomy_again_and_says_why() {
+        let room = |scene: &Scene, name: &str| {
+            scene
+                .table_sizes()
+                .into_iter()
+                .find(|t| t.name == name)
+                .unwrap()
+                .capacity
+        };
+        let mut scene = rings_at(ABOVE);
+        assert_eq!(scene.rebuild_reason(), None);
+        scene.reserve(200_000, 100_000, 50_000);
+        let (nodes, waiting, stuck) = (
+            room(&scene, "selection nodes"),
+            room(&scene, "selection waiting"),
+            room(&scene, "selection stuck"),
+        );
+        assert!(nodes >= 200_000 && waiting >= 100_000 && stuck >= 50_000);
+        // Another bias: made again from nothing, and roomy again, in proportion to d0 squared
+        // (d0 here is a half, so the room is a quarter).
+        let loose = Bands::with_d0(bands().d0() / 2.0);
+        assert_eq!(
+            scene.set_bands(ground(), loose),
+            Ok(Some(SceneUpdate::Rebuilt))
+        );
+        assert_eq!(scene.rebuild_reason(), Some(Rebuild::Bands));
+        assert!(room(&scene, "selection nodes") >= 50_000);
+        assert!(room(&scene, "selection waiting") >= 25_000);
+        assert!(room(&scene, "selection stuck") >= 12_500);
+        // A jump keeps what it had.
+        let far = scene
+            .rings
+            .as_ref()
+            .unwrap()
+            .selection
+            .camera()
+            .map(|c| c + 900.0);
+        let before = room(&scene, "selection nodes");
+        assert_eq!(
+            scene.recentre(ground(), far),
+            Ok(Some(SceneUpdate::Rebuilt))
+        );
+        assert_eq!(scene.rebuild_reason(), Some(Rebuild::Jump));
+        assert!(room(&scene, "selection nodes") >= before);
     }
 
     #[test]

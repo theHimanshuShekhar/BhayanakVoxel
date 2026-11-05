@@ -2,7 +2,7 @@
 //! and the loopback to the server. All Edits come through here, and reach the Voxels only via
 //! [`sim::Predictor`], which calls [`sim::apply`].
 
-use brick_store::{Material, VoxelCoord};
+use brick_store::{Material, TableSize, VoxelCoord};
 use materials::MaterialTable;
 use net::{ClientEnd, Disconnected, EditMode, EditOp, MoveInput, TryRecvError};
 use render::reference::{Hit, Ray, trace};
@@ -226,6 +226,17 @@ impl World {
 
     pub fn scene(&self) -> &Scene {
         &self.scene
+    }
+
+    /// The size of every table that is made roomy up front: the store's, the selection's, the
+    /// loader's and the scene's (see [`crate::growth`]).
+    pub fn table_sizes(&self) -> Vec<TableSize> {
+        let mut sizes = self.predictor.store().table_sizes();
+        sizes.extend(self.scene.table_sizes());
+        if let Some(loader) = &self.loader {
+            sizes.extend(loader.table_sizes());
+        }
+        sizes
     }
 
     /// The Planet's bricks as the client holds them.
