@@ -1660,6 +1660,74 @@ mod tests {
         }
     }
 
+    /// Counts the bricks of level 0 it is asked for. Under y = -1 (the rock) it proves that all is rock, as
+    /// the Planet proves its interior.
+    #[derive(Debug)]
+    struct Counting(std::sync::Arc<AtomicUsize>);
+
+    impl brick_store::BrickSource for Counting {
+        fn brick(&self, level: usize, coord: BrickCoord) -> Brick {
+            if level == 0 {
+                self.0.fetch_add(1, AtomicOrdering::Relaxed);
+            }
+            if coord.0[1] < -1 {
+                Brick::solid(ROCK)
+            } else {
+                Brick::AIR
+            }
+        }
+
+        fn solid_below(&self, _: usize, coord: BrickCoord) -> bool {
+            coord.0[1] < -1
+        }
+    }
+
+    /// Splitting the bricks that arrive classifies them against the bricks beside them, which may
+    /// not be resident yet: that reads what the source proves of them and never generates one, on
+    /// the frame thread, where the loader's workers are the ones to generate.
+    #[test]
+    fn taking_in_bricks_does_not_generate_the_bricks_beside_them() {
+        let made = std::sync::Arc::new(AtomicUsize::new(0));
+        let mut store = flat(4, 4);
+        store.set_source(Counting(made.clone()));
+        store.stream_from(3);
+        let source = store.source().expect("a source");
+        // The Guard: the level that the store streams from, held where it is not air.
+        for x in -3..3 {
+            for y in -3..3 {
+                for z in -3..3 {
+                    let coord = BrickCoord([x, y, z]);
+                    if !store.holds(3, coord) {
+                        let brick = source.brick(3, coord);
+                        if !brick.is_air() {
+                            store.hold(3, coord, brick, source.solid_below(3, coord));
+                        }
+                    }
+                }
+            }
+        }
+        let mut selection = select(&store, [0.5, 20.0, 0.5], D0);
+        let mut rounds = 0;
+        loop {
+            let wanted = selection.take_wanted();
+            if wanted.is_empty() {
+                break;
+            }
+            rounds += 1;
+            // What a loader does: generates the children, and the store holds them.
+            for &(level, coord) in &wanted {
+                let bricks = brick_store::children_from(&*source, level, coord, |c| {
+                    store.holds(level - 1, c)
+                });
+                store.hold_children(level, coord, bricks);
+            }
+            made.store(0, AtomicOrdering::Relaxed);
+            selection.arrived(&store, wanted);
+            assert_eq!(made.load(AtomicOrdering::Relaxed), 0, "round {rounds}");
+        }
+        assert!(rounds > 1, "{rounds}");
+    }
+
     #[test]
     fn a_brick_whose_children_are_not_resident_is_drawn_whole_and_wanted_once() {
         let store = streamed(64, 4, 2);

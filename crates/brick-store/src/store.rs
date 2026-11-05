@@ -305,10 +305,13 @@ impl BrickStore {
         }
     }
 
-    /// Whether every Voxel of level 0 under the brick at `coord` of mip `level` is solid, exactly.
-    /// A coarse brick that reads as full may still have air under it, since a coarse Voxel is
-    /// solid when half of its children are: the pyramid keeps this beside the brick, made with it.
-    /// Where the store holds no brick the source says (see [`BrickSource::solid_below`]).
+    /// Whether every Voxel of level 0 under the brick at `coord` of mip `level` is solid, exactly
+    /// for a brick that is held. A coarse brick that reads as full may still have air under it,
+    /// since a coarse Voxel is solid when half of its children are: the pyramid keeps this beside
+    /// the brick, made with it. Where the store holds no brick the source says (see
+    /// [`BrickSource::solid_below`]): exact when it says so, and otherwise not known, at level 0
+    /// too in a store that streams (see [`Self::is_full_known`]), which does not generate a brick
+    /// to find out. A caller that asks beside many bricks can rely on that.
     pub fn solid_below(&self, level: usize, coord: BrickCoord) -> bool {
         let Some(store) = self.level(level) else {
             return false;
@@ -316,7 +319,7 @@ impl BrickStore {
         match store.bricks.get(&coord) {
             Some(brick) if level == 0 => brick.is_full(),
             Some(_) => store.solid_below.contains(&coord),
-            None if level == 0 => self.brick_at(0, coord).is_full(),
+            None if level == 0 => self.is_full_known(0, coord),
             None => self.source_solid_below(level, coord),
         }
     }
@@ -542,6 +545,20 @@ mod tests {
     use crate::lod::Interior;
 
     const ROCK: Material = Material(3);
+
+    /// Counts the bricks it is asked for, which are rock, and proves rock below y = 0.
+    #[derive(Debug, Default)]
+    struct Counting(std::sync::atomic::AtomicUsize);
+
+    impl BrickSource for Counting {
+        fn brick(&self, _: usize, _: BrickCoord) -> Brick {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Brick::solid(ROCK)
+        }
+        fn solid_below(&self, _: usize, coord: BrickCoord) -> bool {
+            coord.0[1] < 0
+        }
+    }
 
     #[test]
     fn an_empty_store_reads_air_everywhere() {
@@ -1270,19 +1287,8 @@ mod tests {
 
     #[test]
     fn a_store_that_streams_does_not_generate_to_know_whether_a_neighbour_is_full() {
-        use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+        use std::sync::atomic::Ordering::Relaxed;
 
-        #[derive(Debug, Default)]
-        struct Counting(AtomicUsize);
-        impl BrickSource for Counting {
-            fn brick(&self, _: usize, _: BrickCoord) -> Brick {
-                self.0.fetch_add(1, Relaxed);
-                Brick::solid(ROCK)
-            }
-            fn solid_below(&self, _: usize, coord: BrickCoord) -> bool {
-                coord.0[1] < 0
-            }
-        }
         let source = Arc::new(Counting::default());
         let mut store = BrickStore::new();
         store.source = Some(source.clone());
@@ -1296,6 +1302,29 @@ mod tests {
         assert_eq!(source.0.load(Relaxed), 1);
         store.insert(shallow, Brick::solid(ROCK));
         assert!(store.is_full_known(0, shallow), "held bricks are known");
+    }
+
+    #[test]
+    fn a_store_that_streams_does_not_generate_to_know_whether_a_brick_is_solid_below() {
+        use std::sync::atomic::Ordering::Relaxed;
+
+        let source = Arc::new(Counting::default());
+        let mut store = BrickStore::new();
+        store.source = Some(source.clone());
+        store.stream_from(1);
+        let (deep, shallow) = (BrickCoord([0, -1, 0]), BrickCoord([0, 1, 0]));
+        // The children of their parents are not resident: a brick not held is not read.
+        assert!(store.solid_below(0, deep), "the source proves it");
+        assert!(!store.solid_below(0, shallow), "not known, not read");
+        assert_eq!(source.0.load(Relaxed), 0);
+        // Resident, a brick that is not held is air, or proven solid by the source.
+        store.set_children_resident(1, deep.parent());
+        store.set_children_resident(1, shallow.parent());
+        assert!(store.solid_below(0, deep));
+        assert!(!store.solid_below(0, shallow));
+        assert_eq!(source.0.load(Relaxed), 0, "nothing was generated");
+        store.insert(shallow, Brick::solid(ROCK));
+        assert!(store.solid_below(0, shallow), "held bricks are known");
     }
 
     #[test]
