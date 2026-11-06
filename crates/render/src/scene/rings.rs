@@ -82,47 +82,70 @@ impl fmt::Display for RingsFull {
 
 impl std::error::Error for RingsFull {}
 
-/// Hands out ranges of the words of one buffer, first fit, and takes them back.
+/// Hands out ranges of the words of one buffer, the smallest free range that fits, and takes them
+/// back. Both are a few lookups in ordered maps however many ranges are free: a buffer that has had
+/// bricks written and freed for a long time is in tens of thousands of pieces, and looking along
+/// them for one that fits is what a frame cannot afford.
 #[derive(Debug)]
 struct Pool {
-    /// The free ranges, ascending, and never touching: ones that touch are one range.
-    free: Vec<Range<usize>>,
+    /// The free ranges, by where each starts (and where it ends). They never touch: ones that
+    /// touch are one range.
+    by_start: BTreeMap<usize, usize>,
+    /// The same ranges, by length and then start.
+    by_len: BTreeSet<(usize, usize)>,
 }
 
 impl Pool {
     fn new(capacity: usize) -> Self {
-        Self {
-            free: std::iter::once(0..capacity).collect(),
+        let mut pool = Self {
+            by_start: BTreeMap::new(),
+            by_len: BTreeSet::new(),
+        };
+        pool.add(0, capacity);
+        pool
+    }
+
+    fn add(&mut self, start: usize, end: usize) {
+        if end > start {
+            self.by_start.insert(start, end);
+            self.by_len.insert((end - start, start));
         }
+    }
+
+    fn remove(&mut self, start: usize, end: usize) {
+        self.by_start.remove(&start);
+        self.by_len.remove(&(end - start, start));
+    }
+
+    /// The free ranges, ascending.
+    fn free(&self) -> impl Iterator<Item = Range<usize>> + '_ {
+        self.by_start.iter().map(|(&start, &end)| start..end)
     }
 
     /// The start of `len` words that are free, which are now taken, if there are that many in a
     /// row.
     fn take(&mut self, len: usize) -> Option<usize> {
-        let at = self.free.iter().position(|r| r.len() >= len)?;
-        let start = self.free[at].start;
-        if self.free[at].len() == len {
-            self.free.remove(at);
-        } else {
-            self.free[at].start += len;
-        }
+        let &(have, start) = self.by_len.range((len, 0)..).next()?;
+        self.remove(start, start + have);
+        self.add(start + len, start + have);
         Some(start)
     }
 
     /// Gives `len` words from `start` back, joining them to the free ranges they touch.
     fn give(&mut self, start: usize, len: usize) {
-        let at = self.free.partition_point(|r| r.start < start);
-        let after = self.free.get(at).is_some_and(|r| r.start == start + len);
-        let before = at > 0 && self.free[at - 1].end == start;
-        match (before, after) {
-            (true, true) => {
-                self.free[at - 1].end = self.free[at].end;
-                self.free.remove(at);
-            }
-            (true, false) => self.free[at - 1].end = start + len,
-            (false, true) => self.free[at].start = start,
-            (false, false) => self.free.insert(at, start..start + len),
+        let mut from = start;
+        let mut to = start + len;
+        if let Some((&before, &end)) = self.by_start.range(..start).next_back()
+            && end == start
+        {
+            self.remove(before, end);
+            from = before;
         }
+        if let Some(&end) = self.by_start.get(&to) {
+            self.remove(to, end);
+            to = end;
+        }
+        self.add(from, to);
     }
 }
 
@@ -1105,8 +1128,7 @@ impl Scene {
         let rings = self.rings.as_ref()?;
         let free = |pool: &Pool, len: usize| {
             len - pool
-                .free
-                .iter()
+                .free()
                 .map(|r| r.end.min(len).saturating_sub(r.start.min(len)))
                 .sum::<usize>()
         };
@@ -1130,8 +1152,7 @@ impl Scene {
         let words = match &self.rings {
             Some(rings) => {
                 let free = |pool: &Pool| {
-                    pool.free
-                        .iter()
+                    pool.free()
                         .map(|r| r.end.min(usize::MAX / 8).saturating_sub(r.start))
                         .sum::<usize>()
                 };
@@ -1546,9 +1567,8 @@ mod tests {
             .as_ref()
             .unwrap()
             .data
-            .free
-            .iter()
-            .map(Range::len)
+            .free()
+            .map(|r| r.len())
             .sum();
         scene.bricks.len() - free
     }
@@ -1569,9 +1589,8 @@ mod tests {
             .as_ref()
             .unwrap()
             .data
-            .free
-            .iter()
-            .map(Range::len)
+            .free()
+            .map(|r| r.len())
             .sum();
         // Take the spare words, so that the next brick that needs some does not fit.
         assert!(small.rings.as_mut().unwrap().data.take(spare).is_some());
@@ -1762,8 +1781,29 @@ mod tests {
         assert_eq!(pool.take(31), None, "the hole is thirty long");
         pool.give(0, 30);
         pool.give(60, 30);
-        assert_eq!(pool.free, std::iter::once(0..100).collect::<Vec<_>>());
+        assert_eq!(pool.free().next(), Some(0..100));
+        assert_eq!(pool.free().count(), 1);
         assert_eq!(pool.take(100), Some(0));
+    }
+
+    #[test]
+    fn a_pool_takes_the_smallest_range_that_fits_and_joins_neighbours_on_both_sides() {
+        let mut pool = Pool::new(100);
+        let at: Vec<usize> = (0..10).map(|_| pool.take(10).unwrap()).collect();
+        // Free a 10 hole at 20, a 30 hole at 50..80.
+        pool.give(at[2], 10);
+        for start in [50, 60, 70] {
+            pool.give(start, 10);
+        }
+        assert_eq!(pool.free().collect::<Vec<_>>(), [20..30, 50..80]);
+        // A request of 10 goes to the hole of 10, one of 15 to the hole of 30.
+        assert_eq!(pool.take(10), Some(20));
+        assert_eq!(pool.take(15), Some(50));
+        assert_eq!(pool.free().next(), Some(65..80));
+        assert_eq!(pool.free().count(), 1);
+        pool.give(50, 15);
+        assert_eq!(pool.free().next(), Some(50..80));
+        assert_eq!(pool.free().count(), 1);
     }
 
     #[test]

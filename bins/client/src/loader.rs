@@ -32,7 +32,7 @@ use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, TryLockError};
 use std::thread::JoinHandle;
 
-use brick_store::{Brick, BrickCoord, BrickSource, BrickStore, TableSize, children_from};
+use brick_store::{Brick, BrickCoord, BrickSource, BrickStore, TableSize, children_with_solid};
 use render::lod::{Bands, brick_distance};
 use render::scene::select::Key;
 
@@ -140,10 +140,10 @@ impl Shared {
 /// What a worker sends back.
 pub enum Arrival {
     /// The children of `key` that are not air and were not held, as
-    /// [`brick_store::BrickStore::hold_children`] takes them.
+    /// [`brick_store::BrickStore::hold_children_solid`] takes them.
     Children {
         key: Key,
-        bricks: Vec<(BrickCoord, Brick)>,
+        bricks: Vec<(BrickCoord, Brick, bool)>,
     },
     /// The camera went before the children of `key` were generated: they were not.
     Dropped(Key),
@@ -486,7 +486,7 @@ fn work(shared: &Shared, arrivals: &Sender<(u64, Arrival)>) {
                     .position(|&k| k == c)
                     .is_some_and(|i| job.held >> i & 1 == 1)
             };
-            let bricks = children_from(&*shared.source, level, coord, held);
+            let bricks = children_with_solid(&*shared.source, level, coord, held);
             shared
                 .generated
                 .fetch_add(u64::from(8 - job.held.count_ones()), Atomic::Relaxed);

@@ -56,6 +56,24 @@ pub fn children_from(
         .collect()
 }
 
+/// [`children_from`], with whether each brick is solid all the way down (see
+/// [`BrickSource::solid_below`]): what [`crate::BrickStore::hold_children_solid`] takes, so that the
+/// thread that generates the bricks works that out, and the one that holds them does not.
+pub fn children_with_solid(
+    source: &dyn BrickSource,
+    level: usize,
+    coord: BrickCoord,
+    skip: impl Fn(BrickCoord) -> bool,
+) -> Vec<(BrickCoord, Brick, bool)> {
+    children_from(source, level, coord, skip)
+        .into_iter()
+        .map(|(child, brick)| {
+            let solid = level > 1 && source.solid_below(level - 1, child);
+            (child, brick, solid)
+        })
+        .collect()
+}
+
 /// A ball at the Planet's centre made of one Material, so that none of its bricks need be held.
 /// A brick wholly inside `radius` Voxels of the centre reads as `material`, and any other as
 /// air, at every level.

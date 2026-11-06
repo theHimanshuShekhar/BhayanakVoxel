@@ -57,11 +57,21 @@ impl<K: PartialEq> Stillness<K> {
     }
 }
 
-/// What the frame thread aims to spend taking in bricks from the loader in one frame, the upload
-/// to the GPU included. A resident set that is filling takes more frames, not longer ones.
+/// What the frame thread aims to spend taking in bricks from the loader in one frame while the
+/// camera moves, the upload to the GPU included: with following the camera, which takes about as
+/// much, the frame's scene work is about 4 ms. A resident set that is filling takes more frames,
+/// not longer ones.
 pub const STREAM_BUDGET: std::time::Duration = std::time::Duration::from_micros(2000);
-/// Bricks' children taken in at a time, between looks at the clock.
-pub const BATCH: usize = 8;
+/// The same while the camera is where it was a frame ago: there is nothing to follow, so more of
+/// the frame goes to filling in what the bands ask for (about 6 ms of the 8 that no frame's scene
+/// work goes over), and the world is complete in minutes, not the better part of an hour.
+pub const STILL_STREAM_BUDGET: std::time::Duration = std::time::Duration::from_micros(6000);
+/// Most bricks' children taken in at a time, between looks at the clock. How many a frame takes in
+/// at a time is what its budget has left over what one costs, so a frame with room takes in many
+/// at once: the scene packs the regions they are in once, not once for each.
+pub const BATCH: usize = 128;
+/// What taking in one brick's children is expected to cost before it has been measured.
+const ARRIVAL_COST: std::time::Duration = std::time::Duration::from_micros(40);
 /// Most bricks asked of the loader in one frame (the rest wait for the next): the first call has
 /// every brick the Guard leaves to split, and the table that holds them is not made in a frame.
 const WANTED_PER_FRAME: usize = 20_000;
@@ -150,8 +160,10 @@ pub struct World {
     link: ClientEnd,
     /// Generates the bricks that the scene is waiting for, if the Planet is streamed in.
     loader: Option<Loader>,
-    /// What [`World::stream`] expects taking in a batch to cost.
-    batch_cost: std::time::Duration,
+    /// What [`World::stream`] expects taking in one brick's children to cost.
+    arrival_cost: std::time::Duration,
+    /// The camera [`World::stream`] last took bricks in for.
+    streamed_at: Option<[f64; 3]>,
     /// Whether [`World::stream`] leaves what the loader has generated where it is: see
     /// [`World::pause_loading`].
     loading_paused: bool,
@@ -186,7 +198,8 @@ impl World {
             predictor,
             link,
             loader: None,
-            batch_cost: std::time::Duration::ZERO,
+            arrival_cost: ARRIVAL_COST,
+            streamed_at: None,
             loading_paused: false,
             ghost: None,
             ghost_next: None,
@@ -299,8 +312,8 @@ impl World {
     }
 
     /// Asks the loader for what the bands are waiting for, nearest `camera` first, and takes in
-    /// what it has generated, for [`STREAM_BUDGET`] at the most: a few bricks' children at a time
-    /// are held, the scene splits the bricks they are under, and `show` copies what that changed
+    /// what it has generated, for [`STREAM_BUDGET`] at the most, or [`STILL_STREAM_BUDGET`] if the
+    /// camera has not moved since the last call: some bricks' children at a time are held, the scene splits the bricks they are under, and `show` copies what that changed
     /// to the GPU (its time is in the budget). This is all the frame thread does of loading: the
     /// bricks are generated on the loader's threads, at most [`crate::loader::MAX_AHEAD`] ahead
     /// of what is taken in here, and what is not taken in this frame waits for the next. While
@@ -309,13 +322,30 @@ impl World {
     pub fn stream<E: From<RingsFull>>(
         &mut self,
         camera: [f64; 3],
+        show: impl FnMut(&Scene, &SceneUpdate) -> Result<(), E>,
+    ) -> Result<(), E> {
+        let still = self.streamed_at == Some(camera);
+        self.streamed_at = Some(camera);
+        let budget = if still {
+            STILL_STREAM_BUDGET
+        } else {
+            STREAM_BUDGET
+        };
+        self.stream_within(camera, budget, show)
+    }
+
+    /// [`World::stream`] with a budget of its own.
+    pub fn stream_within<E: From<RingsFull>>(
+        &mut self,
+        camera: [f64; 3],
+        budget: std::time::Duration,
         mut show: impl FnMut(&Scene, &SceneUpdate) -> Result<(), E>,
     ) -> Result<(), E> {
         let Self {
             scene,
             predictor,
             loader: Some(loader),
-            batch_cost,
+            arrival_cost,
             loading_paused,
             ..
         } = self
@@ -337,15 +367,24 @@ impl World {
             return Ok(());
         }
         let mut worst = std::time::Duration::ZERO;
-        while started.elapsed() + *batch_cost <= STREAM_BUDGET {
+        loop {
+            let left = budget.saturating_sub(started.elapsed());
+            let room = left.as_nanos() / arrival_cost.as_nanos().max(1);
+            if room == 0 {
+                break;
+            }
+            // Not all that there is room for: an arrival that costs more than was expected
+            // does not take the frame over its budget by as much, and the next batch is sized
+            // by what the first cost.
+            let most = (room * 3 / 5).max(room.min(8)).min(BATCH as u128);
             let batch_started = std::time::Instant::now();
             let mut resident = Vec::new();
-            for arrival in loader.receive(BATCH) {
+            for arrival in loader.receive(most as usize) {
                 match arrival {
                     Arrival::Children { key, bricks } => {
                         predictor
                             .store_for_loading()
-                            .hold_children(key.0, key.1, bricks);
+                            .hold_children_solid(key.0, key.1, bricks);
                         resident.push(key);
                     }
                     Arrival::Dropped(key) => scene.unwant(key),
@@ -357,13 +396,13 @@ impl World {
             if let Some(update) = scene.arrive(predictor.store(), &resident)? {
                 show(scene, &update)?;
             }
-            worst = worst.max(batch_started.elapsed());
+            worst = worst.max(batch_started.elapsed() / resident.len() as u32);
         }
-        // What the next frame expects a batch to cost: a running mean of the worst of each frame,
-        // and never more than a third of the budget, so that one slow batch (a table that grew)
-        // does not stop taking bricks in for the frames after it.
+        // What the next frame expects one to cost: a running mean of the worst batch of each
+        // frame, and never more than a quarter of the budget, so that one slow batch (a table that
+        // grew) does not stop taking bricks in for the frames after it.
         if !worst.is_zero() {
-            *batch_cost = (batch_cost.mul_f64(0.8) + worst.mul_f64(0.2)).min(STREAM_BUDGET / 3);
+            *arrival_cost = (arrival_cost.mul_f64(0.8) + worst.mul_f64(0.2)).min(STREAM_BUDGET / 4);
         }
         Ok(())
     }

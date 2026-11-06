@@ -17,7 +17,7 @@ use render::{Camera, Mode, RingsFull, Scene, SceneUpdate, camera};
 use sim::Predictor;
 
 use crate::loader::{Arrival, Loader, hold_guard};
-use crate::world::{BATCH, STILL_FRAMES, SceneWork, Stillness, World, loading_paused_for};
+use crate::world::{STILL_FRAMES, SceneWork, Stillness, World, loading_paused_for};
 
 const SEED: u64 = 0xB4A7_A9AC;
 const RING: i32 = 160;
@@ -458,6 +458,31 @@ fn scene_frame(
     }
 }
 
+/// The camera moving over the ground at `metres_per_s` (a Voxel is 10 cm) for `frames` frames at
+/// 60 a second, with the loader running: the scene work of each frame.
+fn travel(
+    world: &mut World,
+    camera: &mut Camera,
+    tables: &mut Tables,
+    metres_per_s: f64,
+    frames: usize,
+) -> (SceneWork, Updates) {
+    let frame = Duration::from_micros(16_667);
+    let (mut work, mut updates) = (SceneWork::default(), Updates::default());
+    let (ahead, _) = tangents(camera.horizon_up);
+    let step = metres_per_s * 10.0 / 60.0;
+    let mut moved = camera.position;
+    for _ in 0..frames {
+        let tick = Instant::now();
+        moved = std::array::from_fn(|a| moved[a] + ahead[a] * step);
+        camera.position = over_the_ground(world.store(), moved);
+        camera.carry_up(camera.position);
+        scene_frame(world, camera.position, &mut work, &mut updates, tables);
+        std::thread::sleep(frame.saturating_sub(tick.elapsed()));
+    }
+    (work, updates)
+}
+
 /// The Planet at full size, streamed in as the client does it: the spawn ring and the Guard are
 /// timed by `load`, then the resident set fills with the camera still (timed), and then the camera
 /// walks at 5 m/s with the loader running (scene work per frame, worst and p99). Takes about an
@@ -570,23 +595,7 @@ fn the_full_size_planet_streams_in_and_walking_over_it_does_not_stall() {
     );
 
     // Then it walks, 5 m/s over the ground.
-    let (mut walk_work, mut walk_updates) = (SceneWork::default(), Updates::default());
-    let (ahead, _) = tangents(camera.horizon_up);
-    let mut walked = camera.position;
-    for _ in 0..1800 {
-        let tick = Instant::now();
-        walked = std::array::from_fn(|a| walked[a] + ahead[a] * (50.0 / 60.0));
-        camera.position = over_the_ground(world.store(), walked);
-        camera.carry_up(camera.position);
-        scene_frame(
-            &mut world,
-            camera.position,
-            &mut walk_work,
-            &mut walk_updates,
-            &mut tables,
-        );
-        std::thread::sleep(frame.saturating_sub(tick.elapsed()));
-    }
+    let (walk_work, walk_updates) = travel(&mut world, &mut camera, &mut tables, 5.0, 1800);
     eprintln!(
         "walking 150 m: {}; {} patches, {} rebuilds, the largest patch {} words; {} waiting, {} \
          pending, {} bricks generated in all",
@@ -610,6 +619,27 @@ fn the_full_size_planet_streams_in_and_walking_over_it_does_not_stall() {
         filled,
         "the fill stopped at the {cap} s cap before the loader went idle, so no growth over a \
          full fill was checked"
+    );
+
+    // Then it flies, 48 m/s over the ground: ten times the walk's distance a frame. The
+    // reservations are for the fill and the walk, so the flight is not held to them.
+    let (fly_work, fly_updates) = travel(&mut world, &mut camera, &mut tables, 48.0, 1800);
+    eprintln!(
+        "flying 1.4 km: {}; {} patches, {} rebuilds, the largest patch {} words",
+        fly_work.summary().unwrap(),
+        fly_updates.patched,
+        fly_updates.rebuilt,
+        fly_updates.worst_words,
+    );
+    eprintln!(
+        "  of which following the camera: {}; taking in bricks: {}",
+        fly_updates.recentre.summary().unwrap(),
+        fly_updates.stream.summary().unwrap()
+    );
+    tables.report();
+    eprintln!(
+        "  tables that grew in the flight (it asks for far more than the loader makes in a frame): {:?}",
+        tables.grown
     );
 }
 
@@ -705,7 +735,7 @@ fn letting_go_takes_in_what_was_held_and_the_bands_fill_as_before() {
     }
     // Within its budget, a frame takes in a few batches, not all of what was held.
     assert!(
-        first.len() < crate::loader::MAX_AHEAD / BATCH,
+        first.len() < crate::loader::MAX_AHEAD / 8,
         "{}",
         first.len()
     );
