@@ -9,6 +9,7 @@
 //! in the same way.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{Duration, Instant};
 
 use brick_store::{BrickCoord, BrickStore};
@@ -52,8 +53,16 @@ fn leash_at(leashes: &VecDeque<(u64, Leash)>, seq: u64) -> Option<Leash> {
         .map(|&(_, leash)| leash)
 }
 
+/// The client's Planet, which a thread besides the frame's may read and hold more bricks in (see
+/// [`Predictor::shared_store`]).
+pub type SharedStore = Arc<RwLock<BrickStore>>;
+
+fn read(store: &SharedStore) -> RwLockReadGuard<'_, BrickStore> {
+    store.read().expect("the store's lock is not poisoned")
+}
+
 pub struct Predictor {
-    store: BrickStore,
+    store: SharedStore,
     next_client_seq: u64,
     pending: VecDeque<Pending>,
     /// What each pending Edit spent of the allowance, by its number.
@@ -89,7 +98,7 @@ impl Predictor {
     pub fn new(store: BrickStore) -> Self {
         let ground = Ground::new(store.source());
         Self {
-            store,
+            store: Arc::new(RwLock::new(store)),
             next_client_seq: 0,
             pending: VecDeque::new(),
             spent: BTreeMap::new(),
@@ -111,7 +120,7 @@ impl Predictor {
 
     /// Generates at most `rate` bricks of ground per tick, instead of the usual.
     pub fn with_ground_rate(mut self, rate: usize) -> Self {
-        self.ground = Ground::new(self.store.source()).with_rate(rate);
+        self.ground = Ground::new(read(&self.store).source()).with_rate(rate);
         self
     }
 
@@ -182,7 +191,7 @@ impl Predictor {
         });
         let request = leash.map(|leash| {
             character.set_leash(Some(leash));
-            character.tick(&Footing::new(&self.store, &self.ground), &input);
+            character.tick(&Footing::new(&read(&self.store), &self.ground), &input);
             self.next_input_seq += 1;
             self.pending_inputs.push_back(PendingInput {
                 seq,
@@ -242,20 +251,33 @@ impl Predictor {
                 self.covered = Some(leash);
             }
             character.set_leash(leash);
-            character.tick(&Footing::new(&self.store, &self.ground), &pending.input);
+            character.tick(
+                &Footing::new(&read(&self.store), &self.ground),
+                &pending.input,
+            );
             pending.after = *character.state();
         }
     }
 
-    pub fn store(&self) -> &BrickStore {
-        &self.store
+    /// Reads the Planet's bricks. Do not call this while holding another guard of the same store
+    /// on this thread: a thread that waits to write would stop the second read, and so this one.
+    pub fn store(&self) -> RwLockReadGuard<'_, BrickStore> {
+        read(&self.store)
     }
 
-    /// The Planet's bricks, for a loader to hold more of them: bricks the generator makes, never
-    /// an Edit (those come through [`Predictor::edit`] and the server's word, which keep the
-    /// history to take them back). It must not replace a brick that is held.
-    pub fn store_for_loading(&mut self) -> &mut BrickStore {
-        &mut self.store
+    fn store_mut(&mut self) -> RwLockWriteGuard<'_, BrickStore> {
+        self.store
+            .write()
+            .expect("the store's lock is not poisoned")
+    }
+
+    /// The Planet's bricks, for a thread that selects what is drawn from them, and holds more of
+    /// them as a loader generates them: bricks the generator makes, never an Edit (those come
+    /// through [`Predictor::edit`] and the server's word, which keep the history to take them
+    /// back). It must not replace a brick that is held. Edits write to the store through this
+    /// predictor, which waits for the readers it finds.
+    pub fn shared_store(&self) -> SharedStore {
+        Arc::clone(&self.store)
     }
 
     /// Edits that the server has not answered yet.
@@ -286,8 +308,9 @@ impl Predictor {
     /// the ground around the character, then a cache of what the store does not hold, so that the
     /// bricks are not made again for each Edit or each look of the ghost.
     pub fn plan(&mut self, op: &EditOp) -> Vec<Change> {
+        let store = read(&self.store);
         plan_from(
-            &mut Reads::new(&self.store)
+            &mut Reads::new(&store)
                 .with_ground(&self.ground)
                 .with_cache(&mut self.cache),
             op,
@@ -435,7 +458,7 @@ impl Predictor {
     fn apply_authoritative(&mut self, op: EditOp, settles: Option<u64>) -> Vec<BrickCoord> {
         let mut touched = BTreeSet::new();
         let again = self.revert_from(0, &mut touched);
-        touched.extend(apply(&mut self.store, &op).bricks());
+        touched.extend(apply(&mut self.store_mut(), &op).bricks());
         for (client_seq, op) in again {
             if Some(client_seq) != settles {
                 touched.extend(self.predict(client_seq, op));
@@ -457,8 +480,12 @@ impl Predictor {
         op: EditOp,
         changes: Vec<Change>,
     ) -> Vec<BrickCoord> {
+        let mut store = self
+            .store
+            .write()
+            .expect("the store's lock is not poisoned");
         let undo = apply_changes_from(
-            &mut self.store,
+            &mut store,
             &changes,
             Some(&self.ground),
             Some(&mut self.cache),
@@ -483,7 +510,7 @@ impl Predictor {
         while self.pending.len() > index {
             let pending = self.pending.pop_back().expect("longer than index");
             touched.extend(pending.undo.bricks());
-            pending.undo.revert(&mut self.store);
+            pending.undo.revert(&mut self.store_mut());
             reverted.push((pending.client_seq, pending.op));
         }
         reverted.reverse();
@@ -934,7 +961,8 @@ mod tests {
         let rerun = |client: &Predictor, inputs: &[MoveInput], from: usize| {
             let applied = 10;
             let mut character = Character::spawn(Movement::default(), START, Some(ball(80.0)));
-            let footing = Footing::new(client.store(), client.ground());
+            let store = client.store();
+            let footing = Footing::new(&store, client.ground());
             for input in &inputs[..applied] {
                 character.tick(&footing, input);
             }

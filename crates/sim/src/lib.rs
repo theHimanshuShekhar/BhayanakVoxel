@@ -22,7 +22,7 @@ pub use edit::{
 };
 pub use ground::{Footing, Ground};
 pub use movement::{ConfigError, Movement, MovementConfig, VOXELS_PER_METRE};
-pub use prediction::Predictor;
+pub use prediction::{Predictor, SharedStore};
 pub use server::{Outcome, Server, ServerHandle, TICK_RATE_HZ, spawn};
 
 /// Fixed-timestep accumulator: turns elapsed wall-clock time into a whole number of ticks.

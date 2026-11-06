@@ -43,7 +43,7 @@ pub use camera::Camera;
 pub use debug_view::DebugView;
 pub use offscreen::{GpuInfo, Image, Offscreen};
 pub use profiler::Profiler;
-pub use scene::{Rebuild, RingsFull, Room, Scene, SceneUpdate};
+pub use scene::{PatchCopy, Rebuild, RingPatch, RingsFull, Room, Scene, SceneUpdate};
 pub use sun::Sun;
 pub use timing::Timings;
 pub use upscale::Resolution;

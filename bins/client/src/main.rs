@@ -6,6 +6,7 @@ mod ghost;
 mod growth;
 mod loader;
 mod priority;
+mod scene_worker;
 #[cfg(test)]
 mod streaming_tests;
 mod tool;
@@ -724,9 +725,9 @@ impl App {
         self.show(update)
     }
 
-    /// Takes in the bricks the loader has generated, for a bounded time a frame, and copies what
-    /// that changed to the GPU. Reports once, when the resident set is first complete for the
-    /// bands: nothing waits for bricks and nothing is queued.
+    /// Copies to the GPU what the scene thread made since the last frame (it takes in the bricks the
+    /// loader has generated). Reports once, when the resident set is first complete for the bands:
+    /// nothing waits for bricks and nothing is queued.
     fn stream(&mut self) -> Result<(), Box<dyn Error>> {
         let (Some(world), Some(renderer)) = (&mut self.world, &mut self.renderer) else {
             return Ok(());
@@ -736,14 +737,6 @@ impl App {
         // anything changes.
         let still_frames = self.still.observe((renderer.view(&self.camera), self.bias));
         world.pause_loading(world::loading_paused_for(renderer.mode(), still_frames));
-        // The display's refresh rate sets what filling in may spend of a frame while the camera is
-        // still. The monitor can change as the window is moved.
-        world.set_refresh(
-            self.window
-                .as_ref()
-                .and_then(|w| w.current_monitor())
-                .and_then(|m| m.refresh_rate_millihertz()),
-        );
         let (cpu, growth) = (&mut self.cpu, &mut self.growth);
         world.stream(self.camera.position, |scene, update| {
             upload(growth, cpu, renderer, scene, update)
@@ -751,12 +744,12 @@ impl App {
         self.growth.check(world, Instant::now());
         if let (Some(since), Some(world)) = (self.filling_since, &self.world)
             && world.waiting() == 0
-            && world.loader().is_some_and(|l| l.pending() == 0)
+            && world.loader().is_some_and(|l| l.pending == 0)
         {
             eprintln!(
                 "resident set complete for the bands {:.1?} after the first frame: {} bricks generated",
                 since.elapsed(),
-                world.loader().map_or(0, Loader::generated)
+                world.loader().map_or(0, |l| l.generated)
             );
             self.filling_since = None;
         }
@@ -884,12 +877,12 @@ impl App {
             loading_paused: self
                 .world
                 .as_ref()
-                .is_some_and(|w| w.loading_paused() && w.loader().is_some_and(|l| l.pending() > 0)),
+                .is_some_and(|w| w.loading_paused() && w.loader().is_some_and(|l| l.pending > 0)),
             scene_memory: SceneMemory {
-                used: self.world.as_ref().map_or(0, |w| w.scene().used_bytes()),
+                used: self.world.as_ref().map_or(0, World::used_bytes),
                 allocated: renderer.scene_bytes(),
             },
-            lod: self.world.as_ref().and_then(|w| lod_info(w.scene())),
+            lod: self.world.as_ref().and_then(lod_info),
         };
         let input = gui.state.take_egui_input(window);
         let camera = &self.camera;
@@ -971,12 +964,12 @@ impl App {
 
 /// What the overlay says of the LOD bands: where level 0 ends, in metres, and the bricks drawn at
 /// each level.
-fn lod_info(scene: &Scene) -> Option<LodInfo> {
-    let bands = scene.bands()?;
+fn lod_info(world: &World) -> Option<LodInfo> {
+    let bands = world.bands()?;
     Some(LodInfo {
         // Level 0 owns [0, 2 * d0) Voxels of 10 cm.
         switch_m: bands.floor(1) * 0.1,
-        bricks: (0..RING_LEVELS).map(|l| scene.level_bricks(l)).collect(),
+        bricks: (0..RING_LEVELS).map(|l| world.level_bricks(l)).collect(),
     })
 }
 

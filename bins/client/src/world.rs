@@ -2,6 +2,8 @@
 //! and the loopback to the server. All Edits come through here, and reach the Voxels only via
 //! [`sim::Predictor`], which calls [`sim::apply`].
 
+use std::sync::Arc;
+
 use brick_store::{Material, TableSize, VoxelCoord};
 use materials::MaterialTable;
 use net::{ClientEnd, Disconnected, EditMode, EditOp, MoveInput, TryRecvError};
@@ -11,7 +13,8 @@ use sim::Predictor;
 
 use crate::dig::dig_seconds;
 use crate::ghost::Ghost;
-use crate::loader::{Arrival, Loader};
+use crate::loader::Loader;
+use crate::scene_worker::{LoaderStats, SceneWorker, Stats};
 use crate::tool::{Tool, rotation_for};
 
 /// How many frames in a row the view must be unchanged before the reference image is taken to be
@@ -56,76 +59,6 @@ impl<K: PartialEq> Stillness<K> {
         self.frames
     }
 }
-
-/// What the frame thread aims to spend taking in bricks from the loader in one frame while the
-/// camera moves, the upload to the GPU included: with following the camera, which takes about as
-/// much, the frame's scene work is about 4 ms. A resident set that is filling takes more frames,
-/// not longer ones.
-pub const STREAM_BUDGET: std::time::Duration = std::time::Duration::from_micros(2000);
-/// The most the frame spends taking in bricks while the camera is still: there is nothing to
-/// follow, so more of the frame goes to filling in what the bands ask for, and the Planet is
-/// complete in minutes, not the better part of an hour. No frame's scene work goes over 8 ms.
-pub const STILL_STREAM_BUDGET_MAX: std::time::Duration = std::time::Duration::from_micros(6000);
-/// The refresh rate that is assumed when the display does not say, in millihertz.
-pub const FALLBACK_REFRESH_MILLIHERTZ: u32 = 60_000;
-
-/// What the frame spends taking in bricks while the camera is still, for a display that refreshes
-/// at `refresh_millihertz` (`None` if it does not say, which is taken as 60 Hz): half the frame
-/// period, so that filling in does not cost the frames the display could show, and at most
-/// [`STILL_STREAM_BUDGET_MAX`]. That is 6 ms at 60 Hz and about 2 ms at 240 Hz. The refresh rate
-/// is the display's, not the time frames have taken, which filling in would lengthen in turn.
-pub fn still_budget_for(refresh_millihertz: Option<u32>) -> std::time::Duration {
-    let rate = refresh_millihertz
-        .filter(|&r| r > 0)
-        .unwrap_or(FALLBACK_REFRESH_MILLIHERTZ);
-    let period = std::time::Duration::from_secs_f64(1000.0 / f64::from(rate));
-    (period / 2).min(STILL_STREAM_BUDGET_MAX)
-}
-
-/// How far the camera may move between two calls of [`World::stream`] and still be taken as still,
-/// in Voxels (a millimetre). A camera that is held still can differ in the last bits from one
-/// frame to the next, as a character does that stands on ground that is being remade.
-const STILL_EPSILON: f64 = 0.01;
-
-/// Whether `now` is where `before` was, to within [`STILL_EPSILON`].
-fn camera_is_still(before: Option<[f64; 3]>, now: [f64; 3]) -> bool {
-    before.is_some_and(|b| {
-        (0..3).map(|a| (now[a] - b[a]).powi(2)).sum::<f64>() <= STILL_EPSILON * STILL_EPSILON
-    })
-}
-/// Most bricks' children taken in at a time, between looks at the clock. How many a frame takes in
-/// at a time is what its budget has left over what one costs, so a frame with room takes in many
-/// at once: the scene packs the regions they are in once, not once for each.
-pub const BATCH: usize = 128;
-/// The share of the time left in a frame's budget that a batch is expected to take, as a fraction:
-/// an arrival that costs more than was expected then takes the frame over by less, and the next
-/// batch is sized by what this one cost.
-const BATCH_SHARE: (u128, u128) = (3, 5);
-/// Arrivals taken in at a time even when the budget has room for fewer, so that a frame with
-/// little left still makes progress.
-const LEAST_BATCH: u128 = 8;
-/// The most that one arrival is expected to cost, however slow the last ones were, so that one
-/// slow batch (a table that grew) does not stop taking bricks in for the frames after it.
-const MOST_ARRIVAL_COST: std::time::Duration = std::time::Duration::from_micros(500);
-/// What taking in one brick's children is expected to cost before it has been measured.
-const ARRIVAL_COST: std::time::Duration = std::time::Duration::from_micros(40);
-/// How many arrivals the next batch takes in, given the `left` of the budget and what one is
-/// expected to `cost`: [`BATCH_SHARE`] of the room, at least [`LEAST_BATCH`] if there is room for
-/// that many, and at most [`BATCH`]. None if there is no room for one. The batch is expected to
-/// take no more than `left`.
-fn batch_size(left: std::time::Duration, cost: std::time::Duration) -> Option<usize> {
-    let room = left.as_nanos() / cost.as_nanos().max(1);
-    if room == 0 {
-        return None;
-    }
-    let most = (room * BATCH_SHARE.0 / BATCH_SHARE.1)
-        .max(room.min(LEAST_BATCH))
-        .min(BATCH as u128);
-    Some(most as usize)
-}
-/// Most bricks asked of the loader in one frame (the rest wait for the next): the first call has
-/// every brick the Guard leaves to split, and the table that holds them is not made in a frame.
-const WANTED_PER_FRAME: usize = 20_000;
 
 /// A ghost that took some time to make is not made again for a new Edit for this many times as
 /// long, and the last one is shown until then: so the frame thread spends at most a ninth of its
@@ -206,17 +139,17 @@ impl SceneWork {
 }
 
 pub struct World {
+    /// What is drawn, and what the frame thread traces rays in to aim. Once the world streams
+    /// ([`World::with_loader`]) it is a copy, which what the scene thread makes is written into
+    /// (see [`SceneWorker`]); else it is the scene itself.
     scene: Scene,
     predictor: Predictor,
     link: ClientEnd,
-    /// Generates the bricks that the scene is waiting for, if the Planet is streamed in.
-    loader: Option<Loader>,
-    /// What [`World::stream`] expects taking in one brick's children to cost.
-    arrival_cost: std::time::Duration,
-    /// The camera [`World::stream`] last took bricks in for.
-    streamed_at: Option<[f64; 3]>,
-    /// What [`World::stream`] spends while the camera is still: see [`still_budget_for`].
-    still_budget: std::time::Duration,
+    /// The thread that follows the camera and takes in what the loader generates, if the Planet
+    /// is streamed in.
+    worker: Option<SceneWorker>,
+    /// What the scene thread said of the scene and the loader with the words that `scene` has.
+    stats: Stats,
     /// Whether [`World::stream`] leaves what the loader has generated where it is: see
     /// [`World::pause_loading`].
     loading_paused: bool,
@@ -250,10 +183,8 @@ impl World {
             scene,
             predictor,
             link,
-            loader: None,
-            arrival_cost: ARRIVAL_COST,
-            streamed_at: None,
-            still_budget: still_budget_for(None),
+            worker: None,
+            stats: Stats::default(),
             loading_paused: false,
             ghost: None,
             ghost_next: None,
@@ -261,54 +192,98 @@ impl World {
         }
     }
 
-    /// Streams the Planet in with `loader`: see [`World::stream`]. The scene must have been made
-    /// from the predictor's store, which must stream ([`brick_store::BrickStore::stream_from`]).
+    /// Streams the Planet in with `loader`, on a thread of its own that follows the camera and takes
+    /// in what the loader makes (see [`SceneWorker`]): [`World::recentre`] and [`World::stream`]
+    /// only tell it where the camera is, and take what it has made. The scene, which must be of
+    /// rings, moves to that thread, and the world keeps a copy to draw. It must have been made from
+    /// the predictor's store, which must stream ([`brick_store::BrickStore::stream_from`]).
     pub fn with_loader(mut self, loader: Loader) -> Self {
-        self.loader = Some(loader);
+        let scene = std::mem::take(&mut self.scene);
+        let (worker, mirror, stats) =
+            SceneWorker::start(scene, loader, self.predictor.shared_store());
+        (self.worker, self.scene, self.stats) = (Some(worker), mirror, stats);
         self
     }
 
-    /// The loader, if there is one.
-    pub fn loader(&self) -> Option<&Loader> {
-        self.loader.as_ref()
+    /// What the loader is doing, as of the scene the world has, if there is one.
+    pub fn loader(&self) -> Option<LoaderStats> {
+        self.worker.as_ref().map(|_| self.stats.loader)
     }
 
-    /// Holds back (or lets go of) what the loader generates: while paused, [`World::stream`] does
-    /// not take it in, so the scene stays as it is and the reference image can accumulate. The
+    /// What the scene thread said of the scene and the loader with the words the world has. Empty
+    /// before [`World::with_loader`].
+    #[cfg(test)]
+    pub fn stats(&self) -> &Stats {
+        &self.stats
+    }
+
+    /// Holds back (or lets go of) what the loader generates: while paused, nothing it generated
+    /// is taken in, so the scene stays as it is and the reference image can accumulate. The
     /// loader's threads stop at [`crate::loader::MAX_AHEAD`] jobs ahead, so what waits is bounded.
     pub fn pause_loading(&mut self, paused: bool) {
         self.loading_paused = paused;
+        if let Some(worker) = &self.worker {
+            worker.pause(paused);
+        }
     }
 
     /// Whether there is a loader and it is paused: see [`World::pause_loading`].
     pub fn loading_paused(&self) -> bool {
-        self.loading_paused && self.loader.is_some()
+        self.loading_paused && self.worker.is_some()
     }
 
     /// Bricks that wait for the bricks under them to be resident. Zero, and nothing pending with
     /// the loader, once the resident set is complete for the bands.
     pub fn waiting(&self) -> usize {
-        self.scene.waiting()
+        self.of_scene(|s| s.waiting, Scene::waiting)
     }
 
     pub fn scene(&self) -> &Scene {
         &self.scene
     }
 
+    /// What the scene thread said of the scene (`stat`) if there is one, else what the scene itself
+    /// says (`scene`): the selection is not in the copy that is drawn.
+    fn of_scene<T>(&self, stat: impl Fn(&Stats) -> T, scene: impl Fn(&Scene) -> T) -> T {
+        match self.worker {
+            Some(_) => stat(&self.stats),
+            None => scene(&self.scene),
+        }
+    }
+
+    /// The LOD bands the scene is selected by, if it is rings.
+    pub fn bands(&self) -> Option<render::lod::Bands> {
+        self.of_scene(|s| s.bands, Scene::bands)
+    }
+
+    /// Bricks drawn at `level` (see [`Scene::level_bricks`]).
+    pub fn level_bricks(&self, level: usize) -> usize {
+        self.of_scene(
+            |s| s.level_bricks.get(level).copied().unwrap_or(0),
+            |scene| scene.level_bricks(level),
+        )
+    }
+
+    /// Bytes of the scene's buffers that hold something (see [`Scene::used_bytes`]).
+    pub fn used_bytes(&self) -> u64 {
+        self.of_scene(|s| s.slow.used_bytes, Scene::used_bytes)
+    }
+
     /// The size of every table that is made roomy up front: the store's, the selection's, the
-    /// loader's and the scene's (see [`crate::growth`]).
+    /// loader's and the scene's (see [`crate::growth`]). The last three are as the scene thread
+    /// last looked, a few times a second.
     pub fn table_sizes(&self) -> Vec<TableSize> {
         let mut sizes = self.predictor.store().table_sizes();
-        sizes.extend(self.scene.table_sizes());
-        if let Some(loader) = &self.loader {
-            sizes.extend(loader.table_sizes());
+        match self.worker {
+            Some(_) => sizes.extend(self.stats.slow.tables.iter().cloned()),
+            None => sizes.extend(self.scene.table_sizes()),
         }
         sizes
     }
 
     /// The Planet's bricks as the client holds them.
     #[cfg(test)]
-    pub fn store(&self) -> &brick_store::BrickStore {
+    pub fn store(&self) -> std::sync::RwLockReadGuard<'_, brick_store::BrickStore> {
         self.predictor.store()
     }
 
@@ -360,104 +335,98 @@ impl World {
     }
 
     /// Moves the rings of the Planet to centre on `camera`, a position in Voxels. Returns how
-    /// the scene changed, if it did.
+    /// the scene changed, if it did. A world that streams only tells the scene thread where the
+    /// camera is, and returns what it has made since the last call, which is of an earlier camera:
+    /// the rings are never half moved.
     pub fn recentre(&mut self, camera: [f64; 3]) -> Result<Option<SceneUpdate>, RingsFull> {
-        self.scene.recentre(self.predictor.store(), camera)
+        match &self.worker {
+            Some(worker) => {
+                worker.follow(camera);
+                self.take_ready(false)
+            }
+            None => self.scene.recentre(&self.predictor.store(), camera),
+        }
     }
 
-    /// Sets what [`World::stream`] spends while the camera is still, for a display that refreshes at
-    /// `refresh_millihertz` (see [`still_budget_for`]).
-    pub fn set_refresh(&mut self, refresh_millihertz: Option<u32>) {
-        self.still_budget = still_budget_for(refresh_millihertz);
+    /// Waits for the scene thread to have looked at the camera and at pausing, and takes what it
+    /// has made. Nothing is taken in after a pause that this has waited for.
+    #[cfg(test)]
+    pub fn sync(&mut self) -> Result<Option<SceneUpdate>, RingsFull> {
+        if let Some(worker) = &self.worker {
+            worker.sync()?;
+        }
+        self.take_ready(true)
     }
 
-    /// Asks the loader for what the bands are waiting for, nearest `camera` first, and takes in
-    /// what it has generated, for [`STREAM_BUDGET`] at the most, or the still budget
-    /// ([`World::set_refresh`]) if the camera is where it was at the last call, to within a
-    /// millimetre. Some bricks' children at a time are held, the scene splits the bricks they are
-    /// under, and `show` copies what that changed to the GPU (its time is in the budget). This is
-    /// all the frame thread does of loading: the bricks are generated on the loader's threads, at
-    /// most [`crate::loader::MAX_AHEAD`] ahead of what is taken in here, and what is not taken in
-    /// this frame waits for the next. While loading is paused ([`World::pause_loading`]) it still
-    /// asks for bricks and keeps the loader's queue in order for the camera, but takes none in.
+    /// How far the scene as the world has it is behind `camera`, in Voxels: where the scene thread
+    /// had moved the rings to, when it made what the world has taken.
+    #[cfg(test)]
+    pub fn lag(&self, camera: [f64; 3]) -> f64 {
+        let shown = self.stats.camera.unwrap_or(camera);
+        (0..3)
+            .map(|a| (camera[a] - shown[a]).powi(2))
+            .sum::<f64>()
+            .sqrt()
+    }
+
+    /// An Edit that changes nothing: how long it takes the scene thread to come to it, and to
+    /// publish. For measuring what an Edit waits for.
+    #[cfg(test)]
+    pub fn edit_wait(&mut self) -> Result<std::time::Duration, RingsFull> {
+        let started = std::time::Instant::now();
+        if let Some(worker) = &self.worker {
+            worker.edit(Vec::new())?;
+        }
+        self.take_ready(true)?;
+        Ok(started.elapsed())
+    }
+
+    /// The scene thread's end, for a test to talk to it directly.
+    #[cfg(test)]
+    pub fn worker(&self) -> &SceneWorker {
+        self.worker.as_ref().expect("the world streams")
+    }
+
+    /// Takes what the scene thread has made, and brings the copy of the scene that is drawn up to
+    /// date with it. Returns how it changed, for copying to the GPU.
+    fn take_ready(&mut self, wait: bool) -> Result<Option<SceneUpdate>, RingsFull> {
+        let Some(worker) = &self.worker else {
+            return Ok(None);
+        };
+        let ready = worker.take(wait)?;
+        let update = if let Some(mirror) = ready.mirror {
+            // The old copy is freed by the thread that made the new one.
+            worker.discard_scene(std::mem::replace(&mut self.scene, *mirror));
+            Some(SceneUpdate::Rebuilt)
+        } else if let Some(copy) = ready.patch {
+            self.scene.paste(&copy);
+            // The update is a copy of the patch: what the scene thread allocated goes back to it.
+            let update = Some(SceneUpdate::Rings(copy.patch.clone()));
+            worker.recycle(copy);
+            update
+        } else {
+            None
+        };
+        if let Some(stats) = ready.stats {
+            let before = std::mem::replace(&mut self.stats, stats);
+            if !Arc::ptr_eq(&before.slow, &self.stats.slow) {
+                worker.discard(before.slow);
+            }
+        }
+        Ok(update)
+    }
+
+    /// Tells the scene thread where the camera is and takes what it has made, and `show`s how that
+    /// changed the scene (to copy it to the GPU): bricks that the loader generated were taken in,
+    /// and the bricks they are under split, by the scene thread, since the last call. Nothing
+    /// happens in a world that does not stream.
     pub fn stream<E: From<RingsFull>>(
         &mut self,
         camera: [f64; 3],
-        show: impl FnMut(&Scene, &SceneUpdate) -> Result<(), E>,
-    ) -> Result<(), E> {
-        let still = camera_is_still(self.streamed_at, camera);
-        self.streamed_at = Some(camera);
-        let budget = if still {
-            self.still_budget
-        } else {
-            STREAM_BUDGET
-        };
-        self.stream_within(camera, budget, show)
-    }
-
-    /// [`World::stream`] with a budget of its own.
-    pub fn stream_within<E: From<RingsFull>>(
-        &mut self,
-        camera: [f64; 3],
-        budget: std::time::Duration,
         mut show: impl FnMut(&Scene, &SceneUpdate) -> Result<(), E>,
     ) -> Result<(), E> {
-        let Self {
-            scene,
-            predictor,
-            loader: Some(loader),
-            arrival_cost,
-            loading_paused,
-            ..
-        } = self
-        else {
-            return Ok(());
-        };
-        let Some(bands) = scene.bands() else {
-            return Ok(());
-        };
-        let started = std::time::Instant::now();
-        loader.cancel(scene.take_cancelled());
-        loader.request(
-            predictor.store(),
-            scene.take_wanted_up_to(WANTED_PER_FRAME),
-            camera,
-        );
-        loader.sync(camera, bands);
-        if *loading_paused {
-            return Ok(());
-        }
-        let mut worst = std::time::Duration::ZERO;
-        loop {
-            let left = budget.saturating_sub(started.elapsed());
-            let Some(most) = batch_size(left, *arrival_cost) else {
-                break;
-            };
-            let batch_started = std::time::Instant::now();
-            let mut resident = Vec::new();
-            for arrival in loader.receive(most) {
-                match arrival {
-                    Arrival::Children { key, bricks } => {
-                        predictor
-                            .store_for_loading()
-                            .hold_children_solid(key.0, key.1, bricks);
-                        resident.push(key);
-                    }
-                    Arrival::Dropped(key) => scene.unwant(key),
-                }
-            }
-            if resident.is_empty() {
-                break;
-            }
-            if let Some(update) = scene.arrive(predictor.store(), &resident)? {
-                show(scene, &update)?;
-            }
-            worst = worst.max(batch_started.elapsed() / resident.len() as u32);
-        }
-        // What the next frame expects one to cost: a running mean of the worst batch of each
-        // frame, and never more than [`MOST_ARRIVAL_COST`].
-        if !worst.is_zero() {
-            *arrival_cost = (arrival_cost.mul_f64(0.8) + worst.mul_f64(0.2)).min(MOST_ARRIVAL_COST);
+        if let Some(update) = self.recentre(camera)? {
+            show(&self.scene, &update)?;
         }
         Ok(())
     }
@@ -468,7 +437,13 @@ impl World {
         &mut self,
         bands: render::lod::Bands,
     ) -> Result<Option<SceneUpdate>, RingsFull> {
-        self.scene.set_bands(self.predictor.store(), bands)
+        match &self.worker {
+            Some(worker) => {
+                worker.set_bands(bands)?;
+                self.take_ready(true)
+            }
+            None => self.scene.set_bands(&self.predictor.store(), bands),
+        }
     }
 
     /// The Edit that `tool` makes where the camera looks: at the first solid Voxel along the view
@@ -603,7 +578,18 @@ impl World {
         if let Some(ghost) = &mut self.ghost {
             ghost.dirty |= ghost.touches(changed);
         }
-        self.scene.update(self.predictor.store(), changed).map(Some)
+        match &self.worker {
+            // The scene thread packs the bricks, and says so when it has: the Edit is in what it
+            // made, with whatever else it had made since the last call.
+            Some(worker) => {
+                worker.edit(changed.to_vec())?;
+                self.take_ready(true)
+            }
+            None => self
+                .scene
+                .update(&self.predictor.store(), changed)
+                .map(Some),
+        }
     }
 }
 
@@ -616,47 +602,6 @@ mod tests {
     };
 
     const STONE: Material = Material(7);
-
-    #[test]
-    fn the_still_budget_is_half_a_frame_up_to_6_ms_and_60_hz_when_the_display_does_not_say() {
-        use std::time::Duration;
-        let ms = |m: f64| Duration::from_secs_f64(m / 1000.0);
-        assert_eq!(still_budget_for(Some(60_000)), STILL_STREAM_BUDGET_MAX);
-        assert_eq!(still_budget_for(Some(30_000)), STILL_STREAM_BUDGET_MAX);
-        assert!(still_budget_for(Some(144_000)).abs_diff(ms(1000.0 / 144.0 / 2.0)) < ms(0.001));
-        assert!(still_budget_for(Some(240_000)).abs_diff(ms(2.083)) < ms(0.01));
-        assert_eq!(still_budget_for(None), STILL_STREAM_BUDGET_MAX);
-        assert_eq!(still_budget_for(Some(0)), STILL_STREAM_BUDGET_MAX);
-    }
-
-    #[test]
-    fn a_camera_that_differs_in_the_last_bits_is_still_and_one_that_moved_a_centimetre_is_not() {
-        let at = [1.0e6 + 0.5, 2.0e6, -3.0e6];
-        assert!(!camera_is_still(None, at));
-        assert!(camera_is_still(Some(at), at));
-        assert!(camera_is_still(Some(at), at.map(|c| c + 1e-9 * c.abs())));
-        assert!(!camera_is_still(Some(at), [at[0] + 0.1, at[1], at[2]]));
-    }
-
-    #[test]
-    fn a_batch_is_expected_to_fit_in_what_is_left_of_the_budget() {
-        use std::time::Duration;
-        let cost = Duration::from_micros(50);
-        assert_eq!(batch_size(Duration::ZERO, cost), None);
-        assert_eq!(batch_size(Duration::from_micros(49), cost), None);
-        // Room for 3: all three, since fewer than the least batch fit.
-        assert_eq!(batch_size(Duration::from_micros(160), cost), Some(3));
-        for left_us in [100u64, 500, 2000, 6000, 100_000] {
-            let left = Duration::from_micros(left_us);
-            let most = batch_size(left, cost).unwrap();
-            assert!(most <= BATCH);
-            assert!(cost * most as u32 <= left, "{left_us}: {most}");
-            // Unless the room is small, a batch leaves some of it for one that cost more.
-            if left_us >= 1000 {
-                assert!(cost * most as u32 <= left * 4 / 5, "{left_us}: {most}");
-            }
-        }
-    }
 
     /// A wall of stone, well outside the Planet: Voxels x 4000..4032, y 0..32, z -32..0, in bricks of their own.
     fn wall() -> BrickStore {

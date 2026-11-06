@@ -24,6 +24,12 @@
 //! Edits in, from the bricks of level 0 that they changed, and rewrites only the bricks that
 //! differ.
 //!
+//! **Layout.** The words of a region's mixed bricks are kept together, in the order of the region's
+//! mask, whatever order the camera brought the bricks in: a fresh scene packs them so, and a region
+//! that gains, loses or resizes a brick is written to a new run (see [`Scene::repack_region`]).
+//! Bricks that are next to each other in space are then next to each other in memory, which the
+//! reference's incoherent bounce rays gain from. `crates/render/tests/layout.rs` measures it.
+//!
 //! The way this can fail is that the words run out ([`RingsFull`]). A scene that was sized by the
 //! bricks it needs packs itself again, bigger, when that happens, and says so
 //! ([`SceneUpdate::Rebuilt`]), which makes the GPU copy new buffers; one with a [`Room`] given
@@ -128,6 +134,15 @@ impl Pool {
             Vec::new()
         };
         Self { blocks }
+    }
+
+    /// One past the last word in use of the `capacity` the pool was made for: where the free range
+    /// that reaches the end of the buffer begins.
+    fn used_end(&self, capacity: usize) -> usize {
+        match self.blocks.last().and_then(|b| b.ranges.last()) {
+            Some(r) if r.end >= capacity => r.start.min(capacity),
+            _ => capacity,
+        }
     }
 
     /// The free ranges, ascending.
@@ -326,6 +341,50 @@ impl RingPatch {
     }
 }
 
+impl RingPatch {
+    /// Whether copying this patch writes nothing.
+    pub fn is_empty(&self) -> bool {
+        self.words() == 0 && !self.levels
+    }
+
+    /// This patch and then `later`: what a copy of the scene needs to be brought up to date through
+    /// both, written from the scene as it is after both.
+    pub fn merge(&mut self, later: RingPatch) {
+        let union = |mut a: Vec<usize>, b: Vec<usize>| {
+            a.extend(b);
+            a.sort_unstable();
+            a.dedup();
+            a
+        };
+        self.regions = union(std::mem::take(&mut self.regions), later.regions);
+        self.table = union(std::mem::take(&mut self.table), later.table);
+        let both = |mut a: Vec<Range<usize>>, b: Vec<Range<usize>>| {
+            a.extend(b);
+            merged(a)
+        };
+        self.brick_refs = both(std::mem::take(&mut self.brick_refs), later.brick_refs);
+        self.bricks = both(std::mem::take(&mut self.bricks), later.bricks);
+        self.levels |= later.levels;
+    }
+}
+
+/// A [`RingPatch`] with the words it says were written, as the scene has them, and the header: all
+/// that a copy of the scene (see [`Scene::mirror`]) needs to show what the scene shows, though
+/// the scene has gone on since. The words are copied out, so that the scene can be written to
+/// again, and a later copy of a patch that this one is part of ([`RingPatch::merge`]) says what
+/// the scene is by then.
+#[derive(Clone, Debug, Default)]
+pub struct PatchCopy {
+    pub patch: RingPatch,
+    regions: Vec<u32>,
+    table: Vec<u32>,
+    brick_refs: Vec<u32>,
+    bricks: Vec<u32>,
+    levels: Vec<Level>,
+    bound: Option<Bound>,
+    coarsest: Option<usize>,
+}
+
 /// `ranges` in ascending order, with those that overlap or touch made one.
 fn merged(mut ranges: Vec<Range<usize>>) -> Vec<Range<usize>> {
     ranges.sort_by_key(|r| r.start);
@@ -337,6 +396,16 @@ fn merged(mut ranges: Vec<Range<usize>>) -> Vec<Range<usize>> {
         }
     }
     out
+}
+
+/// What a brick of a region is to be, when the region is packed again.
+enum Want {
+    /// Not in the region.
+    Absent,
+    /// One Material throughout: its entry in `brick_refs`.
+    Solid(u32),
+    /// Mixed, with these words (a range of the words made for the region).
+    Mixed(Range<usize>),
 }
 
 /// The bricks of `selection` or of `keys`, by the level and region they are in.
@@ -613,6 +682,99 @@ impl Scene {
         }
     }
 
+    /// A scene that has the words of this scene of rings, for showing what it shows without the
+    /// selection or the room to change: the copy that [`Scene::paste`] brings up to date, as the
+    /// patches that follow say. The words past the last one in use are not copied, but the buffers
+    /// are the size of this scene's, so that every index is in them. Panics if this is not a
+    /// scene of rings.
+    pub fn mirror(&self) -> Scene {
+        let rings = self.rings.as_ref().expect("a scene of rings");
+        // All of the buffer is written, not left as untouched zero pages: the pages that the
+        // changes land in later would otherwise be found by faults, which is milliseconds on the
+        // thread that pastes them.
+        let held = |words: &[u32], pool: &Pool| {
+            let mut copy = Vec::with_capacity(words.len());
+            copy.extend_from_slice(&words[..pool.used_end(words.len())]);
+            copy.resize(words.len(), 0);
+            copy
+        };
+        Scene {
+            levels: self.levels.clone(),
+            table: self.table.clone(),
+            regions: self.regions.clone(),
+            brick_refs: held(&self.brick_refs, &rings.refs),
+            bricks: held(&self.bricks, &rings.data),
+            bound: self.bound,
+            shown_coarsest: rings.selection.coarsest(),
+            shown_rebuilt: rings.rebuilt,
+            ..Scene::default()
+        }
+    }
+
+    /// The words that `patch`, which this scene of rings made (or merged patches that it made, the
+    /// latest last), wrote, as the scene has them now, with the header.
+    pub fn copy_patch(&self, patch: RingPatch) -> PatchCopy {
+        self.copy_patch_into(patch, PatchCopy::default())
+    }
+
+    /// [`Scene::copy_patch`], into the buffers of `spare`, a copy that is of no more use: so that
+    /// the room it has is used again, and not given back and asked for again.
+    pub fn copy_patch_into(&self, patch: RingPatch, mut copy: PatchCopy) -> PatchCopy {
+        copy.regions.clear();
+        copy.regions.extend(patch.regions.iter().flat_map(|&i| {
+            self.regions[i * REGION_WORDS..][..REGION_WORDS]
+                .iter()
+                .copied()
+        }));
+        copy.table.clear();
+        copy.table.extend(
+            patch
+                .table
+                .iter()
+                .flat_map(|&i| self.table[i * 4..][..4].iter().copied()),
+        );
+        for (out, words, ranges) in [
+            (&mut copy.brick_refs, &self.brick_refs, &patch.brick_refs),
+            (&mut copy.bricks, &self.bricks, &patch.bricks),
+        ] {
+            out.clear();
+            for range in ranges {
+                out.extend_from_slice(&words[range.clone()]);
+            }
+        }
+        copy.levels.clone_from(&self.levels);
+        copy.bound = self.bound;
+        copy.coarsest = self.coarsest_drawn();
+        copy.patch = patch;
+        copy
+    }
+
+    /// Writes `copy` into this scene, a [`Scene::mirror`] of the scene of rings that made it (or
+    /// one that was brought up to date with every copy before it): what is written is what the
+    /// scene of rings had written, and the header is as it was.
+    pub fn paste(&mut self, copy: &PatchCopy) {
+        let patch = &copy.patch;
+        for (&i, words) in patch.regions.iter().zip(copy.regions.chunks(REGION_WORDS)) {
+            self.regions[i * REGION_WORDS..][..REGION_WORDS].copy_from_slice(words);
+        }
+        for (&i, words) in patch.table.iter().zip(copy.table.chunks(4)) {
+            self.table[i * 4..][..4].copy_from_slice(words);
+        }
+        for (buffer, ranges, words) in [
+            (&mut self.brick_refs, &patch.brick_refs, &copy.brick_refs),
+            (&mut self.bricks, &patch.bricks, &copy.bricks),
+        ] {
+            let mut at = 0;
+            for range in ranges {
+                buffer[range.clone()].copy_from_slice(&words[at..at + range.len()]);
+                at += range.len();
+            }
+        }
+        self.levels.clone_from(&copy.levels);
+        self.bound = copy.bound;
+        self.shown_coarsest = copy.coarsest;
+    }
+
     /// Whether this is a scene of rings (see [`Scene::rings`]).
     pub fn is_rings(&self) -> bool {
         self.rings.is_some()
@@ -675,7 +837,9 @@ impl Scene {
 
     /// Why the scene was last packed again ([`SceneUpdate::Rebuilt`]), if it was and is rings.
     pub fn rebuild_reason(&self) -> Option<Rebuild> {
-        self.rings.as_ref().and_then(|r| r.rebuilt)
+        self.rings
+            .as_ref()
+            .map_or(self.shown_rebuilt, |r| r.rebuilt)
     }
 
     /// The size of everything of a scene of rings that is made roomy up front: the selection's
@@ -715,13 +879,27 @@ impl Scene {
     }
 
     /// The level of the brick that is drawn where the Voxel of level 0 at `voxel` is, if one is.
+    /// A copy of a scene of rings ([`Scene::mirror`]) finds it in the regions it lists.
     pub fn level_at(&self, voxel: [i32; 3]) -> Option<usize> {
-        let rings = self.rings.as_ref()?;
-        (0..self.levels.len()).find(|&level| {
-            rings
-                .selection
-                .draws(level, BrickCoord(voxel.map(|v| v >> (level + 3))))
-        })
+        let brick = |level: usize| BrickCoord(voxel.map(|v| v >> (level + 3)));
+        match &self.rings {
+            Some(rings) => {
+                (0..self.levels.len()).find(|&level| rings.selection.draws(level, brick(level)))
+            }
+            None => (0..self.levels.len()).find(|&level| {
+                let coord = brick(level);
+                self.find_region(level, region_of(coord))
+                    .is_some_and(|index| {
+                        let bit = bit_of(coord);
+                        self.regions[index * REGION_WORDS + bit / 32] >> (bit % 32) & 1 != 0
+                    })
+            }),
+        }
+    }
+
+    /// Where the camera is that a scene of rings was last moved to, in Voxels.
+    pub fn camera(&self) -> Option<[f64; 3]> {
+        self.rings.as_ref().map(|r| r.selection.camera())
     }
 
     /// Follows the camera to `camera`, a position in Voxels: the bricks that the bands select
@@ -923,6 +1101,16 @@ impl Scene {
     /// bricks `touch` are written again (if their words differ) or dropped, and the other bricks
     /// of the region are as they were. A region left with no bricks is unlisted, and one that has
     /// some and was not listed is.
+    ///
+    /// **Where the words go.** The words of a region's mixed bricks are kept together, in the order
+    /// of the region's mask, in one run of `bricks`: so that bricks that are next to each other in
+    /// space are next to each other in memory, and a ray that goes through a region reads one place
+    /// (what the reference's incoherent bounce rays gain from; see the module docs). A brick that
+    /// reads differently but takes the same words is written where it is. Any other change to a
+    /// region's mixed bricks (one that comes, goes, or takes other words) writes the region's
+    /// bricks again, to a new run, and gives the old words back. The place of a run does not depend
+    /// on what was done before beyond which words are free: the first free range that is long
+    /// enough, lowest first.
     fn repack_region(
         &mut self,
         store: &BrickStore,
@@ -932,71 +1120,212 @@ impl Scene {
         read: Option<&HashMap<BrickCoord, Brick>>,
     ) -> Result<(), RingsFull> {
         let found = self.find_region(level, key);
-        // What each touched brick is to be: its entry in `brick_refs`, or none.
-        let mut wanted: Vec<(usize, Option<u32>)> = Vec::with_capacity(touch.len());
         let old_entries = found.map(|index| self.region_entries(index));
         let old_at = |bit: usize| old_entries.as_ref().and_then(|e| e[bit]);
+        // The words of the bricks that are to be mixed, end to end, and what each touched brick is
+        // to be.
+        let mut words = std::mem::take(&mut self.rings.as_mut().expect("a scene of rings").scratch);
+        words.clear();
+        let mut wanted: Vec<(usize, Want)> = Vec::with_capacity(touch.len());
         for &coord in touch {
             let bit = bit_of(coord);
             let drawn = self
                 .rings
                 .as_ref()
                 .is_some_and(|r| r.selection.draws(level, coord));
-            let entry = if drawn {
+            let want = if drawn {
                 let brick = match read.and_then(|r| r.get(&coord)) {
                     Some(brick) => Cow::Borrowed(brick),
                     None => store.brick_at(level, coord),
                 };
                 match brick.view() {
-                    BrickView::Air => None,
-                    view => Some(self.put_brick(view, old_at(bit))?),
+                    BrickView::Air => Want::Absent,
+                    BrickView::Solid(material) => Want::Solid(SOLID_FLAG | u32::from(material.0)),
+                    BrickView::Mixed {
+                        occupancy,
+                        palette,
+                        bits,
+                        indices,
+                    } => {
+                        let from = words.len();
+                        encode_mixed(&mut words, occupancy, palette, bits, indices);
+                        Want::Mixed(from..words.len())
+                    }
                 }
             } else {
-                None
+                Want::Absent
             };
-            wanted.push((bit, entry));
+            wanted.push((bit, want));
         }
-        // The usual case: the same bricks are in the region, and some of them read differently.
-        // Then the list of entries stays where it is, and only those words are written.
-        if let (Some(index), Some(old)) = (found, &old_entries) {
+        // The bricks that are to be something else than they are.
+        wanted.retain(|(bit, want)| {
+            let old = old_at(*bit);
+            match want {
+                Want::Absent => old.is_some(),
+                Want::Solid(entry) => old != Some(*entry),
+                Want::Mixed(range) => {
+                    !old.is_some_and(|entry| self.has_words(entry, &words[range.clone()]))
+                }
+            }
+        });
+        let result = self.write_region(level, key, found, old_entries.as_deref(), &wanted, &words);
+        words.clear();
+        self.rings.as_mut().expect("a scene of rings").scratch = words;
+        result
+    }
+
+    /// Whether the brick with `brick_refs` entry `entry` is mixed, with these `words`.
+    fn has_words(&self, entry: u32, words: &[u32]) -> bool {
+        entry & SOLID_FLAG == 0
+            && self.mixed_words(entry) == words.len()
+            && self.bricks[entry as usize..][..words.len()] == *words
+    }
+
+    /// Writes the words of the mixed bricks of a region, those of `changed` that are to be (the
+    /// ranges of `words`) and those that are there, which are copied, to one run of `bricks` in
+    /// the order of the mask, and gives back all the words the bricks had and the region's list of
+    /// entries. Puts the entry of each of them in `new`.
+    fn write_run(
+        &mut self,
+        old: &[Option<u32>],
+        new: &mut [Option<u32>],
+        changed: &[(usize, Want)],
+        words: &[u32],
+        found: Option<usize>,
+    ) -> Result<(), RingsFull> {
+        let mut run: Vec<u32> = Vec::new();
+        let mut starts: Vec<(usize, usize)> = Vec::new();
+        let mut change_of = [usize::MAX; 512];
+        for (i, (bit, _)) in changed.iter().enumerate() {
+            change_of[*bit] = i;
+        }
+        for bit in 0..512 {
+            let from = run.len();
+            match changed.get(change_of[bit]) {
+                Some((_, Want::Mixed(range))) => run.extend_from_slice(&words[range.clone()]),
+                Some(_) => continue,
+                None => match old[bit] {
+                    Some(entry) if entry & SOLID_FLAG == 0 => {
+                        let len = self.mixed_words(entry);
+                        run.extend_from_slice(&self.bricks[entry as usize..][..len]);
+                    }
+                    _ => continue,
+                },
+            }
+            starts.push((bit, from));
+        }
+        // What the region no longer refers to is free, and so is its list of entries. The bricks
+        // that were mixed are all free: they are in the run.
+        for entry in old.iter().flatten() {
+            self.release_brick(*entry);
+        }
+        if let Some(index) = found {
+            self.release_refs(index);
+        }
+        if run.is_empty() {
+            return Ok(());
+        }
+        let rings = self.rings.as_mut().expect("a scene of rings");
+        let at = rings.data.take(run.len()).ok_or(RingsFull)?;
+        rings.patch.bricks.push(at..at + run.len());
+        if self.bricks.len() < at + run.len() {
+            self.bricks.resize(at + run.len(), 0);
+        }
+        self.bricks[at..at + run.len()].copy_from_slice(&run);
+        for (bit, from) in starts {
+            new[bit] = Some((at + from) as u32);
+        }
+        Ok(())
+    }
+
+    /// Makes the region of `level` at `key`, which is at record `found` of `regions` if the scene
+    /// lists it, with `old` as the `brick_refs` entry of each of its 512 bricks, have the bricks
+    /// `changed` (by mask bit) as they say, whose words (for the mixed) are the ranges of `words`.
+    /// See [`Scene::repack_region`].
+    fn write_region(
+        &mut self,
+        level: usize,
+        key: [i32; 3],
+        found: Option<usize>,
+        old: Option<&[Option<u32>]>,
+        changed: &[(usize, Want)],
+        words: &[u32],
+    ) -> Result<(), RingsFull> {
+        if changed.is_empty() {
+            return Ok(());
+        }
+        // The usual case: the same bricks are in the region, and some of them read differently, with
+        // the words they had or none. Then the list of entries stays where it is, and only those
+        // words are written, where they were.
+        let stays = |&(bit, ref want): &(usize, Want)| match (want, old.and_then(|e| e[bit])) {
+            (Want::Absent, _) | (_, None) => false,
+            (Want::Solid(_), Some(_)) => true,
+            (Want::Mixed(range), Some(entry)) => {
+                entry & SOLID_FLAG == 0 && self.mixed_words(entry) == range.len()
+            }
+        };
+        if let (Some(index), Some(old)) = (found, old) {
             let uniform = self.regions[index * REGION_WORDS + REGION_FIRST_REF] & SOLID_FLAG != 0;
-            if !uniform
-                && wanted
-                    .iter()
-                    .all(|&(bit, entry)| entry.is_some() == old[bit].is_some())
-            {
+            if !uniform && changed.iter().all(stays) {
                 let first_ref = self.regions[index * REGION_WORDS + REGION_FIRST_REF] as usize;
                 let rank = |bit: usize| old[..bit].iter().filter(|e| e.is_some()).count();
-                for &(bit, entry) in &wanted {
-                    let (Some(entry), Some(before)) = (entry, old[bit]) else {
-                        continue;
-                    };
-                    if entry != before {
-                        self.release_brick(before);
-                        let at = first_ref + rank(bit);
-                        self.brick_refs[at] = entry;
-                        self.patch().brick_refs.push(at..at + 1);
+                for (bit, want) in changed {
+                    let before = old[*bit].expect("the brick is there");
+                    match want {
+                        Want::Solid(entry) => {
+                            self.release_brick(before);
+                            let at = first_ref + rank(*bit);
+                            self.brick_refs[at] = *entry;
+                            self.patch().brick_refs.push(at..at + 1);
+                        }
+                        Want::Mixed(range) => {
+                            let at = before as usize;
+                            self.bricks[at..at + range.len()]
+                                .copy_from_slice(&words[range.clone()]);
+                            self.patch().bricks.push(at..at + range.len());
+                        }
+                        Want::Absent => unreachable!("the brick stays"),
                     }
                 }
                 return Ok(());
             }
         }
-        let old: Vec<Option<u32>> = old_entries.unwrap_or_else(|| vec![None; 512]);
-        let mut new = old.clone();
-        for &(bit, entry) in &wanted {
-            new[bit] = entry;
+        // Bricks that go, that are or turn solid, and bricks that read differently with the words
+        // they had, need no new words: the rest of the region stays where it is, and only its
+        // list of entries is written, which is enough for a region that loses bricks, as it does
+        // where the bands take it over, or gains bricks that are one Material.
+        let moves = changed
+            .iter()
+            .any(|change| matches!(change.1, Want::Mixed(_)) && !stays(change));
+        let old_all: Vec<Option<u32>> = old.map_or_else(|| vec![None; 512], <[_]>::to_vec);
+        let mut new = old_all.clone();
+        for (bit, want) in changed {
+            new[*bit] = match want {
+                Want::Absent => None,
+                Want::Solid(entry) => Some(*entry),
+                // Where the words will be, in the run that is made below.
+                Want::Mixed(_) => Some(0),
+            };
         }
-        if new == old {
-            return Ok(());
-        }
-        // What the region no longer refers to is free, and so is its list of entries.
-        for (&before, &after) in old.iter().zip(&new) {
-            if let Some(entry) = before.filter(|&e| Some(e) != after) {
-                self.release_brick(entry);
+        if moves {
+            self.write_run(old_all.as_slice(), &mut new, changed, words, found)?;
+        } else {
+            // The words that are given up are free; the others are where they were.
+            for (bit, want) in changed {
+                match (want, old_all[*bit]) {
+                    (Want::Mixed(range), Some(entry)) => {
+                        let at = entry as usize;
+                        self.bricks[at..at + range.len()].copy_from_slice(&words[range.clone()]);
+                        self.patch().bricks.push(at..at + range.len());
+                        new[*bit] = Some(entry);
+                    }
+                    (_, Some(entry)) => self.release_brick(entry),
+                    (_, None) => {}
+                }
             }
-        }
-        if let Some(index) = found {
-            self.release_refs(index);
+            if let Some(index) = found {
+                self.release_refs(index);
+            }
         }
         let bricks: Vec<(usize, u32)> = (0..512).filter_map(|bit| Some((bit, new[bit]?))).collect();
         if bricks.is_empty() {
@@ -1087,43 +1416,6 @@ impl Scene {
         Ok(())
     }
 
-    /// Writes `view`, which is not air, and returns its entry for `brick_refs`. A mixed brick
-    /// takes words from `bricks`, unless `old` is the entry of a mixed brick with the same words,
-    /// which is kept.
-    fn put_brick(&mut self, view: BrickView<'_>, old: Option<u32>) -> Result<u32, RingsFull> {
-        let BrickView::Mixed {
-            occupancy,
-            palette,
-            bits,
-            indices,
-        } = view
-        else {
-            return match view {
-                BrickView::Solid(material) => Ok(SOLID_FLAG | u32::from(material.0)),
-                _ => unreachable!("air bricks are skipped"),
-            };
-        };
-        let old = old.filter(|&entry| entry & SOLID_FLAG == 0);
-        let old_len = old.map(|entry| self.mixed_words(entry));
-        let rings = self.rings.as_mut().expect("a scene of rings");
-        rings.scratch.clear();
-        encode_mixed(&mut rings.scratch, occupancy, palette, bits, indices);
-        let len = rings.scratch.len();
-        if let (Some(old), Some(old_len)) = (old, old_len)
-            && old_len == len
-            && self.bricks[old as usize..][..len] == rings.scratch[..]
-        {
-            return Ok(old);
-        }
-        let at = rings.data.take(len).ok_or(RingsFull)?;
-        rings.patch.bricks.push(at..at + len);
-        if self.bricks.len() < at + len {
-            self.bricks.resize(at + len, 0);
-        }
-        self.bricks[at..at + len].copy_from_slice(&rings.scratch);
-        Ok(at as u32)
-    }
-
     /// Gives back the words of `bricks` that the brick with `entry` has.
     fn release_brick(&mut self, entry: u32) {
         let words = self.mixed_words(entry);
@@ -1156,7 +1448,10 @@ impl Scene {
 
     /// The level of the coarsest brick drawn, if the scene is rings with any.
     pub(super) fn coarsest_drawn(&self) -> Option<usize> {
-        self.rings.as_ref().and_then(|r| r.selection.coarsest())
+        match &self.rings {
+            Some(rings) => rings.selection.coarsest(),
+            None => self.shown_coarsest,
+        }
     }
 
     /// Brings the parts of the header that follow the camera and the bricks up to date: the
