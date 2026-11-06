@@ -35,6 +35,16 @@ pub trait BrickSource: Debug + Send + Sync {
     fn solid_below(&self, _level: usize, _coord: BrickCoord) -> bool {
         false
     }
+
+    /// Whether every Voxel of level 0 under the brick at `coord` of `level` is air, which the
+    /// source knows without reading them: an answer of `true` must be exact, and `false` means
+    /// "not known". A coarse brick that reads as air may still have ground under it (a coarse
+    /// Voxel is solid only when half its children are, and is sampled at the middle), so a
+    /// renderer that leaves out what is not there asks this before it leaves a brick out of the
+    /// tree.
+    fn air_below(&self, _level: usize, _coord: BrickCoord) -> bool {
+        false
+    }
 }
 
 /// The bricks under the brick at `coord` of mip `level` (at least 1) as `source` gives them, in
@@ -100,6 +110,10 @@ impl BrickSource for Interior {
 
     fn solid_below(&self, level: usize, coord: BrickCoord) -> bool {
         coord.within_ball_at(level, self.radius)
+    }
+
+    fn air_below(&self, level: usize, coord: BrickCoord) -> bool {
+        coord.beyond_ball_at(level, self.radius)
     }
 }
 
