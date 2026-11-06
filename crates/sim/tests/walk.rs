@@ -642,7 +642,11 @@ fn every_edit_200_m_from_the_spawn_is_the_same_on_the_client_and_the_server_and_
     assert_ne!(edited, pristine);
     assert_eq!(pair.client.store().content_hash(), edited);
     assert_eq!(pair.client.store().voxel_at(0, centre), None);
-    assert!(read_alike(pair.client.store(), pair.server.store(), centre));
+    assert!(read_alike(
+        &pair.client.store(),
+        pair.server.store(),
+        centre
+    ));
 
     // Made and then turned down by the server, each for a reason that really applies to it: the
     // client takes each back, and the two agree again. Each is sent to the server, which says no.
@@ -749,7 +753,11 @@ fn every_edit_200_m_from_the_spawn_is_the_same_on_the_client_and_the_server_and_
         assert_eq!(pair.client.pending(), 0, "{what}");
         assert_eq!(pair.client.store().content_hash(), edited, "{what}");
         assert_eq!(pair.server.store().content_hash(), edited, "{what}");
-        assert!(read_alike(pair.client.store(), pair.server.store(), centre));
+        assert!(read_alike(
+            &pair.client.store(),
+            pair.server.store(),
+            centre
+        ));
     }
     // Most of them changed something to take back (a Flatten in the air fills a slab).
     assert!(
@@ -820,7 +828,11 @@ fn an_edit_taken_back_beyond_the_spawn_in_a_client_that_streams_leaves_it_readin
         assert_eq!(pair.client.pending(), 0);
         assert!(planet().voxel(centre).is_some());
         assert!(pair.client.store().voxel_at(0, centre).is_some(), "{op:?}");
-        assert!(read_alike(pair.client.store(), pair.server.store(), centre));
+        assert!(read_alike(
+            &pair.client.store(),
+            pair.server.store(),
+            centre
+        ));
     }
 }
 

@@ -48,7 +48,7 @@ use brick_store::{Brick, BrickCoord, BrickStore, BrickView, Material};
 mod rings;
 pub mod select;
 
-pub use rings::{Rebuild, RingPatch, RingsFull, Room};
+pub use rings::{PatchCopy, Rebuild, RingPatch, RingsFull, Room};
 
 /// Bricks along each edge of a region.
 pub const REGION_BRICKS: i32 = 8;
@@ -199,6 +199,10 @@ pub struct Scene {
     garbage: usize,
     /// What a scene of rings keeps besides the buffers; set if this is one.
     rings: Option<rings::Rings>,
+    /// For a copy of a scene of rings ([`Scene::mirror`]): the coarsest level it draws a brick of.
+    shown_coarsest: Option<usize>,
+    /// Likewise, why the scene it is a copy of was last packed again.
+    shown_rebuilt: Option<Rebuild>,
 }
 
 /// Room to leave in a buffer of `len` words for it to grow by: a sixteenth, and some. The GPU

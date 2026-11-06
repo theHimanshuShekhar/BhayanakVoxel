@@ -88,7 +88,10 @@ The bench does not stream: it draws a Planet that is generated whole, so the rin
 and its uploads are not in these numbers. The loader's own costs (the spawn ring, the Guard, how
 long the bands take to fill, and the frame thread's scene work per frame while walking, worst and
 p99) are read from the ignored full-size test:
-`cargo test --release -p client -- --ignored --nocapture full_size`.
+`cargo test --release -p client -- --ignored --nocapture full_size`. The scene's selection and
+packing run on a thread of their own there (ADR 0006), so those numbers are what the frame thread
+pays for it: copying what the scene thread made. The bench's `scene_update_ms` is still the whole
+of following the camera, done inline.
 
 The camera is a function of the frame index only (keyframes, interpolated in a straight line at
 constant speed), never of the clock, so every run on every machine shows the GPU the same views.
