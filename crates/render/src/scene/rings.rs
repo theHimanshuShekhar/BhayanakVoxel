@@ -82,70 +82,145 @@ impl fmt::Display for RingsFull {
 
 impl std::error::Error for RingsFull {}
 
-/// Hands out ranges of the words of one buffer, the smallest free range that fits, and takes them
-/// back. Both are a few lookups in ordered maps however many ranges are free: a buffer that has had
-/// bricks written and freed for a long time is in tens of thousands of pieces, and looking along
-/// them for one that fits is what a frame cannot afford.
+/// Hands out ranges of the words of one buffer, first fit by address, and takes them back: a
+/// request gets the free range with the lowest start that is long enough, cut from its front, so
+/// that the bricks of a scene lie together in the buffer (the reference's bounce rays are
+/// incoherent, and read better from a buffer that is packed than from one that is scattered).
+///
+/// The free ranges are kept in address order in blocks of a few hundred, each with the length of
+/// its longest range. A buffer that has had bricks written and freed for a long time is in tens of
+/// thousands of pieces, and looking along them for one that fits is what a frame cannot afford:
+/// this looks along the blocks, then along one.
 #[derive(Debug)]
 struct Pool {
-    /// The free ranges, by where each starts (and where it ends). They never touch: ones that
-    /// touch are one range.
-    by_start: BTreeMap<usize, usize>,
-    /// The same ranges, by length and then start.
-    by_len: BTreeSet<(usize, usize)>,
+    /// Never empty blocks; in address order, and so are the ranges in them. Ranges never touch:
+    /// ones that touch are one range.
+    blocks: Vec<Block>,
+}
+
+/// Most ranges a block of a [`Pool`] holds before it is split in two.
+const BLOCK: usize = 512;
+
+#[derive(Debug)]
+struct Block {
+    ranges: Vec<Range<usize>>,
+    /// The length of the longest of `ranges`.
+    longest: usize,
+}
+
+impl Block {
+    fn new(ranges: Vec<Range<usize>>) -> Self {
+        let mut block = Self { ranges, longest: 0 };
+        block.measure();
+        block
+    }
+
+    fn measure(&mut self) {
+        self.longest = self.ranges.iter().map(Range::len).max().unwrap_or(0);
+    }
 }
 
 impl Pool {
     fn new(capacity: usize) -> Self {
-        let mut pool = Self {
-            by_start: BTreeMap::new(),
-            by_len: BTreeSet::new(),
+        let blocks = if capacity > 0 {
+            vec![Block::new(std::iter::once(0..capacity).collect())]
+        } else {
+            Vec::new()
         };
-        pool.add(0, capacity);
-        pool
-    }
-
-    fn add(&mut self, start: usize, end: usize) {
-        if end > start {
-            self.by_start.insert(start, end);
-            self.by_len.insert((end - start, start));
-        }
-    }
-
-    fn remove(&mut self, start: usize, end: usize) {
-        self.by_start.remove(&start);
-        self.by_len.remove(&(end - start, start));
+        Self { blocks }
     }
 
     /// The free ranges, ascending.
     fn free(&self) -> impl Iterator<Item = Range<usize>> + '_ {
-        self.by_start.iter().map(|(&start, &end)| start..end)
+        self.blocks.iter().flat_map(|b| b.ranges.iter().cloned())
     }
 
     /// The start of `len` words that are free, which are now taken, if there are that many in a
     /// row.
     fn take(&mut self, len: usize) -> Option<usize> {
-        let &(have, start) = self.by_len.range((len, 0)..).next()?;
-        self.remove(start, start + have);
-        self.add(start + len, start + have);
+        let bi = self.blocks.iter().position(|b| b.longest >= len)?;
+        let block = &mut self.blocks[bi];
+        let at = block.ranges.iter().position(|r| r.len() >= len)?;
+        let start = block.ranges[at].start;
+        if block.ranges[at].len() == len {
+            block.ranges.remove(at);
+        } else {
+            block.ranges[at].start += len;
+        }
+        if block.ranges.is_empty() {
+            self.blocks.remove(bi);
+        } else {
+            block.measure();
+        }
         Some(start)
+    }
+
+    /// Where the range that starts at `start` is, or would be put: the block and the place in it,
+    /// which is the end of the block if every range in it starts earlier.
+    fn place(&self, start: usize) -> (usize, usize) {
+        let bi = self
+            .blocks
+            .partition_point(|b| b.ranges[0].start < start)
+            .saturating_sub(1);
+        let ri = self
+            .blocks
+            .get(bi)
+            .map_or(0, |b| b.ranges.partition_point(|r| r.start < start));
+        (bi, ri)
     }
 
     /// Gives `len` words from `start` back, joining them to the free ranges they touch.
     fn give(&mut self, start: usize, len: usize) {
-        let mut from = start;
-        let mut to = start + len;
-        if let Some((&before, &end)) = self.by_start.range(..start).next_back()
-            && end == start
-        {
-            self.remove(before, end);
-            from = before;
+        let (bi, ri) = self.place(start);
+        let end = start + len;
+        // The range before, which is the one before `ri` in its block (a block that is not the
+        // first is only chosen if its first range starts before `start`), and the range after, which
+        // may be the first of the next block.
+        let before = (ri > 0).then(|| (bi, ri - 1));
+        let after = match self.blocks.get(bi) {
+            Some(b) if ri < b.ranges.len() => Some((bi, ri)),
+            _ if bi + 1 < self.blocks.len() => Some((bi + 1, 0)),
+            _ => None,
+        };
+        let touches_before = before.filter(|&(b, r)| self.blocks[b].ranges[r].end == start);
+        let touches_after = after.filter(|&(b, r)| self.blocks[b].ranges[r].start == end);
+        match (touches_before, touches_after) {
+            (Some((b, r)), Some((ab, ar))) => {
+                let joined = self.blocks[ab].ranges[ar].end;
+                self.blocks[b].ranges[r].end = joined;
+                self.blocks[b].measure();
+                self.blocks[ab].ranges.remove(ar);
+                if self.blocks[ab].ranges.is_empty() {
+                    self.blocks.remove(ab);
+                } else {
+                    self.blocks[ab].measure();
+                }
+            }
+            (Some((b, r)), None) => {
+                self.blocks[b].ranges[r].end = end;
+                self.blocks[b].measure();
+            }
+            (None, Some((b, r))) => {
+                self.blocks[b].ranges[r].start = start;
+                self.blocks[b].measure();
+            }
+            (None, None) => self.insert(bi, ri, start..end),
         }
-        if let Some(&end) = self.by_start.get(&to) {
-            self.remove(to, end);
-            to = end;
+    }
+
+    /// Puts `range` at place `ri` of block `bi`, splitting the block if it is full.
+    fn insert(&mut self, bi: usize, ri: usize, range: Range<usize>) {
+        let Some(block) = self.blocks.get_mut(bi) else {
+            self.blocks.push(Block::new(vec![range]));
+            return;
+        };
+        block.longest = block.longest.max(range.len());
+        block.ranges.insert(ri, range);
+        if block.ranges.len() > BLOCK {
+            let upper = block.ranges.split_off(BLOCK / 2);
+            block.measure();
+            self.blocks.insert(bi + 1, Block::new(upper));
         }
-        self.add(from, to);
     }
 }
 
@@ -1786,24 +1861,84 @@ mod tests {
         assert_eq!(pool.take(100), Some(0));
     }
 
-    #[test]
-    fn a_pool_takes_the_smallest_range_that_fits_and_joins_neighbours_on_both_sides() {
-        let mut pool = Pool::new(100);
-        let at: Vec<usize> = (0..10).map(|_| pool.take(10).unwrap()).collect();
-        // Free a 10 hole at 20, a 30 hole at 50..80.
-        pool.give(at[2], 10);
-        for start in [50, 60, 70] {
-            pool.give(start, 10);
+    /// The pool as it was before it was in blocks: a list of ranges in address order, searched
+    /// from the front, which is what places bricks in the buffer as the GPU timings were made with.
+    struct Linear(Vec<Range<usize>>);
+
+    impl Linear {
+        fn take(&mut self, len: usize) -> Option<usize> {
+            let at = self.0.iter().position(|r| r.len() >= len)?;
+            let start = self.0[at].start;
+            if self.0[at].len() == len {
+                self.0.remove(at);
+            } else {
+                self.0[at].start += len;
+            }
+            Some(start)
         }
-        assert_eq!(pool.free().collect::<Vec<_>>(), [20..30, 50..80]);
-        // A request of 10 goes to the hole of 10, one of 15 to the hole of 30.
-        assert_eq!(pool.take(10), Some(20));
-        assert_eq!(pool.take(15), Some(50));
-        assert_eq!(pool.free().next(), Some(65..80));
-        assert_eq!(pool.free().count(), 1);
-        pool.give(50, 15);
-        assert_eq!(pool.free().next(), Some(50..80));
-        assert_eq!(pool.free().count(), 1);
+
+        fn give(&mut self, start: usize, len: usize) {
+            let at = self.0.partition_point(|r| r.start < start);
+            let after = self.0.get(at).is_some_and(|r| r.start == start + len);
+            let before = at > 0 && self.0[at - 1].end == start;
+            match (before, after) {
+                (true, true) => {
+                    self.0[at - 1].end = self.0[at].end;
+                    self.0.remove(at);
+                }
+                (true, false) => self.0[at - 1].end = start + len,
+                (false, true) => self.0[at].start = start,
+                (false, false) => self.0.insert(at, start..start + len),
+            }
+        }
+    }
+
+    #[test]
+    fn a_pool_places_every_request_where_a_linear_first_fit_does() {
+        // Long enough to have many more ranges than a block holds, to split and empty blocks, and
+        // to join ranges across them.
+        let mut rng = 0x2545_F491_4F6C_DD1D_u64;
+        let mut next = move |n: usize| {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            (rng >> 16) as usize % n
+        };
+        let capacity = 400_000;
+        let (mut pool, mut linear) = (
+            Pool::new(capacity),
+            Linear(std::iter::once(0..capacity).collect()),
+        );
+        let mut held: Vec<(usize, usize)> = Vec::new();
+        let mut most_ranges = 0;
+        for step in 0..60_000 {
+            // Fill up for a while, then free more than is taken, then hold steady.
+            let free_chance = match step {
+                0..20_000 => 35,
+                20_000..40_000 => 60,
+                _ => 50,
+            };
+            if !held.is_empty() && next(100) < free_chance {
+                let (start, len) = held.swap_remove(next(held.len()));
+                pool.give(start, len);
+                linear.give(start, len);
+            } else {
+                let len = match next(10) {
+                    0 => 1 + next(2000),
+                    _ => 1 + next(40),
+                };
+                let (a, b) = (pool.take(len), linear.take(len));
+                assert_eq!(a, b, "step {step}, a request of {len}");
+                held.extend(a.map(|start| (start, len)));
+            }
+            if step % 997 == 0 {
+                assert_eq!(pool.free().collect::<Vec<_>>(), linear.0, "step {step}");
+                most_ranges = most_ranges.max(linear.0.len());
+            }
+        }
+        assert_eq!(pool.free().collect::<Vec<_>>(), linear.0);
+        assert!(most_ranges > 2 * BLOCK, "{most_ranges} ranges at the most");
+        assert!(pool.blocks.iter().all(|b| !b.ranges.is_empty()));
     }
 
     #[test]
