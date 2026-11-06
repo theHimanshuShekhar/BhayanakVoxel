@@ -1,8 +1,10 @@
 //! Sparse hash index of bricks keyed by integer brick coordinate.
 
 use std::borrow::Cow;
+use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::brick::{Brick, Material};
 use crate::coord::{BrickCoord, VoxelCoord};
@@ -33,11 +35,72 @@ pub struct BrickStore {
     /// no pyramid or source of their own.
     coarse: Vec<BrickStore>,
     source: Option<Arc<dyn BrickSource>>,
+    /// Which source this is, for the answers that are remembered (see
+    /// [`BrickStore::source_solid_below`]): 0 for none, and different for every source set.
+    source_id: u64,
     /// Set for a store whose bricks are streamed in (see [`Self::stream_from`]).
     streaming: Option<Streaming>,
     /// What [`Self::reserve_resident`] was asked for before the store streamed, which
     /// [`Self::stream_from`] makes the resident set with room for.
     resident_room: usize,
+}
+
+/// What the source said of a brick's [`BrickSource::solid_below`], for one thread to remember.
+#[derive(Clone, Copy, Default)]
+struct Remembered {
+    source: u64,
+    coord: [i32; 3],
+    level: u8,
+    solid: bool,
+}
+
+/// Answers remembered per thread: a direct-mapped table, in which a brick takes the place of
+/// whichever one had its slot. It is small, since a thread allocates it on first use, and the
+/// threads that are started for one job each (a selection made from scratch) use it
+/// too: the bricks asked about again and again are the few round the ones that just arrived.
+const REMEMBERED: usize = 1 << 12;
+
+thread_local! {
+    static REMEMBERED_SOLID: RefCell<Vec<Remembered>> = const { RefCell::new(Vec::new()) };
+}
+
+/// What `ask` says for the brick at `coord` of `level` of the source `source` (a nonzero
+/// [`BrickStore::source_id`]), asking it only if this thread has not been told lately. The source
+/// is asked about the same few bricks again and again while the scene looks at the bricks round
+/// the ones that just arrived, and an answer takes a microsecond or two to work out from the
+/// world map: more than the rest of looking at a brick.
+///
+/// Both answers are remembered, so [`BrickSource::solid_below`] must be a pure function of the
+/// brick for a source that is used through a store. The table is not borrowed while `ask` runs,
+/// so `ask` may use the store again.
+fn remembered(source: u64, level: usize, coord: BrickCoord, ask: impl FnOnce() -> bool) -> bool {
+    let mut slot = (level as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    for c in coord.0 {
+        slot = (slot.rotate_left(21) ^ u64::from(c as u32)).wrapping_mul(0xC2B2_AE3D_27D4_EB4F);
+    }
+    let slot = (slot >> 40) as usize & (REMEMBERED - 1);
+    let found = REMEMBERED_SOLID.with(|table| {
+        let mut table = table.borrow_mut();
+        if table.is_empty() {
+            table.resize(REMEMBERED, Remembered::default());
+        }
+        let entry = table[slot];
+        (entry.source == source && entry.level as usize == level && entry.coord == coord.0)
+            .then_some(entry.solid)
+    });
+    if let Some(solid) = found {
+        return solid;
+    }
+    let solid = ask();
+    REMEMBERED_SOLID.with(|table| {
+        table.borrow_mut()[slot] = Remembered {
+            source,
+            coord: coord.0,
+            level: level as u8,
+            solid,
+        };
+    });
+    solid
 }
 
 /// How full one table is: its entries, and how many it has room for before it grows (and moves
@@ -201,7 +264,9 @@ impl BrickStore {
     /// Sets what a brick reads as where none is held, replacing any source, and remakes the
     /// pyramid to match. Set it before holding bricks that depend on it.
     pub fn set_source(&mut self, source: impl BrickSource + 'static) {
+        static SOURCES: AtomicU64 = AtomicU64::new(0);
         self.source = Some(Arc::new(source));
+        self.source_id = SOURCES.fetch_add(1, Ordering::Relaxed) + 1;
         self.build_lod(self.coarse.len());
     }
 
@@ -217,9 +282,15 @@ impl BrickStore {
     /// Whether the source says that every Voxel of level 0 under the brick at `coord` of `level`
     /// is solid, for a brick that is not held (see [`BrickSource::solid_below`]).
     pub fn source_solid_below(&self, level: usize, coord: BrickCoord) -> bool {
-        self.source
-            .as_ref()
-            .is_some_and(|source| source.solid_below(level, coord))
+        let Some(source) = &self.source else {
+            return false;
+        };
+        if self.source_id == 0 {
+            return source.solid_below(level, coord);
+        }
+        remembered(self.source_id, level, coord, || {
+            source.solid_below(level, coord)
+        })
     }
 
     /// Whether the store has a source that does not say that every Voxel of level 0 under the
@@ -356,12 +427,32 @@ impl BrickStore {
         bricks: Vec<(BrickCoord, Brick)>,
     ) -> usize {
         let below = level - 1;
+        let bricks = bricks
+            .into_iter()
+            .map(|(child, brick)| {
+                let solid =
+                    !self.holds(below, child) && below > 0 && self.source_solid_below(below, child);
+                (child, brick, solid)
+            })
+            .collect();
+        self.hold_children_solid(level, coord, bricks)
+    }
+
+    /// [`Self::hold_children`], with whether each brick is solid all the way down given (what
+    /// [`crate::children_with_solid`] returns), for a caller that worked it out on another thread.
+    pub fn hold_children_solid(
+        &mut self,
+        level: usize,
+        coord: BrickCoord,
+        bricks: Vec<(BrickCoord, Brick, bool)>,
+    ) -> usize {
+        let below = level - 1;
         let mut held = 0;
-        for (child, brick) in bricks {
+        for (child, brick, solid) in bricks {
             if self.holds(below, child) {
                 continue;
             }
-            self.insert_at(below, child, brick);
+            self.hold(below, child, brick, solid);
             held += 1;
         }
         self.set_children_resident(level, coord);
@@ -592,7 +683,7 @@ impl BrickStore {
             Some(source)
                 if self.streaming.is_some()
                     && self.children_resident(level + 1, coord.parent())
-                    && !source.solid_below(level, coord) =>
+                    && !self.source_solid_below(level, coord) =>
             {
                 Brick::AIR
             }
@@ -646,6 +737,75 @@ mod tests {
         fn solid_below(&self, _: usize, coord: BrickCoord) -> bool {
             coord.0[1] < 0
         }
+    }
+
+    /// Says what a brick is solid below by its height, and counts the times it is asked.
+    #[derive(Debug)]
+    struct Asked {
+        asked: Arc<std::sync::atomic::AtomicUsize>,
+        deep_is_solid: bool,
+    }
+
+    impl BrickSource for Asked {
+        fn brick(&self, _: usize, _: BrickCoord) -> Brick {
+            Brick::AIR
+        }
+        fn solid_below(&self, _: usize, coord: BrickCoord) -> bool {
+            self.asked
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            (coord.0[1] < 0) == self.deep_is_solid
+        }
+    }
+
+    #[test]
+    fn what_the_source_says_of_a_brick_is_asked_once_and_remembered_per_source() {
+        use std::sync::atomic::Ordering::Relaxed;
+
+        let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut store = BrickStore::new();
+        store.set_source(Asked {
+            asked: asked.clone(),
+            deep_is_solid: true,
+        });
+        let (deep, shallow) = (BrickCoord([3, -2, 1]), BrickCoord([3, 2, 1]));
+        for _ in 0..5 {
+            assert!(store.source_solid_below(2, deep));
+            assert!(!store.source_solid_below(2, shallow));
+        }
+        assert_eq!(asked.load(Relaxed), 2);
+        // Another source answers for itself, whatever the first said of the same brick.
+        let mut other = BrickStore::new();
+        other.set_source(Asked {
+            asked: asked.clone(),
+            deep_is_solid: false,
+        });
+        assert!(!other.source_solid_below(2, deep));
+        assert!(other.source_solid_below(2, shallow));
+    }
+
+    #[test]
+    fn holding_children_with_their_solid_below_is_holding_children() {
+        let mut a = BrickStore::new();
+        a.set_source(Interior {
+            radius: 1000,
+            material: ROCK,
+        });
+        a.build_lod(2);
+        a.stream_from(1);
+        let mut b = a.clone();
+        let parent = BrickCoord([0, 0, 0]);
+        let source = a.source().unwrap();
+        let bricks = crate::children_from(&*source, 2, parent, |_| false);
+        let with = crate::children_with_solid(&*source, 2, parent, |_| false);
+        assert_eq!(
+            a.hold_children(2, parent, bricks),
+            b.hold_children_solid(2, parent, with)
+        );
+        for c in parent.children() {
+            assert_eq!(a.solid_below(1, c), b.solid_below(1, c));
+            assert_eq!(a.brick_at(1, c).is_full(), b.brick_at(1, c).is_full());
+        }
+        assert!(b.children_resident(2, parent));
     }
 
     #[test]

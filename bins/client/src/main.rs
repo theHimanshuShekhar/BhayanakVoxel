@@ -736,6 +736,14 @@ impl App {
         // anything changes.
         let still_frames = self.still.observe((renderer.view(&self.camera), self.bias));
         world.pause_loading(world::loading_paused_for(renderer.mode(), still_frames));
+        // The display's refresh rate sets what filling in may spend of a frame while the camera is
+        // still. The monitor can change as the window is moved.
+        world.set_refresh(
+            self.window
+                .as_ref()
+                .and_then(|w| w.current_monitor())
+                .and_then(|m| m.refresh_rate_millihertz()),
+        );
         let (cpu, growth) = (&mut self.cpu, &mut self.growth);
         world.stream(self.camera.position, |scene, update| {
             upload(growth, cpu, renderer, scene, update)

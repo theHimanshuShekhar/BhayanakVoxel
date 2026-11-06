@@ -32,6 +32,9 @@ pub trait BrickSource: Debug + Send + Sync {
     /// "not known". A coarse brick that reads as full may still have air under it (a coarse Voxel
     /// is solid when half its children are), so a renderer that leaves out what no ray can reach
     /// asks this before it leaves a brick out for good.
+    ///
+    /// It must be a pure function of the brick: a store remembers the answers it is given, `false`
+    /// as well as `true`, for as long as the source is set.
     fn solid_below(&self, _level: usize, _coord: BrickCoord) -> bool {
         false
     }
@@ -63,6 +66,24 @@ pub fn children_from(
         .filter(|&child| !skip(child))
         .map(|child| (child, source.brick(level - 1, child)))
         .filter(|(_, brick)| !brick.is_air())
+        .collect()
+}
+
+/// [`children_from`], with whether each brick is solid all the way down (see
+/// [`BrickSource::solid_below`]): what [`crate::BrickStore::hold_children_solid`] takes, so that the
+/// thread that generates the bricks works that out, and the one that holds them does not.
+pub fn children_with_solid(
+    source: &dyn BrickSource,
+    level: usize,
+    coord: BrickCoord,
+    skip: impl Fn(BrickCoord) -> bool,
+) -> Vec<(BrickCoord, Brick, bool)> {
+    children_from(source, level, coord, skip)
+        .into_iter()
+        .map(|(child, brick)| {
+            let solid = level > 1 && source.solid_below(level - 1, child);
+            (child, brick, solid)
+        })
         .collect()
 }
 

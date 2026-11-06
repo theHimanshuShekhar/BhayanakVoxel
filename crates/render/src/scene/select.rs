@@ -28,6 +28,7 @@
 //! travel at which that is first possible, and [`Selection::update`] looks only at those that
 //! are due: the work in a frame is the bricks that may change level, not all of them.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::hash::{BuildHasherDefault, Hasher};
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
@@ -90,8 +91,18 @@ struct Node {
     state: State,
     /// Whether the node is a brick that is drawn: whole, and not air.
     draws: bool,
-    /// The total camera travel at which its state is next looked at, infinite for none.
-    due: f64,
+    /// The stamp of the entry that watches it for a change of state (see
+    /// [`Selection::queue_node`]), or 0 for none: an entry with another stamp is stale.
+    stamp: u64,
+}
+
+/// A node that is close enough to the edge of its hysteresis to be looked at every frame.
+#[derive(Clone, Copy, Debug)]
+struct Hot {
+    key: Key,
+    stamp: u64,
+    /// Whether the node is split (else it is whole).
+    split: bool,
 }
 
 /// A look at all the stuck bricks, in steps.
@@ -123,6 +134,12 @@ const MANY_STUCK: usize = 4096;
 /// node is looked at no later than it is due, and at most this early, which costs a look and is
 /// never wrong.
 const BUCKET: f64 = 4.0;
+
+/// A node that could change within this much camera travel is *hot*: its distance is worked out
+/// every frame, with no table lookup, and it is looked at properly only when it changes. A node that
+/// is further waits in the queue until it is this near, and a hot one goes back to the queue when
+/// it is twice as far.
+const HOT: f64 = 8.0;
 
 /// What changed in what is drawn: the bricks that are drawn now and were not, and the bricks
 /// that were drawn and are not. A brick that came and went in the same change is in neither.
@@ -229,9 +246,16 @@ fn classify(
     }
 }
 
+/// The brick at `coord` of `level` as the store reads it, and whether the store holds it.
+fn read(store: &BrickStore, level: usize, coord: BrickCoord) -> (Cow<'_, Brick>, bool) {
+    match store.level(level).and_then(|l| l.brick(coord)) {
+        Some(brick) => (Cow::Borrowed(brick), true),
+        None => (store.brick_at(level, coord), false),
+    }
+}
+
 fn probe(store: &BrickStore, level: usize, coord: BrickCoord) -> Probe {
-    let held = store.level(level).is_some_and(|l| l.brick(coord).is_some());
-    let brick = store.brick_at(level, coord);
+    let (brick, held) = read(store, level, coord);
     classify(store, level, coord, &brick, held, &[])
 }
 
@@ -240,19 +264,16 @@ fn probe(store: &BrickStore, level: usize, coord: BrickCoord) -> Probe {
 fn probe_children(store: &BrickStore, level: usize, coord: BrickCoord) -> Vec<(BrickCoord, Probe)> {
     let below = level - 1;
     let children = coord.children();
-    let bricks: Vec<_> = children.iter().map(|&c| store.brick_at(below, c)).collect();
+    let reads: Vec<_> = children.iter().map(|&c| read(store, below, c)).collect();
     let known: Vec<(BrickCoord, bool)> = children
         .iter()
-        .zip(&bricks)
-        .map(|(&c, b)| (c, b.is_full()))
+        .zip(&reads)
+        .map(|(&c, (b, _))| (c, b.is_full()))
         .collect();
     children
         .iter()
-        .zip(&bricks)
-        .map(|(&c, b)| {
-            let held = store.level(below).is_some_and(|l| l.brick(c).is_some());
-            (c, classify(store, below, c, b, held, &known))
-        })
+        .zip(&reads)
+        .map(|(&c, (b, held))| (c, classify(store, below, c, b, *held, &known)))
         .collect()
 }
 
@@ -262,7 +283,7 @@ fn probe_children(store: &BrickStore, level: usize, coord: BrickCoord) -> Vec<(B
 /// buried too: nothing under it can be seen, so nothing is drawn. If there are none because they
 /// are air, or the store has nothing under it, and it is not air, it stays whole, which is a
 /// coarser frame than the rule asks for, rather than a hole.
-fn decide(store: &BrickStore, level: usize, coord: BrickCoord, p: Probe) -> Plan {
+fn decide(store: &BrickStore, level: usize, coord: BrickCoord, p: impl FnOnce() -> Probe) -> Plan {
     if !store.children_resident(level, coord) {
         return Plan::Wait;
     }
@@ -270,7 +291,7 @@ fn decide(store: &BrickStore, level: usize, coord: BrickCoord, p: Probe) -> Plan
     let present: Vec<_> = all.iter().filter(|(_, c)| c.present).copied().collect();
     // Nothing under it is in the tree, but a brick under it is something that is not air: it
     // stays whole, which is a coarser frame than the rule asks for, rather than a hole.
-    let hidden_only = present.is_empty() && !all.iter().any(|(_, c)| c.solid) && p.solid;
+    let hidden_only = present.is_empty() && !all.iter().any(|(_, c)| c.solid) && p().solid;
     if hidden_only {
         Plan::Whole
     } else {
@@ -327,7 +348,7 @@ fn plan(store: &BrickStore, bands: Bands, camera: [f64; 3], key: Key, p: Probe) 
     let (level, coord) = key;
     let distance = brick_distance(camera, level, coord);
     if bands.split(level, distance, None) {
-        decide(store, level, coord, p)
+        decide(store, level, coord, || p)
     } else {
         Plan::Whole
     }
@@ -410,9 +431,14 @@ pub struct Selection {
     /// Total length of the camera's path since the selection began.
     travelled: f64,
     nodes: HashMap<Key, Node>,
-    /// The nodes to look at, by the bucket of the camera's travel that they are due in, with the
-    /// travel they were queued for (an entry for a node that was queued again since is stale).
-    queue: BTreeMap<u64, Vec<(f64, Key)>>,
+    /// The nodes that are not hot, by the bucket of the camera's travel in which they are to be
+    /// looked at to see if they have become hot, with the stamp they were queued with (an entry for
+    /// a node that was queued again since is stale).
+    queue: BTreeMap<u64, Vec<(u64, Key)>>,
+    /// The nodes that could change within [`HOT`] travel of the camera.
+    hot: Vec<Hot>,
+    /// The stamps given out so far.
+    stamps: u64,
     /// Bricks drawn at each level.
     drawn: [usize; LEVELS],
     /// Bricks that are drawn whole although they are nearer than their level is used from, since
@@ -459,6 +485,8 @@ impl Selection {
             travelled: 0.0,
             nodes: HashMap::default(),
             queue: BTreeMap::new(),
+            hot: Vec::new(),
+            stamps: 0,
             drawn: [0; LEVELS],
             stuck: HashSet::default(),
             bound: [None; LEVELS],
@@ -682,9 +710,9 @@ impl Selection {
         self.nodes.len()
     }
 
-    /// Nodes waiting in the queue, the stale ones included.
+    /// Entries in the queue and among the hot nodes: the stale ones are counted too.
     pub fn queued(&self) -> usize {
-        self.queue.values().map(Vec::len).sum()
+        self.queue.values().map(Vec::len).sum::<usize>() + self.hot.len()
     }
 
     /// Adds `key`, which is in the tree and whose parent is split (or is the top), and what is
@@ -773,14 +801,23 @@ impl Selection {
     /// Takes `key` off the bricks that wait, because its children will not be generated after all (the
     /// camera has gone from it): it is listed again if the bands want it split later.
     pub fn unwant(&mut self, key: Key) {
-        self.waiting.remove(&key);
+        if self.waiting.remove(&key)
+            && let Some(node) = self.nodes.get(&key)
+            && node.state == State::Whole
+            && node.stamp == 0
+        {
+            // It is watched again, so that the bands ask for its children again if they want it
+            // split.
+            let distance = brick_distance(self.camera, key.0, key.1);
+            self.queue_node(key, distance, false);
+        }
     }
 
     /// Splits the bricks `parents` that were waiting, now that the bricks under them are resident.
     /// Returns what changed in what is drawn.
     pub fn arrived(&mut self, store: &BrickStore, parents: impl IntoIterator<Item = Key>) -> Diff {
         let mut diff = Diff::default();
-        let mut beside = BTreeSet::new();
+        let mut beside = Vec::new();
         for key in parents {
             if self.waiting.remove(&key) {
                 // It was whole as a new brick that the rule splits is, so it is split as one is.
@@ -798,12 +835,23 @@ impl Selection {
                 );
             }
         }
+        beside.sort_unstable();
+        beside.dedup();
         for key in beside {
-            if self.nodes.contains_key(&key) {
+            // Only a brick that is full can be buried, which is all that the children have
+            // changed for it.
+            if store.is_full_known(key.0, key.1) && self.nodes.contains_key(&key) {
                 self.recheck(store, key, &mut diff);
             }
         }
         diff
+    }
+
+    /// Notes that the brick `key` of `level` is not drawn any more.
+    fn undraw(&mut self, level: usize, key: Key, diff: &mut Diff) {
+        self.drawn[level] -= 1;
+        self.stuck.remove(&key);
+        diff.remove(key);
     }
 
     /// Makes `key` a node that is split.
@@ -814,7 +862,7 @@ impl Selection {
             Node {
                 state: State::Split,
                 draws: false,
-                due: f64::INFINITY,
+                stamp: 0,
             },
         );
         self.queue_node(key, distance, true);
@@ -842,31 +890,62 @@ impl Selection {
             Node {
                 state: State::Whole,
                 draws: p.draws,
-                due: f64::INFINITY,
+                stamp: 0,
             },
         );
+        let stuck = self.bands.split(key.0, distance, Some(false));
         if p.draws {
             self.drawn[key.0] += 1;
             diff.add(key);
-            if self.bands.split(key.0, distance, Some(false)) {
+            if stuck {
                 self.add_stuck(key);
             }
         }
-        self.queue_node(key, distance, false);
+        if !stuck {
+            self.queue_node(key, distance, false);
+        }
     }
 
-    /// Queues `key` for when it may change, given its `distance` now.
+    /// Has `key` looked at when it may change, given its `distance` now: every frame if that
+    /// could be soon, else when the camera has gone far enough that it could be.
     fn queue_node(&mut self, key: Key, distance: f64, split: bool) {
         let slack = self.bands.slack(key.0, distance, split);
-        let due = self.travelled + slack;
+        let stamp = if slack.is_finite() {
+            self.stamps += 1;
+            self.stamps
+        } else {
+            0
+        };
         if let Some(node) = self.nodes.get_mut(&key) {
-            node.due = due;
+            node.stamp = stamp;
         }
-        if due.is_finite() {
+        if stamp != 0 {
+            self.watch(key, stamp, split, slack);
+        }
+    }
+
+    /// Puts the entry `stamp` for `key` with the hot nodes if it is `slack` from changing and
+    /// that is near, or in the queue for when it will be.
+    fn watch(&mut self, key: Key, stamp: u64, split: bool, slack: f64) {
+        if slack <= HOT {
+            self.hot.push(Hot { key, stamp, split });
+        } else {
+            // At least half of `HOT` on, so that a node that is just out of reach is not looked at
+            // again and again.
+            let at = self.travelled + (slack - HOT).max(HOT / 2.0);
             self.queue
-                .entry((due / BUCKET) as u64)
+                .entry((at / BUCKET) as u64)
                 .or_default()
-                .push((due, key));
+                .push((stamp, key));
+        }
+    }
+
+    /// Leaves `key`, a whole brick that the bands split but that cannot be (there is nothing to
+    /// split it into, or it waits for that), unwatched: the camera does not change that, only the
+    /// store does, and what changes the store looks at the brick again.
+    fn unwatch(&mut self, key: Key) {
+        if let Some(node) = self.nodes.get_mut(&key) {
+            node.stamp = 0;
         }
     }
 
@@ -882,8 +961,7 @@ impl Selection {
             if let Some(node) = self.nodes.remove(&key) {
                 self.forget(key);
                 if node.draws {
-                    self.drawn[level - 1] -= 1;
-                    diff.remove(key);
+                    self.undraw(level - 1, key, diff);
                 }
                 if node.state == State::Split {
                     self.remove_under(key, diff);
@@ -914,12 +992,10 @@ impl Selection {
         match node.state {
             State::Whole => {
                 if self.bands.split(level, distance, whole_was) {
-                    let p = probe(store, level, coord);
-                    match decide(store, level, coord, p) {
+                    match decide(store, level, coord, || probe(store, level, coord)) {
                         Plan::Split(children) => {
                             if node.draws {
-                                self.drawn[level] -= 1;
-                                diff.remove(key);
+                                self.undraw(level, key, diff);
                             }
                             self.split(store, key, distance, children, diff);
                             return;
@@ -929,6 +1005,10 @@ impl Selection {
                     }
                     if node.draws {
                         self.add_stuck(key);
+                    }
+                    if self.bands.split(level, distance, Some(false)) {
+                        self.unwatch(key);
+                        return;
                     }
                 }
                 self.queue_node(key, distance, false);
@@ -960,19 +1040,65 @@ impl Selection {
         self.camera = camera;
         self.travelled += moved;
         let mut diff = Diff::default();
-        // Everything due by now, taken out first: what is looked at and queued again is due after
+        // The nodes that may have become hot are taken out first, and each is either hot now,
+        // changes, or is queued again for when it may be: what is queued again is looked at after
         // the camera has moved some more, not in this call.
         let now = (self.travelled / BUCKET) as u64;
-        let mut due = Vec::new();
+        let mut popped = Vec::new();
         while let Some(entry) = self.queue.first_entry() {
             if *entry.key() > now {
                 break;
             }
-            due.extend(entry.remove());
+            popped.extend(entry.remove());
         }
-        for (when, key) in due {
+        let (bands, camera) = (self.bands, self.camera);
+        // Whether a node of `level` that is `distance` from the camera changes.
+        let changes = |level: usize, distance: f64, split: bool| {
+            if split {
+                !bands.split(level, distance, Some(true))
+            } else {
+                bands.split(level, distance, Some(false))
+            }
+        };
+        let mut changing: Vec<(u64, Key)> = Vec::new();
+        let hot = std::mem::take(&mut self.hot);
+        let mut stay = Vec::with_capacity(hot.len());
+        let mut cooled = Vec::new();
+        for entry in hot {
+            let distance = brick_distance(camera, entry.key.0, entry.key.1);
+            if changes(entry.key.0, distance, entry.split) {
+                changing.push((entry.stamp, entry.key));
+            } else {
+                let slack = bands.slack(entry.key.0, distance, entry.split);
+                if slack > 2.0 * HOT {
+                    cooled.push((entry, slack));
+                } else {
+                    stay.push(entry);
+                }
+            }
+        }
+        self.hot = stay;
+        for (entry, slack) in cooled {
+            self.watch(entry.key, entry.stamp, entry.split, slack);
+        }
+        for (stamp, key) in popped {
             // An entry for a node that has gone, or has been queued again since, is stale.
-            if self.nodes.get(&key).is_some_and(|n| n.due == when) {
+            let Some(node) = self.nodes.get(&key) else {
+                continue;
+            };
+            if node.stamp != stamp {
+                continue;
+            }
+            let split = node.state == State::Split;
+            let distance = brick_distance(camera, key.0, key.1);
+            if changes(key.0, distance, split) {
+                changing.push((stamp, key));
+            } else {
+                self.watch(key, stamp, split, bands.slack(key.0, distance, split));
+            }
+        }
+        for (stamp, key) in changing {
+            if self.nodes.get(&key).is_some_and(|n| n.stamp == stamp) {
                 self.revisit(store, key, &mut diff);
             }
         }
@@ -1012,8 +1138,7 @@ impl Selection {
                 let node = self.nodes.remove(&key).expect("it was just found");
                 self.forget(key);
                 if node.draws {
-                    self.drawn[level] -= 1;
-                    diff.remove(key);
+                    self.undraw(level, key, diff);
                 }
                 self.remove_under(key, diff);
             }
@@ -1023,15 +1148,21 @@ impl Selection {
                         self.drawn[level] += 1;
                         diff.add(key);
                     } else {
-                        self.drawn[level] -= 1;
-                        diff.remove(key);
+                        self.undraw(level, key, diff);
                     }
                     if let Some(node) = self.nodes.get_mut(&key) {
                         node.draws = p.draws;
                     }
                 }
                 // It may have bricks to be split into now, which it did not have.
-                self.revisit(store, key, diff);
+                let distance = brick_distance(self.camera, level, coord);
+                if self.bands.split(level, distance, Some(false)) {
+                    self.revisit(store, key, diff);
+                } else if self.nodes.get(&key).is_some_and(|n| n.stamp == 0) {
+                    // Left unwatched while it could not be split, and outside the band now, so
+                    // nothing else will look at it when the camera comes back.
+                    self.queue_node(key, distance, false);
+                }
             }
             None if p.present => {
                 let parent_splits = level == self.top
@@ -1275,6 +1406,70 @@ mod tests {
             flips += diff.added.len() + diff.removed.len();
         }
         assert_eq!(flips, 0);
+    }
+
+    #[test]
+    fn a_camera_that_goes_further_than_a_hot_node_in_a_frame_still_draws_each_column_once() {
+        // Steps of 40 Voxels a frame are five times what a node is watched every frame for.
+        let store = flat(64, 5);
+        let mut selection = select(&store, [0.5, 20.0, 0.5], D0);
+        let mut drawn: BTreeSet<Key> = selection.bricks().collect();
+        let mut camera = [0.5, 20.0, 0.5];
+        for i in 0..40 {
+            camera[0] += 40.0;
+            camera[2] -= if i % 2 == 0 { 25.0 } else { -25.0 };
+            let diff = selection.update(&store, camera);
+            for key in &diff.removed {
+                assert!(drawn.remove(key), "removed {key:?} which was not drawn");
+            }
+            for key in &diff.added {
+                assert!(drawn.insert(*key), "added {key:?} which was drawn");
+            }
+            assert_eq!(drawn, selection.bricks().collect::<BTreeSet<_>>());
+            for x in (-500..500).step_by(131) {
+                for z in (-500..500).step_by(37) {
+                    assert_eq!(covering(&selection, x, z).len(), 1, "{camera:?} {x} {z}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_brick_that_could_not_be_split_is_split_when_an_edit_gives_it_bricks_while_the_camera_is_away()
+     {
+        // Level 1 at the origin is solid, with nothing at level 0 under it: it is whole although
+        // the camera is inside its band, and nothing looks at it while the camera stays.
+        #[derive(Debug)]
+        struct Odd;
+        impl brick_store::BrickSource for Odd {
+            fn brick(&self, level: usize, coord: BrickCoord) -> Brick {
+                if level == 1 && coord == BrickCoord([0, 0, 0]) {
+                    Brick::solid(ROCK)
+                } else {
+                    Brick::AIR
+                }
+            }
+        }
+        let mut store = BrickStore::new();
+        store.set_source(Odd);
+        store.build_lod(3);
+        let (top, bands) = (top_level(&store), Bands::with_d0(1000.0));
+        let roots = top_bricks(&store, top, Some(([0; 3], 64)));
+        let (mut selection, _) = Selection::new(&store, [3.0, 3.0, 3.0], bands, top, roots.clone());
+        assert!(selection.draws(1, BrickCoord([0, 0, 0])));
+        // Away, out of its band but not its parent's; then the Edit gives it a brick of level 0, and the camera returns.
+        selection.update(&store, [2500.0, 3.0, 3.0]);
+        let changed = [BrickCoord([0, 0, 0])];
+        store.insert(changed[0], Brick::solid(SOIL));
+        store.refresh_lod(changed);
+        selection.refresh(&store, &changed);
+        selection.update(&store, [3.0, 3.0, 3.0]);
+        let (fresh, _) = Selection::new(&store, [3.0, 3.0, 3.0], bands, top, roots);
+        assert!(fresh.draws(0, BrickCoord([0, 0, 0])));
+        assert_eq!(
+            selection.bricks().collect::<BTreeSet<_>>(),
+            fresh.bricks().collect::<BTreeSet<_>>()
+        );
     }
 
     #[test]
@@ -1661,6 +1856,27 @@ mod tests {
 
     /// Loads what the selection waits for, and what that makes it wait for, until it waits for
     /// nothing. Returns how many rounds it took.
+    /// What a loader does in a frame: what was wanted joins what was asked for and has not come,
+    /// and the `most` nearest to the `camera` arrive. The rest keep waiting, as in the client.
+    fn arrive_nearest(
+        store: &mut BrickStore,
+        selection: &mut Selection,
+        pending: &mut Vec<Key>,
+        camera: [f64; 3],
+        most: usize,
+    ) {
+        pending.extend(selection.take_wanted());
+        pending.sort_by(|a, b| {
+            let d = |&(l, c): &Key| brick_distance(camera, l, c);
+            d(b).total_cmp(&d(a))
+        });
+        let now: Vec<Key> = pending.split_off(pending.len().saturating_sub(most));
+        for &(level, coord) in &now {
+            store.set_children_resident(level, coord);
+        }
+        selection.arrived(store, now);
+    }
+
     fn load_everything(store: &mut BrickStore, selection: &mut Selection) -> usize {
         let mut rounds = 0;
         loop {
@@ -1788,27 +2004,13 @@ mod tests {
         let mut store = streamed(64, 4, 2);
         let mut camera = [0.5, 20.0, 0.5];
         let mut selection = select(&store, camera, D0);
+        let mut pending: Vec<Key> = Vec::new();
         for step in 0..60 {
             camera[0] += 9.0;
             camera[2] -= 4.0;
             selection.update(&store, camera);
             // Some of what is wanted arrives each step, the nearest few.
-            let mut wanted = selection.take_wanted();
-            wanted.sort_by(|a, b| {
-                let d = |&(l, c): &Key| brick_distance(camera, l, c);
-                d(a).total_cmp(&d(b))
-            });
-            let (now, later) = wanted.split_at(wanted.len().min(3));
-            for &(level, coord) in now {
-                store.set_children_resident(level, coord);
-            }
-            selection.arrived(&store, now.iter().copied());
-            // What did not arrive is still wanted.
-            for key in later {
-                selection.unwant(*key);
-                selection.fresh.push(*key);
-                selection.waiting.insert(*key);
-            }
+            arrive_nearest(&mut store, &mut selection, &mut pending, camera, 3);
             for x in (-400..500).step_by(23) {
                 for z in (-500..400).step_by(29) {
                     assert_eq!(
@@ -1819,6 +2021,7 @@ mod tests {
                 }
             }
         }
+        arrive_nearest(&mut store, &mut selection, &mut pending, camera, usize::MAX);
         load_everything(&mut store, &mut selection);
         assert_eq!(selection.waiting(), 0);
     }
@@ -1843,6 +2046,7 @@ mod tests {
     fn the_nearest_stuck_of_a_large_set_is_a_bound_that_is_never_further_than_the_nearest() {
         let mut store = streamed(64, 4, 2);
         let mut selection = select(&store, [0.5, 20.0, 0.5], D0);
+        let mut pending: Vec<Key> = Vec::new();
         selection.many = 0;
         let mut camera = [0.5, 20.0, 0.5];
         let mut tight = 0;
@@ -1851,21 +2055,7 @@ mod tests {
             camera[2] -= 1.0;
             selection.update(&store, camera);
             // Some of what is wanted arrives, the nearest few.
-            let mut wanted = selection.take_wanted();
-            wanted.sort_by(|a, b| {
-                let d = |&(l, c): &Key| brick_distance(camera, l, c);
-                d(a).total_cmp(&d(b))
-            });
-            let (now, later) = wanted.split_at(wanted.len().min(2));
-            for &(level, coord) in now {
-                store.set_children_resident(level, coord);
-            }
-            selection.arrived(&store, now.iter().copied());
-            for key in later {
-                selection.unwant(*key);
-                selection.fresh.push(*key);
-                selection.waiting.insert(*key);
-            }
+            arrive_nearest(&mut store, &mut selection, &mut pending, camera, 2);
             let bound = selection.nearest_stuck();
             let exact = selection.nearest_stuck_in_full();
             for level in 0..LEVELS {
