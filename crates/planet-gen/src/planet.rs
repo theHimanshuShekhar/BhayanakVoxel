@@ -886,6 +886,33 @@ impl Planet {
             || !self.caves.touches(low, high, 1.0)
     }
 
+    /// Whether every Voxel of level 0 under the brick at `coord` of mip `level` is air, for
+    /// certain: it is wholly above the highest ground that its box is over (from the few texels of
+    /// the world map that the box is over, as [`Planet::solid_below`] has it) and above the sea.
+    /// Water and ice below sea level are solid, so the box must be out of the sea, and caves only
+    /// carve, so they do not matter. `false` means that it is not known, not that there is ground:
+    /// a coarse brick over a slope reads as air where the ground pokes up half a Voxel into it,
+    /// and this is `false` for it. Most bricks are decided by a distance or two: the sky high
+    /// above the ground by one.
+    pub fn air_below(&self, level: usize, coord: BrickCoord) -> bool {
+        let width = f64::from(BRICK_SIZE) * f64::from(1u32 << level);
+        let low = coord.0.map(|c| f64::from(c) * width);
+        let high = low.map(|l| l + width);
+        let (near, _) = radii_of_box(low, high);
+        // Nothing on the Planet is this far out, and nothing below the sea is air.
+        if near >= f64::from(MAX_RADIUS) {
+            return true;
+        }
+        if near < SEA_RADIUS {
+            return false;
+        }
+        let corners: [[f64; 3]; 8] = std::array::from_fn(|i| {
+            std::array::from_fn(|a| if i >> a & 1 == 0 { low[a] } else { high[a] })
+        });
+        let (_, highest) = self.map.elevation_range(&corners);
+        near >= SEA_RADIUS + highest + SLACK
+    }
+
     /// The Guard: the bricks of the whole Planet at the mip levels `levels` (8 to 12, the top of
     /// the pyramid, in the client), each as [`Planet::coarse_brick`] makes it, except air and the
     /// bricks wholly in the interior (a source gives those; see [`PlanetSource`]). Generated on
@@ -964,6 +991,10 @@ impl BrickSource for PlanetSource {
     fn solid_below(&self, level: usize, coord: BrickCoord) -> bool {
         self.planet.solid_below(level, coord)
     }
+
+    fn air_below(&self, level: usize, coord: BrickCoord) -> bool {
+        self.planet.air_below(level, coord)
+    }
 }
 
 /// What the store of [`Planet::region_around`] reads where it holds no brick. The store holds
@@ -1031,6 +1062,12 @@ impl BrickSource for RegionSource {
 
     fn solid_below(&self, level: usize, coord: BrickCoord) -> bool {
         inside_interior(level, coord)
+    }
+
+    /// What the Planet says: where it proves that all is air, this store reads air too, as it
+    /// reads everything that the Planet does not have ground or sea in as air or rock.
+    fn air_below(&self, level: usize, coord: BrickCoord) -> bool {
+        self.planet.air_below(level, coord)
     }
 }
 
@@ -2111,6 +2148,122 @@ mod tests {
         assert!(!planet().solid_below(0, at(0.0, 0)));
         assert!(!planet().solid_below(3, at(0.0, 3)));
         assert!(!planet().solid_below(0, at(100.0, 0)));
+    }
+
+    /// Panics if a Voxel of level 0 under the brick at `coord` of `level` is not air: every one
+    /// of them for the bricks up to level 2, and every second one on each axis at level 3 (a
+    /// quarter of a million Voxels under each).
+    fn assert_air_under(level: usize, coord: BrickCoord) {
+        let stride = 1usize << level.saturating_sub(2);
+        let first = coord.0.map(|c| c * (BRICK_SIZE << level));
+        for z in (0..BRICK_SIZE << level).step_by(stride) {
+            for y in (0..BRICK_SIZE << level).step_by(stride) {
+                for x in (0..BRICK_SIZE << level).step_by(stride) {
+                    let at = VoxelCoord([first[0] + x, first[1] + y, first[2] + z]);
+                    assert_eq!(
+                        planet().voxel(at),
+                        None,
+                        "level {level} {coord:?} is air below, but {at:?} is not air"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn air_below_is_never_claimed_for_a_brick_with_ground_or_sea_under_it() {
+        // Over the ground, the sea and the peaks, a brick at a time along the radial from a little
+        // under the ground, or the sea, to well over it: wherever the Planet says that a brick is
+        // air all the way down, every Voxel of level 0 under it is air.
+        let mut proven = 0;
+        for direction in lines() {
+            let surface = planet().map().elevation_at(direction).max(0.0);
+            for level in 0..=3 {
+                let size = f64::from(BRICK_SIZE << level);
+                let mut height = surface - 3.0 * size;
+                while height < surface + 12.0 * size {
+                    let coord = ancestor(along(direction, SEA_RADIUS + height).brick(), level);
+                    if planet().air_below(level, coord) {
+                        proven += 1;
+                        assert_air_under(level, coord);
+                    }
+                    height += size;
+                }
+            }
+        }
+        assert!(proven > 100, "{proven}");
+    }
+
+    #[test]
+    fn air_below_holds_high_in_the_sky_and_not_in_or_under_the_ground_or_the_sea() {
+        let sea = find(|t| t.elevation < -400);
+        let land = find(|t| (100..300).contains(&t.elevation));
+        for level in [0, 1, 4, 8, 12] {
+            let at =
+                |d: [f64; 3], height: f64| ancestor(along(d, SEA_RADIUS + height).brick(), level);
+            for d in [sea, land, [1.0, 0.0, 0.0], [0.3, -0.5, 0.8]] {
+                // Over the highest peak, by more than the brick is wide.
+                let height = 25_000.0 + 2.0 * f64::from(BRICK_SIZE << level);
+                assert!(planet().air_below(level, at(d, height)), "{d:?} {level}");
+                assert!(!planet().air_below(level, at(d, -100.0)), "{d:?} {level}");
+            }
+            // Under the sea, which is solid, and on the sea floor.
+            assert!(!planet().air_below(level, at(sea, -50.0)), "{level}");
+            assert!(!planet().air_below(level, at(sea, -450.0)), "{level}");
+            // In the ground.
+            let ground = planet().map().elevation_at(land);
+            assert!(
+                !planet().air_below(level, at(land, ground - 5.0)),
+                "{level}"
+            );
+        }
+        // The centre of the Planet and the coarsest bricks over it are not air.
+        assert!(!planet().air_below(0, BrickCoord([0, 0, 0])));
+        assert!(!planet().air_below(12, BrickCoord([0, 0, 0])));
+    }
+
+    #[test]
+    fn air_below_is_never_claimed_for_a_brick_at_the_mouth_of_a_cave() {
+        // A cave only carves ground, so the air in it is not a reason to prove a brick air, and a
+        // brick over a mouth is air below only where it is clear of the ground.
+        let mouths = planet().cave_mouths();
+        assert!(mouths.len() > 20, "{} mouths", mouths.len());
+        let mut proven = 0;
+        for mouth in mouths.into_iter().take(40) {
+            let at = VoxelCoord(mouth.map(|c| c.round() as i32)).brick();
+            for level in 0..=2 {
+                let centre = ancestor(at, level);
+                for (dx, dy, dz) in (0..27).map(|i| (i % 3 - 1, i / 3 % 3 - 1, i / 9 - 1)) {
+                    let [x, y, z] = centre.0;
+                    let coord = BrickCoord([x + dx, y + dy, z + dz]);
+                    if planet().air_below(level, coord) {
+                        proven += 1;
+                        assert_air_under(level, coord);
+                    }
+                }
+            }
+        }
+        assert!(proven > 50, "{proven}");
+    }
+
+    #[test]
+    fn the_planet_source_and_the_store_say_what_the_planet_does_about_air_below() {
+        let spawn = planet().spawn(SPAWN_REACH);
+        let crust = planet().crust_around(spawn, SPAWN_REACH, 3);
+        let radius = spawn.iter().map(|c| c * c).sum::<f64>().sqrt();
+        for (dr, level) in [(4000.0, 0), (4000.0, 2), (-500.0, 0), (20.0, 1)] {
+            let coord = ancestor(along(spawn, radius + dr).brick(), level);
+            assert_eq!(
+                crust.may_have_ground_below(level, coord),
+                !planet().air_below(level, coord),
+                "{dr} {level}"
+            );
+        }
+        assert!(
+            !crust.may_have_ground_below(0, ancestor(along(spawn, radius + 4000.0).brick(), 0))
+        );
+        // Without a source, a brick that is not held has nothing under it.
+        assert!(!BrickStore::new().may_have_ground_below(1, BrickCoord([0; 3])));
     }
 
     #[test]

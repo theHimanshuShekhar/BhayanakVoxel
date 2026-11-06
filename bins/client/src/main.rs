@@ -142,6 +142,10 @@ const WORDS_PER_BRICK: f64 = 33.0;
 /// spreads the entries over every page, so a table is in memory in full once a few percent of it
 /// is used; and on Windows the allocation commits all of it at startup. The startup log gives the
 /// total.
+///
+/// The measurement had the coarse bricks that read as air and are not proven to be in the tree
+/// (see `BrickStore::may_have_ground_below`): they are split and read like any other, and make
+/// the tree, the resident set and the bricks waiting 11 to 26% larger than without them.
 struct Room {
     /// Bricks held at each level, from level 0.
     held: Vec<usize>,

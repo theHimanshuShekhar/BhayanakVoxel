@@ -76,6 +76,30 @@ impl BrickCoord {
         far_sq <= u128::from(i64::from(radius).unsigned_abs().pow(2))
     }
 
+    /// True when no Voxel of this brick of mip `level` lies within `radius` Voxels of the Planet's
+    /// centre, measured as [`Self::within_ball_at`] does: no level 0 brick under it has one.
+    pub fn beyond_ball_at(self, level: usize, radius: i32) -> bool {
+        let size = i64::from(BRICK_SIZE) << level;
+        let near_sq: u128 = self
+            .0
+            .map(|b| {
+                let o = i64::from(b) * size;
+                // The coordinate of the Voxels of this brick that is nearest to zero.
+                let near = if o > 0 {
+                    o
+                } else if o + size - 1 < 0 {
+                    o + size - 1
+                } else {
+                    0
+                };
+                let near = near.unsigned_abs();
+                u128::from(near) * u128::from(near)
+            })
+            .iter()
+            .sum();
+        near_sq > u128::from(i64::from(radius).unsigned_abs().pow(2))
+    }
+
     /// The Voxel at `local` inside this brick.
     pub fn voxel(self, local: LocalCoord) -> VoxelCoord {
         let o = self.origin().0;
@@ -191,6 +215,29 @@ mod tests {
             let coarse = BrickCoord([1, -1, 0]);
             let all_under = descendants(coarse, level).all(|b| b.within_ball(60));
             assert_eq!(coarse.within_ball_at(level, 60), all_under, "level {level}");
+        }
+    }
+
+    #[test]
+    fn a_coarse_brick_is_beyond_a_ball_only_when_every_level_0_brick_under_it_is() {
+        for level in 0..4 {
+            for coarse in [[1, -1, 0], [0, 0, 0], [-1, -1, -1], [2, 0, -3]].map(BrickCoord) {
+                for radius in [0, 5, 20, 60, 100, 200] {
+                    let all_under = descendants(coarse, level).all(|b| {
+                        let o = b.origin().0;
+                        !(0..512).any(|i| {
+                            let p = [o[0] + (i & 7), o[1] + (i >> 3 & 7), o[2] + (i >> 6)];
+                            p.iter().map(|c| i64::from(*c).pow(2)).sum::<i64>()
+                                <= i64::from(radius).pow(2)
+                        })
+                    });
+                    assert_eq!(
+                        coarse.beyond_ball_at(level, radius),
+                        all_under,
+                        "{coarse:?} level {level} radius {radius}"
+                    );
+                }
+            }
         }
     }
 
