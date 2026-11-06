@@ -32,6 +32,9 @@ pub trait BrickSource: Debug + Send + Sync {
     /// "not known". A coarse brick that reads as full may still have air under it (a coarse Voxel
     /// is solid when half its children are), so a renderer that leaves out what no ray can reach
     /// asks this before it leaves a brick out for good.
+    ///
+    /// It must be a pure function of the brick: a store remembers the answers it is given, `false`
+    /// as well as `true`, for as long as the source is set.
     fn solid_below(&self, _level: usize, _coord: BrickCoord) -> bool {
         false
     }

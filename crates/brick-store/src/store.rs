@@ -55,8 +55,10 @@ struct Remembered {
 }
 
 /// Answers remembered per thread: a direct-mapped table, in which a brick takes the place of
-/// whichever one had its slot.
-const REMEMBERED: usize = 1 << 16;
+/// whichever one had its slot. It is small, since a thread allocates it on first use, and the
+/// threads that are started for one job each (a selection made from scratch) use it
+/// too: the bricks asked about again and again are the few round the ones that just arrived.
+const REMEMBERED: usize = 1 << 12;
 
 thread_local! {
     static REMEMBERED_SOLID: RefCell<Vec<Remembered>> = const { RefCell::new(Vec::new()) };
@@ -66,32 +68,39 @@ thread_local! {
 /// [`BrickStore::source_id`]), asking it only if this thread has not been told lately. The source
 /// is asked about the same few bricks again and again while the scene looks at the bricks round
 /// the ones that just arrived, and an answer takes a microsecond or two to work out from the
-/// world map: more than the rest of looking at a brick. The answer is a function of the brick, so
-/// remembering it is exact.
+/// world map: more than the rest of looking at a brick.
+///
+/// Both answers are remembered, so [`BrickSource::solid_below`] must be a pure function of the
+/// brick for a source that is used through a store. The table is not borrowed while `ask` runs,
+/// so `ask` may use the store again.
 fn remembered(source: u64, level: usize, coord: BrickCoord, ask: impl FnOnce() -> bool) -> bool {
     let mut slot = (level as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
     for c in coord.0 {
         slot = (slot.rotate_left(21) ^ u64::from(c as u32)).wrapping_mul(0xC2B2_AE3D_27D4_EB4F);
     }
     let slot = (slot >> 40) as usize & (REMEMBERED - 1);
-    REMEMBERED_SOLID.with(|table| {
+    let found = REMEMBERED_SOLID.with(|table| {
         let mut table = table.borrow_mut();
         if table.is_empty() {
             table.resize(REMEMBERED, Remembered::default());
         }
-        let entry = &mut table[slot];
-        if entry.source == source && entry.level as usize == level && entry.coord == coord.0 {
-            return entry.solid;
-        }
-        let solid = ask();
-        *entry = Remembered {
+        let entry = table[slot];
+        (entry.source == source && entry.level as usize == level && entry.coord == coord.0)
+            .then_some(entry.solid)
+    });
+    if let Some(solid) = found {
+        return solid;
+    }
+    let solid = ask();
+    REMEMBERED_SOLID.with(|table| {
+        table.borrow_mut()[slot] = Remembered {
             source,
             coord: coord.0,
             level: level as u8,
             solid,
         };
-        solid
-    })
+    });
+    solid
 }
 
 /// How full one table is: its entries, and how many it has room for before it grows (and moves

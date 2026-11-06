@@ -62,16 +62,67 @@ impl<K: PartialEq> Stillness<K> {
 /// much, the frame's scene work is about 4 ms. A resident set that is filling takes more frames,
 /// not longer ones.
 pub const STREAM_BUDGET: std::time::Duration = std::time::Duration::from_micros(2000);
-/// The same while the camera is where it was a frame ago: there is nothing to follow, so more of
-/// the frame goes to filling in what the bands ask for (about 6 ms of the 8 that no frame's scene
-/// work goes over), and the world is complete in minutes, not the better part of an hour.
-pub const STILL_STREAM_BUDGET: std::time::Duration = std::time::Duration::from_micros(6000);
+/// The most the frame spends taking in bricks while the camera is still: there is nothing to
+/// follow, so more of the frame goes to filling in what the bands ask for, and the Planet is
+/// complete in minutes, not the better part of an hour. No frame's scene work goes over 8 ms.
+pub const STILL_STREAM_BUDGET_MAX: std::time::Duration = std::time::Duration::from_micros(6000);
+/// The refresh rate that is assumed when the display does not say, in millihertz.
+pub const FALLBACK_REFRESH_MILLIHERTZ: u32 = 60_000;
+
+/// What the frame spends taking in bricks while the camera is still, for a display that refreshes
+/// at `refresh_millihertz` (`None` if it does not say, which is taken as 60 Hz): half the frame
+/// period, so that filling in does not cost the frames the display could show, and at most
+/// [`STILL_STREAM_BUDGET_MAX`]. That is 6 ms at 60 Hz and about 2 ms at 240 Hz. The refresh rate
+/// is the display's, not the time frames have taken, which filling in would lengthen in turn.
+pub fn still_budget_for(refresh_millihertz: Option<u32>) -> std::time::Duration {
+    let rate = refresh_millihertz
+        .filter(|&r| r > 0)
+        .unwrap_or(FALLBACK_REFRESH_MILLIHERTZ);
+    let period = std::time::Duration::from_secs_f64(1000.0 / f64::from(rate));
+    (period / 2).min(STILL_STREAM_BUDGET_MAX)
+}
+
+/// How far the camera may move between two calls of [`World::stream`] and still be taken as still,
+/// in Voxels (a millimetre). A camera that is held still can differ in the last bits from one
+/// frame to the next, as a character does that stands on ground that is being remade.
+const STILL_EPSILON: f64 = 0.01;
+
+/// Whether `now` is where `before` was, to within [`STILL_EPSILON`].
+fn camera_is_still(before: Option<[f64; 3]>, now: [f64; 3]) -> bool {
+    before.is_some_and(|b| {
+        (0..3).map(|a| (now[a] - b[a]).powi(2)).sum::<f64>() <= STILL_EPSILON * STILL_EPSILON
+    })
+}
 /// Most bricks' children taken in at a time, between looks at the clock. How many a frame takes in
 /// at a time is what its budget has left over what one costs, so a frame with room takes in many
 /// at once: the scene packs the regions they are in once, not once for each.
 pub const BATCH: usize = 128;
+/// The share of the time left in a frame's budget that a batch is expected to take, as a fraction:
+/// an arrival that costs more than was expected then takes the frame over by less, and the next
+/// batch is sized by what this one cost.
+const BATCH_SHARE: (u128, u128) = (3, 5);
+/// Arrivals taken in at a time even when the budget has room for fewer, so that a frame with
+/// little left still makes progress.
+const LEAST_BATCH: u128 = 8;
+/// The most that one arrival is expected to cost, however slow the last ones were, so that one
+/// slow batch (a table that grew) does not stop taking bricks in for the frames after it.
+const MOST_ARRIVAL_COST: std::time::Duration = std::time::Duration::from_micros(500);
 /// What taking in one brick's children is expected to cost before it has been measured.
 const ARRIVAL_COST: std::time::Duration = std::time::Duration::from_micros(40);
+/// How many arrivals the next batch takes in, given the `left` of the budget and what one is
+/// expected to `cost`: [`BATCH_SHARE`] of the room, at least [`LEAST_BATCH`] if there is room for
+/// that many, and at most [`BATCH`]. None if there is no room for one. The batch is expected to
+/// take no more than `left`.
+fn batch_size(left: std::time::Duration, cost: std::time::Duration) -> Option<usize> {
+    let room = left.as_nanos() / cost.as_nanos().max(1);
+    if room == 0 {
+        return None;
+    }
+    let most = (room * BATCH_SHARE.0 / BATCH_SHARE.1)
+        .max(room.min(LEAST_BATCH))
+        .min(BATCH as u128);
+    Some(most as usize)
+}
 /// Most bricks asked of the loader in one frame (the rest wait for the next): the first call has
 /// every brick the Guard leaves to split, and the table that holds them is not made in a frame.
 const WANTED_PER_FRAME: usize = 20_000;
@@ -164,6 +215,8 @@ pub struct World {
     arrival_cost: std::time::Duration,
     /// The camera [`World::stream`] last took bricks in for.
     streamed_at: Option<[f64; 3]>,
+    /// What [`World::stream`] spends while the camera is still: see [`still_budget_for`].
+    still_budget: std::time::Duration,
     /// Whether [`World::stream`] leaves what the loader has generated where it is: see
     /// [`World::pause_loading`].
     loading_paused: bool,
@@ -200,6 +253,7 @@ impl World {
             loader: None,
             arrival_cost: ARRIVAL_COST,
             streamed_at: None,
+            still_budget: still_budget_for(None),
             loading_paused: false,
             ghost: None,
             ghost_next: None,
@@ -311,23 +365,30 @@ impl World {
         self.scene.recentre(self.predictor.store(), camera)
     }
 
+    /// Sets what [`World::stream`] spends while the camera is still, for a display that refreshes at
+    /// `refresh_millihertz` (see [`still_budget_for`]).
+    pub fn set_refresh(&mut self, refresh_millihertz: Option<u32>) {
+        self.still_budget = still_budget_for(refresh_millihertz);
+    }
+
     /// Asks the loader for what the bands are waiting for, nearest `camera` first, and takes in
-    /// what it has generated, for [`STREAM_BUDGET`] at the most, or [`STILL_STREAM_BUDGET`] if the
-    /// camera has not moved since the last call: some bricks' children at a time are held, the scene splits the bricks they are under, and `show` copies what that changed
-    /// to the GPU (its time is in the budget). This is all the frame thread does of loading: the
-    /// bricks are generated on the loader's threads, at most [`crate::loader::MAX_AHEAD`] ahead
-    /// of what is taken in here, and what is not taken in this frame waits for the next. While
-    /// loading is paused ([`World::pause_loading`]) it still asks for bricks and keeps the loader's
-    /// queue in order for the camera, but takes none in.
+    /// what it has generated, for [`STREAM_BUDGET`] at the most, or the still budget
+    /// ([`World::set_refresh`]) if the camera is where it was at the last call, to within a
+    /// millimetre. Some bricks' children at a time are held, the scene splits the bricks they are
+    /// under, and `show` copies what that changed to the GPU (its time is in the budget). This is
+    /// all the frame thread does of loading: the bricks are generated on the loader's threads, at
+    /// most [`crate::loader::MAX_AHEAD`] ahead of what is taken in here, and what is not taken in
+    /// this frame waits for the next. While loading is paused ([`World::pause_loading`]) it still
+    /// asks for bricks and keeps the loader's queue in order for the camera, but takes none in.
     pub fn stream<E: From<RingsFull>>(
         &mut self,
         camera: [f64; 3],
         show: impl FnMut(&Scene, &SceneUpdate) -> Result<(), E>,
     ) -> Result<(), E> {
-        let still = self.streamed_at == Some(camera);
+        let still = camera_is_still(self.streamed_at, camera);
         self.streamed_at = Some(camera);
         let budget = if still {
-            STILL_STREAM_BUDGET
+            self.still_budget
         } else {
             STREAM_BUDGET
         };
@@ -369,17 +430,12 @@ impl World {
         let mut worst = std::time::Duration::ZERO;
         loop {
             let left = budget.saturating_sub(started.elapsed());
-            let room = left.as_nanos() / arrival_cost.as_nanos().max(1);
-            if room == 0 {
+            let Some(most) = batch_size(left, *arrival_cost) else {
                 break;
-            }
-            // Not all that there is room for: an arrival that costs more than was expected
-            // does not take the frame over its budget by as much, and the next batch is sized
-            // by what the first cost.
-            let most = (room * 3 / 5).max(room.min(8)).min(BATCH as u128);
+            };
             let batch_started = std::time::Instant::now();
             let mut resident = Vec::new();
-            for arrival in loader.receive(most as usize) {
+            for arrival in loader.receive(most) {
                 match arrival {
                     Arrival::Children { key, bricks } => {
                         predictor
@@ -399,10 +455,9 @@ impl World {
             worst = worst.max(batch_started.elapsed() / resident.len() as u32);
         }
         // What the next frame expects one to cost: a running mean of the worst batch of each
-        // frame, and never more than a quarter of the budget, so that one slow batch (a table that
-        // grew) does not stop taking bricks in for the frames after it.
+        // frame, and never more than [`MOST_ARRIVAL_COST`].
         if !worst.is_zero() {
-            *arrival_cost = (arrival_cost.mul_f64(0.8) + worst.mul_f64(0.2)).min(STREAM_BUDGET / 4);
+            *arrival_cost = (arrival_cost.mul_f64(0.8) + worst.mul_f64(0.2)).min(MOST_ARRIVAL_COST);
         }
         Ok(())
     }
@@ -561,6 +616,47 @@ mod tests {
     };
 
     const STONE: Material = Material(7);
+
+    #[test]
+    fn the_still_budget_is_half_a_frame_up_to_6_ms_and_60_hz_when_the_display_does_not_say() {
+        use std::time::Duration;
+        let ms = |m: f64| Duration::from_secs_f64(m / 1000.0);
+        assert_eq!(still_budget_for(Some(60_000)), STILL_STREAM_BUDGET_MAX);
+        assert_eq!(still_budget_for(Some(30_000)), STILL_STREAM_BUDGET_MAX);
+        assert!(still_budget_for(Some(144_000)).abs_diff(ms(1000.0 / 144.0 / 2.0)) < ms(0.001));
+        assert!(still_budget_for(Some(240_000)).abs_diff(ms(2.083)) < ms(0.01));
+        assert_eq!(still_budget_for(None), STILL_STREAM_BUDGET_MAX);
+        assert_eq!(still_budget_for(Some(0)), STILL_STREAM_BUDGET_MAX);
+    }
+
+    #[test]
+    fn a_camera_that_differs_in_the_last_bits_is_still_and_one_that_moved_a_centimetre_is_not() {
+        let at = [1.0e6 + 0.5, 2.0e6, -3.0e6];
+        assert!(!camera_is_still(None, at));
+        assert!(camera_is_still(Some(at), at));
+        assert!(camera_is_still(Some(at), at.map(|c| c + 1e-9 * c.abs())));
+        assert!(!camera_is_still(Some(at), [at[0] + 0.1, at[1], at[2]]));
+    }
+
+    #[test]
+    fn a_batch_is_expected_to_fit_in_what_is_left_of_the_budget() {
+        use std::time::Duration;
+        let cost = Duration::from_micros(50);
+        assert_eq!(batch_size(Duration::ZERO, cost), None);
+        assert_eq!(batch_size(Duration::from_micros(49), cost), None);
+        // Room for 3: all three, since fewer than the least batch fit.
+        assert_eq!(batch_size(Duration::from_micros(160), cost), Some(3));
+        for left_us in [100u64, 500, 2000, 6000, 100_000] {
+            let left = Duration::from_micros(left_us);
+            let most = batch_size(left, cost).unwrap();
+            assert!(most <= BATCH);
+            assert!(cost * most as u32 <= left, "{left_us}: {most}");
+            // Unless the room is small, a batch leaves some of it for one that cost more.
+            if left_us >= 1000 {
+                assert!(cost * most as u32 <= left * 4 / 5, "{left_us}: {most}");
+            }
+        }
+    }
 
     /// A wall of stone, well outside the Planet: Voxels x 4000..4032, y 0..32, z -32..0, in bricks of their own.
     fn wall() -> BrickStore {

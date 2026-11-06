@@ -483,14 +483,58 @@ fn travel(
     (work, updates)
 }
 
+/// What the full-size test holds the frame thread's scene work to, in milliseconds: the 99th
+/// percentile and the worst frame. These are not the targets of #124 (2 ms for following the
+/// camera, 4 ms in all, 8 ms for the worst frame), which were not reached: they are what the
+/// 8-core dev box achieved (see the PR) with room for the noise of a shared machine, so that a
+/// regression fails the test.
+struct Held {
+    /// Scene work in all, and following the camera alone, as (p99, worst).
+    total: (f64, f64),
+    following: (f64, f64),
+}
+
+const HELD_FILL: Held = Held {
+    total: (12.0, 250.0),
+    following: (2.0, 80.0),
+};
+const HELD_WALK: Held = Held {
+    total: (16.0, 100.0),
+    following: (13.0, 40.0),
+};
+const HELD_FLIGHT: Held = Held {
+    total: (45.0, 200.0),
+    following: (40.0, 100.0),
+};
+/// The longest a full fill may take with the camera still, in seconds (it took 309 s before #113's
+/// bricks were added and 411 to 424 s after, on a box that was not otherwise idle).
+const HELD_FILL_SECS: f64 = 520.0;
+
+impl Held {
+    fn assert(&self, what: &str, work: &SceneWork, updates: &Updates) {
+        let check = |label: &str, work: &SceneWork, (p99, worst): (f64, f64)| {
+            let (got99, got_worst) = (work.p99().unwrap(), work.worst().unwrap());
+            assert!(
+                got99 <= p99 && got_worst <= worst,
+                "{what}, {label}: p99 {got99:.2} ms (held to {p99}), worst {got_worst:.2} ms                  (held to {worst})"
+            );
+        };
+        check("scene work in all", work, self.total);
+        check("following the camera", &updates.recentre, self.following);
+    }
+}
+
 /// The Planet at full size, streamed in as the client does it: the spawn ring and the Guard are
 /// timed by `load`, then the resident set fills with the camera still (timed), and then the camera
-/// walks at 5 m/s with the loader running (scene work per frame, worst and p99). Takes about an
-/// hour (the fill is capped by `FULLSIZE_FILL_CAP_SECS`, 5400 by default) and a lot of memory in a
-/// release build: `cargo test --release -p client -- --ignored --nocapture full_size`. It prints
-/// each table's reserved room against its peak (`room_for` in `main.rs` is sized from these) and
-/// fails if a table grew or the scene was rebuilt in the fill or the walk, or if the cap cut the
-/// fill short (a capped run is for trying things out, and reports before it fails).
+/// walks at 5 m/s and then flies at 48 m/s with the loader running (scene work per frame, worst
+/// and p99). Takes about ten minutes (the fill is capped by `FULLSIZE_FILL_CAP_SECS`, 5400 by
+/// default) and a lot of memory in a release build:
+/// `cargo test --release -p client -- --ignored --nocapture full_size`. It prints each table's
+/// reserved room against its peak (`room_for` in `main.rs` is sized from these) and fails if a
+/// table grew or the scene was rebuilt in the fill or the walk (the flight asks for far more than
+/// the loader makes, and only reports what grew), if the cap cut the fill short (a capped run is
+/// for trying things out, and reports before it fails), or if the fill, the walk or the flight
+/// is slower than [`Held`] says.
 #[test]
 #[ignore = "generates the full-size world map"]
 fn the_full_size_planet_streams_in_and_walking_over_it_does_not_stall() {
@@ -570,6 +614,7 @@ fn the_full_size_planet_streams_in_and_walking_over_it_does_not_stall() {
         }
         std::thread::sleep(frame.saturating_sub(tick.elapsed()));
     }
+    let fill_took = began.elapsed();
     let bricks: Vec<usize> = (0..13).map(|l| world.scene().level_bricks(l)).collect();
     eprintln!(
         "resident set complete for the bands {:.1?} after the first frame ({frames} frames): {} \
@@ -620,6 +665,12 @@ fn the_full_size_planet_streams_in_and_walking_over_it_does_not_stall() {
         "the fill stopped at the {cap} s cap before the loader went idle, so no growth over a \
          full fill was checked"
     );
+    HELD_FILL.assert("the fill", &fill_work, &fill_updates);
+    HELD_WALK.assert("the walk", &walk_work, &walk_updates);
+    assert!(
+        fill_took.as_secs_f64() <= HELD_FILL_SECS,
+        "the fill took {fill_took:.1?}, held to {HELD_FILL_SECS} s"
+    );
 
     // Then it flies, 48 m/s over the ground: ten times the walk's distance a frame. The
     // reservations are for the fill and the walk, so the flight is not held to them.
@@ -641,6 +692,7 @@ fn the_full_size_planet_streams_in_and_walking_over_it_does_not_stall() {
         "  tables that grew in the flight (it asks for far more than the loader makes in a frame): {:?}",
         tables.grown
     );
+    HELD_FLIGHT.assert("the flight", &fly_work, &fly_updates);
 }
 
 #[test]

@@ -264,15 +264,15 @@ fn probe(store: &BrickStore, level: usize, coord: BrickCoord) -> Probe {
 fn probe_children(store: &BrickStore, level: usize, coord: BrickCoord) -> Vec<(BrickCoord, Probe)> {
     let below = level - 1;
     let children = coord.children();
-    let read: Vec<_> = children.iter().map(|&c| read(store, below, c)).collect();
+    let reads: Vec<_> = children.iter().map(|&c| read(store, below, c)).collect();
     let known: Vec<(BrickCoord, bool)> = children
         .iter()
-        .zip(&read)
+        .zip(&reads)
         .map(|(&c, (b, _))| (c, b.is_full()))
         .collect();
     children
         .iter()
-        .zip(&read)
+        .zip(&reads)
         .map(|(&c, (b, held))| (c, classify(store, below, c, b, *held, &known)))
         .collect()
 }
@@ -710,7 +710,7 @@ impl Selection {
         self.nodes.len()
     }
 
-    /// Nodes waiting in the queue or hot, the stale ones included.
+    /// Entries in the queue and among the hot nodes: the stale ones are counted too.
     pub fn queued(&self) -> usize {
         self.queue.values().map(Vec::len).sum::<usize>() + self.hot.len()
     }
@@ -840,15 +840,18 @@ impl Selection {
         for key in beside {
             // Only a brick that is full can be buried, which is all that the children have
             // changed for it.
-            let full = store
-                .level(key.0)
-                .and_then(|l| l.brick(key.1))
-                .is_some_and(Brick::is_full);
-            if full && self.nodes.contains_key(&key) {
+            if store.is_full_known(key.0, key.1) && self.nodes.contains_key(&key) {
                 self.recheck(store, key, &mut diff);
             }
         }
         diff
+    }
+
+    /// Notes that the brick `key` of `level` is not drawn any more.
+    fn undraw(&mut self, level: usize, key: Key, diff: &mut Diff) {
+        self.drawn[level] -= 1;
+        self.stuck.remove(&key);
+        diff.remove(key);
     }
 
     /// Makes `key` a node that is split.
@@ -958,9 +961,7 @@ impl Selection {
             if let Some(node) = self.nodes.remove(&key) {
                 self.forget(key);
                 if node.draws {
-                    self.drawn[level - 1] -= 1;
-                    self.stuck.remove(&key);
-                    diff.remove(key);
+                    self.undraw(level - 1, key, diff);
                 }
                 if node.state == State::Split {
                     self.remove_under(key, diff);
@@ -994,9 +995,7 @@ impl Selection {
                     match decide(store, level, coord, || probe(store, level, coord)) {
                         Plan::Split(children) => {
                             if node.draws {
-                                self.drawn[level] -= 1;
-                                self.stuck.remove(&key);
-                                diff.remove(key);
+                                self.undraw(level, key, diff);
                             }
                             self.split(store, key, distance, children, diff);
                             return;
@@ -1139,9 +1138,7 @@ impl Selection {
                 let node = self.nodes.remove(&key).expect("it was just found");
                 self.forget(key);
                 if node.draws {
-                    self.drawn[level] -= 1;
-                    self.stuck.remove(&key);
-                    diff.remove(key);
+                    self.undraw(level, key, diff);
                 }
                 self.remove_under(key, diff);
             }
@@ -1151,9 +1148,7 @@ impl Selection {
                         self.drawn[level] += 1;
                         diff.add(key);
                     } else {
-                        self.drawn[level] -= 1;
-                        self.stuck.remove(&key);
-                        diff.remove(key);
+                        self.undraw(level, key, diff);
                     }
                     if let Some(node) = self.nodes.get_mut(&key) {
                         node.draws = p.draws;
@@ -1163,6 +1158,10 @@ impl Selection {
                 let distance = brick_distance(self.camera, level, coord);
                 if self.bands.split(level, distance, Some(false)) {
                     self.revisit(store, key, diff);
+                } else if self.nodes.get(&key).is_some_and(|n| n.stamp == 0) {
+                    // Left unwatched while it could not be split, and outside the band now, so
+                    // nothing else will look at it when the camera comes back.
+                    self.queue_node(key, distance, false);
                 }
             }
             None if p.present => {
@@ -1433,6 +1432,44 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn a_brick_that_could_not_be_split_is_split_when_an_edit_gives_it_bricks_while_the_camera_is_away()
+     {
+        // Level 1 at the origin is solid, with nothing at level 0 under it: it is whole although
+        // the camera is inside its band, and nothing looks at it while the camera stays.
+        #[derive(Debug)]
+        struct Odd;
+        impl brick_store::BrickSource for Odd {
+            fn brick(&self, level: usize, coord: BrickCoord) -> Brick {
+                if level == 1 && coord == BrickCoord([0, 0, 0]) {
+                    Brick::solid(ROCK)
+                } else {
+                    Brick::AIR
+                }
+            }
+        }
+        let mut store = BrickStore::new();
+        store.set_source(Odd);
+        store.build_lod(3);
+        let (top, bands) = (top_level(&store), Bands::with_d0(1000.0));
+        let roots = top_bricks(&store, top, Some(([0; 3], 64)));
+        let (mut selection, _) = Selection::new(&store, [3.0, 3.0, 3.0], bands, top, roots.clone());
+        assert!(selection.draws(1, BrickCoord([0, 0, 0])));
+        // Away, out of its band but not its parent's; then the Edit gives it a brick of level 0, and the camera returns.
+        selection.update(&store, [2500.0, 3.0, 3.0]);
+        let changed = [BrickCoord([0, 0, 0])];
+        store.insert(changed[0], Brick::solid(SOIL));
+        store.refresh_lod(changed);
+        selection.refresh(&store, &changed);
+        selection.update(&store, [3.0, 3.0, 3.0]);
+        let (fresh, _) = Selection::new(&store, [3.0, 3.0, 3.0], bands, top, roots);
+        assert!(fresh.draws(0, BrickCoord([0, 0, 0])));
+        assert_eq!(
+            selection.bricks().collect::<BTreeSet<_>>(),
+            fresh.bricks().collect::<BTreeSet<_>>()
+        );
     }
 
     #[test]
@@ -1819,6 +1856,27 @@ mod tests {
 
     /// Loads what the selection waits for, and what that makes it wait for, until it waits for
     /// nothing. Returns how many rounds it took.
+    /// What a loader does in a frame: what was wanted joins what was asked for and has not come,
+    /// and the `most` nearest to the `camera` arrive. The rest keep waiting, as in the client.
+    fn arrive_nearest(
+        store: &mut BrickStore,
+        selection: &mut Selection,
+        pending: &mut Vec<Key>,
+        camera: [f64; 3],
+        most: usize,
+    ) {
+        pending.extend(selection.take_wanted());
+        pending.sort_by(|a, b| {
+            let d = |&(l, c): &Key| brick_distance(camera, l, c);
+            d(b).total_cmp(&d(a))
+        });
+        let now: Vec<Key> = pending.split_off(pending.len().saturating_sub(most));
+        for &(level, coord) in &now {
+            store.set_children_resident(level, coord);
+        }
+        selection.arrived(store, now);
+    }
+
     fn load_everything(store: &mut BrickStore, selection: &mut Selection) -> usize {
         let mut rounds = 0;
         loop {
@@ -1946,27 +2004,13 @@ mod tests {
         let mut store = streamed(64, 4, 2);
         let mut camera = [0.5, 20.0, 0.5];
         let mut selection = select(&store, camera, D0);
+        let mut pending: Vec<Key> = Vec::new();
         for step in 0..60 {
             camera[0] += 9.0;
             camera[2] -= 4.0;
             selection.update(&store, camera);
             // Some of what is wanted arrives each step, the nearest few.
-            let mut wanted = selection.take_wanted();
-            wanted.sort_by(|a, b| {
-                let d = |&(l, c): &Key| brick_distance(camera, l, c);
-                d(a).total_cmp(&d(b))
-            });
-            let (now, later) = wanted.split_at(wanted.len().min(3));
-            for &(level, coord) in now {
-                store.set_children_resident(level, coord);
-            }
-            selection.arrived(&store, now.iter().copied());
-            // What did not arrive is still wanted.
-            for key in later {
-                selection.unwant(*key);
-                selection.fresh.push(*key);
-                selection.waiting.insert(*key);
-            }
+            arrive_nearest(&mut store, &mut selection, &mut pending, camera, 3);
             for x in (-400..500).step_by(23) {
                 for z in (-500..400).step_by(29) {
                     assert_eq!(
@@ -1977,6 +2021,7 @@ mod tests {
                 }
             }
         }
+        arrive_nearest(&mut store, &mut selection, &mut pending, camera, usize::MAX);
         load_everything(&mut store, &mut selection);
         assert_eq!(selection.waiting(), 0);
     }
@@ -2001,6 +2046,7 @@ mod tests {
     fn the_nearest_stuck_of_a_large_set_is_a_bound_that_is_never_further_than_the_nearest() {
         let mut store = streamed(64, 4, 2);
         let mut selection = select(&store, [0.5, 20.0, 0.5], D0);
+        let mut pending: Vec<Key> = Vec::new();
         selection.many = 0;
         let mut camera = [0.5, 20.0, 0.5];
         let mut tight = 0;
@@ -2009,21 +2055,7 @@ mod tests {
             camera[2] -= 1.0;
             selection.update(&store, camera);
             // Some of what is wanted arrives, the nearest few.
-            let mut wanted = selection.take_wanted();
-            wanted.sort_by(|a, b| {
-                let d = |&(l, c): &Key| brick_distance(camera, l, c);
-                d(a).total_cmp(&d(b))
-            });
-            let (now, later) = wanted.split_at(wanted.len().min(2));
-            for &(level, coord) in now {
-                store.set_children_resident(level, coord);
-            }
-            selection.arrived(&store, now.iter().copied());
-            for key in later {
-                selection.unwant(*key);
-                selection.fresh.push(*key);
-                selection.waiting.insert(*key);
-            }
+            arrive_nearest(&mut store, &mut selection, &mut pending, camera, 2);
             let bound = selection.nearest_stuck();
             let exact = selection.nearest_stuck_in_full();
             for level in 0..LEVELS {
