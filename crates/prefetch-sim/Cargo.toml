@@ -1,0 +1,11 @@
+[package]
+name = "prefetch-sim"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+brick-store.workspace = true
+planet-gen.workspace = true
+# The band rule is the renderer's own (`render::lod`), not a copy. Nothing here touches the GPU.
+render.workspace = true

@@ -71,6 +71,7 @@ impl Bands {
     }
 
     /// The distance at which `level` starts: 0 for level 0, else `2^level · d0`.
+    #[inline]
     pub fn floor(&self, level: usize) -> f64 {
         if level == 0 {
             0.0
@@ -80,6 +81,7 @@ impl Bands {
     }
 
     /// The level that owns distance `distance`, with no hysteresis, at most `top`.
+    #[inline]
     pub fn level_at(&self, distance: f64, top: usize) -> usize {
         (0..top)
             .rev()
@@ -92,6 +94,7 @@ impl Bands {
     /// was last time, if it was: a brick stays as it was until it is [`HYSTERESIS`] past the
     /// boundary, which is where a camera hovering on one cannot flip it. A brick that is new
     /// is split exactly at the boundary. Level 0 is never split.
+    #[inline]
     pub fn split(&self, level: usize, distance: f64, was_split: Option<bool>) -> bool {
         if level == 0 {
             return false;
@@ -129,6 +132,7 @@ impl Bands {
 
 /// The distance from `camera`, a position in Voxels, to the nearest point of the box of the
 /// brick at `coord` of mip `level`: 0 if the camera is inside it.
+#[inline]
 pub fn brick_distance(camera: [f64; 3], level: usize, coord: BrickCoord) -> f64 {
     let size = (8u64 << level) as f64;
     let mut sum = 0.0;
