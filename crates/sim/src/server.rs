@@ -6,18 +6,20 @@
 //! in-process single-player server today, and the dedicated server once renet carries the
 //! messages instead of the loopback.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use brick_store::BrickStore;
-use net::{ClientMessage, EditOp, Leash, MoveInput, RejectReason, ServerEnd, ServerMessage};
+use brick_store::{BrickStore, VoxelCoord};
+use net::{
+    ClientMessage, EditMode, EditOp, Leash, MoveInput, RejectReason, ServerEnd, ServerMessage,
+};
 
 use crate::{
     BrickCache, Character, EditBudget, FixedTimestep, Footing, Ground, Movement, Reads,
-    apply_changes_from, plan_from, validate, within_reach, work,
+    apply_changes_from, dig_ticks, plan_from, target_hardness, validate, within_reach, work,
 };
 
 /// The server simulates at this rate (issue 11).
@@ -46,8 +48,50 @@ pub enum Outcome {
 const CLEARANCE: f64 = 24.0;
 
 /// Inputs held for a character that has no leash yet, at the most (ten seconds of them): see
-/// [`ClientMessage::Spawn`].
+/// [`ClientMessage::Spawn`]. It is also how far past the next input due a `seq` may be.
 const MAX_QUEUED: usize = 600;
+
+/// How many inputs a client may have applied at once, after a rest: how far a client that was held
+/// up (or a tick that was late) can catch up in a tick.
+const INPUT_BURST: u32 = 4;
+
+/// What one input costs of a client's credit, and what a tick gives back, in eighths of an input.
+/// A tick refills nine eighths, more than the one input a tick that an honest client uses, so that
+/// the burst is built up again (in about half a second) after a catch-up, and the next stall does
+/// not drop inputs. This deliberately lets a modified client move up to 12.5% faster than the
+/// tick rate, over a second at most [`TICK_RATE_HZ`] * 9 / 8 inputs. A later check of the speed
+/// that the character may move at can close that.
+const INPUT_COST: u32 = 8;
+const INPUT_REFILL: u32 = 9;
+
+/// How many ticks early a Dig may be, against the time that it should wait ([`dig_ticks`]): the
+/// jitter of the network and of the server's own ticks. It is not a gain: the time of the last
+/// Dig moves on by the full wait, so being early now makes the next one later.
+const DIG_EARLY_TICKS: u64 = 3;
+
+/// What the server keeps of each client. It outlasts a spawn, so that spawning again is no way
+/// round a limit.
+struct Player {
+    /// What the client may still ask in Edits.
+    budget: EditBudget,
+    /// What the client may have applied of its inputs now, in eighths of one (see
+    /// [`INPUT_COST`]).
+    input_credit: u32,
+    /// The tick of the client's last Dig, or of its arrival before it has dug: the wait for the
+    /// next Dig is counted from it (see [`DIG_EARLY_TICKS`]). So the first Dig pays for its own
+    /// target as every other does, and cannot be made at once.
+    last_dig: u64,
+}
+
+impl Player {
+    fn new(arrived: u64) -> Self {
+        Self {
+            budget: EditBudget::full(),
+            input_credit: INPUT_BURST * INPUT_COST,
+            last_dig: arrived,
+        }
+    }
+}
 
 /// The most work, in units ([`crate::work`]), that the Edits of one tick may ask, all clients
 /// together: what the server will spend on Edits in a tick, so that a burst of them from many
@@ -65,8 +109,11 @@ struct Avatar {
     /// The client's number for the spawn that made this character.
     spawn: u64,
     applied: u64,
-    /// Inputs that arrived before the first leash, in order: the numbers `applied` on.
-    queued: VecDeque<MoveInput>,
+    /// How many ticks the character has run: the inputs applied, which is fewer than `applied`
+    /// when gaps skipped some.
+    ticks_run: u64,
+    /// Inputs that arrived and are not applied yet, each with its number, in order.
+    queued: VecDeque<(u64, MoveInput)>,
     ground: Ground,
     /// Leashes decided since the client was last told, each with the input it first holds for.
     fresh: Vec<(u64, Leash)>,
@@ -78,6 +125,7 @@ impl Avatar {
         self.character
             .tick(&Footing::new(store, &self.ground), input);
         self.applied += 1;
+        self.ticks_run += 1;
         self.keep_ground();
     }
 
@@ -117,11 +165,16 @@ pub struct Server {
     movement: Movement,
     /// New ground generated per input applied, for a character's ground.
     ground_rate: Option<usize>,
+    /// Where the first spawn of each client is put.
+    spawn_point: [f64; 3],
+    /// The clients (by index) that may spawn anywhere.
+    debug: BTreeSet<usize>,
+    /// Whether a Dig is held to the time its target takes (see [`DIG_EARLY_TICKS`]).
+    dig_timing: bool,
     /// The character of each client, by its index in the list given to [`Server::tick`].
     avatars: Vec<Option<Avatar>>,
-    /// What each client may still ask in Edits, by the same index. It outlasts a spawn, so that
-    /// spawning again is no way round a limit.
-    budgets: Vec<EditBudget>,
+    /// What the server keeps of each client, by the same index.
+    players: Vec<Player>,
     /// Units of work that the Edits made this tick asked, against [`EDIT_WORK_PER_TICK`].
     edit_work: u64,
     /// The bricks that Edits read where the store holds none, so that they are made once.
@@ -131,14 +184,19 @@ pub struct Server {
 }
 
 impl Server {
-    pub fn new(store: BrickStore) -> Self {
+    /// A server of the Planet in `store`, which puts the first spawn of every client at
+    /// `spawn_point`, in Voxels, and not where the client asks (see [`ClientMessage::Spawn`]).
+    pub fn new(store: BrickStore, spawn_point: [f64; 3]) -> Self {
         Self {
             store,
             global_seq: 0,
             movement: Movement::default(),
             ground_rate: None,
+            spawn_point,
+            debug: BTreeSet::new(),
+            dig_timing: true,
             avatars: Vec::new(),
-            budgets: Vec::new(),
+            players: Vec::new(),
             edit_work: 0,
             cache: BrickCache::new(),
             tick_count: 0,
@@ -151,6 +209,21 @@ impl Server {
         self
     }
 
+    /// Gives client `index` (its place in the list given to [`Server::tick`]) debug rights: its
+    /// spawns are put where it asks, which is what lets a noclip camera set the character down
+    /// anywhere. The single-player server gives them to its one client.
+    pub fn with_debug_client(mut self, index: usize) -> Self {
+        self.debug.insert(index);
+        self
+    }
+
+    /// Stops holding Digs to the time that their target takes: for tests of the other rules,
+    /// which dig faster than a player could.
+    pub fn without_dig_timing(mut self) -> Self {
+        self.dig_timing = false;
+        self
+    }
+
     pub fn store(&self) -> &BrickStore {
         &self.store
     }
@@ -159,6 +232,12 @@ impl Server {
     /// has spawned.
     pub fn character(&self, index: usize) -> Option<&Character> {
         self.avatars.get(index)?.as_ref().map(|a| &a.character)
+    }
+
+    /// How many ticks of input client `index`'s character has run since it spawned: the inputs
+    /// applied, which is fewer than the ones it has dealt with when a gap skipped some.
+    pub fn ticks_run(&self, index: usize) -> Option<u64> {
+        self.avatars.get(index)?.as_ref().map(|a| a.ticks_run)
     }
 
     /// The ground that client `index`'s character walks on, if it has spawned.
@@ -176,17 +255,17 @@ impl Server {
     /// passes, applies it and gives it the next global sequence number. A rejected request changes
     /// nothing and takes no number. The checks are, in this order: the rate (every request
     /// counts, however it ends), the reach from the character's eyes (no character, no reach), the
-    /// Brush itself ([`validate`]), the work that it asks ([`work`], known from the op alone, so
-    /// that the Planet is not read for an Edit that is not afforded): against what the player has
-    /// left and what the server has left of this tick. Then the Edit is worked out ([`plan`]) at a
-    /// cost that those have bounded, and the Voxels it changes are held to what the player may
-    /// change, and if they are over it nothing is applied.
+    /// Brush itself ([`validate`]), and the work that it asks ([`work`], known from the op alone):
+    /// against what the player has left and what the server has left of this tick. Only then is
+    /// the Planet read, for a Dig, to find the Material it is aimed at, and the Dig is held to the
+    /// time that Material takes after the player's last (see [`DIG_EARLY_TICKS`]); that read is the
+    /// one Voxel's, and makes its brick if there is none. Then the work is taken, the Edit is
+    /// worked out ([`plan`]) at a cost that those have bounded, and the Voxels it changes are held
+    /// to what the player may change, and if they are over it nothing is applied.
     fn handle_edit(&mut self, asker: usize, client_seq: u64, op: EditOp) -> Outcome {
         let reject = |reason| Outcome::Rejected { client_seq, reason };
-        if self.budgets.len() <= asker {
-            self.budgets.resize_with(asker + 1, EditBudget::full);
-        }
-        if !self.budgets[asker].take_op() {
+        self.make_room(asker + 1);
+        if !self.players[asker].budget.take_op() {
             return reject(RejectReason::RateLimited);
         }
         let in_reach = self
@@ -199,10 +278,21 @@ impl Server {
             return reject(reason);
         }
         let asked = work(&op);
-        if !self.budgets[asker].has_work(asked) || self.edit_work + asked > EDIT_WORK_PER_TICK {
+        if !self.players[asker].budget.has_work(asked)
+            || self.edit_work + asked > EDIT_WORK_PER_TICK
+        {
             return reject(RejectReason::RateLimited);
         }
-        self.budgets[asker].take_work(asked);
+        // A Dig waits for what the Material it is aimed at takes to dig, from the last one. It is
+        // counted from here once the Dig is made, below.
+        let wait = (self.dig_timing && op.mode == EditMode::Dig)
+            .then(|| dig_ticks(self.hardness_at(asker, op.centre)));
+        if let Some(wait) = wait
+            && self.tick_count + DIG_EARLY_TICKS < self.players[asker].last_dig + wait
+        {
+            return reject(RejectReason::TooSoon);
+        }
+        self.players[asker].budget.take_work(asked);
         self.edit_work += asked;
         // The Edit reads the Planet from the store, then from the asker's Ground, which holds what
         // the generator makes round the character, and then from the cache.
@@ -211,15 +301,15 @@ impl Server {
             .get(asker)
             .and_then(Option::as_ref)
             .map(|avatar| &avatar.ground);
-        let mut reads = Reads::new(&self.store).with_cache(&mut self.cache);
-        if let Some(ground) = ground {
-            reads = reads.with_ground(ground);
-        }
-        let changes = plan_from(&mut reads, &op);
-        if !self.budgets[asker].take_volume(changes.len() as u64) {
+        let changes = plan_from(&mut reads_over(&self.store, ground, &mut self.cache), &op);
+        if !self.players[asker].budget.take_volume(changes.len() as u64) {
             return reject(RejectReason::VolumeLimited);
         }
         apply_changes_from(&mut self.store, &changes, ground, Some(&mut self.cache));
+        if let Some(wait) = wait {
+            let player = &mut self.players[asker];
+            player.last_dig = self.tick_count.max(player.last_dig + wait);
+        }
         self.global_seq += 1;
         Outcome::Applied {
             global_seq: self.global_seq,
@@ -228,9 +318,53 @@ impl Server {
         }
     }
 
-    /// (Re)places client `index`'s character, standing at `position` with no inputs applied. It
-    /// has no leash until the ground around it is ready, and applies no input until then.
-    fn spawn_character(&mut self, index: usize, spawn: u64, position: [f64; 3]) {
+    /// Makes room for `clients` clients in what the server keeps for each.
+    fn make_room(&mut self, clients: usize) {
+        let arrived = self.tick_count;
+        if self.players.len() < clients {
+            self.players.resize_with(clients, || Player::new(arrived));
+        }
+    }
+
+    /// The hardness of the Voxel at `centre`, as client `asker`'s Edit would read it: that of the
+    /// Voxel that a Dig is aimed at ([`target_hardness`]).
+    fn hardness_at(&mut self, asker: usize, centre: VoxelCoord) -> f32 {
+        let ground = self
+            .avatars
+            .get(asker)
+            .and_then(Option::as_ref)
+            .map(|avatar| &avatar.ground);
+        target_hardness(reads_over(&self.store, ground, &mut self.cache).get(centre))
+    }
+
+    /// Where client `index`'s character is put by a spawn that asks for `position`: see
+    /// [`ClientMessage::Spawn`].
+    fn spawn_position(&self, index: usize, position: [f64; 3]) -> [f64; 3] {
+        if self.debug.contains(&index) {
+            return position;
+        }
+        let Some(Some(avatar)) = self.avatars.get(index) else {
+            return self.spawn_point;
+        };
+        let Some(leash) = avatar.character.leash() else {
+            return avatar.character.state().position;
+        };
+        let away2: f64 = (0..3)
+            .map(|a| (position[a] - leash.centre[a]) * (position[a] - leash.centre[a]))
+            .sum();
+        // A NaN is not inside.
+        if away2 <= leash.radius * leash.radius {
+            position
+        } else {
+            leash.centre
+        }
+    }
+
+    /// (Re)places client `index`'s character, standing where [`Server::spawn_position`] says
+    /// with no inputs applied. It has no leash until the ground around it is ready, and applies
+    /// no input until then.
+    fn spawn_character(&mut self, index: usize, spawn: u64, asked: [f64; 3]) {
+        let position = self.spawn_position(index, asked);
         if self.avatars.len() <= index {
             self.avatars.resize_with(index + 1, || None);
         }
@@ -243,31 +377,61 @@ impl Server {
             character: Character::spawn(self.movement, position, None),
             spawn,
             applied: 0,
+            ticks_run: 0,
             queued: VecDeque::new(),
             ground,
             fresh: Vec::new(),
         });
     }
 
-    /// Applies one tick of input to client `index`'s character, if it has one, it has a leash, and
-    /// `seq` is the input that is due (the channel is ordered, so any other is a repeat or a gap
-    /// and is ignored). Before the leash the input is held instead, to be applied when it comes.
-    /// Returns whether it was applied.
+    /// Takes in input number `seq` for client `index`'s character, if it has one, and applies what
+    /// it may of the inputs held (see [`Server::apply_queued`]). An input before the one that is
+    /// due is a repeat or late and is ignored, as is one far past it (see
+    /// [`ClientMessage::Input`]); one past it is taken, and what is between is skipped when it is
+    /// applied. Returns whether any input was applied.
     fn apply_input(&mut self, index: usize, seq: u64, input: &MoveInput) -> bool {
         let Some(Some(avatar)) = self.avatars.get_mut(index) else {
             return false;
         };
-        if seq != avatar.applied + avatar.queued.len() as u64 {
+        let due = avatar
+            .queued
+            .back()
+            .map_or(avatar.applied, |&(last, _)| last + 1);
+        if seq < due || seq - due >= MAX_QUEUED as u64 {
             return false;
         }
-        if avatar.character.leash().is_none() {
-            if avatar.queued.len() < MAX_QUEUED {
-                avatar.queued.push_back(*input);
-            }
-            return false;
+        // With a leash the inputs are applied as they come, so only a burst's worth are held; the
+        // rest were sent faster than they may be applied, and are dropped.
+        let held = if avatar.character.leash().is_some() {
+            INPUT_BURST as usize
+        } else {
+            MAX_QUEUED
+        };
+        if avatar.queued.len() < held {
+            avatar.queued.push_back((seq, *input));
         }
-        avatar.apply(&self.store, input);
-        true
+        self.apply_queued(index)
+    }
+
+    /// Applies the inputs that client `index`'s character has held, in order, while it has a
+    /// leash and the client has credit for them. An input that is past the next one skips what is
+    /// between. Returns whether any was applied.
+    fn apply_queued(&mut self, index: usize) -> bool {
+        let Some(Some(avatar)) = self.avatars.get_mut(index) else {
+            return false;
+        };
+        let credit = &mut self.players[index].input_credit;
+        let mut moved = false;
+        while avatar.character.leash().is_some() && *credit >= INPUT_COST {
+            let Some((seq, input)) = avatar.queued.pop_front() else {
+                break;
+            };
+            *credit -= INPUT_COST;
+            avatar.applied = seq;
+            avatar.apply(&self.store, &input);
+            moved = true;
+        }
+        moved
     }
 
     /// One tick: tops up each client's Edit allowance, then handles every request that has
@@ -279,10 +443,12 @@ impl Server {
     /// requests, and before that of any new leash. A character with no leash yet is waiting for
     /// its ground, which is filled each tick.
     pub fn tick(&mut self, clients: &[ServerEnd]) {
-        if self.budgets.len() < clients.len() {
-            self.budgets.resize_with(clients.len(), EditBudget::full);
+        self.make_room(clients.len());
+        for player in &mut self.players {
+            player.budget.refill();
+            player.input_credit =
+                (player.input_credit + INPUT_REFILL).min(INPUT_BURST * INPUT_COST);
         }
-        self.budgets.iter_mut().for_each(EditBudget::refill);
         self.edit_work = 0;
         let count = clients.len();
         let first = (self.tick_count % count.max(1) as u64) as usize;
@@ -329,13 +495,11 @@ impl Server {
             if avatar.character.leash().is_none() {
                 avatar.keep_ground();
             }
-            // The inputs that came before the leash are applied as it comes.
-            while avatar.character.leash().is_some()
-                && let Some(input) = avatar.queued.pop_front()
-            {
-                avatar.apply(&self.store, &input);
-                moved = true;
-            }
+            // The inputs that came before the leash, or faster than they may be applied, go on.
+            moved |= self.apply_queued(asker);
+            let Some(Some(avatar)) = self.avatars.get_mut(asker) else {
+                continue;
+            };
             for (from, leash) in avatar.fresh.drain(..) {
                 let _ = client.send(ServerMessage::Leash {
                     spawn: avatar.spawn,
@@ -351,6 +515,19 @@ impl Server {
                 });
             }
         }
+    }
+}
+
+/// Where an Edit by a client with this `ground` reads the Planet from.
+fn reads_over<'a>(
+    store: &'a BrickStore,
+    ground: Option<&'a Ground>,
+    cache: &'a mut BrickCache,
+) -> Reads<'a> {
+    let reads = Reads::new(store).with_cache(cache);
+    match ground {
+        Some(ground) => reads.with_ground(ground),
+        None => reads,
     }
 }
 
@@ -383,10 +560,10 @@ impl Drop for ServerHandle {
     }
 }
 
-/// Starts the server on a new thread. `make_store` builds the Planet on that thread, so the
-/// caller need not wait for it: requests wait in their channels until it is ready.
+/// Starts the server on a new thread. `make_server` builds it, and its Planet, on that thread, so
+/// the caller need not wait for it: requests wait in their channels until it is ready.
 pub fn spawn(
-    make_store: impl FnOnce() -> BrickStore + Send + 'static,
+    make_server: impl FnOnce() -> Server + Send + 'static,
     clients: Vec<ServerEnd>,
 ) -> ServerHandle {
     let stop = Arc::new(AtomicBool::new(false));
@@ -394,7 +571,7 @@ pub fn spawn(
     let thread = {
         let (stop, ticks) = (Arc::clone(&stop), Arc::clone(&ticks));
         std::thread::spawn(move || {
-            let mut server = Server::new(make_store());
+            let mut server = make_server();
             let mut clock =
                 FixedTimestep::new(Duration::from_secs(1) / TICK_RATE_HZ, MAX_TICKS_PER_ADVANCE);
             let mut last = Instant::now();
@@ -421,6 +598,7 @@ pub fn spawn(
 mod tests {
     use super::*;
     use brick_store::{Brick, BrickCoord, Material, VoxelCoord};
+    use materials::MaterialTable;
     use net::{ClientEnd, TryRecvError, loopback};
 
     const STONE: Material = Material(7);
@@ -463,7 +641,7 @@ mod tests {
     #[test]
     fn a_request_is_applied_numbered_and_acked() {
         let (client, end) = loopback();
-        let mut server = Server::new(stone_store());
+        let mut server = Server::new(stone_store(), [0.0; 3]).without_dig_timing();
         client.send(stand()).unwrap();
         client.send(dig(0, [3, 3, 3], 2)).unwrap();
         server.tick(&[end]);
@@ -483,10 +661,17 @@ mod tests {
     #[test]
     fn global_sequence_numbers_follow_the_order_the_server_handled_requests() {
         let (client, end) = loopback();
-        let mut server = Server::new(stone_store());
+        let mut server = Server::new(stone_store(), [0.0; 3]).without_dig_timing();
         client.send(stand()).unwrap();
+        // Places, in the air: Digs would be held to the time they take.
         for seq in 0..4 {
-            client.send(dig(seq, [seq as i32 * 4, 0, 0], 1)).unwrap();
+            let op = place([seq as i32 * 4, 20, 0], net::Shape::Sphere, 1);
+            client
+                .send(ClientMessage::Edit {
+                    client_seq: seq,
+                    op,
+                })
+                .unwrap();
         }
         server.tick(&[end]);
         let seqs: Vec<_> = edits_heard(&client)
@@ -507,7 +692,7 @@ mod tests {
     #[test]
     fn a_rejected_request_changes_nothing_and_takes_no_number() {
         let (client, end) = loopback();
-        let mut server = Server::new(stone_store());
+        let mut server = Server::new(stone_store(), [0.0; 3]).without_dig_timing();
         let before = server.store().content_hash();
         client.send(stand()).unwrap();
         client.send(dig(0, [0, 0, 0], 200)).unwrap();
@@ -535,7 +720,7 @@ mod tests {
     #[test]
     fn every_client_hears_every_edit_but_only_the_asker_is_acked() {
         let ((a, a_end), (b, b_end)) = (loopback(), loopback());
-        let mut server = Server::new(stone_store());
+        let mut server = Server::new(stone_store(), [0.0; 3]).without_dig_timing();
         a.send(stand()).unwrap();
         b.send(stand()).unwrap();
         a.send(dig(5, [0, 0, 0], 1)).unwrap();
@@ -559,7 +744,7 @@ mod tests {
     #[test]
     fn a_client_that_left_does_not_stop_the_others_hearing() {
         let ((a, a_end), (b, b_end)) = (loopback(), loopback());
-        let mut server = Server::new(stone_store());
+        let mut server = Server::new(stone_store(), [0.0; 3]).without_dig_timing();
         b.send(stand()).unwrap();
         b.send(dig(0, [0, 0, 0], 1)).unwrap();
         drop(a);
@@ -570,7 +755,10 @@ mod tests {
     #[test]
     fn on_its_own_thread_it_ticks_at_about_60_hz_and_answers() {
         let (client, end) = loopback();
-        let handle = spawn(stone_store, vec![end]);
+        let handle = spawn(
+            || Server::new(stone_store(), [0.0; 3]).without_dig_timing(),
+            vec![end],
+        );
         client.send(stand()).unwrap();
         client.send(dig(0, [3, 3, 3], 2)).unwrap();
         let started = Instant::now();
@@ -630,7 +818,7 @@ mod tests {
     /// A server with a character standing at the origin of a store of stone.
     fn standing() -> (Server, ServerEnd, ClientEnd) {
         let (client, end) = loopback();
-        let mut server = Server::new(stone_store());
+        let mut server = Server::new(stone_store(), [0.0; 3]).without_dig_timing();
         client.send(stand()).unwrap();
         server.tick(std::slice::from_ref(&end));
         received(&client);
@@ -681,7 +869,7 @@ mod tests {
     #[test]
     fn an_edit_from_a_client_with_no_character_is_out_of_reach() {
         let (client, end) = loopback();
-        let mut server = Server::new(stone_store());
+        let mut server = Server::new(stone_store(), [0.0; 3]).without_dig_timing();
         let before = server.store().content_hash();
         let answers = answers(
             &mut server,
@@ -700,7 +888,8 @@ mod tests {
         // Along y, which is the way up at the origin's own, odd spot, and so is the eyes' way.
         let at = |voxels: f64| {
             let y = (eye[1] + voxels).floor() as i32;
-            EditOp::dig_sphere(VoxelCoord([0, y, 0]), 1)
+            // Places, so that they are not held to the time a Dig takes.
+            place([0, y, 0], net::Shape::Sphere, 1)
         };
         assert_eq!(
             answers(&mut server, &end, &client, &[at(79.0), at(-79.0)]),
@@ -750,7 +939,8 @@ mod tests {
     #[test]
     fn a_player_may_make_20_edits_a_second() {
         let (mut server, end, client) = standing();
-        let ops = vec![EditOp::dig_sphere(VoxelCoord([0, 0, 0]), 0); 25];
+        // Places, in the air: Digs would be held to the time they take.
+        let ops = vec![place([0, 20, 0], net::Shape::Sphere, 0); 25];
         let told = answers(&mut server, &end, &client, &ops);
         assert_eq!(told.iter().filter(|r| r.is_none()).count(), 20);
         assert!(
@@ -784,21 +974,21 @@ mod tests {
             }
         }
         let (client, end) = loopback();
-        let mut server = Server::new(store);
+        let mut server = Server::new(store, [0.0; 3]).without_dig_timing();
         client.send(stand()).unwrap();
         server.tick(std::slice::from_ref(&end));
         received(&client);
 
-        // Nine cubes of 21 Voxels a side, 9 261 Voxels each, side by side.
-        let dig = |i: i32| EditOp {
-            mode: net::EditMode::Dig,
-            ..place(
-                [(i % 3 - 1) * 22, 0, (i / 3 - 1) * 22],
+        // Nine cubes of 21 Voxels a side, 9 261 Voxels each, side by side, placed in the air above
+        // the stone (Digs would be held to the time they take).
+        let cube = |i: i32| {
+            place(
+                [(i % 3 - 1) * 22, 60, (i / 3 - 1) * 22],
                 net::Shape::Cube,
                 10,
             )
         };
-        let nine: Vec<_> = (0..9).map(dig).collect();
+        let nine: Vec<_> = (0..9).map(cube).collect();
         // The burst is 72 000 Voxels, which is seven of them. The two that did not fit changed
         // nothing and cost nothing.
         let told = answers(&mut server, &end, &client, &nine);
@@ -842,7 +1032,7 @@ mod tests {
     #[test]
     fn twenty_smooths_that_change_nothing_in_one_tick_are_limited_by_the_work_they_ask() {
         let (client, end) = loopback();
-        let mut server = Server::new(mass());
+        let mut server = Server::new(mass(), [0.0; 3]).without_dig_timing();
         client.send(stand()).unwrap();
         server.tick(std::slice::from_ref(&end));
         received(&client);
@@ -872,7 +1062,7 @@ mod tests {
     #[test]
     fn a_leaning_cube_of_4_m_placed_from_rest_is_accepted_and_one_more_has_to_wait() {
         let (client, end) = loopback();
-        let mut server = Server::new(mass());
+        let mut server = Server::new(mass(), [0.0; 3]).without_dig_timing();
         client.send(stand()).unwrap();
         server.tick(std::slice::from_ref(&end));
         received(&client);
@@ -950,7 +1140,7 @@ mod tests {
             clients.push(client);
             ends.push(end);
         }
-        let mut server = Server::new(mass());
+        let mut server = Server::new(mass(), [0.0; 3]).without_dig_timing();
         server.tick(&ends);
         for client in &clients {
             received(client);
@@ -1147,7 +1337,7 @@ mod tests {
     #[test]
     fn a_character_applies_no_input_until_its_ground_is_ready_and_is_then_told_its_leash() {
         let (client, end) = loopback();
-        let mut server = Server::new(flat_store());
+        let mut server = Server::new(flat_store(), [0.0; 3]).with_debug_client(0);
         let input = |seq| ClientMessage::Input {
             seq,
             input: forward(),
@@ -1201,7 +1391,7 @@ mod tests {
     #[test]
     fn a_new_leash_is_told_ahead_of_the_body_it_was_decided_in_and_from_the_input_after_it() {
         let (client, end) = loopback();
-        let mut server = Server::new(flat_store());
+        let mut server = Server::new(flat_store(), [0.0; 3]).with_debug_client(0);
         client
             .send(ClientMessage::Spawn {
                 spawn: 1,
@@ -1250,7 +1440,7 @@ mod tests {
     #[test]
     fn inputs_that_arrive_before_the_leash_are_held_and_applied_when_it_comes() {
         let (client, end) = loopback();
-        let mut server = Server::new(flat_store());
+        let mut server = Server::new(flat_store(), [0.0; 3]).with_debug_client(0);
         client
             .send(ClientMessage::Spawn {
                 spawn: 7,
@@ -1273,7 +1463,10 @@ mod tests {
                 break;
             }
         }
-        // The five were applied, in order, as the leash came, and the client is told so.
+        // The five were applied, in order, as the leash came (the burst of four at once, and the
+        // fifth with the next tick's credit), and the client is told so.
+        server.tick(std::slice::from_ref(&end));
+        told.extend(received(&client));
         let last = told.last().expect("told");
         assert!(
             matches!(
@@ -1304,5 +1497,460 @@ mod tests {
         server.tick(std::slice::from_ref(&end));
         let told = received(&client);
         assert!(matches!(told[..], [ServerMessage::Body { applied: 6, .. }]));
+    }
+
+    /// A server on flat ground with a client (debug rights) whose character has its leash, and
+    /// the messages so far taken.
+    fn walking() -> (Server, ServerEnd, ClientEnd) {
+        let (client, end) = loopback();
+        let mut server = Server::new(flat_store(), [0.0; 3]).with_debug_client(0);
+        client
+            .send(ClientMessage::Spawn {
+                spawn: 1,
+                position: [0.0, 3.0, 0.0],
+            })
+            .unwrap();
+        for _ in 0..200 {
+            server.tick(std::slice::from_ref(&end));
+            if server.character(0).and_then(Character::leash).is_some() {
+                break;
+            }
+        }
+        assert!(server.character(0).and_then(Character::leash).is_some());
+        received(&client);
+        (server, end, client)
+    }
+
+    fn input(seq: u64) -> ClientMessage {
+        ClientMessage::Input {
+            seq,
+            input: forward(),
+        }
+    }
+
+    /// The `applied` of the last Body the server sent.
+    fn applied_told(client: &ClientEnd) -> Option<u64> {
+        received(client).into_iter().rev().find_map(|m| match m {
+            ServerMessage::Body { applied, .. } => Some(applied),
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn a_client_that_floods_inputs_gets_about_one_applied_per_tick() {
+        let (mut server, end, client) = walking();
+        let mut seq = 0;
+        let mut flood = |server: &mut Server, count: u64| {
+            for _ in 0..count {
+                client.send(input(seq)).unwrap();
+                seq += 1;
+            }
+            server.tick(std::slice::from_ref(&end));
+        };
+        // A few hundred at once: no more than the burst is applied.
+        flood(&mut server, 300);
+        assert!(server.ticks_run(0).unwrap() <= u64::from(INPUT_BURST));
+        // And then five every tick for a second: nine eighths of one a tick, and the burst.
+        let before = server.ticks_run(0).unwrap();
+        for _ in 0..TICK_RATE_HZ {
+            flood(&mut server, 5);
+        }
+        let run = server.ticks_run(0).unwrap() - before;
+        assert!(
+            run <= u64::from(TICK_RATE_HZ * INPUT_REFILL / INPUT_COST + INPUT_BURST),
+            "{run}"
+        );
+        assert!(run >= u64::from(TICK_RATE_HZ) - 1, "not starved: {run}");
+        // What it is holding is bounded too.
+        let held = server.avatars[0].as_ref().unwrap().queued.len();
+        assert!(held <= INPUT_BURST as usize, "{held}");
+    }
+
+    #[test]
+    fn a_client_that_sends_an_input_a_tick_has_every_one_applied() {
+        let (mut server, end, client) = walking();
+        for seq in 0..120 {
+            client.send(input(seq)).unwrap();
+            server.tick(std::slice::from_ref(&end));
+            assert_eq!(server.ticks_run(0), Some(seq + 1));
+        }
+        assert_eq!(applied_told(&client), Some(120));
+    }
+
+    #[test]
+    fn a_gap_in_the_inputs_is_skipped_and_does_not_freeze_the_character() {
+        let (mut server, end, client) = walking();
+        for seq in [0, 1, 5, 6] {
+            client.send(input(seq)).unwrap();
+        }
+        server.tick(std::slice::from_ref(&end));
+        // The four that came were run, and the three missing never were.
+        assert_eq!(server.ticks_run(0), Some(4));
+        assert_eq!(applied_told(&client), Some(7));
+        // The next one due is 7.
+        client.send(input(7)).unwrap();
+        server.tick(std::slice::from_ref(&end));
+        assert_eq!(applied_told(&client), Some(8));
+    }
+
+    #[test]
+    fn an_input_that_came_late_or_twice_is_ignored_and_one_far_ahead_costs_nothing() {
+        let (mut server, end, client) = walking();
+        for seq in [0, 1, 2] {
+            client.send(input(seq)).unwrap();
+        }
+        server.tick(std::slice::from_ref(&end));
+        assert_eq!(applied_told(&client), Some(3));
+        // A repeat, and 3 after 4 (the channel is ordered, so this is a client's own doing).
+        for seq in [2, 4, 3] {
+            client.send(input(seq)).unwrap();
+        }
+        server.tick(std::slice::from_ref(&end));
+        assert_eq!(server.ticks_run(0), Some(4), "0, 1, 2 and 4");
+        assert_eq!(applied_told(&client), Some(5));
+        // A number that would overflow the count, and one far past the one due, are ignored.
+        for seq in [u64::MAX, 5 + MAX_QUEUED as u64, 5] {
+            client.send(input(seq)).unwrap();
+        }
+        server.tick(std::slice::from_ref(&end));
+        assert_eq!(applied_told(&client), Some(6));
+    }
+
+    /// Where the last Body that the server sent puts the character.
+    fn placed(client: &ClientEnd) -> [f64; 3] {
+        received(client)
+            .into_iter()
+            .rev()
+            .find_map(|m| match m {
+                ServerMessage::Body { state, .. } => Some(state.position),
+                _ => None,
+            })
+            .expect("a Body")
+    }
+
+    fn respawn(client: &ClientEnd, spawn: u64, position: [f64; 3]) {
+        client
+            .send(ClientMessage::Spawn { spawn, position })
+            .unwrap();
+    }
+
+    #[test]
+    fn the_first_spawn_is_where_the_server_says_not_where_the_client_asks() {
+        let (client, end) = loopback();
+        let mut server = Server::new(flat_store(), [0.0, 3.0, 0.0]);
+        respawn(&client, 1, [900.0, 3.0, 900.0]);
+        server.tick(std::slice::from_ref(&end));
+        assert_eq!(placed(&client), [0.0, 3.0, 0.0]);
+    }
+
+    #[test]
+    fn debug_rights_are_a_clients_own() {
+        let (first, first_end) = loopback();
+        let (second, second_end) = loopback();
+        let mut server = Server::new(flat_store(), [0.0, 3.0, 0.0]).with_debug_client(1);
+        respawn(&first, 1, [500.0, 3.0, 0.0]);
+        respawn(&second, 1, [500.0, 3.0, 0.0]);
+        server.tick(&[first_end, second_end]);
+        assert_eq!(placed(&first), [0.0, 3.0, 0.0]);
+        assert_eq!(placed(&second), [500.0, 3.0, 0.0]);
+    }
+
+    /// A client without debug rights, standing with its leash.
+    fn leashed() -> (Server, ServerEnd, ClientEnd, Leash) {
+        let (client, end) = loopback();
+        let mut server = Server::new(flat_store(), [0.0, 3.0, 0.0]);
+        respawn(&client, 1, [0.0, 3.0, 0.0]);
+        for _ in 0..200 {
+            server.tick(std::slice::from_ref(&end));
+            if server.character(0).and_then(Character::leash).is_some() {
+                break;
+            }
+        }
+        let leash = server
+            .character(0)
+            .and_then(Character::leash)
+            .expect("a leash");
+        received(&client);
+        (server, end, client, leash)
+    }
+
+    #[test]
+    fn a_respawn_inside_the_leash_is_accepted() {
+        let (mut server, end, client, leash) = leashed();
+        let inside = [leash.centre[0] + leash.radius * 0.5, 3.0, leash.centre[2]];
+        respawn(&client, 2, inside);
+        server.tick(std::slice::from_ref(&end));
+        assert_eq!(placed(&client), inside);
+    }
+
+    #[test]
+    fn a_respawn_outside_the_leash_or_at_nowhere_goes_to_the_centre_of_the_leash() {
+        let (mut server, end, client, leash) = leashed();
+        for (spawn, asked) in [
+            (2, [leash.centre[0] + leash.radius * 2.0, 3.0, 0.0]),
+            (3, [f64::NAN; 3]),
+            (4, [f64::INFINITY, 0.0, 0.0]),
+        ] {
+            respawn(&client, spawn, asked);
+            server.tick(std::slice::from_ref(&end));
+            assert_eq!(placed(&client), leash.centre, "{asked:?}");
+            // The new character has to get its leash before the next respawn is judged by one.
+            for _ in 0..200 {
+                server.tick(std::slice::from_ref(&end));
+                if server.character(0).and_then(Character::leash).is_some() {
+                    break;
+                }
+            }
+            received(&client);
+        }
+    }
+
+    #[test]
+    fn a_respawn_before_the_leash_stays_where_the_character_is() {
+        let (client, end) = loopback();
+        let mut server = Server::new(flat_store(), [0.0, 3.0, 0.0]);
+        respawn(&client, 1, [0.0, 3.0, 0.0]);
+        server.tick(std::slice::from_ref(&end));
+        assert!(server.character(0).and_then(Character::leash).is_none());
+        received(&client);
+        respawn(&client, 2, [300.0, 3.0, 0.0]);
+        server.tick(std::slice::from_ref(&end));
+        assert_eq!(placed(&client), [0.0, 3.0, 0.0]);
+    }
+
+    #[test]
+    fn a_debug_client_lands_anywhere() {
+        let (mut server, end, client) = walking();
+        respawn(&client, 2, [900.0, 3.0, -900.0]);
+        server.tick(std::slice::from_ref(&end));
+        assert_eq!(placed(&client), [900.0, 3.0, -900.0]);
+    }
+
+    #[test]
+    fn edit_reach_holds_after_a_respawn_that_the_server_turned_back() {
+        let (mut server, end, client, leash) = leashed();
+        // Asks to stand a kilometre away, next to something to dig, and digs it at once.
+        let far = leash.centre[0] + 1000.0;
+        respawn(&client, 2, [far, 3.0, 0.0]);
+        client.send(dig(0, [far as i32, -2, 0], 1)).unwrap();
+        server.tick(std::slice::from_ref(&end));
+        let told = edits_heard(&client);
+        assert!(
+            matches!(
+                told[..],
+                [ServerMessage::Rejected {
+                    reason: RejectReason::OutOfReach,
+                    ..
+                }]
+            ),
+            "{told:?}"
+        );
+    }
+
+    /// A server that holds Digs to the time they take, with a character standing at the origin of
+    /// a store of stone, and the time it takes to dig the hardest Material gone by since it came.
+    fn timed() -> (Server, ServerEnd, ClientEnd) {
+        let (client, end) = loopback();
+        let mut server = Server::new(stone_store(), [0.0; 3]);
+        client.send(stand()).unwrap();
+        for _ in 0..dig_ticks(target_hardness(None)) {
+            server.tick(std::slice::from_ref(&end));
+        }
+        received(&client);
+        (server, end, client)
+    }
+
+    /// The hardness of `STONE`, in ticks of digging.
+    fn stone_ticks() -> u64 {
+        dig_ticks(MaterialTable::built_in().get(STONE).unwrap().hardness)
+    }
+
+    #[test]
+    fn a_dig_before_the_time_it_takes_is_turned_down_and_after_it_is_made() {
+        let (mut server, end, client) = timed();
+        let ticks = stone_ticks();
+        assert!(ticks > DIG_EARLY_TICKS + 1, "stone takes time: {ticks}");
+        let at = |i: i32| EditOp::dig_sphere(VoxelCoord([3 + 2 * i, 3, 3]), 0);
+        assert_eq!(answers(&mut server, &end, &client, &[at(0)]), [None]);
+        // The next tick, and in the same one: too soon, and nothing is changed.
+        let hash = server.store().content_hash();
+        assert_eq!(
+            answers(&mut server, &end, &client, &[at(1), at(2)]),
+            [Some(RejectReason::TooSoon); 2]
+        );
+        assert_eq!(server.store().content_hash(), hash);
+        // Once the time has gone (less the jitter allowed) it is made, and then waits again.
+        for _ in 0..ticks - DIG_EARLY_TICKS - 2 {
+            server.tick(std::slice::from_ref(&end));
+        }
+        assert_eq!(answers(&mut server, &end, &client, &[at(3)]), [None]);
+        assert_eq!(
+            answers(&mut server, &end, &client, &[at(4)]),
+            [Some(RejectReason::TooSoon)]
+        );
+    }
+
+    #[test]
+    fn the_first_dig_after_arriving_pays_for_its_own_time_too() {
+        let (client, end) = loopback();
+        let mut server = Server::new(stone_store(), [0.0; 3]);
+        client.send(stand()).unwrap();
+        // In the tick it arrived in: too soon.
+        client.send(dig(0, [3, 3, 3], 0)).unwrap();
+        server.tick(std::slice::from_ref(&end));
+        assert!(matches!(
+            edits_heard(&client)[..],
+            [ServerMessage::Rejected {
+                reason: RejectReason::TooSoon,
+                ..
+            }]
+        ));
+        for _ in 0..stone_ticks() {
+            server.tick(std::slice::from_ref(&end));
+        }
+        let at = EditOp::dig_sphere(VoxelCoord([3, 3, 3]), 0);
+        assert_eq!(answers(&mut server, &end, &client, &[at]), [None]);
+    }
+
+    #[test]
+    fn digging_faster_than_the_hardness_allows_gains_nothing_over_time() {
+        let (mut server, end, client) = timed();
+        let ticks = stone_ticks();
+        // A Voxel of stone that has not been dug each time.
+        let at = |i: u64| EditOp::dig_sphere(VoxelCoord([i as i32 - 12, 3, 3]), 0);
+        // Trying every tick for ten seconds gets no more than the time allows, plus the jitter.
+        let mut made = 0;
+        for _ in 0..10 * TICK_RATE_HZ {
+            if answers(&mut server, &end, &client, &[at(made)]) == [None] {
+                made += 1;
+            }
+        }
+        let expected = 10 * u64::from(TICK_RATE_HZ) / ticks;
+        assert!(
+            (expected - 1..=expected + 2).contains(&made),
+            "{made} of {expected}"
+        );
+    }
+
+    /// Ticks that a Dig of `to` has to wait after one of `from`, found by trying every tick, in a
+    /// store of the two Materials side by side that a character at the origin stands in.
+    fn wait_after(from: &str, to: &str) -> u64 {
+        let table = MaterialTable::built_in();
+        let mut store = BrickStore::new();
+        for (x, name) in [from, to].into_iter().enumerate() {
+            let material = Material(table.by_name(name).unwrap().id);
+            store.insert(BrickCoord([x as i32, 0, 0]), Brick::solid(material));
+        }
+        let (client, end) = loopback();
+        let mut server = Server::new(store, [0.0; 3]);
+        client.send(stand()).unwrap();
+        for _ in 0..dig_ticks(target_hardness(None)) {
+            server.tick(std::slice::from_ref(&end));
+        }
+        received(&client);
+        let first = EditOp::dig_sphere(VoxelCoord([3, 3, 3]), 0);
+        let second = EditOp::dig_sphere(VoxelCoord([11, 3, 3]), 0);
+        assert_eq!(answers(&mut server, &end, &client, &[first]), [None]);
+        (1..1000)
+            .find(|_| answers(&mut server, &end, &client, &[second]) == [None])
+            .expect("it is made in the end")
+    }
+
+    #[test]
+    fn the_wait_is_for_the_material_dug_next_not_the_one_dug_last() {
+        let table = MaterialTable::built_in();
+        let ticks = |name: &str| dig_ticks(table.by_name(name).unwrap().hardness);
+        for (from, to) in [
+            ("sand", "rock"),
+            ("rock", "sand"),
+            ("obsidian", "sand"),
+            ("sand", "obsidian"),
+        ] {
+            // The tick that makes it is the wait of the Material dug next, less the jitter
+            // allowed, from the last Dig.
+            assert_eq!(
+                wait_after(from, to),
+                ticks(to) - DIG_EARLY_TICKS,
+                "{from} then {to}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_dig_aimed_at_air_waits_as_long_as_the_hardest_material() {
+        let (mut server, end, client) = timed();
+        // The air above the stone, which a big Brush reaches down into the stone from.
+        let big = EditOp::dig_sphere(VoxelCoord([0, 9, 3]), 6);
+        assert_eq!(answers(&mut server, &end, &client, &[big]), [None]);
+        // It was made, and the next waits as long as the hardest Material does.
+        assert_eq!(
+            answers(&mut server, &end, &client, &[big]),
+            [Some(RejectReason::TooSoon)]
+        );
+        for _ in 0..dig_ticks(target_hardness(None)) - DIG_EARLY_TICKS - 2 {
+            server.tick(std::slice::from_ref(&end));
+        }
+        assert_eq!(answers(&mut server, &end, &client, &[big]), [None]);
+    }
+
+    #[test]
+    fn the_wait_between_digs_outlasts_a_respawn_and_places_are_not_held() {
+        let (mut server, end, client) = timed();
+        let at = |i: i32| EditOp::dig_sphere(VoxelCoord([3 + 2 * i, 3, 3]), 0);
+        assert_eq!(answers(&mut server, &end, &client, &[at(0)]), [None]);
+        client.send(stand()).unwrap();
+        assert_eq!(
+            answers(&mut server, &end, &client, &[at(1)]),
+            [Some(RejectReason::TooSoon)]
+        );
+        // Places do not wait for it.
+        let put = |i: i32| place([i * 3, 20, 0], net::Shape::Sphere, 0);
+        assert_eq!(
+            answers(&mut server, &end, &client, &[put(0), put(1), put(2)]),
+            [None; 3]
+        );
+    }
+
+    #[test]
+    fn the_credit_for_inputs_rebuilds_after_a_stall_and_a_second_stall_drops_no_more_than_the_first()
+     {
+        // A stall: the client sends `lump` inputs in one tick, after which it sends one a tick.
+        // Returns how many of the lump were dropped (the inputs the server did not deal with by
+        // the end), and the ticks after which the credit was full again.
+        let stall = |server: &mut Server, end: &ServerEnd, client: &ClientEnd, seq: &mut u64| {
+            let (first, run_before) = (*seq, server.ticks_run(0).unwrap());
+            for _ in 0..12 {
+                client.send(input(*seq)).unwrap();
+                *seq += 1;
+            }
+            server.tick(std::slice::from_ref(end));
+            // One a tick from then on, until the credit is back.
+            let mut ticks = 0;
+            // (An honest client spends an input's worth of the credit each tick, which the next tick
+            // refills, so the credit is full at the start of a tick when it is that much short of
+            // full at the end of one.)
+            while server.players[0].input_credit + INPUT_COST < INPUT_BURST * INPUT_COST {
+                client.send(input(*seq)).unwrap();
+                *seq += 1;
+                server.tick(std::slice::from_ref(end));
+                ticks += 1;
+                assert!(ticks < 100, "the credit never came back");
+            }
+            // With the credit full nothing is held, so what was not run was dropped.
+            let run = server.ticks_run(0).unwrap() - run_before;
+            (*seq - first - run, ticks)
+        };
+        let (mut server, end, client) = walking();
+        let mut seq = 0;
+        let (dropped, ticks) = stall(&mut server, &end, &client, &mut seq);
+        // The burst comes back in about half a second after the inputs that were held have been
+        // applied (a tick refills one eighth more than the input it applies), which is under a
+        // second in all.
+        assert!(ticks <= u64::from(TICK_RATE_HZ), "{ticks}");
+        let (dropped_again, _) = stall(&mut server, &end, &client, &mut seq);
+        assert!(
+            dropped_again <= dropped,
+            "{dropped_again} against {dropped}"
+        );
     }
 }

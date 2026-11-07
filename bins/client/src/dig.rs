@@ -1,24 +1,10 @@
 //! Hardness-timed digging: how long the player holds the button before a Dig is made.
 //!
 //! The client times the hold and then sends one ordinary `EditOp`, so the network message and the
-//! simulation do not know of it. The server does not check the time (see #90).
+//! simulation do not know of it. How long it takes is [`sim::dig_seconds`], which the server also
+//! uses to hold a player to a Dig no sooner than that after the last.
 
 use net::EditOp;
-
-/// Seconds of holding per unit of hardness (0 to 10 in `materials.toml`): sand (1) takes 0.15 s,
-/// soil (2) 0.3 s, rock (6) 0.9 s, obsidian (8) 1.2 s.
-pub const SECONDS_PER_HARDNESS: f64 = 0.15;
-
-/// The least a Dig takes, so that a Material with no hardness (water) is not dug faster than the
-/// server's 20 Edits a second.
-pub const MIN_SECONDS: f64 = 0.05;
-
-/// How long a Dig takes to make, in seconds, in a Material of this hardness. The hardness is that
-/// of the Material at the Voxel aimed at: what the player points at is what they feel, it needs no
-/// read of the Voxels the Brush covers, and it is the same on every frame of the hold.
-pub fn dig_seconds(hardness: f32) -> f64 {
-    (f64::from(hardness) * SECONDS_PER_HARDNESS).max(MIN_SECONDS)
-}
 
 /// The progress of the Dig being held.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -66,6 +52,7 @@ mod tests {
     use super::*;
     use brick_store::VoxelCoord;
     use materials::MaterialTable;
+    use sim::{MIN_DIG_SECONDS, dig_seconds};
 
     fn hardness(name: &str) -> f32 {
         MaterialTable::built_in().by_name(name).unwrap().hardness
@@ -92,8 +79,8 @@ mod tests {
 
     #[test]
     fn a_material_with_no_hardness_still_takes_the_least_time() {
-        assert_eq!(dig_seconds(hardness("water")), MIN_SECONDS);
-        assert_eq!(dig_seconds(0.0), MIN_SECONDS);
+        assert_eq!(dig_seconds(hardness("water")), MIN_DIG_SECONDS);
+        assert_eq!(dig_seconds(0.0), MIN_DIG_SECONDS);
     }
 
     #[test]
@@ -137,7 +124,88 @@ mod tests {
     #[test]
     fn the_least_dig_is_made_once_the_least_time_has_been_held() {
         let mut dig = Dig::default();
-        assert!(!dig.hold(MIN_SECONDS / 2.0, Some((at(0), MIN_SECONDS))));
-        assert!(dig.hold(MIN_SECONDS / 2.0, Some((at(0), MIN_SECONDS))));
+        assert!(!dig.hold(MIN_DIG_SECONDS / 2.0, Some((at(0), MIN_DIG_SECONDS))));
+        assert!(dig.hold(MIN_DIG_SECONDS / 2.0, Some((at(0), MIN_DIG_SECONDS))));
+    }
+
+    /// A player who holds the button on one Material after another, a frame at a time, as the
+    /// client does, is never turned down by the server: not on a step from a hard Material to a
+    /// soft one, nor when the first Dig is made right after the hold of its own time.
+    #[test]
+    fn the_server_never_turns_down_the_digs_of_a_player_who_holds_for_the_time() {
+        use brick_store::{Brick, BrickCoord, BrickStore, Material, VoxelCoord};
+        use net::{ClientMessage, ServerMessage, loopback};
+        use sim::{Server, TICK_RATE_HZ};
+
+        let table = MaterialTable::built_in();
+        let id = |name: &str| Material(table.by_name(name).unwrap().id);
+        // Obsidian, sand and rock side by side, with the character standing among them.
+        let mut store = BrickStore::new();
+        for (x, name) in [(0, "obsidian"), (1, "sand"), (-1, "rock")] {
+            store.insert(BrickCoord([x, 0, 0]), Brick::solid(id(name)));
+        }
+        let (client, end) = loopback();
+        let mut server = Server::new(store, [0.0; 3]);
+        client
+            .send(ClientMessage::Spawn {
+                spawn: 1,
+                position: [0.0; 3],
+            })
+            .unwrap();
+
+        let mut dig = Dig::default();
+        let mut made = 0;
+        let mut seq = 0;
+        // Each Dig is of a Voxel of its own Material, held for in frames of 1/60 s with a
+        // server tick to each frame, and a rest between some.
+        let script = [
+            ("obsidian", [3, 3, 3], 0),
+            ("sand", [9, 3, 3], 0),
+            ("rock", [-3, 3, 3], 0),
+            ("sand", [10, 3, 3], 0),
+            ("obsidian", [4, 3, 3], 30),
+            ("sand", [11, 3, 3], 0),
+            ("sand", [12, 3, 3], 0),
+        ];
+        for (name, centre, rest) in script {
+            for _ in 0..rest {
+                server.tick(std::slice::from_ref(&end));
+            }
+            let seconds = dig_seconds(sim::target_hardness(Some(id(name))));
+            let op = EditOp::dig_sphere(VoxelCoord(centre), 0);
+            // Frames until the hold is done, and then the Edit goes to the server in that frame.
+            let frames = (0..1000)
+                .find(|_| {
+                    let done = dig.hold(1.0 / f64::from(TICK_RATE_HZ), Some((op, seconds)));
+                    if done {
+                        client
+                            .send(ClientMessage::Edit {
+                                client_seq: seq,
+                                op,
+                            })
+                            .unwrap();
+                        seq += 1;
+                    }
+                    server.tick(std::slice::from_ref(&end));
+                    done
+                })
+                .expect("the hold is done");
+            assert!(frames > 0, "{name}");
+            made += 1;
+        }
+        let told: Vec<_> = std::iter::from_fn(|| client.try_recv().ok())
+            .filter(|m| {
+                matches!(
+                    m,
+                    ServerMessage::Applied { .. } | ServerMessage::Rejected { .. }
+                )
+            })
+            .collect();
+        assert_eq!(told.len(), made);
+        assert!(
+            told.iter()
+                .all(|m| matches!(m, ServerMessage::Applied { .. })),
+            "{told:?}"
+        );
     }
 }

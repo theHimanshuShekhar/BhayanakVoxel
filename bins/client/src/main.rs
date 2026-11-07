@@ -588,10 +588,16 @@ impl App {
                 }
                 let (client_end, server_end) = net::loopback();
                 let server_store = loaded.server_store;
-                self.server = Some(sim::spawn(move || server_store, vec![server_end]));
+                // The single-player client may land its character anywhere (noclip), so it has
+                // debug rights.
+                let spawn_point = drop_point(loaded.ground);
+                self.server = Some(sim::spawn(
+                    move || sim::Server::new(server_store, spawn_point).with_debug_client(0),
+                    vec![server_end],
+                ));
                 let mut world = World::new(loaded.scene, Predictor::new(loaded.store), client_end)
                     .with_loader(loaded.loader);
-                world.spawn(drop_point(loaded.ground))?;
+                world.spawn(spawn_point)?;
                 self.spawn = Some(loaded.ground);
                 self.world = Some(world);
                 self.filling_since = Some(Instant::now());

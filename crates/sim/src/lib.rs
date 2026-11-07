@@ -16,9 +16,10 @@ pub use brush::{
 };
 pub use character::{Cell, Character, Occupancy, TICK_DT};
 pub use edit::{
-    EDIT_REACH, EditBudget, MAX_BRUSH_RADIUS, MAX_SMOOTH_RADIUS, OPS_PER_SECOND, SMOOTH_WEIGHT,
-    Undo, VOXEL_BURST, VOXELS_PER_SECOND, WORK_BURST, WORK_PER_SECOND, apply, apply_changes,
-    apply_changes_from, validate, within_reach, work,
+    EDIT_REACH, EditBudget, MAX_BRUSH_RADIUS, MAX_SMOOTH_RADIUS, MIN_DIG_SECONDS, OPS_PER_SECOND,
+    SECONDS_PER_HARDNESS, SMOOTH_WEIGHT, Undo, VOXEL_BURST, VOXELS_PER_SECOND, WORK_BURST,
+    WORK_PER_SECOND, apply, apply_changes, apply_changes_from, dig_seconds, dig_ticks,
+    target_hardness, validate, within_reach, work,
 };
 pub use ground::{Footing, Ground};
 pub use movement::{ConfigError, Movement, MovementConfig, VOXELS_PER_METRE};

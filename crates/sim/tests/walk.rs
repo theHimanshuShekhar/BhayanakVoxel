@@ -126,7 +126,12 @@ impl Pair {
         lag: usize,
     ) -> Self {
         let (link, server_end) = loopback();
-        let (mut client, mut server) = (Predictor::new(client), Server::new(server));
+        let (mut client, mut server) = (
+            Predictor::new(client),
+            Server::new(server, [0.0; 3])
+                .with_debug_client(0)
+                .without_dig_timing(),
+        );
         if let Some(rate) = ground_rate {
             client = client.with_ground_rate(rate);
             server = server.with_ground_rate(rate);
@@ -286,9 +291,9 @@ const SLOW: usize = 8;
 const GOLDEN_AT_THE_EDGE: u64 = 0x2abe_ab1a_1140_ac35;
 
 /// Runs the scripted walk for `inputs` inputs, with the server's replies `lag` ticks late and
-/// `batch` inputs reaching the server in each of its ticks, and `rate` new bricks of ground per
-/// input if not the usual. Returns where the server ends and its leash, and how close to the edge
-/// of it the character got, as a fraction of the leash's radius.
+/// `batch` inputs reaching the server together, once every `batch` of its ticks, and `rate` new
+/// bricks of ground per input if not the usual. Returns where the server ends and its leash, and
+/// how close to the edge of it the character got, as a fraction of the leash's radius.
 fn scripted_walk(
     inputs: u64,
     lag: usize,
@@ -308,7 +313,11 @@ fn scripted_walk(
                 pair.client_tick(script(pair.sent));
             }
         }
-        pair.serve();
+        // The server applies an input a tick (and a burst of a few), so a bunch of `batch` is
+        // followed by the ticks that it takes to apply it.
+        for _ in 0..batch {
+            pair.serve();
+        }
         if let Some(leash) = pair.server.character(0).and_then(sim::Character::leash) {
             let from_centre = distance(pair.server_state().position, leash.centre);
             edge = edge.max(from_centre / leash.radius);
@@ -371,18 +380,18 @@ fn what_the_server_does_with_the_inputs_does_not_depend_on_how_late_the_client_h
 }
 
 /// The ground is made once per input the server applies, not once per tick of its own: so with
-/// several inputs reaching it in one tick, it holds the character to the same leashes as with
+/// several inputs reaching it together, it holds the character to the same leashes as with
 /// one, and the client (which makes its ground once per input too) stays in step.
 #[test]
 fn the_server_makes_ground_once_per_input_not_once_per_tick() {
     for batch in [3, 8] {
         let (state, leash, _) = scripted_walk(TICKS, 3, batch, None);
-        assert_eq!(fingerprint(&state, leash), GOLDEN, "{batch} inputs a tick");
+        assert_eq!(fingerprint(&state, leash), GOLDEN, "{batch} inputs at once");
         let (state, leash, _) = scripted_walk(400, 2, batch, Some(SLOW));
         assert_eq!(
             fingerprint(&state, leash),
             GOLDEN_AT_THE_EDGE,
-            "{batch} inputs a tick, held at the edge"
+            "{batch} inputs at once, held at the edge"
         );
     }
 }
@@ -895,7 +904,9 @@ fn a_character_lands_on_a_block_placed_under_it_beyond_the_spawn_and_both_sides_
 fn a_leash_from_before_a_respawn_that_arrives_after_it_is_ignored_and_the_walk_goes_on() {
     let (link, server_end) = loopback();
     let mut client = Predictor::new(test_planet());
-    let mut server = Server::new(test_planet());
+    let mut server = Server::new(test_planet(), [0.0; 3])
+        .with_debug_client(0)
+        .without_dig_timing();
     // Spawns at A, and the server's first word about it is held back...
     link.send(client.spawn([1530.0, 0.0, 0.0])).unwrap();
     let mut held = Vec::new();

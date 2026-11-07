@@ -5,13 +5,11 @@
 use std::sync::Arc;
 
 use brick_store::{Material, TableSize, VoxelCoord};
-use materials::MaterialTable;
 use net::{ClientEnd, Disconnected, EditMode, EditOp, MoveInput, TryRecvError};
 use render::reference::{Hit, Ray, trace};
 use render::{Camera, Mode, RingsFull, Scene, SceneUpdate, camera};
-use sim::Predictor;
+use sim::{Predictor, dig_seconds, target_hardness};
 
-use crate::dig::dig_seconds;
 use crate::ghost::Ghost;
 use crate::loader::Loader;
 use crate::scene_worker::{LoaderStats, SceneWorker, Stats};
@@ -463,10 +461,10 @@ impl World {
             return None;
         }
         let (op, hit) = self.aim_hit(camera, tool)?;
-        let hardness = MaterialTable::built_in()
-            .get(Material(hit.material))
-            .map_or(0.0, |def| def.hardness);
-        Some((op, dig_seconds(hardness)))
+        Some((
+            op,
+            dig_seconds(target_hardness(Some(Material(hit.material)))),
+        ))
     }
 
     /// [`World::aim`] with the Voxel that the view hit.
@@ -597,6 +595,7 @@ impl World {
 mod tests {
     use super::*;
     use brick_store::{Brick, BrickCoord, BrickStore, Material};
+    use materials::MaterialTable;
     use net::{
         ClientMessage, EditMode, Leash, RejectReason, ServerEnd, ServerMessage, Shape, loopback,
     };

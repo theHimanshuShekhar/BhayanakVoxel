@@ -8,7 +8,7 @@ use brick_store::Material;
 use brick_store::{BrickCoord, BrickStore, VoxelCoord};
 use net::{Alignment, Brush, ClientEnd, EditMode, EditOp, ServerMessage, Shape, loopback};
 use planet_gen::generate_region;
-use sim::{Character, Movement, Predictor};
+use sim::{Character, Movement, Predictor, Server};
 
 const SEED: u64 = 0xB4A7_A9AC;
 
@@ -119,7 +119,10 @@ fn two_clients_and_the_server_have_identical_bricks_after_overlapping_runs_of_ed
     let server = sim::spawn(
         move || {
             wait.recv().expect("the test releases the server");
-            surface()
+            Server::new(surface(), [0.0; 3])
+                .with_debug_client(0)
+                .with_debug_client(1)
+                .without_dig_timing()
         },
         vec![second_server, first_server],
     );

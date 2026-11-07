@@ -3,7 +3,7 @@
 //! the ones the server sends. All of them must end with identical bricks (ADR 0003), so
 //! everything here is integer maths in a fixed order, and `clippy.toml` bans what is not.
 
-use brick_store::{Brick, BrickCoord, BrickStore, LodRefresh, VoxelCoord};
+use brick_store::{Brick, BrickCoord, BrickStore, LodRefresh, Material, VoxelCoord};
 use materials::MaterialTable;
 use net::{EditMode, EditOp, RejectReason};
 
@@ -56,6 +56,38 @@ pub fn work(op: &EditOp) -> u64 {
         1
     };
     crate::examined(op).saturating_mul(weight)
+}
+
+/// Seconds of holding per unit of hardness (0 to 10 in `materials.toml`): sand (1) takes 0.15 s,
+/// soil (2) 0.3 s, rock (6) 0.9 s, obsidian (8) 1.2 s.
+pub const SECONDS_PER_HARDNESS: f64 = 0.15;
+
+/// The least a Dig takes, so that a Material with no hardness (water) is not dug faster than the
+/// server's 20 Edits a second.
+pub const MIN_DIG_SECONDS: f64 = 0.05;
+
+/// The hardness that a Dig aimed at a Voxel of `material` takes: the Material's own, and the
+/// greatest there is (10, see `materials.toml`) for air or a Material that the table does not
+/// define. A client aims at solid Voxels it can see, so the second case is for a Dig that someone
+/// else's has just emptied or that a modified client aims at the air beside the rock, with a
+/// Brush that reaches into it: it is no way round the time.
+pub fn target_hardness(material: Option<Material>) -> f32 {
+    material
+        .and_then(|material| MaterialTable::built_in().get(material))
+        .map_or(10.0, |def| def.hardness)
+}
+
+/// How long a Dig takes to make, in seconds, in a Material of this hardness: the time the client
+/// makes the player hold the button, and the time the server makes a player wait between Digs
+/// ([`dig_ticks`]).
+pub fn dig_seconds(hardness: f32) -> f64 {
+    (f64::from(hardness) * SECONDS_PER_HARDNESS).max(MIN_DIG_SECONDS)
+}
+
+/// [`dig_seconds`] in server ticks, to the nearest tick, so that the server's count of it does not
+/// depend on the clock.
+pub fn dig_ticks(hardness: f32) -> u64 {
+    (dig_seconds(hardness) * f64::from(TICK_RATE_HZ)).round() as u64
 }
 
 /// What the server checks of an Edit before it applies it, apart from the limits that depend on
@@ -724,6 +756,24 @@ mod tests {
                 Err(RejectReason::BrushTooLarge)
             );
         }
+    }
+
+    fn hardness(name: &str) -> f32 {
+        MaterialTable::built_in().by_name(name).unwrap().hardness
+    }
+
+    #[test]
+    fn the_time_of_a_dig_scales_with_the_hardness_and_is_counted_in_whole_ticks() {
+        let seconds = |name| dig_seconds(hardness(name));
+        assert!((seconds("sand") - 0.15).abs() < 1e-9);
+        assert!((seconds("obsidian") - 1.2).abs() < 1e-9);
+        assert!((dig_seconds(4.0) - 2.0 * dig_seconds(2.0)).abs() < 1e-12);
+        assert_eq!(dig_ticks(hardness("sand")), 9);
+        assert_eq!(dig_ticks(hardness("obsidian")), 72);
+        // Water has none, and still takes the least time.
+        assert_eq!(dig_seconds(hardness("water")), MIN_DIG_SECONDS);
+        assert_eq!(dig_seconds(0.0), MIN_DIG_SECONDS);
+        assert_eq!(dig_ticks(0.0), 3);
     }
 
     #[test]
