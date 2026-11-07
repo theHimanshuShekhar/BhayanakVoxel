@@ -31,7 +31,9 @@ fn place(shape: Shape, radius: u16, centre: [i32; 3]) -> EditOp {
 fn ask(ops: &[EditOp]) -> Vec<Option<RejectReason>> {
     let (link, end) = loopback();
     let mut client = Predictor::new(surface());
-    let mut server = Server::new(surface());
+    let mut server = Server::new(surface(), [0.0; 3])
+        .with_debug_client(0)
+        .without_dig_timing();
     link.send(client.spawn(STANDING)).unwrap();
     for &op in ops {
         link.send(client.edit(op).0).unwrap();
@@ -116,7 +118,9 @@ fn a_material_that_is_not_defined_is_turned_down_and_the_client_takes_it_back() 
 #[test]
 fn the_limits_come_back_with_time() {
     let (link, end) = loopback();
-    let mut server = Server::new(surface());
+    let mut server = Server::new(surface(), [0.0; 3])
+        .with_debug_client(0)
+        .without_dig_timing();
     let mut client = Predictor::new(surface());
     link.send(client.spawn(STANDING)).unwrap();
     let op = place(Shape::Sphere, 1, [1505, 0, 0]);

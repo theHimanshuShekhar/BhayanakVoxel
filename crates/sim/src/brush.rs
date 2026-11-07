@@ -133,6 +133,11 @@ impl<'a> Reads<'a> {
         self
     }
 
+    /// The Voxel at `voxel`: `None` for air.
+    pub fn get(&mut self, voxel: VoxelCoord) -> Option<Material> {
+        self.brick(voxel.brick()).get(voxel.local())
+    }
+
     fn brick(&mut self, coord: BrickCoord) -> BrickRef<'a> {
         if let Some(brick) = self.store.brick(coord) {
             return BrickRef::Held(brick);

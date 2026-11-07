@@ -43,6 +43,11 @@ struct PendingInput {
     after: BodyState,
 }
 
+/// The most inputs that a client has sent and the server has not yet dealt with, ten seconds of
+/// them. At the bound the character waits, as it does for the server's leash, rather than run on
+/// with no word from the server.
+pub const MAX_PENDING_INPUTS: usize = 600;
+
 /// The leash that holds for input `seq`: the latest that the server said holds from then or
 /// before.
 fn leash_at(leashes: &VecDeque<(u64, Leash)>, seq: u64) -> Option<Leash> {
@@ -178,17 +183,19 @@ impl Predictor {
         self.budget.refill();
         let character = self.character.as_mut()?;
         let seq = self.next_input_seq;
-        let leash = leash_at(&self.leashes, seq).filter(|leash| {
-            if self.covered != Some(*leash) {
-                if !self.ground.covers(leash) {
-                    // Not made yet: make it, even if the character is somewhere else.
-                    self.ground.centre_on(leash);
-                    return false;
+        let leash = leash_at(&self.leashes, seq)
+            .filter(|_| self.pending_inputs.len() < MAX_PENDING_INPUTS)
+            .filter(|leash| {
+                if self.covered != Some(*leash) {
+                    if !self.ground.covers(leash) {
+                        // Not made yet: make it, even if the character is somewhere else.
+                        self.ground.centre_on(leash);
+                        return false;
+                    }
+                    self.covered = Some(*leash);
                 }
-                self.covered = Some(*leash);
-            }
-            true
-        });
+                true
+            });
         let request = leash.map(|leash| {
             character.set_leash(Some(leash));
             character.tick(&Footing::new(&read(&self.store), &self.ground), &input);
@@ -226,9 +233,17 @@ impl Predictor {
         {
             self.leashes.pop_front();
         }
-        // With no input applied yet (just after a spawn) the prediction is the spawn.
-        let same = predicted.map_or(applied == 0, |p| p.identical(&state));
-        if same {
+        // With no input applied yet (just after a spawn) the prediction is the spawn, unless the
+        // server put the character somewhere else than it asked: then the character is where the
+        // server says, and the ground is made there.
+        if applied == 0 && predicted.is_none() {
+            if self.pending_inputs.is_empty() && !character.state().identical(&state) {
+                character.set_state(state);
+                self.ground.reset(state.position);
+            }
+            return;
+        }
+        if predicted.is_some_and(|p| p.identical(&state)) {
             return;
         }
         self.body_desyncs += 1;
@@ -668,6 +683,7 @@ mod tests {
                     | RejectReason::OutOfRange
                     | RejectReason::BadRotation
                     | RejectReason::UnknownMaterial
+                    | RejectReason::TooSoon
             )
         );
         if asked_work {
@@ -685,6 +701,7 @@ mod tests {
         for reason in [
             RejectReason::RateLimited,
             RejectReason::OutOfReach,
+            RejectReason::TooSoon,
             RejectReason::VolumeLimited,
         ] {
             let mut client = Predictor::new(mass());
@@ -784,6 +801,21 @@ mod tests {
         assert_eq!(client.pending(), 0);
         assert_eq!(client.store().content_hash(), after);
         assert_eq!(after, hash_after(&[op([3, 3, 3])]));
+    }
+
+    #[test]
+    fn a_dig_that_is_too_soon_rolls_the_change_back_like_any_reject() {
+        let mut client = Predictor::new(stone_store());
+        let before = client.store().content_hash();
+        client.edit(op([3, 3, 3]));
+        client.edit(op([-3, 3, 3]));
+        let reject = rejected_with(0, RejectReason::TooSoon);
+        assert!(!client.receive(reject).is_empty());
+        assert_eq!(client.pending(), 1, "the later Dig stays");
+        assert_eq!(client.store().content_hash(), hash_after(&[op([-3, 3, 3])]));
+        client.receive(rejected_with(1, RejectReason::TooSoon));
+        assert_eq!(client.pending(), 0);
+        assert_eq!(client.store().content_hash(), before);
     }
 
     #[test]
@@ -1007,6 +1039,65 @@ mod tests {
         assert_eq!(client.body_desyncs(), 1);
         let now = client.character().unwrap().state();
         assert!(now.identical(&want), "{now:?}\n{want:?}");
+    }
+
+    #[test]
+    fn the_character_goes_where_the_server_put_it_when_that_is_not_where_it_asked() {
+        let mut client = Predictor::new(flat_store());
+        client.spawn(START);
+        let mut put = *client.character().unwrap().state();
+        put.position = [10.0, 3.0, 0.0];
+        client.receive(ServerMessage::Body {
+            spawn: 1,
+            applied: 0,
+            state: put,
+        });
+        assert!(client.character().unwrap().state().identical(&put));
+        // Not a desync, which is a prediction that was wrong.
+        assert_eq!(client.body_desyncs(), 0);
+        // The ground is made around the place, and the walk goes on from it.
+        client.receive(ServerMessage::Leash {
+            spawn: 1,
+            from: 0,
+            leash: Leash {
+                centre: [10.0, 3.0, 0.0],
+                radius: 80.0,
+            },
+        });
+        assert!((0..300).any(|_| client.walk(forward()).is_some()));
+        assert!(client.ground().covers(&Leash {
+            centre: [10.0, 3.0, 0.0],
+            radius: 80.0,
+        }));
+    }
+
+    #[test]
+    fn inputs_the_server_has_not_dealt_with_are_bounded_and_the_character_waits_at_the_bound() {
+        let mut client = Predictor::new(flat_store());
+        client.spawn(START);
+        client.receive(ServerMessage::Leash {
+            spawn: 1,
+            from: 0,
+            leash: ball(80.0),
+        });
+        // The server says nothing more: the client sends no more than the bound.
+        let sent = (0..MAX_PENDING_INPUTS * 3)
+            .filter(|_| client.walk(forward()).is_some())
+            .count();
+        assert_eq!(sent, MAX_PENDING_INPUTS);
+        // Its word frees room, and the numbering goes on without a gap.
+        let mut told = *client.character().unwrap().state();
+        told.position[0] += 1.0;
+        client.receive(ServerMessage::Body {
+            spawn: 1,
+            applied: 100,
+            state: told,
+        });
+        let next = (0..10).find_map(|_| client.walk(forward()));
+        assert!(matches!(
+            next,
+            Some(ClientMessage::Input { seq, .. }) if seq == MAX_PENDING_INPUTS as u64
+        ));
     }
 
     #[test]

@@ -109,6 +109,10 @@ pub enum RejectReason {
     VolumeLimited,
     /// A rotation that is not 0 to 7.
     BadRotation,
+    /// A Dig made before the player has had the time to dig the last one, which depends on how
+    /// hard the Material at the target is (see `sim::dig_seconds`). The client times its own
+    /// Digs the same way, so an honest client is not turned down for this, bar network jitter.
+    TooSoon,
 }
 
 /// What a player asks of their character for one tick (the sim's fixed step): plain data, so
@@ -177,6 +181,14 @@ pub enum ClientMessage {
     /// a `Body` for no inputs applied yet, and with the first `Leash` once the ground around the
     /// character is ready.
     ///
+    /// **Where the character stands is the server's to decide.** The first spawn of a client is
+    /// put at the server's own spawn point, whatever `position` says. A later one is accepted at
+    /// `position` only if that is inside the leash of the character the client already has; if it
+    /// is not (or is NaN), the character is put at the centre of that leash, or where it stands
+    /// if it has none yet. A client that the server has given debug rights (the single-player
+    /// server gives them to its one client) is put at `position` always. Either way the `Body`
+    /// says where the character is, and the client takes that place.
+    ///
     /// **Inputs before the first leash.** A client sends no input until it has that first
     /// leash. If one arrives anyway (a stale leash let it go early), the server holds it, in
     /// order, up to a bound, and applies it when the leash exists: it is neither applied
@@ -184,6 +196,21 @@ pub enum ClientMessage {
     Spawn { spawn: u64, position: [f64; 3] },
     /// The character's input for one tick. `seq` numbers the client's inputs from 0 upwards;
     /// the server applies them in order, each as one tick.
+    ///
+    /// **Rate.** The server applies about one input per tick to a client: a credit that a tick
+    /// refills by one, up to a small burst so that a late tick can catch up. Inputs that arrive
+    /// faster wait, a burst's worth of them, and the rest are dropped. A client that floods inputs
+    /// gets no more of them applied, nor more ground generated, than one that sends them as it
+    /// should.
+    ///
+    /// **Gaps and reordering.** An input with a `seq` before the next one due is a repeat or
+    /// came late, and is ignored. One with a `seq` past the one due (the ones between were lost,
+    /// or dropped for the rate) is taken all the same, and the missing inputs are skipped, never
+    /// run, so that a gap cannot freeze the character. The server counts the inputs it has dealt
+    /// with as `seq + 1`, which [`ServerMessage::Body`] reports, and the client runs again, from
+    /// the server's state, the ones it has sent since. A `seq` more than the bound (600) past
+    /// the one due is ignored, as no honest client is so far ahead. The channel is ordered, so a
+    /// gap comes only from the rate or from a client's own mistake.
     Input { seq: u64, input: MoveInput },
 }
 
@@ -205,8 +232,9 @@ pub enum ServerMessage {
         client_seq: u64,
         reason: RejectReason,
     },
-    /// The server has applied the first `applied` inputs of this client's character (none, just
-    /// after a spawn), and this is where the character is then. Sent once per server tick in
+    /// The server has dealt with the first `applied` inputs of this client's character (none,
+    /// just after a spawn; a gap is skipped over, see [`ClientMessage::Input`]), and this is
+    /// where the character is then. Sent once per server tick in
     /// which any arrived. `spawn` is the [`ClientMessage::Spawn`] it is for.
     Body {
         spawn: u64,
