@@ -44,3 +44,7 @@ opt-level = 3
 # Voxel the capsule touches. IEEE-exact operations give the same bits in every profile.
 [profile.dev.package.sim]
 opt-level = 3
+
+# The simulator replays camera paths through every brick of a shell, thousands of times over.
+[profile.dev.package.prefetch-sim]
+opt-level = 3
