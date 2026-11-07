@@ -214,8 +214,8 @@ fn looks_at(face: &Face, eye: [f64; 3]) -> bool {
     (eye[face.axis] - f64::from(face.plane())) * side > 0.0
 }
 
-/// Nearer than this, in Voxels, a point is not drawn.
-const NEAR: f64 = 0.5;
+/// Nearer than this, in Voxels (5 cm), a point is not drawn.
+const NEAR: f64 = 0.05 * brick_store::VOXELS_PER_METRE;
 
 /// Where `point`, in Voxels, is on a screen of this `aspect`: from 0 to 1 across and down from the
 /// top left. `None` if it is behind the camera or too near it.

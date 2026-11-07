@@ -1,6 +1,6 @@
 //! The Brush the player has picked: what the mouse applies, and the hotbar of tools it comes from.
 
-use brick_store::{Material, VoxelCoord};
+use brick_store::{Material, VOXELS_PER_METRE, VoxelCoord};
 use materials::MaterialTable;
 use net::{Alignment, Brush, EditMode, EditOp, Shape};
 use sim::{MAX_BRUSH_RADIUS, MAX_SMOOTH_RADIUS};
@@ -18,8 +18,9 @@ pub const HOTBAR: [(EditMode, Shape); 9] = [
     (EditMode::Flatten, Shape::Cylinder),
 ];
 
-/// The radius the client starts with: 1 m at 10 cm Voxels.
-pub(crate) const DEFAULT_RADIUS: u16 = 10;
+/// The radius the client starts with: 1 m, in Voxels.
+pub(crate) const DEFAULT_RADIUS: u16 = VOXELS_PER_METRE as u16;
+const _: () = assert!(DEFAULT_RADIUS <= MAX_BRUSH_RADIUS);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Tool {
@@ -136,8 +137,8 @@ impl Tool {
             Alignment::World => "grid",
         };
         format!(
-            "{mode} {shape} {} cm{fill}, {grid}",
-            (u32::from(self.radius) * 2 + 1) * 10
+            "{mode} {shape} {:.0} cm{fill}, {grid}",
+            (f64::from(self.radius) * 2.0 + 1.0) * 100.0 / VOXELS_PER_METRE
         )
     }
 }
@@ -209,7 +210,7 @@ mod tests {
         let tool = Tool::default();
         assert_eq!(
             tool.op(VoxelCoord([1, 2, 3]), 0),
-            EditOp::dig_sphere(VoxelCoord([1, 2, 3]), 10)
+            EditOp::dig_sphere(VoxelCoord([1, 2, 3]), DEFAULT_RADIUS)
         );
     }
 
@@ -244,17 +245,17 @@ mod tests {
     #[test]
     fn resizing_goes_from_a_voxel_to_2_m() {
         let mut tool = Tool::default();
-        tool.resize(-30);
+        tool.resize(-100);
         assert_eq!(tool.radius, 0);
-        tool.resize(30);
+        tool.resize(100);
         assert_eq!(tool.radius, MAX_BRUSH_RADIUS);
         assert!(sim::validate(&tool.op(VoxelCoord([0; 3]), 0)).is_ok());
     }
 
     #[test]
-    fn a_smooth_or_a_flatten_is_held_to_radius_10_and_a_dig_or_a_place_to_20() {
+    fn a_smooth_or_a_flatten_is_held_to_1_m_and_a_dig_or_a_place_to_2_m() {
         let mut tool = Tool::default();
-        tool.resize(30);
+        tool.resize(100);
         assert_eq!(tool.radius, MAX_BRUSH_RADIUS);
         // Picking Smooth takes it down to what the server allows, and it does not go up again.
         tool.select(6);
@@ -308,10 +309,10 @@ mod tests {
     #[test]
     fn the_title_says_what_the_tool_does() {
         let mut tool = Tool::default();
-        assert_eq!(tool.describe(), "dig sphere 210 cm, local up");
+        assert_eq!(tool.describe(), "dig sphere 205 cm, local up");
         tool.select(4);
         tool.toggle_alignment();
-        assert_eq!(tool.describe(), "place cube 210 cm, rock, grid");
+        assert_eq!(tool.describe(), "place cube 205 cm, rock, grid");
     }
 
     #[test]

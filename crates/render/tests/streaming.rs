@@ -5,7 +5,7 @@
 
 use std::sync::OnceLock;
 
-use brick_store::{BrickCoord, BrickStore, VoxelCoord, children_from};
+use brick_store::{BrickCoord, BrickStore, VOXELS_PER_METRE, VoxelCoord, children_from};
 use planet_gen::planet::{Planet, tangents};
 use planet_gen::world_map::WorldMap;
 use render::lod::{Bands, brick_distance};
@@ -14,17 +14,15 @@ use render::scene::Bound;
 use render::{Camera, Scene, camera};
 
 const SEED: u64 = 0xB4A7_A9AC;
-/// Levels above level 0 that the pyramid has: levels 0 to 12.
-const PYRAMID: usize = 12;
-/// The Guard of these tests is levels 10 to 12; the real one is 8 to 12.
-const GUARD: std::ops::RangeInclusive<usize> = 10..=12;
-const FLOOR: usize = 10;
-/// Voxels around the spawn that the ring has: 16 m.
+/// Levels above level 0 that the pyramid has: levels 0 to 13.
+const PYRAMID: usize = 13;
+/// The Guard of these tests is levels 11 to 13; the real one is 9 to 13.
+const GUARD: std::ops::RangeInclusive<usize> = 11..=13;
+const FLOOR: usize = 11;
+/// Voxels around the spawn that the ring has: 8 m.
 const RING: i32 = 160;
 /// Level 1 from 128 Voxels, level 2 from 256, and so on: a scale that fits in a test.
 const D0: f64 = 64.0;
-/// A Voxel is 10 cm.
-const VOXELS_PER_METRE: f64 = 10.0;
 
 struct World {
     planet: Planet,
@@ -120,7 +118,8 @@ fn camera_at(along: f64) -> Camera {
     let length = ground.iter().map(|c| c * c).sum::<f64>().sqrt();
     let up = ground.map(|c| c / length);
     let (ahead, _) = tangents(up);
-    let position = std::array::from_fn(|a| ground[a] + up[a] * 40.0 + ahead[a] * along);
+    let position =
+        std::array::from_fn(|a| ground[a] + up[a] * 4.0 * VOXELS_PER_METRE + ahead[a] * along);
     let mut camera = Camera::looking_at(position, std::array::from_fn(|a| position[a] + ahead[a]));
     camera.carry_up(position);
     camera
@@ -292,8 +291,8 @@ fn walking_at_5_m_per_s_while_the_loader_keeps_up_a_little_at_a_time_leaves_no_h
     let mut oracle = Scene::rings(&oracle_store, camera.position, bands(), bound()).unwrap();
     let mut loader = Loader::default();
     let ahead = tangents(camera.horizon_up).0;
-    // 5 m/s is 50 Voxels a second, at 60 frames a second; 8 seconds, past the ring and its 16 m.
-    let step = 50.0 / 60.0;
+    // 5 m/s at 60 frames a second; 8 seconds, past the ring and its 8 m.
+    let step = 5.0 * VOXELS_PER_METRE / 60.0;
     let (mut hits, mut coarser, mut compared, mut checks) = (0, 0, 0, 0);
     for frame in 0..480 {
         // Along the ground, 4 m over it, as a walker is: a camera that goes straight on is in
@@ -302,7 +301,7 @@ fn walking_at_5_m_per_s_while_the_loader_keeps_up_a_little_at_a_time_leaves_no_h
             |p: [f64; 3]| -> [f64; 3] { std::array::from_fn(|a| p[a] + ahead[a] * step) };
         let moved = ahead_of(camera.position);
         let length = moved.iter().map(|c| c * c).sum::<f64>().sqrt();
-        let target = ground_radius(moved) + 40.0;
+        let target = ground_radius(moved) + 4.0 * VOXELS_PER_METRE;
         let position = moved.map(|c| c * target / length);
         camera.position = position;
         camera.carry_up(position);
@@ -428,7 +427,7 @@ fn ground_radius(position: [f64; 3]) -> f64 {
     let up = unit(position);
     let length = position.iter().map(|c| c * c).sum::<f64>().sqrt();
     let at = |r: f64| VoxelCoord(up.map(|u| (u * r).floor() as i32));
-    let mut r = length + 80.0;
+    let mut r = length + 8.0 * VOXELS_PER_METRE;
     while planet.voxel(at(r)).is_none() {
         r -= 1.0;
     }
@@ -437,7 +436,7 @@ fn ground_radius(position: [f64; 3]) -> f64 {
 
 #[test]
 fn flying_at_20_m_per_s_leaves_no_hole_in_the_ground_ahead_of_the_camera() {
-    // 4 m over the ground and 20 m/s, which is 200 Voxels a second, with the loader reading six
+    // 4 m over the ground and 20 m/s, with the loader reading six
     // bricks' children a frame. A coarse brick just over a slope can be air at the middle of its
     // Voxels with ground under it that pokes into it: if it is not drawn, a ray goes through the
     // ground and hits what is under it.
@@ -452,9 +451,10 @@ fn flying_at_20_m_per_s_leaves_no_hole_in_the_ground_ahead_of_the_camera() {
         let up = unit(position);
         let along: f64 = ahead.iter().zip(&up).map(|(f, u)| f * u).sum();
         let heading = unit(std::array::from_fn(|a| ahead[a] - up[a] * along));
-        position = std::array::from_fn(|a| position[a] + heading[a] * 200.0 / 60.0);
+        position =
+            std::array::from_fn(|a| position[a] + heading[a] * 20.0 * VOXELS_PER_METRE / 60.0);
         let length = position.iter().map(|c| c * c).sum::<f64>().sqrt();
-        let target = ground_radius(position) + 40.0;
+        let target = ground_radius(position) + 4.0 * VOXELS_PER_METRE;
         position = position.map(|c| c * target / length);
         scene.recentre(&store, position).unwrap();
         loader.pump(&mut store, &mut scene, position, 6);

@@ -66,7 +66,7 @@ const GHOST_BACKOFF: u32 = 8;
 /// How far the player aims an Edit, in Voxels: 7.5 m, which leaves half a metre of the server's
 /// reach ([`sim::EDIT_REACH`], measured from where the server has the character) for the character
 /// to have moved on from where the client saw it.
-pub(crate) const AIM_REACH: f64 = sim::EDIT_REACH - 5.0;
+pub(crate) const AIM_REACH: f64 = sim::EDIT_REACH - 0.5 * brick_store::VOXELS_PER_METRE;
 
 /// Why the Planet cannot be kept going.
 #[derive(Debug, PartialEq, Eq)]
@@ -713,7 +713,7 @@ mod tests {
         }
         // Standing where it was put, eyes 1.6 m up: it waits.
         let eye = world.eye().unwrap();
-        assert!((eye[0] - (4036.0 + 16.0)).abs() < 0.1, "{eye:?}");
+        assert!((eye[0] - (4036.0 + 32.0)).abs() < 0.1, "{eye:?}");
 
         // The server's word: a ball round the spawn's brick, wide enough for the whole wall. The
         // wall's bricks are in the store, and the rest of the ground is air.
@@ -732,7 +732,7 @@ mod tests {
             world.walk(MoveInput::default()).unwrap();
         }
         let eye = world.eye().unwrap();
-        assert!((4032.0 + 15.0..4032.0 + 17.0).contains(&eye[0]), "{eye:?}");
+        assert!((4032.0 + 31.0..4032.0 + 33.0).contains(&eye[0]), "{eye:?}");
 
         assert_eq!(
             server.try_recv(),
@@ -836,7 +836,7 @@ mod tests {
     #[test]
     fn nothing_is_aimed_at_beyond_the_reach() {
         let (mut world, server) = world();
-        let far = Camera::looking_at([4016.5, 16.5, 120.5], [4016.5, 16.5, 0.0]);
+        let far = Camera::looking_at([4016.5, 16.5, 220.5], [4016.5, 16.5, 0.0]);
         assert_eq!(world.aim(&far, &Tool::default()), None);
         assert!(world.edit(&far, &Tool::default()).unwrap().is_none());
         assert_eq!(server.try_recv(), Err(TryRecvError::Empty));
@@ -1001,11 +1001,11 @@ mod tests {
     #[test]
     fn an_edit_that_would_change_more_voxels_than_are_left_is_not_made_and_its_ghost_is_grey() {
         let (mut world, server) = world();
-        // A cube of 41 Voxels a side, on the wall's face, in the air: 68 921 Voxels of the 72 000.
+        // The biggest cube, 81 Voxels a side, on the wall's face, in the air: 531 441 Voxels of the 576 000.
         let tool = Tool {
             mode: EditMode::Place,
             shape: Shape::Cube,
-            radius: 20,
+            radius: sim::MAX_BRUSH_RADIUS,
             material: Material(35),
             alignment: net::Alignment::World,
         };
@@ -1013,14 +1013,14 @@ mod tests {
         world.show_ghost(&back, &tool);
         assert!(!world.ghost().unwrap().blocked);
         assert!(world.edit(&back, &tool).unwrap().is_some());
-        // Another on the face of that one would change as many, and there are 3 079 left.
+        // Another on the face of that one would change as many, and there are 44 559 left.
         world.show_ghost_at(
             &back,
             &tool,
             std::time::Instant::now() + std::time::Duration::from_secs(5),
         );
         let ghost = world.ghost().unwrap();
-        assert!(ghost.changed > 3_079 && ghost.blocked, "{}", ghost.changed);
+        assert!(ghost.changed > 44_559 && ghost.blocked, "{}", ghost.changed);
         assert!(world.edit(&back, &tool).unwrap().is_none());
         let mut sent = 0;
         while let Ok(ClientMessage::Edit { .. }) = server.try_recv() {
@@ -1028,8 +1028,10 @@ mod tests {
         }
         assert_eq!(sent, 1);
         // A small one fits, and is made.
+        // (from further back: the camera is in the big cube).
         let small = Tool { radius: 4, ..tool };
-        assert!(world.edit(&back, &small).unwrap().is_some());
+        let further = Camera::looking_at([4016.5, 16.5, 140.5], [4016.5, 16.5, 0.0]);
+        assert!(world.edit(&further, &small).unwrap().is_some());
     }
 
     #[test]
@@ -1081,11 +1083,16 @@ mod tests {
     #[test]
     fn an_ack_keeps_the_hole_and_a_reject_fills_it_again() {
         let (mut world, server) = world();
+        // Holes of half a metre in radius: the wall can take two of them one behind the other.
+        let small = Tool {
+            radius: 10,
+            ..Tool::default()
+        };
         let hit = |world: &World| centre_hit(world.scene(), &camera()).unwrap().voxel;
         let whole = hit(&world);
-        world.edit(&camera(), &Tool::default()).unwrap();
+        world.edit(&camera(), &small).unwrap();
         let first = hit(&world);
-        world.edit(&camera(), &Tool::default()).unwrap();
+        world.edit(&camera(), &small).unwrap();
         let second = hit(&world);
         assert!(whole != first && first != second);
         let Ok(ClientMessage::Edit { op, .. }) = server.try_recv() else {

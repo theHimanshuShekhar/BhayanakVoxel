@@ -4,9 +4,10 @@
 use serde::Serialize;
 
 use super::budget::{Budgets, Status, status};
+use super::edits::EditsReport;
 use super::stats::Stats;
 
-pub const SCHEMA_VERSION: u32 = 4;
+pub const SCHEMA_VERSION: u32 = 5;
 
 /// One timed thing (a pass, or the GPU total of a profiler frame) in one mode, against its
 /// budget. In reference mode a profiler frame is one sample, so the entries of that mode have
@@ -181,7 +182,13 @@ pub struct BudgetSummary {
 }
 
 /// How `modes` fared against `budgets`; a run with `diag` switches on is not held to them.
-pub fn summarize(source: &str, budgets: &Budgets, modes: &Modes, diag: &[String]) -> BudgetSummary {
+pub fn summarize(
+    source: &str,
+    budgets: &Budgets,
+    modes: &Modes,
+    edits: Option<&Entry>,
+    diag: &[String],
+) -> BudgetSummary {
     if !diag.is_empty() {
         return BudgetSummary {
             source: source.to_string(),
@@ -198,11 +205,17 @@ pub fn summarize(source: &str, budgets: &Budgets, modes: &Modes, diag: &[String]
         .entries()
         .filter(|(_, e)| e.status.fails())
         .map(|(mode, e)| format!("{mode}/{}", e.name))
+        .chain(
+            edits
+                .filter(|e| e.status.fails())
+                .map(|e| format!("edits/{}", e.name)),
+        )
         .collect();
     let unmatched = budgets
         .passes
         .keys()
         .filter(|name| !modes.entries().any(|(_, e)| &e.name == *name))
+        .filter(|name| !edits.is_some_and(|e| &e.name == *name))
         .map(|name| format!("passes.{name}"))
         .collect();
     BudgetSummary {
@@ -272,6 +285,9 @@ pub struct Report {
     /// File names, in the output folder.
     pub screenshots: Vec<String>,
     pub budgets: BudgetSummary,
+    /// The Edit stress: the largest Brush, dug and placed in turn at the metric rate, on the
+    /// whole Planet; null for `--short`.
+    pub edits: Option<EditsReport>,
 }
 
 #[cfg(test)]
@@ -306,10 +322,10 @@ mod tests {
     fn a_diagnostic_run_is_marked_and_not_held_to_its_budgets() {
         // Far over the 1 ms budget, which a measurement would fail.
         let slow = modes(5.0);
-        let measured = summarize("embedded", &budgets(), &slow, &[]);
+        let measured = summarize("embedded", &budgets(), &slow, None, &[]);
         assert!(!measured.ok && !measured.failed.is_empty() && measured.skipped.is_none());
         let diag = vec!["no-follow".to_string(), "gap-ms=2".to_string()];
-        let skipped = summarize("embedded", &budgets(), &slow, &diag);
+        let skipped = summarize("embedded", &budgets(), &slow, None, &diag);
         assert!(!skipped.ok && skipped.failed.is_empty());
         let reason = skipped.skipped.expect("a reason");
         assert!(reason.contains("no-follow,gap-ms=2") && reason.contains("not checked"));
@@ -387,7 +403,7 @@ mod tests {
 
     #[test]
     fn the_summary_is_ok_when_nothing_is_over() {
-        let summary = summarize("embedded", &budgets(), &modes(0.5), &[]);
+        let summary = summarize("embedded", &budgets(), &modes(0.5), None, &[]);
         assert!(summary.ok, "{summary:?}");
         assert!(summary.failed.is_empty());
         assert_eq!(summary.source, "embedded");
@@ -395,7 +411,7 @@ mod tests {
 
     #[test]
     fn the_summary_names_what_failed_and_which_budgets_matched_nothing() {
-        let summary = summarize("b.toml", &budgets(), &modes(3.0), &[]);
+        let summary = summarize("b.toml", &budgets(), &modes(3.0), None, &[]);
         assert!(!summary.ok);
         // 3.0 ms is over the pass's 1.0 ms, but within the 8.6 ms of the whole frame.
         assert_eq!(summary.failed, ["primary/primary"]);
@@ -448,7 +464,8 @@ mod tests {
                 reference: Stats::of(&[1.5]),
             }],
             screenshots: vec!["primary-0.png".into()],
-            budgets: summarize("embedded", &budgets(), &modes(0.5), &[]),
+            budgets: summarize("embedded", &budgets(), &modes(0.5), None, &[]),
+            edits: None,
         };
         let json = serde_json::to_value(&report).unwrap();
         let keys = |v: &serde_json::Value| -> Vec<String> {
@@ -462,13 +479,14 @@ mod tests {
                 "build",
                 "caves",
                 "config",
+                "edits",
                 "machine",
                 "modes",
                 "schema_version",
                 "screenshots"
             ]
         );
-        assert_eq!(json["schema_version"], 4);
+        assert_eq!(json["schema_version"], 5);
         assert_eq!(
             keys(&json["caves"][0]),
             ["bricks", "name", "primary", "reference", "upscale"]

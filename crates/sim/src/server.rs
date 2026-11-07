@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use brick_store::{BrickStore, VoxelCoord};
+use brick_store::{BrickStore, VOXELS_PER_METRE, VoxelCoord};
 use net::{
     ClientMessage, EditMode, EditOp, Leash, MoveInput, RejectReason, ServerEnd, ServerMessage,
 };
@@ -43,9 +43,9 @@ pub enum Outcome {
 }
 
 /// How far inside a leash the character must be for the server to hold it to that leash, in
-/// Voxels: its height (1.8 m) and some to spare, so that a leash never takes the ground from under
-/// or over it.
-const CLEARANCE: f64 = 24.0;
+/// Voxels: its height (1.8 m) and some to spare (2.4 m), so that a leash never takes the ground
+/// from under or over it.
+const CLEARANCE: f64 = 2.4 * VOXELS_PER_METRE;
 
 /// Inputs held for a character that has no leash yet, at the most (ten seconds of them): see
 /// [`ClientMessage::Spawn`]. It is also how far past the next input due a `seq` may be.
@@ -883,6 +883,7 @@ mod tests {
 
     #[test]
     fn an_edit_is_in_reach_up_to_8_m_from_the_eyes_and_not_beyond() {
+        let reach = crate::EDIT_REACH;
         let (mut server, end, client) = standing();
         let eye = server.character(0).unwrap().eye();
         // Along y, which is the way up at the origin's own, odd spot, and so is the eyes' way.
@@ -892,17 +893,27 @@ mod tests {
             place([0, y, 0], net::Shape::Sphere, 1)
         };
         assert_eq!(
-            answers(&mut server, &end, &client, &[at(79.0), at(-79.0)]),
+            answers(
+                &mut server,
+                &end,
+                &client,
+                &[at(reach - 1.0), at(1.0 - reach)]
+            ),
             [None, None]
         );
-        let far = answers(&mut server, &end, &client, &[at(81.0), at(-81.0)]);
+        let far = answers(
+            &mut server,
+            &end,
+            &client,
+            &[at(reach + 1.0), at(-reach - 1.0)],
+        );
         assert_eq!(far, [Some(RejectReason::OutOfReach); 2]);
     }
 
     #[test]
     fn a_brush_bigger_than_2_m_and_a_material_that_is_not_defined_are_turned_down() {
         let (mut server, end, client) = standing();
-        let big = place([0, 0, 0], net::Shape::Cube, 21);
+        let big = place([0, 0, 0], net::Shape::Cube, crate::MAX_BRUSH_RADIUS + 1);
         let unknown = EditOp {
             material: Material(60_000),
             ..place([0, 0, 0], net::Shape::Sphere, 2)
@@ -963,8 +974,8 @@ mod tests {
     }
 
     #[test]
-    fn a_player_may_change_8_m3_of_voxels_a_second() {
-        // A mass of stone 80 Voxels (8 m) across, with a character standing in the middle of it.
+    fn a_player_may_change_8_cubic_metres_a_second() {
+        // A mass of stone 80 Voxels (4 m) across, with a character standing in the middle of it.
         let mut store = BrickStore::new();
         for x in -5..5 {
             for y in -5..5 {
@@ -979,31 +990,36 @@ mod tests {
         server.tick(std::slice::from_ref(&end));
         received(&client);
 
-        // Nine cubes of 21 Voxels a side, 9 261 Voxels each, side by side, placed in the air above
+        // Nine cubes of 41 Voxels a side, 68 921 Voxels each, side by side, placed in the air above
         // the stone (Digs would be held to the time they take).
         let cube = |i: i32| {
             place(
-                [(i % 3 - 1) * 22, 60, (i / 3 - 1) * 22],
+                [(i % 3 - 1) * 42, 120, (i / 3 - 1) * 42],
                 net::Shape::Cube,
-                10,
+                20,
             )
         };
         let nine: Vec<_> = (0..9).map(cube).collect();
-        // The burst is 72 000 Voxels, which is seven of them. The two that did not fit changed
+        // The burst is 576 000 Voxels, which is eight of them. The one that did not fit changed
         // nothing and cost nothing.
         let told = answers(&mut server, &end, &client, &nine);
-        assert_eq!(told[..7], [None; 7]);
-        assert_eq!(told[7..], [Some(RejectReason::VolumeLimited); 2]);
+        assert_eq!(told[..8], [None; 8]);
+        assert_eq!(told[8..], [Some(RejectReason::VolumeLimited)]);
 
-        // A second brings back 8 000 Voxels, which is room for one more, and not for two.
+        // A second brings back 64 000 Voxels, which is room for one more, and not for two.
         for _ in 0..TICK_RATE_HZ {
             server.tick(std::slice::from_ref(&end));
         }
-        let told = answers(&mut server, &end, &client, &nine[7..]);
+        let told = answers(
+            &mut server,
+            &end,
+            &client,
+            &[nine[8], place([0, 120, -84], net::Shape::Cube, 20)],
+        );
         assert_eq!(told, [None, Some(RejectReason::VolumeLimited)]);
     }
 
-    /// A mass of stone 80 Voxels (8 m) across, with room to place in beyond it.
+    /// A mass of stone 80 Voxels (4 m) across, with room to place in beyond it.
     fn mass() -> BrickStore {
         let mut store = BrickStore::new();
         for x in -5..5 {
@@ -1037,18 +1053,18 @@ mod tests {
         server.tick(std::slice::from_ref(&end));
         received(&client);
 
-        // A cube of 21 Voxels a side on the grid, in the middle of solid stone, where a Smooth
-        // changes nothing. It asks 9 261 Voxels' worth, six units each: 55 566. The player's 360 000
-        // are six of those, and no more, though none of them changes a Voxel.
-        let smooth = smooth(net::Shape::Cube, 10, [0, 0, 0], net::Alignment::World);
-        assert_eq!(crate::work(&smooth), 55_566);
+        // A cube of 41 Voxels a side on the grid, in the middle of solid stone, where a Smooth
+        // changes nothing. It asks 68 921 Voxels' worth, six units each: 413 526. The player's 2.88
+        // million are six of those, and no more, though none of them changes a Voxel.
+        let smooth = smooth(net::Shape::Cube, 20, [0, 0, 0], net::Alignment::World);
+        assert_eq!(crate::work(&smooth), 413_526);
         let told = answers(&mut server, &end, &client, &[smooth; 20]);
         assert_eq!(told[..6], [None; 6]);
         assert_eq!(told[6..], [Some(RejectReason::RateLimited); 14]);
-        assert_eq!(server.edit_work(), 6 * 55_566);
+        assert_eq!(server.edit_work(), 6 * 413_526);
         assert!(server.edit_work() <= EDIT_WORK_PER_TICK);
 
-        // And the work comes back at 600 000 a second: ten thousand a tick, so one Smooth in
+        // And the work comes back at 4.8 million a second: 80 000 a tick, so one Smooth in
         // six ticks.
         for _ in 0..4 {
             server.tick(std::slice::from_ref(&end));
@@ -1068,14 +1084,14 @@ mod tests {
         received(&client);
 
         // In the air over the stone, on a lean, and turned an eighth: the box that holds it is
-        // 300 000 Voxels and more, the most that any Brush asks.
+        // 2 million Voxels and more, the most that any Brush asks.
         let cube = EditOp {
             alignment: net::Alignment::Local,
             rotation: 1,
-            ..place([30, 60, 12], net::Shape::Cube, 20)
+            ..place([60, 120, 24], net::Shape::Cube, 40)
         };
         let asked = crate::work(&cube);
-        assert!((250_000..=crate::WORK_BURST).contains(&asked), "{asked}");
+        assert!((2_000_000..=crate::WORK_BURST).contains(&asked), "{asked}");
         let changed_before = server.store().content_hash();
         assert_eq!(answers(&mut server, &end, &client, &[cube]), [None]);
         assert_ne!(server.store().content_hash(), changed_before);
@@ -1088,7 +1104,7 @@ mod tests {
     }
 
     #[test]
-    fn a_smooth_or_a_flatten_over_radius_10_is_too_big_and_a_dig_or_a_place_may_be_20() {
+    fn a_smooth_or_a_flatten_over_1_m_is_too_big_and_a_dig_or_a_place_over_2_m() {
         let (mut server, end, client) = standing();
         let asked = |mode, radius| EditOp {
             mode,
@@ -1099,12 +1115,12 @@ mod tests {
             &end,
             &client,
             &[
-                asked(net::EditMode::Smooth, 11),
-                asked(net::EditMode::Flatten, 11),
+                asked(net::EditMode::Smooth, crate::MAX_SMOOTH_RADIUS + 1),
+                asked(net::EditMode::Flatten, crate::MAX_SMOOTH_RADIUS + 1),
                 asked(net::EditMode::Smooth, 10),
                 asked(net::EditMode::Flatten, 10),
                 asked(net::EditMode::Place, 20),
-                asked(net::EditMode::Dig, 21),
+                asked(net::EditMode::Dig, crate::MAX_BRUSH_RADIUS + 1),
             ],
         );
         assert_eq!(
@@ -1184,7 +1200,7 @@ mod tests {
     fn big_sphere() -> EditOp {
         EditOp {
             mode: net::EditMode::Dig,
-            ..place([0, 0, 0], net::Shape::Sphere, 20)
+            ..place([0, 0, 0], net::Shape::Sphere, 40)
         }
     }
 
@@ -1192,14 +1208,14 @@ mod tests {
         EditOp {
             alignment: net::Alignment::Local,
             rotation: 1,
-            ..place([30, 60, 12], net::Shape::Cube, 20)
+            ..place([60, 120, 24], net::Shape::Cube, 40)
         }
     }
 
     #[test]
     fn the_work_of_the_edits_of_a_tick_is_no_more_than_the_servers_share_whoever_asks() {
         // Fourteen players, every one with a full allowance, each asking for the biggest sphere
-        // in the one tick: 68 921 each. Ten fit the tick's 720 000, and the other four are told
+        // in the one tick: 531 441 each. Ten fit the tick's 5.76 million, and the other four are told
         // to ask again.
         let (mut server, clients, ends) = crowd(14);
         let everyone: Vec<usize> = (0..14).collect();
@@ -1209,7 +1225,7 @@ mod tests {
             told.iter()
                 .all(|t| t.is_none() || *t == Some(RejectReason::RateLimited))
         );
-        assert_eq!(server.edit_work(), 10 * 68_921);
+        assert_eq!(server.edit_work(), 10 * 531_441);
         assert!(server.edit_work() <= EDIT_WORK_PER_TICK);
     }
 
@@ -1230,11 +1246,11 @@ mod tests {
         assert_eq!(told, [None; 4]);
 
         // Now all of them ask in every tick for a share that is far too small for them all (a
-        // tilted cube of 4 m, over 300 000 each, of which two fit), each with a full allowance
+        // tilted cube of 4 m, over 2 million each, of which one fits), each with a full allowance
         // again after a rest of a second. Whoever is served first goes round: over 14 ticks each
         // of them is served, and none is turned down by the tick every time.
         let (mut server, clients, ends) = crowd(14);
-        assert!(crate::work(&leaning_cube()) > 250_000);
+        assert!(crate::work(&leaning_cube()) > 2_000_000);
         let mut served = [0; 14];
         let mut refused = [0; 14];
         for _ in 0..14 {
@@ -1259,13 +1275,13 @@ mod tests {
 
     #[test]
     fn a_maximum_brush_is_served_beside_the_ordinary_work_of_the_others_whoever_is_last() {
-        // Nineteen players each make an ordinary Edit (9 261 Voxels' work), and one a cube of 4 m
-        // on a lean (over 300 000): 176 000 and more, within the tick's 720 000, wherever in the
+        // Nineteen players each make an ordinary Edit (68 921 Voxels' work), and one a cube of 4 m
+        // on a lean (over 2 million): 3.3 million and more, within the tick's 5.76 million, wherever in the
         // order the cube is.
         let (mut server, clients, ends) = crowd(20);
         let ordinary = EditOp {
             mode: net::EditMode::Dig,
-            ..place([0, 0, 0], net::Shape::Cube, 10)
+            ..place([0, 0, 0], net::Shape::Cube, 20)
         };
         for (i, client) in clients.iter().enumerate() {
             let op = if i == 19 { leaning_cube() } else { ordinary };
@@ -1280,7 +1296,7 @@ mod tests {
                 .any(|m| matches!(m, ServerMessage::Rejected { .. }));
             assert!(!refused, "client {i} was turned down");
         }
-        assert!(server.edit_work() > 19 * 9_261 + 250_000);
+        assert!(server.edit_work() > 19 * 68_921 + 2_000_000);
         assert!(server.edit_work() <= EDIT_WORK_PER_TICK);
     }
 
@@ -1377,13 +1393,24 @@ mod tests {
         }
         let leash = leash.expect("the ground became ready");
         assert_eq!(server.character(0).unwrap().leash(), Some(leash));
-        assert!((32.0..=80.0).contains(&leash.radius), "{leash:?}");
+        assert!(
+            (48.0..=f64::from(crate::ground::REACH)).contains(&leash.radius),
+            "{leash:?}"
+        );
 
+        // The ball goes on filling, so the input may be answered with a wider leash first.
         client.send(input(0)).unwrap();
         server.tick(std::slice::from_ref(&end));
         let told = received(&client);
         assert!(
-            matches!(told[..], [ServerMessage::Body { applied: 1, .. }]),
+            matches!(
+                told[..],
+                [ServerMessage::Body { applied: 1, .. }]
+                    | [
+                        ServerMessage::Leash { from: 1, .. },
+                        ServerMessage::Body { applied: 1, .. }
+                    ]
+            ),
             "{told:?}"
         );
     }

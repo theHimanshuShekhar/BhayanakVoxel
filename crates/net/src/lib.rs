@@ -51,7 +51,7 @@ pub enum Alignment {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Brush {
     pub shape: Shape,
-    /// In Voxels: 0 is the centre Voxel alone, and 20 (2 m) is the most a player may use.
+    /// In Voxels: 0 is the centre Voxel alone, and 40 (2 m) is the most a player may use.
     pub radius: u16,
 }
 

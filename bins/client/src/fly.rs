@@ -1,13 +1,14 @@
 //! Which movement keys are held, and what they do: move the free-fly debug camera (noclip), or
 //! become the character's input for a tick.
 
+use brick_store::VOXELS_PER_METRE;
 use net::MoveInput;
 use render::Camera;
 
 /// Radians of turn per pixel of mouse movement.
 const LOOK_SENSITIVITY: f64 = 0.0025;
-/// Voxels per second (10 cm Voxels, so 6 m/s).
-const SPEED: f64 = 60.0;
+/// Voxels per second: 6 m/s.
+const SPEED: f64 = 6.0 * VOXELS_PER_METRE;
 /// Multiplier while the speed modifier is held.
 const FAST: f64 = 8.0;
 
@@ -141,10 +142,10 @@ mod tests {
 
     #[test]
     fn wasd_move_along_and_across_the_view() {
-        assert_eq!(moved(&[Action::Forward], 0.5), [0.0, 0.0, -30.0]);
-        assert_eq!(moved(&[Action::Back], 0.5), [0.0, 0.0, 30.0]);
-        assert_eq!(moved(&[Action::Right], 0.5), [30.0, 0.0, 0.0]);
-        assert_eq!(moved(&[Action::Left], 0.5), [-30.0, 0.0, 0.0]);
+        assert_eq!(moved(&[Action::Forward], 0.5), [0.0, 0.0, -SPEED / 2.0]);
+        assert_eq!(moved(&[Action::Back], 0.5), [0.0, 0.0, SPEED / 2.0]);
+        assert_eq!(moved(&[Action::Right], 0.5), [SPEED / 2.0, 0.0, 0.0]);
+        assert_eq!(moved(&[Action::Left], 0.5), [-SPEED / 2.0, 0.0, 0.0]);
     }
 
     #[test]
@@ -152,7 +153,7 @@ mod tests {
         let mut camera = camera();
         camera.turn(0.0, -1.0);
         held(&[Action::Up]).update(&mut camera, 1.0);
-        assert_eq!(camera.position, [0.0, 60.0, 0.0]);
+        assert_eq!(camera.position, [0.0, SPEED, 0.0]);
     }
 
     #[test]
@@ -163,8 +164,8 @@ mod tests {
         let [x, y, z] = camera.position;
         assert!(
             x.abs() < 1e-9
-                && (y - 60.0 * 0.5f64.sqrt()).abs() < 1e-9
-                && (z + 60.0 * 0.5f64.sqrt()).abs() < 1e-9
+                && (y - SPEED * 0.5f64.sqrt()).abs() < 1e-9
+                && (z + SPEED * 0.5f64.sqrt()).abs() < 1e-9
         );
     }
 
@@ -176,14 +177,14 @@ mod tests {
     #[test]
     fn two_keys_are_no_faster_than_one() {
         let [x, _, z] = moved(&[Action::Forward, Action::Right], 1.0);
-        assert!(((x * x + z * z).sqrt() - 60.0).abs() < 1e-6);
+        assert!(((x * x + z * z).sqrt() - SPEED).abs() < 1e-6);
     }
 
     #[test]
     fn the_speed_modifier_multiplies_the_speed() {
         assert_eq!(
             moved(&[Action::Forward, Action::Fast], 1.0),
-            [0.0, 0.0, -480.0]
+            [0.0, 0.0, -SPEED * FAST]
         );
     }
 
@@ -220,7 +221,7 @@ mod tests {
             held(&[Action::Up]).update(&mut camera, 1.0);
             let moved = [0, 1, 2].map(|a| camera.position[a] - position[a]);
             assert!(
-                (0..3).all(|a| (moved[a] - 60.0 * radial[a]).abs() < 1e-9),
+                (0..3).all(|a| (moved[a] - SPEED * radial[a]).abs() < 1e-9),
                 "up from {position:?} moved {moved:?}"
             );
             held(&[Action::Down]).update(&mut camera, 1.0);
@@ -249,7 +250,7 @@ mod tests {
             crossed |= camera.position[0] > 0.0;
             let next = camera.forward();
             let step = (0..3).map(|a| (next[a] - forward[a]).powi(2)).sum::<f64>();
-            // Each step is 6 Voxels, 0.002 radians of the Planet: nothing like a flip or a spin.
+            // Each step is 12 Voxels, 0.004 radians of the Planet: nothing like a flip or a spin.
             assert!(
                 step.sqrt() < 0.005,
                 "forward jumped by {} at {:?}",
@@ -270,7 +271,7 @@ mod tests {
         let mut camera = over_the_planet([0.0, 0.0, 6.0], [0.0; 3]);
         held(&[Action::Forward, Action::Up]).update(&mut camera, 0.0);
         assert!(camera.forward().iter().all(|c| c.is_finite()));
-        // Down for 0.1 s is 6 Voxels: onto the centre, and then through it.
+        // Down for 0.1 s is 12 Voxels: onto the centre, and then through it.
         let fly = held(&[Action::Down]);
         for _ in 0..2 {
             fly.update(&mut camera, 0.1);

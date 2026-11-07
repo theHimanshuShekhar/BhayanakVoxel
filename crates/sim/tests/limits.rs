@@ -4,11 +4,12 @@
 use brick_store::{BrickCoord, BrickStore, Material, VoxelCoord};
 use net::{Alignment, Brush, EditMode, EditOp, RejectReason, ServerMessage, Shape, loopback};
 use planet_gen::generate_region;
-use sim::{Predictor, Server, TICK_RATE_HZ};
+use sim::{MAX_BRUSH_RADIUS, Predictor, Server, TICK_RATE_HZ};
 
 const SEED: u64 = 0xB4A7_A9AC;
 
-/// Where the character stands: on the surface at +x, which is about Voxel x = 1500.
+/// Where the character stands: on the surface at +x, which is about Voxel x = 1500 (75 m from the
+/// test Planet's centre).
 const STANDING: [f64; 3] = [1500.0, 0.0, 0.0];
 
 fn surface() -> BrickStore {
@@ -69,7 +70,7 @@ fn ask(ops: &[EditOp]) -> Vec<Option<RejectReason>> {
 #[test]
 fn a_brush_over_2_m_is_turned_down_and_the_client_takes_it_back() {
     let told = ask(&[
-        place(Shape::Sphere, 21, [1505, 0, 0]),
+        place(Shape::Sphere, MAX_BRUSH_RADIUS + 1, [1505, 0, 0]),
         place(Shape::Sphere, 20, [1505, 0, 0]),
     ]);
     assert_eq!(told, [Some(RejectReason::BrushTooLarge), None]);
@@ -77,9 +78,10 @@ fn a_brush_over_2_m_is_turned_down_and_the_client_takes_it_back() {
 
 #[test]
 fn an_edit_over_8_m_from_the_eyes_is_turned_down_and_the_client_takes_it_back() {
-    // The eyes are at about x = 1516, so these are 8.5 m away along the surface, and 7.5 m.
-    let far = place(Shape::Cube, 3, [1516, 85, 0]);
-    let near = place(Shape::Cube, 3, [1516, 75, 0]);
+    // The eyes are at about x = 1532 (1.6 m up), so these are 8.25 m away along the surface, and
+    // 7.75 m.
+    let far = place(Shape::Cube, 3, [1532, 165, 0]);
+    let near = place(Shape::Cube, 3, [1532, 155, 0]);
     assert_eq!(ask(&[far, near]), [Some(RejectReason::OutOfReach), None]);
 }
 
@@ -94,13 +96,14 @@ fn a_21st_edit_in_a_second_is_turned_down_and_the_client_takes_it_back() {
 }
 
 #[test]
-fn edits_over_8_m3_of_voxels_in_a_burst_are_turned_down_and_the_client_takes_them_back() {
-    // Cubes of 21 Voxels a side, 9 261 Voxels each, in the air over the surface, side by side.
-    let cube = |i: i32| place(Shape::Cube, 10, [1520, (i % 3 - 1) * 22, (i / 3 - 1) * 22]);
+fn edits_over_the_voxel_burst_are_turned_down_and_the_client_takes_them_back() {
+    // Cubes of 41 Voxels a side, 68 921 Voxels each, in the air over the surface, side by side:
+    // eight fit the burst of 576 000.
+    let cube = |i: i32| place(Shape::Cube, 20, [1580, (i % 3 - 1) * 42, (i / 3 - 1) * 42]);
     let ops: Vec<_> = (0..9).map(cube).collect();
     let told = ask(&ops);
-    assert!(told[..7].iter().all(Option::is_none), "{told:?}");
-    assert_eq!(told[7..], [Some(RejectReason::VolumeLimited); 2]);
+    assert!(told[..8].iter().all(Option::is_none), "{told:?}");
+    assert_eq!(told[8..], [Some(RejectReason::VolumeLimited)]);
 }
 
 #[test]

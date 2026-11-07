@@ -1,4 +1,4 @@
-# How characters move (decision in #16). Metres and seconds; the sim converts to 10 cm Voxels.
+# How characters move (decision in #16). Metres and seconds; the sim converts to Voxels.
 # Compiled into the client and the server, which must read the same numbers: they run the same
 # controller on the same inputs and expect bit-identical positions.
 

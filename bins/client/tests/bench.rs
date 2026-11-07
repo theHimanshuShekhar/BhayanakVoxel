@@ -64,7 +64,9 @@ fn check_entry(entry: &Value) {
 }
 
 fn check_schema(report: &Value, out: &Path) {
-    assert_eq!(report["schema_version"], 4);
+    assert_eq!(report["schema_version"], 5);
+    // The Edit stress is of the whole Planet, which the patch is not.
+    assert!(report["edits"].is_null());
     assert!(!string(&report["build"]["version"]).is_empty());
     assert!(report["build"]["commit"].is_null() || report["build"]["commit"].is_string());
 

@@ -44,7 +44,7 @@ fn main() {
                 println!(
                     "   level {} dist {:.1} m angle to velocity {:.0} deg mask now {} (visible 1, shell 2, prefetch 4)",
                     key.level(),
-                    d(key) / 10.0,
+                    d(key) / prefetch_sim::model::VOXELS_PER_METRE,
                     cos.acos().to_degrees(),
                     cache.mask_of(*key)
                 );

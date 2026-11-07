@@ -11,7 +11,7 @@ The single spherical world the game takes place on; voxel all the way through an
 _Avoid_: World, map, level
 
 **Voxel**:
-The smallest unit of matter on the Planet, much smaller than a Minecraft block.
+The smallest unit of matter on the Planet, 5 cm across (ADR 0007), much smaller than a Minecraft block. Sizes in the game are in metres; the Voxel is the unit of the Planet's coordinates.
 _Avoid_: Block, cube
 
 **Exposed**:

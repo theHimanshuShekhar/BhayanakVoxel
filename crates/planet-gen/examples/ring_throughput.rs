@@ -1,5 +1,5 @@
 //! Times what the client does at start-up that is the generator's: the spawn ring
-//! (`Planet::crust_around`, level 0 on all cores) and the Guard (`Planet::guard`, levels 8 to 12
+//! (`Planet::crust_around`, level 0 on all cores) and the Guard (`Planet::guard`, levels 9 to 13
 //! of the whole Planet), and then level 0 bricks on one core under the spawn and under a cave's
 //! mouth, which is what the loader and a character's Ground (#106) make: first at the ring's
 //! depth, then deeper, in the cave band. The spawn is clear of caves; the ring is timed at the
@@ -7,18 +7,18 @@
 //!
 //! `cargo run --release -p planet-gen --example ring_throughput -- [REACH] [SIZE] [SEED]`
 //!
-//! REACH is the ring's radius in Voxels (default 400, the client's), SIZE the texels along a
+//! REACH is the ring's radius in Voxels (default 800, the client's 40 m), SIZE the texels along a
 //! face of the world map (default 2048, the real Planet).
 
 use std::time::Instant;
 
-use brick_store::{BRICK_SIZE, BrickCoord};
+use brick_store::{BRICK_SIZE, BrickCoord, VOXELS_PER_METRE};
 use planet_gen::planet::{Planet, tangents};
 use planet_gen::world_map::{WORLD_RADIUS, WorldMap};
 
 fn main() {
     let mut args = std::env::args().skip(1);
-    let reach: i32 = args.next().map_or(400, |s| s.parse().expect("REACH"));
+    let reach: i32 = args.next().map_or(800, |s| s.parse().expect("REACH"));
     let size = args.next().map_or(2048, |s| s.parse().expect("SIZE"));
     let seed = args
         .next()
@@ -40,10 +40,10 @@ fn main() {
     );
 
     let started = Instant::now();
-    let ring = planet.crust_around(spawn, reach, 12);
+    let ring = planet.crust_around(spawn, reach, 13);
     println!(
         "spawn ring ({} m): {} bricks in {:.2?}",
-        reach / 10,
+        f64::from(reach) / VOXELS_PER_METRE,
         ring.len(),
         started.elapsed()
     );
@@ -52,19 +52,19 @@ fn main() {
     println!("{} cave mouths", mouths.len());
     let mouth = mouths[mouths.len() / 2];
     let started = Instant::now();
-    let ring = planet.crust_around(mouth, reach, 12);
+    let ring = planet.crust_around(mouth, reach, 13);
     println!(
         "a ring at a cave mouth ({} m): {} bricks in {:.2?}",
-        reach / 10,
+        f64::from(reach) / VOXELS_PER_METRE,
         ring.len(),
         started.elapsed()
     );
     drop(ring);
 
     let started = Instant::now();
-    let guard = planet.guard(8..=12);
+    let guard = planet.guard(9..=13);
     println!(
-        "Guard (levels 8 to 12): {} bricks in {:.2?}",
+        "Guard (levels 9 to 13): {} bricks in {:.2?}",
         guard.len(),
         started.elapsed()
     );
@@ -74,8 +74,8 @@ fn main() {
     // deeper, in the cave band.
     for (place, ground) in [("spawn", spawn), ("a cave mouth", mouth)] {
         for (name, depths, across) in [
-            ("the ring's depth (0 to 53 m)", 0..66, 24),
-            ("the cave band (53 to 300 m)", 66..375, 6),
+            ("the ring's depth (0 to 53 m)", 0..132, 24),
+            ("the cave band (53 to 300 m)", 132..750, 6),
         ] {
             let (made, took) = time_bricks(&planet, ground, depths, across);
             println!(

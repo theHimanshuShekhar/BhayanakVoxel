@@ -2,6 +2,12 @@
 //! small test Planet (a sphere of 1500 Voxels), which tests and goldens use; [`planet`] is the
 //! real one.
 //!
+//! The real Planet is written in metres and turned into Voxels with
+//! [`brick_store::VOXELS_PER_METRE`] (ADR 0007), so the same seed makes the same landscape
+//! whatever the size of a Voxel. The test Planet is a fixture of a fixed number of Voxels, which
+//! a smaller Voxel makes smaller in metres (75 m in radius at 5 cm), so that its tests and
+//! goldens stay the size they were.
+//!
 //! A brick depends only on `(seed, GENERATOR_VERSION, brick coordinate)`; never on generation
 //! order, thread count or hash-map iteration order. Randomness is a stateless integer hash of
 //! the lattice coordinates, and the only float operations are `+ - * /` and conversions, which
@@ -20,9 +26,9 @@ pub mod planet;
 pub mod world_map;
 
 /// Identifies the generation algorithm. Bump it whenever generated bricks change.
-pub const GENERATOR_VERSION: u32 = 3;
+pub const GENERATOR_VERSION: u32 = 4;
 
-/// Mean radius of the test Planet in Voxels: 150 m at 10 cm Voxels, so 300 m across.
+/// Mean radius of the test Planet in Voxels: 75 m at 5 cm Voxels, so 150 m across.
 pub const PLANET_RADIUS: i32 = 1500;
 
 /// Every Voxel of the test Planet is within this many Voxels of its centre: its mean radius plus

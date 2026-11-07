@@ -306,7 +306,7 @@ impl Predictor {
     }
 
     /// Whether the server will not turn `op` down for something that is known here from the op
-    /// alone: a Brush that is not allowed (a Smooth or Flatten over radius 10 among them), or more
+    /// alone: a Brush that is not allowed (a Smooth or Flatten over 1 m among them), or more
     /// Edits or work than the allowance that this client counts as the server's. The Voxels that
     /// the Edit changes are not known without working it out: see [`Predictor::can_change`]. The
     /// reach is not counted: it depends on where the server has the character, which is a little
@@ -600,7 +600,7 @@ mod tests {
         let small = EditOp::dig_sphere(VoxelCoord([3, 3, 3]), 1);
         assert_eq!(client.foresee(&small), Ok(()));
         // Not allowed at all.
-        let too_big = EditOp::dig_sphere(VoxelCoord([3, 3, 3]), 21);
+        let too_big = EditOp::dig_sphere(VoxelCoord([3, 3, 3]), crate::MAX_BRUSH_RADIUS + 1);
         assert_eq!(client.foresee(&too_big), Err(RejectReason::BrushTooLarge));
         // Twenty Edits in a second, and then no more until the ticks bring credit.
         for _ in 0..20 {
@@ -616,12 +616,12 @@ mod tests {
         assert_eq!(client.foresee(&small), Err(RejectReason::RateLimited));
     }
 
-    /// Solid stone 80 Voxels across, round the origin.
+    /// Solid stone 96 Voxels across, round the origin: room for the biggest cube.
     fn mass() -> BrickStore {
         let mut store = BrickStore::new();
-        for x in -5..5 {
-            for y in -5..5 {
-                for z in -5..5 {
+        for x in -6..6 {
+            for y in -6..6 {
+                for z in -6..6 {
                     store.insert(BrickCoord([x, y, z]), Brick::solid(STONE));
                 }
             }
@@ -646,26 +646,26 @@ mod tests {
     #[test]
     fn the_client_foresees_that_a_second_big_edit_changes_more_voxels_than_it_may() {
         let mut client = Predictor::new(mass());
-        // A cube of 41 Voxels a side dug out of the stone: 68 921 Voxels changed, of 72 000.
-        let big = cube(net::EditMode::Dig, 20);
+        // The biggest cube, 81 Voxels a side, dug out of the stone: 531 441 Voxels changed, of 576 000.
+        let big = cube(net::EditMode::Dig, crate::MAX_BRUSH_RADIUS);
         assert_eq!(client.foresee(&big), Ok(()));
         let (_, changed) = client.edit_checked(big).unwrap();
         assert!(!changed.is_empty());
         // Another is not made: it is not worked out against the Planet, which stays as it is.
         let hash = client.store().content_hash();
         assert_eq!(
-            client.edit_checked(cube(net::EditMode::Place, 20)),
+            client.edit_checked(cube(net::EditMode::Place, crate::MAX_BRUSH_RADIUS)),
             Err(RejectReason::VolumeLimited)
         );
         assert_eq!(client.store().content_hash(), hash);
         assert_eq!(client.pending(), 1, "and it is not asked of the server");
-        // A small one fits what is left (3 079 Voxels): a cube of 9 changes 729.
+        // A small one fits what is left (44 559 Voxels): a cube of 9 changes 729.
         assert!(client.edit_checked(cube(net::EditMode::Place, 4)).is_ok());
-        // The ticks bring it back, 8 000 Voxels a second.
+        // The ticks bring it back, 64 000 Voxels a second.
         for _ in 0..60 {
             client.walk(MoveInput::default());
         }
-        assert!(client.can_change(10_000) && !client.can_change(11_000));
+        assert!(client.can_change(100_000) && !client.can_change(110_000));
     }
 
     /// What the allowance is after making `op` and being told `reason`, worked out as the server
@@ -697,7 +697,7 @@ mod tests {
 
     #[test]
     fn a_reject_gives_the_client_back_what_the_server_did_not_take() {
-        let big = cube(net::EditMode::Dig, 20);
+        let big = cube(net::EditMode::Dig, crate::MAX_BRUSH_RADIUS);
         for reason in [
             RejectReason::RateLimited,
             RejectReason::OutOfReach,
@@ -708,7 +708,7 @@ mod tests {
             let (_, changed) = client.edit_checked(big).unwrap();
             assert!(!changed.is_empty());
             // The Edit is out of the allowance: the Voxels, the work and the credit.
-            assert!(!client.can_change(10_000));
+            assert!(!client.can_change(50_000));
             client.receive(rejected_with(0, reason));
             assert_eq!(
                 client.budget,
@@ -722,12 +722,12 @@ mod tests {
         let mut client = Predictor::new(mass());
         client.edit_checked(big).unwrap();
         client.receive(rejected_with(0, RejectReason::RateLimited));
-        assert!(client.foresee(&big).is_ok() && client.can_change(68_921));
+        assert!(client.foresee(&big).is_ok() && client.can_change(531_441));
     }
 
     #[test]
     fn what_the_server_made_is_not_given_back_and_a_reject_is_given_back_once() {
-        let big = cube(net::EditMode::Dig, 20);
+        let big = cube(net::EditMode::Dig, crate::MAX_BRUSH_RADIUS);
         let mut client = Predictor::new(mass());
         let (_, changed) = client.edit_checked(big).unwrap();
         let after = client.budget;
@@ -735,7 +735,7 @@ mod tests {
         // Acked: it was made, and the allowance stays as spent.
         client.receive(applied(big, 1, Some(0)));
         assert_eq!(client.budget, after);
-        assert_eq!(client.budget, server_took(&big, None, 68_921));
+        assert_eq!(client.budget, server_took(&big, None, 531_441));
         // A reject for an Edit that is no longer pending (or told twice) gives back nothing more.
         client.receive(rejected_with(0, RejectReason::RateLimited));
         assert_eq!(client.budget, after);
@@ -761,29 +761,29 @@ mod tests {
     }
 
     #[test]
-    fn the_client_foresees_the_work_that_a_smooth_asks_and_that_one_over_radius_10_is_too_big() {
+    fn the_client_foresees_the_work_that_a_smooth_asks_and_that_one_over_1_m_is_too_big() {
         let mut client = Predictor::new(mass());
-        let smooth = cube(net::EditMode::Smooth, 10);
-        // 6 times 9 261: six of them are 333 000 of the 360 000, and they change nothing.
+        let smooth = cube(net::EditMode::Smooth, crate::MAX_SMOOTH_RADIUS);
+        // 6 times 68 921: six of them are 2.48 million of the 2.88 million, and they change nothing.
         for _ in 0..6 {
             assert_eq!(client.foresee(&smooth), Ok(()));
             client.edit(smooth);
         }
         assert_eq!(client.foresee(&smooth), Err(RejectReason::RateLimited));
         // Not Voxels changed: a Dig of a small cube is not afforded for lack of work either, but
-        // that left is 26 000 units.
-        assert_eq!(client.foresee(&cube(net::EditMode::Dig, 4)), Ok(()));
+        // that left is 400 000 units.
+        assert_eq!(client.foresee(&cube(net::EditMode::Dig, 8)), Ok(()));
         assert_eq!(
-            client.foresee(&cube(net::EditMode::Dig, 15)),
+            client.foresee(&cube(net::EditMode::Dig, crate::MAX_BRUSH_RADIUS)),
             Err(RejectReason::RateLimited)
         );
-        assert!(client.can_change(72_000 - 1));
+        assert!(client.can_change(crate::VOXEL_BURST as usize - 1));
         assert_eq!(
-            client.foresee(&cube(net::EditMode::Smooth, 11)),
+            client.foresee(&cube(net::EditMode::Smooth, crate::MAX_SMOOTH_RADIUS + 1)),
             Err(RejectReason::BrushTooLarge)
         );
         assert_eq!(
-            client.foresee(&cube(net::EditMode::Flatten, 11)),
+            client.foresee(&cube(net::EditMode::Flatten, crate::MAX_SMOOTH_RADIUS + 1)),
             Err(RejectReason::BrushTooLarge)
         );
     }
@@ -965,7 +965,7 @@ mod tests {
         client.receive(ServerMessage::Leash {
             spawn: 1,
             from: 0,
-            leash: ball(80.0),
+            leash: ball(f64::from(crate::ground::REACH)),
         });
         // The ground is made by the client, a little at a time, and then it goes: with the first
         // input, whatever number of ticks it waited.
@@ -980,7 +980,11 @@ mod tests {
         };
         assert!((10..100).contains(&waited), "waited {waited} ticks");
         assert!(matches!(first, ClientMessage::Input { seq: 0, .. }));
-        assert!(client.ground().covers(&ball(80.0)));
+        assert!(
+            client
+                .ground()
+                .covers(&ball(f64::from(crate::ground::REACH)))
+        );
     }
 
     /// The client has run ahead of a leash that the server then says holds from input 20: when
@@ -1013,7 +1017,7 @@ mod tests {
         client.receive(ServerMessage::Leash {
             spawn: 1,
             from: 0,
-            leash: ball(80.0),
+            leash: ball(f64::from(crate::ground::REACH)),
         });
         let mut inputs = Vec::new();
         while inputs.len() < 60 {
@@ -1078,7 +1082,7 @@ mod tests {
         client.receive(ServerMessage::Leash {
             spawn: 1,
             from: 0,
-            leash: ball(80.0),
+            leash: ball(f64::from(crate::ground::REACH)),
         });
         // The server says nothing more: the client sends no more than the bound.
         let sent = (0..MAX_PENDING_INPUTS * 3)
@@ -1109,7 +1113,7 @@ mod tests {
         client.receive(ServerMessage::Leash {
             spawn: 1,
             from: 0,
-            leash: ball(80.0),
+            leash: ball(f64::from(crate::ground::REACH)),
         });
         let mut elsewhere = *client.character().unwrap().state();
         elsewhere.position[0] += 9.0;
@@ -1125,7 +1129,7 @@ mod tests {
         client.receive(ServerMessage::Leash {
             spawn: 2,
             from: 0,
-            leash: ball(80.0),
+            leash: ball(f64::from(crate::ground::REACH)),
         });
         assert!((0..200).any(|_| client.walk(forward()).is_some()));
     }
