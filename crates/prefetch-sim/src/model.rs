@@ -8,9 +8,10 @@ pub use brick_store::VOXELS_PER_METRE;
 use render::lod::{Bands, GUARD_FIRST, LEVELS};
 
 /// Bricks a full fill draws, in units of d0 squared (a level's bricks are the surface within its
-/// band, so they go with d0²): measured by the client on the full-size Planet, 3.56 million at a
-/// bias of 1 (`BRICKS_PER_D0_SQUARED` in `bins/client/src/main.rs`).
-pub const DRAWN_PER_D0_SQUARED: f64 = 3.37;
+/// band, so they go with d0²): measured by the client on the full-size Planet, 3.44 million at a
+/// bias of 1 (`BRICKS_PER_D0_SQUARED` in `bins/client/src/main.rs`; 3.56 million, 3.37 d0², before
+/// #142 stopped the deep sea from being drawn).
+pub const DRAWN_PER_D0_SQUARED: f64 = 3.25;
 
 /// The model's [`Model::crust`].
 pub const CRUST: f64 = 0.4;

@@ -941,7 +941,8 @@ impl Planet {
     /// caves go, under the sea, or has no tube of the caves near it. `false` means that it is
     /// not known, not that it has air. The strata and everything below them are solid, so this
     /// holds for every brick that is a brick or so under the ground and not near a cave, which
-    /// is nearly all of the crust.
+    /// is nearly all of the crust. So does a brick wholly in the sea, above the ground and below
+    /// sea level, which is all water.
     pub fn solid_below(&self, level: usize, coord: BrickCoord) -> bool {
         self.solid_below_with(level, coord, true)
     }
@@ -955,11 +956,16 @@ impl Planet {
         let width = f64::from(BRICK_SIZE) * f64::from(1u32 << level);
         let low = coord.0.map(|c| f64::from(c) * width);
         let high = low.map(|l| l + width);
-        let (_, far) = radii_of_box(low, high);
+        let (near, far) = radii_of_box(low, high);
         let corners: [[f64; 3]; 8] = std::array::from_fn(|i| {
             std::array::from_fn(|a| if i >> a & 1 == 0 { low[a] } else { high[a] })
         });
         let (lowest, highest) = self.map.elevation_range(&corners);
+        // Wholly above the ground and below the sea: water, or ice on a polar sea, which are
+        // solid, and no cave is there (the deep sea is most of the bricks that no ground proves).
+        if far < SEA_RADIUS && SEA_RADIUS + highest - near + SLACK <= 0.0 {
+            return true;
+        }
         let shallowest = SEA_RADIUS + lowest - far - SLACK;
         if shallowest <= 0.0 {
             return false;
@@ -2232,7 +2238,58 @@ mod tests {
         assert!(planet().solid_below(3, at(-1600.0, 3)));
         assert!(!planet().solid_below(0, at(0.0, 0)));
         assert!(!planet().solid_below(3, at(0.0, 3)));
-        assert!(!planet().solid_below(0, at(200.0, 0)));
+        // Above the ground and the sea (over open sea, the water is solid up to its surface).
+        let sky = 200.0 + (SEA_RADIUS - radius).max(0.0);
+        assert!(!planet().solid_below(0, at(sky, 0)));
+    }
+
+    #[test]
+    fn solid_below_holds_for_the_water_of_the_sea_and_is_never_claimed_with_air_in_it() {
+        // Over deep sea (the elevation is in units of 10 cm), a brick at a time from the sea
+        // floor to above the surface.
+        let direction = find(|t| t.elevation < -3000);
+        let floor = planet()
+            .map()
+            .elevation_at(along(direction, SEA_RADIUS).0.map(f64::from));
+        let brick_at = |radius: f64, level: usize| {
+            BrickCoord(along(direction, radius).brick().0.map(|c| c >> level))
+        };
+        let (mut proven, mut water) = (0, 0);
+        for level in 0..5 {
+            let step = 3.0 * f64::from(BRICK_SIZE << level);
+            let mut radius = SEA_RADIUS + floor - 40.0;
+            while radius < SEA_RADIUS + 60.0 {
+                let coord = brick_at(radius, level);
+                if planet().solid_below(level, coord) {
+                    proven += 1;
+                    // Every Voxel of level 0 under it, or a lattice of them for the big ones.
+                    let stride = 1 << level.saturating_sub(1);
+                    let first = coord.0.map(|c| c * (BRICK_SIZE << level));
+                    for z in (0..BRICK_SIZE << level).step_by(stride as usize) {
+                        for y in (0..BRICK_SIZE << level).step_by(stride as usize) {
+                            for x in (0..BRICK_SIZE << level).step_by(stride as usize) {
+                                let at = VoxelCoord([first[0] + x, first[1] + y, first[2] + z]);
+                                let voxel = planet().voxel(at);
+                                assert!(
+                                    voxel.is_some(),
+                                    "level {level} {coord:?} has air at {at:?}"
+                                );
+                                water += usize::from(voxel == Some(WATER));
+                            }
+                        }
+                    }
+                }
+                radius += step;
+            }
+        }
+        assert!(
+            proven > 20 && water > 0,
+            "{proven} proven, {water} water Voxels"
+        );
+        // A brick in the middle of the water is proven, and the one across the surface is not.
+        assert!(planet().solid_below(2, brick_at(SEA_RADIUS - 300.0, 2)));
+        assert!(!planet().solid_below(2, brick_at(SEA_RADIUS, 2)));
+        assert!(!planet().solid_below(0, brick_at(SEA_RADIUS + 20.0, 0)));
     }
 
     /// Panics if a Voxel of level 0 under the brick at `coord` of `level` is not air: every one

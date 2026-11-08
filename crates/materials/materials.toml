@@ -493,6 +493,9 @@ hardness = 0.5
 density = 150.0
 fluid = "none"
 
+# Water is solid to the generator's proofs: a brick wholly under the sea is "solid below" and
+# sealed, so deep water is never generated or drawn (#142). Transparent water (M1b) must revisit
+# that, since light then passes through it and the deep water is seen (ADR 0007).
 [[material]]
 id = 27
 name = "water"

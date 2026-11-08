@@ -19,6 +19,10 @@
 //! (Without the bound the workers finish far faster than a frame can take bricks in, and what is
 //! finished piles up in the channel in the order it was asked for.)
 //!
+//! **Only what can be drawn.** A job generates the children that the source does not prove air
+//! or buried ([`brick_store::children_to_generate`]); those read as they would if generated, but
+//! cost nothing, which at 5 cm is most of a split's eight (#142).
+//!
 //! A job is dropped, not run, if the scene no longer wants it: the camera has gone from where the
 //! bands would split its brick, or its brick was merged or buried ([`Loader::cancel`]). So
 //! nothing is generated beyond the bands. The workers run at the lowest priority
@@ -32,7 +36,7 @@ use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, TryLockError};
 use std::thread::JoinHandle;
 
-use brick_store::{Brick, BrickCoord, BrickSource, BrickStore, TableSize, children_with_solid};
+use brick_store::{Brick, BrickCoord, BrickSource, BrickStore, TableSize, children_generated};
 use render::lod::{Bands, brick_distance};
 use render::scene::select::Key;
 
@@ -136,7 +140,8 @@ impl Shared {
 
 /// What a worker sends back.
 pub enum Arrival {
-    /// The children of `key` that are not air and were not held, as
+    /// The children of `key` that are not air, were not held and can be drawn (see
+    /// [`brick_store::children_to_generate`]), as
     /// [`brick_store::BrickStore::hold_children_solid`] takes them.
     Children {
         key: Key,
@@ -488,10 +493,10 @@ fn work(shared: &Shared, arrivals: &Sender<(u64, Arrival)>) {
                     .position(|&k| k == c)
                     .is_some_and(|i| job.held >> i & 1 == 1)
             };
-            let bricks = children_with_solid(&*shared.source, level, coord, held);
+            let (bricks, generated) = children_generated(&*shared.source, level, coord, held);
             shared
                 .generated
-                .fetch_add(u64::from(8 - job.held.count_ones()), Atomic::Relaxed);
+                .fetch_add(generated as u64, Atomic::Relaxed);
             Arrival::Children {
                 key: job.key,
                 bricks,
@@ -664,6 +669,45 @@ mod tests {
             "{}",
             source.made.load(Atomic::Relaxed)
         );
+    }
+
+    /// Rock under y = 0 that it proves solid there, counting what it was asked for.
+    #[derive(Debug, Default)]
+    struct Ground {
+        made: AtomicUsize,
+    }
+
+    impl BrickSource for Ground {
+        fn brick(&self, _: usize, _: BrickCoord) -> Brick {
+            self.made.fetch_add(1, Atomic::Relaxed);
+            Brick::solid(brick_store::Material(1))
+        }
+        fn solid_below(&self, _: usize, coord: BrickCoord) -> bool {
+            coord.0[1] < 0
+        }
+    }
+
+    #[test]
+    fn a_job_generates_only_the_children_that_can_be_drawn_and_counts_those() {
+        let source = Arc::new(Ground::default());
+        let mut loader = new_loader(source.clone());
+        // Its children are at y = -2 and -1: the four below are buried, the four at -1 have a brick
+        // above them that is not known to be solid.
+        let key = (3, BrickCoord([0, -1, 0]));
+        loader.request(&BrickStore::new(), [key], [0.0; 3]);
+        let started = std::time::Instant::now();
+        let bricks = loop {
+            loader.sync([0.0; 3], bands());
+            if let Some(Arrival::Children { bricks, .. }) = loader.receive(1).pop() {
+                break bricks;
+            }
+            assert!(started.elapsed().as_secs() < 30, "never came");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        };
+        assert_eq!(bricks.len(), 4);
+        assert!(bricks.iter().all(|(c, _, _)| c.0[1] == -1));
+        assert_eq!(source.made.load(Atomic::Relaxed), 4);
+        assert_eq!(loader.generated(), 4);
     }
 
     #[test]

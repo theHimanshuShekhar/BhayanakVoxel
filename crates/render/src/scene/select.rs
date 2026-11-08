@@ -246,11 +246,19 @@ fn classify(
     }
 }
 
-/// The brick at `coord` of `level` as the store reads it, and whether the store holds it.
+/// The brick at `coord` of `level` as the store reads it, and whether the store holds it. A brick
+/// that is not held and that the store knows is full without generating it, as the buried bricks
+/// that the loader leaves out are ([`BrickStore::reads_full_from_source`]), is read as a full brick
+/// of some Material, which is all that the tree asks of a brick: reading it as it is would
+/// generate it, on this thread. A brick that an Edit exposes is drawn from the store, and so is
+/// read as it is.
 fn read(store: &BrickStore, level: usize, coord: BrickCoord) -> (Cow<'_, Brick>, bool) {
     match store.level(level).and_then(|l| l.brick(coord)) {
         Some(brick) => (Cow::Borrowed(brick), true),
-        None => (store.brick_at(level, coord), false),
+        None if store.reads_full_from_source(level, coord) => {
+            (Cow::Owned(Brick::solid(brick_store::Material(1))), false)
+        }
+        None => (Cow::Owned(store.unheld_brick(level, coord)), false),
     }
 }
 
@@ -1966,6 +1974,88 @@ mod tests {
             assert_eq!(made.load(AtomicOrdering::Relaxed), 0, "round {rounds}");
         }
         assert!(rounds > 1, "{rounds}");
+    }
+
+    /// Rock under y = -8 (the top of the level 0 bricks at y = -2), at every level: a brick wholly
+    /// under it is rock and says so, one that has it in is rock too (a coarse brick's air is not
+    /// modelled), one wholly over it is air.
+    #[derive(Debug)]
+    struct Floor;
+
+    impl Floor {
+        fn size(level: usize) -> i32 {
+            8 << level
+        }
+    }
+
+    impl brick_store::BrickSource for Floor {
+        fn brick(&self, level: usize, coord: BrickCoord) -> Brick {
+            if coord.0[1] * Self::size(level) >= -8 {
+                Brick::AIR
+            } else {
+                Brick::solid(ROCK)
+            }
+        }
+
+        fn solid_below(&self, level: usize, coord: BrickCoord) -> bool {
+            (coord.0[1] + 1) * Self::size(level) <= -8
+        }
+    }
+
+    /// A buried brick that the loader left out is not drawn; an Edit that opens the brick over it
+    /// makes it a brick that shows, and it is drawn then, with the Voxels the source gives it.
+    #[test]
+    fn an_edit_beside_a_buried_brick_that_was_left_out_leads_to_its_being_drawn_with_its_voxels() {
+        let mut store = BrickStore::new();
+        store.set_source(Floor);
+        store.build_lod(3);
+        store.stream_from(3);
+        let source = store.source().expect("a source");
+        for x in -3..3 {
+            for y in -3..3 {
+                for z in -3..3 {
+                    let coord = BrickCoord([x, y, z]);
+                    if !store.holds(3, coord) {
+                        let brick = source.brick(3, coord);
+                        if !brick.is_air() {
+                            store.hold(3, coord, brick, source.solid_below(3, coord));
+                        }
+                    }
+                }
+            }
+        }
+        let mut selection = select(&store, [0.5, 20.0, 0.5], D0);
+        loop {
+            let wanted = selection.take_wanted();
+            if wanted.is_empty() {
+                break;
+            }
+            for &(level, coord) in &wanted {
+                let bricks = brick_store::children_from(&*source, level, coord, |c| {
+                    store.holds(level - 1, c)
+                });
+                store.hold_children(level, coord, bricks);
+            }
+            selection.arrived(&store, wanted);
+        }
+        // The rock is under y = -1: its top layer (y = -2) shows, and the one under (y = -3) is
+        // buried, so it was left out: not held, not drawn, and full as far as the store knows.
+        let (x, z) = (0, 0);
+        let (top, buried) = (BrickCoord([x, -2, z]), BrickCoord([x, -3, z]));
+        assert!(store.holds(0, top) && selection.draws(0, top));
+        assert!(!store.holds(0, buried), "it was left out");
+        assert!(store.reads_full_from_source(0, buried));
+        assert!(!selection.draws(0, buried) && !selection.splits(0, buried));
+
+        // An Edit takes out the brick over it (it stays held, as air): now the buried brick has
+        // air against its top face.
+        store.insert(top, Brick::AIR);
+        let diff = selection.refresh(&store, &[top]);
+        assert!(selection.draws(0, buried), "it shows now");
+        assert!(diff.added.contains(&(0, buried)));
+        assert!(!selection.draws(0, top));
+        // What it is drawn with is what the source makes of it, generated when it is read.
+        assert_eq!(*store.brick_at(0, buried), Brick::solid(ROCK));
     }
 
     #[test]
