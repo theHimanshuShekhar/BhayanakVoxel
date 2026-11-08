@@ -14,7 +14,7 @@ pub use brush::{
     BrickCache, CACHE_BRICKS, Change, MAX_COORD, Reads, axes, examined, examined_box, plan,
     plan_from,
 };
-pub use character::{Cell, Character, Occupancy, TICK_DT};
+pub use character::{Cell, Character, Content, Occupancy, TICK_DT};
 pub use edit::{
     EDIT_REACH, EditBudget, MAX_BRUSH_RADIUS, MAX_SMOOTH_RADIUS, MIN_DIG_SECONDS, OPS_PER_SECOND,
     SECONDS_PER_HARDNESS, SMOOTH_WEIGHT, Undo, VOXEL_BURST, VOXELS_PER_SECOND, WORK_BURST,

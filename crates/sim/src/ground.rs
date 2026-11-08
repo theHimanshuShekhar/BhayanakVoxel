@@ -33,11 +33,11 @@ use std::mem::size_of;
 use std::sync::{Arc, OnceLock};
 
 use brick_store::{
-    BRICK_SIZE, Brick, BrickCoord, BrickSource, BrickStore, VOXELS_PER_METRE, VoxelCoord,
+    BRICK_SIZE, Brick, BrickCoord, BrickSource, BrickStore, BrickView, VOXELS_PER_METRE, VoxelCoord,
 };
 use net::Leash;
 
-use crate::{Cell, Occupancy};
+use crate::{Cell, Content, Occupancy};
 
 /// The farthest a leash reaches from its centre, in Voxels: 8 m, the Edit reach. Bigger than a
 /// character needs to stand in (2 m), so that it keeps going while the next ground is made. At 5 cm
@@ -313,6 +313,17 @@ impl Occupancy for Footing<'_> {
             Some(_) => Cell::Air,
         }
     }
+
+    fn content(&self, coord: BrickCoord) -> Content<'_> {
+        match self.store.brick(coord).or_else(|| self.ground.get(coord)) {
+            None => Content::Solid,
+            Some(brick) => match brick.view() {
+                BrickView::Air => Content::Air,
+                BrickView::Solid(_) => Content::Solid,
+                BrickView::Mixed { occupancy, .. } => Content::Mixed(occupancy),
+            },
+        }
+    }
 }
 
 #[cfg(test)]
@@ -542,5 +553,78 @@ mod tests {
             radius: f64::from(REACH) + 1.0,
             ..wide
         }));
+    }
+
+    /// Bricks of every kind: stone below y = 0, air above y = 8, and a mixed brick between that has
+    /// a bump, a pit and a thin wall in it.
+    #[derive(Debug)]
+    struct Lumpy;
+
+    impl BrickSource for Lumpy {
+        fn brick(&self, _: usize, coord: BrickCoord) -> Brick {
+            match coord.0[1] {
+                ..0 => Brick::solid(STONE),
+                0 => {
+                    let mut brick = Brick::solid(STONE);
+                    for x in 0..8u8 {
+                        for z in 0..8u8 {
+                            let bump = (x + z + coord.0[0].rem_euclid(3) as u8) % 5;
+                            for y in 3 + bump / 2..8 {
+                                brick.set([x, y, z], None);
+                            }
+                        }
+                    }
+                    if coord.0[2] % 2 == 0 {
+                        for y in 0..8 {
+                            brick.set([3, y, 4], Some(STONE));
+                        }
+                    }
+                    brick
+                }
+                _ => Brick::AIR,
+            }
+        }
+    }
+
+    #[test]
+    fn a_bricks_content_is_what_its_cells_are() {
+        let mut ground = Ground::new(Some(Arc::new(Lumpy))).with_rate(100_000);
+        ground.reset([0.0; 3]);
+        complete(&mut ground);
+        let mut store = BrickStore::new();
+        store.insert(BrickCoord([1, 1, 0]), Brick::solid(STONE));
+        let footing = Footing::new(&store, &ground);
+        let (mut air, mut solid, mut mixed) = (0, 0, 0);
+        // The ground, the Edit among it, and bricks that nothing holds.
+        for coord in [
+            [0, -1, 0],
+            [0, 0, 0],
+            [3, 0, 2],
+            [0, 1, 0],
+            [1, 1, 0],
+            [90, 0, 0],
+        ] {
+            let coord = BrickCoord(coord);
+            let content = footing.content(coord);
+            let origin = coord.origin().0;
+            for local in 0..BRICK_SIZE.pow(3) {
+                let [x, y, z] = [local % 8, local / 8 % 8, local / 64];
+                let voxel = VoxelCoord([origin[0] + x, origin[1] + y, origin[2] + z]);
+                let solid_cell = footing.cell(voxel) != Cell::Air;
+                let solid_content = match content {
+                    Content::Air => false,
+                    Content::Solid => true,
+                    Content::Mixed(words) => words[local as usize / 64] >> (local % 64) & 1 == 1,
+                    Content::PerVoxel => unreachable!(),
+                };
+                assert_eq!(solid_content, solid_cell, "{voxel:?}");
+            }
+            match content {
+                Content::Air => air += 1,
+                Content::Solid => solid += 1,
+                _ => mixed += 1,
+            }
+        }
+        assert_eq!((air, solid, mixed), (1, 3, 2));
     }
 }
