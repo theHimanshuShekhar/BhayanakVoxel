@@ -353,6 +353,10 @@ struct Updates {
     /// long an Edit (that changes nothing) waited every so often, in milliseconds.
     lag: Vec<f64>,
     edit_waits: Vec<f64>,
+    /// The most the store counted against its budget at the end of any frame, and the most bytes
+    /// of words the scene used.
+    held_peak: usize,
+    scene_peak: u64,
 }
 
 /// The median, 99th percentile and largest of `values`, for a line of a report.
@@ -376,6 +380,19 @@ impl Updates {
 }
 
 impl Updates {
+    /// Adds what `later` came to, which came after.
+    fn merge(&mut self, later: Updates) {
+        self.recentre.merge(later.recentre);
+        self.stream.merge(later.stream);
+        self.rebuilt += later.rebuilt;
+        self.patched += later.patched;
+        self.worst_words = self.worst_words.max(later.worst_words);
+        self.lag.extend(later.lag);
+        self.edit_waits.extend(later.edit_waits);
+        self.held_peak = self.held_peak.max(later.held_peak);
+        self.scene_peak = self.scene_peak.max(later.scene_peak);
+    }
+
     fn add(&mut self, update: Option<render::SceneUpdate>) {
         match update {
             Some(render::SceneUpdate::Rebuilt) => self.rebuilt += 1,
@@ -513,6 +530,12 @@ fn scene_frame(
     for update in streamed {
         updates.add(Some(update));
     }
+    updates.held_peak = updates.held_peak.max(world.store().streamed_len());
+    updates.scene_peak = updates.scene_peak.max(world.used_bytes());
+}
+
+fn norm(v: [f64; 3]) -> f64 {
+    v.iter().map(|c| c * c).sum::<f64>().sqrt()
 }
 
 /// The camera moving over the ground at `metres_per_s` for `frames` frames at
@@ -532,6 +555,10 @@ fn travel(
     for _ in 0..frames {
         let tick = Instant::now();
         moved = std::array::from_fn(|a| moved[a] + ahead[a] * step);
+        // On the sphere of the ground the camera is over, which a straight line leaves: a flight
+        // of kilometres is far above the ground by its end.
+        let (radius, length) = (norm(camera.position), norm(moved));
+        moved = moved.map(|c| c / length * radius);
         camera.position = over_the_ground(&world.store(), moved);
         camera.carry_up(camera.position);
         scene_frame(world, camera.position, &mut work, &mut updates, tables);
@@ -544,6 +571,31 @@ fn travel(
         std::thread::sleep(frame.saturating_sub(tick.elapsed()));
     }
     (work, updates)
+}
+
+/// A line on the host store and the process's resident memory, for the full-size test.
+fn memory(world: &World, when: &str) -> String {
+    let rss_mib = std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|status| {
+            status
+                .lines()
+                .find_map(|line| line.strip_prefix("VmRSS:").map(str::to_owned))
+        })
+        .and_then(|line| line.split_whitespace().next()?.parse::<f64>().ok())
+        .map_or(f64::NAN, |kib| kib / 1024.0);
+    let store = world.store();
+    let bricks: usize = (0..store.level_count())
+        .map(|l| store.level(l).map_or(0, |l| l.len()))
+        .sum();
+    format!(
+        "memory {when}: store {bricks} bricks held, {} counted against the budget, {} evicted, {} \
+         edited; scene {:.0} MiB used; process resident {rss_mib:.0} MiB",
+        store.streamed_len(),
+        store.evicted_len(),
+        store.diverged_len(),
+        world.used_bytes() as f64 / (1024.0 * 1024.0)
+    )
 }
 
 /// What the full-size test holds the frame thread's scene work to, in milliseconds: the 99th
@@ -570,6 +622,12 @@ const HELD_FLIGHT: Held = HELD;
 /// bricks were added, 411 to 424 s after with the frame thread taking them in, and 146 to 190 s
 /// with the scene thread).
 const HELD_FILL_SECS: f64 = 300.0;
+/// The most the drawn scene may use per copy (the words of the bricks it draws, in MiB), near the
+/// ground at the full bands: measured 463 MiB for 3.56 million drawn bricks at about 132 bytes
+/// each. The prefetch simulator's shell at rest is 227 to 259 MB (#49), about half as many
+/// drawn bricks; #143 re-checks that. The bands bound the scene whatever the store holds, so this
+/// is a ceiling on the client, with some room over what was measured.
+const SCENE_MIB_MOST: f64 = 512.0;
 
 impl Held {
     fn assert(&self, what: &str, work: &SceneWork, updates: &Updates) {
@@ -607,7 +665,14 @@ fn the_full_size_planet_streams_in_and_walking_over_it_does_not_stall() {
             .unwrap_or_default()
             .trim()
     );
-    let loaded = crate::load_planet();
+    let mut loaded = crate::load_planet();
+    // For comparing with a store that is not evicted from: `FULLSIZE_NO_BUDGET=1`.
+    if std::env::var_os("FULLSIZE_NO_BUDGET").is_some() {
+        loaded.store.set_budget(brick_store::Budget {
+            bricks: usize::MAX / 4,
+            overflow: 0.0,
+        });
+    }
     let (client, _server) = loopback();
     let mut world =
         World::new(loaded.scene, Predictor::new(loaded.store), client).with_loader(loaded.loader);
@@ -692,6 +757,7 @@ fn the_full_size_planet_streams_in_and_walking_over_it_does_not_stall() {
         fill_updates.worst_words,
     );
     tables.report();
+    eprintln!("{}", memory(&world, "after the fill"));
     eprintln!("filling: {}", fill_work.summary().unwrap());
     eprintln!(
         "  of which following the camera: {}; taking in bricks: {}",
@@ -729,10 +795,18 @@ fn the_full_size_planet_streams_in_and_walking_over_it_does_not_stall() {
     );
 
     // Then it flies, 48 m/s over the ground: ten times the walk's distance a frame. The
-    // reservations are for the fill and the walk, so the flight is not held to them.
-    let (fly_work, fly_updates) = travel(&mut world, &mut camera, &mut tables, 48.0, 1800);
+    // reservations are for the fill and the walk, so the flight is not held to them. It goes on
+    // for 5 km (#141), in legs, with the host store and the resident set reported after each.
+    let (mut fly_work, mut fly_updates) = (SceneWork::default(), Updates::default());
+    let scene_after_fill = world.used_bytes();
+    for leg in 1..=6 {
+        let (work, updates) = travel(&mut world, &mut camera, &mut tables, 48.0, 1050);
+        eprintln!("{}", memory(&world, &format!("flight, {} m", leg * 840)));
+        fly_work.merge(work);
+        fly_updates.merge(updates);
+    }
     eprintln!(
-        "flying 1.4 km: {}; {} patches, {} rebuilds, the largest patch {} words",
+        "flying 5 km: {}; {} patches, {} rebuilds, the largest patch {} words",
         fly_work.summary().unwrap(),
         fly_updates.patched,
         fly_updates.rebuilt,
@@ -750,6 +824,62 @@ fn the_full_size_planet_streams_in_and_walking_over_it_does_not_stall() {
         tables.grown
     );
     HELD_FLIGHT.assert("the flight", &fly_work, &fly_updates);
+    // The host store stays within its budget and the overflow (#141): with the flight asking for
+    // far more than the loader makes, the most it counted at the end of any frame is bounded by
+    // the limit, not growing with the distance; and the scene, which the bands bound, does not
+    // grow either.
+    let store = world.store();
+    let budget = store.budget().unwrap();
+    let mib = |bytes: u64| bytes as f64 / (1024.0 * 1024.0);
+    let eviction = world.stats().eviction;
+    eprintln!(
+        "the most the store counted at the end of a frame in the flight: {}; the budget {} with its \
+         overflow {}; {} bricks evicted in {} passes",
+        fly_updates.held_peak,
+        budget.bricks,
+        budget.limit(),
+        store.evicted_len(),
+        eviction.passes
+    );
+    eprintln!(
+        "eviction: the last pass took {:.1?} to list the units, the longest {:.1?}; the store's read \
+         lock was held {} times to look at units, {:.2?} at a time on average and {:.2?} at the \
+         longest; its write lock {:.2?} at the longest",
+        eviction.listing,
+        eviction.longest_listing,
+        eviction.reads,
+        eviction.read_total / eviction.reads.max(1) as u32,
+        eviction.longest_read,
+        eviction.longest_write
+    );
+    eprintln!(
+        "the scene: {:.0} MiB used after the fill, at most {:.0} MiB in the flight (the prefetch \
+         simulator's shell at rest near the ground is 227 to 259 MB)",
+        mib(scene_after_fill),
+        mib(fly_updates.scene_peak)
+    );
+    assert!(
+        fly_updates.scene_peak <= scene_after_fill + scene_after_fill / 20,
+        "the scene grew in the flight"
+    );
+    assert!(
+        mib(scene_after_fill.max(fly_updates.scene_peak)) <= SCENE_MIB_MOST,
+        "the scene used {:.0} MiB, held to {SCENE_MIB_MOST}",
+        mib(scene_after_fill.max(fly_updates.scene_peak))
+    );
+    if std::env::var_os("FULLSIZE_NO_BUDGET").is_none() {
+        assert!(
+            fly_updates.held_peak <= budget.limit(),
+            "the store counted {} against a limit of {}",
+            fly_updates.held_peak,
+            budget.limit()
+        );
+        assert!(
+            store.evicted_len() > 0,
+            "the flight was long enough to evict"
+        );
+    }
+    drop(store);
     // Last, so that a capped run reports the walk and the flight too.
     assert!(
         filled,
@@ -1316,4 +1446,152 @@ fn the_frame_thread_takes_a_few_milliseconds_of_the_largest_edit_at_the_spawn_wi
         assert!(store < 2.0 && look < 6.0, "a wait: {store} and {look}");
         assert!(ghost < 10.0, "the ghost: {ghost}");
     }
+}
+
+/// A world like [`spawned_world`] whose store has the `budget`.
+fn budgeted_world(workers: usize, budget: brick_store::Budget) -> (World, ServerEnd, Camera) {
+    let mut store = spawned_store();
+    store.set_budget(budget);
+    let camera = crate::spawn_camera(ground());
+    let scene = Scene::rings(&store, camera.position, bands(), bound()).unwrap();
+    let loader = Loader::new(store.source().unwrap(), camera.position, bands(), workers);
+    let (client, server) = loopback();
+    let world = World::new(scene, Predictor::new(store), client).with_loader(loader);
+    (world, server, camera)
+}
+
+/// The camera moved `frames` frames of `step` Voxels along the ground in `direction`, streaming.
+fn fly(
+    world: &mut World,
+    from: [f64; 3],
+    direction: [f64; 3],
+    step: f64,
+    frames: usize,
+) -> [f64; 3] {
+    let mut moved = from;
+    let mut position = from;
+    for _ in 0..frames {
+        moved = std::array::from_fn(|a| moved[a] + direction[a] * step);
+        position = over_the_ground(&world.store(), moved);
+        world.recentre(position).unwrap();
+        stream(world, position);
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    position
+}
+
+/// Streams with the camera at `camera` until the resident set is complete and the store is within
+/// its budget's limit.
+fn settle(world: &mut World, camera: [f64; 3]) {
+    let started = Instant::now();
+    loop {
+        stream(world, camera);
+        world.sync().unwrap();
+        if idle(world) && !world.store().over_limit() {
+            return;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(120),
+            "does not settle: idle {}, {} held of a limit of {}, {} evicted, {} edited",
+            idle(world),
+            world.store().streamed_len(),
+            world.store().budget().unwrap().limit(),
+            world.store().evicted_len(),
+            world.store().diverged_len()
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
+}
+
+#[test]
+fn flying_away_and_back_keeps_the_store_within_its_budget_and_leaves_no_hole_or_stale_edit() {
+    // The budget is what the complete set holds with the camera at the spawn, and a sliver over.
+    let (mut first, _s, spawn) = spawned_world(2);
+    fill(&mut first, spawn.position);
+    first.sync().unwrap();
+    let full = first.store().streamed_len();
+    drop(first);
+    let budget = brick_store::Budget {
+        bricks: full * 11 / 10,
+        overflow: 0.01,
+    };
+    let (mut world, _server, spawn) = budgeted_world(2, budget);
+    fill(&mut world, spawn.position);
+
+    // Dig at the spawn, so that there is an Edit to keep.
+    let aim = up_close(&mut world, &spawn);
+    let at = crate::world::centre_hit(world.scene(), &aim)
+        .expect("ground")
+        .voxel;
+    assert!(world.store().voxel_at(0, VoxelCoord(at)).is_some());
+    // The scene shows the crater: a ray at the Voxel goes deeper than it did.
+    let ray = ray_through(aim.position, at.map(f64::from));
+    let before_t = trace(world.scene(), &ray).expect("ground").t;
+    dig_and_wait(&mut world, &aim);
+    let dug_t = trace(world.scene(), &ray).expect("ground").t;
+    assert!(dug_t > before_t + 2.0, "{before_t} {dug_t}");
+    assert!(world.store().voxel_at(0, VoxelCoord(at)).is_none());
+    assert!(world.store().diverged_len() > 0);
+    // A brick of the ground 60 Voxels along from the crater, well outside what the crater keeps.
+    let (ahead, _) = tangents(spawn.horizon_up);
+    let probe = {
+        let store = world.store();
+        let beside = over_the_ground(
+            &store,
+            std::array::from_fn(|a| at[a] as f64 + ahead[a] * 60.0),
+        );
+        let up = beside.map(|c| c / norm(beside));
+        let brick = (0..80)
+            .map(|i| {
+                VoxelCoord(std::array::from_fn(|a| {
+                    (beside[a] - up[a] * f64::from(i)).round() as i32
+                }))
+                .brick()
+            })
+            .find(|&b| store.holds(0, b))
+            .expect("the ground beside the crater is held");
+        assert!(store.children_resident(1, brick.parent()));
+        brick
+    };
+
+    // Fly away far enough that the spawn's units are left behind, and settle there.
+    let away = fly(&mut world, aim.position, ahead, 20.0, 500);
+    settle(&mut world, away);
+    {
+        let store = world.store();
+        eprintln!(
+            "complete set {full}; after the flight {} (limit {}), {} bricks evicted",
+            store.streamed_len(),
+            budget.limit(),
+            store.evicted_len()
+        );
+        assert!(store.streamed_len() <= budget.limit());
+        assert!(store.evicted_len() > 0, "the flight left units to evict");
+        assert!(store.diverged_len() > 0, "the Edit is still the store's");
+        assert!(
+            !store.children_resident(1, probe.parent()) && !store.holds(0, probe),
+            "a unit near the spawn that nothing keeps was evicted"
+        );
+    }
+
+    // Back at the spawn the area is streamed in again: ground at level 0 under the camera, and the
+    // crater where it was dug.
+    fly(&mut world, away, ahead.map(|c| -c), 20.0, 500);
+    let back = aim.position;
+    world.recentre(back).unwrap();
+    settle(&mut world, back);
+    let down = ray_through(back, std::array::from_fn(|a| back[a] - spawn.horizon_up[a]));
+    let hit = trace(world.scene(), &down).expect("ground under the camera");
+    assert_eq!(world.scene().level_at(hit.voxel), Some(0));
+    assert!(world.store().voxel_at(0, VoxelCoord(at)).is_none());
+    assert!(
+        world.store().holds(0, probe),
+        "the unit that was evicted is streamed in again"
+    );
+    let again = trace(world.scene(), &ray).expect("ground").t;
+    assert!(
+        (again - dug_t).abs() <= 1.0,
+        "the crater is in the scene: the ray hit at {dug_t} when it was dug and at {again} now"
+    );
+    assert!(world.store().streamed_len() <= budget.limit());
 }

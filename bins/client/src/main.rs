@@ -18,7 +18,7 @@ use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 
-use brick_store::{BrickStore, VOXELS_PER_METRE};
+use brick_store::{BrickStore, Budget, VOXELS_PER_METRE};
 use dig::Dig;
 use editor::{Editor, Grab, Input};
 use fly::{Action, Fly};
@@ -188,7 +188,8 @@ fn room_for(bands: Bands) -> Room {
     }));
     Room {
         held,
-        // 3.37 million bricks had their children resident.
+        // 3.02 million bricks had their children resident at the end of the fill, and 3.37
+        // million after the walk (the store's budget counts them: see `budget_for`).
         resident: scaled(4_210_000.0),
         // The tree held 17.67 million nodes.
         nodes: scaled(22_100_000.0),
@@ -196,6 +197,41 @@ fn room_for(bands: Bands) -> Room {
         // end, and stuck 120 000.
         waiting: scaled(277_000.0),
         stuck: scaled(150_000.0),
+    }
+}
+
+/// What the store may hold (`BrickStore::streamed_len`: the bricks held under the Guard, and an
+/// entry for each unit whose children are resident), per d0 squared. The complete resident set
+/// counted 29.31 million at a `d0` of 1028.2 Voxels (the measurement of [`BRICKS_PER_D0_SQUARED`]:
+/// 26.97 million bricks held, 0.68 million of them the Guard's, which are not counted, and 3.02
+/// million units resident), which is 27.7 per d0 squared. The complete
+/// shell is what eviction keeps (ADR 0004; the prefetch simulator of #87 sizes its budget at the
+/// shell), so a camera that stays or walks never evicts; flying, which leaves a trail of the
+/// shells it passed through, does.
+///
+/// #87's 227 to 259 MB per scene copy at 136 bytes a brick is the bricks that are *drawn*, which
+/// the bands bound (3.56 million, 474 MiB of words in the scene, at 33 words a brick) whatever the
+/// store holds. The host store holds about eight times as many bricks as are drawn: the
+/// ancestors of every drawn brick, and the bricks beside and under them that the bands do not
+/// draw but split. That is what is budgeted here, since it is what grows.
+const STREAMED_PER_D0_SQUARED: f64 = 27.8;
+/// How far over the budget the store may go before eviction starts (ADR 0004 says 10 to 20%).
+/// A flight of 2.5 km took the store 16% over the complete set (the trail of shells), so 10% is
+/// evicted from within a few kilometres. At the cap, when everything left is wanted, eviction
+/// waits until the store has grown by a quarter (`EVICT_BACKOFF` in `scene_worker`): coarsening
+/// the LOD to fit is #143's.
+const BUDGET_OVERFLOW: f64 = 0.1;
+
+/// How much the store may hold, for the full bands at a bias of 1 scaled with `d0` squared like
+/// `room_for`: the tables are reserved for the most the complete fill held with [`HEADROOM`], and
+/// eviction brings the store's total back to the budget. The budget bounds the total, not each
+/// level: a flight holds a different mix of levels than the fill, and a table that is near a
+/// size of its hash table (the level 2 bricks, at 1.82 million of 1.84) can double once in a
+/// long flight.
+fn budget_for(bands: Bands) -> Budget {
+    Budget {
+        bricks: (STREAMED_PER_D0_SQUARED * bands.d0() * bands.d0()) as usize,
+        overflow: BUDGET_OVERFLOW,
     }
 }
 
@@ -314,6 +350,7 @@ fn load(map: WorldMap, reach: i32) -> Result<Loaded, RingsFull> {
     let room = room_for(bands);
     store.reserve(&room.held);
     store.reserve_resident(room.resident);
+    store.set_budget(budget_for(bands));
     let guarded = Instant::now();
     let held = loader::hold_guard(&mut store, &planet, GUARD_FIRST);
     eprintln!(

@@ -897,6 +897,14 @@ impl Scene {
         }
     }
 
+    /// Whether a scene of rings splits the brick at `coord` of `level` into the eight bricks
+    /// under it (see [`Selection::splits`]), so that they are in use.
+    pub fn splits(&self, level: usize, coord: BrickCoord) -> bool {
+        self.rings
+            .as_ref()
+            .is_some_and(|rings| rings.selection.splits(level, coord))
+    }
+
     /// Where the camera is that a scene of rings was last moved to, in Voxels.
     pub fn camera(&self) -> Option<[f64; 3]> {
         self.rings.as_ref().map(|r| r.selection.camera())

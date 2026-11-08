@@ -383,6 +383,11 @@ impl Loader {
         self.requested.len()
     }
 
+    /// Whether the children of `key` are asked for and not received (see [`Loader::pending`]).
+    pub fn is_requested(&self, key: Key) -> bool {
+        self.requested.contains_key(&key)
+    }
+
     /// Bricks the workers have asked the generator for, since the start.
     pub fn generated(&self) -> u64 {
         self.shared.generated.load(Atomic::Relaxed)
