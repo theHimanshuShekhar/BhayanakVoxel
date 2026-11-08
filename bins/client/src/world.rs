@@ -159,6 +159,27 @@ pub struct World {
     /// Time spent running inputs again after the server and the prediction differed, since
     /// [`World::take_resim`].
     resim: std::time::Duration,
+    /// The Edits given to the scene thread that have not been waited for ([`World::edit`]).
+    unshown_edit: Option<UnshownEdit>,
+    /// How long [`World::edit_due`] waits: [`EDIT_WAIT`], or more in a test on a slow build.
+    edit_wait: std::time::Duration,
+}
+
+/// How long the frame thread waits for the scene thread to have packed the bricks of level 0 of
+/// an Edit, in the frame after the one that made it: a few milliseconds. The pack is done at once
+/// and is a few milliseconds of the thread's, so it is there; if the thread was busy with
+/// something else for longer, the Edit shows the frame after instead of the frame thread waiting.
+const EDIT_WAIT: std::time::Duration = std::time::Duration::from_millis(4);
+
+/// Edits that [`World::edit`] gave to the scene thread and that the frame thread is to see in the
+/// scene by the second look at it ([`World::recentre`]) after the oldest of them.
+#[derive(Clone, Copy, Debug)]
+struct UnshownEdit {
+    /// The job of the newest: the thread does them in order, so it is done when they all are.
+    newest: u64,
+    /// Whether the frame that the oldest was made in has looked at the scene since. The next look
+    /// is the one that waits for them.
+    looked_since_oldest: bool,
 }
 
 /// The first solid Voxel along the camera's view through the middle of the screen.
@@ -187,6 +208,8 @@ impl World {
             ghost: None,
             ghost_next: None,
             resim: std::time::Duration::ZERO,
+            unshown_edit: None,
+            edit_wait: EDIT_WAIT,
         }
     }
 
@@ -197,6 +220,8 @@ impl World {
     /// the predictor's store, which must stream ([`brick_store::BrickStore::stream_from`]).
     pub fn with_loader(mut self, loader: Loader) -> Self {
         let scene = std::mem::take(&mut self.scene);
+        // The scene thread remakes the coarse levels over what an Edit changed.
+        self.predictor.defer_lod();
         let (worker, mirror, stats) =
             SceneWorker::start(scene, loader, self.predictor.shared_store());
         (self.worker, self.scene, self.stats) = (Some(worker), mirror, stats);
@@ -340,9 +365,36 @@ impl World {
         match &self.worker {
             Some(worker) => {
                 worker.follow(camera);
-                self.take_ready(false)
+                let wait = self.edit_due()?;
+                self.take_ready(wait)
             }
             None => self.scene.recentre(&self.predictor.store(), camera),
+        }
+    }
+
+    /// Whether the Edits that [`World::edit`] gave to the scene thread are to be taken with a wait
+    /// now. That is at the second look at the scene after the oldest: the first is the frame's
+    /// that made it, when the thread has only just begun, and the next is a frame later, when it
+    /// has long packed the bricks of level 0 (the coarse levels are remade after, a step at a
+    /// time, and are not waited for). The wait is for [`EDIT_WAIT`] at the most.
+    ///
+    /// So an Edit shows in the frame after the one that made it, if the scene thread has packed it
+    /// by [`EDIT_WAIT`] into that frame, which is the bound of C1 in
+    /// `docs/research/scheduling-and-upload.md`; and else in the first look after it is packed. The
+    /// frame thread waits [`EDIT_WAIT`] at the most for it.
+    fn edit_due(&mut self) -> Result<bool, RingsFull> {
+        let Some(edit) = &mut self.unshown_edit else {
+            return Ok(false);
+        };
+        if !edit.looked_since_oldest {
+            edit.looked_since_oldest = true;
+            return Ok(false);
+        }
+        let newest = edit.newest;
+        self.unshown_edit = None;
+        match &self.worker {
+            Some(worker) => worker.wait_for(newest, Some(self.edit_wait)),
+            None => Ok(false),
         }
     }
 
@@ -377,6 +429,13 @@ impl World {
         }
         self.take_ready(true)?;
         Ok(started.elapsed())
+    }
+
+    /// Waits `time` for an Edit in the frame after it, instead of [`EDIT_WAIT`]: a test on a build
+    /// that packs a large Edit in more than a few milliseconds.
+    #[cfg(test)]
+    pub fn set_edit_wait(&mut self, time: std::time::Duration) {
+        self.edit_wait = time;
     }
 
     /// The scene thread's end, for a test to talk to it directly.
@@ -508,8 +567,8 @@ impl World {
         let waiting = self.ghost.is_some() && self.ghost_next.is_some_and(|next| now < next);
         if stale && !waiting {
             let started = std::time::Instant::now();
-            let changes = self.predictor.plan(&op);
-            self.ghost = Some(Ghost::new(op, changes));
+            let plan = self.predictor.plan_bricks(&op);
+            self.ghost = Some(Ghost::new(op, &plan));
             self.ghost_next = Some(now + started.elapsed() * GHOST_BACKOFF);
         }
         if let Some(ghost) = &mut self.ghost {
@@ -529,9 +588,14 @@ impl World {
         self.ghost.as_ref()
     }
 
-    /// Applies `tool` where the camera looks: shows the Edit at once, and asks the server for it.
-    /// Returns how the scene changed, if there was anything to apply it to. An Edit that the
-    /// client knows the server will turn down (see [`sim::Predictor::foresee`]) is not made.
+    /// Applies `tool` where the camera looks, and asks the server for it. The Voxels are changed
+    /// here, which is the planning and the writing of the bricks (a few milliseconds for the
+    /// largest Brush), and the rest is the scene thread's (the coarse levels, the packing): the
+    /// Edit is on the screen within a frame, the first [`World::recentre`] that comes after the
+    /// next, and not in this call, which returns how the scene changed only if something else the
+    /// thread had made was ready. An Edit that the client knows the server will turn down (see
+    /// [`sim::Predictor::foresee`]) is not made. A world with no scene thread (see
+    /// [`World::with_loader`]) does all of it in the call, and returns how the scene changed.
     pub fn edit(&mut self, camera: &Camera, tool: &Tool) -> Result<Option<SceneUpdate>, Stopped> {
         let Some(op) = self.aim(camera, tool) else {
             return Ok(None);
@@ -540,7 +604,21 @@ impl World {
             return Ok(None);
         };
         self.link.send(request)?;
-        Ok(self.refresh(&changed)?)
+        let Some(worker) = &self.worker else {
+            return Ok(self.refresh(&changed)?);
+        };
+        // The Voxels are changed. The scene thread remakes the coarse levels over them and packs
+        // them, and the frame thread goes on: see [`World::recentre`], which takes it.
+        if let Some(ghost) = &mut self.ghost {
+            ghost.dirty |= ghost.touches(&changed);
+        }
+        // A second Edit before the first is waited for keeps the first one's frame.
+        let newest = worker.edit_later(changed);
+        self.unshown_edit = Some(UnshownEdit {
+            newest,
+            looked_since_oldest: self.unshown_edit.is_some_and(|e| e.looked_since_oldest),
+        });
+        Ok(self.take_ready(false)?)
     }
 
     /// Takes in what the server has sent. Returns how the scene changed, if it did.
@@ -876,12 +954,13 @@ mod tests {
                 let after = world.store();
                 // The Voxels that differ now are the ghost's, and are what it said they become.
                 let mut differing = 0;
+                let changes = ghost.changes();
                 for x in 4016 - 20..=4016 + 20 {
                     for y in -4..=36 {
                         for z in -26..=26 {
                             let voxel = VoxelCoord([x, y, z]);
                             let now = after.get(voxel);
-                            let change = ghost.changes.iter().find(|c| c.voxel == voxel);
+                            let change = changes.iter().find(|c| c.voxel == voxel);
                             assert_eq!(before.get(voxel) != now, change.is_some(), "{op:?}");
                             differing += usize::from(change.is_some());
                             if let Some(change) = change {
@@ -890,7 +969,7 @@ mod tests {
                         }
                     }
                 }
-                assert_eq!(differing, ghost.changes.len(), "{op:?}");
+                assert_eq!(differing, changes.len(), "{op:?}");
                 non_empty += usize::from(differing > 0);
                 // An Edit that changed the Planet where the ghost reads calls for a new ghost.
                 assert_eq!(world.ghost().unwrap().dirty, differing > 0);

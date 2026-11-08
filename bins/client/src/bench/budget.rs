@@ -161,6 +161,9 @@ mod tests {
         assert_eq!(budgets.passes["primary"], 1.0, "Primary visibility, #10");
         assert_eq!(budgets.passes["upscale"], 0.5, "Upscale, #10");
         assert!(budgets.passes.contains_key("reference"));
+        // A mean over all the frames lets an Edit hitch hide; the longest Edit does not (#156).
+        assert_eq!(budgets.passes["edits"], 1.0);
+        assert_eq!(budgets.passes["edit_frame_thread"], 4.0);
         assert!(budgets.gpu_total.contains_key("primary"));
     }
 }

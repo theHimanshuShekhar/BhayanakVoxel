@@ -16,9 +16,25 @@ use brick_store::{BrickCoord, BrickStore};
 use net::{BodyState, ClientMessage, EditOp, Leash, MoveInput, RejectReason, ServerMessage};
 
 use crate::{
-    BrickCache, Change, Character, EditBudget, Footing, Ground, Movement, Reads, Undo, apply,
-    apply_changes_from, plan_from, validate, work,
+    BrickCache, Character, EditBudget, Footing, Ground, Movement, Plan, Reads, Undo,
+    apply_plan_from, plan_bricks, plan_bricks_from, validate, work, write_plan_from,
 };
+
+/// Writes `plan` to `store`: level 0 and the coarse levels, or level 0 only if `deferred` (see
+/// [`Predictor::defer_lod`]).
+fn write_edit(
+    deferred: bool,
+    store: &mut BrickStore,
+    plan: &Plan,
+    ground: Option<&Ground>,
+    cache: Option<&mut BrickCache>,
+) -> Undo {
+    if deferred {
+        write_plan_from(store, plan, ground, cache)
+    } else {
+        apply_plan_from(store, plan, ground, cache)
+    }
+}
 
 /// What an Edit that is not yet answered took from the allowance, which it is to be given back if
 /// the server turns it down for a reason that did not take it there (see
@@ -96,6 +112,8 @@ pub struct Predictor {
     budget: EditBudget,
     /// The bricks that Edits read where the store holds none (and the ground does not), made once.
     cache: BrickCache,
+    /// Whether Edits leave the store's coarse levels to the caller: see [`Predictor::defer_lod`].
+    lod_deferred: bool,
 }
 
 impl Predictor {
@@ -120,7 +138,17 @@ impl Predictor {
             spawns: 0,
             budget: EditBudget::full(),
             cache: BrickCache::new(),
+            lod_deferred: false,
         }
+    }
+
+    /// From now on an Edit, or taking one back, changes level 0 of the store and no more: the
+    /// coarse levels of its pyramid stay as they were over the bricks that the calls return (the
+    /// bricks changed), until the caller remakes them with [`BrickStore::refresh_lod`] over those
+    /// bricks, and before anything reads them. Remaking them is most of the time of a large Edit,
+    /// and the client leaves it to the scene thread, which reads them.
+    pub fn defer_lod(&mut self) {
+        self.lod_deferred = true;
     }
 
     /// Generates at most `rate` bricks of ground per tick, instead of the usual.
@@ -319,12 +347,13 @@ impl Predictor {
         Ok(())
     }
 
-    /// The Voxels that `op` changes here: [`crate::plan`], reading the Planet from the store, then
-    /// the ground around the character, then a cache of what the store does not hold, so that the
-    /// bricks are not made again for each Edit or each look of the ghost.
-    pub fn plan(&mut self, op: &EditOp) -> Vec<Change> {
+    /// The Voxels that `op` changes here, brick by brick (see [`crate::plan_bricks_from`]):
+    /// reading the Planet from the store, then the ground around the character, then a cache of
+    /// what the store does not hold, so that the bricks are not made again for each Edit or each
+    /// look of the ghost. The Edit is applied from this, and the ghost is made from it.
+    pub fn plan_bricks(&mut self, op: &EditOp) -> Plan {
         let store = read(&self.store);
-        plan_from(
+        plan_bricks_from(
             &mut Reads::new(&store)
                 .with_ground(&self.ground)
                 .with_cache(&mut self.cache),
@@ -344,9 +373,9 @@ impl Predictor {
     /// when the server says so: it is for the caller to not make one (see
     /// [`Predictor::edit_checked`]).
     pub fn edit(&mut self, op: EditOp) -> (ClientMessage, Vec<BrickCoord>) {
-        let changes = self.plan(&op);
-        let spent = self.spend(&op, changes.len());
-        self.edit_planned(op, changes, spent)
+        let plan = self.plan_bricks(&op);
+        let spent = self.spend(&op, plan.len());
+        self.edit_planned(op, plan, spent)
     }
 
     /// [`Predictor::edit`], but not made if the server is known to turn it down for what
@@ -357,12 +386,12 @@ impl Predictor {
         op: EditOp,
     ) -> Result<(ClientMessage, Vec<BrickCoord>), RejectReason> {
         self.foresee(&op)?;
-        let changes = self.plan(&op);
-        if !self.can_change(changes.len()) {
+        let plan = self.plan_bricks(&op);
+        if !self.can_change(plan.len()) {
             return Err(RejectReason::VolumeLimited);
         }
-        let spent = self.spend(&op, changes.len());
-        Ok(self.edit_planned(op, changes, spent))
+        let spent = self.spend(&op, plan.len());
+        Ok(self.edit_planned(op, plan, spent))
     }
 
     /// Counts an Edit that changes `changed` Voxels against the allowance, as the server does: an
@@ -386,13 +415,13 @@ impl Predictor {
     fn edit_planned(
         &mut self,
         op: EditOp,
-        changes: Vec<Change>,
+        plan: Plan,
         spent: Spent,
     ) -> (ClientMessage, Vec<BrickCoord>) {
         let client_seq = self.next_client_seq;
         self.next_client_seq += 1;
         self.spent.insert(client_seq, spent);
-        let changed = self.predict_changes(client_seq, op, changes);
+        let changed = self.predict_plan(client_seq, op, &plan);
         (ClientMessage::Edit { client_seq, op }, changed)
     }
 
@@ -472,8 +501,12 @@ impl Predictor {
     /// Edit it answers, if any, which is not applied again.
     fn apply_authoritative(&mut self, op: EditOp, settles: Option<u64>) -> Vec<BrickCoord> {
         let mut touched = BTreeSet::new();
+        let deferred = self.lod_deferred;
         let again = self.revert_from(0, &mut touched);
-        touched.extend(apply(&mut self.store_mut(), &op).bricks());
+        let mut store = self.store_mut();
+        let plan = plan_bricks(&store, &op);
+        touched.extend(write_edit(deferred, &mut store, &plan, None, None).bricks());
+        drop(store);
         for (client_seq, op) in again {
             if Some(client_seq) != settles {
                 touched.extend(self.predict(client_seq, op));
@@ -484,24 +517,20 @@ impl Predictor {
 
     /// Applies `op` as a new pending Edit and returns the bricks it changed.
     fn predict(&mut self, client_seq: u64, op: EditOp) -> Vec<BrickCoord> {
-        let changes = self.plan(&op);
-        self.predict_changes(client_seq, op, changes)
+        let plan = self.plan_bricks(&op);
+        self.predict_plan(client_seq, op, &plan)
     }
 
     /// [`Predictor::predict`] for an Edit that is already worked out.
-    fn predict_changes(
-        &mut self,
-        client_seq: u64,
-        op: EditOp,
-        changes: Vec<Change>,
-    ) -> Vec<BrickCoord> {
+    fn predict_plan(&mut self, client_seq: u64, op: EditOp, plan: &Plan) -> Vec<BrickCoord> {
         let mut store = self
             .store
             .write()
             .expect("the store's lock is not poisoned");
-        let undo = apply_changes_from(
+        let undo = write_edit(
+            self.lod_deferred,
             &mut store,
-            &changes,
+            plan,
             Some(&self.ground),
             Some(&mut self.cache),
         );
@@ -525,7 +554,11 @@ impl Predictor {
         while self.pending.len() > index {
             let pending = self.pending.pop_back().expect("longer than index");
             touched.extend(pending.undo.bricks());
-            pending.undo.revert(&mut self.store_mut());
+            if self.lod_deferred {
+                pending.undo.revert_bricks(&mut self.store_mut());
+            } else {
+                pending.undo.revert(&mut self.store_mut());
+            }
             reverted.push((pending.client_seq, pending.op));
         }
         reverted.reverse();
@@ -536,6 +569,7 @@ impl Predictor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::apply;
     use brick_store::{Brick, Material, VoxelCoord};
     use net::RejectReason;
 
@@ -786,6 +820,68 @@ mod tests {
             client.foresee(&cube(net::EditMode::Flatten, crate::MAX_SMOOTH_RADIUS + 1)),
             Err(RejectReason::BrushTooLarge)
         );
+    }
+
+    /// The stone store with a pyramid of two coarse levels.
+    fn stone_pyramid() -> BrickStore {
+        let mut store = stone_store();
+        store.build_lod(2);
+        store
+    }
+
+    #[test]
+    fn leaving_the_coarse_levels_to_the_caller_makes_the_levels_that_making_them_at_once_does() {
+        let (mut now, mut later) = (
+            Predictor::new(stone_pyramid()),
+            Predictor::new(stone_pyramid()),
+        );
+        later.defer_lod();
+        // What the caller does with the bricks that a call says changed, here as the scene thread
+        // does: remake the levels over them. Until then they are stale.
+        let remake = |later: &Predictor, touched: &[BrickCoord]| {
+            let shared = later.shared_store();
+            let mut store = shared.write().unwrap();
+            store.refresh_lod(touched.iter().copied());
+        };
+        let same = |now: &Predictor, later: &Predictor, what: &str| {
+            let (a, b) = (now.store(), later.store());
+            assert_eq!(a.content_hash(), b.content_hash(), "{what}");
+            assert_eq!(a.lod_hash(), b.lod_hash(), "{what}");
+        };
+        // Two overlapping Edits, one of them unrefreshed when the next is made.
+        let (first, second) = (op([3, 3, 3]), op([5, 4, 3]));
+        let (_, touched) = now.edit(first);
+        let (_, deferred) = later.edit(first);
+        assert_eq!(touched, deferred);
+        assert_ne!(
+            now.store().lod_hash(),
+            later.store().lod_hash(),
+            "not made yet"
+        );
+        now.edit(second);
+        let (_, deferred_too) = later.edit(second);
+        remake(&later, &[deferred, deferred_too].concat());
+        same(&now, &later, "two Edits");
+        // The first is turned down: the second stays on top of nothing, as the prediction says.
+        let (touched, deferred) = (now.receive(rejected(0)), later.receive(rejected(0)));
+        assert_eq!(touched, deferred);
+        remake(&later, &deferred);
+        same(&now, &later, "after a reject");
+        // The server's own Edit goes under the pending one.
+        let other = op([-6, 2, 2]);
+        let (touched, deferred) = (
+            now.receive(applied(other, 1, None)),
+            later.receive(applied(other, 1, None)),
+        );
+        assert_eq!(touched, deferred);
+        remake(&later, &deferred);
+        same(&now, &later, "after another's Edit");
+        // And the last, taken back.
+        let (touched, deferred) = (now.receive(rejected(1)), later.receive(rejected(1)));
+        assert_eq!(touched, deferred);
+        remake(&later, &deferred);
+        same(&now, &later, "after the last reject");
+        assert_eq!(later.store().content_hash(), hash_after(&[other]));
     }
 
     #[test]

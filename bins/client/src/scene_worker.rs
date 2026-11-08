@@ -19,10 +19,16 @@
 //! taking both, and a copy of all of the scene that is waiting has the later changes pasted into it
 //! instead of being made again. The counts in a [`Ready`] are of the same state as its words.
 //!
-//! **Edits** do not wait for the camera. The frame thread changes the store (the predictor does,
-//! under the lock's write side, waiting for a read that is going on) and then [`SceneWorker::edit`]s
-//! with the bricks changed: this thread packs them ahead of anything else it has to do and the
-//! call returns when that is published, so the Edit is on the screen the frame it is made.
+//! **Edits** do not wait for the camera, and the frame thread does not wait for them (#156). It
+//! changes level 0 of the store (the predictor does, under the lock's write side, waiting for a
+//! read that is going on), which is a few milliseconds for the largest Brush, and then
+//! [`SceneWorker::edit_later`]s with the bricks changed and goes on. This thread remakes the
+//! coarse levels over them (the predictor leaves that to it: [`sim::Predictor::defer_lod`]) and
+//! packs them ahead of anything else it has to do but the job it is in the middle of, and
+//! publishes. The Edit is on the screen the first frame that takes what is published, so at most
+//! one frame later than the frame that made it if the thread takes less than a frame over it, as it
+//! does for the largest Brush (see ADR 0006). What the server says that takes an Edit back or
+//! changes the Voxels (other players' Edits) is still waited for: [`SceneWorker::edit`].
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -31,7 +37,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, TryLockError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use brick_store::{BrickCoord, TableSize};
+use brick_store::{BrickCoord, LodWork, TableSize};
 use render::lod::{Bands, LEVELS};
 use render::{PatchCopy, RingPatch, RingsFull, Scene, SceneUpdate};
 use sim::SharedStore;
@@ -214,6 +220,26 @@ enum Job {
     /// A panic, for a test of what the frame thread does about one.
     #[cfg(test)]
     Panic,
+    /// Busy for a while, for a test of what the frame thread does not wait for.
+    #[cfg(test)]
+    Stall(Duration),
+    /// From now on the remaking of the coarse levels sleeps this long before each step, with the
+    /// store not held, for a test that it does not hold up what is not coarse.
+    #[cfg(test)]
+    SlowCoarse(Duration),
+}
+
+/// How long a step of remaking the coarse levels may take with the store's write lock held, so
+/// that the frame thread's reads of the store wait about this long at the most.
+const COARSE_STEP: Duration = Duration::from_micros(500);
+
+/// How long the thread lets go of the store between two steps.
+const COARSE_PAUSE: Duration = Duration::from_micros(50);
+
+/// The coarse levels over the bricks of an Edit, being remade in steps.
+struct CoarseWork {
+    changed: Vec<BrickCoord>,
+    work: Option<LodWork>,
 }
 
 struct Inbox {
@@ -323,6 +349,10 @@ impl SceneWorker {
             spare: Vec::new(),
             slow,
             slow_at: Instant::now(),
+            coarse: VecDeque::new(),
+            sync_waiting: None,
+            #[cfg(test)]
+            coarse_sleep: Duration::ZERO,
         };
         let thread = std::thread::Builder::new()
             .name("scene".into())
@@ -361,11 +391,20 @@ impl SceneWorker {
         self.shared.wake.notify_one();
     }
 
-    /// Packs the bricks of level 0 that an Edit changed, which the store has been changed to
-    /// show, and returns when that is published. The Edit is in what [`SceneWorker::take`] gives
-    /// next, with whatever else the thread had done.
+    /// Remakes the coarse levels over the bricks of level 0 that an Edit changed, which the store
+    /// has been changed to show (the predictor leaves the coarse levels to this thread: see
+    /// [`sim::Predictor::defer_lod`]), packs them, and returns when that is published. The Edit is
+    /// in what [`SceneWorker::take`] gives next, with whatever else the thread had done.
     pub fn edit(&self, changed: Vec<BrickCoord>) -> Result<(), RingsFull> {
-        self.job(Job::Edit(changed))
+        let ticket = self.edit_later(changed);
+        self.wait(ticket)
+    }
+
+    /// [`SceneWorker::edit`], without waiting: the thread does it ahead of anything it has to do
+    /// but what it is in the middle of, and publishes it. Returns the job's number, for
+    /// [`SceneWorker::wait`].
+    pub fn edit_later(&self, changed: Vec<BrickCoord>) -> u64 {
+        self.enqueue(Job::Edit(changed))
     }
 
     /// Selects the bricks again for other `bands`, and returns when that is published.
@@ -381,6 +420,19 @@ impl SceneWorker {
         self.job(Job::Sync)
     }
 
+    /// Has the thread busy for `time` before it looks at what comes after, and returns at once.
+    #[cfg(test)]
+    pub fn stall(&self, time: Duration) -> u64 {
+        self.enqueue(Job::Stall(time))
+    }
+
+    /// Has the thread sleep `time` before each step of remaking the coarse levels from now on.
+    #[cfg(test)]
+    pub fn slow_coarse(&self, time: Duration) {
+        let ticket = self.enqueue(Job::SlowCoarse(time));
+        self.wait(ticket).unwrap();
+    }
+
     /// Has the thread panic, and waits for it to: the call panics too.
     #[cfg(test)]
     pub fn panic(&self) {
@@ -388,6 +440,12 @@ impl SceneWorker {
     }
 
     fn job(&self, job: Job) -> Result<(), RingsFull> {
+        let ticket = self.enqueue(job);
+        self.wait(ticket)
+    }
+
+    /// Gives the thread `job` and returns its number.
+    fn enqueue(&self, job: Job) -> u64 {
         let ticket = {
             let mut inbox = lock(&self.shared.inbox);
             inbox.issued += 1;
@@ -396,19 +454,45 @@ impl SceneWorker {
             ticket
         };
         self.shared.wake.notify_one();
+        ticket
+    }
+
+    /// Returns when the job `ticket` (or one after it) is published. An error if the scene ran out
+    /// of room.
+    pub fn wait(&self, ticket: u64) -> Result<(), RingsFull> {
+        self.wait_for(ticket, None).map(|_| ())
+    }
+
+    /// [`SceneWorker::wait`], for `timeout` at the most if there is one. Whether the job is
+    /// published.
+    pub fn wait_for(&self, ticket: u64, timeout: Option<Duration>) -> Result<bool, RingsFull> {
+        let until = timeout.map(|t| Instant::now() + t);
         let mut outbox = lock(&self.shared.outbox);
         while outbox.done < ticket && !outbox.failed && !outbox.died {
-            outbox = self
-                .shared
-                .finished
-                .wait(outbox)
-                .expect("the scene thread panicked");
+            outbox = match until {
+                None => self
+                    .shared
+                    .finished
+                    .wait(outbox)
+                    .expect("the scene thread panicked"),
+                Some(until) => {
+                    let left = until.saturating_duration_since(Instant::now());
+                    if left.is_zero() {
+                        return Ok(false);
+                    }
+                    self.shared
+                        .finished
+                        .wait_timeout(outbox, left)
+                        .expect("the scene thread panicked")
+                        .0
+                }
+            };
         }
         assert!(!outbox.died, "the scene thread panicked");
         if outbox.failed {
             return Err(RingsFull);
         }
-        Ok(())
+        Ok(true)
     }
 
     /// What the thread has made since the last call. With `wait` false it does not wait for the
@@ -499,6 +583,12 @@ struct Engine {
     /// What is in the stats that is slow to find out, and when it was.
     slow: Arc<Slow>,
     slow_at: Instant,
+    /// Edits whose coarse levels are still to be remade, oldest first.
+    coarse: VecDeque<CoarseWork>,
+    /// A sync that waits for the coarse levels.
+    sync_waiting: Option<u64>,
+    #[cfg(test)]
+    coarse_sleep: Duration,
 }
 
 impl Engine {
@@ -549,6 +639,16 @@ impl Engine {
                         continue;
                     }
                     Job::Panic => panic!("a panic that a test asked for"),
+                    Job::Stall(time) => {
+                        std::thread::sleep(time);
+                        self.publish(Some(ticket));
+                        continue;
+                    }
+                    Job::SlowCoarse(time) => {
+                        self.coarse_sleep = time;
+                        self.publish(Some(ticket));
+                        continue;
+                    }
                     _ => {}
                 }
                 if self.run_job(job).is_err() {
@@ -557,10 +657,16 @@ impl Engine {
                 }
                 self.publish(Some(ticket));
             }
-            let outcome = self.follow(camera).and_then(|moved| {
-                worked |= moved;
-                self.stream(camera)
-            });
+            let outcome = self
+                .remake_coarse()
+                .and_then(|remade| {
+                    worked |= remade;
+                    self.follow(camera)
+                })
+                .and_then(|moved| {
+                    worked |= moved;
+                    self.stream(camera)
+                });
             match outcome {
                 Ok(took) => worked |= took,
                 Err(RingsFull) => {
@@ -568,8 +674,16 @@ impl Engine {
                     return;
                 }
             }
+            // A sync is done when the coarse levels over the Edits before it are made, too.
+            let busy = !self.coarse.is_empty();
+            let synced = if busy {
+                self.sync_waiting = synced.or(self.sync_waiting);
+                None
+            } else {
+                synced.or(self.sync_waiting.take())
+            };
             self.publish(synced);
-            idle = !worked;
+            idle = !worked && !busy;
         }
     }
 
@@ -595,14 +709,71 @@ impl Engine {
     fn run_job(&mut self, job: Job) -> Result<(), RingsFull> {
         let store = self.store.read().expect("the store's lock is not poisoned");
         let update = match job {
-            Job::Edit(changed) => Some(self.scene.update(&store, &changed)?),
+            // The bricks of level 0 are packed at once, with the coarse levels as they were, which
+            // is what is drawn near the camera and is published for the frame thread to wait for.
+            // The coarse levels are remade after, a step at a time ([`Engine::remake_coarse`]).
+            Job::Edit(changed) => {
+                let update = self.scene.update(&store, &changed)?;
+                self.coarse.push_back(CoarseWork {
+                    changed,
+                    work: None,
+                });
+                Some(update)
+            }
             Job::Bands(bands) => self.scene.set_bands(&store, bands)?,
             #[cfg(test)]
-            Job::Sync | Job::Panic => unreachable!("not run here"),
+            Job::Sync | Job::Panic | Job::Stall(_) | Job::SlowCoarse(_) => {
+                unreachable!("not run here")
+            }
         };
         drop(store);
         self.note(update);
         Ok(())
+    }
+
+    /// Does a step of remaking the coarse levels of the oldest Edit that has them to do, holding
+    /// the store's write lock for [`COARSE_STEP`] at the most: the frame thread reads the store
+    /// for the character and the ghost, and does not wait longer than that for it. Between steps
+    /// the thread looks at what the frame thread asked of it, so that another Edit is packed first.
+    /// When the coarse levels over an Edit are made, the bricks over it are packed again. Whether
+    /// there was a step.
+    ///
+    /// An Edit made between steps changes level 0, which the steps that follow read: what is made
+    /// is what a refresh made after it would, and that Edit's own refresh finds what it changed,
+    /// so the levels end as a refresh of all of them at once would make them.
+    fn remake_coarse(&mut self) -> Result<bool, RingsFull> {
+        let Some(front) = self.coarse.front_mut() else {
+            return Ok(false);
+        };
+        #[cfg(test)]
+        std::thread::sleep(self.coarse_sleep);
+        let work = match &mut front.work {
+            Some(work) => work,
+            None => {
+                let store = self.store.read().expect("the store's lock is not poisoned");
+                front
+                    .work
+                    .insert(store.begin_lod(front.changed.iter().copied()))
+            }
+        };
+        let done = {
+            let mut store = self
+                .store
+                .write()
+                .expect("the store's lock is not poisoned");
+            store.step_lod(work, Some(Instant::now() + COARSE_STEP))
+        };
+        if done {
+            let finished = self.coarse.pop_front().expect("there is a front");
+            let store = self.store.read().expect("the store's lock is not poisoned");
+            let update = self.scene.update(&store, &finished.changed)?;
+            drop(store);
+            self.note(Some(update));
+        } else {
+            // Long enough for a reader that waits for the lock to take it.
+            std::thread::sleep(COARSE_PAUSE);
+        }
+        Ok(true)
     }
 
     /// Moves the scene to `camera`, if it is not there. Whether it was moved.

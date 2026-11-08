@@ -168,6 +168,41 @@ fn ray_through(from: [f64; 3], to: [f64; 3]) -> Ray {
 
 /// `camera` pulled forward along its view to a point within reach of the ground it looks at
 /// (the spawn is 4 m up, and the ground it looks at is further than 7.5 m), for a click.
+/// `camera` pulled on to 8 Voxels from the ground it looks at, where everything that is drawn is
+/// of level 0, as the ground in reach is in the game (its d0 is 51 m); the bands of these tests
+/// are shorter. The rings are made for it.
+fn up_close(world: &mut World, camera: &Camera) -> Camera {
+    let reach = within_reach(world, camera);
+    let distance = crate::world::centre_hit(world.scene(), &reach)
+        .expect("ground")
+        .t;
+    let forward = reach.forward();
+    let close = Camera {
+        position: std::array::from_fn(|a| {
+            reach.position[a] + forward[a] * f64::from(distance - 8.0)
+        }),
+        ..reach
+    };
+    // The scene thread follows the camera when it has the time: wait for it to have, and for the
+    // bricks that come of it, which are now near.
+    world.recentre(close.position).unwrap();
+    world.sync().unwrap();
+    fill(world, close.position);
+    world.sync().unwrap();
+    assert!(
+        world.level_bricks(0) > 0,
+        "the ground is drawn at level 0 where the camera is"
+    );
+    close
+}
+
+/// A dig where `camera` looks, as a click makes it, and the update that shows it once the scene
+/// thread has published it (the click itself does not wait: see [`World::edit`]).
+fn dig_and_wait(world: &mut World, camera: &Camera) -> SceneUpdate {
+    world.edit(camera, &crate::tool::Tool::default()).unwrap();
+    world.sync().unwrap().expect("there is ground to dig")
+}
+
 fn within_reach(world: &World, camera: &Camera) -> Camera {
     let forward = camera.forward();
     let distance = crate::world::centre_hit(world.scene(), camera)
@@ -189,10 +224,7 @@ fn a_dig_near_the_camera_shows_at_every_band_that_covers_it() {
     // Dig where the camera looks, as a click does.
     let aim = within_reach(&world, &spawn);
     let before = crate::world::centre_hit(world.scene(), &aim);
-    world
-        .edit(&aim, &crate::tool::Tool::default())
-        .unwrap()
-        .expect("there is ground to dig");
+    dig_and_wait(&mut world, &aim);
     let at = before.expect("the camera looks at the ground").voxel;
     let target = at.map(f64::from);
 
@@ -841,10 +873,7 @@ fn an_edit_while_loading_is_held_is_shown() {
         std::thread::sleep(Duration::from_millis(5));
     }
     assert!(world.loader().unwrap().pending > 0, "the loader has work");
-    let update = world
-        .edit(&aim, &crate::tool::Tool::default())
-        .unwrap()
-        .expect("there is ground to dig");
+    let update = dig_and_wait(&mut world, &aim);
     assert!(matches!(update, SceneUpdate::Rings(_)));
     // The Voxels that were dug are gone from the scene: the view hits something further on.
     let after = crate::world::centre_hit(world.scene(), &aim);
@@ -1067,31 +1096,59 @@ fn what_the_scene_thread_counts_as_drawn_is_what_the_frame_threads_copy_lists() 
 }
 
 #[test]
-fn an_edit_and_its_undo_are_in_the_scene_the_call_that_makes_them_while_the_camera_is_followed() {
+fn an_edit_is_in_the_scene_the_frame_after_the_one_that_makes_it_while_the_camera_is_followed() {
     let (mut world, server, camera) = spawned_world(2);
     fill(&mut world, camera.position);
-    let aim = within_reach(&world, &camera);
+    let aim = up_close(&mut world, &camera);
     let depth = |world: &World| {
         crate::world::centre_hit(world.scene(), &aim)
             .expect("ground")
             .t
     };
     let whole = depth(&world);
+    // A build that is not optimised takes longer than a few milliseconds to pack the Edit.
+    world.set_edit_wait(Duration::from_secs(20));
 
     // The camera is on the move, so the scene thread has the rings to follow when the Edit is
-    // made, and the call that makes it does not come back before the Edit is packed.
+    // made, and it is busy for a while with that before it comes to the Edit.
     let (ahead, _) = tangents(camera.horizon_up);
+    let at = |n: i32| -> [f64; 3] {
+        std::array::from_fn(|a| aim.position[a] + 2.0 * f64::from(n) * ahead[a])
+    };
     for n in 1..=5 {
-        let at: [f64; 3] = std::array::from_fn(|a| camera.position[a] + 8.0 * n as f64 * ahead[a]);
-        world.recentre(at).unwrap();
+        world.recentre(at(n)).unwrap();
     }
-    let update = world
-        .edit(&aim, &crate::tool::Tool::default())
-        .unwrap()
-        .expect("there is ground to dig");
-    assert!(matches!(update, SceneUpdate::Rings(_)));
+    // The coarse levels are slow to remake (each step of them sleeps), which must not hold up the
+    // Edit that is seen, nor the frame thread's reads of the store. And the thread is busy for a
+    // little when the Edit is made, so that it is not done in the frame that makes it, however
+    // quick the machine: the frame after waits a few milliseconds for it, and has it.
+    world.worker().slow_coarse(Duration::from_millis(40));
+    world.worker().stall(Duration::from_millis(2));
+    world.edit(&aim, &crate::tool::Tool::default()).unwrap();
+    // The frame of the click goes on and looks at the scene, which may have the Edit already.
+    world.recentre(at(6)).unwrap();
+    // And the frame after has it, waiting for the thread to have packed it and not for the coarse
+    // levels, which take far longer here.
+    let looking = Instant::now();
+    world.recentre(at(7)).unwrap();
+    assert!(
+        looking.elapsed() < Duration::from_secs(2),
+        "the coarse levels take seconds here: {:?}",
+        looking.elapsed()
+    );
     let dug = depth(&world);
     assert!(dug > whole + 1.0, "the hole shows: {whole}, then {dug}");
+    // The frame thread reads the store (the character, the ghost) while the coarse levels are
+    // remade in steps, and waits for no more than a step.
+    let mut longest = Duration::ZERO;
+    for _ in 0..40 {
+        let asked = Instant::now();
+        drop(world.store());
+        longest = longest.max(asked.elapsed());
+        std::thread::sleep(Duration::from_millis(3));
+    }
+    assert!(longest < Duration::from_millis(25), "{longest:?}");
+    world.worker().slow_coarse(Duration::ZERO);
 
     // The server turns it down: the ground is back in the call that hears of it.
     let Ok(ClientMessage::Edit { .. }) = server.try_recv() else {
@@ -1109,6 +1166,36 @@ fn an_edit_and_its_undo_are_in_the_scene_the_call_that_makes_them_while_the_came
         "{whole} before, {} after the undo",
         depth(&world)
     );
+}
+
+#[test]
+fn an_edit_the_scene_thread_is_too_busy_to_pack_shows_when_it_has_and_the_frame_does_not_wait() {
+    let (mut world, _server, camera) = spawned_world(2);
+    fill(&mut world, camera.position);
+    let aim = up_close(&mut world, &camera);
+    let depth = |world: &World| {
+        crate::world::centre_hit(world.scene(), &aim)
+            .expect("ground")
+            .t
+    };
+    let whole = depth(&world);
+    world.worker().stall(Duration::from_millis(300));
+    world.edit(&aim, &crate::tool::Tool::default()).unwrap();
+    // The two looks of the frame and the frame after: the thread is busy, and the frame thread
+    // waits a few milliseconds for it and goes on with the Edit not shown.
+    for _ in 0..2 {
+        let looking = Instant::now();
+        world.recentre(aim.position).unwrap();
+        assert!(looking.elapsed() < Duration::from_millis(30));
+    }
+    assert!((depth(&world) - whole).abs() < 0.5, "not shown yet");
+    // It shows once the thread has packed it.
+    let started = Instant::now();
+    while (depth(&world) - whole).abs() < 0.5 {
+        assert!(started.elapsed() < Duration::from_secs(5), "never shown");
+        std::thread::sleep(Duration::from_millis(10));
+        world.recentre(aim.position).unwrap();
+    }
 }
 
 #[test]
@@ -1151,4 +1238,82 @@ fn a_job_that_is_done_is_always_there_to_be_taken_even_as_the_thread_goes_on_pub
 fn a_panic_on_the_scene_thread_is_a_panic_on_the_frame_thread_not_a_wait() {
     let (world, _server, _camera) = spawned_world(1);
     world.worker().panic();
+}
+
+/// What the frame thread does for the largest Brush at the spawn, with every wait in it, as the
+/// client's frame loop does: the click, the reads of the store that the character and the ghost
+/// make while the scene thread remakes the coarse levels (which at the spawn are read from the
+/// generator, and take tens of milliseconds), and the looks at the scene that wait for the Edit
+/// and paste it. In release each is held to a few milliseconds; a build that is not optimised only
+/// runs it, with a smaller Brush. `-- --nocapture` prints them. The ghost, which is made again
+/// after a click (its plan, and its outline from the masks), is held to the same few milliseconds.
+#[test]
+fn the_frame_thread_takes_a_few_milliseconds_of_the_largest_edit_at_the_spawn_with_every_wait() {
+    use crate::tool::Tool;
+    use net::{EditMode, Shape};
+
+    let release = !cfg!(debug_assertions);
+    let (mut world, _server, camera) = spawned_world(2);
+    fill(&mut world, camera.position);
+    let aim = up_close(&mut world, &camera);
+    let radius = if release { sim::MAX_BRUSH_RADIUS } else { 12 };
+    let tool = |mode| Tool {
+        mode,
+        shape: Shape::Cube,
+        radius,
+        ..Tool::default()
+    };
+    let ms = |t: Instant| t.elapsed().as_secs_f64() * 1e3;
+    // The worst of each, over the Edits, in milliseconds.
+    let (mut store, mut ghost, mut look) = (0f64, 0f64, 0f64);
+    let mut shown = 0;
+    let mut clicks = Vec::new();
+    for n in 0..8 {
+        let mode = if n % 2 == 0 {
+            EditMode::Dig
+        } else {
+            EditMode::Place
+        };
+        // The allowance is a tick's credit at a time: a rest of 10 seconds fills it.
+        for _ in 0..600 {
+            world.walk(net::MoveInput::default()).unwrap();
+        }
+        world.hide_ghost();
+        let before = crate::world::centre_hit(world.scene(), &aim).map(|h| h.t);
+        let started = Instant::now();
+        world.edit(&aim, &tool(mode)).unwrap();
+        clicks.push(ms(started));
+        // The frames after: each reads the store as the character does, makes the ghost of the
+        // next click, and looks at the scene, as the frame does, with the time of a frame between.
+        for _ in 0..6 {
+            let asked = Instant::now();
+            drop(world.store());
+            store = store.max(ms(asked));
+            let asked = Instant::now();
+            world.show_ghost(&aim, &tool(mode));
+            ghost = ghost.max(ms(asked));
+            let asked = Instant::now();
+            world.recentre(aim.position).unwrap();
+            look = look.max(ms(asked));
+            std::thread::sleep(Duration::from_millis(16));
+        }
+        let after = crate::world::centre_hit(world.scene(), &aim).map(|h| h.t);
+        shown += usize::from(before != after);
+    }
+    clicks.sort_by(f64::total_cmp);
+    let (median, worst) = (clicks[clicks.len() / 2], clicks[clicks.len() - 1]);
+    eprintln!(
+        "frame thread, 8 Edits of a cube of {radius}, in ms: click median {median:.2} worst \
+         {worst:.2}; the worst read of the store {store:.2}, look at the scene (the wait for the \
+         Edit, and the paste) {look:.2}, ghost made after a click {ghost:.2}"
+    );
+    assert!(shown >= 6, "the Edits show: {shown} of 8");
+    if release {
+        // The click is the plan, which reads bricks the generator makes the first time (the worst
+        // click), and the write. The store is not held for more than a step of the coarse levels,
+        // and the looks wait for the Edit's pack for a few milliseconds at the most.
+        assert!(median < 5.0 && worst < 12.0, "a hitch in the click");
+        assert!(store < 2.0 && look < 6.0, "a wait: {store} and {look}");
+        assert!(ghost < 10.0, "the ghost: {ghost}");
+    }
 }

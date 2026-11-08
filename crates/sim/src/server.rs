@@ -19,7 +19,7 @@ use net::{
 
 use crate::{
     BrickCache, Character, EditBudget, FixedTimestep, Footing, Ground, Movement, Reads,
-    apply_changes_from, dig_ticks, plan_from, target_hardness, validate, within_reach, work,
+    apply_plan_from, dig_ticks, plan_bricks_from, target_hardness, validate, within_reach, work,
 };
 
 /// The server simulates at this rate (issue 11).
@@ -301,11 +301,11 @@ impl Server {
             .get(asker)
             .and_then(Option::as_ref)
             .map(|avatar| &avatar.ground);
-        let changes = plan_from(&mut reads_over(&self.store, ground, &mut self.cache), &op);
-        if !self.players[asker].budget.take_volume(changes.len() as u64) {
+        let plan = plan_bricks_from(&mut reads_over(&self.store, ground, &mut self.cache), &op);
+        if !self.players[asker].budget.take_volume(plan.len() as u64) {
             return reject(RejectReason::VolumeLimited);
         }
-        apply_changes_from(&mut self.store, &changes, ground, Some(&mut self.cache));
+        apply_plan_from(&mut self.store, &plan, ground, Some(&mut self.cache));
         if let Some(wait) = wait {
             let player = &mut self.players[asker];
             player.last_dig = self.tick_count.max(player.last_dig + wait);

@@ -11,15 +11,15 @@ mod server;
 use std::time::Duration;
 
 pub use brush::{
-    BrickCache, CACHE_BRICKS, Change, MAX_COORD, Reads, axes, examined, examined_box, plan,
-    plan_from,
+    BrickCache, BrickChange, CACHE_BRICKS, Change, MAX_COORD, Plan, Reads, axes, examined,
+    examined_box, plan, plan_bricks, plan_bricks_from, plan_from,
 };
 pub use character::{Cell, Character, Content, Occupancy, TICK_DT};
 pub use edit::{
     EDIT_REACH, EditBudget, MAX_BRUSH_RADIUS, MAX_SMOOTH_RADIUS, MIN_DIG_SECONDS, OPS_PER_SECOND,
     SECONDS_PER_HARDNESS, SMOOTH_WEIGHT, Undo, VOXEL_BURST, VOXELS_PER_SECOND, WORK_BURST,
-    WORK_PER_SECOND, apply, apply_changes, apply_changes_from, dig_seconds, dig_ticks,
-    target_hardness, validate, within_reach, work,
+    WORK_PER_SECOND, apply, apply_plan, apply_plan_from, dig_seconds, dig_ticks, target_hardness,
+    validate, within_reach, work, write_plan_from,
 };
 pub use ground::{Footing, Ground};
 pub use movement::{ConfigError, Movement, MovementConfig};

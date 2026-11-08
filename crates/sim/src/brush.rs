@@ -27,7 +27,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::ops::Deref;
 use std::sync::Arc;
 
-use brick_store::{BRICK_SIZE, Brick, BrickCoord, BrickStore, Material, VoxelCoord};
+use brick_store::{BRICK_SIZE, Brick, BrickCoord, BrickStore, Material, VoxelCoord, VoxelMask};
 use net::{Alignment, EditMode, EditOp, Shape};
 
 use crate::Ground;
@@ -372,6 +372,23 @@ impl Footprint {
         }
     }
 
+    /// Whether every Voxel of the box that is `low` to `high` from the centre (inclusive, along
+    /// each grid axis) is in the Brush, so that none of them need be tested. Exact, as the Brush
+    /// is convex (a sphere, a cube or a diamond-sectioned one, a cylinder), so a box is in it
+    /// when its eight corners are.
+    fn holds(&self, low: Vec3, high: Vec3) -> bool {
+        (0..8).all(|corner| {
+            let at = |a: usize| {
+                if corner >> a & 1 == 0 {
+                    low[a]
+                } else {
+                    high[a]
+                }
+            };
+            self.contains(std::array::from_fn(at))
+        })
+    }
+
     /// The most whole Voxels that a Voxel of the Brush can be from its centre along grid axis `a`,
     /// or a little more where it is not known exactly.
     fn half_extent(&self, a: usize) -> i64 {
@@ -546,6 +563,15 @@ fn locals_within(origin: Vec3, first: Vec3, last: Vec3) -> [std::ops::RangeInclu
     })
 }
 
+/// The bits of a row of a layer (`x` of 0 to 7) that are in `xs`, a range from [`locals_within`].
+fn row_bits(xs: &std::ops::RangeInclusive<u8>) -> u64 {
+    if xs.is_empty() {
+        0
+    } else {
+        (1 << (xs.end() + 1)) - (1 << xs.start())
+    }
+}
+
 /// A Voxel becomes solid when at least this many of the 27 around it (itself included) are.
 const SMOOTH_SOLID: u32 = 14;
 
@@ -580,6 +606,126 @@ fn smoothed(snapshot: &Snapshot, voxel: Vec3, now: Option<Material>) -> Option<M
     })
 }
 
+/// What an Edit does to one brick: the Voxels that become air, and the Voxels that become each
+/// Material, as masks over the brick. Every Voxel in them differs from what it is now.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BrickChange {
+    pub coord: BrickCoord,
+    pub cleared: VoxelMask,
+    /// The Voxels that become solid, for each Material that any of them becomes: a Dig has none,
+    /// a Place and a Flatten one, and a Smooth as many as it takes the Materials of its neighbours.
+    pub filled: Vec<(Material, VoxelMask)>,
+}
+
+impl BrickChange {
+    /// How many Voxels change.
+    fn len(&self) -> usize {
+        let ones = |mask: &VoxelMask| mask.iter().map(|w| w.count_ones() as usize).sum::<usize>();
+        ones(&self.cleared)
+            + self
+                .filled
+                .iter()
+                .map(|(_, mask)| ones(mask))
+                .sum::<usize>()
+    }
+
+    /// The Voxels of the brick that change, whatever they become.
+    pub fn mask(&self) -> VoxelMask {
+        std::array::from_fn(|layer| self.changed(layer))
+    }
+
+    /// The Voxels of `layer` of the brick that change, bit `x + 8 y` of each.
+    fn changed(&self, layer: usize) -> u64 {
+        self.filled
+            .iter()
+            .fold(self.cleared[layer], |all, (_, mask)| all | mask[layer])
+    }
+
+    /// What the Voxel at bit `bit` of `layer` becomes, which is a Voxel that changes.
+    fn becomes(&self, layer: usize, bit: u32) -> Option<Material> {
+        self.filled
+            .iter()
+            .find(|(_, mask)| mask[layer] >> bit & 1 == 1)
+            .map(|&(material, _)| material)
+    }
+}
+
+/// What an Edit does to the Planet, brick by brick: the same Voxels as the list that [`plan`]
+/// makes, but not as one entry each, so that a Brush of 100 000 Voxels is some hundreds of bricks,
+/// and a brick the Brush holds whole is one mask (see [`plan_bricks_from`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Plan {
+    bricks: Vec<BrickChange>,
+}
+
+impl Plan {
+    /// The plan that makes `changes`, which are for Voxels that are not the same Voxel: for a test
+    /// that has a list of Voxels (such as the ghost's) and wants what an Edit makes of them.
+    pub fn from_changes(changes: impl IntoIterator<Item = Change>) -> Self {
+        let mut bricks: BTreeMap<BrickCoord, BrickChange> = BTreeMap::new();
+        for change in changes {
+            let coord = change.voxel.brick();
+            let brick = bricks.entry(coord).or_insert_with(|| BrickChange {
+                coord,
+                cleared: [0; 8],
+                filled: Vec::new(),
+            });
+            let [x, y, z] = change.voxel.local().map(usize::from);
+            let bit = 1u64 << (x + 8 * y);
+            match change.to {
+                None => brick.cleared[z] |= bit,
+                Some(material) => match brick.filled.iter_mut().find(|(m, _)| *m == material) {
+                    Some((_, mask)) => mask[z] |= bit,
+                    None => {
+                        let mut mask = [0; 8];
+                        mask[z] = bit;
+                        brick.filled.push((material, mask));
+                    }
+                },
+            }
+        }
+        Self {
+            bricks: bricks.into_values().collect(),
+        }
+    }
+
+    /// The bricks that change, in ascending order.
+    pub fn bricks(&self) -> &[BrickChange] {
+        &self.bricks
+    }
+
+    /// How many Voxels change.
+    pub fn len(&self) -> usize {
+        self.bricks.iter().map(BrickChange::len).sum()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.bricks.is_empty()
+    }
+
+    /// The Voxels that change one by one, in ascending brick order and within a brick by index:
+    /// the list that [`plan`] returns.
+    pub fn changes(&self) -> impl Iterator<Item = Change> + '_ {
+        self.bricks.iter().flat_map(|brick| {
+            (0..8usize).flat_map(move |layer| {
+                let mut bits = brick.changed(layer);
+                std::iter::from_fn(move || {
+                    if bits == 0 {
+                        return None;
+                    }
+                    let bit = bits.trailing_zeros();
+                    bits &= bits - 1;
+                    let local = [(bit & 7) as u8, (bit >> 3) as u8, layer as u8];
+                    Some(Change {
+                        voxel: brick.coord.voxel(local),
+                        to: brick.becomes(layer, bit),
+                    })
+                })
+            })
+        })
+    }
+}
+
 /// The Voxels that `op` changes in `store`, in ascending brick order and within a brick by index,
 /// with what each becomes. Every one of them differs from what it is now: a dig lists only the
 /// solid Voxels it covers, a place only the air ones. This is the one function that says what an
@@ -587,6 +733,8 @@ fn smoothed(snapshot: &Snapshot, voxel: Vec3, now: Option<Material>) -> Option<M
 ///
 /// It goes through the [`examined`] Voxels, and nothing else. An op that has none (a centre or a
 /// radius out of range) changes nothing. The op should have passed [`crate::validate`].
+///
+/// This is [`plan_bricks`] one Voxel at a time, for what has to show each Voxel.
 pub fn plan(store: &BrickStore, op: &EditOp) -> Vec<Change> {
     plan_from(&mut Reads::new(store), op)
 }
@@ -594,8 +742,26 @@ pub fn plan(store: &BrickStore, op: &EditOp) -> Vec<Change> {
 /// [`plan`], reading the Planet as `reads` says (see [`Reads`]): the same list, whichever way the
 /// bricks are found.
 pub fn plan_from(reads: &mut Reads, op: &EditOp) -> Vec<Change> {
+    plan_bricks_from(reads, op).changes().collect()
+}
+
+/// [`plan`], brick by brick: what an Edit is applied from ([`crate::apply_plan_from`]), and the
+/// number of Voxels it changes, without a list of them.
+pub fn plan_bricks(store: &BrickStore, op: &EditOp) -> Plan {
+    plan_bricks_from(&mut Reads::new(store), op)
+}
+
+/// [`plan_bricks`], reading the Planet as `reads` says (see [`Reads`]).
+///
+/// A Dig or a Place works on the brick's occupancy, a word of 64 Voxels at a time: the candidates
+/// are the solid Voxels of the brick for a Dig and the air ones for a Place, and the Voxels of
+/// them that the Brush covers are the ones that change. Where the Brush holds the whole of what is
+/// looked at of the brick ([`Footprint::holds`]), that is all of the candidates, and no Voxel is
+/// tested; only the bricks that the Brush's edge crosses are tested Voxel by Voxel. A Smooth and a
+/// Flatten read each Voxel they look at.
+pub fn plan_bricks_from(reads: &mut Reads, op: &EditOp) -> Plan {
     let Some(footprint) = Footprint::of(op) else {
-        return Vec::new();
+        return Plan::default();
     };
     let (first, last) = footprint.bounds();
     // Flatten's plane is the tangent one: square to the exact radial direction.
@@ -605,7 +771,7 @@ pub fn plan_from(reads: &mut Reads, op: &EditOp) -> Vec<Change> {
         Snapshot::new(reads, beside(first, -1), beside(last, 1))
     });
 
-    let mut changes = Vec::new();
+    let mut plan = Plan::default();
     let (low, high) = bricks_of(first, last);
     for x in low[0]..=high[0] {
         for y in low[1]..=high[1] {
@@ -631,9 +797,35 @@ pub fn plan_from(reads: &mut Reads, op: &EditOp) -> Vec<Change> {
                     _ => {}
                 }
                 let locals = locals_within(origin, first, last);
+                // The Brush holds the whole of what is looked at of this brick, so that no Voxel
+                // of it needs the test of the shape.
+                let inside = footprint.holds(low, high);
+                // The Voxels that can change: the solid ones for a Dig and the air ones for a
+                // Place, a word of them to a layer of the brick, and any for the others.
+                let candidates = match (op.mode, &brick) {
+                    (EditMode::Dig, Some(brick)) => brick.solid_mask(),
+                    (EditMode::Place, Some(brick)) => brick.solid_mask().map(|word| !word),
+                    _ => [u64::MAX; 8],
+                };
+                let columns = row_bits(&locals[0]);
+                let mut change = BrickChange {
+                    coord,
+                    cleared: [0; 8],
+                    filled: Vec::new(),
+                };
+                // The Voxels that change to `op.material` in a Place, or to air in a Dig.
+                let mut changed: VoxelMask = [0; 8];
                 for lz in locals[2].clone() {
                     for ly in locals[1].clone() {
-                        for lx in locals[0].clone() {
+                        let row = candidates[usize::from(lz)] >> (8 * ly) & columns;
+                        if inside && matches!(op.mode, EditMode::Dig | EditMode::Place) {
+                            changed[usize::from(lz)] |= row << (8 * ly);
+                            continue;
+                        }
+                        let mut rest = row;
+                        while rest != 0 {
+                            let lx = rest.trailing_zeros() as u8;
+                            rest &= rest - 1;
                             let local = [lx, ly, lz];
                             let at: Vec3 = [
                                 origin[0] + i64::from(lx),
@@ -641,41 +833,75 @@ pub fn plan_from(reads: &mut Reads, op: &EditOp) -> Vec<Change> {
                                 origin[2] + i64::from(lz),
                             ];
                             let d: Vec3 = std::array::from_fn(|a| at[a] - footprint.centre[a]);
-                            if !footprint.contains(d) {
+                            if !inside && !footprint.contains(d) {
                                 continue;
                             }
-                            let now = match (&snapshot, &brick) {
-                                (Some(snapshot), _) => snapshot.get(at),
-                                (None, Some(brick)) => brick.get(local),
-                                (None, None) => unreachable!("one of the two is made"),
-                            };
+                            let bit = 1u64 << (8 * ly + lx);
                             let to = match op.mode {
-                                EditMode::Dig => now.is_some().then_some(None),
-                                EditMode::Place => now.is_none().then_some(Some(op.material)),
-                                EditMode::Flatten if dot(normal, d) > 0 => {
-                                    now.is_some().then_some(None)
+                                // Every candidate changes.
+                                EditMode::Dig | EditMode::Place => {
+                                    changed[usize::from(lz)] |= bit;
+                                    continue;
                                 }
-                                EditMode::Flatten => now.is_none().then_some(Some(op.material)),
-                                EditMode::Smooth => {
-                                    let snapshot = snapshot.as_ref().expect("made for Smooth");
-                                    let to = smoothed(snapshot, at, now);
-                                    (to.is_some() != now.is_some()).then_some(to)
+                                EditMode::Flatten | EditMode::Smooth => {
+                                    let now = match &snapshot {
+                                        Some(snapshot) => snapshot.get(at),
+                                        None => {
+                                            brick.as_ref().expect("made but for Smooth").get(local)
+                                        }
+                                    };
+                                    match op.mode {
+                                        EditMode::Flatten if dot(normal, d) > 0 => {
+                                            now.is_some().then_some(None)
+                                        }
+                                        EditMode::Flatten => {
+                                            now.is_none().then_some(Some(op.material))
+                                        }
+                                        _ => {
+                                            let snapshot =
+                                                snapshot.as_ref().expect("made for Smooth");
+                                            let to = smoothed(snapshot, at, now);
+                                            (to.is_some() != now.is_some()).then_some(to)
+                                        }
+                                    }
                                 }
                             };
-                            if let Some(to) = to {
-                                changes.push(Change {
-                                    voxel: coord.voxel(local),
-                                    to,
-                                });
+                            match to {
+                                None => {}
+                                Some(None) => change.cleared[usize::from(lz)] |= bit,
+                                Some(Some(material)) => {
+                                    let filled = &mut change.filled;
+                                    match filled.iter_mut().find(|(m, _)| *m == material) {
+                                        Some((_, mask)) => mask[usize::from(lz)] |= bit,
+                                        None => {
+                                            let mut mask = [0; 8];
+                                            mask[usize::from(lz)] = bit;
+                                            filled.push((material, mask));
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
                 }
+                match op.mode {
+                    EditMode::Dig => change.cleared = changed,
+                    EditMode::Place if changed != [0; 8] => {
+                        change.filled.push((op.material, changed));
+                    }
+                    _ => {}
+                }
+                if change.len() > 0 {
+                    plan.bricks.push(change);
+                }
             }
         }
     }
-    changes
+    plan
 }
+
+#[cfg(test)]
+pub(crate) mod frozen;
 
 #[cfg(test)]
 mod tests {
@@ -1149,7 +1375,7 @@ mod tests {
 
     #[test]
     fn reading_through_the_ground_and_the_cache_gives_the_same_edits_and_the_same_bricks() {
-        use crate::{Ground, apply_changes_from};
+        use crate::{Ground, apply_plan, apply_plan_from};
         let centre = [2000, 0, -300];
         let mut plain = rough_store();
         let mut through = rough_store();
@@ -1173,8 +1399,16 @@ mod tests {
                 let mut cached = Reads::new(&through).with_cache(&mut cache);
                 assert_eq!(plan_from(&mut cached, &op), want);
                 assert_eq!(plan(&through, &op), want);
-                crate::apply_changes(&mut plain, &want);
-                apply_changes_from(&mut through, &got, Some(&ground), Some(&mut cache));
+                let wanted = plan_bricks(&plain, &op);
+                apply_plan(&mut plain, &wanted);
+                let planned = plan_bricks_from(
+                    &mut Reads::new(&through)
+                        .with_ground(&ground)
+                        .with_cache(&mut cache),
+                    &op,
+                );
+                assert_eq!(planned.changes().collect::<Vec<_>>(), got);
+                apply_plan_from(&mut through, &planned, Some(&ground), Some(&mut cache));
                 assert_eq!(through.content_hash(), plain.content_hash(), "{op:?}");
             }
         }

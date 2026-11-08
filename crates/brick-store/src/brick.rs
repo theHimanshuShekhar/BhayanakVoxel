@@ -10,6 +10,10 @@ pub const BRICK_VOXELS: usize = (BRICK_SIZE * BRICK_SIZE * BRICK_SIZE) as usize;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Material(pub u16);
 
+/// A set of the Voxels of a brick: one word for each layer of z, and in it bit `x + 8 y`, which is
+/// the order of the brick's Voxels.
+pub type VoxelMask = [u64; 8];
+
 /// Sparse 8×8×8 block of Voxels.
 ///
 /// A brick that is all air or all one Material is stored as a flag only. Anything else keeps an
@@ -165,8 +169,14 @@ impl Mixed {
             self.occupancy[i / 64] &= !(1 << (i % 64));
             return;
         };
-        let index = self
-            .palette
+        let index = self.palette_index(material);
+        self.occupancy[i / 64] |= 1 << (i % 64);
+        self.write_index(i, index);
+    }
+
+    /// The place of `material` in the palette, which it is added to if it is not there.
+    fn palette_index(&mut self, material: Material) -> usize {
+        self.palette
             .iter()
             .position(|&m| m == material)
             .unwrap_or_else(|| {
@@ -176,9 +186,7 @@ impl Mixed {
                     self.widen(bits);
                 }
                 self.palette.len() - 1
-            });
-        self.occupancy[i / 64] |= 1 << (i % 64);
-        self.write_index(i, index);
+            })
     }
 
     /// The flag this brick can be stored as, if it is uniform.
@@ -225,6 +233,63 @@ impl Brick {
             Repr::Solid(material) => Box::new(Mixed::filled(material)),
         };
         mixed.set(voxel_index(local), voxel);
+        self.0 = mixed.uniform().unwrap_or(Repr::Mixed(mixed));
+    }
+
+    /// The solid Voxels of the brick, as a [`VoxelMask`].
+    pub fn solid_mask(&self) -> VoxelMask {
+        match &self.0 {
+            Repr::Air => [0; 8],
+            Repr::Solid(_) => [u64::MAX; 8],
+            Repr::Mixed(mixed) => mixed.occupancy,
+        }
+    }
+
+    /// Makes the Voxels of `mask` air, and the brick uniform if that leaves it so. The same as
+    /// [`Brick::set`] of each of them, in one go.
+    pub fn clear(&mut self, mask: &VoxelMask) {
+        if *mask == [0; 8] || self.is_air() {
+            return;
+        }
+        if *mask == [u64::MAX; 8] {
+            self.0 = Repr::Air;
+            return;
+        }
+        let mut mixed = match std::mem::replace(&mut self.0, Repr::Air) {
+            Repr::Mixed(mixed) => mixed,
+            Repr::Air => unreachable!("an air brick has returned"),
+            Repr::Solid(material) => Box::new(Mixed::filled(material)),
+        };
+        for (word, clear) in mixed.occupancy.iter_mut().zip(mask) {
+            *word &= !clear;
+        }
+        self.0 = mixed.uniform().unwrap_or(Repr::Mixed(mixed));
+    }
+
+    /// Makes the Voxels of `mask` solid, of `material`, and the brick uniform if that leaves it
+    /// so. The same as [`Brick::set`] of each of them, in one go.
+    pub fn fill(&mut self, mask: &VoxelMask, material: Material) {
+        if *mask == [0; 8] || matches!(self.0, Repr::Solid(m) if m == material) {
+            return;
+        }
+        if *mask == [u64::MAX; 8] {
+            self.0 = Repr::Solid(material);
+            return;
+        }
+        let mut mixed = match std::mem::replace(&mut self.0, Repr::Air) {
+            Repr::Mixed(mixed) => mixed,
+            Repr::Air => Box::new(Mixed::empty()),
+            Repr::Solid(material) => Box::new(Mixed::filled(material)),
+        };
+        let index = mixed.palette_index(material);
+        for (layer, word) in mask.iter().enumerate() {
+            mixed.occupancy[layer] |= word;
+            let mut bits = *word;
+            while bits != 0 {
+                mixed.write_index(layer * 64 + bits.trailing_zeros() as usize, index);
+                bits &= bits - 1;
+            }
+        }
         self.0 = mixed.uniform().unwrap_or(Repr::Mixed(mixed));
     }
 
@@ -349,6 +414,66 @@ mod tests {
             assert!(b.is_uniform());
             assert_eq!(b.storage_bytes(), 0);
             assert_eq!(b.index_bits(), 0);
+        }
+    }
+
+    /// A brick of bits of two Materials and air, the same each time.
+    fn patchy() -> Brick {
+        let mut b = Brick::solid(ROCK);
+        for i in (0..BRICK_VOXELS).step_by(3) {
+            b.set(local(i), (i % 2 == 0).then_some(Material(9)));
+        }
+        b
+    }
+
+    /// A mask of the Voxels `pick` says, in the order of the brick's.
+    fn mask_of(pick: impl Fn(usize) -> bool) -> VoxelMask {
+        let mut mask = [0; 8];
+        for i in (0..BRICK_VOXELS).filter(|&i| pick(i)) {
+            mask[i / 64] |= 1 << (i % 64);
+        }
+        mask
+    }
+
+    #[test]
+    fn clearing_and_filling_by_mask_are_setting_each_voxel_and_collapse_what_becomes_uniform() {
+        let brick = |kind: usize| match kind {
+            0 => Brick::AIR,
+            1 => Brick::solid(ROCK),
+            2 => Brick::solid(Material(9)),
+            _ => patchy(),
+        };
+        let masks = [
+            mask_of(|_| false),
+            mask_of(|_| true),
+            mask_of(|i| i % 5 == 0),
+            mask_of(|i| i < 256),
+        ];
+        for kind in 0..4 {
+            for mask in &masks {
+                let in_mask = |i: usize| mask[i / 64] >> (i % 64) & 1 == 1;
+                let mut by_mask = brick(kind);
+                by_mask.clear(mask);
+                let mut by_voxel = brick(kind);
+                for i in (0..BRICK_VOXELS).filter(|&i| in_mask(i)) {
+                    by_voxel.set(local(i), None);
+                }
+                assert_eq!(by_mask, by_voxel, "clear, brick {kind}");
+                assert_eq!(by_mask.is_uniform(), by_voxel.is_uniform());
+                assert_eq!(by_mask.solid_mask(), by_voxel.solid_mask());
+
+                for material in [ROCK, Material(4)] {
+                    let mut by_mask = brick(kind);
+                    by_mask.fill(mask, material);
+                    let mut by_voxel = brick(kind);
+                    for i in (0..BRICK_VOXELS).filter(|&i| in_mask(i)) {
+                        by_voxel.set(local(i), Some(material));
+                    }
+                    assert_eq!(by_mask, by_voxel, "fill, brick {kind}");
+                    assert_eq!(by_mask.is_uniform(), by_voxel.is_uniform());
+                    assert_eq!(by_mask.content_hash(), by_voxel.content_hash());
+                }
+            }
         }
     }
 
