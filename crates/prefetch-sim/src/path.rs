@@ -157,7 +157,9 @@ pub const MAX_LOOKAHEAD_POINTS: usize = 12;
 pub fn zoom(model: &Model, from: f64, to: f64, seconds: f64, dt: f64) -> Path {
     let (_, heading) = start(model, 0.0);
     let up = unit(START);
-    let (low, high) = (500.0f64, 1.0e6f64);
+    // The altitudes, in Voxels, from which the camera looks along the horizon (50 m) to straight
+    // down (100 km).
+    let (low, high) = (50.0 * VOXELS_PER_METRE, 100.0e3 * VOXELS_PER_METRE);
     let span = to.ln() - from.ln();
     let altitude_at = |time: f64| {
         let s = (time / seconds).clamp(0.0, 1.0);
@@ -248,17 +250,16 @@ mod tests {
         let (a, b) = (&path.samples[0], &path.samples[40]);
         assert_eq!(norm(a.vel), 0.0, "it starts at rest");
         assert!(
-            (norm(path.samples[5].vel) - 250.0).abs() < 1e-6,
+            (norm(path.samples[5].vel) - 25.0 * VOXELS_PER_METRE).abs() < 1e-6,
             "half way up the ramp"
         );
-        // 1 s of ramp (25 m) then 3 s at 50 m/s: 175 m, 1750 Voxels, which the chord
-        // all but equals.
+        // 1 s of ramp (25 m) then 3 s at 50 m/s: 175 m, which the chord all but equals.
         let chord = norm(sub(b.pos, a.pos));
-        assert!((chord - 1750.0).abs() < 1.0, "{chord}");
+        assert!((chord - 175.0 * VOXELS_PER_METRE).abs() < 1.0, "{chord}");
         for (i, s) in path.samples.iter().enumerate() {
-            assert!((model.altitude(s.pos) - 500.0).abs() < 1e-6);
+            assert!((model.altitude(s.pos) - 50.0 * VOXELS_PER_METRE).abs() < 1e-6);
             if i >= 10 {
-                assert!((norm(s.vel) - 500.0).abs() < 1e-6);
+                assert!((norm(s.vel) - 50.0 * VOXELS_PER_METRE).abs() < 1e-6);
             }
             assert!(
                 dot(s.fwd, unit(s.pos)).abs() < 1e-9,
@@ -283,12 +284,14 @@ mod tests {
         let up = takeoff(&model, 50.0, 2.0, 0.1);
         let last = up.samples.last().unwrap();
         // 25 m of ramp and then 1 s at 50 m/s: 75 m.
-        assert!((model.altitude(last.pos) - (EYE + 750.0)).abs() < 1e-6);
-        let zoom = zoom(&model, EYE, 7.0e6, 5.0, 0.1);
+        assert!((model.altitude(last.pos) - (EYE + 75.0 * VOXELS_PER_METRE)).abs() < 1e-6);
+        // To 700 km, the Zoom's far end.
+        let orbit = 700.0e3 * VOXELS_PER_METRE;
+        let zoom = zoom(&model, EYE, orbit, 5.0, 0.1);
         let first = &zoom.samples[0];
         let last = zoom.samples.last().unwrap();
         assert!((model.altitude(first.pos) - EYE).abs() < 1e-6);
-        assert!((model.altitude(last.pos) - 7.0e6).abs() < 1.0);
+        assert!((model.altitude(last.pos) - orbit).abs() < 1.0);
         assert!(
             zoom.samples
                 .iter()

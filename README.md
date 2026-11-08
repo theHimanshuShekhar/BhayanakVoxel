@@ -11,7 +11,7 @@
 
 BhayanakVoxel is built as a custom engine in Rust on [wgpu](https://wgpu.rs), with Vulkan as the
 only supported backend. It does not use a heightfield, a mesh renderer or a third-party engine:
-the Planet is Voxels all the way through, down to 10 cm, and every one of them is editable.
+the Planet is Voxels all the way through, down to 5 cm, and every one of them is editable.
 
 > **Status:** early development. The skeleton (M0) is done; M1a — "Walk the Planet" — is in
 > progress. Digging, deterministic Planet generation and the rendering tracer work today.
@@ -19,7 +19,7 @@ the Planet is Voxels all the way through, down to 10 cm, and every one of them i
 
 ## What makes it different
 
-- **One planet, no map borders.** A single sphere of Voxels, 10 cm across each, with an editable
+- **One planet, no map borders.** A single sphere of Voxels, 5 cm across each, with an editable
   surface. Edits propagate through the LOD pyramid, so a crater dug up close stays visible from
   orbit.
 - **Continuous Zoom.** The camera pulls back from first/third person to a full view of the Planet

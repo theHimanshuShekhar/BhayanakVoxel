@@ -3,7 +3,9 @@
 //! the ones the server sends. All of them must end with identical bricks (ADR 0003), so
 //! everything here is integer maths in a fixed order, and `clippy.toml` bans what is not.
 
-use brick_store::{Brick, BrickCoord, BrickStore, LodRefresh, Material, VoxelCoord};
+use brick_store::{
+    Brick, BrickCoord, BrickStore, LodRefresh, Material, VOXELS_PER_METRE, VoxelCoord,
+};
 use materials::MaterialTable;
 use net::{EditMode, EditOp, RejectReason};
 
@@ -11,40 +13,68 @@ use crate::Ground;
 use crate::TICK_RATE_HZ;
 use crate::brush::{BrickCache, Change, MAX_COORD, implied_brick};
 
-/// Largest Brush a player may use: 2 m at 10 cm Voxels (issue 15).
-pub const MAX_BRUSH_RADIUS: u16 = 20;
-
 /// How far from a player's eyes an Edit's centre may be: 8 m (issue 15), in Voxels.
-pub const EDIT_REACH: f64 = 80.0;
+pub const EDIT_REACH: f64 = 8.0 * VOXELS_PER_METRE;
 
 /// Edits a player may make per second, and at once after a rest (issue 15).
 pub const OPS_PER_SECOND: u32 = 20;
 
-/// Voxels a player's Edits may change per second: 8 m^3 (issue 15).
-pub const VOXELS_PER_SECOND: u32 = 8_000;
+/// The Voxels in a cubic metre: what the Edit limits below, which are in cubic metres, turn into.
+const VOXELS_PER_CUBIC_METRE: f64 = VOXELS_PER_METRE * VOXELS_PER_METRE * VOXELS_PER_METRE;
 
-/// Voxels a player may change in one burst after a rest: nine seconds' worth, which is enough for
-/// the biggest Brush (a cube of 41 Voxels a side, 68 921) to be used on its own.
+/// Voxels a player's Edits may change per second: 8 m^3 (issue 15, and ADR 0007: the one budget
+/// that is in metres and not a count, per #137), 64 000 at 5 cm.
+pub const VOXELS_PER_SECOND: u32 = (8.0 * VOXELS_PER_CUBIC_METRE) as u32;
+
+/// Voxels a player may change in one burst after a rest: nine seconds' worth.
 pub const VOXEL_BURST: u32 = 9 * VOXELS_PER_SECOND;
-
-/// The biggest Brush that a Smooth or a Flatten may use: 1 m, which is 2 m across. They read
-/// the Voxels beside the ones they change (a Smooth, 27 for each) and are the dearest to work out.
-pub const MAX_SMOOTH_RADIUS: u16 = 10;
 
 /// How many times as dear a Voxel that a Smooth looks at is as one that another Edit does: a
 /// Smooth reads the 27 Voxels round each (35 to 60 ns in release against 4 to 12).
 pub const SMOOTH_WEIGHT: u64 = 6;
 
-/// Units of work a player may ask of the server per second. A unit is what the server spends on
-/// looking at a Voxel for a Dig, Place or Flatten, about 10 ns, so this is 6 ms of the server's
-/// time a second for each player. What an Edit asks is [`work`], which does not depend on what
-/// is in the Planet, and is known before the Edit is worked out.
-pub const WORK_PER_SECOND: u64 = 600_000;
+/// Units of work a player may ask of the server per second: 600 000 at 10 cm Voxels, scaled with
+/// the Edit rate. A unit is what the server spends on looking at a Voxel for a Dig, Place or
+/// Flatten, about 10 ns, so this is 48 ms of the server's time a second for each player. What an
+/// Edit asks is [`work`], which does not depend on what is in the Planet, and is known before the
+/// Edit is worked out.
+pub const WORK_PER_SECOND: u64 = (600.0 * VOXELS_PER_CUBIC_METRE) as u64;
 
-/// Units of work a player may ask for at once after a rest: more than any one Edit that
-/// [`validate`] lets through can be (a leaning cube of 41 Voxels, turned an eighth, has a box of
-/// about 350 000 Voxels), so that any one Brush can be used from rest.
-pub const WORK_BURST: u64 = 360_000;
+/// Units of work a player may ask for at once after a rest: 360 000 at 10 cm Voxels, scaled with
+/// the rate (0.6 of a second's worth), so that any one Brush can be used from rest.
+pub const WORK_BURST: u64 = (360.0 * VOXELS_PER_CUBIC_METRE) as u64;
+
+/// How much bigger, in tenths, the box that holds a cube that leans the most is than the cube:
+/// 5.1 times its volume (the cube of the square root of 3 is 5.196; the most measured is 5.08).
+const LEANING_BOX_TENTHS: u64 = 51;
+
+/// The biggest radius whose Brush, of `weight` units of work for each Voxel it examines, a player
+/// can afford from rest: a cube of that radius changes no more than [`VOXEL_BURST`] Voxels, and
+/// the box that holds it when it leans the most ([`LEANING_BOX_TENTHS`]) asks no more than
+/// [`WORK_BURST`].
+const fn affordable_radius(weight: u64) -> u16 {
+    let mut radius = 0u16;
+    loop {
+        let side = 2 * (radius as u64 + 1) + 1;
+        let volume = side * side * side;
+        if volume > VOXEL_BURST as u64 || LEANING_BOX_TENTHS * volume * weight > 10 * WORK_BURST {
+            return radius;
+        }
+        radius += 1;
+    }
+}
+
+const fn least(a: u16, b: u16) -> u16 {
+    if a < b { a } else { b }
+}
+
+/// Largest Brush a player may use: 2 m (issue 15), 40 Voxels, unless the bursts afford less.
+pub const MAX_BRUSH_RADIUS: u16 = least((2.0 * VOXELS_PER_METRE) as u16, affordable_radius(1));
+
+/// The biggest Brush that a Smooth or a Flatten may use: 1 m, 20 Voxels, unless the bursts afford
+/// less. They read the Voxels beside the ones they change (a Smooth, 27 for each) and are the
+/// dearest to work out.
+pub const MAX_SMOOTH_RADIUS: u16 = least(VOXELS_PER_METRE as u16, affordable_radius(SMOOTH_WEIGHT));
 
 /// What the server has to spend to work out `op`, in units (see [`WORK_PER_SECOND`]): the Voxels
 /// of the box that holds its Brush ([`crate::examined`]), whatever it ends up changing, and for a
@@ -630,12 +660,12 @@ mod tests {
         }
         assert!(budget.take_op() && !budget.take_op());
 
-        // Voxels changed: 72 000 at once, and 8 000 a second.
+        // Voxels changed: the burst at once, and 64 000 (8 m^3) a second.
         let mut budget = EditBudget::full();
         assert!(budget.has_volume(u64::from(VOXEL_BURST)));
         assert!(!budget.has_volume(u64::from(VOXEL_BURST) + 1));
         assert!(!budget.has_volume(u64::MAX));
-        assert!(budget.take_volume(70_000));
+        assert!(budget.take_volume(u64::from(VOXEL_BURST) - 2_000));
         assert!(
             !budget.take_volume(2_001),
             "only 2 000 left, and nothing was taken"
@@ -645,7 +675,7 @@ mod tests {
         for _ in 0..TICK_RATE_HZ {
             budget.refill();
         }
-        assert!(budget.take_volume(8_000) && !budget.take_volume(1));
+        assert!(budget.take_volume(u64::from(VOXELS_PER_SECOND)) && !budget.take_volume(1));
 
         // Work: a burst that is more than any one Edit can ask, and the rate a second.
         let mut budget = EditBudget::full();
@@ -653,7 +683,7 @@ mod tests {
         assert!(!budget.has_work(u64::MAX));
         assert!(budget.take_work(WORK_BURST - 5));
         assert!(!budget.take_work(6) && budget.take_work(5));
-        // A tick brings back 10 000 units, and a second all of the burst, and no more.
+        // A tick brings back its share of the rate, and a second all of the burst, and no more.
         budget.refill();
         assert!(
             budget.take_work(WORK_PER_SECOND / u64::from(TICK_RATE_HZ)) && !budget.take_work(1)
@@ -687,8 +717,10 @@ mod tests {
         );
     }
 
+    /// Every Edit that [`validate`] allows, of the biggest Brushes at the places that lean them the
+    /// most, asks for no more than the bursts hold, so that each can be used from rest.
     #[test]
-    fn no_edit_that_is_allowed_asks_for_more_work_than_the_burst_and_a_leaning_cube_asks_a_lot() {
+    fn no_edit_that_is_allowed_asks_for_more_than_the_bursts_and_a_leaning_cube_asks_a_lot() {
         let mut most = 0;
         for mode in [
             EditMode::Dig,
@@ -723,17 +755,32 @@ mod tests {
                         };
                         assert_eq!(validate(&op), Ok(()), "{op:?}");
                         assert!(work(&op) <= WORK_BURST, "{op:?}: {}", work(&op));
+                        let cube = (2 * u64::from(radius) + 1).pow(3);
+                        assert!(cube <= u64::from(VOXEL_BURST), "{op:?}: {cube}");
                         most = most.max(work(&op));
                     }
                 }
             }
         }
-        // A tilted cube of 4 m is most of it.
+        // A tilted cube of 2 m across is most of it.
         assert!(most > 300_000, "{most}");
     }
 
     #[test]
-    fn a_smooth_or_a_flatten_is_no_bigger_than_radius_10_and_a_dig_or_a_place_than_radius_20() {
+    fn the_biggest_brushes_are_metric_and_the_bursts_just_afford_them() {
+        // 2 m and 1 m in radius: the Edit rate is in metres, so the bursts keep up with the Brush.
+        assert_eq!((MAX_BRUSH_RADIUS, MAX_SMOOTH_RADIUS), (40, 20));
+        assert_eq!((VOXELS_PER_SECOND, VOXEL_BURST), (64_000, 576_000));
+        // One more Voxel of radius and a cube would be more than the bursts hold.
+        let side = 2 * u64::from(MAX_BRUSH_RADIUS) + 3;
+        let volume = side.pow(3);
+        assert!(volume > u64::from(VOXEL_BURST) || 51 * volume > 10 * WORK_BURST);
+        // A Smooth's is a metre because that is its limit; the bursts would afford a little more.
+        assert!(affordable_radius(SMOOTH_WEIGHT) >= MAX_SMOOTH_RADIUS);
+    }
+
+    #[test]
+    fn a_smooth_or_a_flatten_is_no_bigger_than_1_m_and_a_dig_or_a_place_than_2_m() {
         let with = |mode, radius| EditOp {
             mode,
             ..EditOp::dig_sphere(VoxelCoord([5, 5, 5]), radius)
@@ -743,16 +790,16 @@ mod tests {
             ..op
         };
         for mode in [EditMode::Smooth, EditMode::Flatten] {
-            assert_eq!(validate(&material(with(mode, 10))), Ok(()));
+            assert_eq!(validate(&material(with(mode, MAX_SMOOTH_RADIUS))), Ok(()));
             assert_eq!(
-                validate(&material(with(mode, 11))),
+                validate(&material(with(mode, MAX_SMOOTH_RADIUS + 1))),
                 Err(RejectReason::BrushTooLarge)
             );
         }
         for mode in [EditMode::Dig, EditMode::Place] {
-            assert_eq!(validate(&material(with(mode, 20))), Ok(()));
+            assert_eq!(validate(&material(with(mode, MAX_BRUSH_RADIUS))), Ok(()));
             assert_eq!(
-                validate(&material(with(mode, 21))),
+                validate(&material(with(mode, MAX_BRUSH_RADIUS + 1))),
                 Err(RejectReason::BrushTooLarge)
             );
         }
@@ -779,8 +826,8 @@ mod tests {
     #[test]
     fn reach_is_8_m_from_the_eyes_to_the_middle_of_the_centre_voxel() {
         let eye = [10.0, 20.0, 30.0];
-        assert!(within_reach(eye, VoxelCoord([89, 19, 29])));
-        assert!(!within_reach(eye, VoxelCoord([90, 19, 29])));
+        assert!(within_reach(eye, VoxelCoord([169, 19, 29])));
+        assert!(!within_reach(eye, VoxelCoord([170, 19, 29])));
         assert!(!within_reach([f64::NAN; 3], VoxelCoord([0; 3])));
     }
 

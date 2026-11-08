@@ -22,7 +22,7 @@ pub use edit::{
     target_hardness, validate, within_reach, work,
 };
 pub use ground::{Footing, Ground};
-pub use movement::{ConfigError, Movement, MovementConfig, VOXELS_PER_METRE};
+pub use movement::{ConfigError, Movement, MovementConfig};
 pub use prediction::{Predictor, SharedStore};
 pub use server::{Outcome, Server, ServerHandle, TICK_RATE_HZ, spawn};
 

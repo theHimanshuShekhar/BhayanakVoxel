@@ -11,7 +11,7 @@
 use std::error::Error;
 use std::path::Path;
 
-use brick_store::{BrickCoord, BrickStore, VoxelCoord, children_from};
+use brick_store::{BrickCoord, BrickStore, VOXELS_PER_METRE, VoxelCoord, children_from};
 use planet_gen::planet::{Planet, tangents};
 use planet_gen::world_map::{WORLD_RADIUS, WorldMap};
 use render::lod::{Bands, brick_distance};
@@ -25,10 +25,11 @@ use super::{Flight, ModePlan, draw, pass_stats, run_mode, write_png};
 /// Texels along a face of the world map the stills use.
 const MAP_SIZE: u32 = 512;
 /// Voxels round the cave that the level 0 ring holds: 30 m.
-const RING: i32 = 300;
-/// Where the Guard begins.
-const GUARD_FIRST: usize = 10;
-/// Voxels at which a Voxel of level 0 covers one output pixel, for the stills: 10 m.
+const RING: i32 = (30.0 * VOXELS_PER_METRE) as i32;
+/// Where the Guard begins: two levels above the real Guard's, so that the stills are made in
+/// seconds.
+const GUARD_FIRST: usize = crate::loader::GUARD_FIRST + 2;
+/// Voxels at which a Voxel of level 0 covers one output pixel, for the stills: 5 m.
 const D0: f64 = 100.0;
 /// Samples of a reference screenshot, which is not timed.
 const SHOT_SPP: u32 = 16;
@@ -59,7 +60,7 @@ pub struct Site {
     pub stills: [Still; 2],
 }
 
-/// How much the ground rises across 60 Voxels at `point`, at the most along the two ways.
+/// How much the ground rises across 6 m at `point`, at the most along the two ways.
 fn slope(planet: &Planet, point: [f64; 3]) -> f64 {
     let (ahead, aside) = tangents(unit(point));
     let rise = |way: [f64; 3]| {
@@ -68,9 +69,9 @@ fn slope(planet: &Planet, point: [f64; 3]) -> f64 {
                 .map()
                 .elevation_at(std::array::from_fn(|a| point[a] + way[a] * side))
         };
-        (at(30.0) - at(-30.0)).abs()
+        (at(3.0 * VOXELS_PER_METRE) - at(-3.0 * VOXELS_PER_METRE)).abs()
     };
-    rise(ahead).max(rise(aside)) / 60.0
+    rise(ahead).max(rise(aside)) / (6.0 * VOXELS_PER_METRE)
 }
 
 /// The Voxels of air under the ground within 8 m or so of the mouth `point`, on a lattice 80 cm
@@ -79,19 +80,20 @@ fn air_under_the_ground(planet: &Planet, point: [f64; 3]) -> Vec<[f64; 3]> {
     let up = unit(point);
     let (ahead, aside) = tangents(up);
     let mut found = Vec::new();
+    let step = 0.8 * VOXELS_PER_METRE;
     for i in -10..=10 {
         for j in -10..=10 {
             for k in -8..=0 {
                 let at: [f64; 3] = std::array::from_fn(|a| {
                     point[a]
-                        + ahead[a] * f64::from(i * 8)
-                        + aside[a] * f64::from(j * 8)
-                        + up[a] * f64::from(k * 8 - 8)
+                        + ahead[a] * f64::from(i) * step
+                        + aside[a] * f64::from(j) * step
+                        + up[a] * f64::from(k - 1) * step
                 });
                 let voxel = at.map(f64::round);
                 let ground = f64::from(WORLD_RADIUS) + planet.map().elevation_at(voxel);
                 if planet.voxel(VoxelCoord(voxel.map(|c| c as i32))).is_none()
-                    && length(voxel) < ground - 4.0
+                    && length(voxel) < ground - 0.4 * VOXELS_PER_METRE
                 {
                     found.push(voxel);
                 }
@@ -137,9 +139,9 @@ pub fn find_site(planet: &Planet) -> Site {
     } else {
         unit(level)
     };
-    let outside: [f64; 3] = std::array::from_fn(|a| mouth[a] - inward[a] * 90.0);
+    let outside: [f64; 3] = std::array::from_fn(|a| mouth[a] - inward[a] * 9.0 * VOXELS_PER_METRE);
     let ground = f64::from(WORLD_RADIUS) + planet.map().elevation_at(outside);
-    let eye = unit(outside).map(|c| c * (ground + 20.0));
+    let eye = unit(outside).map(|c| c * (ground + 2.0 * VOXELS_PER_METRE));
     Site {
         mouth,
         stills: [
@@ -147,7 +149,7 @@ pub fn find_site(planet: &Planet) -> Site {
                 name: "mouth",
                 key: Keyframe {
                     position: eye,
-                    target: std::array::from_fn(|a| mouth[a] - up[a] * 10.0),
+                    target: std::array::from_fn(|a| mouth[a] - up[a] * VOXELS_PER_METRE),
                 },
             },
             Still {
@@ -326,9 +328,10 @@ mod tests {
         let ground = |p: [f64; 3]| f64::from(WORLD_RADIUS) + planet.map().elevation_at(p);
         let [mouth, tunnel] = &site.stills;
         assert!(length(mouth.key.position) > ground(mouth.key.position));
-        assert!(length(tunnel.key.position) < ground(tunnel.key.position) - 4.0);
+        assert!(length(tunnel.key.position) < ground(tunnel.key.position) - 0.4 * VOXELS_PER_METRE);
         let near = |p: [f64; 3]| length(std::array::from_fn(|a| p[a] - site.mouth[a]));
-        assert!(near(mouth.key.position) < 150.0 && near(tunnel.key.position) < 150.0);
+        let reach = 15.0 * VOXELS_PER_METRE;
+        assert!(near(mouth.key.position) < reach && near(tunnel.key.position) < reach);
     }
 
     #[test]

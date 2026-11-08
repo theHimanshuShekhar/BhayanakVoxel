@@ -15,8 +15,8 @@
 //! # A step
 //!
 //! Time is cut into steps of at most 1/240 s ([`SUBSTEPS_PER_SECOND`]), in which the capsule
-//! moves at most 0.3 Voxels along the ground and 2 when falling at terminal speed: less than its
-//! radius (3), so it cannot pass through anything a Voxel thick between one test and the next.
+//! moves at most 0.6 Voxels along the ground and 4 when falling at terminal speed: less than its
+//! radius (6), so it cannot pass through anything a Voxel thick between one test and the next.
 //! In each step:
 //! 1. If the capsule is inside the ground, it is lifted out, slowly, and nothing else happens.
 //! 2. Crouching is taken (always), or let go of (only if there is room to stand).
@@ -34,7 +34,7 @@
 //! Standing still, nothing moves it sideways: the fall is straight down along up, so it does
 //! not slide down a slope of the Voxel staircase it stands on.
 
-use brick_store::VoxelCoord;
+use brick_store::{VOXELS_PER_METRE, VoxelCoord};
 use net::{BodyState, Leash, MoveInput};
 
 use crate::Movement;
@@ -46,19 +46,19 @@ pub const TICK_DT: f64 = 1.0 / 60.0;
 const SUBSTEPS_PER_SECOND: f64 = 240.0;
 /// The longest frame taken in one call; more is dropped.
 const MAX_DT: f64 = 1.0;
-/// A gap this small, in Voxels, between the feet and the ground counts as standing on it.
-const SKIN: f64 = 0.02;
+/// A gap this small, in Voxels (2 mm), between the feet and the ground counts as standing on it.
+const SKIN: f64 = 0.002 * VOXELS_PER_METRE;
 /// Rounds of bisection that find where the capsule touches something: the distance searched,
 /// divided by 2^14.
 const BISECTIONS: usize = 14;
 /// How far into a Voxel the capsule may be without counting as touching it, in Voxels (1 mm).
-const TOLERANCE: f64 = 0.01;
+const TOLERANCE: f64 = 0.001 * VOXELS_PER_METRE;
 /// How far into a Voxel the capsule must be at the start of a step to count as stuck, in Voxels
 /// (5 mm). More than [`TOLERANCE`], because the radial up turns as the capsule walks and tips
 /// a capsule that rests on the ground into it by a hair.
-const STUCK: f64 = 0.05;
-/// How fast a character that is inside the ground is lifted out of it, in Voxels per step.
-const UNSTICK: f64 = 0.25;
+const STUCK: f64 = 0.005 * VOXELS_PER_METRE;
+/// How fast a character that is inside the ground is lifted out of it, in Voxels per step (2.5 cm).
+const UNSTICK: f64 = 0.025 * VOXELS_PER_METRE;
 /// Rounds of pushing out of contacts before giving up and staying where it was.
 const PUSH_ROUNDS: usize = 4;
 

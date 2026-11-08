@@ -24,6 +24,12 @@ reference = 3.0
 # TAAU (#51): the upscale pass builds the 1440p image from the 1280x720 one and its history.
 upscale = 0.5
 
+# Edits and BVH updates (#10, 1 ms), held at the metric Edit rate (8 m3/s, #147): the mean over
+# every frame of the Edit stress of the whole-Planet bench, in which the largest Brush is dug and
+# placed in turn at the rate the server allows. It is CPU time (the Edit applied, the scene
+# packed, the writes sent), and not a GPU pass.
+edits = 1.0
+
 # M1 stages from #10, for when the passes exist (the names are suggestions):
 # shadows      = 0.4   # sun shadows, 1 ray/px
 # gi           = 1.5   # GI bounce and radiance cache
@@ -32,7 +38,6 @@ upscale = 0.5
 # volumetrics  = 1.0
 # denoise      = 1.0
 # atmosphere   = 0.3
-# edits        = 1.0   # Edits and BVH updates
 # post         = 0.5   # post-processing and UI (the window's blit and overlay passes are not
 #                      # run by the offscreen bench)
 

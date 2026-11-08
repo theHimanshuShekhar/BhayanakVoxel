@@ -9,7 +9,9 @@ use crate::demand::{Point, build, traverse};
 use crate::model::{EYE, Model, VOXELS_PER_METRE, add, scale, unit};
 use crate::path::{self, Path};
 
-/// Bytes the Guard takes, measured: 680 K bricks of levels 8 to 12, 73.9 MiB.
+/// Bytes the Guard takes, measured at 10 cm Voxels: 680 K bricks of levels 8 to 12, 73.9 MiB. The
+/// Guard of 5 cm Voxels is levels 9 to 13: the same Voxel sizes, and so about the same bricks.
+/// (Not measured again yet.)
 pub const GUARD_BYTES: f64 = 73.9 * 1024.0 * 1024.0;
 
 /// Bytes a drawn brick costs in one packed copy of the scene: the 33 words of `bricks` and 1 of
@@ -23,20 +25,20 @@ pub const GUARD_BYTES: f64 = 73.9 * 1024.0 * 1024.0;
 pub const BRICK_BYTES: f64 = 34.0 * 4.0;
 
 /// Drawn bricks a second that the loader and the scene thread get from the Planet to the scene
-/// today, end to end: the full fill of #123 drew 3.21 million bricks (`BRICKS_PER_D0_SQUARED`) in
-/// 142 s on the 8-core dev box, with the scene thread of ADR 0006 taking them in as they came. An
-/// upper bound on today's intake, since the fill may be limited by generation.
-pub const CURRENT_INTAKE: f64 = 3_210_000.0 / 142.0;
+/// today, end to end: the full fill (#123, measured again at 5 cm Voxels for #147) drew 3.56
+/// million bricks (`BRICKS_PER_D0_SQUARED`) in 160 s on the 8-core dev box, with the scene thread
+/// of ADR 0006 taking them in as they came. An upper bound on today's intake, since the fill may be limited by generation.
+pub const CURRENT_INTAKE: f64 = 3_560_000.0 / 160.0;
 
 /// The loader's `MAX_AHEAD`: most jobs generated and not taken in.
 pub const LOADER_MAX_AHEAD: usize = 512;
 
-/// What a generated brick costs on one core, in µs, from the real loader: the full fill of #123
-/// generated 22.3 million bricks (2.79 million jobs of 8) in 142 s on 6 workers of the 8-core dev
-/// box, so 26 K bricks/s/worker, 38 µs. If the workers were ever idle the true cost is lower, so
+/// What a generated brick costs on one core, in µs, from the real loader: the full fill (at 5 cm)
+/// generated 23.9 million bricks (2.99 million jobs of 8) in 160 s on 6 workers of the 8-core dev
+/// box, so 25 K bricks/s/worker, 40 µs. If the workers were ever idle the true cost is lower, so
 /// this is an upper bound on the cost of the loader's job and the figure used. (Not measured by
 /// this crate: from `room_for`'s numbers in the client.)
-pub const GENERATION_US: f64 = 38.0;
+pub const GENERATION_US: f64 = 40.0;
 
 /// What `examples/gen_rate.rs` measures on one core, for the same job (`children_with_solid`, 8
 /// children with `solid_below`, air and buried ones included): 1500 jobs sampled at random from
@@ -620,7 +622,7 @@ mod tests {
 
     #[test]
     fn a_full_fill_draws_what_the_client_measured() {
-        // 3.04 d0^2 bricks (3.21 million), within 10%.
+        // 3.37 d0^2 bricks (3.56 million), within 10%.
         let model = Model::real();
         let d0 = model.bands.d0();
         let drawn = drawn_bricks(&model) as f64 / (d0 * d0);
@@ -633,22 +635,23 @@ mod tests {
 
     #[test]
     fn a_shell_at_the_ground_holds_about_the_surface_in_its_band() {
-        // No margins: level 0 owns 2 d0 = 205.6 m, level 1 to the 253 m horizon. The surface there
-        // is a disc of 253 m: pi r^2 over the bricks' areas, times what a cubic grid makes of a
-        // surface (between 1 and sqrt 3 times the area, 1.5 on average).
+        // No margins: level 0 owns 2 d0 = 102.8 m, level 1 to 205.6 m, and level 2 to the 253 m
+        // horizon. The surface there is a disc of 253 m: pi r^2 over the bricks' areas, times what
+        // a cubic grid makes of a surface (between 1 and sqrt 3 times the area, 1.5 on average).
         let mut model = Model::real();
         model.crust = 0.0;
         model.vertical_margin = 0.0;
         model.radial_margin = 1.0;
         let size = shell_size(&model, 2.0);
-        let (r0, r1) = (205.6f64, 253.0f64);
-        let flat = std::f64::consts::PI * (r0 * r0 / 0.64 + (r1 * r1 - r0 * r0) / 2.56);
+        let (r0, r1, r2) = (102.8f64, 205.6f64, 253.0f64);
+        let flat = std::f64::consts::PI
+            * (r0 * r0 / 0.16 + (r1 * r1 - r0 * r0) / 0.64 + (r2 * r2 - r1 * r1) / 2.56);
         let ratio = size.bricks as f64 / flat;
         assert!(
             (1.0..1.75).contains(&ratio),
             "{} bricks, {ratio} of flat",
             size.bricks
         );
-        assert_eq!(size.levels, (0, 1));
+        assert_eq!(size.levels, (0, 2));
     }
 }

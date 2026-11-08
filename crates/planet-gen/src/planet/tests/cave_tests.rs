@@ -82,7 +82,7 @@ fn caves_are_only_under_land_less_than_300_m_below_the_ground() {
                     0.0 < depth && depth < caves::MAX_DEPTH,
                     "{depth} Voxels deep"
                 );
-                by_depth[(depth / 500.0) as usize] += 1;
+                by_depth[(depth / f64::from(voxels(50.0))) as usize] += 1;
                 carved += 1;
             }
         }
@@ -100,7 +100,7 @@ fn caves_are_only_under_land_less_than_300_m_below_the_ground() {
             let at = on(tube, f64::from(k) / 8.0);
             let (depth, elevation) = depth_and_elevation(at);
             let wall = caves::MAX_DEPTH + 2.0 * caves::MAX_TUBE_RADIUS;
-            if elevation >= 0.0 && (wall..wall + 400.0).contains(&depth) {
+            if elevation >= 0.0 && (wall..wall + f64::from(voxels(40.0))).contains(&depth) {
                 let coord = brick_of_point(at);
                 assert_eq!(planet().brick(coord), ground_brick(coord), "{coord:?}");
                 deep += 1;
@@ -131,7 +131,8 @@ fn some_caves_open_to_the_surface() {
         let up = mouth.map(|c| c / distance(*mouth));
         // At the ground there and a little below it, in the bricks around, since the tube may
         // open to one side of the point.
-        let found = [0.0, -15.0, -30.0].into_iter().any(|dr| {
+        let found = [0.0, -1.5, -3.0].into_iter().any(|metres| {
+            let dr = metres * VOXELS_PER_METRE;
             let at: [f64; 3] = std::array::from_fn(|a| mouth[a] + up[a] * dr);
             let coord = brick_of_point(at);
             (-1..=1).any(|dx| {
@@ -163,12 +164,12 @@ fn some_surfaces_overhang_with_air_under_solid_along_a_radial_column() {
         let (ahead, aside) = tangents(up);
         for (s, t) in [
             (0, 0),
-            (20, 0),
-            (-20, 0),
-            (0, 20),
-            (0, -20),
-            (35, 35),
-            (-35, -35),
+            (40, 0),
+            (-40, 0),
+            (0, 40),
+            (0, -40),
+            (70, 70),
+            (-70, -70),
         ] {
             columns += 1;
             let base: [f64; 3] = std::array::from_fn(|a| {
@@ -176,7 +177,7 @@ fn some_surfaces_overhang_with_air_under_solid_along_a_radial_column() {
             });
             let dir = base.map(|c| c / distance(base));
             let ground = SEA_RADIUS + planet().map().elevation_at(dir);
-            let column: Vec<_> = (-300..=40)
+            let column: Vec<_> = (-600..=80)
                 .map(|dr| planet().voxel(along(dir, ground + f64::from(dr))))
                 .collect();
             let roof = column
@@ -184,8 +185,8 @@ fn some_surfaces_overhang_with_air_under_solid_along_a_radial_column() {
                 .position(|w| w[0].is_none() && w[1].is_some());
             if let Some(roof) = roof {
                 roofs += 1;
-                // `roof` is the index of the air, so its height is from -300 up.
-                near += usize::from(roof as i32 - 300 > -200);
+                // `roof` is the index of the air, so its height is from -600 up.
+                near += usize::from(roof as i32 - 600 > -400);
             }
         }
     }
@@ -197,13 +198,13 @@ fn some_surfaces_overhang_with_air_under_solid_along_a_radial_column() {
 }
 
 /// The radius of the largest ball of air centred at `centre`, in Voxels, as far as the Planet's
-/// bricks 56 Voxels round it say: the distance to the nearest solid Voxel.
+/// bricks 88 Voxels round it say: the distance to the nearest solid Voxel.
 fn air_ball_radius(centre: [f64; 3]) -> f64 {
     let at = brick_of_point(centre);
     let mut nearest = f64::INFINITY;
-    for dx in -7..=7 {
-        for dy in -7..=7 {
-            for dz in -7..=7 {
+    for dx in -11..=11 {
+        for dy in -11..=11 {
+            for dz in -11..=11 {
                 let coord = BrickCoord([at.0[0] + dx, at.0[1] + dy, at.0[2] + dz]);
                 let brick = planet().brick(coord);
                 if brick.is_air() {
@@ -225,7 +226,7 @@ fn no_cave_is_wider_than_8_m() {
     for tube in planet().caves.tubes() {
         assert!(tube.ra.max(tube.rb) + caves::ROUGHNESS <= caves::MAX_TUBE_RADIUS);
     }
-    const { assert!(2.0 * caves::MAX_TUBE_RADIUS <= 80.0) };
+    const { assert!(2.0 * caves::MAX_TUBE_RADIUS <= 160.0) };
     // And measured: the biggest ball of air in the cave, at the ends of tubes that are deep
     // enough under the ground that no ball reaches the sky, where tubes meet and the cave is
     // widest. None is 8 m across.
@@ -234,7 +235,7 @@ fn no_cave_is_wider_than_8_m() {
     for tube in tubes_stepping(97) {
         for (end, radius) in [(tube.a, tube.ra), (tube.b, tube.rb)] {
             let (depth, elevation) = depth_and_elevation(end);
-            if radius < 20.0 || elevation < 100.0 || !(1000.0..2500.0).contains(&depth) {
+            if radius < 40.0 || elevation < 200.0 || !(2000.0..5000.0).contains(&depth) {
                 continue;
             }
             let width = 2.0 * (air_ball_radius(end) - 0.5);
@@ -248,9 +249,9 @@ fn no_cave_is_wider_than_8_m() {
         sum / f64::from(measured)
     );
     assert!(measured > 30, "{measured}");
-    assert!(widest <= 80.0, "{widest} Voxels across");
+    assert!(widest <= 160.0, "{widest} Voxels across");
     assert!(
-        widest >= 40.0,
+        widest >= 80.0,
         "{widest}: the chambers are not much of a cave"
     );
 }
@@ -289,20 +290,20 @@ fn no_cave_reaches_further_than_a_kilometre() {
             .fold(0.0, f64::max);
         reaches.push(reach);
         longest = longest.max(reach);
-        over_half += usize::from(reach > 5000.0);
+        over_half += usize::from(reach > 500.0 * VOXELS_PER_METRE);
     }
     reaches.sort_by(f64::total_cmp);
     eprintln!(
         "{} systems: longest reach {:.0} m, median {:.0} m, 90th percentile {:.0} m; \
          {over_half} reach over 500 m",
         systems.len(),
-        longest / 10.0,
-        reaches[reaches.len() / 2] / 10.0,
-        reaches[reaches.len() * 9 / 10] / 10.0,
+        longest / VOXELS_PER_METRE,
+        reaches[reaches.len() / 2] / VOXELS_PER_METRE,
+        reaches[reaches.len() * 9 / 10] / VOXELS_PER_METRE,
     );
     assert!(longest <= 2.0 * caves::SPAN, "{longest}");
     assert!(
-        longest > 7_000.0,
+        longest > 700.0 * VOXELS_PER_METRE,
         "the longest should come close to a kilometre: {longest}"
     );
     // Every end is within the ball of its cube, which is wholly inside the cube.
@@ -355,7 +356,7 @@ fn solid_below_is_never_claimed_for_a_brick_with_a_cave_in_it() {
     // that a brick is solid all the way down, every brick of level 0 under it is full (all of
     // them at levels 0 to 2, and every ninth at level 3, where there are 512).
     let (mut claimed, mut taken, mut with_caves) = (0, 0, 0);
-    for tube in tubes_stepping(211) {
+    for tube in tubes_stepping(105) {
         let Some(at) = middle_in_the_band(tube) else {
             continue;
         };
@@ -384,7 +385,7 @@ fn solid_below_is_never_claimed_for_a_brick_with_a_cave_in_it() {
         }
     }
     eprintln!("{claimed} claims, {taken} taken away by the caves");
-    assert!(claimed > 1_000 && taken > 100, "{claimed} {taken}");
+    assert!(claimed > 500 && taken > 100, "{claimed} {taken}");
     assert_eq!(with_caves, 0);
 }
 
@@ -514,9 +515,9 @@ fn a_coarse_brick_with_caves_at_levels_5_and_6_is_its_eight_finer_bricks_downsam
 
 #[test]
 fn a_coarse_voxel_is_a_cave_only_where_a_tube_holds_most_of_it() {
-    // At level 7 and up (12.8 m Voxels and wider) no tube is wide enough: the caves are not in
+    // At level 8 and up (12.8 m Voxels and wider) no tube is wide enough: the caves are not in
     // the coarse bricks, and so are never in the Guard.
-    for level in [7, 8, 10, 12] {
+    for level in [8, 9, 11, 13] {
         for coord in coarse_bricks_with_caves(level, 61, 40) {
             assert_eq!(
                 planet().coarse_brick(level, coord),

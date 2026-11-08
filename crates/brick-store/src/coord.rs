@@ -3,6 +3,11 @@
 /// Edge length of a brick in Voxels (ADR 0002).
 pub const BRICK_SIZE: i32 = 8;
 
+/// Voxels of level 0 in a metre: Voxels are 5 cm (ADR 0007). The one place the size of a Voxel is
+/// written down: every size in metres (the Planet's, the character's, an Edit's reach) is
+/// converted with it, and a test checks that no other crate defines a copy.
+pub const VOXELS_PER_METRE: f64 = 20.0;
+
 /// Position of a Voxel within its brick, each axis in `0..BRICK_SIZE`.
 pub type LocalCoord = [u8; 3];
 

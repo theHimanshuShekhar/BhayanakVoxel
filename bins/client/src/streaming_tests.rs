@@ -1,16 +1,16 @@
 //! The ring loader at work (#86): the loader's threads, the world that takes in what they make, and
 //! the scene that is drawn from it, on the test world map. Bands of `d0` = 64 Voxels make a few
-//! levels fit in a test; the Guard is levels 10 to 12.
+//! levels fit in a test; the Guard is levels 11 to 13.
 
 use std::collections::HashMap;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
-use brick_store::{BrickStore, TableSize, VoxelCoord};
+use brick_store::{BrickStore, TableSize, VOXELS_PER_METRE, VoxelCoord};
 use net::{ClientMessage, EditOp, RejectReason, ServerEnd, ServerMessage, loopback};
 use planet_gen::planet::{Planet, tangents};
 use planet_gen::world_map::WorldMap;
-use render::lod::Bands;
+use render::lod::{Bands, LEVELS};
 use render::reference::{Ray, trace};
 use render::scene::{Bound, REGION_WORDS};
 use render::{Camera, Mode, RingsFull, Scene, SceneUpdate, camera};
@@ -22,7 +22,8 @@ use crate::world::{STILL_FRAMES, SceneWork, Stillness, World, loading_paused_for
 const SEED: u64 = 0xB4A7_A9AC;
 const RING: i32 = 160;
 const D0: f64 = 64.0;
-const GUARD_FIRST: usize = 10;
+/// Two levels above the real Guard's, so that a test's Guard is quick to make.
+const GUARD_FIRST: usize = crate::loader::GUARD_FIRST + 2;
 
 fn planet() -> &'static Planet {
     static PLANET: OnceLock<Planet> = OnceLock::new();
@@ -47,7 +48,7 @@ fn bound() -> Bound {
 
 /// The ring and the Guard: what the client has right after the spawn.
 fn spawned_store() -> BrickStore {
-    let mut store = planet().crust_around(ground(), RING, 12);
+    let mut store = planet().crust_around(ground(), RING, LEVELS - 1);
     hold_guard(&mut store, planet(), GUARD_FIRST);
     store
 }
@@ -216,13 +217,13 @@ fn a_dig_near_the_camera_shows_at_every_band_that_covers_it() {
 
         // The Planet with everything resident, dug and not: the Planet's own bricks, with the
         // same Edit applied to one.
-        let mut dug = planet().crust_around(ground(), RING, 12);
+        let mut dug = planet().crust_around(ground(), RING, LEVELS - 1);
         sim::apply(
             &mut dug,
             &EditOp::dig_sphere(VoxelCoord(at), crate::tool::DEFAULT_RADIUS),
         );
         let dug_scene = Scene::rings(&dug, from, bands(), bound()).unwrap();
-        let whole = planet().crust_around(ground(), RING, 12);
+        let whole = planet().crust_around(ground(), RING, LEVELS - 1);
         let whole_scene = Scene::rings(&whole, from, bands(), bound()).unwrap();
         let (hole, flat) = (trace(&dug_scene, &ray), trace(&whole_scene, &ray));
         let (hole, flat, shown) = (hole.unwrap(), flat.unwrap(), shown.unwrap());
@@ -482,7 +483,7 @@ fn scene_frame(
     }
 }
 
-/// The camera moving over the ground at `metres_per_s` (a Voxel is 10 cm) for `frames` frames at
+/// The camera moving over the ground at `metres_per_s` for `frames` frames at
 /// 60 a second, with the loader running: the scene work of each frame.
 fn travel(
     world: &mut World,
@@ -494,7 +495,7 @@ fn travel(
     let frame = Duration::from_micros(16_667);
     let (mut work, mut updates) = (SceneWork::default(), Updates::default());
     let (ahead, _) = tangents(camera.horizon_up);
-    let step = metres_per_s * 10.0 / 60.0;
+    let step = metres_per_s * VOXELS_PER_METRE / 60.0;
     let mut moved = camera.position;
     for _ in 0..frames {
         let tick = Instant::now();
@@ -631,7 +632,7 @@ fn the_full_size_planet_streams_in_and_walking_over_it_does_not_stall() {
         }
         if last_report.elapsed() > Duration::from_secs(30) {
             last_report = Instant::now();
-            let drawn: usize = (0..13).map(|l| world.level_bricks(l)).sum();
+            let drawn: usize = (0..LEVELS).map(|l| world.level_bricks(l)).sum();
             eprintln!(
                 "  {:.0?}: {frames} frames, {} waiting, {} pending, {} generated, {drawn} drawn",
                 began.elapsed(),
@@ -643,7 +644,7 @@ fn the_full_size_planet_streams_in_and_walking_over_it_does_not_stall() {
         std::thread::sleep(frame.saturating_sub(tick.elapsed()));
     }
     let fill_took = began.elapsed();
-    let bricks: Vec<usize> = (0..13).map(|l| world.level_bricks(l)).collect();
+    let bricks: Vec<usize> = (0..LEVELS).map(|l| world.level_bricks(l)).collect();
     eprintln!(
         "resident set complete for the bands {:.1?} after the first frame ({frames} frames): {} \
          bricks generated, {} drawn (per level {bricks:?}), scene {:.0} MiB used of {:.0} MiB \
@@ -684,7 +685,7 @@ fn the_full_size_planet_streams_in_and_walking_over_it_does_not_stall() {
         walk_updates.recentre.summary().unwrap(),
         walk_updates.stream.summary().unwrap()
     );
-    eprintln!("{}", walk_updates.report(5.0 * 10.0 / 60.0));
+    eprintln!("{}", walk_updates.report(5.0 * VOXELS_PER_METRE / 60.0));
     tables.report();
     // The reservations hold over the fill and the walk: no table grew and nothing was packed again.
     tables.assert_none_grew();
@@ -710,7 +711,7 @@ fn the_full_size_planet_streams_in_and_walking_over_it_does_not_stall() {
         fly_updates.recentre.summary().unwrap(),
         fly_updates.stream.summary().unwrap()
     );
-    eprintln!("{}", fly_updates.report(48.0 * 10.0 / 60.0));
+    eprintln!("{}", fly_updates.report(48.0 * VOXELS_PER_METRE / 60.0));
     tables.report();
     eprintln!(
         "  tables that grew in the flight (it asks for far more than the loader makes in a frame): {:?}",
@@ -1053,15 +1054,15 @@ fn what_the_scene_thread_counts_as_drawn_is_what_the_frame_threads_copy_lists() 
         std::thread::sleep(Duration::from_millis(3));
     }
     world.sync().unwrap();
-    assert_eq!(listed(world.scene()), world.stats().level_bricks[..13]);
+    assert_eq!(listed(world.scene()), world.stats().level_bricks[..LEVELS]);
     fill(&mut world, camera.position);
-    assert_eq!(listed(world.scene()), world.stats().level_bricks[..13]);
+    assert_eq!(listed(world.scene()), world.stats().level_bricks[..LEVELS]);
     // And after the rings have followed the camera, and the bands have filled again.
     let (ahead, _) = tangents(camera.horizon_up);
     let moved: [f64; 3] = std::array::from_fn(|a| camera.position[a] + 150.0 * ahead[a]);
     world.recentre(moved).unwrap();
     fill(&mut world, moved);
-    assert_eq!(listed(world.scene()), world.stats().level_bricks[..13]);
+    assert_eq!(listed(world.scene()), world.stats().level_bricks[..LEVELS]);
     assert!(world.stats().level_bricks.iter().sum::<usize>() > 1000);
 }
 
@@ -1128,7 +1129,7 @@ fn changes_made_while_a_copy_of_the_whole_scene_waits_go_into_the_copy() {
     let copy = ready.mirror.expect("the copy waits");
     assert!(ready.patch.is_none());
     let stats = ready.stats.unwrap();
-    assert_eq!(listed(&copy), stats.level_bricks[..13]);
+    assert_eq!(listed(&copy), stats.level_bricks[..LEVELS]);
 }
 
 #[test]

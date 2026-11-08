@@ -1,7 +1,7 @@
 //! The tunable numbers of character movement, read from `movement.toml` (decision in #16).
 //!
 //! The file is in metres and seconds, as a designer thinks of them. [`Movement`] holds the same
-//! numbers in Voxels, which the controller works in; converting is a multiplication by 10, so
+//! numbers in Voxels, which the controller works in; converting is a multiplication by [`VOXELS_PER_METRE`], so
 //! it is exact in the sense that matters: the client and the server get the same bits from the
 //! same file.
 
@@ -9,13 +9,11 @@ use std::error::Error;
 use std::fmt;
 use std::sync::OnceLock;
 
+use brick_store::VOXELS_PER_METRE;
 use serde::Deserialize;
 
 /// The data file the game ships with, compiled in so that every binary has it.
 const BUILT_IN: &str = include_str!("../movement.toml");
-
-/// Voxels in a metre: Voxels are 10 cm.
-pub const VOXELS_PER_METRE: f64 = 10.0;
 
 /// The file as written, in metres and seconds.
 #[derive(Clone, Copy, Debug, PartialEq, Deserialize)]
@@ -199,13 +197,18 @@ mod tests {
     #[test]
     fn movement_is_the_config_in_voxels() {
         let m = Movement::default();
+        let v = |metres: f64| metres * VOXELS_PER_METRE;
         assert_eq!(
             (m.walk_speed, m.run_speed, m.crouch_speed),
-            (45.0, 70.0, 20.0)
+            (v(4.5), v(7.0), v(2.0))
         );
-        assert_eq!((m.step_height, m.height, m.radius), (5.0, 18.0, 3.0));
+        assert_eq!(
+            (m.step_height, m.height, m.radius),
+            (v(0.5), v(1.8), v(0.3))
+        );
         // Leaves the ground at the speed that takes it 1.2 m up against 9.8 m/s^2.
-        assert!((m.jump_speed - 48.5).abs() < 0.1, "{}", m.jump_speed);
+        let wanted = (2.0 * 9.8 * 1.2f64).sqrt() * VOXELS_PER_METRE;
+        assert!((m.jump_speed - wanted).abs() < 0.01, "{}", m.jump_speed);
     }
 
     fn with(line: &str) -> String {

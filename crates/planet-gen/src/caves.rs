@@ -27,31 +27,36 @@
 //! Directions come from random vectors that are normalised, not from random angles.
 
 use crate::planet::{SEA_RADIUS, tangents};
-use crate::world_map::{PEAK, SEA_LEVEL, WorldMap};
+use crate::world_map::{PEAK, SEA_LEVEL, WorldMap, voxels};
 use crate::{Corners, distance, hash, value_noise};
 
+/// The size of `metres`, in Voxels, as a float.
+const fn v(metres: f64) -> f64 {
+    voxels(metres) as f64
+}
+
 /// Voxels along the edge of the cubes that the world is cut into: 1.024 km.
-pub const CELL: i32 = 10_240;
-/// Cubes along each axis: enough to hold the Planet, which is within 180,000 Voxels of the
-/// centre ([`crate::planet::MAX_RADIUS`]).
+pub const CELL: i32 = voxels(1_024.0);
+/// Cubes along each axis: enough to hold the Planet, which is within 18 km of the centre
+/// ([`crate::planet::MAX_RADIUS`]).
 const CELLS: usize = 36;
 /// The coordinate of the cube at index 0, in cubes.
 const FIRST: i32 = -(CELLS as i32 / 2);
 
 /// How far below the ground caves go, in Voxels: 300 m.
-pub const MAX_DEPTH: f64 = 3000.0;
-/// How far, from the tube's own radius, the wall's roughness moves the cave's surface.
-pub const ROUGHNESS: f64 = 4.0;
+pub const MAX_DEPTH: f64 = v(300.0);
+/// How far, from the tube's own radius, the wall's roughness moves the cave's surface: 40 cm.
+pub const ROUGHNESS: f64 = v(0.4);
 /// The widest a tube gets, roughness and all: its radius, in Voxels, 3.6 m.
 pub const MAX_TUBE_RADIUS: f64 = CHAMBER.1 + ROUGHNESS;
 /// Radii of a passage at its ends, and of a chamber, in Voxels: 0.8 to 2 m, and 2.4 to 3.2 m.
-const PASSAGE: (f64, f64) = (8.0, 20.0);
-const CHAMBER: (f64, f64) = (24.0, 32.0);
+const PASSAGE: (f64, f64) = (v(0.8), v(2.0));
+const CHAMBER: (f64, f64) = (v(2.4), v(3.2));
 /// How many of the ends of tubes are chambers.
 const CHAMBER_SHARE: f64 = 0.25;
 /// How far from the middle of its cube a system gets, tubes' radii included, in Voxels: 490 m,
 /// 30 m short of the cube's side, and so the most that a cave reaches is twice this, 980 m.
-pub const SPAN: f64 = 4_900.0;
+pub const SPAN: f64 = v(490.0);
 /// How far from the middle of its cube the ends of tubes stay.
 const HEART: f64 = SPAN - MAX_TUBE_RADIUS;
 
@@ -60,34 +65,36 @@ const HEART: f64 = SPAN - MAX_TUBE_RADIUS;
 /// ground goes through.
 const ATTEMPTS: u64 = 8;
 /// How far under the ground a system's anchor is, in Voxels: 15 to 240 m.
-const ANCHOR_DEPTH: std::ops::RangeInclusive<f64> = 150.0..=2400.0;
+const ANCHOR_DEPTH: std::ops::RangeInclusive<f64> = v(15.0)..=v(240.0);
 /// Segments of the main walk of a system, and of each of its branches (up to two).
 const WALK: (u64, u64) = (8, 14);
 const BRANCH: (u64, u64) = (3, 6);
 /// How long a segment is, in Voxels: 50 to 150 m.
-const LENGTH: (f64, f64) = (500.0, 1500.0);
+const LENGTH: (f64, f64) = (v(50.0), v(150.0));
 /// How much a segment turns from the one before: the size of the random vector added to the
 /// heading, along the ground, and (half of it) up and down.
 const TURN: f64 = 0.8;
 /// The most a tunnel climbs or sinks, as the sine of its angle to the ground: 20 degrees.
 const PITCH: f64 = 0.35;
 /// How much of half a coarse Voxel's width must be inside a tube for the Voxel to be carved: see
-/// [`Caves::carves`]. At least 0.57, so that no tube carves a Voxel of level 7 (12.8 m) or up.
+/// [`Caves::carves`]. At least 0.57, so that no tube carves a Voxel of level 8 (12.8 m) or up.
 const BALL: f64 = 0.6;
 /// Whether a tube can carve a coarse Voxel whose `half` is as [`Caves::carves`] says: not one of
-/// level 7 or up, which is 12.8 m across, wider than any tube.
+/// level 8 or up, which is 12.8 m across, wider than any tube.
 pub(crate) const fn carves_voxels_of(half: f64) -> bool {
     half * BALL < MAX_TUBE_RADIUS
 }
 
-// No tube carves a Voxel of level 7 (12.8 m: `half` 63.5) or coarser: the Guard, and the levels the
-// horizon cap applies to, have no caves in them.
-const _: () = assert!(!carves_voxels_of(63.5));
-// ...and one of level 6 can be carved, which the agreement tests at levels 5 and 6 rely on.
-const _: () = assert!(carves_voxels_of(31.5));
+// No tube carves a Voxel of level 8 (12.8 m: `half` 127.5) or coarser: the Guard, and the levels
+// the horizon cap applies to, have no caves in them.
+const _: () = assert!(!carves_voxels_of(127.5));
+// ...and one of level 7 can be carved, which the agreement tests at levels 6 and 7 rely on.
+const _: () = assert!(carves_voxels_of(63.5));
 
-/// Distance, in Voxels, of the cells of the noise that makes the walls rough.
-const ROUGH_CELL: i32 = 16;
+/// Distance, in Voxels, of the cells of the noise that makes the walls rough: 1.6 m, a power of
+/// two so that the in-cell fraction is exact.
+const ROUGH_CELL: i32 = voxels(1.6);
+const _: () = assert!(ROUGH_CELL.count_ones() == 1);
 
 /// Salts that tell the cave streams of randomness from the world map's and each other's.
 const SALT: u64 = 0xca5e_5bad_d00d_1e55;
@@ -667,27 +674,27 @@ mod tests {
         let tube = Tube {
             a: [0.0; 3],
             b: [400.0, 0.0, 0.0],
-            ra: 20.0,
-            rb: 20.0,
+            ra: 40.0,
+            rb: 40.0,
         };
         let (mut inside, mut outside) = (0, 0);
         for x in 0..200 {
-            for dy in 0..40 {
+            for dy in 0..80 {
                 let point = [f64::from(x) * 2.0, f64::from(dy), 3.0];
                 let carved = caves.carves(&[tube], point, 0.0, &mut None);
-                // Within 20 - 4 of the axis it is air, and beyond 20 + 4 it is not.
+                // Within 40 - 8 of the axis it is air, and beyond 40 + 8 it is not.
                 let off = (f64::from(dy) * f64::from(dy) + 9.0).sqrt();
-                assert!(off >= 16.0 || carved, "{point:?}");
-                assert!(off < 24.0 || !carved, "{point:?}");
-                inside += usize::from(off >= 16.0 && carved);
-                outside += usize::from(off < 24.0 && !carved);
+                assert!(off >= 32.0 || carved, "{point:?}");
+                assert!(off < 48.0 || !carved, "{point:?}");
+                inside += usize::from(off >= 32.0 && carved);
+                outside += usize::from(off < 48.0 && !carved);
             }
         }
         // Within the roughness the wall is neither always there nor never.
         assert!(inside > 100 && outside > 100, "{inside} {outside}");
         // A coarse Voxel is carved only if a ball around its middle fits in the tube: one that
         // is more than the tube's radius across is not, whatever the roughness.
-        assert!(!caves.carves(&[tube], [100.0, 0.0, 0.0], 40.0, &mut None));
-        assert!(caves.carves(&[tube], [100.0, 0.0, 0.0], 10.0, &mut None));
+        assert!(!caves.carves(&[tube], [100.0, 0.0, 0.0], 80.0, &mut None));
+        assert!(caves.carves(&[tube], [100.0, 0.0, 0.0], 20.0, &mut None));
     }
 }

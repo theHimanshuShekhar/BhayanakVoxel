@@ -4,15 +4,13 @@
 //! Everything is in Voxels of level 0 (the unit of the Planet frame and of [`render::lod`]), so
 //! a metre is [`VOXELS_PER_METRE`] of them. The Planet is a sphere about the origin.
 
-use render::lod::{Bands, LEVELS};
-
-/// Voxels of level 0 in a metre: Voxels are 10 cm.
-pub const VOXELS_PER_METRE: f64 = 10.0;
+pub use brick_store::VOXELS_PER_METRE;
+use render::lod::{Bands, GUARD_FIRST, LEVELS};
 
 /// Bricks a full fill draws, in units of d0 squared (a level's bricks are the surface within its
-/// band, so they go with d0²): measured by the client on the full-size Planet, 3.21 million at a
+/// band, so they go with d0²): measured by the client on the full-size Planet, 3.56 million at a
 /// bias of 1 (`BRICKS_PER_D0_SQUARED` in `bins/client/src/main.rs`).
-pub const DRAWN_PER_D0_SQUARED: f64 = 3.04;
+pub const DRAWN_PER_D0_SQUARED: f64 = 3.37;
 
 /// The model's [`Model::crust`].
 pub const CRUST: f64 = 0.4;
@@ -56,7 +54,7 @@ pub struct Model {
 }
 
 impl Model {
-    /// The real Planet, with the ADR 0004 margins, the Guard at levels 8 to the top, the
+    /// The real Planet, with the ADR 0004 margins, the Guard at levels 9 to the top, the
     /// renderer's strict band rule at 1440p, and a 1 to 2 s prefetch lead.
     pub fn real() -> Self {
         let tan_v = (render::lod::VFOV / 2.0).tan();
@@ -66,7 +64,7 @@ impl Model {
             crust: CRUST,
             bands: Bands::standard(1.0),
             levels: LEVELS,
-            guard_first: Some(8),
+            guard_first: Some(GUARD_FIRST),
             radial_margin: 1.25,
             vertical_margin: 20.0 * VOXELS_PER_METRE,
             lead: Some((1.0, 2.0)),

@@ -165,8 +165,8 @@ pub(crate) fn implied_brick(
     (*reads.brick(coord)).clone()
 }
 
-/// The farthest a centre may be from the origin along an axis, in Voxels: 1 677 km, a hundred
-/// times the Planet's radius. It keeps the products of the maths below inside 128 bits.
+/// The farthest a centre may be from the origin along an axis, in Voxels: 839 km, fifty times the
+/// Planet's radius. It keeps the products of the maths below inside 128 bits.
 pub const MAX_COORD: i32 = 1 << 24;
 
 /// The biggest radius [`plan`] and [`examined`] are defined for, which is well past what the

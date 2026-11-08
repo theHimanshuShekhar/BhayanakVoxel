@@ -36,10 +36,7 @@ use brick_store::{Brick, BrickCoord, BrickSource, BrickStore, TableSize, childre
 use render::lod::{Bands, brick_distance};
 use render::scene::select::Key;
 
-/// The first level of the Guard: the levels from here to the top of the pyramid (8 to 12, since
-/// [`render::lod::LEVELS`] is 13) are generated for the whole Planet right after the spawn ring
-/// (ADR 0004).
-pub const GUARD_FIRST: usize = 8;
+pub use render::lod::GUARD_FIRST;
 
 /// Most jobs that the workers have taken from the queue and the frame thread has not yet taken
 /// in: being generated, or finished and waiting in the channel. A brick wanted newly waits for at

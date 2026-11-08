@@ -18,7 +18,7 @@ use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 
-use brick_store::BrickStore;
+use brick_store::{BrickStore, VOXELS_PER_METRE};
 use dig::Dig;
 use editor::{Editor, Grab, Input};
 use fly::{Action, Fly};
@@ -54,15 +54,15 @@ const TITLE: &str = "BhayanakVoxel";
 /// turning left and right does not spin the view about its middle.
 const SPAWN_PITCH: f64 = -25.0;
 /// How far above the ground the client spawns, in Voxels: 4 m.
-const SPAWN_HEIGHT: f64 = 40.0;
+const SPAWN_HEIGHT: f64 = 4.0 * VOXELS_PER_METRE;
 /// Voxels from the spawn point that the client generates the full crust to, along the ground (see
-/// [`Planet::crust_around`]): the spawn ring, 40 m, which takes about 1.5 s on eight cores. The
+/// [`Planet::crust_around`]): the spawn ring, 40 m, which takes about 7.7 s on eight cores at 5 cm (it was 1.5 s at 10 cm). The
 /// loader generates the rest of what the LOD bands draw (#86). The character does not walk on
 /// the ring: it walks on the ground that the predictor makes around it (see [`sim::Ground`]).
-const SPAWN_REACH: i32 = 400;
+const SPAWN_REACH: i32 = (40.0 * VOXELS_PER_METRE) as i32;
 
-/// How far above the ground the character is set down, in Voxels: it drops the last few.
-const DROP_HEIGHT: f64 = 3.0;
+/// How far above the ground the character is set down, in Voxels (30 cm): it drops the last few.
+const DROP_HEIGHT: f64 = 0.3 * VOXELS_PER_METRE;
 /// After a stall, run at most this many character ticks to catch up and drop the rest.
 const MAX_TICKS_PER_FRAME: u32 = 5;
 
@@ -70,7 +70,7 @@ const MAX_TICKS_PER_FRAME: u32 = 5;
 const SUN_STEP: f32 = 0.05;
 
 /// Mip levels the client draws the Planet in: the LOD bands pick one for each brick from its
-/// distance (see [`render::lod`]), 0 to 12, which reaches orbit at 50 Planet radii.
+/// distance (see [`render::lod`]), 0 to 13, which reaches orbit at 50 Planet radii.
 const RING_LEVELS: usize = lod::LEVELS;
 
 /// Pixels of a touchpad's scrolling that make one line of a wheel.
@@ -113,23 +113,21 @@ fn planet_scene(
 const HEADROOM: f64 = 1.25;
 
 /// The measurements that `room_for` and `expected_words` are sized from: the full-size Planet's
-/// uncapped fill (3 321 s, 22.2 million bricks generated) and then a 150 m walk, at a bias of 1
-/// (`d0` of 1028.2 Voxels), on the 8-core dev box on 2026-11-05, after the fix that stopped the
-/// frame thread generating bricks, with the change that keeps coarse air bricks with ground under
-/// them in the LOD tree applied (it was not merged then: it makes the tree, the resident set and
-/// the waiting bricks 13 to 26% bigger, and without it these are over by that much). The
+/// fill with the camera still (160 s, 23.9 million bricks generated, at 5 cm Voxels) and then a
+/// 150 m walk, at a bias of 1 (`d0` of 1028.2 Voxels), on the 8-core dev box on 2026-11-07. They
+/// were taken at 10 cm Voxels (3 321 s uncapped, 22.2 million bricks) and measured again for ADR
+/// 0007: the levels hold what the level below held at 10 cm, as a Voxel of the same size does. The
 /// full-size test prints them: `cargo test --release -p client -- --ignored --nocapture full_size`.
 ///
-/// Bricks that the bands draw: 3 212 737, which is 3.04 d0² (a level's bricks are the surface
-/// within its band, so they go with d0²), 0.36 d0² for each of the levels 0 to 7 and a few for
+/// Bricks that the bands draw: 3 560 809, which is 3.37 d0² (a level's bricks are the surface
+/// within its band, so they go with d0²), 0.36 d0² for each of the levels 1 to 8 and a few for
 /// the levels above. The Guard's 178 000 bricks that are drawn first are in that count, as they
 /// are split.
-const BRICKS_PER_D0_SQUARED: f64 = 3.04;
-/// Words of `brick_refs` and of `bricks` per brick drawn when the resident set was complete: 3.2
-/// million and 105.2 million words of them. The scene's first reservation, 28 words a brick and a
-/// tenth over, was 103.3 million words and ran out 3.09 million bricks into the fill: the
-/// 10.4 s frame of #119 was the scene packed again (here 12.3 s) with the words that were left
-/// in pieces too small.
+const BRICKS_PER_D0_SQUARED: f64 = 3.37;
+/// Words of `brick_refs` and of `bricks` per brick drawn when the resident set was complete: 3.56
+/// million and 117.4 million words of them. The scene's first reservation, 28 words a brick and a
+/// tenth over, ran out 3.09 million bricks into the fill at 10 cm: the 10.4 s frame of #119 was
+/// the scene packed again with the words that were left in pieces too small.
 const REFS_PER_BRICK: f64 = 1.0;
 const WORDS_PER_BRICK: f64 = 33.0;
 
@@ -162,8 +160,10 @@ fn room_for(bands: Bands) -> Room {
     let s = (bands.d0() / 1028.2).powi(2);
     let scaled = |n: f64| (n * s) as usize + 1024;
     // The most each level held, from level 1, with `HEADROOM` (the table of which are solid below
-    // is reserved the same): 1.45, 2.67, 4.06, 4.64, 2.39, 1.59 and 1.33 million bricks.
-    const HELD_AT_LEVELS_1_TO_7: [f64; 7] = [
+    // is reserved the same): 1.39 (1.84 in the walk, hence 1.9 million here), 1.45, 2.67, 4.06,
+    // 4.64, 2.39, 1.59 and 1.33 million bricks.
+    const HELD_AT_LEVELS_1_TO_8: [f64; 8] = [
+        1_900_000.0,
         1_820_000.0,
         3_340_000.0,
         5_080_000.0,
@@ -172,30 +172,30 @@ fn room_for(bands: Bands) -> Room {
         1_990_000.0,
         1_660_000.0,
     ];
-    // The Guard's levels hold what they hold whatever the bands are: level 8 577 000 (all of it
-    // the Guard), level 9 85 000, levels 10 to 12 14 000 and fewer.
+    // The Guard's levels hold what they hold whatever the bands are: level 9 577 000 (all of it
+    // the Guard), level 10 85 000, levels 11 to 13 14 000 and fewer.
     const GUARD_SECOND: usize = GUARD_FIRST + 1;
-    // Level 0 held 2.08 million bricks, of which 751 000 are the spawn ring, held already when
+    // Level 0 held 6.77 million bricks, of which 5.63 million are the spawn ring, held already when
     // this is reserved and not scaled, so more is made room for than is held: `HEADROOM` over the
-    // ring is 188 000 more (250 000 here), and 1.25 times the 1.33 million that scale is 1.67
-    // million.
-    let mut held = vec![250_000 + scaled(1_670_000.0)];
+    // ring is 1.41 million more (1.5 million here), and 1.25 times the 1.14 million that scale is
+    // 1.43 million.
+    let mut held = vec![1_500_000 + scaled(1_430_000.0)];
     held.extend((1..RING_LEVELS).map(|level| match level {
-        1..GUARD_FIRST => scaled(HELD_AT_LEVELS_1_TO_7[level - 1]),
+        1..GUARD_FIRST => scaled(HELD_AT_LEVELS_1_TO_8[level - 1]),
         GUARD_FIRST => 720_000,
         GUARD_SECOND => 110_000,
         _ => 20_000,
     }));
     Room {
         held,
-        // 2.79 million bricks had their children resident.
-        resident: scaled(3_480_000.0),
-        // The tree held 16.66 million nodes.
-        nodes: scaled(20_800_000.0),
-        // Waiting, and asked of the loader, were 222 000 from the first request (208 000) to the
-        // end, and stuck 1.88 million.
+        // 3.37 million bricks had their children resident.
+        resident: scaled(4_210_000.0),
+        // The tree held 17.67 million nodes.
+        nodes: scaled(22_100_000.0),
+        // Waiting, and asked of the loader, were 221 000 from the first request (215 000) to the
+        // end, and stuck 120 000.
         waiting: scaled(277_000.0),
-        stuck: scaled(2_350_000.0),
+        stuck: scaled(150_000.0),
     }
 }
 
@@ -242,7 +242,7 @@ fn generate_ground(map: WorldMap, reach: i32, levels: usize) -> Ground {
     let store = planet.crust_around(ground, reach, levels - 1);
     eprintln!(
         "spawn ring ({} m): {} bricks in {:.2?}",
-        reach / 10,
+        f64::from(reach) / VOXELS_PER_METRE,
         store.len(),
         started.elapsed()
     );
@@ -973,8 +973,8 @@ impl App {
 fn lod_info(world: &World) -> Option<LodInfo> {
     let bands = world.bands()?;
     Some(LodInfo {
-        // Level 0 owns [0, 2 * d0) Voxels of 10 cm.
-        switch_m: bands.floor(1) * 0.1,
+        // Level 0 owns [0, 2 * d0) Voxels.
+        switch_m: bands.floor(1) / VOXELS_PER_METRE,
         bricks: (0..RING_LEVELS).map(|l| world.level_bricks(l)).collect(),
     })
 }
@@ -1300,7 +1300,7 @@ mod tests {
         };
         let over = leash.centre.map(|c| c + 30.0);
         assert_eq!(landing(over, Some(leash), ground), over);
-        let past = leash.centre.map(|c| c + 400.0);
+        let past = leash.centre.map(|c| c + 600.0);
         assert_eq!(landing(past, Some(leash), ground), leash.centre);
         assert_eq!(landing([f64::NAN; 3], Some(leash), ground), leash.centre);
         // Not the spawn, which is far from it.

@@ -11,7 +11,7 @@
 //! `d0 = v0 · f_out / bias`, with `v0` the size of a Voxel, `f_out = output_height / (2·tan(vfov/2))`
 //! the focal length in output pixels, and `bias` the output pixels one Voxel may cover (1.0 by
 //! default; 2.0 is the loose rule that does a quarter of the work for up to one pixel more of
-//! error). At 1440p and a 70° vertical field of view that is 102.8 m for 10 cm Voxels.
+//! error). At 1440p and a 70° vertical field of view that is 51.4 m for 5 cm Voxels.
 //!
 //! The distance of a brick is that of the nearest point of its box, not of its centre (see
 //! [`brick_distance`]). A brick is moved out to the coarser level at 1.05 times the boundary and
@@ -23,9 +23,15 @@
 
 use brick_store::BrickCoord;
 
-/// Levels of the pyramid that are drawn: 0 to 12. Level 12's Voxels are 410 m across, which is
+/// Levels of the pyramid that are drawn: 0 to 13. Level 13's Voxels are 410 m across, which is
 /// under a pixel at 800 km, the greatest distance of the Zoom range.
-pub const LEVELS: usize = 13;
+pub const LEVELS: usize = 14;
+
+/// The first level of the Guard: the levels from here to the top of the pyramid (9 to 13, since
+/// [`LEVELS`] is 14) are generated for the whole Planet right after the spawn ring (ADR 0004).
+/// Level 9 is the one whose Voxels are 25.6 m across, as level 8 was at 10 cm. The client's loader
+/// and the prefetch simulator both use it.
+pub const GUARD_FIRST: usize = 9;
 
 /// How far past a boundary a brick must go before it changes level, as a fraction of the
 /// boundary's distance: out at `1 + HYSTERESIS` times it, back in at `1 - HYSTERESIS` times.
@@ -54,7 +60,7 @@ impl Bands {
     }
 
     /// The rule for 1440p output and the camera's field of view, with a Voxel allowed `bias`
-    /// output pixels. `d0` is then 102.8 m for 10 cm Voxels at a bias of 1.
+    /// output pixels. `d0` is then 51.4 m for 5 cm Voxels at a bias of 1.
     pub fn standard(bias: f64) -> Self {
         Self::new(OUTPUT_HEIGHT, VFOV, bias)
     }
@@ -147,21 +153,33 @@ pub fn brick_distance(camera: [f64; 3], level: usize, coord: BrickCoord) -> f64 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use brick_store::VOXELS_PER_METRE;
 
     const VFOV: f64 = 70.0 * std::f64::consts::PI / 180.0;
 
     #[test]
     fn d0_is_a_voxel_times_the_focal_length_over_the_bias() {
-        // 1440p, 70 degrees: f is 1028.2 pixels, so a 10 cm Voxel is one pixel at 102.8 m.
+        // 1440p, 70 degrees: f is 1028.2 pixels, so a 5 cm Voxel is one pixel at 51.4 m.
         let bands = Bands::new(1440, VFOV, 1.0);
         assert!((bands.d0() - 1028.2).abs() < 0.1, "{}", bands.d0());
-        // In metres: 0.1 m a Voxel.
-        assert!((bands.d0() * 0.1 - 102.8).abs() < 0.05);
+        // In metres: a Voxel is 1 / VOXELS_PER_METRE of one.
+        assert!((bands.d0() / VOXELS_PER_METRE - 51.4).abs() < 0.05);
         // The bias scales every distance.
         assert!((Bands::new(1440, VFOV, 2.0).d0() * 2.0 - bands.d0()).abs() < 1e-9);
         // So does the image height, and a wider view shortens them.
         assert!((Bands::new(720, VFOV, 1.0).d0() * 2.0 - bands.d0()).abs() < 1e-9);
         assert!(Bands::new(1440, 2.0 * VFOV / 1.5, 1.0).d0() < bands.d0());
+    }
+
+    #[test]
+    fn the_pyramid_reaches_the_farthest_zoom_distance_and_no_further() {
+        // A level owns everything beyond its floor, so the top level must start before the Zoom
+        // range's 800 km, and one more would only start beyond it: the levels follow from the
+        // size of a Voxel.
+        let bands = Bands::new(1440, VFOV, 1.0);
+        let farthest = 800_000.0 * VOXELS_PER_METRE;
+        assert!(bands.floor(LEVELS - 1) <= farthest);
+        assert!(bands.floor(LEVELS) > farthest);
     }
 
     #[test]

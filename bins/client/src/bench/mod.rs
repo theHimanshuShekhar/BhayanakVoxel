@@ -12,6 +12,7 @@
 mod args;
 mod budget;
 mod caves;
+mod edits;
 mod path;
 mod report;
 mod stats;
@@ -231,6 +232,12 @@ fn run(args: &Args) -> Result<u8, Box<dyn Error>> {
     } else {
         sweep(&mut gpu, &mut flight, &budgets)?
     };
+    let edits = if plan.patch {
+        None
+    } else {
+        eprintln!("edits: the largest Brush at the metric rate...");
+        edits::run(&mut gpu, &mut flight, &budgets)?
+    };
     let timers_supported = gpu.timers_supported();
     // The cave stills are of another scene, and another GPU context: this one's is done with.
     drop(gpu);
@@ -272,7 +279,14 @@ fn run(args: &Args) -> Result<u8, Box<dyn Error>> {
         altitudes,
         caves,
         screenshots,
-        budgets: report::summarize(&source, &budgets, &modes, &args.diag.switches()),
+        budgets: report::summarize(
+            &source,
+            &budgets,
+            &modes,
+            edits.as_ref().map(|e| &e.per_frame),
+            &args.diag.switches(),
+        ),
+        edits,
         modes,
     };
     let json = serde_json::to_string_pretty(&report)?;
@@ -285,7 +299,9 @@ fn run(args: &Args) -> Result<u8, Box<dyn Error>> {
 
     // A diagnostic run is not held to the budgets: it exits 0 whatever they say.
     let code = if report.config.diag.is_empty() {
-        budget::exit_code(&report.modes.statuses(), args.no_fail)
+        let mut statuses = report.modes.statuses();
+        statuses.extend(report.edits.as_ref().map(edits::EditsReport::status));
+        budget::exit_code(&statuses, args.no_fail)
     } else {
         0
     };
@@ -425,7 +441,7 @@ fn run_mode(
             let distance = camera.position.iter().map(|c| c * c).sum::<f64>().sqrt();
             lod_at_keyframes.push(KeyframeLod {
                 frame,
-                height_m: (distance - radius) / sim::VOXELS_PER_METRE,
+                height_m: (distance - radius) / brick_store::VOXELS_PER_METRE,
                 bricks: (0..render::lod::LEVELS)
                     .map(|level| flight.scene.level_bricks(level))
                     .collect(),
@@ -471,8 +487,8 @@ fn run_mode(
 }
 
 /// Heights above the Planet's mean radius that the sweep looks from, in Voxels, straight above
-/// its pole: 4.8 m (the ground),
-/// 100 m, 500 m and 2 km.
+/// its pole: 2.4 m (the ground), 50 m, 250 m and 1 km. The test Planet is a fixed number of
+/// Voxels (see [`planet_gen`]), so these are too, whatever a Voxel measures.
 const SWEEP_HEIGHTS: [f64; 4] = [48.0, 1000.0, 5000.0, 20000.0];
 
 /// The test Planet from a still camera at each of [`SWEEP_HEIGHTS`], looking at the ground that
@@ -501,7 +517,7 @@ fn sweep(
             target: [0.0, radius, -1500.0],
         };
         let path = CameraPath::new(vec![at, at]);
-        eprintln!("sweep: {:.0} m", height / sim::VOXELS_PER_METRE);
+        eprintln!("sweep: {:.0} m", height / brick_store::VOXELS_PER_METRE);
         let by_mode = |gpu: &mut Offscreen, flight: &mut Flight, share, mode| {
             run_mode(gpu, flight, &path, share, mode, budgets, None)
         };
@@ -511,7 +527,7 @@ fn sweep(
             .collect();
         let reference = by_mode(gpu, flight, reference, Mode::Reference)?;
         altitudes.push(Altitude {
-            height_m: height / sim::VOXELS_PER_METRE,
+            height_m: height / brick_store::VOXELS_PER_METRE,
             bricks,
             primary: pass_stats(&primary, "primary"),
             upscale: pass_stats(&primary, "upscale"),
@@ -594,6 +610,20 @@ fn print_summary(report: &Report) {
             ms(a.reference.mean_ms),
             ms(a.reference.p95_ms),
             a.bricks
+        );
+    }
+    if let Some(e) = &report.edits {
+        eprintln!(
+            "edits: {} Edits of a {} in {} frames, {:.1} m3/s: per frame {} ms (budget {:?}), per Edit {} (p95 {}, max {}) ms",
+            e.edits,
+            e.brush,
+            e.frames,
+            e.m3_per_s,
+            ms(e.per_frame.stats.mean_ms),
+            e.per_frame.budget_ms,
+            ms(e.per_edit.mean_ms),
+            ms(e.per_edit.p95_ms),
+            ms(e.per_edit.max_ms)
         );
     }
     for c in &report.caves {

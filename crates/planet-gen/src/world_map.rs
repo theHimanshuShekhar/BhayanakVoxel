@@ -6,6 +6,12 @@
 //! it, its biome and its fantasy-region masks. Sea level is the constant [`SEA_LEVEL`], and
 //! rivers and lakes are not here yet (M1b).
 //!
+//! The map is the same whatever the size of a Voxel (ADR 0007): sizes are in metres, and the
+//! noise is sampled on a lattice of fixed 10 cm spacing ([`ELEVATION_UNITS_PER_METRE`]), not on
+//! Voxels. Elevations are stored in the same 10 cm units, which an `i16` holds to 3.27 km (a 5 cm
+//! Voxel would not hold the 2 km peak); [`WorldMap::elevation_at`] and
+//! [`WorldMap::elevation_range`] give them in Voxels.
+//!
 //! It follows the crate's rules. Randomness is `value_noise` of an integer point on the sphere,
 //! so the six faces meet without a seam, and the floats used are only `+ - * /`, `sqrt` and
 //! conversions. Every texel is computed from read-only inputs, and the sums and the median are
@@ -13,22 +19,51 @@
 //! must bump [`GENERATOR_VERSION`](crate::GENERATOR_VERSION), which also keys the map's cache on
 //! disk (with saves), and update the golden hash in `tests/golden.rs`.
 
+use brick_store::VOXELS_PER_METRE;
+
 use super::value_noise;
+
+/// Elevations in the map's texels are whole numbers of this many to the metre: 10 cm, whatever
+/// the size of a Voxel. An `i16` holds 3.27 km of them, enough for the 2 km peak.
+pub const ELEVATION_UNITS_PER_METRE: i32 = 10;
+
+/// Voxels in one elevation unit: 2 for 5 cm Voxels, a whole number so that converting is exact.
+const VOXELS_PER_UNIT: f64 = VOXELS_PER_METRE / ELEVATION_UNITS_PER_METRE as f64;
+
+/// Whole Voxels in `metres`, rounded to the nearest: the way the generator turns a size in metres
+/// into the integer it works with.
+pub(crate) const fn voxels(metres: f64) -> i32 {
+    (metres * VOXELS_PER_METRE + 0.5) as i32
+}
+
+/// Whole elevation units in `metres`.
+pub(crate) const fn units(metres: f64) -> i32 {
+    (metres * ELEVATION_UNITS_PER_METRE as f64 + 0.5) as i32
+}
 
 /// Texels along one face's edge for the real Planet.
 pub const WORLD_MAP_SIZE: u32 = 2048;
 
-/// Distance of sea level from the Planet's centre, in Voxels: 16 km at 10 cm Voxels.
-pub const WORLD_RADIUS: i32 = 160_000;
+/// Distance of sea level from the Planet's centre, in Voxels: 16 km.
+pub const WORLD_RADIUS: i32 = voxels(16_000.0);
 
-/// Elevation of the sea surface. Elevations are in Voxels above or below it.
+/// Elevation of the sea surface. Texel elevations are in units of 10 cm above or below it.
 pub const SEA_LEVEL: i16 = 0;
 
 /// Height of the highest peak above sea level, in Voxels (2 km).
-pub const PEAK: i32 = 20_000;
+pub const PEAK: i32 = voxels(2_000.0);
 
 /// Depth of the deepest trench below sea level, in Voxels (1 km).
-pub const TRENCH: i32 = 10_000;
+pub const TRENCH: i32 = voxels(1_000.0);
+
+/// [`PEAK`] and [`TRENCH`] in the map's elevation units.
+const PEAK_UNITS: i32 = units(2_000.0);
+const TRENCH_UNITS: i32 = units(1_000.0);
+
+/// Radius of the sphere that the noise is sampled on, in lattice points: 16 km at the lattice's
+/// 10 cm spacing. Its cells are powers of two of that spacing, so the map does not change with
+/// the size of a Voxel.
+const NOISE_RADIUS: i32 = units(16_000.0);
 
 /// Faces as (normal, u axis, v axis), each a signed unit vector along one of x, y and z. A face
 /// is the set of cube points `normal + a * u + b * v` for `a` and `b` in `[-1, 1]`. The order
@@ -81,15 +116,21 @@ impl Regions {
 /// One texel of the world map.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Texel {
-    /// Height above [`SEA_LEVEL`] after erosion, in Voxels; negative on the sea floor.
+    /// Height above [`SEA_LEVEL`] after erosion, in units of 10 cm
+    /// ([`ELEVATION_UNITS_PER_METRE`]); negative on the sea floor.
     pub elevation: i16,
-    /// Height lost to erosion, in Voxels: negative where eroded material settled.
+    /// Height lost to erosion, in the same units: negative where eroded material settled.
     pub erosion: i16,
     pub biome: Biome,
     pub regions: Regions,
 }
 
 impl Texel {
+    /// The texel's elevation in Voxels.
+    pub fn elevation_voxels(&self) -> f64 {
+        f64::from(self.elevation) * VOXELS_PER_UNIT
+    }
+
     /// Whether the texel is below the sea surface. A texel exactly at [`SEA_LEVEL`] is land: it
     /// does not flood.
     pub fn is_ocean(&self) -> bool {
@@ -203,7 +244,7 @@ impl WorldMap {
     fn elevation_beyond(&self, face: usize, i: i32, j: i32) -> f64 {
         let last = self.size as i32 - 1;
         let (inner_i, inner_j) = (i.clamp(0, last), j.clamp(0, last));
-        let read = |(face, i, j): (usize, u32, u32)| f64::from(self.texel(face, i, j).elevation);
+        let read = |(face, i, j): (usize, u32, u32)| self.texel(face, i, j).elevation_voxels();
         let (ci, cj) = (inner_i as u32, inner_j as u32);
         let inner = read((face, ci, cj));
         let across_i = || read(step(self.size, face, ci, cj, usize::from(i > 0)));
@@ -396,11 +437,11 @@ fn step(size: u32, face: usize, i: u32, j: u32, side: usize) -> (usize, u32, u32
     (next, coord(FACES[next][1]), coord(FACES[next][2]))
 }
 
-/// Value noise summed over `octaves` octaves, from cells `1 << first` Voxels wide down, each
-/// half the weight of the one before; in `[-1, 1)`. The noise is sampled at the point of the
-/// sphere of [`WORLD_RADIUS`] in `direction`.
+/// Value noise summed over `octaves` octaves, from cells `1 << first` lattice points wide down,
+/// each half the weight of the one before; in `[-1, 1)`. The noise is sampled at the lattice
+/// point of the sphere of [`NOISE_RADIUS`] in `direction`.
 fn fractal(seed: u64, direction: [f64; 3], first: u32, octaves: u32) -> f64 {
-    let point = direction.map(|d| (d * f64::from(WORLD_RADIUS)).round() as i32);
+    let point = direction.map(|d| (d * f64::from(NOISE_RADIUS)).round() as i32);
     let (mut total, mut weight, mut sum) = (0.0, 1.0, 0.0);
     for octave in 0..octaves {
         let salt = u64::from(octave).wrapping_mul(0x9e37_79b9_7f4a_7c15);
@@ -422,7 +463,7 @@ const REGION: [u64; 4] = [
     0x8eb4_4a87_6858_1511,
 ];
 
-/// The elevation noise at a point, in `[-2^20, 2^20)`, before it is scaled to Voxels.
+/// The elevation noise at a point, in `[-2^20, 2^20)`, before it is scaled to elevation units.
 fn raw_elevation(seed: u64, direction: [f64; 3]) -> i32 {
     (fractal(seed ^ ELEVATION, direction, 16, 9) * 1_048_576.0) as i32
 }
@@ -440,8 +481,8 @@ fn area_weights(size: u32) -> Vec<u32> {
         .collect()
 }
 
-/// Scales the noise to Voxels so that sea level sits at the median by area, which makes half
-/// the Planet ocean, the highest point [`PEAK`] above it and the lowest [`TRENCH`] below.
+/// Scales the noise to elevation units so that sea level sits at the median by area, which makes
+/// half the Planet ocean, the highest point [`PEAK`] above it and the lowest [`TRENCH`] below.
 fn normalise(raw: &[i32], size: u32) -> Vec<i16> {
     const SHIFT: u32 = 5;
     const OFFSET: i32 = 1 << 20;
@@ -469,9 +510,9 @@ fn normalise(raw: &[i32], size: u32) -> Vec<i16> {
         .map(|&v| {
             let above = i64::from(v - median);
             (if above >= 0 {
-                above * i64::from(PEAK) / rise
+                above * i64::from(PEAK_UNITS) / rise
             } else {
-                above * i64::from(TRENCH) / fall
+                above * i64::from(TRENCH_UNITS) / fall
             }) as i16
         })
         .collect()
@@ -483,9 +524,10 @@ fn normalise(raw: &[i32], size: u32) -> Vec<i16> {
 /// number of steps and the talus scale with the texel size, so the slope limit is the same at
 /// every size, but a coarse map is not a small copy of a fine one: material spreads about
 /// `sqrt(size / 16)` texels, and the amounts moved differ (on the test seed the largest change
-/// is about 1,250 Voxels at 256 texels and 580 at 2048).
+/// is about 1,250 units at 256 texels and 580 at 2048).
 fn erode(heights: &mut Vec<i16>, size: u32, threads: usize) {
-    // A slope of 0.2 (11 degrees) across one texel, which is 251,327 Voxels / `size` wide.
+    // A slope of 0.2 (11 degrees) across one texel, which is 251,327 units / `size` wide: a
+    // quarter of the circumference of sea level, 25.1 km.
     let talus = (251_327 / size as i32) / 5;
     let mut next = vec![0i16; heights.len()];
     for _ in 0..size / 16 {
@@ -510,7 +552,7 @@ fn erode(heights: &mut Vec<i16>, size: u32, threads: usize) {
 fn biome(seed: u64, direction: [f64; 3], elevation: i16) -> Biome {
     let latitude = direction[1].abs();
     let land = elevation >= SEA_LEVEL;
-    let height = f64::from(elevation.max(SEA_LEVEL)) / f64::from(PEAK);
+    let height = f64::from(elevation.max(SEA_LEVEL)) / f64::from(PEAK_UNITS);
     let warmth = 1.0 - latitude - 0.8 * height + 0.1 * fractal(seed ^ WARMTH, direction, 15, 3);
     let subtropics = (1.0 - (latitude - 0.35).abs() / 0.35).max(0.0);
     let aridity = fractal(seed ^ ARIDITY, direction, 15, 3) + 0.7 * subtropics;
@@ -600,7 +642,7 @@ mod tests {
             *elevations.iter().min().unwrap(),
             *elevations.iter().max().unwrap(),
         );
-        // 10 cm Voxels: 20,000 is 2 km. Erosion shaves the highest peak a little.
+        // Units of 10 cm: 20,000 is 2 km. Erosion shaves the highest peak a little.
         assert!((17_000..=20_000).contains(&high), "highest {high}");
         assert!((-10_000..=-8_500).contains(&low), "lowest {low}");
     }
@@ -711,7 +753,7 @@ mod tests {
     fn interpolated_elevation_is_the_texel_elevation_at_its_centre_and_between_at_an_edge() {
         let map = map();
         let (face, i, j) = (2, 100, 37);
-        let here = f64::from(map.texel(face, i, j).elevation);
+        let here = map.texel(face, i, j).elevation_voxels();
         assert!((map.elevation_at(centre(SIZE, face, i, j)) - here).abs() < 0.01);
         // The point halfway between two texel centres, in the cube coordinates the texels
         // are evenly spaced in, is their mean.
@@ -722,7 +764,7 @@ mod tests {
         );
         let (a, b) = (warp(a), warp(b));
         let cube: [f64; 3] = std::array::from_fn(|k| n[k] + a * u[k] + b * v[k]);
-        let mean = (here + f64::from(map.texel(face, i + 1, j).elevation)) / 2.0;
+        let mean = (here + map.texel(face, i + 1, j).elevation_voxels()) / 2.0;
         assert!((map.elevation_at(cube) - mean).abs() < 0.01);
     }
 
@@ -773,7 +815,7 @@ mod tests {
             [c[0] + 1e-7 * s, c[1], c[2] - 1e-7 * s]
         };
         let (low, high) = map.elevation_range(&[near(-1.0), near(1.0)]);
-        assert!(high - low < 0.01, "{low} {high}");
+        assert!(high - low < 0.02, "{low} {high}");
         assert!(low <= map.elevation_at(near(0.0)) && map.elevation_at(near(0.0)) <= high);
         // At a texel's centre the range is that of a cell, which is among the texels around it.
         let centre = map.texel_direction(0, 100, 100);
@@ -781,7 +823,7 @@ mod tests {
         let here = map.elevation_at(centre);
         assert!(low <= here + 1e-9 && here <= high + 1e-9);
         let all: Vec<f64> = (0..9)
-            .map(|k| f64::from(map.texel(0, 99 + k % 3, 99 + k / 3).elevation))
+            .map(|k| map.texel(0, 99 + k % 3, 99 + k / 3).elevation_voxels())
             .collect();
         assert!(low >= all.iter().copied().fold(f64::INFINITY, f64::min) - 1e-9);
         assert!(high <= all.iter().copied().fold(f64::NEG_INFINITY, f64::max) + 1e-9);

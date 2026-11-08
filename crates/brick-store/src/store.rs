@@ -509,7 +509,7 @@ impl BrickStore {
     }
 
     /// Replaces the pyramid with `coarse_levels` levels above this one. The Planet needs about
-    /// 19 or 20 to reach from 10 cm Voxels to its disc.
+    /// 20 or 21 to reach from 5 cm Voxels to its disc.
     pub fn build_lod(&mut self, coarse_levels: usize) {
         self.coarse = vec![BrickStore::new(); coarse_levels];
         self.remake_above(self.bricks.keys().copied().collect(), false);
