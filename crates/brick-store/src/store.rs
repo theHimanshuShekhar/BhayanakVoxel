@@ -43,6 +43,29 @@ pub struct BrickStore {
     /// What [`Self::reserve_resident`] was asked for before the store streamed, which
     /// [`Self::stream_from`] makes the resident set with room for.
     resident_room: usize,
+    /// How much the store may hold once it streams (see [`Self::set_budget`]).
+    budget: Option<Budget>,
+    /// The bricks of level 0 that an Edit changed after the store began to stream, which eviction
+    /// keeps (see [`Self::evict_children`]).
+    diverged: Diverged,
+}
+
+/// How much a store that streams may hold, counted as [`BrickStore::streamed_len`] does. Eviction
+/// (ADR 0004) starts when the store holds more than [`Budget::limit`], and goes on until it holds
+/// no more than [`Budget::bricks`], so that it is not run again for every brick that arrives.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Budget {
+    pub bricks: usize,
+    /// How far over `bricks` the store may go before eviction starts, as a fraction of it: 0.1
+    /// to 0.2 (ADR 0004). What it holds then is what was wanted lately.
+    pub overflow: f64,
+}
+
+impl Budget {
+    /// The most the store holds before eviction starts.
+    pub fn limit(&self) -> usize {
+        (self.bricks as f64 * (1.0 + self.overflow)) as usize
+    }
 }
 
 /// What the source said of a brick's [`BrickSource::solid_below`], for one thread to remember.
@@ -149,14 +172,209 @@ impl TableSize {
     }
 }
 
+/// The units whose children are resident, in parts that can each be looked at on their own (see
+/// [`BrickStore::eviction_candidates`]): a unit is in the part its coordinates hash to.
+const SHARDS: usize = 4096;
+
+#[derive(Clone, Debug)]
+struct Resident {
+    shards: Vec<HashMap<(usize, BrickCoord), Stamp>>,
+    len: usize,
+}
+
+impl Resident {
+    fn with_capacity(room: usize) -> Self {
+        let mut resident = Self {
+            shards: (0..SHARDS).map(|_| HashMap::new()).collect(),
+            len: 0,
+        };
+        resident.reserve(room);
+        resident
+    }
+
+    fn shard(key: &(usize, BrickCoord)) -> usize {
+        let [x, y, z] = key.1.0.map(|c| u64::from(c as u32));
+        let mut h = (key.0 as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        for c in [x, y, z] {
+            h = (h.rotate_left(23) ^ c).wrapping_mul(0xC2B2_AE3D_27D4_EB4F);
+        }
+        (h >> 40) as usize % SHARDS
+    }
+
+    /// Room for `room` more units, a part's share of it and a tenth over: the parts fill unevenly.
+    fn reserve(&mut self, room: usize) {
+        let each = room.div_ceil(SHARDS) * 11 / 10;
+        for shard in &mut self.shards {
+            shard.reserve(each);
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn capacity(&self) -> usize {
+        self.shards.iter().map(HashMap::capacity).sum()
+    }
+
+    fn contains(&self, key: &(usize, BrickCoord)) -> bool {
+        self.shards[Self::shard(key)].contains_key(key)
+    }
+
+    fn insert(&mut self, key: (usize, BrickCoord), stamp: Stamp) {
+        if self.shards[Self::shard(&key)].insert(key, stamp).is_none() {
+            self.len += 1;
+        }
+    }
+
+    fn remove(&mut self, key: &(usize, BrickCoord)) {
+        if self.shards[Self::shard(key)].remove(key).is_some() {
+            self.len -= 1;
+        }
+    }
+
+    fn part(&self, part: usize) -> impl Iterator<Item = (&(usize, BrickCoord), &Stamp)> {
+        self.shards[part].iter()
+    }
+}
+
+/// A unit that [`BrickStore::eviction_candidates`] found may be taken away.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Candidate {
+    /// How many levels out of its band it is, 0 in the band.
+    pub gap: u32,
+    /// The last pass at which it was wanted.
+    pub stamp: u64,
+    pub level: usize,
+    pub coord: BrickCoord,
+}
+
+impl Candidate {
+    /// The unit, as `(level, coord)`.
+    pub fn unit(&self) -> (usize, BrickCoord) {
+        (self.level, self.coord)
+    }
+
+    /// What the candidates are put in order by, first to be taken first: those furthest out of
+    /// their band, and of those the longest unwanted.
+    pub fn order(&self) -> (std::cmp::Reverse<u32>, u64, usize, BrickCoord) {
+        (
+            std::cmp::Reverse(self.gap),
+            self.stamp,
+            self.level,
+            self.coord,
+        )
+    }
+}
+
+/// The bricks of level 0 that an Edit changed after the store began to stream (the diverged
+/// bricks: not what the source makes), and how many are under each unit, so that what eviction
+/// must keep is looked up and not worked out.
+#[derive(Clone, Debug, Default)]
+struct Diverged {
+    bricks: HashSet<BrickCoord>,
+    /// Bricks that became diverged (true) or stopped being, in order, that `under` does not count
+    /// yet: noting a brick is one lookup, which is what the thread that makes Edits pays.
+    pending: Vec<(BrickCoord, bool)>,
+    /// For each unit `(level, coord)`, of every level from 1 to the Guard's: how many diverged
+    /// bricks are under it.
+    under: HashMap<(usize, BrickCoord), u32>,
+}
+
+impl Diverged {
+    fn mark(&mut self, coord: BrickCoord) {
+        if self.bricks.insert(coord) {
+            self.pending.push((coord, true));
+        }
+    }
+
+    fn unmark(&mut self, coord: BrickCoord) {
+        if self.bricks.remove(&coord) {
+            self.pending.push((coord, false));
+        }
+    }
+
+    /// Counts what is pending, a brick at a time, until `until`. Whether it is all counted.
+    fn sync(&mut self, floor: usize, until: Option<std::time::Instant>) -> bool {
+        let mut counted = 0;
+        for &(coord, added) in &self.pending {
+            let mut over = coord;
+            for level in 1..=floor {
+                over = over.parent();
+                if added {
+                    *self.under.entry((level, over)).or_default() += 1;
+                } else if let Some(n) = self.under.get_mut(&(level, over)) {
+                    *n -= 1;
+                    if *n == 0 {
+                        self.under.remove(&(level, over));
+                    }
+                }
+            }
+            counted += 1;
+            if counted % 32 == 0 && until.is_some_and(|t| std::time::Instant::now() >= t) {
+                break;
+            }
+        }
+        self.pending.drain(..counted);
+        self.pending.is_empty()
+    }
+
+    /// Whether the unit `(level, coord)` holds a diverged brick, is over one, or is beside a unit
+    /// that is. A coarse brick is made from the Voxels beside the bricks it covers (see
+    /// [`BrickStore::refresh_lod`]), so what an Edit changed at a level is in the units over it and
+    /// the ones beside them, and none of these can be made again from the source. (What is
+    /// changed at a level is within one unit of the unit over the Edit, at every level: the
+    /// neighbours of a brick that changed are within two bricks, and a parent is half as far.)
+    fn pinned(&self, level: usize, coord: BrickCoord) -> bool {
+        if self.under.is_empty() {
+            return false;
+        }
+        (0..27).any(|step: i32| {
+            let at =
+                [0, 1, 2].map(|a| coord.0[a].saturating_add(step / 3i32.pow(a as u32) % 3 - 1));
+            self.under.contains_key(&(level, BrickCoord(at)))
+        })
+    }
+}
+
 /// What a store that is streamed in keeps of what is resident.
 #[derive(Clone, Debug)]
 struct Streaming {
     /// Levels above this one are always resident: the Guard.
     floor: usize,
     /// The bricks `(level, coord)` whose eight children (the bricks of the level below that they
-    /// cover) are resident.
-    resident: HashSet<(usize, BrickCoord)>,
+    /// cover) are resident, and when each was last wanted.
+    resident: Resident,
+    /// The passes of eviction so far (see [`BrickStore::begin_eviction_pass`]).
+    clock: Stamp,
+    /// Bricks removed by [`BrickStore::evict_children`], since the store began to stream.
+    evicted: u64,
+}
+
+/// A tick of [`Streaming::clock`], which a unit was last wanted at. It is atomic so that
+/// [`BrickStore::eviction_candidates`] can note the units that are wanted while only reading the
+/// store, as the scene thread does without stopping the frame thread's reads.
+#[derive(Debug, Default)]
+struct Stamp(AtomicU64);
+
+impl Clone for Stamp {
+    fn clone(&self) -> Self {
+        Self::new(self.get())
+    }
+}
+
+impl Stamp {
+    fn new(tick: u64) -> Self {
+        Self(AtomicU64::new(tick))
+    }
+
+    fn get(&self) -> u64 {
+        self.0.load(Ordering::Relaxed)
+    }
+
+    fn set(&self, tick: u64) {
+        self.0.store(tick, Ordering::Relaxed);
+    }
 }
 
 /// The six bricks that share a face with `coord`.
@@ -260,13 +478,25 @@ impl BrickStore {
     /// the brick that are written (see [`Brick::clear`] and [`Brick::fill`]). It is for level 0
     /// and does not refresh the coarse levels, as [`Self::set`] does not: tell
     /// [`Self::refresh_lod`].
+    ///
+    /// In a store that streams this is how an Edit changes a brick that is held, so the brick is
+    /// diverged, and kept from eviction ([`Self::evict_children`]).
     pub fn brick_mut(&mut self, coord: BrickCoord) -> Option<&mut Brick> {
-        self.bricks.get_mut(&coord)
+        let brick = self.bricks.get_mut(&coord)?;
+        if self.streaming.is_some() {
+            self.diverged.mark(coord);
+        }
+        Some(brick)
     }
 
-    /// Stores `brick` at `coord`, replacing any brick there.
+    /// Stores `brick` at `coord`, replacing any brick there. In a store that streams this is how
+    /// an Edit puts in a brick that was not held (bricks that are streamed in are held with
+    /// [`Self::hold`]): it is then diverged, and kept from eviction ([`Self::evict_children`]).
     pub fn insert(&mut self, coord: BrickCoord, brick: Brick) {
         self.bricks.insert(coord, brick);
+        if self.streaming.is_some() {
+            self.diverged.mark(coord);
+        }
     }
 
     /// Removes the brick at `coord`, which then reads as the source gives it, or as air with none.
@@ -278,6 +508,7 @@ impl BrickStore {
     /// back. [`Self::discard`] removes without that.
     pub fn remove(&mut self, coord: BrickCoord) -> Option<Brick> {
         let removed = self.bricks.remove(&coord);
+        self.diverged.unmark(coord);
         if self.streaming.is_some()
             && let Some(source) = &self.source
             && !source.solid_below(0, coord)
@@ -293,6 +524,7 @@ impl BrickStore {
     /// Removes the brick at `coord` and nothing else, for a brick that was only held for a moment
     /// to work on, and was known to read as the source gives it when it was.
     pub fn discard(&mut self, coord: BrickCoord) -> Option<Brick> {
+        self.diverged.unmark(coord);
         self.bricks.remove(&coord)
     }
 
@@ -373,7 +605,8 @@ impl BrickStore {
     /// on several threads.
     pub fn hold(&mut self, level: usize, coord: BrickCoord, brick: Brick, solid: bool) {
         if level == 0 {
-            return self.insert(coord, brick);
+            self.bricks.insert(coord, brick);
+            return;
         }
         let store = &mut self.coarse[level - 1];
         store.bricks.insert(coord, brick);
@@ -432,7 +665,7 @@ impl BrickStore {
             ));
         }
         if let Some(streaming) = &self.streaming {
-            sizes.push(TableSize::hash::<(usize, BrickCoord)>(
+            sizes.push(TableSize::hash::<((usize, BrickCoord), Stamp)>(
                 "store resident",
                 streaming.resident.len(),
                 streaming.resident.capacity(),
@@ -450,7 +683,9 @@ impl BrickStore {
     pub fn stream_from(&mut self, floor: usize) {
         self.streaming = Some(Streaming {
             floor,
-            resident: HashSet::with_capacity(self.resident_room),
+            resident: Resident::with_capacity(self.resident_room),
+            clock: Stamp::default(),
+            evicted: 0,
         });
     }
 
@@ -466,8 +701,174 @@ impl BrickStore {
     /// that are not air are held. Does nothing unless the store streams.
     pub fn set_children_resident(&mut self, level: usize, coord: BrickCoord) {
         if let Some(s) = &mut self.streaming {
-            s.resident.insert((level, coord));
+            let now = s.clock.get();
+            s.resident.insert((level, coord), Stamp::new(now));
         }
+    }
+
+    /// Sets how much the store may hold. It only takes effect once the store streams.
+    pub fn set_budget(&mut self, budget: Budget) {
+        self.budget = Some(budget);
+    }
+
+    /// How much the store may hold, if it was told ([`Self::set_budget`]).
+    pub fn budget(&self) -> Option<Budget> {
+        self.budget
+    }
+
+    /// What the budget is of, for a store that streams: the bricks held under the Guard (the levels
+    /// below its first, see [`Self::stream_from`]) and the bricks whose children are resident, an
+    /// entry each, which is all that a brick of air costs. Zero unless the store streams.
+    pub fn streamed_len(&self) -> usize {
+        self.streaming.as_ref().map_or(0, |s| {
+            s.resident.len()
+                + (0..s.floor)
+                    .filter_map(|level| self.level(level))
+                    .map(|level| level.bricks.len())
+                    .sum::<usize>()
+        })
+    }
+
+    /// Whether the store holds more than its budget's [`Budget::limit`].
+    pub fn over_limit(&self) -> bool {
+        self.budget
+            .is_some_and(|budget| self.streamed_len() > budget.limit())
+    }
+
+    /// Whether the store holds more than the [`Budget::bricks`] of its budget, which eviction
+    /// that has started goes on until it does not.
+    pub fn over_budget(&self) -> bool {
+        self.budget
+            .is_some_and(|budget| self.streamed_len() > budget.bricks)
+    }
+
+    /// Bricks removed by [`Self::evict_children`] since the store began to stream.
+    pub fn evicted_len(&self) -> u64 {
+        self.streaming.as_ref().map_or(0, |s| s.evicted)
+    }
+
+    /// The bricks of level 0 that an Edit changed since the store began to stream: the diverged
+    /// bricks, which are kept from eviction.
+    pub fn diverged_len(&self) -> usize {
+        self.diverged.bricks.len()
+    }
+
+    /// Whether diverged bricks have come or gone that [`Self::sync_diverged`] has not counted yet,
+    /// so that [`Self::evict_children`] does not know what to keep.
+    pub fn diverged_pending(&self) -> bool {
+        !self.diverged.pending.is_empty()
+    }
+
+    /// Counts the bricks that became diverged, or stopped being, since this was last called, under
+    /// the units over them, for `until` at the most (one is always counted). Whether it is done. A
+    /// thread that evicts calls it before it does ([`Self::diverged_pending`]), so that the thread
+    /// that makes the Edits only notes the brick it changed, and does not walk up the pyramid for
+    /// it.
+    pub fn sync_diverged(&mut self, until: Option<std::time::Instant>) -> bool {
+        match &self.streaming {
+            Some(s) => self.diverged.sync(s.floor, until),
+            None => true,
+        }
+    }
+
+    /// Starts a pass of eviction: returns its number, which stamps the units that
+    /// [`Self::eviction_candidates`] finds wanted. A unit's stamp is the last pass at which it was
+    /// wanted, so "least recently used" means wanted at the earliest pass.
+    pub fn begin_eviction_pass(&self) -> u64 {
+        self.streaming.as_ref().map_or(0, |s| {
+            let pass = s.clock.get() + 1;
+            s.clock.set(pass);
+            pass
+        })
+    }
+
+    /// How many parts [`Self::eviction_candidates`] looks at the resident units in.
+    pub const EVICTION_PARTS: usize = SHARDS;
+
+    /// Looks at one `part` of the units whose children are resident, of the [`Self::EVICTION_PARTS`],
+    /// and adds to `out` those that eviction may take away: not wanted (`wanted` says which are,
+    /// and they are stamped with the `pass`), not the Guard's, and not over or beside a diverged
+    /// brick. `gap` says how far a unit is out of its band, 0 for in the band. It only reads the
+    /// store, and a part is small (a four-thousandth of the units), so a thread that shares the store
+    /// can let go of it between parts: a unit that arrives meanwhile is looked at in the next pass.
+    pub fn eviction_candidates(
+        &self,
+        part: usize,
+        pass: u64,
+        wanted: impl Fn(usize, BrickCoord) -> bool,
+        gap: impl Fn(usize, BrickCoord) -> u32,
+        out: &mut Vec<Candidate>,
+    ) {
+        let Some(s) = &self.streaming else {
+            return;
+        };
+        for (&(level, coord), stamp) in s.resident.part(part) {
+            if level > s.floor {
+                continue;
+            }
+            if wanted(level, coord) {
+                stamp.set(pass);
+            } else if !self.diverged.pinned(level, coord) {
+                out.push(Candidate {
+                    gap: gap(level, coord),
+                    stamp: stamp.get(),
+                    level,
+                    coord,
+                });
+            }
+        }
+    }
+
+    /// Takes away the eight bricks under the brick at `coord` of `level`, and notes that they are
+    /// not resident, so that a renderer draws the brick whole and asks for them again when the
+    /// bands split it: how a store that streams stays within its budget. Returns how many bricks
+    /// it removed (air is not held, so often fewer than eight), or `None`, with nothing done,
+    /// when it must not:
+    /// - their children are not resident, or are the Guard's;
+    /// - they hold or are over or beside a diverged brick (the journal is the source of truth, but
+    ///   until it has everything the store has the only copy of an Edit, and a coarse brick over
+    ///   one is made from it, not from the source), or such bricks are not counted yet
+    ///   ([`Self::sync_diverged`]);
+    /// - `wanted` says they are wanted: the caller's drawn set and what is in flight;
+    /// - a brick under them has its children resident (those go first: the units are a tree, and
+    ///   none is left under one that is gone).
+    ///
+    /// They come back as the source gives them, by [`Self::hold_children`], when they are needed.
+    pub fn evict_children(
+        &mut self,
+        level: usize,
+        coord: BrickCoord,
+        wanted: impl Fn(usize, BrickCoord) -> bool,
+    ) -> Option<usize> {
+        let s = self.streaming.as_ref()?;
+        if level == 0
+            || level > s.floor
+            || !s.resident.contains(&(level, coord))
+            || self.diverged_pending()
+            || self.diverged.pinned(level, coord)
+            || wanted(level, coord)
+            || (level > 1
+                && coord
+                    .children()
+                    .iter()
+                    .any(|&c| s.resident.contains(&(level - 1, c))))
+        {
+            return None;
+        }
+        let mut removed = 0;
+        for child in coord.children() {
+            let store = if level == 1 {
+                &mut *self
+            } else {
+                &mut self.coarse[level - 2]
+            };
+            removed += usize::from(store.bricks.remove(&child).is_some());
+            store.solid_below.remove(&child);
+        }
+        let s = self.streaming.as_mut().expect("it was streaming");
+        s.resident.remove(&(level, coord));
+        s.evicted += removed as u64;
+        Some(removed)
     }
 
     /// Holds the bricks of `bricks` as the bricks under the brick at `coord` of `level` (at least
@@ -809,6 +1210,9 @@ impl BrickStore {
         let brick = coord.brick();
         if voxel.is_none() && !self.bricks.contains_key(&brick) {
             return;
+        }
+        if self.streaming.is_some() {
+            self.diverged.mark(brick);
         }
         self.bricks
             .entry(brick)
@@ -1667,17 +2071,17 @@ mod tests {
         store.build_lod(2);
         store.reserve(&[1000, 500]);
         // Asked for before the store streams, the room is kept for the resident set that starts.
-        store.reserve_resident(1000);
+        store.reserve_resident(100_000);
         store.stream_from(1);
         let (_, capacity) = room(&store);
-        assert!(capacity >= 1000);
-        for i in 0..1000 {
+        assert!(capacity >= 100_000);
+        for i in 0..50_000 {
             store.set_children_resident(1, BrickCoord([i, 0, 0]));
         }
-        assert_eq!(room(&store), (1000, capacity), "it did not grow");
+        assert_eq!(room(&store), (50_000, capacity), "it did not grow");
         // Asked for after, it is made more roomy.
-        store.reserve_resident(5000);
-        assert!(room(&store).1 >= 6000);
+        store.reserve_resident(100_000);
+        assert!(room(&store).1 >= 150_000);
         let sizes = store.table_sizes();
         let level_0 = sizes.iter().find(|t| t.name == "store level 0 bricks");
         assert!(level_0.is_some_and(|t| t.capacity >= 1000));
@@ -1841,5 +2245,317 @@ mod tests {
         store.insert(coord, Brick::AIR);
         store.discard(coord);
         assert!(!store.holds(0, coord));
+    }
+
+    /// A store with a pyramid of `levels` levels that streams from `floor` over [`Slab`], with
+    /// the children of the units `units` resident (as the loader holds them).
+    fn resident(levels: usize, floor: usize, units: &[(usize, BrickCoord)]) -> BrickStore {
+        let mut store = BrickStore::new();
+        store.set_source(Slab);
+        store.build_lod(levels - 1);
+        store.stream_from(floor);
+        for &(level, coord) in units {
+            let kids = crate::children_from(&*store.source().unwrap(), level, coord, |_| false);
+            store.hold_children(level, coord, kids);
+        }
+        store
+    }
+
+    /// The units that eviction may take, in the order to take them: all the parts looked at, and
+    /// the candidates put in order.
+    fn order(
+        store: &BrickStore,
+        wanted: impl Fn(usize, BrickCoord) -> bool,
+        gap: impl Fn(usize, BrickCoord) -> u32,
+    ) -> Vec<(usize, BrickCoord)> {
+        let pass = store.begin_eviction_pass();
+        let mut found = Vec::new();
+        for part in 0..BrickStore::EVICTION_PARTS {
+            store.eviction_candidates(part, pass, &wanted, &gap, &mut found);
+        }
+        found.sort_unstable_by_key(Candidate::order);
+        found.iter().map(Candidate::unit).collect()
+    }
+
+    const NEVER: fn(usize, BrickCoord) -> bool = |_, _| false;
+    const NO_GAP: fn(usize, BrickCoord) -> u32 = |_, _| 0;
+
+    #[test]
+    fn evicting_the_children_of_a_unit_takes_them_and_their_residence_and_they_can_come_back() {
+        let unit = (1, BrickCoord([0, -1, 0]));
+        let mut store = resident(4, 3, &[unit]);
+        let held = store.len();
+        assert_eq!(held, 8);
+        assert_eq!(store.streamed_len(), held + 1, "the bricks and the unit");
+        assert!(store.children_resident(unit.0, unit.1));
+        let before = store.brick_at(0, unit.1.children()[3]).into_owned();
+
+        assert_eq!(store.evict_children(unit.0, unit.1, NEVER), Some(8));
+        assert_eq!(store.len(), 0);
+        assert_eq!(store.streamed_len(), 0);
+        assert_eq!(store.evicted_len(), 8);
+        assert!(!store.children_resident(unit.0, unit.1));
+        assert_eq!(
+            store.evict_children(unit.0, unit.1, NEVER),
+            None,
+            "nothing is resident to take"
+        );
+
+        // Held again as the loader does, it reads as before.
+        let kids = crate::children_from(&*store.source().unwrap(), unit.0, unit.1, |_| false);
+        store.hold_children(unit.0, unit.1, kids);
+        assert_eq!(*store.brick_at(0, unit.1.children()[3]), before);
+    }
+
+    #[test]
+    fn a_unit_of_the_levels_under_the_guard_is_evicted_with_its_coarse_bricks_and_their_flags() {
+        let unit = (2, BrickCoord([0, -1, 0]));
+        let mut store = resident(4, 3, &[unit]);
+        let child = unit.1.children()[0];
+        assert!(store.holds(1, child));
+        store.hold(1, child, Brick::solid(ROCK), true);
+        assert!(store.level(1).unwrap().solid_below.contains(&child));
+        assert_eq!(store.evict_children(unit.0, unit.1, NEVER), Some(8));
+        assert!(!store.holds(1, child));
+        assert!(!store.level(1).unwrap().solid_below.contains(&child));
+    }
+
+    #[test]
+    fn the_guard_is_never_listed_or_evicted() {
+        // Levels 3 and 4 are the Guard of a store of five levels that streams from 3.
+        let mut store = resident(5, 3, &[]);
+        let top = BrickCoord([0, -1, 0]);
+        store.insert_at(4, top, Brick::solid(ROCK));
+        for child in top.children() {
+            store.insert_at(3, child, Brick::solid(ROCK));
+        }
+        // Even told that the children of a Guard brick are resident, they are not listed or taken.
+        store.set_children_resident(4, top);
+        assert!(order(&store, NEVER, NO_GAP).is_empty());
+        assert_eq!(store.evict_children(4, top, NEVER), None);
+        assert!(top.children().iter().all(|&c| store.holds(3, c)));
+        assert!(store.holds(4, top));
+        // The units of the first level of the Guard hold the bricks under it, and not the Guard.
+        let first = (3, top.children()[0]);
+        let kids = crate::children_from(&*store.source().unwrap(), first.0, first.1, |_| false);
+        store.hold_children(first.0, first.1, kids);
+        assert_eq!(store.evict_children(first.0, first.1, NEVER), Some(8));
+        assert!(top.children().iter().all(|&c| store.holds(3, c)));
+    }
+
+    #[test]
+    fn a_unit_the_caller_wants_is_not_listed_or_evicted_and_what_it_does_not_want_is() {
+        let (a, b) = ((1, BrickCoord([0, -1, 0])), (1, BrickCoord([5, -1, 0])));
+        let mut store = resident(4, 3, &[a, b]);
+        let drawn = |level, coord| (level, coord) == a;
+        assert_eq!(order(&store, drawn, NO_GAP), vec![b]);
+        assert_eq!(store.evict_children(a.0, a.1, drawn), None);
+        assert!(store.children_resident(a.0, a.1));
+        assert_eq!(store.evict_children(b.0, b.1, drawn), Some(8));
+        assert_eq!(store.len(), 8, "a's children are held");
+    }
+
+    #[test]
+    fn the_units_over_a_unit_that_is_wanted_are_kept_by_it() {
+        let drawn = (1, BrickCoord([0, -1, 0]));
+        let (middle, top) = ((2, drawn.1.parent()), (3, drawn.1.parent().parent()));
+        let mut store = resident(5, 4, &[drawn, middle, top]);
+        // Only the unit of the brick that is drawn is wanted: the units over it are not taken from
+        // under it, though the caller did not say so of them.
+        let wanted = |level, coord| (level, coord) == drawn;
+        assert_eq!(order(&store, wanted, NO_GAP).len(), 2);
+        assert_eq!(store.evict_children(top.0, top.1, wanted), None);
+        assert_eq!(store.evict_children(middle.0, middle.1, wanted), None);
+        assert!(store.children_resident(drawn.0, drawn.1));
+        // With the unit under them taken, they can go, from the lowest.
+        assert_eq!(store.evict_children(drawn.0, drawn.1, NEVER), Some(8));
+        assert_eq!(store.evict_children(middle.0, middle.1, NEVER), Some(8));
+        assert_eq!(store.evict_children(top.0, top.1, NEVER), Some(8));
+    }
+
+    #[test]
+    fn a_unit_the_caller_says_a_job_is_in_flight_for_is_kept() {
+        // The caller wants the unit of a brick that has a job, and the unit that the brick is a
+        // child of, which the job's arrival would be under.
+        let job = (1, BrickCoord([1, -1, 0]));
+        let over = (2, job.1.parent());
+        let beside = (2, BrickCoord([9, -1, 0]));
+        let mut store = resident(5, 4, &[over, beside]);
+        let in_flight = |level, coord| (level, coord) == job || (level, coord) == over;
+        assert_eq!(order(&store, in_flight, NO_GAP), vec![beside]);
+        assert_eq!(store.evict_children(over.0, over.1, in_flight), None);
+        assert!(store.holds(1, job.1));
+        assert_eq!(store.evict_children(beside.0, beside.1, in_flight), Some(8));
+    }
+
+    #[test]
+    fn a_brick_an_edit_changed_and_the_units_over_it_and_beside_it_are_kept_until_it_is_taken_back()
+    {
+        let near = (1, BrickCoord([0, -1, 0]));
+        let far = (1, BrickCoord([40, -1, 0]));
+        let mut store = resident(6, 4, &[near, far]);
+        let coarse = (2, BrickCoord([0, -1, 0]));
+        let kids = crate::children_from(&*store.source().unwrap(), coarse.0, coarse.1, |_| false);
+        store.hold_children(coarse.0, coarse.1, kids);
+        let edited = near.1.children()[2];
+        store.insert(edited, Brick::solid(Material(9)));
+        assert_eq!(store.diverged_len(), 1);
+        store.sync_diverged(None);
+        // The Edit's brick, and the unit over it and over those beside it, are kept...
+        assert_eq!(store.evict_children(near.0, near.1, NEVER), None);
+        assert!(store.holds(0, edited));
+        assert!(
+            order(&store, NEVER, NO_GAP)
+                .iter()
+                .all(|u| *u != near && *u != coarse)
+        );
+        // ...and so is the coarser unit over it, while a unit far from it goes.
+        assert_eq!(store.evict_children(coarse.0, coarse.1, NEVER), None);
+        assert_eq!(store.evict_children(far.0, far.1, NEVER), Some(8));
+        // Taken back, the Edit is not one any more.
+        store.remove(edited);
+        assert_eq!(store.diverged_len(), 0);
+        store.sync_diverged(None);
+        assert_eq!(store.evict_children(near.0, near.1, NEVER), Some(8));
+        assert_eq!(store.evict_children(coarse.0, coarse.1, NEVER), Some(8));
+    }
+
+    #[test]
+    fn every_way_to_change_a_brick_in_place_makes_it_an_edit() {
+        let unit = (1, BrickCoord([0, -1, 0]));
+        let mut store = resident(4, 3, &[unit]);
+        let [a, _, c, ..] = unit.1.children();
+        store.brick_mut(a).expect("a brick of rock is held");
+        assert!(store.brick_mut(BrickCoord([99, 99, 99])).is_none());
+        assert_eq!(
+            store.diverged_len(),
+            1,
+            "a brick that is not held is not an Edit"
+        );
+        store.set(c.origin(), None);
+        assert_eq!(store.diverged_len(), 2);
+        store.sync_diverged(None);
+        assert_eq!(store.evict_children(unit.0, unit.1, NEVER), None);
+    }
+
+    #[test]
+    fn the_unit_beside_an_edit_is_kept_too_since_the_coarse_brick_over_it_reads_the_edit() {
+        // A brick on the face of its parent has a neighbour in the next unit over.
+        let (here, next) = ((1, BrickCoord([0, -1, 0])), (1, BrickCoord([1, -1, 0])));
+        let mut store = resident(4, 3, &[here, next]);
+        store.insert(BrickCoord([1, -1, 0]), Brick::solid(Material(9)));
+        store.sync_diverged(None);
+        assert_eq!(store.evict_children(here.0, here.1, NEVER), None);
+        assert_eq!(store.evict_children(next.0, next.1, NEVER), None);
+    }
+
+    #[test]
+    fn nothing_is_evicted_while_diverged_bricks_are_not_counted_and_then_they_are_kept() {
+        let unit = (1, BrickCoord([0, -1, 0]));
+        let mut store = resident(4, 3, &[unit]);
+        // An Edit far away: until it is counted the store does not know what to keep.
+        store.insert(BrickCoord([60, -1, 0]), Brick::solid(Material(9)));
+        assert!(store.diverged_pending());
+        assert_eq!(store.evict_children(unit.0, unit.1, NEVER), None);
+        assert!(store.sync_diverged(None));
+        assert!(!store.diverged_pending());
+        assert_eq!(store.evict_children(unit.0, unit.1, NEVER), Some(8));
+        // A later one in the unit is kept when it is counted.
+        let kids = crate::children_from(&*store.source().unwrap(), unit.0, unit.1, |_| false);
+        store.hold_children(unit.0, unit.1, kids);
+        store.insert(unit.1.children()[1], Brick::solid(Material(9)));
+        store.sync_diverged(None);
+        assert_eq!(store.evict_children(unit.0, unit.1, NEVER), None);
+    }
+
+    #[test]
+    fn counting_diverged_bricks_can_be_done_in_steps_and_a_brick_back_and_forth_counts_once() {
+        let mut store = resident(4, 3, &[]);
+        let bricks: Vec<_> = (0..200).map(|x| BrickCoord([x * 30, -1, 0])).collect();
+        for &c in &bricks {
+            store.insert(c, Brick::solid(Material(9)));
+        }
+        // Each step counts at least one brick, and a deadline in the past is one step.
+        let past = std::time::Instant::now();
+        let mut steps = 0;
+        while !store.sync_diverged(Some(past)) {
+            steps += 1;
+            assert!(steps < 200);
+        }
+        assert!(steps > 1);
+        let unit = (1, bricks[5].parent());
+        assert!(store.diverged.pinned(unit.0, unit.1));
+        // Taken back and made again, and counted only at the end: counted once.
+        store.remove(bricks[5]);
+        store.insert(bricks[5], Brick::solid(Material(9)));
+        store.remove(bricks[5]);
+        store.sync_diverged(None);
+        assert!(!store.diverged.pinned(unit.0, unit.1));
+        assert_eq!(store.diverged_len(), 199);
+    }
+
+    #[test]
+    fn bricks_held_before_streaming_began_are_not_edits() {
+        let mut store = BrickStore::new();
+        store.set_source(Slab);
+        store.build_lod(3);
+        // The spawn ring is inserted before the store streams.
+        let ring = BrickCoord([0, -1, 0]);
+        store.insert(ring, Brick::solid(ROCK));
+        store.stream_from(3);
+        let unit = (1, ring.parent());
+        let kids = crate::children_from(&*store.source().unwrap(), unit.0, unit.1, |c| c == ring);
+        store.hold_children(unit.0, unit.1, kids);
+        assert_eq!(store.diverged_len(), 0);
+        assert_eq!(store.evict_children(unit.0, unit.1, NEVER), Some(8));
+    }
+
+    #[test]
+    fn a_unit_with_units_under_it_waits_for_them() {
+        let (coarse, fine) = ((2, BrickCoord([0, -1, 0])), (1, BrickCoord([1, -1, 1])));
+        let mut store = resident(4, 3, &[coarse, fine]);
+        assert_eq!(store.evict_children(coarse.0, coarse.1, NEVER), None);
+        assert_eq!(store.evict_children(fine.0, fine.1, NEVER), Some(8));
+        assert_eq!(store.evict_children(coarse.0, coarse.1, NEVER), Some(8));
+    }
+
+    #[test]
+    fn the_units_furthest_out_of_their_band_go_first_and_then_the_least_recently_wanted() {
+        let units: Vec<_> = (0..4).map(|x| (1, BrickCoord([x * 4, -1, 0]))).collect();
+        let store = resident(4, 3, &units);
+        // Units 0 and 1 are wanted at the first look, 2 and 3 are not; then 0 is wanted again.
+        let first = |level, coord| (level, coord) == units[0] || (level, coord) == units[1];
+        let listed = order(&store, first, NO_GAP);
+        assert_eq!(listed.len(), 2);
+        assert!(listed.contains(&units[2]) && listed.contains(&units[3]));
+        let second = |level, coord| (level, coord) == units[0];
+        let listed = order(&store, second, NO_GAP);
+        // 1 was wanted more lately than 2 and 3, which were not wanted since they arrived.
+        assert_eq!(listed.last(), Some(&units[1]), "{listed:?}");
+        // A unit that is further out of its band goes before them all.
+        let out = |level, coord| u32::from((level, coord) == units[1]);
+        assert_eq!(order(&store, NEVER, out)[0], units[1]);
+    }
+
+    #[test]
+    fn the_budget_says_when_to_start_and_when_to_stop() {
+        let units: Vec<_> = (0..10).map(|x| (1, BrickCoord([x * 4, -1, 0]))).collect();
+        let mut store = resident(4, 3, &units);
+        assert_eq!(store.streamed_len(), 90);
+        assert!(!store.over_limit());
+        store.set_budget(Budget {
+            bricks: 50,
+            overflow: 0.2,
+        });
+        assert_eq!(store.budget().unwrap().limit(), 60);
+        assert!(store.over_limit() && store.over_budget());
+        for unit in order(&store, NEVER, NO_GAP) {
+            if !store.over_budget() {
+                break;
+            }
+            store.evict_children(unit.0, unit.1, NEVER);
+        }
+        assert_eq!(store.streamed_len(), 45, "five units of nine are gone");
+        assert!(!store.over_limit() && !store.over_budget());
     }
 }

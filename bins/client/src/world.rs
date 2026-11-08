@@ -112,6 +112,12 @@ impl SceneWork {
         self.millis.push(took.as_secs_f64() * 1000.0);
     }
 
+    /// Adds the frames of `other`, which came after these.
+    #[cfg(test)]
+    pub fn merge(&mut self, other: SceneWork) {
+        self.millis.extend(other.millis);
+    }
+
     /// The longest frame, in milliseconds.
     pub fn worst(&self) -> Option<f64> {
         self.millis.iter().copied().max_by(f64::total_cmp)

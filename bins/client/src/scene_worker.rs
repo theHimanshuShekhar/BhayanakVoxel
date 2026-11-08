@@ -19,6 +19,11 @@
 //! taking both, and a copy of all of the scene that is waiting has the later changes pasted into it
 //! instead of being made again. The counts in a [`Ready`] are of the same state as its words.
 //!
+//! **Eviction** (#141, ADR 0004) runs here too, so that the frame thread pays for none of it. The
+//! store only grows as the loader holds bricks; when it holds more than its
+//! [`brick_store::Budget`] allows, this thread takes the children of bricks that are no longer
+//! wanted out of it, a few at a time under the write lock (see [`Engine::evict`]).
+//!
 //! **Edits** do not wait for the camera, and the frame thread does not wait for them (#156). It
 //! changes level 0 of the store (the predictor does, under the lock's write side, waiting for a
 //! read that is going on), which is a few milliseconds for the largest Brush, and then
@@ -37,8 +42,8 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, TryLockError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use brick_store::{BrickCoord, LodWork, TableSize};
-use render::lod::{Bands, LEVELS};
+use brick_store::{BrickCoord, BrickStore, Candidate, LodWork, TableSize};
+use render::lod::{Bands, LEVELS, brick_distance};
 use render::{PatchCopy, RingPatch, RingsFull, Scene, SceneUpdate};
 use sim::SharedStore;
 
@@ -73,6 +78,24 @@ const ARRIVAL_COST: Duration = Duration::from_micros(40);
 /// Most bricks asked of the loader in one slice (the rest wait for the next): the first call has
 /// every brick the Guard leaves to split, and the table that holds them is not made in a slice.
 const WANTED_PER_SLICE: usize = 20_000;
+
+/// The longest eviction holds the store's write lock for at a time: the frame thread reads the
+/// store, and waits for a writer, so eviction takes the lock for a few units at a time.
+const EVICT_HOLD: Duration = Duration::from_micros(500);
+/// How long it lets go of the store after a hold, for a reader that waits for the lock to take it
+/// (as [`COARSE_PAUSE`] does).
+const EVICT_PAUSE: Duration = Duration::from_micros(50);
+/// Most holds of the write lock in one round of the thread's work, each with a pause after.
+const EVICT_HOLDS: usize = 3;
+/// The time one round of looking at the units spends, between looks at what the frame thread asked
+/// of the thread. A part of the units is looked at under the read lock, which is let go of between
+/// parts.
+const EVICT_LOOK: Duration = Duration::from_millis(2);
+/// When eviction has done all it can and the store is still over its budget (what is left is all
+/// wanted), it is not begun again until the store has grown by a quarter: looking at every unit
+/// is not free. This is what happens at the cap for now: the LOD is not coarsened to fit it
+/// (#143).
+const EVICT_BACKOFF: (usize, usize) = (5, 4);
 
 /// How many arrivals the next batch takes in, given the `left` of the slice and what one is
 /// expected to `cost`: [`BATCH_SHARE`] of the room, at least [`LEAST_BATCH`] if there is room for
@@ -143,9 +166,28 @@ pub struct Stats {
     pub loader: LoaderStats,
     /// What costs more to find out, as of a few times a second.
     pub slow: Arc<Slow>,
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub eviction: EvictionStats,
     /// Where the scene had been moved to.
     #[cfg(test)]
     pub camera: Option<[f64; 3]>,
+}
+
+/// What eviction has done and what it cost the other threads, since the start.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct EvictionStats {
+    /// Passes begun, and how long the last took to list the units in (the parts looked at and
+    /// put in order), and the longest.
+    pub passes: u64,
+    pub listing: Duration,
+    pub longest_listing: Duration,
+    /// The longest the store's read lock was held for at a time to look at units, and its write
+    /// lock to take them away.
+    pub longest_read: Duration,
+    pub longest_write: Duration,
+    /// Parts looked at in all, and the time the read lock was held for them: their mean hold.
+    pub reads: u64,
+    pub read_total: Duration,
 }
 
 /// The parts of [`Stats`] that cost a walk over the scene's free ranges, found a few times a
@@ -168,7 +210,7 @@ impl Stats {
 }
 
 /// The scene and the loader as they are now, with `slow` as it was last looked at.
-fn stats_of(scene: &Scene, loader: &Loader, slow: &Arc<Slow>) -> Stats {
+fn stats_of(scene: &Scene, loader: &Loader, slow: &Arc<Slow>, eviction: EvictionStats) -> Stats {
     let mut level_bricks = [0; LEVELS];
     for (level, bricks) in level_bricks.iter_mut().enumerate().take(scene.levels.len()) {
         *bricks = scene.level_bricks(level);
@@ -179,6 +221,7 @@ fn stats_of(scene: &Scene, loader: &Loader, slow: &Arc<Slow>) -> Stats {
         bands: scene.bands(),
         loader: LoaderStats::of(loader),
         slow: Arc::clone(slow),
+        eviction,
         #[cfg(test)]
         camera: scene.camera(),
     }
@@ -315,7 +358,7 @@ impl SceneWorker {
         assert!(scene.is_rings(), "only a scene of rings follows a camera");
         let mirror = scene.mirror();
         let slow = slow_of(&scene, &loader);
-        let stats = stats_of(&scene, &loader, &slow);
+        let stats = stats_of(&scene, &loader, &slow, EvictionStats::default());
         let camera = scene.camera().expect("a scene of rings has a camera");
         let shared = Arc::new(Shared {
             inbox: Mutex::new(Inbox {
@@ -351,6 +394,9 @@ impl SceneWorker {
             slow_at: Instant::now(),
             coarse: VecDeque::new(),
             sync_waiting: None,
+            evicting: None,
+            evict_from: 0,
+            eviction: EvictionStats::default(),
             #[cfg(test)]
             coarse_sleep: Duration::ZERO,
         };
@@ -587,8 +633,53 @@ struct Engine {
     coarse: VecDeque<CoarseWork>,
     /// A sync that waits for the coarse levels.
     sync_waiting: Option<u64>,
+    /// Eviction that is going on, if the store went over its budget.
+    evicting: Option<Evicting>,
+    /// Eviction does not begin before the store holds more than this (see [`EVICT_BACKOFF`]).
+    evict_from: usize,
+    eviction: EvictionStats,
     #[cfg(test)]
     coarse_sleep: Duration,
+}
+
+/// Eviction that has begun.
+enum Evicting {
+    /// Looking at the units a part at a time, for those that may be taken.
+    Listing {
+        pass: u64,
+        began: Instant,
+        next: usize,
+        found: Vec<Candidate>,
+    },
+    /// Taking them, in order.
+    Taking {
+        queue: VecDeque<(usize, BrickCoord)>,
+        /// Units that could not be taken yet (units were under them), for another go once the
+        /// rest are done, if any of the rest were taken.
+        deferred: Vec<(usize, BrickCoord)>,
+        took: bool,
+    },
+}
+
+/// Whether the unit `(level, coord)`, whose children are resident, is wanted: the bands split it,
+/// the scene has split it (every brick drawn is under one that is split, and so is every brick
+/// over it), or the loader is making the children of one of its children, which would be held
+/// under it.
+fn wanted<'a>(
+    scene: &'a Scene,
+    loader: &'a Loader,
+    bands: Bands,
+    camera: [f64; 3],
+) -> impl Fn(usize, BrickCoord) -> bool + 'a {
+    move |level, coord| {
+        bands.split(level, brick_distance(camera, level, coord), Some(true))
+            || scene.splits(level, coord)
+            || (level > 1
+                && coord
+                    .children()
+                    .iter()
+                    .any(|&child| loader.is_requested((level - 1, child))))
+    }
 }
 
 impl Engine {
@@ -674,6 +765,7 @@ impl Engine {
                     return;
                 }
             }
+            worked |= self.evict();
             // A sync is done when the coarse levels over the Edits before it are made, too.
             let busy = !self.coarse.is_empty();
             let synced = if busy {
@@ -859,6 +951,202 @@ impl Engine {
         Ok(took)
     }
 
+    /// Takes the children of bricks out of the store while it holds more than its budget. Whether it
+    /// is going on. It does a little each time it is called, so that the thread's other work, and
+    /// the other threads that use the store, are never held up by it for long.
+    ///
+    /// It begins when the store holds more than half way between [`brick_store::Budget::bricks`]
+    /// and its [`brick_store::Budget::limit`]. It looks at the
+    /// units (see [`brick_store::BrickStore::eviction_candidates`]) a part at a time, under the
+    /// read lock, for [`EVICT_LOOK`] at a time, and lists those that are not wanted: those the
+    /// bands still split, those the scene has split (so every brick drawn, and the ones above it),
+    /// and those with a job of the loader among their children. It puts the first of them in
+    /// order, with no lock held: furthest out of their band first and then the longest unwanted
+    /// (wanted at the earliest pass). Then it takes them, for [`EVICT_HOLD`] under the write lock
+    /// at a time with [`EVICT_PAUSE`] between, until the store holds no more than
+    /// [`brick_store::Budget::bricks`]. What the store keeps itself is the Guard and the units
+    /// over and beside the diverged bricks. Whether a unit is wanted is asked again as each is
+    /// taken, since the scene and the loader move on in between. A brick that is needed after all
+    /// is asked for by the scene like any other that is not resident, and generated again.
+    ///
+    /// A job that was given up on and arrives anyway leaves the unit under it resident with none
+    /// over it: nothing wants that, so it is listed and taken like any other.
+    fn evict(&mut self) -> bool {
+        let (Some(camera), Some(bands)) = (self.scene.camera(), self.scene.bands()) else {
+            return false;
+        };
+        if self.evicting.is_none() {
+            let store = self.store.read().expect("the store's lock is not poisoned");
+            let Some(budget) = store.budget() else {
+                return false;
+            };
+            // It begins half way into the overflow, so that the store that grows while the units are
+            // looked at and taken stays within the limit.
+            let begins = budget.bricks + (budget.limit() - budget.bricks) / 2;
+            if store.streamed_len() <= begins.max(self.evict_from) {
+                return false;
+            }
+            self.evicting = Some(Evicting::Listing {
+                pass: store.begin_eviction_pass(),
+                began: Instant::now(),
+                next: 0,
+                found: Vec::new(),
+            });
+            self.eviction.passes += 1;
+        }
+        let done = match self.evicting.take() {
+            Some(Evicting::Listing {
+                pass,
+                began,
+                next,
+                found,
+            }) => {
+                let (evicting, done) = self.list(bands, camera, pass, began, next, found);
+                self.evicting = evicting;
+                done
+            }
+            Some(Evicting::Taking {
+                mut queue,
+                mut deferred,
+                mut took,
+            }) => {
+                let done = self.take(bands, camera, &mut queue, &mut deferred, &mut took);
+                self.evicting = Some(Evicting::Taking {
+                    queue,
+                    deferred,
+                    took,
+                });
+                done
+            }
+            None => true,
+        };
+        if done {
+            let store = self.store.read().expect("the store's lock is not poisoned");
+            self.evict_from = if store.over_budget() {
+                store.streamed_len() / EVICT_BACKOFF.1 * EVICT_BACKOFF.0
+            } else {
+                0
+            };
+            self.evicting = None;
+        }
+        self.evicting.is_some()
+    }
+
+    /// Looks at parts of the units for [`EVICT_LOOK`], from part `next`. Returns the state it is
+    /// in after, and whether eviction is done (there is nothing to take).
+    fn list(
+        &mut self,
+        bands: Bands,
+        camera: [f64; 3],
+        pass: u64,
+        began: Instant,
+        mut next: usize,
+        mut found: Vec<Candidate>,
+    ) -> (Option<Evicting>, bool) {
+        let wanted = wanted(&self.scene, &self.loader, bands, camera);
+        // How many levels a unit's children are from the level the bands use at its distance.
+        let gap = |level: usize, coord| {
+            let owner = bands.level_at(brick_distance(camera, level, coord), LEVELS - 1);
+            (level as i64 - 1 - owner as i64).unsigned_abs() as u32
+        };
+        let started = Instant::now();
+        while next < BrickStore::EVICTION_PARTS && started.elapsed() < EVICT_LOOK {
+            let store = self.store.read().expect("the store's lock is not poisoned");
+            let held = Instant::now();
+            store.eviction_candidates(next, pass, &wanted, gap, &mut found);
+            let took = held.elapsed();
+            self.eviction.longest_read = self.eviction.longest_read.max(took);
+            self.eviction.reads += 1;
+            self.eviction.read_total += took;
+            drop(store);
+            next += 1;
+        }
+        if next < BrickStore::EVICTION_PARTS {
+            let state = Evicting::Listing {
+                pass,
+                began,
+                next,
+                found,
+            };
+            return (Some(state), false);
+        }
+        // The first that are to be taken, in order: as many as the store is over by (each takes
+        // a unit's entry at least).
+        let over = {
+            let store = self.store.read().expect("the store's lock is not poisoned");
+            let budget = store.budget().expect("eviction began with a budget");
+            store.streamed_len().saturating_sub(budget.bricks)
+        };
+        if over < found.len() {
+            found.select_nth_unstable_by_key(over, Candidate::order);
+            found.truncate(over);
+        }
+        found.sort_unstable_by_key(Candidate::order);
+        let listing = began.elapsed();
+        self.eviction.listing = listing;
+        self.eviction.longest_listing = self.eviction.longest_listing.max(listing);
+        let done = found.is_empty();
+        let queue = found.iter().map(Candidate::unit).collect();
+        let state = Evicting::Taking {
+            queue,
+            deferred: Vec::new(),
+            took: false,
+        };
+        (Some(state), done)
+    }
+
+    /// Takes units of `queue` away for [`EVICT_HOLD`], then lets go of the store for
+    /// [`EVICT_PAUSE`]. Whether it is done: the store is within its budget, or there is nothing
+    /// more that can be taken.
+    fn take(
+        &mut self,
+        bands: Bands,
+        camera: [f64; 3],
+        queue: &mut VecDeque<(usize, BrickCoord)>,
+        deferred: &mut Vec<(usize, BrickCoord)>,
+        took: &mut bool,
+    ) -> bool {
+        let wanted = wanted(&self.scene, &self.loader, bands, camera);
+        let mut done = false;
+        for _ in 0..EVICT_HOLDS {
+            let mut store = self
+                .store
+                .write()
+                .expect("the store's lock is not poisoned");
+            let held = Instant::now();
+            let until = held + EVICT_HOLD;
+            // Edits are counted first, a brick at a time, so that what they keep is known.
+            if store.sync_diverged(Some(until)) {
+                while Instant::now() < until {
+                    if !store.over_budget() {
+                        done = true;
+                        break;
+                    }
+                    let Some((level, coord)) = queue.pop_front() else {
+                        if *took && !deferred.is_empty() {
+                            *queue = std::mem::take(deferred).into();
+                            *took = false;
+                            continue;
+                        }
+                        done = true;
+                        break;
+                    };
+                    match store.evict_children(level, coord, &wanted) {
+                        Some(_) => *took = true,
+                        None => deferred.push((level, coord)),
+                    }
+                }
+            }
+            drop(store);
+            self.eviction.longest_write = self.eviction.longest_write.max(held.elapsed());
+            if done {
+                break;
+            }
+            std::thread::sleep(EVICT_PAUSE);
+        }
+        done
+    }
+
     /// Makes what changed since the last publish available to the frame thread, merged with what
     /// it has not taken yet, if there is anything to say; and tells a job's waiter it is done.
     /// What the frame thread has not taken stays in the outbox while it is merged, under the lock
@@ -876,7 +1164,7 @@ impl Engine {
                 self.spare.push(*copy);
             }
         }
-        let stats = stats_of(&self.scene, &self.loader, &self.slow);
+        let stats = stats_of(&self.scene, &self.loader, &self.slow, self.eviction);
         let changes = std::mem::replace(&mut self.changes, Changes::None);
         if matches!(changes, Changes::None) && stats.same_counts(&self.published) && job.is_none() {
             return;

@@ -563,6 +563,14 @@ impl Selection {
             .is_some_and(|n| n.state == State::Whole && n.draws)
     }
 
+    /// Whether the brick at `coord` of `level` is split into the bricks under it, which are then
+    /// in use: they, and so what is resident under it, are not to be evicted.
+    pub fn splits(&self, level: usize, coord: BrickCoord) -> bool {
+        self.nodes
+            .get(&(level, coord))
+            .is_some_and(|n| n.state == State::Split)
+    }
+
     /// Every brick drawn, in no order.
     pub fn bricks(&self) -> impl Iterator<Item = Key> + '_ {
         self.nodes
@@ -1980,6 +1988,22 @@ mod tests {
         let near = BrickCoord([0, -1, 0]).parent().parent();
         assert!(wanted.contains(&(2, near)), "{near:?}");
         assert!(wanted.len() < 200, "{}", wanted.len());
+    }
+
+    #[test]
+    fn a_brick_that_is_split_is_said_to_split_and_one_that_is_drawn_whole_is_not() {
+        let mut store = streamed(64, 4, 2);
+        let mut selection = select(&store, [0.5, 20.0, 0.5], D0);
+        load_everything(&mut store, &mut selection);
+        let (drawn_level, drawn) = selection.bricks().next().expect("something is drawn");
+        assert!(!selection.splits(drawn_level, drawn));
+        // Every brick over one that is drawn is split.
+        let (mut level, mut over) = (drawn_level, drawn);
+        while level < selection.top() {
+            (level, over) = (level + 1, over.parent());
+            assert!(selection.splits(level, over), "{level} {over:?}");
+        }
+        assert!(!selection.splits(0, BrickCoord([9999, 9999, 9999])));
     }
 
     #[test]

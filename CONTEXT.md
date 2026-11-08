@@ -89,8 +89,12 @@ A frame where a brick inside the resident set is drawn at a coarser level than t
 _Avoid_: LOD miss, pop
 
 **Diverged brick**:
-A brick whose content differs from what the generator would produce for its coordinate — an Edit, settled Fluid, or merged Debris. The only bricks that must be persisted.
+A brick whose content differs from what the generator would produce for its coordinate — an Edit, settled Fluid, or merged Debris. The only bricks that must be persisted, and the only ones eviction never drops (with the units over them and beside them).
 _Avoid_: Dirty brick, edited brick
+
+**Unit**:
+A brick together with its eight children: the store keeps the children of a brick resident, or evicts them, together. Eviction takes units, furthest out of their band first and then least recently wanted, and never one that is the Guard's, wanted this frame, has a job in flight, or is over or beside a diverged brick.
+_Avoid_: Chunk, node (the selection's nodes are the bricks drawn and split)
 
 **Prefetch**:
 Work issued early because the camera is predicted to need it. It hides latency; it is not what makes residency correct.
