@@ -1,19 +1,25 @@
 //! The ghost Brush: the Voxels that the next click would change, shown at the cursor. They are
-//! exactly those of [`sim::plan`], which is also what the click's Edit is applied from, so what the
-//! ghost shows is what the Edit does.
+//! exactly those of [`sim::plan_bricks`], which is also what the click's Edit is applied from, so
+//! what the ghost shows is what the Edit does.
 //!
 //! The ghost is drawn by the overlay's egui pass, as the faces of the Voxels' outline, projected
 //! with the camera and tinted by the mode; it needs no pass of the renderer's own. It is seen
-//! through the terrain, which is what a preview of a dig wants. Only the outline is kept: the list
-//! of Voxels, up to some 69 000 of them, is not.
+//! through the terrain, which is what a preview of a dig wants. Only the outline is kept: the
+//! Voxels are not. The outline is found brick by brick, on the masks of the changed Voxels, a
+//! word of them at a time, so that a Brush of half a million Voxels costs a millisecond or two
+//! of the frame thread and not fifteen.
 
-use brick_store::{BRICK_SIZE, BrickCoord};
+use std::collections::HashMap;
+
+use brick_store::{BRICK_SIZE, BrickCoord, VoxelMask};
 use egui::{Color32, Mesh, Pos2};
 use materials::MaterialTable;
 use net::{EditMode, EditOp};
 use render::Camera;
 use render::overlay::swatch;
+#[cfg(test)]
 use sim::Change;
+use sim::Plan;
 
 /// One face of a Voxel that has no changed Voxel against it: part of the ghost's outline.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -60,14 +66,14 @@ pub struct Ghost {
     /// The first and last brick of the Voxels that the Edit reads, a Voxel beyond what it
     /// changes included.
     reads: Option<([i32; 3], [i32; 3])>,
-    /// The Voxels the Edit changes, for the tests to compare with what the Edit did.
+    /// What the Edit changes, for the tests to compare with what the Edit did.
     #[cfg(test)]
-    pub changes: Vec<Change>,
+    plan: Plan,
 }
 
 impl Ghost {
-    /// The ghost of `op`, which changes `changes` (see [`sim::plan`]).
-    pub fn new(op: EditOp, changes: Vec<Change>) -> Self {
+    /// The ghost of `op`, which changes what `plan` says (see [`sim::plan_bricks`]).
+    pub fn new(op: EditOp, plan: &Plan) -> Self {
         let reads = sim::examined_box(&op).map(|(first, last)| {
             let brick = |v: [i64; 3]| -> [i32; 3] {
                 std::array::from_fn(|a| {
@@ -82,11 +88,11 @@ impl Ghost {
             op,
             blocked: false,
             dirty: false,
-            changed: changes.len(),
-            faces: outline(&changes),
+            changed: plan.len(),
+            faces: outline(plan),
             reads,
             #[cfg(test)]
-            changes,
+            plan: plan.clone(),
         }
     }
 
@@ -99,6 +105,12 @@ impl Ghost {
         changed
             .iter()
             .any(|b| (0..3).all(|a| (first[a]..=last[a]).contains(&b.0[a])))
+    }
+
+    /// The Voxels the Edit changes, one by one.
+    #[cfg(test)]
+    pub fn changes(&self) -> Vec<Change> {
+        self.plan.changes().collect()
     }
 
     /// The outline of the Voxels.
@@ -165,9 +177,104 @@ fn tint(op: &EditOp, blocked: bool) -> Color32 {
     Color32::from_rgba_unmultiplied(r, g, b, 70)
 }
 
-/// The faces of the changed Voxels that no changed Voxel is against. The Voxels are marked in a
-/// box that holds them, so that a face is found by looking at the cells beside it.
-fn outline(changes: &[Change]) -> Vec<Face> {
+/// The faces of the changed Voxels that no changed Voxel is against. Brick by brick: a brick's
+/// changed Voxels are a [`VoxelMask`], and a Voxel's neighbour is a bit of the mask shifted, or of
+/// the mask of the brick beside it, so that a word of 64 Voxels is looked at at once, and a brick
+/// that is changed whole with changed bricks on all six sides has no faces and costs no more than
+/// looking.
+fn outline(plan: &Plan) -> Vec<Face> {
+    let masks: HashMap<BrickCoord, VoxelMask> = plan
+        .bricks()
+        .iter()
+        .map(|brick| (brick.coord, brick.mask()))
+        .collect();
+    let mut faces = Vec::new();
+    for brick in plan.bricks() {
+        let mask = &masks[&brick.coord];
+        if *mask == [u64::MAX; 8]
+            && NEIGHBOURS.iter().all(|&(axis, positive)| {
+                masks
+                    .get(&beside(brick.coord, axis, positive))
+                    .is_some_and(|m| *m == [u64::MAX; 8])
+            })
+        {
+            continue;
+        }
+        let next = |axis: usize, positive: bool| -> VoxelMask {
+            masks
+                .get(&beside(brick.coord, axis, positive))
+                .copied()
+                .unwrap_or([0; 8])
+        };
+        let [west, east, below, above, behind, ahead] = [
+            next(0, false),
+            next(0, true),
+            next(1, false),
+            next(1, true),
+            next(2, false),
+            next(2, true),
+        ];
+        for layer in 0..8 {
+            let word = mask[layer];
+            // The neighbour of each Voxel in each direction, as a bit at the Voxel's own place:
+            // set where that neighbour is changed.
+            let present = [
+                // -x: the Voxel at x - 1, which for x = 0 is the brick's west one at x = 7.
+                (word << 1 & !COLUMN_0) | (west[layer] >> 7 & COLUMN_0),
+                (word >> 1 & !COLUMN_7) | (east[layer] << 7 & COLUMN_7),
+                word << 8 | below[layer] >> 56,
+                word >> 8 | above[layer] << 56,
+                if layer > 0 {
+                    mask[layer - 1]
+                } else {
+                    behind[7]
+                },
+                if layer < 7 { mask[layer + 1] } else { ahead[0] },
+            ];
+            for (side, present) in present.into_iter().enumerate() {
+                let (axis, positive) = (side / 2, side % 2 == 1);
+                let mut bits = word & !present;
+                while bits != 0 {
+                    let bit = bits.trailing_zeros();
+                    bits &= bits - 1;
+                    let local = [(bit & 7) as u8, (bit >> 3) as u8, layer as u8];
+                    faces.push(Face {
+                        voxel: brick.coord.voxel(local).0,
+                        axis,
+                        positive,
+                    });
+                }
+            }
+        }
+    }
+    faces
+}
+
+/// The six sides of a brick: the axis, and whether it is the far side.
+const NEIGHBOURS: [(usize, bool); 6] = [
+    (0, false),
+    (0, true),
+    (1, false),
+    (1, true),
+    (2, false),
+    (2, true),
+];
+
+/// The bits of a layer's word whose Voxel has x of 0, and of 7.
+const COLUMN_0: u64 = 0x0101_0101_0101_0101;
+const COLUMN_7: u64 = COLUMN_0 << 7;
+
+/// The brick beside `coord` on the `positive` or the near side of `axis`.
+fn beside(coord: BrickCoord, axis: usize, positive: bool) -> BrickCoord {
+    let mut next = coord.0;
+    next[axis] += if positive { 1 } else { -1 };
+    BrickCoord(next)
+}
+
+/// The outline of `changes` as it was made before #156, a Voxel at a time, kept as it was for the
+/// test that holds [`outline`] to it.
+#[cfg(test)]
+fn outline_by_voxel(changes: &[Change]) -> Vec<Face> {
     let Some(first) = changes.first() else {
         return Vec::new();
     };
@@ -178,7 +285,6 @@ fn outline(changes: &[Change]) -> Vec<Face> {
             high[a] = high[a].max(change.voxel.0[a]);
         }
     }
-    // One cell of room all round, so that a face on the edge has a cell to look at.
     let size: [usize; 3] = std::array::from_fn(|a| (high[a] - low[a]) as usize + 3);
     let cell = |v: [i32; 3]| -> usize {
         let at: [usize; 3] = std::array::from_fn(|a| (v[a] - low[a] + 1) as usize);
@@ -258,7 +364,10 @@ mod tests {
     }
 
     fn ghost(changes: Vec<Change>) -> Ghost {
-        Ghost::new(EditOp::dig_sphere(VoxelCoord([0; 3]), 1), changes)
+        Ghost::new(
+            EditOp::dig_sphere(VoxelCoord([0; 3]), 1),
+            &Plan::from_changes(changes),
+        )
     }
 
     #[test]
@@ -301,7 +410,17 @@ mod tests {
     fn a_ghost_in_the_tests_lists_the_voxels_it_was_given() {
         let changes = cube(2);
         let ghost = ghost(changes.clone());
-        assert_eq!(ghost.changes, changes);
+        // In the order of an Edit: by brick, and in the brick by layer, row and column.
+        let mut ordered = changes;
+        ordered.sort_by_key(|c| {
+            (
+                c.voxel.brick(),
+                c.voxel.local()[2],
+                c.voxel.local()[1],
+                c.voxel.local()[0],
+            )
+        });
+        assert_eq!(ghost.changes(), ordered);
     }
 
     #[test]
@@ -393,8 +512,75 @@ mod tests {
         assert!(!off.touches(&[BrickCoord([125, 0, 0])]));
     }
 
+    #[test]
+    fn the_outline_found_brick_by_brick_is_the_one_found_voxel_by_voxel_face_for_face() {
+        use brick_store::{Brick, BrickCoord, BrickStore};
+        use net::{Alignment, Brush, Shape};
+
+        // Rock with holes in it, and soil on top, over a few bricks, so that a Brush meets whole
+        // bricks, bricks with a surface, and air; and its edges are in the middle of bricks and on
+        // their borders.
+        let mut store = BrickStore::new();
+        for x in -4..4 {
+            for y in -4..2 {
+                for z in -4..4 {
+                    store.insert(BrickCoord([x, y, z]), Brick::solid(Material(3)));
+                }
+            }
+        }
+        for i in 0..400i32 {
+            let v = [(i * 7) % 61 - 30, (i * 5) % 29 - 14, (i * 11) % 59 - 29];
+            store.set(VoxelCoord(v), None);
+            store.set(VoxelCoord([v[0], 12 + i % 4, v[2]]), Some(Material(5)));
+        }
+        let mut checked = 0;
+        for mode in [
+            EditMode::Dig,
+            EditMode::Place,
+            EditMode::Smooth,
+            EditMode::Flatten,
+        ] {
+            for shape in [Shape::Sphere, Shape::Cube, Shape::Cylinder] {
+                for (centre, radius, alignment, rotation) in [
+                    ([0, 0, 0], 6, Alignment::World, 0),
+                    ([3, -9, 5], 17, Alignment::World, 0),
+                    ([-8, 6, 2], 19, Alignment::Local, 1),
+                    ([7, -7, -7], 12, Alignment::Local, 0),
+                    ([0, 8, 0], 30, Alignment::World, 0),
+                ] {
+                    if matches!(mode, EditMode::Smooth | EditMode::Flatten) && radius > 20 {
+                        continue;
+                    }
+                    let op = EditOp {
+                        mode,
+                        brush: Brush { shape, radius },
+                        centre: VoxelCoord(centre),
+                        material: Material(35),
+                        alignment,
+                        rotation,
+                    };
+                    let plan = sim::plan_bricks(&store, &op);
+                    let by_brick = outline(&plan);
+                    let changes: Vec<_> = plan.changes().collect();
+                    // The same faces, in whatever order, and each once.
+                    let faces = |faces: &[Face]| -> BTreeSet<_> {
+                        faces
+                            .iter()
+                            .map(|f| (f.voxel, f.axis, f.positive))
+                            .collect()
+                    };
+                    let old = outline_by_voxel(&changes);
+                    assert_eq!(by_brick.len(), old.len(), "{op:?}");
+                    assert_eq!(faces(&by_brick), faces(&old), "{op:?}");
+                    checked += by_brick.len();
+                }
+            }
+        }
+        assert!(checked > 50_000, "{checked}");
+    }
+
     fn ghost_of(op: EditOp) -> Ghost {
-        Ghost::new(op, Vec::new())
+        Ghost::new(op, &Plan::default())
     }
 
     /// Measures what a ghost of the biggest Brush costs on the frame thread: the Edit worked out,
@@ -434,10 +620,10 @@ mod tests {
                         rotation: 0,
                     };
                     let started = Instant::now();
-                    let changes = sim::plan(&store, &op);
+                    let changes = sim::plan_bricks(&store, &op);
                     let planned = started.elapsed();
                     let made = Instant::now();
-                    let ghost = Ghost::new(op, changes);
+                    let ghost = Ghost::new(op, &changes);
                     let outlined = made.elapsed();
                     let drawn = Instant::now();
                     let mesh = ghost.mesh(&camera, egui::vec2(1920.0, 1080.0));

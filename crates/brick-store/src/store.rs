@@ -177,6 +177,53 @@ fn moved_parents(bricks: &BTreeSet<BrickCoord>) -> BTreeSet<BrickCoord> {
     bricks.iter().map(|c| c.parent()).collect()
 }
 
+/// A [`BrickStore::refresh_lod`] in the middle: see [`BrickStore::step_lod`].
+#[derive(Debug)]
+pub struct LodWork {
+    refresh: LodRefresh,
+    beside: bool,
+    /// The coarse level being made, from 1.
+    level: usize,
+    phase: LodPhase,
+    /// The bricks of the level below that changed, and whose `solid_below` did, for this level.
+    moved: BTreeSet<BrickCoord>,
+    flipped: BTreeSet<BrickCoord>,
+    /// The parents of `moved`, which are made from the source if they have no children held.
+    direct: BTreeSet<BrickCoord>,
+    /// The bricks of this level still to remake, the next last, and those to work `solid_below`
+    /// out again of.
+    queue: Vec<BrickCoord>,
+    flag_queue: Vec<BrickCoord>,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum LodPhase {
+    Start,
+    Bricks,
+    Flags,
+}
+
+impl LodWork {
+    fn new(changed: BTreeSet<BrickCoord>, beside: bool) -> Self {
+        Self {
+            refresh: LodRefresh::default(),
+            beside,
+            level: 1,
+            phase: LodPhase::Start,
+            moved: changed,
+            flipped: BTreeSet::new(),
+            direct: BTreeSet::new(),
+            queue: Vec::new(),
+            flag_queue: Vec::new(),
+        }
+    }
+
+    /// What the refresh did, once [`BrickStore::step_lod`] has said it is done.
+    pub fn finish(self) -> LodRefresh {
+        self.refresh
+    }
+}
+
 /// What [`BrickStore::refresh_lod`] did.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct LodRefresh {
@@ -207,6 +254,14 @@ impl BrickStore {
 
     pub fn brick(&self, coord: BrickCoord) -> Option<&Brick> {
         self.bricks.get(&coord)
+    }
+
+    /// The brick at `coord` to change in place, if one is held: one lookup for all the Voxels of
+    /// the brick that are written (see [`Brick::clear`] and [`Brick::fill`]). It is for level 0
+    /// and does not refresh the coarse levels, as [`Self::set`] does not: tell
+    /// [`Self::refresh_lod`].
+    pub fn brick_mut(&mut self, coord: BrickCoord) -> Option<&mut Brick> {
+        self.bricks.get_mut(&coord)
     }
 
     /// Stores `brick` at `coord`, replacing any brick there.
@@ -564,51 +619,95 @@ impl BrickStore {
     /// A level is remade only from the bricks of the level below that changed, held or read
     /// differently. When none did, nothing above it can have, and the rest is left alone.
     fn remake_above(&mut self, changed: BTreeSet<BrickCoord>, beside: bool) -> LodRefresh {
-        let mut refresh = LodRefresh::default();
-        let mut moved = changed;
-        // The bricks whose `solid_below` changed, on the level just made. That is kept up past
-        // where the bricks stop changing (a hole too small to show on a coarse level still keeps
-        // the brick over it from being solid all the way down), but it remakes no brick.
-        let mut flipped: BTreeSet<BrickCoord> = BTreeSet::new();
-        for level in 1..=self.coarse.len() {
-            let over: BTreeSet<_> = moved
-                .iter()
-                .flat_map(|&coord| {
-                    let touching = beside.then(|| touching(coord)).into_iter().flatten();
-                    std::iter::once(coord).chain(touching)
-                })
-                .map(BrickCoord::parent)
-                .collect();
-            let flags: BTreeSet<_> = flipped.iter().map(|c| c.parent()).collect();
-            let direct = moved_parents(&moved);
-            moved = BTreeSet::new();
-            flipped = BTreeSet::new();
-            for &coord in &over {
-                let held = self.remake(level, coord, direct.contains(&coord));
-                refresh.remade += 1;
-                let (was_held, before) = match held {
-                    Some(brick) => (true, brick),
-                    None => (false, self.unheld(level, coord)),
-                };
-                let now_held = self.coarse[level - 1].bricks.contains_key(&coord);
-                let read_differently = before != *self.brick_at(level, coord);
-                if read_differently {
-                    refresh.changed.push((level, coord));
-                }
-                if read_differently || was_held != now_held {
-                    moved.insert(coord);
-                }
+        let mut work = LodWork::new(changed, beside);
+        let finished = self.step_lod(&mut work, None);
+        debug_assert!(finished);
+        work.refresh
+    }
+
+    /// Starts a [`BrickStore::refresh_lod`] that is done in steps ([`BrickStore::step_lod`]), so
+    /// that a thread that shares the store behind a lock can let go of it between steps.
+    pub fn begin_lod(&self, changed: impl IntoIterator<Item = BrickCoord>) -> LodWork {
+        LodWork::new(changed.into_iter().collect(), true)
+    }
+
+    /// Does the next part of `work`, a coarse brick at a time, until it is done or `until` has
+    /// passed (one coarse brick is always made). Returns whether it is done, and then
+    /// [`LodWork::finish`] has what it did. Run to the end it is [`BrickStore::refresh_lod`],
+    /// whatever the steps and whatever is read between them, as long as the Voxels of level 0 and
+    /// the source are not changed by anything but a later refresh in between.
+    ///
+    /// The coarse levels are between the old pyramid and the new one until it is done: nothing
+    /// but the thread that steps should read them.
+    pub fn step_lod(&mut self, work: &mut LodWork, until: Option<std::time::Instant>) -> bool {
+        loop {
+            if work.level > self.coarse.len() {
+                return true;
             }
-            for &coord in over.union(&flags) {
-                if self.remake_solid_below(level, coord) {
-                    flipped.insert(coord);
+            match work.phase {
+                LodPhase::Start => {
+                    let level = work.level;
+                    let over: BTreeSet<_> = work
+                        .moved
+                        .iter()
+                        .flat_map(|&coord| {
+                            let touching =
+                                work.beside.then(|| touching(coord)).into_iter().flatten();
+                            std::iter::once(coord).chain(touching)
+                        })
+                        .map(BrickCoord::parent)
+                        .collect();
+                    let flags: BTreeSet<_> = work.flipped.iter().map(|c| c.parent()).collect();
+                    work.direct = moved_parents(&work.moved);
+                    work.flag_queue = over.union(&flags).copied().collect();
+                    work.queue = over.into_iter().collect();
+                    work.queue.reverse();
+                    work.moved = BTreeSet::new();
+                    work.flipped = BTreeSet::new();
+                    work.phase = LodPhase::Bricks;
+                    debug_assert!(level >= 1);
                 }
-            }
-            if moved.is_empty() && flipped.is_empty() {
-                break;
+                LodPhase::Bricks => {
+                    let level = work.level;
+                    while let Some(coord) = work.queue.pop() {
+                        let held = self.remake(level, coord, work.direct.contains(&coord));
+                        work.refresh.remade += 1;
+                        let (was_held, before) = match held {
+                            Some(brick) => (true, brick),
+                            None => (false, self.unheld(level, coord)),
+                        };
+                        let now_held = self.coarse[level - 1].bricks.contains_key(&coord);
+                        let read_differently = before != *self.brick_at(level, coord);
+                        if read_differently {
+                            work.refresh.changed.push((level, coord));
+                        }
+                        if read_differently || was_held != now_held {
+                            work.moved.insert(coord);
+                        }
+                        if until.is_some_and(|t| std::time::Instant::now() >= t) {
+                            if work.queue.is_empty() {
+                                work.phase = LodPhase::Flags;
+                            }
+                            return false;
+                        }
+                    }
+                    work.phase = LodPhase::Flags;
+                }
+                LodPhase::Flags => {
+                    let level = work.level;
+                    for coord in std::mem::take(&mut work.flag_queue) {
+                        if self.remake_solid_below(level, coord) {
+                            work.flipped.insert(coord);
+                        }
+                    }
+                    if work.moved.is_empty() && work.flipped.is_empty() {
+                        return true;
+                    }
+                    work.level += 1;
+                    work.phase = LodPhase::Start;
+                }
             }
         }
-        refresh
     }
 
     /// Remakes brick `coord` of coarse level `level` from the eight bricks of the level below:
@@ -1060,6 +1159,29 @@ mod tests {
         );
         assert_eq!(refresh.changed, differing(&before, &store));
         assert_eq!(store.lod_hash(), rebuilt(&store).lod_hash());
+    }
+
+    #[test]
+    fn a_refresh_done_in_steps_is_the_refresh_done_at_once() {
+        for hole in [[1, 0, 1], [0, 0, 0], [3, 1, 2]] {
+            let mut once = block();
+            once.build_lod(4);
+            let mut stepped = once.clone();
+            for store in [&mut once, &mut stepped] {
+                store.insert(BrickCoord(hole), Brick::AIR);
+            }
+            let want = once.refresh_lod([BrickCoord(hole)]);
+            let mut work = stepped.begin_lod([BrickCoord(hole)]);
+            let mut steps = 0;
+            // A deadline that has passed: one coarse brick a step.
+            while !stepped.step_lod(&mut work, Some(std::time::Instant::now())) {
+                steps += 1;
+            }
+            assert!(steps > 3, "{steps}");
+            assert_eq!(work.finish(), want);
+            assert_eq!(stepped.lod_hash(), once.lod_hash());
+            assert_eq!(stepped.lod_hash(), rebuilt(&stepped).lod_hash());
+        }
     }
 
     #[test]

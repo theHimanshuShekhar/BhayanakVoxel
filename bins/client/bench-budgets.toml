@@ -30,6 +30,16 @@ upscale = 0.5
 # packed, the writes sent), and not a GPU pass.
 edits = 1.0
 
+# The longest Edit of the same stress on the frame thread (#156): planning it and changing level 0
+# of the Voxels, and sending the writes to the GPU. The mean above is over all 1 800 frames, so an
+# Edit that costs 40 ms (it did, at 5 cm, before) is 0.1 ms of it. The coarse levels and the
+# packing are the scene thread's, which the frame thread does not wait for, and are not in this.
+# The bench runs the parts on one thread, so the waits of the real frame thread are not in it
+# either (a release test of the client holds them).
+# It is a maximum, not a mean: one hitch fails the run. 4 ms is a quarter of a 16.7 ms frame, the
+# most that one Edit should take of it, with the largest cube planned and written in about 1 to 3.
+edit_frame_thread = 4.0
+
 # M1 stages from #10, for when the passes exist (the names are suggestions):
 # shadows      = 0.4   # sun shadows, 1 ray/px
 # gi           = 1.5   # GI bounce and radiance cache

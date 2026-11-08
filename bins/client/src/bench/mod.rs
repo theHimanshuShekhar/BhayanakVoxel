@@ -283,7 +283,7 @@ fn run(args: &Args) -> Result<u8, Box<dyn Error>> {
             &source,
             &budgets,
             &modes,
-            edits.as_ref().map(|e| &e.per_frame),
+            &edits.as_ref().map_or(Vec::new(), |e| e.entries().to_vec()),
             &args.diag.switches(),
         ),
         edits,
@@ -300,7 +300,7 @@ fn run(args: &Args) -> Result<u8, Box<dyn Error>> {
     // A diagnostic run is not held to the budgets: it exits 0 whatever they say.
     let code = if report.config.diag.is_empty() {
         let mut statuses = report.modes.statuses();
-        statuses.extend(report.edits.as_ref().map(edits::EditsReport::status));
+        statuses.extend(report.edits.iter().flat_map(edits::EditsReport::statuses));
         budget::exit_code(&statuses, args.no_fail)
     } else {
         0
@@ -614,7 +614,7 @@ fn print_summary(report: &Report) {
     }
     if let Some(e) = &report.edits {
         eprintln!(
-            "edits: {} Edits of a {} in {} frames, {:.1} m3/s: per frame {} ms (budget {:?}), per Edit {} (p95 {}, max {}) ms",
+            "edits: {} Edits of a {} in {} frames, {:.1} m3/s: per frame {} ms (budget {:?}), per Edit {} (p95 {}, max {}) ms; frame thread {} (max {}, budget {:?}), scene thread {} (max {}) ms",
             e.edits,
             e.brush,
             e.frames,
@@ -623,7 +623,12 @@ fn print_summary(report: &Report) {
             e.per_frame.budget_ms,
             ms(e.per_edit.mean_ms),
             ms(e.per_edit.p95_ms),
-            ms(e.per_edit.max_ms)
+            ms(e.per_edit.max_ms),
+            ms(e.frame_thread.stats.mean_ms),
+            ms(e.frame_thread.stats.max_ms),
+            e.frame_thread.budget_ms,
+            ms(e.scene_thread.mean_ms),
+            ms(e.scene_thread.max_ms)
         );
     }
     for c in &report.caves {

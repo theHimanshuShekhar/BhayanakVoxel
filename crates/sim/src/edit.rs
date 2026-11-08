@@ -11,7 +11,7 @@ use net::{EditMode, EditOp, RejectReason};
 
 use crate::Ground;
 use crate::TICK_RATE_HZ;
-use crate::brush::{BrickCache, Change, MAX_COORD, implied_brick};
+use crate::brush::{BrickCache, BrickChange, MAX_COORD, Plan, implied_brick};
 
 /// How far from a player's eyes an Edit's centre may be: 8 m (issue 15), in Voxels.
 pub const EDIT_REACH: f64 = 8.0 * VOXELS_PER_METRE;
@@ -286,6 +286,14 @@ impl Undo {
     /// which coarse bricks that changed. The Edit must be the latest change to them.
     pub fn revert(self, store: &mut BrickStore) -> LodRefresh {
         let changed: Vec<_> = self.bricks().collect();
+        self.revert_bricks(store);
+        store.refresh_lod(changed)
+    }
+
+    /// [`Undo::revert`] for level 0 only: the coarse levels are not remade, and are as stale as
+    /// the Edit left them if it was written with [`write_plan_from`]. The caller remakes them
+    /// over the bricks that were reverted ([`BrickStore::refresh_lod`]) before anything reads them.
+    pub fn revert_bricks(self, store: &mut BrickStore) {
         for (coord, before) in self.bricks {
             match before {
                 Some(brick) => store.insert(coord, brick),
@@ -294,7 +302,6 @@ impl Undo {
                 }
             }
         }
-        store.refresh_lod(changed)
     }
 }
 
@@ -311,41 +318,78 @@ impl Undo {
 /// this returns, remaking only the coarse bricks over the bricks that changed. The returned
 /// [`Undo::lod`] lists the coarse bricks whose content changed.
 pub fn apply(store: &mut BrickStore, op: &EditOp) -> Undo {
-    let changes = crate::plan(store, op);
-    apply_changes(store, &changes)
+    let plan = crate::plan_bricks(store, op);
+    apply_plan(store, &plan)
 }
 
-/// Writes `changes`, which [`crate::plan`] made from `store` as it is now.
-pub fn apply_changes(store: &mut BrickStore, changes: &[Change]) -> Undo {
-    apply_changes_from(store, changes, None, None)
+/// Writes `plan`, which [`crate::plan_bricks`] made from `store` as it is now.
+pub fn apply_plan(store: &mut BrickStore, plan: &Plan) -> Undo {
+    apply_plan_from(store, plan, None, None)
 }
 
-/// [`apply_changes`], finding the bricks that the store does not hold in the character's `ground`
-/// and through the `cache`, as [`crate::plan_from`] does, and not by making them again.
-pub fn apply_changes_from(
+/// [`apply_plan`], finding the bricks that the store does not hold in the character's `ground`
+/// and through the `cache`, as [`crate::plan_bricks_from`] does, and not by making them again.
+///
+/// Brick by brick: a brick is looked up in the store once, whatever number of its Voxels change,
+/// and written as masks ([`Brick::clear`] and [`Brick::fill`]); the coarse levels are remade once
+/// for each brick that changed, level by level, after all of them are written.
+pub fn apply_plan_from(
     store: &mut BrickStore,
-    changes: &[Change],
+    plan: &Plan,
+    ground: Option<&Ground>,
+    cache: Option<&mut BrickCache>,
+) -> Undo {
+    let mut undo = write_plan_from(store, plan, ground, cache);
+    undo.lod = store.refresh_lod(undo.bricks());
+    undo
+}
+
+/// [`apply_plan_from`] for level 0 only: the store's coarse levels are left as they were, which
+/// is stale over the bricks of [`Undo::bricks`] until the caller remakes them
+/// ([`BrickStore::refresh_lod`]) and before anything reads them. It is what the client's frame
+/// thread does of an Edit, the rest being for the scene thread, which reads the coarse levels.
+pub fn write_plan_from(
+    store: &mut BrickStore,
+    plan: &Plan,
     ground: Option<&Ground>,
     mut cache: Option<&mut BrickCache>,
 ) -> Undo {
     let mut undo = Undo::default();
-    for group in changes.chunk_by(|a, b| a.voxel.brick() == b.voxel.brick()) {
-        let brick = group[0].voxel.brick();
-        let before = store.brick(brick).cloned();
-        if before.is_none() {
-            let implied = implied_brick(store, ground, cache.as_deref_mut(), brick);
-            if !implied.is_air() {
-                store.insert(brick, implied);
+    for change in plan.bricks() {
+        let coord = change.coord;
+        match store.brick_mut(coord) {
+            Some(brick) => {
+                let before = brick.clone();
+                write_brick(brick, change);
+                undo.bricks.push((coord, Some(before)));
+            }
+            None => {
+                let mut brick = implied_brick(store, ground, cache.as_deref_mut(), coord);
+                // A brick that is air is held only once something is put in it, so that one that
+                // is dug out of the core stays held as air and a dig of air holds nothing.
+                let holds = !brick.is_air() || !change.filled.is_empty();
+                write_brick(&mut brick, change);
+                if holds {
+                    store.insert(coord, brick);
+                }
+                undo.bricks.push((coord, None));
             }
         }
-        for change in group {
-            store.set(change.voxel, change.to);
-        }
-        undo.bricks.push((brick, before));
     }
-    undo.lod = store.refresh_lod(undo.bricks());
     undo
 }
+
+/// Writes the Voxels of one brick that `change` says: the ones that become air, and the ones that
+/// become each Material.
+fn write_brick(brick: &mut Brick, change: &BrickChange) {
+    brick.clear(&change.cleared);
+    for (material, mask) in &change.filled {
+        brick.fill(mask, *material);
+    }
+}
+
+#[cfg(test)]
+mod equivalence;
 
 #[cfg(test)]
 mod tests {

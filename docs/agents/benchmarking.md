@@ -155,6 +155,15 @@ before reading anything into the times.
 - `lod_at_keyframes` has, for each keyframe of the path, the frame, how high the camera is above
   the Planet's mean radius in metres, and how many bricks are drawn at each level of detail
   (level 0 first). Empty for `--short`.
+- `edits` is the Edit stress (#147, #156; null for `--short`): the largest cube Brush dug and
+  placed in turn at the metric rate for 30 s. `per_frame` is an `ENTRY` of CPU time over every
+  frame, those with no Edit at 0, against the `edits` budget (a mean, so a hitch can hide in it).
+  `frame_thread` is an `ENTRY` of the part of each Edit that the client's frame thread does (the
+  Edit planned, level 0 of the Voxels changed, the writes sent to the GPU), held to the
+  `edit_frame_thread` budget by its **longest** Edit, `max_ms`, so one hitch fails the run.
+  `scene_thread` is `STATS` of the rest (the coarse levels remade, the bricks packed), which the
+  frame thread does not wait for and which has no budget. `per_edit` is `STATS` of all of it as
+  if on one thread.
 - `altitudes` is the sweep: for each height, the bricks drawn at each level and the `primary` and
   `upscale` passes of primary mode and the `reference` pass of reference mode (one sample), with
   no budget held against them. It is how the cost of the LOD bands is read at the ground, 100 m,
