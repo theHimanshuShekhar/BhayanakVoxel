@@ -502,7 +502,7 @@ impl BrickStore {
     /// Removes the brick at `coord`, which then reads as the source gives it, or as air with none.
     ///
     /// In a store that streams, a brick that is not held reads as air once its parent's children
-    /// are resident (all of them that are not air are held), so removing one there puts back what
+    /// are resident (all of them that are not air or proven solid are held), so removing one there puts back what
     /// the source makes of it, whether or not they are resident yet (they may arrive after, and
     /// not hold a brick that was held when they were asked for): this is how an Edit is taken
     /// back. [`Self::discard`] removes without that.
@@ -698,7 +698,8 @@ impl BrickStore {
     }
 
     /// Records that the eight bricks under the brick at `coord` of `level` are resident: the ones
-    /// that are not air are held. Does nothing unless the store streams.
+    /// that are drawable are held (not air, not buried: see [`crate::children_to_generate`]; the
+    /// rest read as the source gives them). Does nothing unless the store streams.
     pub fn set_children_resident(&mut self, level: usize, coord: BrickCoord) {
         if let Some(s) = &mut self.streaming {
             let now = s.clock.get();
@@ -913,6 +914,26 @@ impl BrickStore {
         }
         self.set_children_resident(level, coord);
         held
+    }
+
+    /// Whether the brick at `coord` of `level`, which the caller has found is not held, is full as
+    /// far as the store knows without generating it: it streams, its parent's children are
+    /// resident, and the source proves it solid all the way down. That is a brick that the loader
+    /// left out as buried (see [`crate::children_to_generate`]), but also one that is drawn since
+    /// an Edit exposed it, and one whose Edit was undone ([`Self::remove`]). Reading it
+    /// ([`Self::unheld_brick`]) generates it, which is exact and costs a brick, so a reader that
+    /// only needs to know that it is full (the renderer's tree) asks this first.
+    pub fn reads_full_from_source(&self, level: usize, coord: BrickCoord) -> bool {
+        self.streaming.is_some()
+            && self.source.is_some()
+            && self.children_resident(level + 1, coord.parent())
+            && self.source_solid_below(level, coord)
+    }
+
+    /// The brick at `coord` of mip `level`, which the caller has found is not held, as it reads
+    /// ([`Self::brick_at`] without looking for it again).
+    pub fn unheld_brick(&self, level: usize, coord: BrickCoord) -> Brick {
+        self.unheld(level, coord)
     }
 
     /// What a brick that is not held reads as: a handle to the source, which a thread that
@@ -1178,8 +1199,9 @@ impl BrickStore {
     fn unheld(&self, level: usize, coord: BrickCoord) -> Brick {
         match &self.source {
             // In a store that streams, the bricks under a parent whose children are resident are all
-            // held but the air and what the source proves solid (see
-            // [`Self::hold_children`]): to read the rest is not to generate them.
+            // held but the air, and what the source proves solid (which includes the buried ones
+            // that [`crate::children_to_generate`] leaves out): to read the rest is not to
+            // generate them.
             Some(source)
                 if self.streaming.is_some()
                     && self.children_resident(level + 1, coord.parent())
@@ -1309,6 +1331,41 @@ mod tests {
             assert_eq!(a.brick_at(1, c).is_full(), b.brick_at(1, c).is_full());
         }
         assert!(b.children_resident(2, parent));
+    }
+
+    #[test]
+    fn a_child_left_out_as_buried_is_not_held_and_reads_as_the_source_gives_it() {
+        let mut store = BrickStore::new();
+        store.set_source(Counting::default());
+        store.build_lod(2);
+        store.stream_from(1);
+        let source = store.source().unwrap();
+        // Children at y = -2 (buried) and y = -1 (drawn, with y = 0 above, not known solid).
+        let parent = BrickCoord([0, -1, 0]);
+        let bricks = crate::children_from(&*source, 1, parent, |_| false);
+        assert_eq!(bricks.len(), 4);
+        let before = store.reads_full_from_source(0, BrickCoord([0, -2, 0]));
+        assert!(
+            !before,
+            "it is not so until its parent's children are resident"
+        );
+        assert_eq!(store.hold_children(1, parent, bricks), 4);
+        for child in parent.children() {
+            let buried = child.0[1] == -2;
+            assert_eq!(
+                !store.holds(0, child) && store.reads_full_from_source(0, child),
+                buried,
+                "{child:?}"
+            );
+            assert_eq!(store.holds(0, child), !buried, "{child:?}");
+            assert!(store.solid_below(0, child));
+            assert_eq!(*store.brick_at(0, child), Brick::solid(ROCK), "{child:?}");
+        }
+        assert_eq!(
+            store.streamed_len(),
+            5,
+            "the unit and the four held, not the four left out"
+        );
     }
 
     #[test]

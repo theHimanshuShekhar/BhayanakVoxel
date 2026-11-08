@@ -113,23 +113,25 @@ fn planet_scene(
 const HEADROOM: f64 = 1.25;
 
 /// The measurements that `room_for` and `expected_words` are sized from: the full-size Planet's
-/// fill with the camera still (160 s, 23.9 million bricks generated, at 5 cm Voxels) and then a
-/// 150 m walk, at a bias of 1 (`d0` of 1028.2 Voxels), on the 8-core dev box on 2026-11-07. They
-/// were taken at 10 cm Voxels (3 321 s uncapped, 22.2 million bricks) and measured again for ADR
-/// 0007: the levels hold what the level below held at 10 cm, as a Voxel of the same size does. The
-/// full-size test prints them: `cargo test --release -p client -- --ignored --nocapture full_size`.
+/// fill with the camera still (118 s, 9.41 million bricks generated, at 5 cm Voxels) and then a
+/// 150 m walk, at a bias of 1 (`d0` of 1028.2 Voxels), on the 8-core dev box on 2026-11-09, with
+/// the loader generating only the children that can be drawn (#142). They were taken before that
+/// (2026-11-07, 160 s, 23.9 million bricks generated, 29.3 million counted against the budget).
+/// The full-size test prints them: `cargo test --release -p client -- --ignored --nocapture
+/// full_size`.
 ///
-/// Bricks that the bands draw: 3 560 809, which is 3.37 d0² (a level's bricks are the surface
-/// within its band, so they go with d0²), 0.36 d0² for each of the levels 1 to 8 and a few for
+/// Bricks that the bands draw: 3 439 848, which is 3.25 d0² (a level's bricks are the surface
+/// within its band, so they go with d0²), 0.35 d0² for each of the levels 1 to 8 and a few for
 /// the levels above. The Guard's 178 000 bricks that are drawn first are in that count, as they
-/// are split.
-const BRICKS_PER_D0_SQUARED: f64 = 3.37;
-/// Words of `brick_refs` and of `bricks` per brick drawn when the resident set was complete: 3.56
-/// million and 117.4 million words of them. The scene's first reservation, 28 words a brick and a
+/// are split. (It was 3 560 809 before #142: the bricks of the deep sea, which no ray reaches,
+/// were drawn while a neighbour was not known to be full.)
+const BRICKS_PER_D0_SQUARED: f64 = 3.25;
+/// Words of `brick_refs` and of `bricks` per brick drawn when the resident set was complete: 3.44
+/// million and 117.6 million words of them. The scene's first reservation, 28 words a brick and a
 /// tenth over, ran out 3.09 million bricks into the fill at 10 cm: the 10.4 s frame of #119 was
 /// the scene packed again with the words that were left in pieces too small.
 const REFS_PER_BRICK: f64 = 1.0;
-const WORDS_PER_BRICK: f64 = 33.0;
+const WORDS_PER_BRICK: f64 = 34.2;
 
 /// What the tables that hold the Planet are made roomy for at the start, for the full bands at a
 /// bias of 1: the most each held in the measurement of [`BRICKS_PER_D0_SQUARED`], with
@@ -159,27 +161,27 @@ struct Room {
 fn room_for(bands: Bands) -> Room {
     let s = (bands.d0() / 1028.2).powi(2);
     let scaled = |n: f64| (n * s) as usize + 1024;
-    // The most each level held, from level 1, with `HEADROOM` (the table of which are solid below
-    // is reserved the same): 1.39 (1.84 in the walk, hence 1.9 million here), 1.45, 2.67, 4.06,
-    // 4.64, 2.39, 1.59 and 1.33 million bricks.
+    // The most each level held in the fill and the walk, from level 1, with `HEADROOM` (the table
+    // of which are solid below is reserved the same): 1.20, 1.03, 1.06, 1.09, 1.09, 0.99, 0.91
+    // and 0.84 million bricks.
     const HELD_AT_LEVELS_1_TO_8: [f64; 8] = [
-        1_900_000.0,
-        1_820_000.0,
-        3_340_000.0,
-        5_080_000.0,
-        5_800_000.0,
-        2_990_000.0,
-        1_990_000.0,
-        1_660_000.0,
+        1_500_000.0,
+        1_290_000.0,
+        1_320_000.0,
+        1_360_000.0,
+        1_360_000.0,
+        1_240_000.0,
+        1_140_000.0,
+        1_050_000.0,
     ];
     // The Guard's levels hold what they hold whatever the bands are: level 9 577 000 (all of it
     // the Guard), level 10 85 000, levels 11 to 13 14 000 and fewer.
     const GUARD_SECOND: usize = GUARD_FIRST + 1;
-    // Level 0 held 6.77 million bricks, of which 5.63 million are the spawn ring, held already when
+    // Level 0 held 6.99 million bricks, of which 5.63 million are the spawn ring, held already when
     // this is reserved and not scaled, so more is made room for than is held: `HEADROOM` over the
-    // ring is 1.41 million more (1.5 million here), and 1.25 times the 1.14 million that scale is
-    // 1.43 million.
-    let mut held = vec![1_500_000 + scaled(1_430_000.0)];
+    // ring is 1.41 million more (1.5 million here), and 1.25 times the 1.36 million that scale is
+    // 1.70 million.
+    let mut held = vec![1_500_000 + scaled(1_700_000.0)];
     held.extend((1..RING_LEVELS).map(|level| match level {
         1..GUARD_FIRST => scaled(HELD_AT_LEVELS_1_TO_8[level - 1]),
         GUARD_FIRST => 720_000,
@@ -188,13 +190,13 @@ fn room_for(bands: Bands) -> Room {
     }));
     Room {
         held,
-        // 3.02 million bricks had their children resident at the end of the fill, and 3.37
+        // 2.18 million bricks had their children resident at the end of the fill, and 2.53
         // million after the walk (the store's budget counts them: see `budget_for`).
-        resident: scaled(4_210_000.0),
-        // The tree held 17.67 million nodes.
-        nodes: scaled(22_100_000.0),
-        // Waiting, and asked of the loader, were 221 000 from the first request (215 000) to the
-        // end, and stuck 120 000.
+        resident: scaled(3_160_000.0),
+        // The tree held 9.44 million nodes.
+        nodes: scaled(11_800_000.0),
+        // Waiting, and asked of the loader, were 219 000 from the first request (208 000) to the
+        // end, and stuck 116 000.
         waiting: scaled(277_000.0),
         stuck: scaled(150_000.0),
     }
@@ -202,32 +204,33 @@ fn room_for(bands: Bands) -> Room {
 
 /// What the store may hold (`BrickStore::streamed_len`: the bricks held under the Guard, and an
 /// entry for each unit whose children are resident), per d0 squared. The complete resident set
-/// counted 29.31 million at a `d0` of 1028.2 Voxels (the measurement of [`BRICKS_PER_D0_SQUARED`]:
-/// 26.97 million bricks held, 0.68 million of them the Guard's, which are not counted, and 3.02
-/// million units resident), which is 27.7 per d0 squared. The complete
+/// counted 16.13 million at a `d0` of 1028.2 Voxels (the measurement of [`BRICKS_PER_D0_SQUARED`]:
+/// 14.63 million bricks held, 0.68 million of them the Guard's, which are not counted, and 2.18
+/// million units resident), which is 15.26 per d0 squared (27.7 before #142 left the air and the
+/// buried bricks out of the units: they are not held, and so not counted). The complete
 /// shell is what eviction keeps (ADR 0004; the prefetch simulator of #87 sizes its budget at the
 /// shell), so a camera that stays or walks never evicts; flying, which leaves a trail of the
 /// shells it passed through, does.
 ///
 /// #87's 227 to 259 MB per scene copy at 136 bytes a brick is the bricks that are *drawn*, which
-/// the bands bound (3.56 million, 474 MiB of words in the scene, at 33 words a brick) whatever the
-/// store holds. The host store holds about eight times as many bricks as are drawn: the
-/// ancestors of every drawn brick, and the bricks beside and under them that the bands do not
-/// draw but split. That is what is budgeted here, since it is what grows.
-const STREAMED_PER_D0_SQUARED: f64 = 27.8;
+/// the bands bound (3.44 million, 474 MiB in the scene, at 34 words a brick) whatever the store
+/// holds. The host store holds about four times as many bricks as are drawn: the ancestors of
+/// every drawn brick, and the bricks beside and under them that the bands do not draw but split.
+/// That is what is budgeted here, since it is what grows.
+const STREAMED_PER_D0_SQUARED: f64 = 15.3;
 /// How far over the budget the store may go before eviction starts (ADR 0004 says 10 to 20%).
-/// A flight of 2.5 km took the store 16% over the complete set (the trail of shells), so 10% is
-/// evicted from within a few kilometres. At the cap, when everything left is wanted, eviction
-/// waits until the store has grown by a quarter (`EVICT_BACKOFF` in `scene_worker`): coarsening
-/// the LOD to fit is #143's.
+/// A flight leaves a trail of the shells it passed through, and takes the store over the complete
+/// set (16.1 million counted at the end of the fill) by 12% in 840 m, 28% in 2.5 km and 57% in
+/// 5 km, measured with nothing evicted (#142), so 10% is evicted from within a kilometre. At the
+/// cap, when everything left is wanted, eviction waits until the store has grown by a quarter
+/// (`EVICT_BACKOFF` in `scene_worker`): coarsening the LOD to fit is #143's.
 const BUDGET_OVERFLOW: f64 = 0.1;
 
 /// How much the store may hold, for the full bands at a bias of 1 scaled with `d0` squared like
 /// `room_for`: the tables are reserved for the most the complete fill held with [`HEADROOM`], and
 /// eviction brings the store's total back to the budget. The budget bounds the total, not each
-/// level: a flight holds a different mix of levels than the fill, and a table that is near a
-/// size of its hash table (the level 2 bricks, at 1.82 million of 1.84) can double once in a
-/// long flight.
+/// level: a flight holds a different mix of levels than the fill, and a table that is near the
+/// size of its hash table can double once in a long flight.
 fn budget_for(bands: Bands) -> Budget {
     Budget {
         bricks: (STREAMED_PER_D0_SQUARED * bands.d0() * bands.d0()) as usize,

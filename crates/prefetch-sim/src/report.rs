@@ -622,7 +622,7 @@ mod tests {
 
     #[test]
     fn a_full_fill_draws_what_the_client_measured() {
-        // 3.37 d0^2 bricks (3.56 million), within 10%.
+        // 3.25 d0^2 bricks (3.44 million), within 10%.
         let model = Model::real();
         let d0 = model.bands.d0();
         let drawn = drawn_bricks(&model) as f64 / (d0 * d0);

@@ -50,20 +50,69 @@ pub trait BrickSource: Debug + Send + Sync {
     }
 }
 
-/// The bricks under the brick at `coord` of mip `level` (at least 1) as `source` gives them, in
-/// [`BrickCoord::children`] order, except air and the ones `skip` says to leave out (those the
-/// store holds already): what [`crate::BrickStore::hold_children`] takes. It reads only the
+/// The children of the brick at `coord` of mip `level` (at least 1), in [`BrickCoord::children`]
+/// order, that are worth generating: not the ones `skip` says to leave out (those the store holds
+/// already), and not the ones the source proves can never be drawn, without generating them
+/// (unknown means generate):
+/// - air: [`BrickSource::air_below`] says every Voxel of level 0 under it is air;
+/// - buried: [`BrickSource::solid_below`] says that of it and of the six bricks that touch its
+///   faces that every Voxel is solid, so that it is full with full bricks all round, which no ray
+///   from outside reaches (the bricks that the renderer takes out of its tree for good: see
+///   `render::scene::select`).
+///
+/// A child left out reads as the source gives it, all the same: [`crate::BrickStore`] reads air
+/// for what is not held under a brick whose children are resident and is not proven solid, and
+/// what the source gives for what is. It is generated when an Edit exposes it. It reads only the
 /// source, so it can run on any thread.
+pub fn children_to_generate(
+    source: &dyn BrickSource,
+    level: usize,
+    coord: BrickCoord,
+    skip: impl Fn(BrickCoord) -> bool,
+) -> Vec<BrickCoord> {
+    let below = level - 1;
+    let children = coord.children();
+    // Whether each of the eight is solid below, asked at most once.
+    let mut solid: [Option<bool>; 8] = [None; 8];
+    let mut solid_at =
+        |i: usize| *solid[i].get_or_insert_with(|| source.solid_below(below, children[i]));
+    let mut out = Vec::with_capacity(8);
+    for (i, &child) in children.iter().enumerate() {
+        if skip(child) || source.air_below(below, child) {
+            continue;
+        }
+        let buried = solid_at(i)
+            && (0..6).all(|face| {
+                let mut at = [i & 1, i >> 1 & 1, i >> 2].map(|bit| bit as i32);
+                at[face / 2] += if face % 2 == 0 { -1 } else { 1 };
+                if at.iter().all(|a| (0..2).contains(a)) {
+                    solid_at((at[0] | at[1] << 1 | at[2] << 2) as usize)
+                } else {
+                    let mut next = child.0;
+                    next[face / 2] += if face % 2 == 0 { -1 } else { 1 };
+                    source.solid_below(below, BrickCoord(next))
+                }
+            });
+        if !buried {
+            out.push(child);
+        }
+    }
+    out
+}
+
+/// The bricks under the brick at `coord` of mip `level` (at least 1) as `source` gives them, in
+/// [`BrickCoord::children`] order, except air, the ones `skip` says to leave out (those the
+/// store holds already) and the ones that can never be drawn (see [`children_to_generate`]): what
+/// [`crate::BrickStore::hold_children`] takes. It reads only the source, so it can run on any
+/// thread.
 pub fn children_from(
     source: &dyn BrickSource,
     level: usize,
     coord: BrickCoord,
     skip: impl Fn(BrickCoord) -> bool,
 ) -> Vec<(BrickCoord, Brick)> {
-    coord
-        .children()
+    children_to_generate(source, level, coord, skip)
         .into_iter()
-        .filter(|&child| !skip(child))
         .map(|child| (child, source.brick(level - 1, child)))
         .filter(|(_, brick)| !brick.is_air())
         .collect()
@@ -78,13 +127,29 @@ pub fn children_with_solid(
     coord: BrickCoord,
     skip: impl Fn(BrickCoord) -> bool,
 ) -> Vec<(BrickCoord, Brick, bool)> {
-    children_from(source, level, coord, skip)
+    children_generated(source, level, coord, skip).0
+}
+
+/// [`children_with_solid`], and how many bricks were generated for it (the air that is dropped
+/// after it was generated counts), for a loader that reports what it costs.
+pub fn children_generated(
+    source: &dyn BrickSource,
+    level: usize,
+    coord: BrickCoord,
+    skip: impl Fn(BrickCoord) -> bool,
+) -> (Vec<(BrickCoord, Brick, bool)>, usize) {
+    let wanted = children_to_generate(source, level, coord, skip);
+    let generated = wanted.len();
+    let bricks = wanted
         .into_iter()
+        .map(|child| (child, source.brick(level - 1, child)))
+        .filter(|(_, brick)| !brick.is_air())
         .map(|(child, brick)| {
             let solid = level > 1 && source.solid_below(level - 1, child);
             (child, brick, solid)
         })
-        .collect()
+        .collect();
+    (bricks, generated)
 }
 
 /// A ball at the Planet's centre made of one Material, so that none of its bricks need be held.
@@ -395,6 +460,114 @@ mod tests {
             z if z >= top - thin => Some(SOIL),
             _ => Some(BEDROCK),
         }
+    }
+
+    /// Rock in the rows of bricks with y up to 0 and air above, at every level, which it proves
+    /// only for y below 0 (solid) and above 1 (air): rows 0 and 1 are "not known" both ways. It
+    /// counts the bricks it generates.
+    #[derive(Debug, Default)]
+    struct Layers {
+        generated: std::sync::atomic::AtomicUsize,
+    }
+
+    impl BrickSource for Layers {
+        fn brick(&self, _: usize, coord: BrickCoord) -> Brick {
+            self.generated
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if coord.0[1] < 1 {
+                Brick::solid(ROCK)
+            } else {
+                Brick::AIR
+            }
+        }
+        fn solid_below(&self, _: usize, coord: BrickCoord) -> bool {
+            coord.0[1] < 0
+        }
+        fn air_below(&self, _: usize, coord: BrickCoord) -> bool {
+            coord.0[1] > 1
+        }
+    }
+
+    impl Layers {
+        fn generated(&self) -> usize {
+            self.generated.load(std::sync::atomic::Ordering::Relaxed)
+        }
+    }
+
+    /// The rows (y) of the children `children_to_generate` keeps, deduplicated.
+    fn rows(source: &Layers, parent: BrickCoord) -> Vec<i32> {
+        let mut rows: Vec<i32> = children_to_generate(source, 2, parent, |_| false)
+            .iter()
+            .map(|c| c.0[1])
+            .collect();
+        rows.sort_unstable();
+        rows.dedup();
+        rows
+    }
+
+    #[test]
+    fn a_child_that_the_source_proves_air_is_not_generated() {
+        let source = Layers::default();
+        // Children at y = 4 and 5, both air below.
+        assert!(children_to_generate(&source, 2, BrickCoord([0, 2, 0]), |_| false).is_empty());
+        assert!(children_from(&source, 2, BrickCoord([0, 2, 0]), |_| false).is_empty());
+        assert_eq!(source.generated(), 0);
+    }
+
+    #[test]
+    fn a_child_that_is_solid_with_solid_all_round_is_buried_and_not_generated() {
+        let source = Layers::default();
+        // Children at y = -4 and -3: both solid below, and the one at -3 has the one at -2 above it
+        // (solid), so both are buried.
+        let parent = BrickCoord([0, -2, 0]);
+        assert!(children_to_generate(&source, 2, parent, |_| false).is_empty());
+        assert_eq!(source.generated(), 0);
+    }
+
+    #[test]
+    fn a_solid_child_with_a_brick_beside_it_that_is_not_known_solid_is_generated() {
+        let source = Layers::default();
+        // Children at y = -2 and -1: the ones at -1 have y = 0 above them, which is not known to be
+        // solid (it is rock, but the source does not say), so they are drawn; the ones at -2 are
+        // buried.
+        let parent = BrickCoord([0, -1, 0]);
+        assert_eq!(rows(&source, parent), [-1]);
+        assert_eq!(children_to_generate(&source, 2, parent, |_| false).len(), 4);
+        // What is generated is what is counted, and what is left out reads as it would.
+        let (bricks, generated) = children_generated(&source, 2, parent, |_| false);
+        assert_eq!((bricks.len(), generated, source.generated()), (4, 4, 4));
+    }
+
+    #[test]
+    fn a_child_that_is_neither_proven_air_nor_proven_solid_is_generated() {
+        let source = Layers::default();
+        // Children at y = 0 and 1: nothing is known of either, and the one at 1 is air once it is
+        // generated, which is dropped after (unknown means generate).
+        let parent = BrickCoord([0, 0, 0]);
+        assert_eq!(children_to_generate(&source, 2, parent, |_| false).len(), 8);
+        let (bricks, generated) = children_generated(&source, 2, parent, |_| false);
+        assert_eq!((bricks.len(), generated), (4, 8));
+    }
+
+    #[test]
+    fn a_child_that_is_held_is_not_generated_whatever_it_is() {
+        let source = Layers::default();
+        let parent = BrickCoord([0, 0, 0]);
+        let held = BrickCoord([0, 0, 0]);
+        let kept = children_to_generate(&source, 2, parent, |c| c == held);
+        assert_eq!(kept.len(), 7);
+        assert!(!kept.contains(&held));
+    }
+
+    #[test]
+    fn a_buried_child_beside_a_held_one_stays_buried() {
+        // Held bricks are skipped but still count as what the source says of them: the Edits that
+        // change one are found by the renderer, which reads the store, not the source.
+        let source = Layers::default();
+        let parent = BrickCoord([0, -1, 0]);
+        let kept = children_to_generate(&source, 2, parent, |c| c.0 == [0, -2, 0]);
+        assert_eq!(kept.len(), 4);
+        assert!(kept.iter().all(|c| c.0[1] == -1));
     }
 
     #[test]

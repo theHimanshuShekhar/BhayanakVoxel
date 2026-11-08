@@ -398,6 +398,11 @@ mod tests {
     use net::{Alignment, Brush, EditMode, Shape};
     use planet_gen::{CORE, ROCK, SOIL};
 
+    /// The brick `level` levels coarser that covers `coord`.
+    fn ancestor(coord: BrickCoord, level: usize) -> BrickCoord {
+        (0..level).fold(coord, |c, _| c.parent())
+    }
+
     const STONE: Material = Material(7);
 
     /// An empty store whose bricks that are not held read as the Planet's core.
@@ -1272,6 +1277,97 @@ mod tests {
         assert_eq!(*undo.lod(), LodRefresh::default());
         assert_eq!(store.level_count(), 1);
         assert_eq!(undo.revert(&mut store), LodRefresh::default());
+    }
+
+    /// A dig into bricks that the loader left out because they are buried reads, at level 0 and in
+    /// the coarse levels, as it does in a store that was given every brick the source makes.
+    #[test]
+    fn a_dig_into_buried_bricks_that_were_left_out_is_what_a_dig_into_generated_ones_is() {
+        use brick_store::children_to_generate;
+        use planet_gen::planet::{Planet, tangents};
+        use planet_gen::world_map::WorldMap;
+
+        let planet = Planet::new(WorldMap::generate(0xB4A7_A9AC, 512));
+        let ground = planet.spawn(100);
+        let length = ground.iter().map(|c| c * c).sum::<f64>().sqrt();
+        let up = ground.map(|c| c / length);
+        let (ahead, _) = tangents(up);
+        let point: [f64; 3] = std::array::from_fn(|a| ground[a] + ahead[a] * 300.0);
+        let radius = point.iter().map(|c| c * c).sum::<f64>().sqrt();
+        let at = |r: f64| VoxelCoord(point.map(|c| (c / radius * r).round() as i32));
+
+        let mut left_out = Vec::new();
+        let mut skipping = planet.crust_around(ground, 100, 2);
+        skipping.stream_from(1);
+        let mut everything = skipping.clone();
+        let source = skipping.source().unwrap();
+        // Down the column under the point, the first brick whose children have one that is left
+        // out (some are, a little under the ground and away from caves).
+        let parent = (0..80)
+            .map(|d| at(radius + 100.0 - f64::from(d) * 25.0).brick().parent())
+            .find(|&parent| {
+                let kept = children_to_generate(&*source, 1, parent, |_| false);
+                left_out = parent
+                    .children()
+                    .into_iter()
+                    .filter(|c| !kept.contains(c) && source.solid_below(0, *c))
+                    .collect();
+                !left_out.is_empty()
+            })
+            .expect("a buried brick under the ground");
+        let held = brick_store::children_from(&*source, 1, parent, |_| false);
+        assert!(held.len() < 8);
+        skipping.hold_children(1, parent, held);
+        // The other store has all of them, the way a load that did not skip would.
+        let all = parent
+            .children()
+            .into_iter()
+            .map(|c| (c, source.brick(0, c)))
+            .filter(|(_, brick)| !brick.is_air())
+            .collect();
+        everything.hold_children(1, parent, all);
+        for &c in &left_out {
+            assert!(
+                skipping.reads_full_from_source(0, c)
+                    && !skipping.holds(0, c)
+                    && everything.holds(0, c)
+            );
+            assert_eq!(skipping.brick_at(0, c), everything.brick_at(0, c));
+        }
+
+        // Dig into the middle of one of them, a ball that reaches into its neighbours.
+        let into = left_out[0].origin().0.map(|v| v + 4);
+        let op = EditOp::dig_sphere(VoxelCoord(into), 14);
+        apply(&mut skipping, &op);
+        apply(&mut everything, &op);
+        assert!(skipping.holds(0, left_out[0]), "the dig held it");
+
+        let first = VoxelCoord(into).brick();
+        for level in 0..3 {
+            let reach = if level == 0 { 3 } else { 2 };
+            let base = if level == 0 {
+                first
+            } else {
+                ancestor(first, level)
+            };
+            for dx in -reach..=reach {
+                for dy in -reach..=reach {
+                    for dz in -reach..=reach {
+                        let c = BrickCoord([base.0[0] + dx, base.0[1] + dy, base.0[2] + dz]);
+                        assert_eq!(
+                            skipping.brick_at(level, c),
+                            everything.brick_at(level, c),
+                            "level {level} {c:?}"
+                        );
+                        assert_eq!(
+                            skipping.solid_below(level, c),
+                            everything.solid_below(level, c),
+                            "solid below, level {level} {c:?}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     /// The client streams the Planet in and the server does not; an Edit taken back must leave

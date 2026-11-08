@@ -623,8 +623,8 @@ const HELD_FLIGHT: Held = HELD;
 /// with the scene thread).
 const HELD_FILL_SECS: f64 = 300.0;
 /// The most the drawn scene may use per copy (the words of the bricks it draws, in MiB), near the
-/// ground at the full bands: measured 463 MiB for 3.56 million drawn bricks at about 132 bytes
-/// each. The prefetch simulator's shell at rest is 227 to 259 MB (#49), about half as many
+/// ground at the full bands: measured 474 MiB for 3.44 million drawn bricks at about 144 bytes
+/// each (the words of the bricks and their regions). The prefetch simulator's shell at rest is 227 to 259 MB (#49), about half as many
 /// drawn bricks; #143 re-checks that. The bands bound the scene whatever the store holds, so this
 /// is a ceiling on the client, with some room over what was measured.
 const SCENE_MIB_MOST: f64 = 512.0;
@@ -799,6 +799,7 @@ fn the_full_size_planet_streams_in_and_walking_over_it_does_not_stall() {
     // for 5 km (#141), in legs, with the host store and the resident set reported after each.
     let (mut fly_work, mut fly_updates) = (SceneWork::default(), Updates::default());
     let scene_after_fill = world.used_bytes();
+    let generated_before_flight = world.loader().unwrap().generated;
     for leg in 1..=6 {
         let (work, updates) = travel(&mut world, &mut camera, &mut tables, 48.0, 1050);
         eprintln!("{}", memory(&world, &format!("flight, {} m", leg * 840)));
@@ -816,6 +817,11 @@ fn the_full_size_planet_streams_in_and_walking_over_it_does_not_stall() {
         "  of which following the camera: {}; taking in bricks: {}",
         fly_updates.recentre.summary().unwrap(),
         fly_updates.stream.summary().unwrap()
+    );
+    eprintln!(
+        "  the flight generated {} bricks, {} drawn at the end",
+        world.loader().unwrap().generated - generated_before_flight,
+        (0..LEVELS).map(|l| world.level_bricks(l)).sum::<usize>()
     );
     eprintln!("{}", fly_updates.report(48.0 * VOXELS_PER_METRE / 60.0));
     tables.report();
@@ -1503,16 +1509,24 @@ fn settle(world: &mut World, camera: [f64; 3]) {
     }
 }
 
+/// Frames of 20 Voxels in each leg of the flight away and of the flight back: a shell holds fewer
+/// bricks since #142 leaves the air and the buried bricks out of a unit, and what one shell adds to
+/// the store beyond the ones before is a few per cent, so two legs take it over its limit.
+const FLIGHT_FRAMES: usize = 1500;
+
 #[test]
 fn flying_away_and_back_keeps_the_store_within_its_budget_and_leaves_no_hole_or_stale_edit() {
-    // The budget is what the complete set holds with the camera at the spawn, and a sliver over.
+    // The budget is what the complete set holds with the camera at the spawn, and 7 per cent over:
+    // the complete set elsewhere is a few per cent more or less, and a store that cannot get under
+    // its limit with everything wanted is left alone by eviction for a while (`EVICT_BACKOFF`), so
+    // the margin is the most that the flight takes the store over (3 per cent a shell), less a little.
     let (mut first, _s, spawn) = spawned_world(2);
     fill(&mut first, spawn.position);
     first.sync().unwrap();
     let full = first.store().streamed_len();
     drop(first);
     let budget = brick_store::Budget {
-        bricks: full * 11 / 10,
+        bricks: full * 107 / 100,
         overflow: 0.01,
     };
     let (mut world, _server, spawn) = budgeted_world(2, budget);
@@ -1533,7 +1547,7 @@ fn flying_away_and_back_keeps_the_store_within_its_budget_and_leaves_no_hole_or_
     assert!(world.store().voxel_at(0, VoxelCoord(at)).is_none());
     assert!(world.store().diverged_len() > 0);
     // A brick of the ground 60 Voxels along from the crater, well outside what the crater keeps.
-    let (ahead, _) = tangents(spawn.horizon_up);
+    let (ahead, right) = tangents(spawn.horizon_up);
     let probe = {
         let store = world.store();
         let beside = over_the_ground(
@@ -1554,8 +1568,10 @@ fn flying_away_and_back_keeps_the_store_within_its_budget_and_leaves_no_hole_or_
         brick
     };
 
-    // Fly away far enough that the spawn's units are left behind, and settle there.
-    let away = fly(&mut world, aim.position, ahead, 20.0, 500);
+    // Fly away far enough that the spawn's units are left behind, and then on to the side, so that
+    // the shells that it passes through are three and more than the limit holds, and settle there.
+    let turn = fly(&mut world, aim.position, ahead, 20.0, FLIGHT_FRAMES);
+    let away = fly(&mut world, turn, right, 20.0, FLIGHT_FRAMES);
     settle(&mut world, away);
     {
         let store = world.store();
@@ -1576,7 +1592,8 @@ fn flying_away_and_back_keeps_the_store_within_its_budget_and_leaves_no_hole_or_
 
     // Back at the spawn the area is streamed in again: ground at level 0 under the camera, and the
     // crater where it was dug.
-    fly(&mut world, away, ahead.map(|c| -c), 20.0, 500);
+    let turn = fly(&mut world, away, right.map(|c| -c), 20.0, FLIGHT_FRAMES);
+    fly(&mut world, turn, ahead.map(|c| -c), 20.0, FLIGHT_FRAMES);
     let back = aim.position;
     world.recentre(back).unwrap();
     settle(&mut world, back);
