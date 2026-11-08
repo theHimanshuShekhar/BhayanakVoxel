@@ -600,3 +600,234 @@ fn the_sim_path_uses_only_operations_that_are_exact_on_every_machine() {
         }
     }
 }
+
+/// Bricks held by coordinate, as the ground is: what is not held is unloaded.
+struct BrickWorld(std::collections::BTreeMap<BrickCoord, brick_store::Brick>);
+
+impl Occupancy for BrickWorld {
+    fn cell(&self, voxel: VoxelCoord) -> Cell {
+        match self.0.get(&voxel.brick()) {
+            None => Cell::Unloaded,
+            Some(brick) if brick.get(voxel.local()).is_some() => Cell::Solid,
+            Some(_) => Cell::Air,
+        }
+    }
+
+    fn content(&self, brick: BrickCoord) -> Content<'_> {
+        match self.0.get(&brick).map(brick_store::Brick::view) {
+            None | Some(brick_store::BrickView::Solid(_)) => Content::Solid,
+            Some(brick_store::BrickView::Air) => Content::Air,
+            Some(brick_store::BrickView::Mixed { occupancy, .. }) => Content::Mixed(occupancy),
+        }
+    }
+}
+
+/// The deepest contact as the controller found it before it asked for bricks (5b94335): every
+/// Voxel of the capsule's bounds, one `cell` at a time, in the same order. Frozen here as the
+/// reference that the brick-wise `contact` must equal to the bit.
+#[allow(clippy::too_many_arguments)]
+fn contact_per_voxel(
+    world: &impl Occupancy,
+    leash: Option<Leash>,
+    r: f64,
+    feet: [f64; 3],
+    up: [f64; 3],
+    height: f64,
+    reach: f64,
+    any: bool,
+) -> Option<Contact> {
+    let solid = |voxel: [i32; 3]| {
+        if let Some(leash) = &leash {
+            let centre = voxel.map(|c| f64::from(c) + 0.5);
+            let from_centre = sub(centre, leash.centre);
+            if dot(from_centre, from_centre) > leash.radius * leash.radius {
+                return true;
+            }
+        }
+        world.cell(VoxelCoord(voxel)) != Cell::Air
+    };
+    let a = add(feet, scale(up, r));
+    let b = add(feet, scale(up, height - r));
+    let lo = [0, 1, 2].map(|k| (a[k].min(b[k]) - r).floor() as i32);
+    let hi = [0, 1, 2].map(|k| (a[k].max(b[k]) + r).floor() as i32);
+    let mut deepest: Option<Contact> = None;
+    for x in lo[0]..=hi[0] {
+        for y in lo[1]..=hi[1] {
+            for z in lo[2]..=hi[2] {
+                let voxel = [x, y, z];
+                if !solid(voxel) {
+                    continue;
+                }
+                let min = voxel.map(f64::from);
+                let max = min.map(|c| c + 1.0);
+                let (dist, p) = segment_to_box(a, b, min, max);
+                if dist >= reach * reach {
+                    continue;
+                }
+                if any {
+                    return Some(Contact {
+                        depth: 0.0,
+                        normal: up,
+                    });
+                }
+                let contact = if dist > 0.0 {
+                    let length = dist.sqrt();
+                    Contact {
+                        depth: reach - length,
+                        normal: scale(sub(p, nearest_in_box(p, min, max)), 1.0 / length),
+                    }
+                } else {
+                    Contact {
+                        depth: r + 1.0,
+                        normal: up,
+                    }
+                };
+                if deepest.as_ref().is_none_or(|d| contact.depth > d.depth) {
+                    deepest = Some(contact);
+                }
+            }
+        }
+    }
+    deepest
+}
+
+/// A small deterministic generator (xorshift), so that the run is the same each time.
+struct Random(u64);
+
+impl Random {
+    fn next(&mut self) -> u64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0
+    }
+
+    /// In `[0, 1)`.
+    fn unit(&mut self) -> f64 {
+        (self.next() >> 11) as f64 / (1u64 << 53) as f64
+    }
+
+    fn between(&mut self, lo: f64, hi: f64) -> f64 {
+        lo + (hi - lo) * self.unit()
+    }
+}
+
+#[test]
+fn the_contact_found_brick_by_brick_is_the_one_found_voxel_by_voxel_to_the_bit() {
+    use brick_store::{Brick, Material};
+
+    let mut random = Random(0x9E37_79B9_7F4A_7C15);
+    let stone = Material(7);
+    let r = Movement::default().radius;
+    let mut compared = [0u32; 3];
+    for _ in 0..24 {
+        // A world of 4 x 4 x 4 bricks: air, solid, mixed at various densities, and some not held.
+        let mut bricks = std::collections::BTreeMap::new();
+        for x in -2..2 {
+            for y in -2..2 {
+                for z in -2..2 {
+                    let brick = match random.next() % 16 {
+                        0 => continue,
+                        1..=8 => Brick::AIR,
+                        9 => Brick::solid(stone),
+                        kind => {
+                            let density = [0.02, 0.1, 0.5][kind as usize % 3];
+                            let mut brick = Brick::AIR;
+                            for i in 0..512u32 {
+                                if random.unit() < density {
+                                    let local = [(i % 8) as u8, (i / 8 % 8) as u8, (i / 64) as u8];
+                                    brick.set(local, Some(stone));
+                                }
+                            }
+                            brick
+                        }
+                    };
+                    bricks.insert(BrickCoord([x, y, z]), brick);
+                }
+            }
+        }
+        let world = BrickWorld(bricks);
+        for _ in 0..400 {
+            let up = [0, 1, 2].map(|_| random.between(-1.0, 1.0));
+            let length = dot(up, up).sqrt();
+            let up = up.map(|c| c / length);
+            let mut feet = [0, 1, 2].map(|_| random.between(-8.0, 8.0));
+            let leash = match random.next() % 4 {
+                0 | 1 => None,
+                // A wall that grazes the capsule: a sphere about a point some way off, whose
+                // surface is within a few Voxels of the feet.
+                2 => {
+                    let away = [0, 1, 2].map(|_| random.between(-1.0, 1.0));
+                    let away = away.map(|c| c / dot(away, away).sqrt() * random.between(8.0, 50.0));
+                    Some(Leash {
+                        centre: add(feet, away),
+                        radius: (dot(away, away).sqrt() + random.between(-14.0, 14.0)).max(1.0),
+                    })
+                }
+                // A wall that a Voxel's centre is on, or a hair either side of, with the capsule
+                // beside that Voxel: the radius is the square root of a whole number of Voxels'
+                // squares, less or more by nothing, 1/100 or 1/2.
+                _ => {
+                    // The corner of a brick that is farthest from the centre, which is what a
+                    // brick is judged by.
+                    let far = [0, 1, 2].map(|_| random.next() % 2 == 1);
+                    let voxel = far.map(|far| {
+                        let brick = (random.next() % 4) as f64 - 2.0;
+                        brick * 8.0 + if far { 7.5 } else { 0.5 }
+                    });
+                    feet = voxel.map(|c| c + random.between(-4.0, 4.0));
+                    let mut centre = voxel;
+                    for k in 0..3 {
+                        let by = (random.next() % 18) as f64 + 2.0;
+                        centre[k] += if far[k] { -by } else { by };
+                    }
+                    let gap = sub(voxel, centre);
+                    let offset = [0.0, 0.01, -0.01, 0.5, -0.5][random.next() as usize % 5];
+                    Some(Leash {
+                        centre,
+                        radius: (dot(gap, gap) + offset).max(1.0).sqrt(),
+                    })
+                }
+            };
+            let height = [v(1.8), v(1.2)][random.next() as usize % 2];
+            let reach = match random.next() % 4 {
+                0 => r,
+                1 => r - TOLERANCE,
+                2 => r - STUCK,
+                _ => random.between(0.5, r + 1.0),
+            };
+            for any in [false, true] {
+                let capsule = Capsule {
+                    world: &world,
+                    leash,
+                    radius: r,
+                    reached: RefCell::new(Vec::new()),
+                };
+                let new = capsule.contact(feet, up, height, reach, any);
+                let old = contact_per_voxel(&world, leash, r, feet, up, height, reach, any);
+                match (&new, &old) {
+                    (None, None) => compared[0] += 1,
+                    (Some(new), Some(old)) => {
+                        compared[1] += 1;
+                        assert_eq!(new.depth.to_bits(), old.depth.to_bits());
+                        for k in 0..3 {
+                            assert_eq!(new.normal[k].to_bits(), old.normal[k].to_bits());
+                        }
+                    }
+                    _ => panic!(
+                        "brick by brick {:?}, voxel by voxel {:?} at {feet:?}, up {up:?}, \
+                         height {height}, reach {reach}, any {any}, leash {leash:?}",
+                        new.as_ref().map(|c| (c.depth, c.normal)),
+                        old.as_ref().map(|c| (c.depth, c.normal)),
+                    ),
+                }
+                compared[2] += u32::from(leash.is_some());
+            }
+        }
+    }
+    // Both kinds of answer, and the leash, were exercised.
+    assert!(
+        compared[0] >= 10 && compared[1] > 1000 && compared[2] > 1000,
+        "{compared:?}"
+    );
+}

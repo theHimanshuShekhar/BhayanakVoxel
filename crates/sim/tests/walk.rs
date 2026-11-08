@@ -414,13 +414,12 @@ fn distance(a: [f64; 3], b: [f64; 3]) -> f64 {
         .sqrt()
 }
 
-// The controller's tick, held to half of one: 2.1 ms in the mean (release) at 10 cm Voxels, and
-// 10.6 to 12.8 ms at 5 cm, where the capsule touches about 7 times the Voxels. The ground keeps up
-// (it never waits) and the client and the server agree, but the mean (13.4 ms), the 99th
-// percentile (24.2 ms, over the 16.7 ms tick, so that assertion fails too) and the worst tick
-// (33 ms) are all over. #154 brings it back, and then this runs again.
+// The controller's tick, held to half of one: 2.1 ms in the mean (release) at 10 cm Voxels. At
+// 5 cm the capsule's bounds hold about 7 times the Voxels, which the controller used to ask the
+// store for one by one (9 ms of the 13 ms tick); it now asks per brick, skips the air ones and the
+// Voxels out of reach, and the tick is the ground's generation (about 4 ms in the mean, and 13 ms
+// in the 99th percentile, when the ball is moved and a tick makes the most it may).
 #[test]
-#[ignore = "too slow at 5 cm until #154"]
 fn a_character_runs_a_kilometre_from_the_spawn_without_stopping_while_the_ground_keeps_up() {
     let (start, axis) = spawn_and_way();
     let mut pair = Pair::new(real_planet, None, 2);

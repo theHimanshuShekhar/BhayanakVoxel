@@ -34,7 +34,9 @@
 //! Standing still, nothing moves it sideways: the fall is straight down along up, so it does
 //! not slide down a slope of the Voxel staircase it stands on.
 
-use brick_store::{VOXELS_PER_METRE, VoxelCoord};
+use std::cell::RefCell;
+
+use brick_store::{BRICK_SIZE, BrickCoord, VOXELS_PER_METRE, VoxelCoord};
 use net::{BodyState, Leash, MoveInput};
 
 use crate::Movement;
@@ -77,6 +79,27 @@ pub enum Cell {
 /// the Planet. It must answer from what is held, and never generate anything.
 pub trait Occupancy {
     fn cell(&self, voxel: VoxelCoord) -> Cell;
+
+    /// What the brick `brick` holds, if that is known whole: a query then skips an air brick and
+    /// takes a solid one without asking [`Occupancy::cell`] for each of its Voxels. It must agree
+    /// with `cell` for every Voxel of the brick. A world that cannot say is [`Content::PerVoxel`].
+    fn content(&self, _brick: BrickCoord) -> Content<'_> {
+        Content::PerVoxel
+    }
+}
+
+/// What a brick holds, as far as a character is concerned.
+#[derive(Clone, Copy, Debug)]
+pub enum Content<'a> {
+    /// Every Voxel is [`Cell::Air`].
+    Air,
+    /// Every Voxel is not [`Cell::Air`]: solid, or unloaded.
+    Solid,
+    /// Some are solid: bit `x | y << 3 | z << 6` of the words (bit `i % 64` of word `i / 64`) is
+    /// set where the Voxel is.
+    Mixed(&'a [u64; 8]),
+    /// Not known whole: ask [`Occupancy::cell`].
+    PerVoxel,
 }
 
 fn dot(a: [f64; 3], b: [f64; 3]) -> f64 {
@@ -195,18 +218,58 @@ struct Capsule<'a, W> {
     world: &'a W,
     leash: Option<Leash>,
     radius: f64,
+    /// The bricks that a query reaches into, kept between queries so that none allocates.
+    reached: RefCell<Vec<Reached<'a>>>,
 }
 
-impl<W: Occupancy> Capsule<'_, W> {
-    fn solid(&self, voxel: [i32; 3]) -> bool {
-        if let Some(leash) = &self.leash {
+/// A brick that a query reaches into: what it holds, and whether all of it is inside the leash
+/// (if not, a Voxel beyond the leash is solid whatever the brick holds).
+#[derive(Clone, Copy)]
+struct Reached<'a> {
+    content: Content<'a>,
+    inside: bool,
+}
+
+impl<'a, W: Occupancy> Capsule<'a, W> {
+    /// Whether the farthest Voxel of `brick` from the leash's centre is inside it, so that the
+    /// leash makes none of its Voxels solid. Measured as [`Capsule::solid`] measures a Voxel, so
+    /// that a brick that passes has no Voxel that does not.
+    fn inside_leash(&self, brick: BrickCoord) -> bool {
+        let Some(leash) = &self.leash else {
+            return true;
+        };
+        let origin = brick.origin().0;
+        let mut far2 = 0.0;
+        for (k, &first) in origin.iter().enumerate() {
+            let low = f64::from(first) + 0.5 - leash.centre[k];
+            let high = f64::from(first) + f64::from(BRICK_SIZE - 1) + 0.5 - leash.centre[k];
+            let far = low.abs().max(high.abs());
+            far2 += far * far;
+        }
+        far2 <= leash.radius * leash.radius
+    }
+
+    /// Whether `voxel`, in a brick that `reached` describes, is solid to the capsule.
+    fn solid(&self, reached: Reached<'_>, voxel: [i32; 3]) -> bool {
+        if !reached.inside
+            && let Some(leash) = &self.leash
+        {
             let centre = voxel.map(|c| f64::from(c) + 0.5);
             let from_centre = sub(centre, leash.centre);
             if dot(from_centre, from_centre) > leash.radius * leash.radius {
                 return true;
             }
         }
-        self.world.cell(VoxelCoord(voxel)) != Cell::Air
+        match reached.content {
+            Content::Air => false,
+            Content::Solid => true,
+            Content::Mixed(words) => {
+                let [x, y, z] = voxel.map(|c| c.rem_euclid(BRICK_SIZE) as usize);
+                let i = x | y << 3 | z << 6;
+                words[i / 64] >> (i % 64) & 1 == 1
+            }
+            Content::PerVoxel => self.world.cell(VoxelCoord(voxel)) != Cell::Air,
+        }
     }
 
     /// The deepest contact of the capsule standing on `feet` with Voxels, `height` tall along
@@ -224,42 +287,93 @@ impl<W: Occupancy> Capsule<'_, W> {
         let b = add(feet, scale(up, height - r));
         let lo = [0, 1, 2].map(|k| (a[k].min(b[k]) - r).floor() as i32);
         let hi = [0, 1, 2].map(|k| (a[k].max(b[k]) + r).floor() as i32);
+        // The bricks that the bounds reach, each looked up once.
+        let first = lo.map(|c| c.div_euclid(BRICK_SIZE));
+        let last = hi.map(|c| c.div_euclid(BRICK_SIZE));
+        let [ny, nz] = [1, 2].map(|k| (i64::from(last[k]) - i64::from(first[k]) + 1) as usize);
+        let mut bricks = self.reached.borrow_mut();
+        bricks.clear();
+        for x in first[0]..=last[0] {
+            for y in first[1]..=last[1] {
+                for z in first[2]..=last[2] {
+                    let brick = BrickCoord([x, y, z]);
+                    bricks.push(Reached {
+                        content: self.world.content(brick),
+                        inside: self.inside_leash(brick),
+                    });
+                }
+            }
+        }
+        let reached = |voxel: [i32; 3]| {
+            let [x, y, z] =
+                [0, 1, 2].map(|k| (voxel[k].div_euclid(BRICK_SIZE) - first[k]) as usize);
+            bricks[(x * ny + y) * nz + z]
+        };
+        // A Voxel whose box is farther from the segment's bounding box than this is not touched.
+        // The margin is far more than the rounding of the exact test, which still decides.
+        let (seg_lo, seg_hi) = (
+            [0, 1, 2].map(|k| a[k].min(b[k])),
+            [0, 1, 2].map(|k| a[k].max(b[k])),
+        );
+        let near = (reach + 0.01) * (reach + 0.01);
         let mut deepest: Option<Contact> = None;
         for x in lo[0]..=hi[0] {
             for y in lo[1]..=hi[1] {
-                for z in lo[2]..=hi[2] {
-                    let voxel = [x, y, z];
-                    if !self.solid(voxel) {
+                // In 64 bits, so that the end of a run at the top of the range does not wrap.
+                let mut z = i64::from(lo[2]);
+                while z <= i64::from(hi[2]) {
+                    let here = reached([x, y, z as i32]);
+                    let end = i64::from(hi[2])
+                        .min(z.div_euclid(i64::from(BRICK_SIZE)) * i64::from(BRICK_SIZE) + 7);
+                    if matches!(here.content, Content::Air) && here.inside {
+                        // Nothing in this run of the brick is solid.
+                        z = end + 1;
                         continue;
                     }
-                    let min = voxel.map(f64::from);
-                    let max = min.map(|c| c + 1.0);
-                    let (dist, p) = segment_to_box(a, b, min, max);
-                    if dist >= reach * reach {
-                        continue;
-                    }
-                    if any {
-                        return Some(Contact {
-                            depth: 0.0,
-                            normal: up,
-                        });
-                    }
-                    let contact = if dist > 0.0 {
-                        let length = dist.sqrt();
-                        Contact {
-                            depth: reach - length,
-                            normal: scale(sub(p, nearest_in_box(p, min, max)), 1.0 / length),
+                    for z in z as i32..=end as i32 {
+                        let voxel = [x, y, z];
+                        if !self.solid(here, voxel) {
+                            continue;
                         }
-                    } else {
-                        // The axis is inside the Voxel: out of it is any way; up is as good.
-                        Contact {
-                            depth: r + 1.0,
-                            normal: up,
+                        let min = voxel.map(f64::from);
+                        let max = min.map(|c| c + 1.0);
+                        let away2: f64 = (0..3)
+                            .map(|k| {
+                                let gap = (min[k] - seg_hi[k]).max(seg_lo[k] - max[k]).max(0.0);
+                                gap * gap
+                            })
+                            .sum();
+                        if away2 > near {
+                            continue;
                         }
-                    };
-                    if deepest.as_ref().is_none_or(|d| contact.depth > d.depth) {
-                        deepest = Some(contact);
+                        let (dist, p) = segment_to_box(a, b, min, max);
+                        if dist >= reach * reach {
+                            continue;
+                        }
+                        if any {
+                            return Some(Contact {
+                                depth: 0.0,
+                                normal: up,
+                            });
+                        }
+                        let contact = if dist > 0.0 {
+                            let length = dist.sqrt();
+                            Contact {
+                                depth: reach - length,
+                                normal: scale(sub(p, nearest_in_box(p, min, max)), 1.0 / length),
+                            }
+                        } else {
+                            // The axis is inside the Voxel: out of it is any way; up is as good.
+                            Contact {
+                                depth: r + 1.0,
+                                normal: up,
+                            }
+                        };
+                        if deepest.as_ref().is_none_or(|d| contact.depth > d.depth) {
+                            deepest = Some(contact);
+                        }
                     }
+                    z = end + 1;
                 }
             }
         }
@@ -448,6 +562,7 @@ impl Character {
             world,
             leash: self.leash,
             radius: self.movement.radius,
+            reached: RefCell::new(Vec::new()),
         };
         for _ in 0..steps as usize {
             self.substep(&capsule, input, each);

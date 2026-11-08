@@ -138,6 +138,35 @@ impl Texel {
     }
 }
 
+/// The four texels that the elevation is interpolated between, over the square of the map
+/// between their centres: see [`WorldMap::elevation_cell`].
+#[derive(Clone, Copy, Debug)]
+pub struct ElevationCell {
+    size: u32,
+    face: usize,
+    i: i32,
+    j: i32,
+    /// The elevations at `(i, j)`, `(i + 1, j)`, `(i, j + 1)` and `(i + 1, j + 1)`.
+    a: [f64; 4],
+}
+
+impl ElevationCell {
+    /// What [`WorldMap::elevation_at`] says of `direction`, by the same sums, if it is in this
+    /// cell; else `None`.
+    pub fn elevation_at(&self, direction: [f64; 3]) -> Option<f64> {
+        let (face, x, y) = position(self.size, direction);
+        let (x, y) = (x - 0.5, y - 0.5);
+        let (i, j) = (x.floor() as i32, y.floor() as i32);
+        if (face, i, j) != (self.face, self.i, self.j) {
+            return None;
+        }
+        let (fx, fy) = (x - f64::from(i), y - f64::from(j));
+        let lerp = |a: f64, b: f64, t: f64| a + (b - a) * t;
+        let [a00, a10, a01, a11] = self.a;
+        Some(lerp(lerp(a00, a10, fx), lerp(a01, a11, fx), fy))
+    }
+}
+
 /// The world map of one seed. See the module documentation.
 pub struct WorldMap {
     seed: u64,
@@ -314,6 +343,34 @@ impl WorldMap {
             }
         }
         (low, high)
+    }
+
+    /// The one cell of the bilinear interpolation of [`WorldMap::elevation_at`] that all of
+    /// `directions` are in, if they are in one: so that the elevation in any direction between
+    /// them can be had without reading the four texels again.
+    pub fn elevation_cell(&self, directions: &[[f64; 3]]) -> Option<ElevationCell> {
+        let mut places = directions.iter().map(|&d| position(self.size, d));
+        let (face, x, y) = places.next().expect("directions must not be empty");
+        let cell = |v: f64| (v - 0.5).floor() as i32;
+        let ((mut i0, mut i1), (mut j0, mut j1)) = ((cell(x), cell(x)), (cell(y), cell(y)));
+        for (f, x, y) in places {
+            if f != face {
+                return None;
+            }
+            (i0, i1) = (i0.min(cell(x)), i1.max(cell(x)));
+            (j0, j1) = (j0.min(cell(y)), j1.max(cell(y)));
+        }
+        (i0 == i1 && j0 == j1).then(|| {
+            let [a00, a10, a01, a11] = [(0, 0), (1, 0), (0, 1), (1, 1)]
+                .map(|(di, dj)| self.elevation_beyond(face, i0 + di, j0 + dj));
+            ElevationCell {
+                size: self.size,
+                face,
+                i: i0,
+                j: j0,
+                a: [a00, a10, a01, a11],
+            }
+        })
     }
 
     /// FNV-1a hash of the size and every texel, face by face, row by row.
@@ -766,6 +823,46 @@ mod tests {
         let cube: [f64; 3] = std::array::from_fn(|k| n[k] + a * u[k] + b * v[k]);
         let mean = (here + map.texel(face, i + 1, j).elevation_voxels()) / 2.0;
         assert!((map.elevation_at(cube) - mean).abs() < 0.01);
+    }
+
+    #[test]
+    fn an_elevation_cell_gives_the_bits_elevation_at_does_and_nothing_outside_it() {
+        let map = map();
+        let e = 1e-4;
+        // Around a texel centre (its cell's corner), a face edge and a cube corner.
+        for around in [
+            map.texel_direction(1, 100, 60),
+            map.texel_direction(2, 255, 3),
+            map.texel_direction(4, 0, 0),
+            [1.0, 1.0, 1.0],
+        ] {
+            let at = |s: f64, t: f64| [around[0] + e * s, around[1] + e * t, around[2] - e * s];
+            let steps = [-3.0, -1.0, 0.0, 0.5, 2.0, 3.0];
+            let mut inside = 0;
+            for &(s, t) in &[(0.1, 0.1), (0.2, 0.3), (0.7, 0.1)] {
+                let Some(cell) = map.elevation_cell(&[at(s, t), at(s + 0.01, t + 0.01)]) else {
+                    continue;
+                };
+                for &a in &steps {
+                    for &b in &steps {
+                        let direction = at(a, b);
+                        if let Some(elevation) = cell.elevation_at(direction) {
+                            inside += 1;
+                            assert_eq!(elevation.to_bits(), map.elevation_at(direction).to_bits());
+                        }
+                    }
+                }
+            }
+            assert!(inside > 0, "{around:?}");
+        }
+        // Directions in different cells have no cell.
+        assert!(
+            map.elevation_cell(&[
+                map.texel_direction(1, 100, 60),
+                map.texel_direction(1, 103, 60)
+            ])
+            .is_none()
+        );
     }
 
     #[test]
