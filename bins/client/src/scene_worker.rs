@@ -42,8 +42,8 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, TryLockError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use brick_store::{BrickCoord, BrickStore, Candidate, LodWork, TableSize};
-use render::lod::{Bands, LEVELS, brick_distance};
+use brick_store::{BrickCoord, BrickStore, Candidate, LodWork, TableSize, VOXELS_PER_METRE};
+use render::lod::{AHEAD, Bands, Class, LEVELS, brick_distance};
 use render::{PatchCopy, RingPatch, RingsFull, Scene, SceneUpdate};
 use sim::SharedStore;
 
@@ -92,10 +92,47 @@ const EVICT_HOLDS: usize = 3;
 /// parts.
 const EVICT_LOOK: Duration = Duration::from_millis(2);
 /// When eviction has done all it can and the store is still over its budget (what is left is all
-/// wanted), it is not begun again until the store has grown by a quarter: looking at every unit
-/// is not free. This is what happens at the cap for now: the LOD is not coarsened to fit it
-/// (#143).
-const EVICT_BACKOFF: (usize, usize) = (5, 4);
+/// wanted), it is not begun again until the store has grown by this fraction of the overflow
+/// (the room between the budget and its limit): looking at every unit is not free.
+const EVICT_RETRY: (usize, usize) = (1, 4);
+
+/// At the memory cap (ADR 0004): when the store is over its limit and everything left is wanted,
+/// the farthest bands are drawn coarser a step at a time instead of a wanted brick being dropped,
+/// as (first level, factor) of [`render::lod::Bands::coarsened`]; the first few step in the
+/// bands nearest the Guard, the last ones reach nearly to the camera.
+const COARSENING: [(usize, f64); 6] = [(8, 1.5), (7, 1.5), (6, 1.5), (5, 1.5), (4, 2.0), (2, 2.0)];
+/// How long a step of coarsening stands before the next, or before one is taken back: the scene
+/// is selected and packed again for each.
+#[cfg(not(test))]
+const COARSEN_HOLD: Duration = Duration::from_secs(10);
+#[cfg(test)]
+const COARSEN_HOLD: Duration = Duration::from_millis(300);
+/// A step is taken back when what the scene would want with it taken back (worked out from the
+/// nodes it wants now, see [`Engine::relax`]) is under this fraction of the store's budget, as
+/// (numerator, denominator). A step is taken at the limit, 10% over the budget at the most (see
+/// `BUDGET_OVERFLOW` in `main`), so a step taken back leaves room: it is not taken again at once.
+const RELAX_BELOW: (usize, usize) = (19, 20);
+
+/// A step that was taken back and taken again stays until the camera has moved this fraction of
+/// `d0`: the bands' model of what a step wants (`Bands::weight`) is for flat ground.
+const BARRED_FOR: f64 = 4.0;
+
+/// How often the soft misses are counted, when a diagnostic asks for them.
+const SOFT_MISSES_EVERY: Duration = Duration::from_millis(100);
+
+/// The places that prefetch looks at, in seconds along the camera's velocity (ADR 0004: a lead of
+/// 1 to 2 s).
+const LEAD: [f64; AHEAD] = [1.0, 2.0];
+/// Slower than this, in Voxels a second (1 m/s), the camera is standing and there is no lead.
+const LEAD_FROM_SPEED: f64 = VOXELS_PER_METRE;
+
+/// `bands` at `step` of [`COARSENING`] (0 is as they are).
+fn coarsened(bands: Bands, step: usize) -> Bands {
+    match step.checked_sub(1).and_then(|i| COARSENING.get(i)) {
+        Some(&(from, factor)) => bands.coarsened(from, factor),
+        None => bands,
+    }
+}
 
 /// How many arrivals the next batch takes in, given the `left` of the slice and what one is
 /// expected to `cost`: [`BATCH_SHARE`] of the room, at least [`LEAST_BATCH`] if there is room for
@@ -163,6 +200,11 @@ pub struct Stats {
     /// Bricks drawn at each level (see [`Scene::level_bricks`]).
     pub level_bricks: [usize; LEVELS],
     pub bands: Option<Bands>,
+    /// Steps of coarsening at the memory cap (see [`COARSENING`]), 0 for none.
+    pub coarsening: usize,
+    /// Bricks drawn coarser than the bands ask because their children are not resident; counted
+    /// only if [`SceneWorker::count_soft_misses`] says to.
+    pub soft_misses: usize,
     pub loader: LoaderStats,
     /// What costs more to find out, as of a few times a second.
     pub slow: Arc<Slow>,
@@ -204,6 +246,8 @@ impl Stats {
     /// Whether `other` has the same counts, which are cheap to look at: the rest changes slowly.
     fn same_counts(&self, other: &Stats) -> bool {
         self.waiting == other.waiting
+            && self.soft_misses == other.soft_misses
+            && self.coarsening == other.coarsening
             && self.loader == other.loader
             && self.level_bricks == other.level_bricks
     }
@@ -219,6 +263,8 @@ fn stats_of(scene: &Scene, loader: &Loader, slow: &Arc<Slow>, eviction: Eviction
         waiting: scene.waiting(),
         level_bricks,
         bands: scene.bands(),
+        coarsening: 0,
+        soft_misses: 0,
         loader: LoaderStats::of(loader),
         slow: Arc::clone(slow),
         eviction,
@@ -287,6 +333,9 @@ struct CoarseWork {
 
 struct Inbox {
     camera: [f64; 3],
+    /// The camera's velocity, in Voxels a second, as the frame thread has seen it move: what the
+    /// lead looks ahead along (zero for no lead).
+    velocity: [f64; 3],
     /// Jobs that the frame thread waits for, with the number each is to be told done by.
     jobs: VecDeque<(u64, Job)>,
     issued: u64,
@@ -312,6 +361,9 @@ struct Shared {
     finished: Condvar,
     /// Whether taking in what the loader generated is held back.
     paused: AtomicBool,
+    /// Whether [`Stats::soft_misses`] is counted, which looks at every brick that waits (a
+    /// diagnostic: see [`SceneWorker::count_soft_misses`]).
+    count_soft_misses: AtomicBool,
 }
 
 /// What the frame thread has no more use for, which it hands back for the scene thread to use
@@ -363,6 +415,7 @@ impl SceneWorker {
         let shared = Arc::new(Shared {
             inbox: Mutex::new(Inbox {
                 camera,
+                velocity: [0.0; 3],
                 jobs: VecDeque::new(),
                 issued: 0,
                 shutdown: false,
@@ -376,8 +429,10 @@ impl SceneWorker {
             }),
             finished: Condvar::new(),
             paused: AtomicBool::new(false),
+            count_soft_misses: AtomicBool::new(false),
         });
         let (garbage, graveyard) = mpsc::channel();
+        let user_bands = scene.bands();
         let engine = Engine {
             scene,
             loader,
@@ -397,6 +452,17 @@ impl SceneWorker {
             evicting: None,
             evict_from: 0,
             eviction: EvictionStats::default(),
+            user_bands,
+            coarsening: 0,
+            coarsened_at: Instant::now(),
+            units_per_node: 0.0,
+            relaxed: false,
+            barred: None,
+            over_the_cap: false,
+            soft_misses: 0,
+            soft_misses_at: Instant::now(),
+            ahead: [None; AHEAD],
+            velocity: [0.0; 3],
             #[cfg(test)]
             coarse_sleep: Duration::ZERO,
         };
@@ -418,13 +484,23 @@ impl SceneWorker {
     /// Tells the thread where the camera is, a position in Voxels: it follows it when it has the
     /// time, and a camera that moved on again by then is not followed to. Does not wait: if the
     /// thread is at the camera at this moment, it is told the next time.
-    pub fn follow(&self, camera: [f64; 3]) {
+    /// A `velocity` for the camera, in Voxels a second, makes the thread look ahead along it for
+    /// prefetch (zero for none).
+    pub fn follow_moving(&self, camera: [f64; 3], velocity: [f64; 3]) {
         if let Ok(mut inbox) = self.shared.inbox.try_lock()
-            && inbox.camera != camera
+            && (inbox.camera != camera || inbox.velocity != velocity)
         {
             inbox.camera = camera;
+            inbox.velocity = velocity;
             self.shared.wake.notify_one();
         }
+    }
+
+    /// Has the thread count the soft misses in each [`Stats`] it publishes (or not): a diagnostic,
+    /// since it looks at every brick that waits.
+    #[cfg(test)]
+    pub fn count_soft_misses(&self, on: bool) {
+        self.shared.count_soft_misses.store(on, Ordering::Relaxed);
     }
 
     /// Holds back (or lets go of) taking in what the loader generated (see
@@ -635,9 +711,34 @@ struct Engine {
     sync_waiting: Option<u64>,
     /// Eviction that is going on, if the store went over its budget.
     evicting: Option<Evicting>,
-    /// Eviction does not begin before the store holds more than this (see [`EVICT_BACKOFF`]).
+    /// Eviction does not begin before the store holds more than this (see [`EVICT_RETRY`]).
     evict_from: usize,
     eviction: EvictionStats,
+    /// The bands the frame thread asked for, which the scene's are [`COARSENING`] of.
+    user_bands: Option<Bands>,
+    /// How many steps of [`COARSENING`] the scene's bands are at, and when that last changed.
+    coarsening: usize,
+    coarsened_at: Instant,
+    /// How many units the store held for each node of the selection when the last step was taken
+    /// (everything it held was wanted then), for working out what a step taken back would want.
+    units_per_node: f64,
+    /// The last change of step was one taken back: if the next is a step up again, what was taken
+    /// back did not fit after all.
+    relaxed: bool,
+    /// A step that was taken back and had to be taken again, and where the camera was: it is not
+    /// taken back until the camera has gone a way from there (the model that says it fits is
+    /// for flat ground, and can be wrong).
+    barred: Option<(usize, [f64; 3])>,
+    /// Eviction has done what it can and the store is over its limit: the next step of coarsening
+    /// is due when the last has stood long enough.
+    over_the_cap: bool,
+    /// The last count of soft misses, and when (see [`SOFT_MISSES_EVERY`]).
+    soft_misses: usize,
+    soft_misses_at: Instant,
+    /// The places the scene looks ahead to (see [`Engine::look_ahead`]), and the velocity of the
+    /// camera that was looked at last.
+    ahead: [Option<[f64; 3]>; AHEAD],
+    velocity: [f64; 3],
     #[cfg(test)]
     coarse_sleep: Duration,
 }
@@ -661,19 +762,23 @@ enum Evicting {
     },
 }
 
-/// Whether the unit `(level, coord)`, whose children are resident, is wanted: the bands split it,
-/// the scene has split it (every brick drawn is under one that is split, and so is every brick
-/// over it), or the loader is making the children of one of its children, which would be held
-/// under it.
+/// Whether the unit `(level, coord)`, whose children are resident, is wanted: the bands split it
+/// or the margin about the camera wants its children ([`render::lod::Placed::class`]: the lead, prefetch, is
+/// not kept, and goes first when the store is over its budget), the scene has split it (every
+/// brick drawn is under one that is split, and so is every brick over it), or the loader is making
+/// the children of one of its children, which would be held under it.
 fn wanted<'a>(
     scene: &'a Scene,
     loader: &'a Loader,
     bands: Bands,
     camera: [f64; 3],
 ) -> impl Fn(usize, BrickCoord) -> bool + 'a {
+    let reach = scene.reach().from(camera);
     move |level, coord| {
-        bands.split(level, brick_distance(camera, level, coord), Some(true))
-            || scene.splits(level, coord)
+        matches!(
+            reach.class(bands, level, coord),
+            Some(Class::Drawn | Class::Margin)
+        ) || scene.splits(level, coord)
             || (level > 1
                 && coord
                     .children()
@@ -687,23 +792,47 @@ impl Engine {
         let _watch = DeathWatch(Arc::clone(&self.shared));
         let mut idle = false;
         loop {
-            let (camera, jobs) = {
+            let (camera, velocity, jobs) = {
                 let mut inbox = lock(&self.shared.inbox);
-                if idle && inbox.jobs.is_empty() && Some(inbox.camera) == self.camera {
+                if idle
+                    && inbox.jobs.is_empty()
+                    && Some(inbox.camera) == self.camera
+                    && inbox.velocity == self.velocity
+                {
                     let shared = Arc::clone(&self.shared);
-                    let (camera, paused) = (self.camera, self.paused);
+                    let (camera, paused, moving) = (self.camera, self.paused, self.velocity);
                     let quiet = |inbox: &mut Inbox| {
                         inbox.jobs.is_empty()
                             && Some(inbox.camera) == camera
+                            && inbox.velocity == moving
                             && !inbox.shutdown
                             && shared.paused.load(Ordering::Acquire) == paused
                     };
-                    inbox = if self.published.loader.pending == 0 {
+                    // While the bands are coarsened the thread looks at the clock, to take a step
+                    // back when what is wanted fits: when the hold is over, and then once in
+                    // each hold. A camera that is exactly still wakes nothing else.
+                    let held = if self.coarsening > 0 {
+                        match COARSEN_HOLD.saturating_sub(self.coarsened_at.elapsed()) {
+                            Duration::ZERO => COARSEN_HOLD,
+                            left => left,
+                        }
+                    } else {
+                        Duration::ZERO
+                    };
+                    inbox = if self.published.loader.pending == 0 && !self.over_the_cap {
                         // Nothing is on its way: only the frame thread can give it something to do.
-                        self.shared
-                            .wake
-                            .wait_while(inbox, |inbox| quiet(inbox))
-                            .expect("the frame thread panicked")
+                        if held.is_zero() {
+                            self.shared
+                                .wake
+                                .wait_while(inbox, |inbox| quiet(inbox))
+                                .expect("the frame thread panicked")
+                        } else {
+                            self.shared
+                                .wake
+                                .wait_timeout_while(inbox, held, |inbox| quiet(inbox))
+                                .expect("the frame thread panicked")
+                                .0
+                        }
                     } else {
                         self.shared
                             .wake
@@ -715,8 +844,13 @@ impl Engine {
                 if inbox.shutdown {
                     return;
                 }
-                (inbox.camera, std::mem::take(&mut inbox.jobs))
+                (
+                    inbox.camera,
+                    inbox.velocity,
+                    std::mem::take(&mut inbox.jobs),
+                )
             };
+            self.look_ahead(camera, velocity);
             self.paused = self.shared.paused.load(Ordering::Acquire);
             let mut worked = !jobs.is_empty();
             // A sync is done when the rest of what the thread does in this round is.
@@ -766,6 +900,8 @@ impl Engine {
                 }
             }
             worked |= self.evict();
+            self.coarsen_more();
+            self.relax();
             // A sync is done when the coarse levels over the Edits before it are made, too.
             let busy = !self.coarse.is_empty();
             let synced = if busy {
@@ -812,7 +948,11 @@ impl Engine {
                 });
                 Some(update)
             }
-            Job::Bands(bands) => self.scene.set_bands(&store, bands)?,
+            Job::Bands(bands) => {
+                self.user_bands = Some(bands);
+                self.scene
+                    .set_bands(&store, coarsened(bands, self.coarsening))?
+            }
             #[cfg(test)]
             Job::Sync | Job::Panic | Job::Stall(_) | Job::SlowCoarse(_) => {
                 unreachable!("not run here")
@@ -870,7 +1010,8 @@ impl Engine {
 
     /// Moves the scene to `camera`, if it is not there. Whether it was moved.
     fn follow(&mut self, camera: [f64; 3]) -> Result<bool, RingsFull> {
-        if self.camera == Some(camera) {
+        // A camera that has not moved is looked at again for a brick that the loader gave up on.
+        if self.camera == Some(camera) && !self.scene.rewanted() {
             return Ok(false);
         }
         let store = self.store.read().expect("the store's lock is not poisoned");
@@ -891,6 +1032,8 @@ impl Engine {
             return Ok(false);
         };
         let started = Instant::now();
+        // The reach first: what is asked for is classed by it.
+        self.loader.set_reach(self.scene.reach());
         {
             let store = self.store.read().expect("the store's lock is not poisoned");
             self.loader.cancel(self.scene.take_cancelled());
@@ -928,7 +1071,11 @@ impl Engine {
                             store.hold_children_solid(key.0, key.1, bricks);
                             resident.push(key);
                         }
-                        Arrival::Dropped(key) => self.scene.unwant(key),
+                        Arrival::Dropped(key) => {
+                            self.scene.unwant(key);
+                            // The scene looks at it again: that is work for the next round.
+                            took = true;
+                        }
                     }
                 }
             }
@@ -1022,14 +1169,152 @@ impl Engine {
         };
         if done {
             let store = self.store.read().expect("the store's lock is not poisoned");
-            self.evict_from = if store.over_budget() {
-                store.streamed_len() / EVICT_BACKOFF.1 * EVICT_BACKOFF.0
-            } else {
-                0
+            let (over_limit, over_budget) = (store.over_limit(), store.over_budget());
+            self.evict_from = match store.budget() {
+                Some(budget) if over_budget => {
+                    store.streamed_len()
+                        + (budget.limit() - budget.bricks) / EVICT_RETRY.1 * EVICT_RETRY.0
+                }
+                _ => 0,
             };
             self.evicting = None;
+            drop(store);
+            // Everything that is left is wanted and it is still over the limit: draw the farthest
+            // bands coarser rather than drop a brick that is wanted (ADR 0004).
+            self.over_the_cap = over_limit && self.coarsening < COARSENING.len();
         }
         self.evicting.is_some()
+    }
+
+    /// At the memory cap, takes the next step of [`COARSENING`] once the last has stood for
+    /// [`COARSEN_HOLD`], and has eviction look again.
+    fn coarsen_more(&mut self) {
+        if !self.over_the_cap || self.coarsened_at.elapsed() < COARSEN_HOLD {
+            return;
+        }
+        // What the store holds for each node, while all it holds is wanted: taken before the
+        // scene is selected again.
+        let per_node = {
+            let store = self.store.read().expect("the store's lock is not poisoned");
+            store.streamed_len() as f64 / self.scene.nodes().max(1) as f64
+        };
+        let step = self.coarsening + 1;
+        let was_relaxed = self.relaxed;
+        if self.coarsen(step) {
+            self.units_per_node = per_node;
+            self.relaxed = false;
+            if was_relaxed {
+                self.barred = self.scene.camera().map(|camera| (step, camera));
+            }
+            self.over_the_cap = false;
+            self.evict_from = 0;
+        }
+    }
+
+    /// Takes the scene to `step` of [`COARSENING`], if it has stood at its step for
+    /// [`COARSEN_HOLD`]: the scene is selected and packed again, and the units that the coarser
+    /// bands do not want are for eviction to take. Whether it did.
+    fn coarsen(&mut self, step: usize) -> bool {
+        let Some(bands) = self.user_bands else {
+            return false;
+        };
+        if self.coarsened_at.elapsed() < COARSEN_HOLD {
+            return false;
+        }
+        let store = self.store.read().expect("the store's lock is not poisoned");
+        let update = self.scene.set_bands(&store, coarsened(bands, step));
+        drop(store);
+        match update {
+            Ok(update) => {
+                self.coarsening = step;
+                self.coarsened_at = Instant::now();
+                self.note(update);
+                true
+            }
+            // The scene is not to be used again, which the next job finds. It is not selected
+            // again every round meanwhile.
+            Err(RingsFull) => {
+                self.coarsened_at = Instant::now();
+                false
+            }
+        }
+    }
+
+    /// Takes a step of coarsening back when what the scene would want with it taken back fits the
+    /// store's budget with room to spare ([`RELAX_BELOW`]): the camera has slowed or settled, so
+    /// the lead and the trail are gone, or it is where less is wanted. What the store holds says
+    /// nothing of it, since eviction stops once the store is under its budget: this is worked out
+    /// from the nodes the scene wants, as the bands' [`Bands::weight`] of the step before is to that
+    /// of now, and the units the store held for a node when the step was taken.
+    fn relax(&mut self) {
+        let Some(bands) = self.user_bands else {
+            return;
+        };
+        if self.coarsening == 0
+            || self.loader.pending() != 0
+            || self.evicting.is_some()
+            || self.coarsened_at.elapsed() < COARSEN_HOLD
+        {
+            return;
+        }
+        if let Some((step, from)) = self.barred {
+            let moved = self.scene.camera().map_or(f64::INFINITY, |camera| {
+                (0..3)
+                    .map(|a| (camera[a] - from[a]).powi(2))
+                    .sum::<f64>()
+                    .sqrt()
+            });
+            if step == self.coarsening && moved <= bands.d0() / BARRED_FOR {
+                return;
+            }
+            self.barred = None;
+        }
+        let before = coarsened(bands, self.coarsening - 1).weight();
+        let now = coarsened(bands, self.coarsening).weight();
+        let would_want = self.scene.nodes() as f64 * before / now * self.units_per_node;
+        let fits = {
+            let store = self.store.read().expect("the store's lock is not poisoned");
+            store.budget().is_some_and(|budget| {
+                would_want * (RELAX_BELOW.1 as f64) < (budget.bricks * RELAX_BELOW.0) as f64
+            })
+        };
+        if fits && self.coarsen(self.coarsening - 1) {
+            self.relaxed = true;
+        }
+    }
+
+    /// Looks ahead along `velocity` from `camera`: the places [`LEAD`] seconds on, which the scene
+    /// wants the children of the bricks near at the lowest priority. A lead that has moved by less
+    /// than a sixteenth of `d0` is kept, so that a camera whose velocity is noise does not make the
+    /// selection look again.
+    fn look_ahead(&mut self, camera: [f64; 3], velocity: [f64; 3]) {
+        self.velocity = velocity;
+        let Some(bands) = self.scene.bands() else {
+            return;
+        };
+        let speed = velocity.iter().map(|v| v * v).sum::<f64>().sqrt();
+        let ahead: [Option<[f64; 3]>; AHEAD] = if speed < LEAD_FROM_SPEED {
+            [None; AHEAD]
+        } else {
+            std::array::from_fn(|i| {
+                Some(std::array::from_fn(|a| camera[a] + velocity[a] * LEAD[i]))
+            })
+        };
+        let kept = ahead.iter().zip(&self.ahead).all(|pair| match pair {
+            (None, None) => true,
+            (Some(new), Some(old)) => {
+                let moved = (0..3)
+                    .map(|a| (new[a] - old[a]).powi(2))
+                    .sum::<f64>()
+                    .sqrt();
+                moved <= bands.d0() / 16.0
+            }
+            _ => false,
+        });
+        if !kept {
+            self.ahead = ahead;
+            self.scene.set_ahead(ahead);
+        }
     }
 
     /// Looks at parts of the units for [`EVICT_LOOK`], from part `next`. Returns the state it is
@@ -1164,7 +1449,17 @@ impl Engine {
                 self.spare.push(*copy);
             }
         }
-        let stats = stats_of(&self.scene, &self.loader, &self.slow, self.eviction);
+        let mut stats = stats_of(&self.scene, &self.loader, &self.slow, self.eviction);
+        stats.coarsening = self.coarsening;
+        if self.shared.count_soft_misses.load(Ordering::Relaxed) {
+            // Looking at every brick that waits takes milliseconds in a fill, so it is done a
+            // few times a second, and the count is the last one in between.
+            if self.soft_misses_at.elapsed() >= SOFT_MISSES_EVERY {
+                self.soft_misses_at = Instant::now();
+                self.soft_misses = self.scene.soft_misses();
+            }
+            stats.soft_misses = self.soft_misses;
+        }
         let changes = std::mem::replace(&mut self.changes, Changes::None);
         if matches!(changes, Changes::None) && stats.same_counts(&self.published) && job.is_none() {
             return;

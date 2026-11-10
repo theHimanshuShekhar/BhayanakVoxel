@@ -491,6 +491,16 @@ impl Tables {
     }
 }
 
+/// The calling thread's time on a CPU and its time waiting for one while it could run, in
+/// nanoseconds, from the kernel's scheduler (`/proc/thread-self/schedstat`), on Linux. A frame
+/// that took long in wall time but little of either is a thread that was not scheduled (the
+/// 11.4 ms frame of #142's flight).
+fn schedstat() -> Option<(u64, u64)> {
+    let text = std::fs::read_to_string("/proc/thread-self/schedstat").ok()?;
+    let mut fields = text.split_whitespace();
+    Some((fields.next()?.parse().ok()?, fields.next()?.parse().ok()?))
+}
+
 /// One frame's scene work, timed, as the client does it.
 fn scene_frame(
     world: &mut World,
@@ -499,6 +509,7 @@ fn scene_frame(
     updates: &mut Updates,
     tables: &mut Tables,
 ) {
+    let sched_before = schedstat();
     let started = Instant::now();
     let moved = world.recentre(position).unwrap();
     let recentred = started.elapsed();
@@ -514,16 +525,45 @@ fn scene_frame(
     updates.stream.record(streaming.elapsed());
     work.record(started.elapsed());
     let took = started.elapsed();
+    let sched = schedstat()
+        .zip(sched_before)
+        .map(|((run, wait), (run0, wait0))| {
+            ((run - run0) as f64 / 1e6, (wait - wait0) as f64 / 1e6)
+        });
     let rebuilt = moved
         .as_ref()
         .is_some_and(|u| matches!(u, SceneUpdate::Rebuilt))
         || streamed.iter().any(|u| matches!(u, SceneUpdate::Rebuilt));
     let grown = tables.after_frame(world, rebuilt);
-    if took > Duration::from_millis(16) {
+    // Over the 8 ms that the frame thread is held to (HELD), or `FULLSIZE_SLOW_MS` to look at the
+    // tail of a run: where the time went. The 11.4 ms frame of #142's flight was one of these.
+    static SLOW: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    let slow = *SLOW.get_or_init(|| {
+        std::env::var("FULLSIZE_SLOW_MS")
+            .ok()
+            .and_then(|ms| ms.parse().ok())
+            .map_or(Duration::from_millis(8), Duration::from_millis)
+    });
+    if took > slow {
+        let words = |u: &Option<SceneUpdate>| match u {
+            Some(SceneUpdate::Rings(patch)) => patch.words(),
+            _ => 0,
+        };
+        let moved_words = words(&moved);
+        let streamed_words: usize = streamed.iter().map(|u| words(&Some(u.clone()))).sum();
         eprintln!(
-            "  slow frame: {took:.1?} (recentre {recentred:.1?}), rebuilt {rebuilt}, grew {grown:?}, \
-             {} batches shown",
-            streamed.len()
+            "  slow frame: {took:.1?} (recentre {recentred:.1?}, stream {:.1?}), patch words {moved_words} + \
+             {streamed_words}, rebuilt {rebuilt}, grew {grown:?}, {} batches shown, load {}; the \
+             thread ran {:.1} ms and waited for a core {:.1} ms (ms, from the scheduler)",
+            streaming.elapsed(),
+            streamed.len(),
+            std::fs::read_to_string("/proc/loadavg")
+                .unwrap_or_default()
+                .split_whitespace()
+                .next()
+                .unwrap_or("?"),
+            sched.map_or(f64::NAN, |s| s.0),
+            sched.map_or(f64::NAN, |s| s.1),
         );
     }
     updates.add(moved);
@@ -624,9 +664,11 @@ const HELD_FLIGHT: Held = HELD;
 const HELD_FILL_SECS: f64 = 300.0;
 /// The most the drawn scene may use per copy (the words of the bricks it draws, in MiB), near the
 /// ground at the full bands: measured 474 MiB for 3.44 million drawn bricks at about 144 bytes
-/// each (the words of the bricks and their regions). The prefetch simulator's shell at rest is 227 to 259 MB (#49), about half as many
-/// drawn bricks; #143 re-checks that. The bands bound the scene whatever the store holds, so this
-/// is a ceiling on the client, with some room over what was measured.
+/// each (the words of the bricks and their regions). The prefetch simulator's shell at rest, 227 to
+/// 259 MB (#49), is about half of that because it stops at the horizon, which the client does not
+/// yet: it draws the whole Planet (#143 re-checked it, `prefetch-sim`'s `built_size`). The bands
+/// bound the scene whatever the store holds, and the margins are not drawn, so this is a ceiling
+/// on the client, with some room over what was measured.
 const SCENE_MIB_MOST: f64 = 512.0;
 
 impl Held {
@@ -860,7 +902,8 @@ fn the_full_size_planet_streams_in_and_walking_over_it_does_not_stall() {
     );
     eprintln!(
         "the scene: {:.0} MiB used after the fill, at most {:.0} MiB in the flight (the prefetch \
-         simulator's shell at rest near the ground is 227 to 259 MB)",
+         simulator's horizon-capped shell at rest near the ground is 227 to 259 MB; the client \
+         draws the whole Planet)",
         mib(scene_after_fill),
         mib(fly_updates.scene_peak)
     );
@@ -873,7 +916,13 @@ fn the_full_size_planet_streams_in_and_walking_over_it_does_not_stall() {
         "the scene used {:.0} MiB, held to {SCENE_MIB_MOST}",
         mib(scene_after_fill.max(fly_updates.scene_peak))
     );
+    eprintln!(
+        "steps of coarsening at the end: {}",
+        world.stats().coarsening
+    );
     if std::env::var_os("FULLSIZE_NO_BUDGET").is_none() {
+        // The budget is the complete set with the margins: the bands are not coarsened to fit it.
+        assert_eq!(world.stats().coarsening, 0);
         assert!(
             fly_updates.held_peak <= budget.limit(),
             "the store counted {} against a limit of {}",
@@ -1345,7 +1394,7 @@ fn changes_made_while_a_copy_of_the_whole_scene_waits_go_into_the_copy() {
     let (ahead, _) = tangents(camera.horizon_up);
     for n in 1..=3 {
         let at: [f64; 3] = std::array::from_fn(|a| camera.position[a] + 20.0 * n as f64 * ahead[a]);
-        world.worker().follow(at);
+        world.worker().follow_moving(at, [0.0; 3]);
         world.worker().sync().unwrap();
     }
     let ready = world.worker().take(true).unwrap();
@@ -1518,7 +1567,7 @@ const FLIGHT_FRAMES: usize = 1500;
 fn flying_away_and_back_keeps_the_store_within_its_budget_and_leaves_no_hole_or_stale_edit() {
     // The budget is what the complete set holds with the camera at the spawn, and 7 per cent over:
     // the complete set elsewhere is a few per cent more or less, and a store that cannot get under
-    // its limit with everything wanted is left alone by eviction for a while (`EVICT_BACKOFF`), so
+    // its limit with everything wanted is left alone by eviction for a while (`EVICT_RETRY`), so
     // the margin is the most that the flight takes the store over (3 per cent a shell), less a little.
     let (mut first, _s, spawn) = spawned_world(2);
     fill(&mut first, spawn.position);
@@ -1611,4 +1660,383 @@ fn flying_away_and_back_keeps_the_store_within_its_budget_and_leaves_no_hole_or_
         "the crater is in the scene: the ray hit at {dug_t} when it was dug and at {again} now"
     );
     assert!(world.store().streamed_len() <= budget.limit());
+}
+
+/// A world like [`spawned_world`] with the residency margins of ADR 0004 and a `budget` if given.
+fn margined_world(
+    workers: usize,
+    budget: Option<brick_store::Budget>,
+) -> (World, ServerEnd, Camera) {
+    let mut store = spawned_store();
+    if let Some(budget) = budget {
+        store.set_budget(budget);
+    }
+    let camera = crate::spawn_camera(ground());
+    let mut scene = Scene::rings(&store, camera.position, bands(), bound()).unwrap();
+    scene.set_margins(&store, render::lod::Margins::standard());
+    let loader = Loader::new(store.source().unwrap(), camera.position, bands(), workers);
+    let (client, server) = loopback();
+    let world = World::new(scene, Predictor::new(store), client).with_loader(loader);
+    (world, server, camera)
+}
+
+#[test]
+fn margins_make_more_of_the_store_resident_and_draw_no_more() {
+    let (mut plain, _s, camera) = spawned_world(2);
+    fill(&mut plain, camera.position);
+    plain.sync().unwrap();
+    let (mut margined, _s2, camera) = margined_world(2, None);
+    fill(&mut margined, camera.position);
+    margined.sync().unwrap();
+    let drawn = |w: &World| (0..LEVELS).map(|l| w.level_bricks(l)).collect::<Vec<_>>();
+    // A margin is not drawn: the bricks that are, are the bands'. It draws fewer, even, since the
+    // bricks it makes resident are known to be full beside the ones that are drawn, which buries more.
+    let (a, b) = (drawn(&plain), drawn(&margined));
+    eprintln!("drawn per level {a:?} without margins, {b:?} with");
+    assert!(a.iter().zip(&b).all(|(plain, margin)| margin <= plain));
+    let (a, b) = (
+        plain.store().streamed_len(),
+        margined.store().streamed_len(),
+    );
+    eprintln!("store counted {a} without margins, {b} with");
+    assert!(b > a + a / 50, "the margin adds units: {a} {b}");
+    // Nothing the bands do not ask for yet is a soft miss.
+    margined.count_soft_misses();
+    stream(&mut margined, camera.position);
+    assert_eq!(margined.stats().soft_misses, 0);
+}
+
+#[test]
+fn flying_with_margins_evicts_the_trail_and_keeps_the_margin_the_camera_is_in() {
+    let (mut first, _s, spawn) = margined_world(2, None);
+    fill(&mut first, spawn.position);
+    first.sync().unwrap();
+    let full = first.store().streamed_len();
+    drop(first);
+    let budget = brick_store::Budget {
+        bricks: full * 102 / 100,
+        overflow: 0.01,
+    };
+    let (mut world, _server, spawn) = margined_world(2, Some(budget));
+    world.count_soft_misses();
+    fill(&mut world, spawn.position);
+    let (ahead, right) = tangents(spawn.horizon_up);
+    let turn = fly(&mut world, spawn.position, ahead, 20.0, FLIGHT_FRAMES);
+    let away = fly(&mut world, turn, right, 20.0, FLIGHT_FRAMES);
+    settle(&mut world, away);
+    world.sync().unwrap();
+    let store = world.store();
+    eprintln!(
+        "complete set {full}; after the flight {} (limit {}), {} bricks evicted",
+        store.streamed_len(),
+        budget.limit(),
+        store.evicted_len()
+    );
+    assert!(store.evicted_len() > 0, "the flight left units to evict");
+    assert!(store.streamed_len() <= budget.limit());
+    drop(store);
+    // Settled: nothing the margin wants is missing, and eviction left the units it wants alone
+    // (else the scene thread would be generating them again, and the loader would not be idle).
+    stream(&mut world, away);
+    world.sync().unwrap();
+    assert!(idle(&world));
+    assert_eq!(world.stats().soft_misses, 0);
+}
+
+#[test]
+fn a_prefetch_lead_makes_bricks_ahead_that_a_camera_without_one_does_not() {
+    let (mut without, _s, camera) = spawned_world(2);
+    fill(&mut without, camera.position);
+    without.set_lead(false);
+    let (ahead, _) = tangents(camera.horizon_up);
+    let (mut leading, _s2, _) = spawned_world(2);
+    fill(&mut leading, camera.position);
+    // Both go the same way at 7.5 m/s (0.75 Voxels every 5 ms: the test Planet is small, so the
+    // places a lead looks at are near its ground only if it is short), and the frames show it to the one
+    // that looks ahead.
+    for step in 1..=160 {
+        let at: [f64; 3] =
+            std::array::from_fn(|a| camera.position[a] + ahead[a] * 0.75 * f64::from(step));
+        for world in [&mut without, &mut leading] {
+            world.recentre(at).unwrap();
+            world.stream::<RingsFull>(at, |_, _| Ok(())).unwrap();
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    without.sync().unwrap();
+    leading.sync().unwrap();
+    let (a, b) = (
+        without.loader().unwrap().generated,
+        leading.loader().unwrap().generated,
+    );
+    eprintln!("generated {a} without a lead, {b} with one");
+    assert!(b > a, "the lead makes bricks: {a} {b}");
+}
+
+#[test]
+fn at_the_cap_the_farthest_bands_are_coarsened_instead_of_a_wanted_brick_dropped() {
+    // The budget is a share of the complete set with the margins: less than the bands want.
+    let (mut full, _s, camera) = margined_world(2, None);
+    fill(&mut full, camera.position);
+    full.sync().unwrap();
+    let complete = full.store().streamed_len();
+    let drawn: usize = (0..LEVELS).map(|l| full.level_bricks(l)).sum();
+    drop(full);
+    let budget = brick_store::Budget {
+        bricks: complete * 90 / 100,
+        overflow: 0.02,
+    };
+    let (mut world, _server, camera) = margined_world(2, Some(budget));
+    world.count_soft_misses();
+    let began = Instant::now();
+    loop {
+        stream(&mut world, camera.position);
+        world.sync().unwrap();
+        if idle(&world) && !world.store().over_limit() && world.stats().coarsening > 0 {
+            break;
+        }
+        assert!(
+            began.elapsed() < Duration::from_secs(120),
+            "does not settle: {} counted of {}, coarsening {}",
+            world.store().streamed_len(),
+            budget.limit(),
+            world.stats().coarsening
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    let now: usize = (0..LEVELS).map(|l| world.level_bricks(l)).sum();
+    eprintln!(
+        "coarsening {} steps: {} counted of a limit of {}, {} bricks drawn of {drawn}",
+        world.stats().coarsening,
+        world.store().streamed_len(),
+        budget.limit(),
+        now
+    );
+    assert!(now < drawn, "the scene is coarser: {now} of {drawn}");
+    // Coarser, not holes: the ground under the camera is still drawn, at level 0.
+    let down = ray_through(
+        camera.position,
+        std::array::from_fn(|a| camera.position[a] - camera.horizon_up[a]),
+    );
+    let hit = trace(world.scene(), &down).expect("ground under the camera");
+    assert_eq!(world.scene().level_at(hit.voxel), Some(0));
+}
+
+#[test]
+fn coarsening_stands_while_what_is_wanted_does_not_fit_and_is_taken_back_when_it_does() {
+    let (mut full, _s, camera) = margined_world(2, None);
+    fill(&mut full, camera.position);
+    full.sync().unwrap();
+    let complete = full.store().streamed_len();
+    drop(full);
+    let budget = |share: usize| brick_store::Budget {
+        bricks: complete * share / 100,
+        overflow: 0.02,
+    };
+    let (mut world, _server, camera) = margined_world(2, Some(budget(90)));
+    let began = Instant::now();
+    let settle = |world: &mut World, done: &dyn Fn(&World) -> bool, what: &str| loop {
+        stream(world, camera.position);
+        world.sync().unwrap();
+        if idle(world) && done(world) {
+            return;
+        }
+        assert!(
+            began.elapsed() < Duration::from_secs(240),
+            "{what}: coarsening {}, {} held of a limit of {}",
+            world.stats().coarsening,
+            world.store().streamed_len(),
+            world.store().budget().unwrap().limit()
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    };
+    // Less room than the bands want: it coarsens, and settles within the limit.
+    settle(
+        &mut world,
+        &|w| w.stats().coarsening > 0 && !w.store().over_limit(),
+        "does not coarsen under a budget it does not fit",
+    );
+    // It stands: what is wanted at the step before still does not fit, so a few holds later (300 ms
+    // each in a test) the steps are what they were, not taken back and made again.
+    let steps = world.stats().coarsening;
+    for _ in 0..30 {
+        std::thread::sleep(Duration::from_millis(100));
+        stream(&mut world, camera.position);
+        world.sync().unwrap();
+    }
+    assert_eq!(world.stats().coarsening, steps, "the steps are not stable");
+    eprintln!("stands at {steps} steps");
+    // Room for it (what the camera wants fell, or the budget grew): the steps are taken back,
+    // one each hold, to none, and it is not coarsened again.
+    // The camera is exactly still and nothing is waited for with `sync` (which wakes the scene
+    // thread): the thread looks at the clock itself, or it stays coarse for good.
+    world.set_budget(budget(140));
+    let given_back = Instant::now();
+    while world.stats().coarsening > 0 {
+        stream(&mut world, camera.position);
+        assert!(
+            given_back.elapsed() < Duration::from_secs(60),
+            "a parked scene thread never takes the steps back: {} steps",
+            world.stats().coarsening
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    std::thread::sleep(Duration::from_millis(1000));
+    stream(&mut world, camera.position);
+    world.sync().unwrap();
+    assert_eq!(world.stats().coarsening, 0);
+    assert!(!world.store().over_limit());
+}
+
+/// One frame of a path at 60 a second, in real time: the camera is at `position`, the scene
+/// thread is told, and what it made is taken. Returns the soft misses it reports (counted by the
+/// scene thread, see [`crate::scene_worker::Stats::soft_misses`]).
+fn path_frame(world: &mut World, position: [f64; 3]) -> usize {
+    world.recentre(position).unwrap();
+    world.stream::<RingsFull>(position, |_, _| Ok(())).unwrap();
+    world.stats().soft_misses
+}
+
+/// What a path counted: frames with a soft miss, the bricks missed summed over the frames, and the
+/// most at once.
+struct Misses {
+    name: &'static str,
+    frames: usize,
+    with_misses: usize,
+    total: usize,
+    peak: usize,
+}
+
+/// Runs the camera along `position_at(t)` (seconds) for `seconds` at 60 frames a second, with the
+/// loader running, counting soft misses.
+fn run_path(
+    world: &mut World,
+    name: &'static str,
+    seconds: f64,
+    mut position_at: impl FnMut(&World, f64) -> [f64; 3],
+) -> Misses {
+    let frame = Duration::from_micros(16_667);
+    let began = Instant::now();
+    let mut misses = Misses {
+        name,
+        frames: 0,
+        with_misses: 0,
+        total: 0,
+        peak: 0,
+    };
+    while began.elapsed().as_secs_f64() < seconds {
+        let tick = Instant::now();
+        let position = position_at(world, began.elapsed().as_secs_f64());
+        let soft = path_frame(world, position);
+        misses.frames += 1;
+        misses.with_misses += usize::from(soft > 0);
+        misses.total += soft;
+        misses.peak = misses.peak.max(soft);
+        std::thread::sleep(frame.saturating_sub(tick.elapsed()));
+    }
+    eprintln!(
+        "  {name}: {} frames, {} with soft misses, {} bricks missed in all, {} at most at once; \
+         {} waiting at the end",
+        misses.frames,
+        misses.with_misses,
+        misses.total,
+        misses.peak,
+        world.waiting()
+    );
+    misses
+}
+
+/// The soft misses (a drawn brick whose wanted level is not resident, CONTEXT.md) on the paths of
+/// #143, in the real client at full size: a 50 m/s flight at 2 m and at 50 m, a 50 m/s vertical
+/// take-off, and standing still. Each starts at the spawn, with the shell complete and the
+/// camera still; the camera goes back to it and the loader catches up between paths. The runs differ
+/// in what is on: `FULLSIZE_MARGINS=0` has no margins, `FULLSIZE_PREFETCH=0` no prefetch (both on
+/// by default), and the counts are compared by hand. A 180 degree turn moves nothing the scene
+/// reads, since the selection does not look at the view and the whole Planet is drawn (ADR 0004), so
+/// that criterion is what it is: 2 s of the camera standing. About ten minutes at full size:
+/// `FULLSIZE_MARGINS=0 FULLSIZE_PREFETCH=0 cargo test --release -p client -- --ignored --nocapture soft_misses`.
+#[test]
+#[ignore = "generates the full-size world map"]
+fn soft_misses_on_the_flight_take_off_and_standing_paths() {
+    let off = |name: &str| std::env::var_os(name).is_some_and(|v| v == "0");
+    let (margins, prefetch) = (!off("FULLSIZE_MARGINS"), !off("FULLSIZE_PREFETCH"));
+    eprintln!("margins {margins}, prefetch {prefetch}");
+    let loaded = crate::load_planet();
+    let (client, _server) = loopback();
+    let mut world =
+        World::new(loaded.scene, Predictor::new(loaded.store), client).with_loader(loaded.loader);
+    world.set_lead(prefetch);
+    let spawn = loaded.camera;
+    let began = Instant::now();
+    wait_idle(&mut world, spawn.position, Duration::from_secs(5400));
+    // Counted from here: looking at every brick that waits slows a fill down.
+    world.count_soft_misses();
+    eprintln!("filled after {:.0?}", began.elapsed());
+    eprintln!("{}", memory(&world, "at rest"));
+
+    let (ahead, right) = tangents(spawn.horizon_up);
+    let up = spawn.horizon_up;
+    let speed = 50.0 * VOXELS_PER_METRE;
+    let radius = norm(spawn.position);
+    // Along the sphere that the camera is over, `extra` Voxels above the 2 m flight.
+    let along = move |world: &World, direction: [f64; 3], metres: f64, extra: f64| {
+        let flat: [f64; 3] =
+            std::array::from_fn(|a| spawn.position[a] + direction[a] * metres * VOXELS_PER_METRE);
+        let on = flat.map(|c| c / norm(flat) * radius);
+        let at = over_the_ground(&world.store(), on);
+        let length = norm(at);
+        std::array::from_fn(|a| at[a] + at[a] / length * extra)
+    };
+    let mut all = Vec::new();
+    all.push(run_path(&mut world, "flight at 2 m", 10.0, |w, t| {
+        along(w, ahead, 50.0 * t, 0.0)
+    }));
+    eprintln!("{}", memory(&world, "after the flight at 2 m"));
+    wait_idle(&mut world, spawn.position, Duration::from_secs(1200));
+    all.push(run_path(&mut world, "flight at 50 m", 10.0, |w, t| {
+        along(w, right, 50.0 * t, 48.0 * VOXELS_PER_METRE)
+    }));
+    eprintln!("{}", memory(&world, "after the flight at 50 m"));
+    wait_idle(&mut world, spawn.position, Duration::from_secs(1200));
+    all.push(run_path(&mut world, "vertical take-off", 6.0, |_, t| {
+        std::array::from_fn(|a| spawn.position[a] + up[a] * speed * t)
+    }));
+    eprintln!("{}", memory(&world, "after the take-off"));
+    wait_idle(&mut world, spawn.position, Duration::from_secs(1200));
+    all.push(run_path(&mut world, "standing still", 2.0, |_, _| {
+        spawn.position
+    }));
+    eprintln!("margins {margins}, prefetch {prefetch}:");
+    for m in &all {
+        eprintln!(
+            "  {:>18}: {:>4} of {} frames with soft misses, {:>8} brick-frames, peak {:>6}",
+            m.name, m.with_misses, m.frames, m.total, m.peak
+        );
+    }
+    eprintln!("coarsening steps: {}", world.stats().coarsening);
+}
+
+/// Streams with the camera at `camera` until the loader has nothing left (or `cap` is over). A
+/// jump back to a camera that no path counts, when it is not already there.
+fn wait_idle(world: &mut World, camera: [f64; 3], cap: Duration) {
+    let began = Instant::now();
+    let mut last = Instant::now();
+    loop {
+        world.recentre_moving(camera, [0.0; 3]).unwrap();
+        world.stream::<RingsFull>(camera, |_, _| Ok(())).unwrap();
+        if idle(world) {
+            return;
+        }
+        if last.elapsed() > Duration::from_secs(30) {
+            last = Instant::now();
+            eprintln!(
+                "  {:.0?}: {} waiting, {} pending",
+                began.elapsed(),
+                world.waiting(),
+                world.loader().unwrap().pending
+            );
+        }
+        assert!(began.elapsed() < cap, "does not fill");
+        std::thread::sleep(Duration::from_millis(16));
+    }
 }

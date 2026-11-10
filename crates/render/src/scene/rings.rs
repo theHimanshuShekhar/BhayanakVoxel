@@ -48,7 +48,7 @@ use super::{
     Bound, Level, MAX_LEVELS, REGION_BRICKS, REGION_FIRST_REF, REGION_VOXELS, REGION_WORDS,
     SOLID_FLAG, Scene, SceneUpdate, bit_of, encode_mixed, region_of,
 };
-use crate::lod::Bands;
+use crate::lod::{AHEAD, Bands, Margins, Reach};
 
 /// How many words the buffers of a scene of rings have, for each level, when the scene is given
 /// room instead of being sized by the bricks it holds. The levels share what they have, except
@@ -816,9 +816,15 @@ impl Scene {
     ) -> Result<SceneUpdate, RingsFull> {
         let rings = self.rings.as_ref().expect("a scene of rings");
         let (ball, sizing, clipped) = (rings.ball, rings.sizing, self.bound.is_some());
-        let reserved = rings.reserved;
+        let (reserved, reach) = (rings.reserved, rings.selection.reach());
         *self = Scene::rings_sized(store, camera, bands, ball, sizing)?;
         self.bound = clipped.then_some(ball);
+        if !reach.is_none()
+            && let Some(rings) = &mut self.rings
+        {
+            rings.selection.set_ahead(reach.ahead);
+            rings.selection.set_margins(store, reach.margins);
+        }
         if let (Some(reserved), Some(rings)) = (reserved, &mut self.rings) {
             let scale = (bands.d0() / reserved.d0).powi(2);
             let by = |n: usize| (n as f64 * scale) as usize;
@@ -999,6 +1005,45 @@ impl Scene {
     /// How many bricks wait for the bricks under them to be resident.
     pub fn waiting(&self) -> usize {
         self.rings.as_ref().map_or(0, |r| r.selection.waiting())
+    }
+
+    /// Whether the selection has a brick to look at again that no camera move will bring (see
+    /// [`Selection::rewanted`]).
+    pub fn rewanted(&self) -> bool {
+        self.rings.as_ref().is_some_and(|r| r.selection.rewanted())
+    }
+
+    /// Nodes of the selection: what the scene wants, drawn or split or in reach (see
+    /// [`Selection::nodes`]).
+    pub fn nodes(&self) -> usize {
+        self.rings.as_ref().map_or(0, |r| r.selection.nodes())
+    }
+
+    /// The soft misses of this moment (see [`Selection::soft_misses`]).
+    pub fn soft_misses(&self) -> usize {
+        self.rings.as_ref().map_or(0, |r| r.selection.soft_misses())
+    }
+
+    /// What residency looks at besides the bands (see [`Selection::reach`]).
+    pub fn reach(&self) -> Reach {
+        self.rings
+            .as_ref()
+            .map_or(Reach::NONE, |r| r.selection.reach())
+    }
+
+    /// Wants the children of the bricks within `margins` resident, without drawing them (see
+    /// [`Selection::set_margins`]). Kept when the scene is made again for other bands or a jump.
+    pub fn set_margins(&mut self, store: &BrickStore, margins: Margins) {
+        if let Some(rings) = &mut self.rings {
+            rings.selection.set_margins(store, margins);
+        }
+    }
+
+    /// Where the camera is going, for prefetch (see [`Selection::set_ahead`]).
+    pub fn set_ahead(&mut self, ahead: [Option<[f64; 3]>; AHEAD]) {
+        if let Some(rings) = &mut self.rings {
+            rings.selection.set_ahead(ahead);
+        }
     }
 
     /// The bricks of [`Scene::take_wanted`] that are not wanted any more: their nodes are gone

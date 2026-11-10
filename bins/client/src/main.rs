@@ -190,40 +190,44 @@ fn room_for(bands: Bands) -> Room {
     }));
     Room {
         held,
-        // 2.18 million bricks had their children resident at the end of the fill, and 2.53
-        // million after the walk (the store's budget counts them: see `budget_for`).
-        resident: scaled(3_160_000.0),
+        // 3.15 million bricks had their children resident at the end of the fill with the margins
+        // (#143; 2.18 million without), and 3.70 million after the walk, with the lead
+        // (2.53 million without both): the store's budget counts them (see `budget_for`).
+        resident: scaled(4_400_000.0),
         // The tree held 9.44 million nodes.
         nodes: scaled(11_800_000.0),
-        // Waiting, and asked of the loader, were 219 000 from the first request (208 000) to the
-        // end, and stuck 116 000.
-        waiting: scaled(277_000.0),
+        // Waiting, and asked of the loader, were 884 000 at the most with the margins (#143: the
+        // first request is 296 000 bricks, and the margin's children, a brick at the edge of
+        // every band, are asked for as the fill goes outward; 219 000 without them), and stuck
+        // 116 000.
+        waiting: scaled(1_100_000.0),
         stuck: scaled(150_000.0),
     }
 }
 
 /// What the store may hold (`BrickStore::streamed_len`: the bricks held under the Guard, and an
 /// entry for each unit whose children are resident), per d0 squared. The complete resident set
-/// counted 16.13 million at a `d0` of 1028.2 Voxels (the measurement of [`BRICKS_PER_D0_SQUARED`]:
-/// 14.63 million bricks held, 0.68 million of them the Guard's, which are not counted, and 2.18
-/// million units resident), which is 15.26 per d0 squared (27.7 before #142 left the air and the
-/// buried bricks out of the units: they are not held, and so not counted). The complete
-/// shell is what eviction keeps (ADR 0004; the prefetch simulator of #87 sizes its budget at the
-/// shell), so a camera that stays or walks never evicts; flying, which leaves a trail of the
-/// shells it passed through, does.
+/// counted 20.90 million with the margins of ADR 0004 at a `d0` of 1028.2 Voxels (#143: 18.43
+/// million bricks held, 0.68 million of them the Guard's, which are not counted, and 3.15 million
+/// units resident), which is 19.77 per d0 squared. Without the margins it was 16.13 million
+/// (15.26 per d0 squared, 27.7 before #142 left the air and the buried bricks out of the units:
+/// they are not held, and so not counted): the 1.25 radial margin and the 20 m vertical one make
+/// 30% more of the store resident, and the loader generates 45% more bricks to fill it (13.67
+/// million against 9.41). The complete shell, margins included, is what eviction keeps (ADR 0004;
+/// the prefetch simulator of #87 sizes its budget at the shell), so a camera that stays or walks
+/// never evicts; flying, which leaves a trail of the shells it passed through, does.
 ///
 /// #87's 227 to 259 MB per scene copy at 136 bytes a brick is the bricks that are *drawn*, which
 /// the bands bound (3.44 million, 474 MiB in the scene, at 34 words a brick) whatever the store
 /// holds. The host store holds about four times as many bricks as are drawn: the ancestors of
 /// every drawn brick, and the bricks beside and under them that the bands do not draw but split.
 /// That is what is budgeted here, since it is what grows.
-const STREAMED_PER_D0_SQUARED: f64 = 15.3;
+const STREAMED_PER_D0_SQUARED: f64 = 19.8;
 /// How far over the budget the store may go before eviction starts (ADR 0004 says 10 to 20%).
 /// A flight leaves a trail of the shells it passed through, and takes the store over the complete
-/// set (16.1 million counted at the end of the fill) by 12% in 840 m, 28% in 2.5 km and 57% in
-/// 5 km, measured with nothing evicted (#142), so 10% is evicted from within a kilometre. At the
-/// cap, when everything left is wanted, eviction waits until the store has grown by a quarter
-/// (`EVICT_BACKOFF` in `scene_worker`): coarsening the LOD to fit is #143's.
+/// set by 12% in 840 m, 28% in 2.5 km and 57% in 5 km, measured with nothing evicted (#142, with
+/// no margins), so 10% is evicted from within a kilometre. At the cap, when everything left is
+/// wanted, the farthest bands are drawn coarser instead (`COARSENING` in `scene_worker`).
 const BUDGET_OVERFLOW: f64 = 0.1;
 
 /// How much the store may hold, for the full bands at a bias of 1 scaled with `d0` squared like
@@ -337,6 +341,16 @@ fn landing(eye: [f64; 3], leash: Option<Leash>, ground: [f64; 3]) -> [f64; 3] {
     }
 }
 
+/// The residency margins: ADR 0004's. The full-size test can run without them to measure what they
+/// buy (`FULLSIZE_MARGINS=0`).
+fn margins() -> render::lod::Margins {
+    #[cfg(test)]
+    if std::env::var_os("FULLSIZE_MARGINS").is_some_and(|v| v == "0") {
+        return render::lod::Margins::NONE;
+    }
+    render::lod::Margins::standard()
+}
+
 /// Makes the Planet of `map` into what the client starts with: the spawn ring on gentle land,
 /// then the Guard, and the scene of the bands drawn from them, with a loader to make the resident set complete
 /// (#86). The ring and the Guard are timed, and reported, apart.
@@ -370,6 +384,9 @@ fn load(map: WorldMap, reach: i32) -> Result<Loaded, RingsFull> {
     )?;
     let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
     scene.reserve(room.nodes, room.waiting, room.stuck);
+    // The margins of ADR 0004, on from the start: the selection is only the Guard and the spawn
+    // ring now, so looking at its bricks again is cheap.
+    scene.set_margins(&store, margins());
     let mut loader = Loader::new(
         store.source().expect("the ring's store has a source"),
         camera.position,
