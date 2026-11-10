@@ -20,8 +20,17 @@
 //!
 //! All distances are in Voxels of level 0, the unit of the Planet frame, so `v0` is 1 and
 //! `d0 = f_out / bias`.
+//!
+//! **Residency is wider than what is drawn** (ADR 0004, #143). The bricks under a brick that is
+//! drawn whole are *wanted* resident before the bands split it: [`Margins`] says how much earlier
+//! (a radial factor on the distance, and a camera raised along the Planet's up), and [`Reach`]
+//! adds where the camera is going. [`Reach::class`] says which of the three (drawn, margin,
+//! prefetch) wants a brick's children, which is the order the loader works in.
+//!
+//! **Coarsening** ([`Bands::coarsened`]) is the last resort at the memory cap: the farthest bands
+//! use a larger bias, so that fewer bricks are drawn and wanted.
 
-use brick_store::BrickCoord;
+use brick_store::{BrickCoord, VOXELS_PER_METRE};
 
 /// Levels of the pyramid that are drawn: 0 to 13. Level 13's Voxels are 410 m across, which is
 /// under a pixel at 800 km, the greatest distance of the Zoom range.
@@ -48,6 +57,16 @@ pub const VFOV: f64 = 70.0 * std::f64::consts::PI / 180.0;
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Bands {
     d0: f64,
+    coarsening: Option<Coarsening>,
+}
+
+/// The farthest bands drawn coarser, to fit the memory budget: the levels from `from` up use a bias
+/// `factor` times the rest's, so each of them starts `factor` times nearer. The factor is at most
+/// 2, which keeps the bands in order: at 2, level `from - 1` owns no distance at all.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Coarsening {
+    pub from: usize,
+    pub factor: f64,
 }
 
 impl Bands {
@@ -56,7 +75,10 @@ impl Bands {
     pub fn new(output_height: u32, vfov: f64, bias: f64) -> Self {
         assert!(bias > 0.0 && bias.is_finite(), "bias is {bias}");
         let focal = f64::from(output_height) / (2.0 * (vfov / 2.0).tan());
-        Self { d0: focal / bias }
+        Self {
+            d0: focal / bias,
+            coarsening: None,
+        }
     }
 
     /// The rule for 1440p output and the camera's field of view, with a Voxel allowed `bias`
@@ -68,7 +90,25 @@ impl Bands {
     /// The rule with `d0` given directly, in Voxels.
     pub fn with_d0(d0: f64) -> Self {
         assert!(d0 > 0.0 && d0.is_finite(), "d0 is {d0}");
-        Self { d0 }
+        Self {
+            d0,
+            coarsening: None,
+        }
+    }
+
+    /// These bands with the levels from `from` up drawn coarser by `factor` (1 to 2, 1 is none).
+    pub fn coarsened(self, from: usize, factor: f64) -> Self {
+        assert!(from >= 1, "level 0 has no band to start nearer");
+        assert!((1.0..=2.0).contains(&factor), "factor is {factor}");
+        Self {
+            coarsening: (factor > 1.0).then_some(Coarsening { from, factor }),
+            ..self
+        }
+    }
+
+    /// How the farthest bands are coarsened, if they are.
+    pub fn coarsening(&self) -> Option<Coarsening> {
+        self.coarsening
     }
 
     /// The distance at which a Voxel of level 0 covers one output pixel, in Voxels.
@@ -76,14 +116,35 @@ impl Bands {
         self.d0
     }
 
-    /// The distance at which `level` starts: 0 for level 0, else `2^level · d0`.
+    /// The distance at which `level` starts: 0 for level 0, else `2^level · d0` (nearer by the
+    /// factor of a [`Coarsening`] for the levels it reaches).
     #[inline]
     pub fn floor(&self, level: usize) -> f64 {
         if level == 0 {
-            0.0
-        } else {
-            self.d0 * (1u64 << level) as f64
+            return 0.0;
         }
+        let floor = self.d0 * (1u64 << level) as f64;
+        match self.coarsening {
+            Some(c) if level >= c.from => floor / c.factor,
+            _ => floor,
+        }
+    }
+
+    /// How many bricks the levels below the Guard hold over flat ground, in units of `d0` squared
+    /// (a level owns a ring of ground from `floor(level)` to `floor(level + 1)`, and its bricks
+    /// are `8 << level` Voxels across): 4 for level 0 and 3 for each of the others, less for those
+    /// that a [`Coarsening`] draws coarser. Only the ratio of two of these means anything: it says
+    /// how much more, or less, the bands want than other bands do.
+    pub fn weight(&self) -> f64 {
+        (0..GUARD_FIRST)
+            .map(|level| {
+                let (from, to) = (self.floor(level), self.floor(level + 1));
+                let across = (8u64 << level) as f64;
+                (to * to - from * from) / (across * across)
+            })
+            .sum::<f64>()
+            / (self.d0 * self.d0)
+            * 64.0
     }
 
     /// The level that owns distance `distance`, with no hysteresis, at most `top`.
@@ -133,6 +194,173 @@ impl Bands {
     /// at least this far. Zero for level 0.
     pub fn clear_radius(&self, level: usize) -> f64 {
         self.floor(level) * (1.0 - HYSTERESIS)
+    }
+}
+
+/// How much earlier than the bands the bricks under a brick are wanted resident (ADR 0004): the
+/// resident set is the drawn cut of the pyramid grown by these.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Margins {
+    /// A brick's children are wanted when the brick is nearer than this many times the distance
+    /// the bands split it at: 1.25 is a quarter of every band's start.
+    pub radial: f64,
+    /// The camera also wants what a camera this far higher, along the Planet's radial up, would,
+    /// in Voxels.
+    pub vertical: f64,
+}
+
+impl Margins {
+    /// No margin: residency is exactly what is drawn.
+    pub const NONE: Margins = Margins {
+        radial: 1.0,
+        vertical: 0.0,
+    };
+
+    /// ADR 0004's: 1.25 radial and 20 m vertical.
+    pub fn standard() -> Self {
+        Self {
+            radial: 1.25,
+            vertical: 20.0 * VOXELS_PER_METRE,
+        }
+    }
+}
+
+/// Places that prefetch looks at, along the camera's velocity: [`Reach::ahead`] holds this many.
+pub const AHEAD: usize = 2;
+
+/// Which wants the children of a brick resident, most urgent last (the loader works in this order
+/// before distance).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Class {
+    /// Only where the camera is going, a second or two on: never relied on.
+    Prefetch,
+    /// The margins about the camera.
+    Margin,
+    /// The bands split the brick: it is drawn whole only until they arrive.
+    Drawn,
+}
+
+/// What residency looks at besides what is drawn: the [`Margins`], and where the camera will be
+/// ([`AHEAD`] positions on its velocity, which the client works out from the frames it has seen).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Reach {
+    pub margins: Margins,
+    pub ahead: [Option<[f64; 3]>; AHEAD],
+}
+
+impl Reach {
+    /// What is drawn and nothing else.
+    pub const NONE: Reach = Reach {
+        margins: Margins::NONE,
+        ahead: [None; AHEAD],
+    };
+
+    /// Whether this asks for nothing beyond the bands.
+    pub fn is_none(&self) -> bool {
+        *self == Reach::NONE
+    }
+
+    /// Whether the margins ask for anything beyond the bands.
+    pub fn has_margins(&self) -> bool {
+        self.margins != Margins::NONE
+    }
+
+    /// `camera` raised by the vertical margin, along the Planet's radial up (the Planet is a
+    /// sphere about the origin of the frame).
+    pub fn raised(&self, camera: [f64; 3]) -> [f64; 3] {
+        let length = camera.iter().map(|c| c * c).sum::<f64>().sqrt();
+        let up = if length > 1.0 {
+            camera.map(|c| c / length)
+        } else {
+            [0.0, 1.0, 0.0]
+        };
+        std::array::from_fn(|a| camera[a] + up[a] * self.margins.vertical)
+    }
+
+    /// This reach seen from `camera`, with the raised camera worked out once for the many bricks
+    /// that are asked about.
+    pub fn from(&self, camera: [f64; 3]) -> Placed {
+        Placed {
+            reach: *self,
+            camera,
+            raised: self.raised(camera),
+        }
+    }
+
+    /// [`Placed::distance`], for one brick.
+    pub fn distance(&self, camera: [f64; 3], level: usize, coord: BrickCoord) -> f64 {
+        self.from(camera).distance(level, coord)
+    }
+
+    /// [`Placed::class`], for one brick.
+    pub fn class(
+        &self,
+        bands: Bands,
+        camera: [f64; 3],
+        level: usize,
+        coord: BrickCoord,
+    ) -> Option<Class> {
+        self.from(camera).class(bands, level, coord)
+    }
+}
+
+/// A [`Reach`] seen from one camera: ask it about many bricks without working out where the
+/// camera raised is each time.
+#[derive(Clone, Copy, Debug)]
+pub struct Placed {
+    reach: Reach,
+    camera: [f64; 3],
+    raised: [f64; 3],
+}
+
+impl Placed {
+    /// Whether the reach asks for nothing beyond the bands.
+    pub fn is_none(&self) -> bool {
+        self.reach.is_none()
+    }
+
+    /// The distance the bands are applied to for residency: the nearer of the camera and the camera
+    /// raised, over the radial margin, or that of a place the camera is going, whichever is
+    /// least. A brick whose children are wanted is one the bands split at this distance. It moves
+    /// no faster than the places it is measured from do.
+    pub fn distance(&self, level: usize, coord: BrickCoord) -> f64 {
+        let mut near = brick_distance(self.camera, level, coord);
+        if self.reach.margins.vertical > 0.0 {
+            near = near.min(brick_distance(self.raised, level, coord));
+        }
+        self.reach
+            .ahead
+            .iter()
+            .flatten()
+            .fold(near / self.reach.margins.radial, |d, &at| {
+                d.min(brick_distance(at, level, coord))
+            })
+    }
+
+    /// Who wants the children of the brick at `coord` of `level`, with the bands applied as
+    /// [`Bands::split`] does to a brick that is split already (it stays wanted until the camera is
+    /// [`HYSTERESIS`] past the boundary). `None` if nothing does.
+    pub fn class(&self, bands: Bands, level: usize, coord: BrickCoord) -> Option<Class> {
+        let reach = &self.reach;
+        let drawn = brick_distance(self.camera, level, coord);
+        if bands.split(level, drawn, Some(true)) {
+            return Some(Class::Drawn);
+        }
+        if reach.has_margins() {
+            let mut near = drawn;
+            if reach.margins.vertical > 0.0 {
+                near = near.min(brick_distance(self.raised, level, coord));
+            }
+            if bands.split(level, near / reach.margins.radial, Some(true)) {
+                return Some(Class::Margin);
+            }
+        }
+        reach
+            .ahead
+            .iter()
+            .flatten()
+            .any(|&at| bands.split(level, brick_distance(at, level, coord), Some(true)))
+            .then_some(Class::Prefetch)
     }
 }
 
@@ -323,5 +551,95 @@ mod tests {
                 assert!(change <= moved + 1e-9);
             }
         }
+    }
+
+    #[test]
+    fn coarsening_brings_the_farthest_bands_in_and_keeps_them_in_order() {
+        let bands = Bands::with_d0(100.0);
+        let coarse = bands.coarsened(3, 1.5);
+        for level in 0..3 {
+            assert_eq!(coarse.floor(level), bands.floor(level));
+        }
+        assert!((coarse.floor(3) - 800.0 / 1.5).abs() < 1e-9);
+        assert!((coarse.floor(5) - 3200.0 / 1.5).abs() < 1e-9);
+        assert_eq!(coarse.level_at(500.0, 8), 2);
+        assert_eq!(coarse.level_at(540.0, 8), 3);
+        // At 2 the band under the first level coarsened is gone: level 2 owns nothing.
+        let most = bands.coarsened(3, 2.0);
+        assert_eq!(most.floor(3), most.floor(2));
+        assert_eq!(most.level_at(450.0, 8), 3);
+        // No factor, no coarsening, and the bands are the plain ones.
+        assert_eq!(bands.coarsened(3, 1.0), bands);
+        for level in 1..10 {
+            assert!(coarse.floor(level) >= coarse.floor(level - 1));
+        }
+    }
+
+    #[test]
+    fn a_brick_is_wanted_by_the_margin_before_the_bands_split_it_and_by_the_lead_later() {
+        let bands = Bands::with_d0(100.0);
+        let reach = Reach {
+            margins: Margins {
+                radial: 1.25,
+                vertical: 0.0,
+            },
+            ahead: [Some([1000.0, 0.0, 0.0]), None],
+        };
+        let camera = [0.0, 0.0, 0.0];
+        let at = |x: i32| BrickCoord([x, 0, 0]);
+        // Level 1 starts at 200, bricks are 16 Voxels across: the one at the camera is drawn
+        // split, one at 224 (x = 14) is whole but under 250 (1.25 times 200): the margin.
+        assert_eq!(reach.class(bands, camera, 1, at(0)), Some(Class::Drawn));
+        assert_eq!(reach.class(bands, camera, 1, at(14)), Some(Class::Margin));
+        // 304 away: beyond the margin, and 700 from the place the camera is going.
+        assert_eq!(reach.class(bands, camera, 1, at(19)), None);
+        // Level 4 starts at 1600 and its bricks are 128 across: x = 14 is 1792 away, in the margin.
+        assert_eq!(
+            reach.class(bands, camera, 4, BrickCoord([14, 0, 0])),
+            Some(Class::Margin)
+        );
+        // Near the place the camera is going, and nowhere else, only the lead wants it.
+        assert_eq!(reach.class(bands, camera, 1, at(62)), Some(Class::Prefetch));
+        // With no reach beyond the bands only the bands want it.
+        assert_eq!(Reach::NONE.class(bands, camera, 1, at(14)), None);
+        assert_eq!(
+            Reach::NONE.class(bands, camera, 1, at(0)),
+            Some(Class::Drawn)
+        );
+        assert!(Class::Drawn > Class::Margin && Class::Margin > Class::Prefetch);
+    }
+
+    #[test]
+    fn the_weight_of_bands_falls_with_coarsening_and_not_with_d0_squared() {
+        let plain = Bands::with_d0(1000.0);
+        assert!((plain.weight() - 28.0).abs() < 1e-9, "{}", plain.weight());
+        assert!((Bands::with_d0(500.0).weight() - plain.weight()).abs() < 1e-9);
+        let mut last = plain.weight();
+        for (from, factor) in [(8, 1.5), (7, 1.5), (6, 1.5), (5, 1.5), (4, 2.0), (2, 2.0)] {
+            let weight = plain.coarsened(from, factor).weight();
+            assert!(weight < last, "{from} {factor}: {weight} {last}");
+            last = weight;
+        }
+    }
+
+    #[test]
+    fn the_vertical_margin_is_a_camera_raised_along_the_radial_up() {
+        let reach = Reach {
+            margins: Margins {
+                radial: 1.0,
+                vertical: 400.0,
+            },
+            ahead: [None; AHEAD],
+        };
+        // On the +x axis the radial up is +x.
+        let up = reach.raised([5000.0, 0.0, 0.0]);
+        assert!((up[0] - 5400.0).abs() < 1e-9 && up[1] == 0.0 && up[2] == 0.0);
+        // A brick above the camera is nearer to the raised camera than to the camera.
+        let above = BrickCoord([700, 0, 0]);
+        let plain = brick_distance([5000.0, 0.0, 0.0], 0, above);
+        let raised = reach.distance([5000.0, 0.0, 0.0], 0, above);
+        assert!((plain - raised - 400.0).abs() < 1e-9, "{plain} {raised}");
+        // At the origin there is no up to take: a fixed one is used instead of a NaN.
+        assert!(reach.raised([0.0; 3]).iter().all(|c| c.is_finite()));
     }
 }

@@ -12,6 +12,11 @@
 //! sleep. Whether or not the camera moves: moving only changes which are nearest, and which are
 //! wanted at all.
 //!
+//! **Classes** (#143, ADR 0004): the scene also wants the children of bricks that the bands do not
+//! split yet, the margin about the camera and, at the lowest priority, the places it is going. A job
+//! is of the class of what wants it ([`render::lod::Class`]): the bricks the bands split first,
+//! then the margin, then prefetch, and by distance from the camera in each.
+//!
 //! **Nearest first, end to end.** The workers run only [`MAX_AHEAD`] jobs ahead of what the frame
 //! thread has taken in. Past that they wait, and the jobs stay in the queue, which is ordered by
 //! distance from the camera and put in order again as it moves. So a brick that is wanted newly
@@ -37,7 +42,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, TryLockError};
 use std::thread::JoinHandle;
 
 use brick_store::{Brick, BrickCoord, BrickSource, BrickStore, TableSize, children_generated};
-use render::lod::{Bands, brick_distance};
+use render::lod::{Bands, Class, Reach, brick_distance};
 use render::scene::select::Key;
 
 pub use render::lod::GUARD_FIRST;
@@ -72,6 +77,10 @@ pub fn hold_guard(
 /// One brick's children to generate.
 #[derive(Clone)]
 struct Job {
+    /// Who wants the children of `key`, when this was queued or last ordered: the bands, the
+    /// margin about the camera, or only where it is going (B1: drawn first, then margin, then
+    /// prefetch).
+    class: Class,
     /// How far `key` was from the camera when this was queued or last ordered.
     distance: f64,
     key: Key,
@@ -96,12 +105,13 @@ impl PartialOrd for Job {
     }
 }
 
-/// Nearest is greatest, for the max-heap that [`BinaryHeap`] is.
+/// The most urgent class, and in it the nearest, is greatest, for the max-heap that [`BinaryHeap`]
+/// is. The view's direction is not in it: it would order refinement, and the loader is not told it.
 impl Ord for Job {
     fn cmp(&self, other: &Self) -> Ordering {
-        other
-            .distance
-            .total_cmp(&self.distance)
+        self.class
+            .cmp(&other.class)
+            .then_with(|| other.distance.total_cmp(&self.distance))
             .then_with(|| other.key.cmp(&self.key))
     }
 }
@@ -110,10 +120,14 @@ struct State {
     queue: BinaryHeap<Job>,
     camera: [f64; 3],
     bands: Bands,
+    reach: Reach,
     /// The camera that the queue was last ordered for.
     ordered_for: [f64; 3],
     /// Set when the camera has gone far enough that the queue is no longer in order.
     stale: bool,
+    /// A worker has the queue, to put it in order without the lock held (see [`reordered`]): the
+    /// others wait for it, and the queue is not pruned meanwhile.
+    reordering: bool,
     /// Tickets of jobs that were given up on: skipped when they come to the front. A ticket of a
     /// job that had gone to a worker already stays until the queue is empty.
     cancelled: HashSet<u64>,
@@ -164,6 +178,9 @@ pub struct Loader {
     /// Bricks asked for whose children have not been received, and the request.
     requested: HashMap<Key, u64>,
     next_ticket: u64,
+    /// The bands and reach that jobs are classed by (the workers' are in their state).
+    bands: Bands,
+    reach: Reach,
 }
 
 /// Workers for `cores` cores: two fewer, so that the simulation and the frame thread always have
@@ -186,8 +203,10 @@ impl Loader {
                 queue: BinaryHeap::new(),
                 camera,
                 bands,
+                reach: Reach::NONE,
                 ordered_for: camera,
                 stale: false,
+                reordering: false,
                 cancelled: HashSet::new(),
                 shutdown: false,
             }),
@@ -215,7 +234,15 @@ impl Loader {
             cancels: Vec::new(),
             requested: HashMap::new(),
             next_ticket: 0,
+            bands,
+            reach: Reach::NONE,
         }
+    }
+
+    /// Sets what the jobs are classed by besides the bands: the margins and where the camera is
+    /// going. The workers are told by the next [`Loader::sync`].
+    pub fn set_reach(&mut self, reach: Reach) {
+        self.reach = reach;
     }
 
     /// Panics if a worker has stopped, which only a panic in the generator does: loading would
@@ -272,7 +299,14 @@ impl Loader {
                 .enumerate()
                 .filter(|&(_, child)| store.holds(level - 1, child))
                 .fold(0u8, |mask, (i, _)| mask | 1 << i);
+            // A brick the scene asked for that nothing wants by now (it was wanted a moment ago) is
+            // as urgent as any: it is dropped when a worker comes to it.
+            let class = self
+                .reach
+                .class(self.bands, camera, level, coord)
+                .unwrap_or(Class::Drawn);
             self.outbox.push(Job {
+                class,
                 distance: brick_distance(camera, level, coord),
                 key,
                 ticket,
@@ -308,14 +342,19 @@ impl Loader {
             Err(TryLockError::Poisoned(_)) => panic!("a ring loader thread panicked"),
         };
         state.camera = camera;
+        // What the classes are made of changed: the queue is put in order again for it.
+        let reclass = state.bands != bands || state.reach != self.reach;
         state.bands = bands;
+        state.reach = self.reach;
+        self.bands = bands;
         let moved = (0..3)
             .map(|a| (camera[a] - state.ordered_for[a]).powi(2))
             .sum::<f64>()
             .sqrt();
         // Moving only puts the work in another order: the queue is sorted again by a worker once
         // the camera has gone a little way, not on every Voxel.
-        if moved > bands.d0() / 16.0 && !state.queue.is_empty() {
+        let queued = !state.queue.is_empty() || !self.outbox.is_empty() || state.reordering;
+        if (reclass || moved > bands.d0() / 16.0) && queued {
             state.stale = true;
         }
         state.cancelled.extend(self.cancels.drain(..));
@@ -323,7 +362,10 @@ impl Loader {
         // are as far ahead as they may be: so what was given up on is taken out of the queue
         // once it is a share of it, in time that is a share of what was queued since. A ticket
         // of a job that a worker has taken is of no use any more either.
-        if state.cancelled.len() >= PRUNE_FROM && state.cancelled.len() * 4 >= state.queue.len() {
+        if !state.reordering
+            && state.cancelled.len() >= PRUNE_FROM
+            && state.cancelled.len() * 4 >= state.queue.len()
+        {
             let State {
                 queue, cancelled, ..
             } = &mut *state;
@@ -436,16 +478,16 @@ impl Drop for Loader {
     }
 }
 
-/// Puts the queue in order for the camera it has now, nearest first.
-fn reorder(state: &mut State) {
-    let camera = state.camera;
-    let mut jobs = std::mem::take(&mut state.queue).into_vec();
+/// `jobs` in order for `camera`, nearest first in each class. Working out the classes of a million
+/// jobs takes long enough that a worker does it with the lock let go of.
+fn reordered(mut jobs: Vec<Job>, camera: [f64; 3], bands: Bands, reach: Reach) -> BinaryHeap<Job> {
+    let at = reach.from(camera);
     for job in &mut jobs {
         job.distance = brick_distance(camera, job.key.0, job.key.1);
+        // One that nothing wants now keeps the class it had: a worker drops it.
+        job.class = at.class(bands, job.key.0, job.key.1).unwrap_or(job.class);
     }
-    state.queue = BinaryHeap::from(jobs);
-    state.ordered_for = camera;
-    state.stale = false;
+    BinaryHeap::from(jobs)
 }
 
 /// A worker: takes the nearest job when the frame thread is not too far behind, drops it if the
@@ -453,16 +495,30 @@ fn reorder(state: &mut State) {
 fn work(shared: &Shared, arrivals: &Sender<(u64, Arrival)>) {
     crate::priority::lower_current_thread();
     loop {
-        let (job, camera, bands) = {
+        let (job, camera, bands, reach) = {
             let mut state = shared.lock();
             loop {
                 if state.shutdown {
                     return;
                 }
-                if state.stale {
-                    reorder(&mut state);
-                }
-                if state.queue.is_empty() {
+                if state.reordering {
+                    // The queue is with the worker that is putting it in order.
+                } else if state.stale {
+                    state.stale = false;
+                    state.reordering = true;
+                    state.ordered_for = state.camera;
+                    let jobs = std::mem::take(&mut state.queue).into_vec();
+                    let (camera, bands, reach) = (state.camera, state.bands, state.reach);
+                    drop(state);
+                    let mut queue = reordered(jobs, camera, bands, reach);
+                    state = shared.lock();
+                    // What was queued meanwhile joins it.
+                    queue.append(&mut state.queue);
+                    state.queue = queue;
+                    state.reordering = false;
+                    shared.wake.notify_all();
+                    continue;
+                } else if state.queue.is_empty() {
                     // Whatever is left was for jobs that are gone.
                     state.cancelled.clear();
                 } else if shared.ahead.load(Atomic::Relaxed) < MAX_AHEAD {
@@ -474,7 +530,7 @@ fn work(shared: &Shared, arrivals: &Sender<(u64, Arrival)>) {
                     // `ahead` can see it not in flight (see `Loader::in_flight`).
                     shared.working.fetch_add(1, Atomic::AcqRel);
                     shared.ahead.fetch_add(1, Atomic::AcqRel);
-                    break (job, state.camera, state.bands);
+                    break (job, state.camera, state.bands, state.reach);
                 }
                 state = shared
                     .wake
@@ -483,10 +539,11 @@ fn work(shared: &Shared, arrivals: &Sender<(u64, Arrival)>) {
             }
         };
         let (level, coord) = job.key;
-        // The bands split a brick nearer than its level is used from; with the margin that a
-        // brick that is split keeps (see `Bands::split`), so that a job is only dropped for a
-        // brick that the camera has really left.
-        let arrival = if bands.split(level, brick_distance(camera, level, coord), Some(true)) {
+        // The bands split a brick nearer than its level is used from, and the margin and the lead
+        // want its children before; with the hysteresis that a brick that is split keeps (see
+        // `Bands::split`), so that a job is only dropped for a brick that the camera has really
+        // left.
+        let arrival = if reach.class(bands, camera, level, coord).is_some() {
             let kids = coord.children();
             let held = |c: BrickCoord| {
                 kids.iter()
@@ -518,6 +575,7 @@ mod tests {
 
     fn job(distance: f64, x: i32) -> Job {
         Job {
+            class: Class::Drawn,
             distance,
             key: (3, BrickCoord([x, 0, 0])),
             ticket: 0,
@@ -531,8 +589,10 @@ mod tests {
             queue: BinaryHeap::from([job(300.0, 30), job(10.0, 1), job(100.0, 10)]),
             camera: [0.0; 3],
             bands: Bands::with_d0(64.0),
+            reach: Reach::NONE,
             ordered_for: [0.0; 3],
             stale: false,
+            reordering: false,
             cancelled: HashSet::new(),
             shutdown: false,
         };
@@ -547,11 +607,65 @@ mod tests {
         assert_eq!(order, [1, 10, 30]);
         // The camera went to brick 30: it is now the nearest (a level 3 brick is 64 Voxels).
         state.camera = [30.0 * 64.0, 0.0, 0.0];
-        reorder(&mut state);
-        assert!(!state.stale);
-        assert_eq!(state.ordered_for, state.camera);
+        let jobs = std::mem::take(&mut state.queue).into_vec();
+        state.queue = reordered(jobs, state.camera, state.bands, state.reach);
         assert_eq!(state.queue.pop().unwrap().key.1.0[0], 30);
         assert_eq!(state.queue.pop().unwrap().key.1.0[0], 10);
+    }
+
+    #[test]
+    fn the_drawn_set_comes_first_then_the_margin_then_prefetch_and_by_distance_in_each() {
+        let with = |class, distance, x| Job {
+            class,
+            ..job(distance, x)
+        };
+        let mut queue = BinaryHeap::from([
+            with(Class::Prefetch, 1.0, 1),
+            with(Class::Margin, 5.0, 2),
+            with(Class::Drawn, 900.0, 3),
+            with(Class::Margin, 2.0, 4),
+            with(Class::Drawn, 800.0, 5),
+        ]);
+        let order: Vec<i32> = std::iter::from_fn(|| queue.pop())
+            .map(|j| j.key.1.0[0])
+            .collect();
+        assert_eq!(order, [5, 3, 4, 2, 1]);
+    }
+
+    #[test]
+    fn a_job_is_classed_by_who_wants_it_and_the_queue_follows_the_reach() {
+        use render::lod::Margins;
+        // d0 of 64: a level 1 brick splits under 128 away.
+        let mut loader = new_loader(Arc::new(Counting::default()));
+        loader.set_reach(Reach {
+            margins: Margins {
+                radial: 1.25,
+                vertical: 0.0,
+            },
+            ahead: [None; 2],
+        });
+        loader.sync([0.0; 3], bands());
+        // 8 Voxels a brick at level 0; level 1 bricks are 16 across: x = 4 is 64 away, 9 is 144.
+        let near = (1, BrickCoord([4, 0, 0]));
+        let margin = (1, BrickCoord([9, 0, 0]));
+        loader.request(&BrickStore::new(), [margin, near], [0.0; 3]);
+        let classes: HashMap<Key, Class> = loader.outbox.iter().map(|j| (j.key, j.class)).collect();
+        assert_eq!(classes[&near], Class::Drawn);
+        assert_eq!(classes[&margin], Class::Margin);
+    }
+
+    #[test]
+    fn a_job_that_only_the_lead_wants_is_prefetch_not_drawn() {
+        let mut loader = new_loader(Arc::new(Counting::default()));
+        // 8 Voxels a brick at level 0; level 1 bricks are 16 across: x = 40 is 640 away, past
+        // the bands for the camera at the origin, and 2 away from the lead.
+        let far = (1, BrickCoord([40, 0, 0]));
+        loader.set_reach(Reach {
+            margins: render::lod::Margins::NONE,
+            ahead: [Some([650.0, 0.0, 0.0]), None],
+        });
+        loader.request(&BrickStore::new(), [far], [0.0; 3]);
+        assert_eq!(loader.outbox[0].class, Class::Prefetch);
     }
 
     #[test]

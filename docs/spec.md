@@ -105,10 +105,10 @@ Every Milestone is **done** only when all of the following hold:
 - Determinism and golden gates stay green.
 
 **M1a-2 order (2026-11-10).** The tracking issue is [#41](https://github.com/theHimanshuShekhar/bhayanakvoxel/issues/41).
-1. The streaming bench (#162 with #64's measurement part), including the simulator's 2× undercount of drawn bricks.
+1. The streaming bench (#162 with #64's measurement part).
 2. The 320 km Planet: the generator, then the renderer's levels, Guard and sizes, measured again.
 3. Speed-scaled LOD and the 20 m spawn.
-4. #143 margins and prefetch, #62 saves with the journal, #144 Edit epochs, #145 and #163 uploads, #146 horizon cap.
+4. #62 saves with the journal (#143 margins and prefetch are done), #144 Edit epochs, #145 and #163 uploads, #146 horizon cap.
 5. The server bot soak.
 6. The reference view's decisions (#100–#103) and ADR 0005, before any lighting ticket.
 7. #52 sun shadows, #53 atmosphere, #54 GI, #55 denoiser, then the #50 hardware RT spike.
