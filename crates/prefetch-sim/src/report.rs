@@ -14,31 +14,35 @@ use crate::path::{self, Path};
 /// (Not measured again yet.)
 pub const GUARD_BYTES: f64 = 73.9 * 1024.0 * 1024.0;
 
-/// Bytes a drawn brick costs in one packed copy of the scene: the 33 words of `bricks` and 1 of
-/// `brick_refs` per brick that `room_for` in the client is sized from (#123, measured from a full
-/// fill), 136 B. (The research's 200 B was an estimate.) The memory the client holds is more
-/// than this times the bricks: the scene thread's copy and the frame thread's copy of it (ADR
-/// 0006: about 542 MiB each at full size), and the host `BrickStore` that holds every generated
-/// brick, which is about 7 times the bricks drawn (22 million generated for 3.2 million drawn) and
-/// is not counted here. Every MB in the report is one packed copy; a copy for the frame thread
-/// doubles it.
-pub const BRICK_BYTES: f64 = 34.0 * 4.0;
+/// Bytes a drawn brick costs in one packed copy of the scene, as the client measures it: 474 MiB
+/// for the 3.44 million bricks of the full fill at 5 cm (#142), 144.5 B, which is the 34 words of
+/// `bricks` and `brick_refs` per brick that `room_for` in the client is sized from (136 B, as
+/// #123 measured it) and the region records and tables that go with them. The memory the client
+/// holds is more than this times the bricks: the scene thread's copy and the frame thread's copy
+/// of it (ADR 0006: about 542 MiB each at full size), and the host `BrickStore`, which holds the
+/// ancestors and the bricks the bands split but do not draw. Every MB in the report is one packed
+/// copy; a copy for the frame thread doubles it.
+pub const BRICK_BYTES: f64 = 474.0 * 1024.0 * 1024.0 / 3_439_848.0;
 
 /// Drawn bricks a second that the loader and the scene thread get from the Planet to the scene
-/// today, end to end: the full fill (#123, measured again at 5 cm Voxels for #147) drew 3.56
-/// million bricks (`BRICKS_PER_D0_SQUARED`) in 160 s on the 8-core dev box, with the scene thread
-/// of ADR 0006 taking them in as they came. An upper bound on today's intake, since the fill may be limited by generation.
-pub const CURRENT_INTAKE: f64 = 3_560_000.0 / 160.0;
+/// today, end to end: the full fill at 5 cm drew 3.44 million bricks
+/// (`BRICKS_PER_D0_SQUARED`) in 97.8 s on the 8-core dev box (#142: the loader generating only
+/// the children that can be drawn; 160 s for 3.56 million before), with the scene thread of ADR
+/// 0006 taking them in as they came. An upper bound on today's intake, since the fill may be
+/// limited by generation.
+pub const CURRENT_INTAKE: f64 = 3_439_848.0 / 97.8;
 
 /// The loader's `MAX_AHEAD`: most jobs generated and not taken in.
 pub const LOADER_MAX_AHEAD: usize = 512;
 
-/// What a generated brick costs on one core, in µs, from the real loader: the full fill (at 5 cm)
-/// generated 23.9 million bricks (2.99 million jobs of 8) in 160 s on 6 workers of the 8-core dev
-/// box, so 25 K bricks/s/worker, 40 µs. If the workers were ever idle the true cost is lower, so
-/// this is an upper bound on the cost of the loader's job and the figure used. (Not measured by
-/// this crate: from `room_for`'s numbers in the client.)
-pub const GENERATION_US: f64 = 40.0;
+/// What a generated brick costs on one core, in µs, from the real loader: the full fill (at 5 cm,
+/// #142) generated 9.41 million bricks in 97.8 s on 6 workers of the 8-core dev box, so 16 K
+/// bricks/s/worker, 62 µs. (It was 40 µs when the fill generated 23.9 million bricks in 160 s: #142
+/// stopped generating the air and the buried bricks, which cost 7 µs each, so a brick that is
+/// generated now costs more on average, and a drawn brick costs less in all.) If the workers were
+/// ever idle the true cost is lower, so this is an upper bound on the cost of the loader's job and
+/// the figure used. (Not measured by this crate: from the client's fill.)
+pub const GENERATION_US: f64 = 6.0 * 97.8e6 / 9_410_000.0;
 
 /// What `examples/gen_rate.rs` measures on one core, for the same job (`children_with_solid`, 8
 /// children with `solid_below`, air and buried ones included): 1500 jobs sampled at random from
@@ -76,9 +80,19 @@ pub fn measured() -> Params {
 /// Bricks that a full fill draws for a camera at the ground: the band rule over the whole Planet,
 /// at every level, with no horizon. What the client measured is [`DRAWN_PER_D0_SQUARED`] d0².
 pub fn drawn_bricks(model: &Model) -> usize {
+    built_size(model, EYE / VOXELS_PER_METRE)
+}
+
+/// Bricks that the client as built draws at rest at `altitude_m`: the band rule over the whole
+/// Planet, every level, the Guard's too, with no horizon cap and no margin (the client has none of
+/// the first yet, and the margins are residency, not drawing). This is what its scene holds, and
+/// what [`BRICK_BYTES`] is measured over; [`shell_size`] is the shell that a horizon cap would
+/// keep, which at the ground is about half of it, since the client also draws everything beyond
+/// the horizon, from the far side of the Planet inward, at the coarse levels.
+pub fn built_size(model: &Model, altitude_m: f64) -> usize {
     let up = unit([0.36, 0.48, 0.8]);
     let point = Point {
-        pos: scale(up, model.planet_radius + EYE),
+        pos: scale(up, model.planet_radius + altitude_m * VOXELS_PER_METRE),
         reach: f64::INFINITY,
     };
     let mut drawn = 0;
@@ -285,6 +299,8 @@ pub struct ShellSize {
     pub reach_m: f64,
     pub bricks: usize,
     pub levels: (usize, usize),
+    /// What the client as built draws at rest there, with no horizon cap (see [`built_size`]).
+    pub built: usize,
 }
 
 /// The bricks of the shell (the camera and its vertical margin) at rest at `altitude_m`, not
@@ -317,6 +333,7 @@ pub fn shell_size(model: &Model, altitude_m: f64) -> ShellSize {
         reach_m: points[0].reach / VOXELS_PER_METRE,
         bricks: keys.len(),
         levels,
+        built: built_size(model, altitude_m),
     }
 }
 
@@ -391,25 +408,27 @@ pub fn markdown(
     let _ = writeln!(w);
     let _ = writeln!(
         w,
-        "| Altitude | Shell reach | Levels | Bricks | MB at {:.0} B |",
+        "| Altitude | Shell reach | Levels | Bricks | MB at {:.1} B | As built (no horizon cap): bricks | MB |",
         params.brick_bytes
     );
-    let _ = writeln!(w, "|---|---|---|---|---|");
+    let _ = writeln!(w, "|---|---|---|---|---|---|---|");
     for s in sizes {
         let _ = writeln!(
             w,
-            "| {} m | {:.0} m | {}-{} | {} | {:.1} |",
+            "| {} m | {:.0} m | {}-{} | {} | {:.1} | {} | {:.1} |",
             s.altitude_m,
             s.reach_m,
             s.levels.0,
             s.levels.1,
             s.bricks,
             mib(s.bricks as f64 * params.brick_bytes),
+            s.built,
+            mib(s.built as f64 * params.brick_bytes),
         );
     }
     let _ = writeln!(
         w,
-        "\nRadial margin {}, vertical margin {} m, crust {}, Guard from level {:?} ({:.1} MiB, not in the shell columns), {} workers at {:.0} generated bricks/s/core ({} µs, as the fill implies), jobs of {}, today's intake {:.1} K drawn bricks/s.",
+        "\nRadial margin {}, vertical margin {} m, crust {}, Guard from level {:?} ({:.1} MiB, not in the shell columns), {} workers at {:.0} generated bricks/s/core ({:.0} µs, as the fill implies), jobs of {}, today's intake {:.1} K drawn bricks/s. The client generated {:.2} bricks per drawn brick in its fill (9.41 million for 3.44 million), the model {:.2} on the paths: scale the generation columns by that ratio for the client's.",
         model.radial_margin,
         model.vertical_margin / VOXELS_PER_METRE,
         model.crust,
@@ -420,6 +439,17 @@ pub fn markdown(
         GENERATION_US,
         params.job_size,
         CURRENT_INTAKE / 1.0e3,
+        9_410_000.0 / 3_439_848.0,
+        results
+            .iter()
+            .map(|r| r.nominal.generated_per_drawn())
+            .filter(|g| *g > 0.0)
+            .sum::<f64>()
+            / results
+                .iter()
+                .filter(|r| r.nominal.generated_per_drawn() > 0.0)
+                .count()
+                .max(1) as f64,
     );
     out
 }
@@ -631,6 +661,25 @@ mod tests {
                 .contains(&drawn),
             "{drawn} d0^2"
         );
+    }
+
+    #[test]
+    fn the_scene_at_rest_is_the_client_s_474_mib_and_the_shell_is_the_part_inside_the_horizon() {
+        // The client draws the whole Planet, as the bands say, with no horizon cap: 3.44 million
+        // bricks, 474 MiB per scene copy at BRICK_BYTES, within 10%.
+        let model = Model::real();
+        let built = built_size(&model, 2.0);
+        let mib_built = mib(built as f64 * BRICK_BYTES);
+        assert!(
+            (427.0..521.0).contains(&mib_built),
+            "{built} bricks, {mib_built} MiB"
+        );
+        // The simulator's shell at rest, 227 to 259 MB (#49), is what a horizon cap would keep:
+        // about half of it. That was the undercount; the scene was never the shell.
+        let shell = shell_size(&model, 2.0);
+        assert_eq!(shell.built, built);
+        let share = shell.bricks as f64 / built as f64;
+        assert!((0.35..0.65).contains(&share), "{share}");
     }
 
     #[test]

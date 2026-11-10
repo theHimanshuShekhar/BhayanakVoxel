@@ -169,6 +169,45 @@ pub struct World {
     unshown_edit: Option<UnshownEdit>,
     /// How long [`World::edit_due`] waits: [`EDIT_WAIT`], or more in a test on a slow build.
     edit_wait: std::time::Duration,
+    /// Whether [`World::recentre`] tells the scene thread how the camera is moving, for prefetch.
+    lead: bool,
+    motion: Motion,
+}
+
+/// The camera's velocity as the frames show it: a running mean over about a tenth of a second, so
+/// that a jittery camera does not move where prefetch looks every frame.
+#[derive(Clone, Copy, Debug, Default)]
+struct Motion {
+    last: Option<(std::time::Instant, [f64; 3])>,
+    velocity: [f64; 3],
+}
+
+/// Faster than this, in Voxels a second (400 m/s, several times the flight speed), the camera
+/// has jumped (a teleport, a Zoom's cut) and is not looked ahead along.
+const MOST_LEAD_SPEED: f64 = 400.0 * brick_store::VOXELS_PER_METRE;
+
+impl Motion {
+    /// The velocity after the camera was seen at `camera` at `now`.
+    fn observe(&mut self, camera: [f64; 3], now: std::time::Instant) -> [f64; 3] {
+        let before = self.last.replace((now, camera));
+        let Some((then, from)) = before else {
+            return [0.0; 3];
+        };
+        let dt = now.duration_since(then).as_secs_f64();
+        if dt <= 0.0 {
+            return self.velocity;
+        }
+        let raw: [f64; 3] = std::array::from_fn(|a| (camera[a] - from[a]) / dt);
+        let speed = raw.iter().map(|v| v * v).sum::<f64>().sqrt();
+        if dt > 0.25 || speed > MOST_LEAD_SPEED {
+            self.velocity = [0.0; 3];
+            return self.velocity;
+        }
+        let alpha = (dt / 0.1).min(1.0);
+        self.velocity =
+            std::array::from_fn(|a| self.velocity[a] + (raw[a] - self.velocity[a]) * alpha);
+        self.velocity
+    }
 }
 
 /// How long the frame thread waits for the scene thread to have packed the bricks of level 0 of
@@ -216,6 +255,8 @@ impl World {
             resim: std::time::Duration::ZERO,
             unshown_edit: None,
             edit_wait: EDIT_WAIT,
+            lead: true,
+            motion: Motion::default(),
         }
     }
 
@@ -244,6 +285,30 @@ impl World {
     #[cfg(test)]
     pub fn stats(&self) -> &Stats {
         &self.stats
+    }
+
+    /// Whether [`World::recentre`] tells the scene thread how the camera moves, so that it
+    /// prefetches along the velocity (on by default).
+    #[cfg(test)]
+    pub fn set_lead(&mut self, on: bool) {
+        self.lead = on;
+    }
+
+    /// Gives the store another budget while the scene thread runs (a test of what it does when
+    /// there is less, or more, to want than it had room for).
+    #[cfg(test)]
+    pub fn set_budget(&self, budget: brick_store::Budget) {
+        self.predictor
+            .shared_store()
+            .write()
+            .expect("the store's lock is not poisoned")
+            .set_budget(budget);
+    }
+
+    /// Has the scene thread count soft misses in [`Stats::soft_misses`] (a diagnostic).
+    #[cfg(test)]
+    pub fn count_soft_misses(&self) {
+        self.worker().count_soft_misses(true);
     }
 
     /// Holds back (or lets go of) what the loader generates: while paused, nothing it generated
@@ -368,9 +433,24 @@ impl World {
     /// camera is, and returns what it has made since the last call, which is of an earlier camera:
     /// the rings are never half moved.
     pub fn recentre(&mut self, camera: [f64; 3]) -> Result<Option<SceneUpdate>, RingsFull> {
+        let velocity = if self.lead {
+            self.motion.observe(camera, std::time::Instant::now())
+        } else {
+            [0.0; 3]
+        };
+        self.recentre_moving(camera, velocity)
+    }
+
+    /// [`World::recentre`] with the camera's `velocity` given, in Voxels a second, for the lead
+    /// (prefetch) to look ahead along: for a path that is not at the speed of the clock.
+    pub fn recentre_moving(
+        &mut self,
+        camera: [f64; 3],
+        velocity: [f64; 3],
+    ) -> Result<Option<SceneUpdate>, RingsFull> {
         match &self.worker {
             Some(worker) => {
-                worker.follow(camera);
+                worker.follow_moving(camera, velocity);
                 let wait = self.edit_due()?;
                 self.take_ready(wait)
             }
