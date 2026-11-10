@@ -11,6 +11,6 @@ BhayanakVoxel is built as a custom engine in Rust on wgpu, with a pinned wgpu ve
 
 ## Consequences
 
-- Hardware ray queries in wgpu are experimental, so M1 lighting starts from compute-shader ray marching.
+- Hardware ray queries in wgpu are experimental, so M1 lighting is built on compute-shader ray marching: every pass goes through one `trace()` and is tuned on the compute path. Hardware ray queries are a time-boxed spike after GI (#50, re-ordered 2026-11-10), adopted only if they are faster on real secondary rays; no lighting ticket waits for them.
 - NVIDIA-only denoisers and upscalers (NRD, DLSS) need native interop.
 - Each wgpu upgrade is a deliberate task that comes with its migration guide.

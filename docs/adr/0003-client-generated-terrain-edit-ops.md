@@ -12,3 +12,8 @@ Even single-player runs the real server simulation in-process, behind the same m
 - **Per-Voxel deltas:** about 520 Voxels per 1 m crater, far larger than one operation.
 - **Interest-limited Edits with catch-up snapshots:** rejected because the Zoom would show stale terrain far away.
 - **Direct calls in M1, network added later:** faster to start, but the riskiest retrofit.
+
+## Amendments
+
+- The figures above were worked out at 10 cm Voxels. At 5 cm (ADR 0007) a 1 m crater is about 4,200 Voxels and streamed terrain would cost several times the 12 Mbit/s, so the choice is stronger, not weaker. The operation is the same size.
+- ADR 0010 (2026-11-10) adds an Edit journal for durability, and undo, which restores bricks through the snapshot path.
