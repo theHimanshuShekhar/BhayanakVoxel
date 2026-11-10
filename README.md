@@ -14,8 +14,9 @@ only supported backend. It does not use a heightfield, a mesh renderer or a thir
 the Planet is Voxels all the way through, down to 5 cm, and every one of them is editable.
 
 > **Status:** early development. The skeleton (M0) is done; M1a — "Walk the Planet" — is in
-> progress. Digging, deterministic Planet generation and the rendering tracer work today.
-> Character movement, Zoom, real-time lighting, Debris and Fluids are still being built.
+> progress. Digging, walking, deterministic Planet generation and the rendering tracer work today.
+> Flight and Zoom, real-time lighting, saves, Debris and Fluids are still being built. The plan is
+> in [`docs/spec.md`](docs/spec.md).
 
 ## What makes it different
 
@@ -71,7 +72,7 @@ cargo run --release -p client
 cargo run --release -p server
 ```
 
-The client generates the Planet on startup, which takes about 20 seconds in a release build; the
+The client generates the Planet on startup, which takes about half a minute in a release build; the
 window title says when it is done.
 
 ### Controls
@@ -115,8 +116,8 @@ The Brush is shown as a ghost where the click would apply it: exactly the Voxels
 aligned to the Planet's local up (exactly radial) and turned to face the way the camera looks, in
 steps of 45 degrees. The server holds each player to 20 Edits a second, a Brush of at most 2 m
 radius for a Dig or a Place (4 m across) and 1 m for a Smooth or a Flatten, a reach of 8 m from the
-eyes (the client aims at 7.5 m), and 8 m^3 (8,000 Voxels) a second of Voxels changed, in bursts of
-up to 72,000. Separately, a CPU budget of 600,000 units a second (360,000 at once) counts the
+eyes (the client aims at 7.5 m), and 8 m^3 (64,000 Voxels) a second of Voxels changed, in bursts of
+up to 576,000. Separately, a CPU budget of 4.8 million units a second (2.88 million at once) counts the
 Voxels in the box that holds the Brush, whether or not it changes anything (a Smooth's count six
 times), which is what stops Edits that change nothing from being free. Edits are made as the
 walking character and not from noclip; an Edit over a limit is taken back.

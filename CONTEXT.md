@@ -46,10 +46,18 @@ _Avoid_: Fragment, chunk (reserved for storage, if used at all)
 A Material whose Voxels flow and settle over time (water, sand, lava).
 _Avoid_: Liquid (sand is a Fluid too)
 
+**Journal**:
+The durable, ordered record of the Edits the server has accepted since the last checkpoint of the diverged bricks. Replaying it on top of that checkpoint gives the Planet as it was (ADR 0010).
+_Avoid_: Edit log, write-ahead log, history (the undo history is another thing)
+
+**Spawn**:
+The one place on a Planet where every character starts, chosen from the seed.
+_Avoid_: Spawn point, start position
+
 ### Experience
 
 **Zoom**:
-The continuous camera transition from a player's first/third-person view out to an orbital view of the whole Planet and back.
+The continuous camera transition from a player's first/third-person view out to an orbital view of the whole Planet and back. It moves the camera, never the character.
 _Avoid_: Map view, space view
 
 ### Walking
@@ -85,7 +93,7 @@ The always-resident coarse copy of the whole Planet, kept so a late fine brick i
 _Avoid_: Fallback LOD, backup
 
 **Soft miss**:
-A frame where a brick inside the resident set is drawn at a coarser level than the LOD rule asks for. Not a hole, but a visible pop; a soft miss inside the resident set is a bug.
+A frame where a brick inside the resident set is drawn at a coarser level than the LOD band asks for at the camera's speed. A coarser level that the band itself selects for a fast camera is not a soft miss. Not a hole, but a visible pop; a soft miss inside the resident set is a bug.
 _Avoid_: LOD miss, pop
 
 **Diverged brick**:
@@ -105,7 +113,7 @@ The spherical cap of the Planet visible from a camera at height h, with half-ang
 _Avoid_: Horizon cull, planet cull
 
 **LOD band**:
-The distance interval that selects one level: from 2^L·d0 to 2^(L+1)·d0, where d0 is the distance at which a level-0 Voxel covers one output pixel.
+The distance interval that selects one level: from 2^L·d0 to 2^(L+1)·d0, where d0 is the distance at which a level-0 Voxel covers one output pixel while the camera is slow, and shrinks as the camera moves faster, so a fast camera selects coarser levels.
 _Avoid_: Ring (the ring is the residency; the band is the selection rule)
 
 ### Planning

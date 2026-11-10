@@ -13,11 +13,18 @@ dev's RTX 4090.
 - **CPU-only PRs do not get the label**, even when they are performance-sensitive (planet
   generation, brick packing, the sim hot path): the bench measures GPU passes, so it cannot see
   them. Their throughput is guarded by CI targets and tests instead, and they merge on green CI.
-- **The dev** downloads the PR's `client-windows` artifact, runs the bench on the RTX 4090
-  (below), and pastes `report.json` into a PR comment, together with a screenshot or two.
-- **A pass over its budget blocks the merge** (#13). The dev removes the label once the report is
-  in and nothing is over. Budgets are in `bins/client/bench-budgets.toml`; a PR that deliberately
+- **The orchestrating agent** runs the bench on the RTX 4090 over SSH from the PR's
+  `client-windows` artifact (below), and posts `report.json` in a PR comment, together with a
+  screenshot or two. It checks the PR's comments first, so a report is not made twice. The dev can
+  do the same by hand.
+- **A pass over its budget blocks the merge** (#13). The agent removes the label once the report is
+  in and nothing is over, and merges on green CI and review. Budgets are in `bins/client/bench-budgets.toml`; a PR that deliberately
   changes one says so and why.
+- **Streaming gates** (decided 2026-11-10, built by the streaming bench ticket): on the full-size
+  Planet the bench also gates frame time p99 (16.7 ms), frame-thread CPU p99 (8 ms), holes (none),
+  soft misses at the speed-scaled level (none, ADR 0009) and memory. CPU-only PRs that touch
+  streaming (the loader, the prefetcher, eviction, generation) get a `needs-stream-bench` label
+  and the same run, since CI cannot see them.
 - CI runs the bench too, but only as a smoke test on lavapipe (software Vulkan): it checks that
   it runs and that the report has the right shape, and its timings mean nothing.
 
