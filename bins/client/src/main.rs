@@ -1,4 +1,5 @@
 mod bench;
+mod clock;
 mod dig;
 mod editor;
 mod fly;

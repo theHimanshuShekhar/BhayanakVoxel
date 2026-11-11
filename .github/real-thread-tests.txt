@@ -1,25 +1,38 @@
-# Client tests that start real threads: the loader's workers (`Loader::new`), the scene thread
-# (`World::with_loader`), or a plain thread. Some of them wait on wall-clock time, so they do not
-# gate merges (see docs/agents/ci.md).
+# Client tests that are about real threads or real time. They start the loader's workers
+# (`Loader::new`), the scene thread (`World::with_loader`) or a plain thread, and some of them wait
+# on wall-clock time, so they do not gate merges (see docs/agents/ci.md). Every other test that
+# streams runs stepped (`Loader::stepped`, `World::with_stepped_loader`: no threads, no sleeps, no
+# machine clock) and gates.
 #
 # One test-name filter per line. libtest matches a filter anywhere in the full test name. The
 # `linux` and `windows-tests` jobs `--skip` each line; the `real-thread-tests` job runs only these.
-# Every client test therefore runs in exactly one of the two.
+# Every client test therefore runs in exactly one of the two. A line that matches no test of the
+# client binary, or a test of another crate, fails a check (.github/scripts/check-real-thread-list.sh).
 #
-# A new test that starts a loader or the scene thread must be added here.
+# A new test goes here only if its point is a thread or the time: how long the frame thread waits,
+# a worker that panics or races, a thread that is busy or parked. A test of what becomes resident,
+# what is drawn, order, eviction or Edits is a stepped test.
 
-# Every test in bins/client/src/streaming_tests.rs (this includes its two ignored full-size tests).
-streaming_tests::
+# The two full-size runs (ignored by default): the frame thread's milliseconds over the whole Planet.
+streaming_tests::the_full_size_planet_streams_in_and_walking_over_it_does_not_stall
+streaming_tests::soft_misses_on_the_flight_take_off_and_standing_paths
 
-# The tests in bins/client/src/loader.rs that call `new_loader`, which starts two workers. The
-# other three tests there (queue order, job classes by order, workers_for) start none.
-loader::tests::a_job_is_classed_by_who_wants_it_and_the_queue_follows_the_reach
-loader::tests::a_job_that_only_the_lead_wants_is_prefetch_not_drawn
-loader::tests::the_workers_go_no_further_ahead_than_what_the_frame_thread_has_taken_in
-loader::tests::a_brick_wanted_newly_and_near_is_not_queued_behind_the_far_ones_asked_for_before
-loader::tests::a_job_generates_only_the_children_that_can_be_drawn_and_counts_those
-loader::tests::a_job_that_was_given_up_on_is_not_generated
-loader::tests::a_late_drop_does_not_undo_a_brick_that_was_asked_for_again
+# The scene thread's work of each frame, timed (what it prints is the point; the fill after it runs
+# stepped in `after_walking_at_5_m_per_s_...`).
+streaming_tests::walking_at_5_m_per_s_while_the_loader_runs_reports_the_scene_work_of_every_frame
+
+# The frame thread's waits for the scene thread and for the store, in milliseconds.
+streaming_tests::an_edit_the_frame_after_does_not_wait_for_slow_coarse_levels_and_reads_of_the_store_wait_a_step_at_most
+streaming_tests::the_frame_thread_takes_a_few_milliseconds_of_the_largest_edit_at_the_spawn_with_every_wait
+
+# A scene thread that is busy for real time, one that is parked and wakes itself, one that panics, and
+# a result that is never lost to a thread that goes on publishing.
+streaming_tests::an_edit_the_scene_thread_is_too_busy_to_pack_shows_when_it_has_and_the_frame_does_not_wait
+streaming_tests::a_parked_scene_thread_takes_the_coarsening_steps_back_when_the_hold_is_over
+streaming_tests::a_panic_on_the_scene_thread_is_a_panic_on_the_frame_thread_not_a_wait
+streaming_tests::a_job_that_is_done_is_always_there_to_be_taken_even_as_the_thread_goes_on_publishing
+
+# A loader worker that panics.
 loader::tests::a_worker_that_panics_panics_the_frame_thread_instead_of_loading_stopping_silently
 
 # bins/client/src/priority.rs: spawns a thread to lower its priority (Linux only).
