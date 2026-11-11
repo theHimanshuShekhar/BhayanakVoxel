@@ -1,13 +1,13 @@
 # BhayanakVoxel
 
-A detailed voxel game set on a single spherical planet, where players reshape a finely voxelized world and can zoom continuously from their character out to orbit.
+A detailed voxel game set on a spherical planet, where players reshape a finely voxelized world and can zoom continuously from their character out to orbit.
 
 ## Language
 
 ### World
 
 **Planet**:
-The single spherical world the game takes place on; voxel all the way through and editable at every point.
+A spherical world the game takes place on; voxel all the way through and editable at every point. The Vertical slice has one.
 _Avoid_: World, map, level
 
 **Voxel**:
@@ -33,6 +33,14 @@ _Avoid_: Modification, build
 **Brush**:
 The shape and size an Edit applies to the Planet (e.g. a 1 m sphere).
 _Avoid_: Tool size, cursor
+
+**Piece**:
+A ready-made Voxel model, such as a brick or a log, one metre across, that a player places whole in a single Edit. Once placed it is ordinary Voxels and the Planet does not remember it. A Piece lines up with the Piece it is placed against.
+_Avoid_: Block, prefab, tile
+
+**Tool**:
+What a character holds to make Edits, such as a pickaxe or a shovel. A Tool decides which Brushes its holder can use and how fast it digs each Material. Not in the Vertical slice, where a player picks a Brush freely.
+_Avoid_: Item, weapon
 
 **Ghost**:
 The preview of a Brush where the next click would apply it, showing exactly the Voxels the Edit would change.
