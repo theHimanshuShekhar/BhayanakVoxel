@@ -26,7 +26,9 @@ streaming_tests::an_edit_the_frame_after_does_not_wait_for_slow_coarse_levels_an
 streaming_tests::the_frame_thread_takes_a_few_milliseconds_of_the_largest_edit_at_the_spawn_with_every_wait
 
 # A scene thread that is busy for real time, one that is parked and wakes itself, one that panics, and
-# a result that is never lost to a thread that goes on publishing.
+# a result that is never lost to a thread that goes on publishing. The first stays here though the
+# bound it checks has a stepped test (`an_edit_a_busy_scene_thread_has_not_packed_...`): only a real
+# thread runs the frame thread's wait on the machine's clock (a condition variable's timeout).
 streaming_tests::an_edit_the_scene_thread_is_too_busy_to_pack_shows_when_it_has_and_the_frame_does_not_wait
 streaming_tests::a_parked_scene_thread_takes_the_coarsening_steps_back_when_the_hold_is_over
 streaming_tests::a_panic_on_the_scene_thread_is_a_panic_on_the_frame_thread_not_a_wait

@@ -312,6 +312,18 @@ impl World {
         self.clock.advance(time);
     }
 
+    /// The time on the world's clock.
+    #[cfg(test)]
+    pub fn time(&self) -> std::time::Instant {
+        self.clock.now()
+    }
+
+    /// How long [`World::edit_due`] waits for an Edit at a look at the scene.
+    #[cfg(test)]
+    pub fn edit_wait_time(&self) -> std::time::Duration {
+        self.edit_wait
+    }
+
     /// What the loader is doing, as of the scene the world has, if there is one.
     pub fn loader(&self) -> Option<LoaderStats> {
         self.worker.as_ref().map(|_| self.stats.loader)

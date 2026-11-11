@@ -1516,6 +1516,82 @@ fn an_edit_the_scene_thread_is_too_busy_to_pack_shows_when_it_has_and_the_frame_
     }
 }
 
+/// ADR 0006's bound on the stepped clock: the frame thread waits `EDIT_WAIT` for an Edit and no
+/// more, and the Edit is in the first look after the scene thread has packed it, with the result
+/// kept until it is taken. (`an_edit_the_scene_thread_is_too_busy_to_pack_shows_when_it_has_and_
+/// the_frame_does_not_wait` is the same on real threads, where the wait is a condition variable's.)
+#[test]
+fn an_edit_a_busy_scene_thread_has_not_packed_is_waited_for_edit_wait_and_shows_in_the_first_look_after_it_has()
+ {
+    let (mut world, _server, camera) = spawned_world(Run::Stepped);
+    fill(&mut world, camera.position);
+    let aim = up_close(&mut world, &camera);
+    let depth = |world: &World| {
+        crate::world::centre_hit(world.scene(), &aim)
+            .expect("ground")
+            .t
+    };
+    let whole = depth(&world);
+    // The thread is busy for 300 ms of the world's time from now, as a frame's worth of the camera
+    // and the arrivals would keep it: it does nothing until then, the Edit's pack included.
+    let busy = Duration::from_millis(300);
+    let began = world.time();
+    world.worker().busy_for(busy);
+    world.edit(&aim, &crate::tool::Tool::default()).unwrap();
+
+    // The frame of the click looks without waiting. The frame after waits for the Edit, gives up
+    // at `EDIT_WAIT` on the clock with the thread still busy, and has taken nothing.
+    let waited = world.time();
+    assert!(
+        world.recentre(aim.position).unwrap().is_none(),
+        "nothing is made while the thread is busy"
+    );
+    assert_eq!(world.time(), waited, "the first look does not wait");
+    assert!(
+        world.recentre(aim.position).unwrap().is_none(),
+        "nothing is taken while the thread is busy"
+    );
+    assert_eq!(
+        world.time() - waited,
+        world.edit_wait_time(),
+        "the second look waits for the Edit, no more"
+    );
+    assert!((depth(&world) - whole).abs() < 0.5, "not shown yet");
+
+    // Frames go by. Every look until the thread is free takes nothing (never an empty result that
+    // the Edit would be lost to), and the first look after it has packed the Edit shows it.
+    let mut shown = None;
+    for frame in 1..=40 {
+        pace(&world, FRAME);
+        let looked_at = world.time();
+        let update = world.recentre(aim.position).unwrap();
+        if (depth(&world) - whole).abs() >= 0.5 {
+            assert!(update.is_some(), "the Edit comes in an update");
+            shown = Some((frame, looked_at));
+            break;
+        }
+        assert!(update.is_none(), "nothing is taken before the Edit is");
+        assert!(
+            looked_at < began + busy,
+            "a thread that is free has packed it by the look after: {:?} of {busy:?}",
+            looked_at - began
+        );
+    }
+    let (frame, looked_at) = shown.expect("the Edit never showed");
+    assert!(
+        looked_at >= began + busy,
+        "it shows only once the thread was free: {:?}",
+        looked_at - began
+    );
+    assert!(
+        looked_at - FRAME < began + busy,
+        "and in the first look after: frame {frame}, at {:?}",
+        looked_at - began
+    );
+    let dug = depth(&world);
+    assert!(dug > whole + 1.0, "the hole shows: {whole}, then {dug}");
+}
+
 #[test]
 fn changes_made_while_a_copy_of_the_whole_scene_waits_go_into_the_copy() {
     let (mut world, _server, camera) = spawned_world(Run::Stepped);

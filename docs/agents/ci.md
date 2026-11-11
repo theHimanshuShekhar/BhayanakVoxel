@@ -58,6 +58,11 @@ hold (the coarsening's, the soft-miss count's) ends when the test has moved the 
 `Patience` to wait for something: it counts steps, not seconds. Do not call `Instant::now` or
 `thread::sleep` in a stepped test.
 
+A stepped scene thread can be busy too. `world.worker().busy_for(time)` has it do nothing for `time`
+of the clock. A wait that has a timeout, such as the frame thread's `EDIT_WAIT` for an Edit, then
+gives up when the timeout is over on that clock, and the Edit shows in the first look after the
+thread is free. That is the stepped test of ADR 0006's bound.
+
 **Write a real-thread test** only when the point is a thread or the time: how long the frame thread
 waits, a lock that is held too long, a worker that panics or races, a scene thread that is busy or
 parked. It uses `Run::Threads(n)`, and its name goes in `.github/real-thread-tests.txt` with a

@@ -48,9 +48,3 @@ opt-level = 3
 # The simulator replays camera paths through every brick of a shell, thousands of times over.
 [profile.dev.package.prefetch-sim]
 opt-level = 3
-
-# The client's stepped streaming tests (#180) select and pack the scene thousands of times over on
-# one thread, where they had a thread each before: this takes the longest of them from 77 s to 44 s.
-# Nothing in the crate depends on the optimisation level.
-[profile.dev.package.render]
-opt-level = 3

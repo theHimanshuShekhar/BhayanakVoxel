@@ -409,6 +409,10 @@ pub struct SceneWorker {
     /// [`SceneWorker::start_stepped`]).
     #[cfg(test)]
     stepped: Option<Mutex<Engine>>,
+    /// Until when (on the stepped clock) a stepped thread is busy and does nothing: what a wait of
+    /// the frame thread's that has a timeout runs out against (see [`SceneWorker::busy_for`]).
+    #[cfg(test)]
+    busy_until: Mutex<Option<Instant>>,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -520,19 +524,47 @@ impl SceneWorker {
             thread: None,
             #[cfg(test)]
             stepped: None,
+            #[cfg(test)]
+            busy_until: Mutex::new(None),
         };
         (engine, worker, mirror, stats)
     }
 
     /// One step of a stepped scene thread: the loader makes up to [`STEP_JOBS`] jobs, and the
     /// thread does a round of its work (following the camera it was last told, its jobs, taking in
-    /// what was made, publishing). Does nothing for one with a thread. The frame thread's calls that
-    /// wait for the thread step it until it has done.
+    /// what was made, publishing). Does nothing for one with a thread, nor for one that is busy
+    /// ([`SceneWorker::busy_for`]). The frame thread's calls that wait for the thread step it until
+    /// it has done.
     #[cfg(test)]
     pub fn step(&self) {
         if let Some(engine) = &self.stepped {
-            engine.lock().expect("the engine is not poisoned").step();
+            let mut engine = engine.lock().expect("the engine is not poisoned");
+            if let Some(until) = *lock(&self.busy_until)
+                && engine.clock.now() < until
+            {
+                return;
+            }
+            engine.step();
         }
+    }
+
+    /// Has a stepped thread busy for `time` of its clock from now, as the camera or the arrivals
+    /// keep a real one: it does nothing until then, the jobs it has included. A wait for a job with
+    /// a timeout that is over before that gives up with the clock moved on to the timeout, and the
+    /// job is done by the first step after the thread is free; a wait with no timeout moves the
+    /// clock on to when it is free.
+    #[cfg(test)]
+    pub fn busy_for(&self, time: Duration) {
+        let engine = self
+            .stepped
+            .as_ref()
+            .expect("only a stepped thread is busy");
+        let now = engine
+            .lock()
+            .expect("the engine is not poisoned")
+            .clock
+            .now();
+        *lock(&self.busy_until) = Some(now + time);
     }
 
     /// Tells the thread where the camera is, a position in Voxels: it follows it when it has the
@@ -642,16 +674,35 @@ impl SceneWorker {
     /// [`SceneWorker::wait`], for `timeout` at the most if there is one. Whether the job is
     /// published.
     pub fn wait_for(&self, ticket: u64, timeout: Option<Duration>) -> Result<bool, RingsFull> {
-        // A stepped thread is as quick as the frame thread needs it to be: it steps until the job
-        // is done, and a timeout, which is for a thread that may be busy, does not run out.
+        // A stepped thread steps until the job is done. It is as quick as the frame thread needs it
+        // to be unless the test has it busy ([`SceneWorker::busy_for`]): then a timeout runs out on
+        // the stepped clock if the thread is still busy at the end of it, and the wait is over.
         #[cfg(test)]
-        if self.stepped.is_some() {
+        if let Some(engine) = &self.stepped {
+            let clock = engine
+                .lock()
+                .expect("the engine is not poisoned")
+                .clock
+                .clone();
+            let until = timeout.map(|t| clock.now() + t);
             for _ in 0..MOST_STEPS_FOR_A_JOB {
                 {
                     let outbox = lock(&self.shared.outbox);
                     if outbox.done >= ticket || outbox.failed {
                         break;
                     }
+                }
+                let free = *lock(&self.busy_until);
+                if let Some(free) = free
+                    && free > clock.now()
+                {
+                    if let Some(until) = until
+                        && free > until
+                    {
+                        clock.advance(until.saturating_duration_since(clock.now()));
+                        return Ok(false);
+                    }
+                    clock.advance(free - clock.now());
                 }
                 self.step();
             }
