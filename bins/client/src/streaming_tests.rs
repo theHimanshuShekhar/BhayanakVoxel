@@ -1747,30 +1747,69 @@ fn flying_with_margins_evicts_the_trail_and_keeps_the_margin_the_camera_is_in() 
 fn a_prefetch_lead_makes_bricks_ahead_that_a_camera_without_one_does_not() {
     let (mut without, _s, camera) = spawned_world(2);
     fill(&mut without, camera.position);
-    without.set_lead(false);
     let (ahead, _) = tangents(camera.horizon_up);
     let (mut leading, _s2, _) = spawned_world(2);
     fill(&mut leading, camera.position);
-    // Both go the same way at 7.5 m/s (0.75 Voxels every 5 ms: the test Planet is small, so the
-    // places a lead looks at are near its ground only if it is short), and the frames show it to the one
-    // that looks ahead.
-    for step in 1..=160 {
-        let at: [f64; 3] =
-            std::array::from_fn(|a| camera.position[a] + ahead[a] * 0.75 * f64::from(step));
-        for world in [&mut without, &mut leading] {
-            world.recentre(at).unwrap();
-            world.stream::<RingsFull>(at, |_, _| Ok(())).unwrap();
+    // Both stand at the same place 120 Voxels on, and the one that looks ahead is given a
+    // velocity of 7.5 m/s (the test Planet is small, so the places a lead looks at are near its
+    // ground only if it is short). The velocity is given, not worked out from the time of the
+    // frames (the unit tests in world.rs cover that), and the path is not walked, so that what
+    // is held does not depend on which frames the scene thread saw.
+    let speed = 7.5 * VOXELS_PER_METRE;
+    let velocity = ahead.map(|c| c * speed);
+    let end: [f64; 3] = std::array::from_fn(|a| camera.position[a] + ahead[a] * 120.0);
+    for (world, velocity) in [(&mut without, [0.0; 3]), (&mut leading, velocity)] {
+        let began = Instant::now();
+        loop {
+            world.recentre_moving(end, velocity).unwrap();
+            world.sync().unwrap();
+            // `lag` is 0 once the scene thread has taken the update that moved it to `end`: the
+            // thread can drop one that comes while it is busy, and then the world is idle at the
+            // spawn.
+            if idle(world) && world.lag(end) == 0.0 {
+                break;
+            }
+            assert!(
+                began.elapsed() < Duration::from_secs(180),
+                "does not settle"
+            );
         }
-        std::thread::sleep(Duration::from_millis(5));
     }
-    without.sync().unwrap();
-    leading.sync().unwrap();
-    let (a, b) = (
-        without.loader().unwrap().generated,
-        leading.loader().unwrap().generated,
+    // The bricks that only the leading world holds are ahead of the camera: the lead made them.
+    let (plain, led) = (without.store(), leading.store());
+    let mut only_led = Vec::new();
+    for level in 0..LEVELS {
+        let held = plain.level(level).unwrap().sorted_coords();
+        for coord in led.level(level).unwrap().sorted_coords() {
+            if held.binary_search(&coord).is_err() {
+                only_led.push((level, coord));
+            }
+        }
+    }
+    eprintln!(
+        "{} bricks are held with a lead and not without",
+        only_led.len()
     );
-    eprintln!("generated {a} without a lead, {b} with one");
-    assert!(b > a, "the lead makes bricks: {a} {b}");
+    assert!(!only_led.is_empty(), "the lead makes bricks");
+    let ahead_of_end = only_led
+        .iter()
+        .filter(|(level, coord)| {
+            let edge = f64::from(brick_store::BRICK_SIZE << level);
+            let along: f64 = (0..3)
+                .map(|a| (f64::from(coord.0[a]) + 0.5) * edge - end[a])
+                .zip(ahead)
+                .map(|(d, t)| d * t)
+                .sum();
+            along > 0.0
+        })
+        .count();
+    eprintln!("{ahead_of_end} of them are ahead of the camera");
+    assert_eq!(
+        ahead_of_end,
+        only_led.len(),
+        "what the lead made is all ahead of the camera: {ahead_of_end} of {}",
+        only_led.len()
+    );
 }
 
 #[test]
