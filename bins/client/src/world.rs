@@ -433,12 +433,18 @@ impl World {
     /// camera is, and returns what it has made since the last call, which is of an earlier camera:
     /// the rings are never half moved.
     pub fn recentre(&mut self, camera: [f64; 3]) -> Result<Option<SceneUpdate>, RingsFull> {
-        let velocity = if self.lead {
-            self.motion.observe(camera, std::time::Instant::now())
+        let velocity = self.lead_velocity(camera, std::time::Instant::now());
+        self.recentre_moving(camera, velocity)
+    }
+
+    /// The velocity [`World::recentre`] hands to the scene thread for the camera seen at `camera`
+    /// at `now`: the measured one, or none if the lead is off.
+    fn lead_velocity(&mut self, camera: [f64; 3], now: std::time::Instant) -> [f64; 3] {
+        if self.lead {
+            self.motion.observe(camera, now)
         } else {
             [0.0; 3]
-        };
-        self.recentre_moving(camera, velocity)
+        }
     }
 
     /// [`World::recentre`] with the camera's `velocity` given, in Voxels a second, for the lead
@@ -789,6 +795,54 @@ mod tests {
         let scene = Scene::new(&store, None);
         let (client, server) = loopback();
         (World::new(scene, Predictor::new(store), client), server)
+    }
+
+    /// `n` frames of 5 ms after `base`.
+    fn frames(base: std::time::Instant, n: u32) -> std::time::Instant {
+        base + std::time::Duration::from_millis(5) * n
+    }
+
+    #[test]
+    fn the_velocity_is_a_running_mean_of_the_frames_that_resets_on_a_gap_or_a_jump() {
+        let base = std::time::Instant::now();
+        let mut motion = Motion::default();
+        // The first sighting has nothing to measure against.
+        assert_eq!(motion.observe([0.0; 3], base), [0.0; 3]);
+        // 0.75 Voxels every 5 ms along x is 150 Voxels a second, which the mean comes to.
+        let mut velocity = [0.0; 3];
+        for n in 1..=200 {
+            velocity = motion.observe([0.75 * f64::from(n), 0.0, 0.0], frames(base, n));
+        }
+        assert!((velocity[0] - 150.0).abs() < 1.0, "{velocity:?}");
+        assert!(velocity[1].abs() < 1e-9 && velocity[2].abs() < 1e-9);
+        // The same moment twice gives the velocity there was.
+        let now = frames(base, 200);
+        assert_eq!(motion.observe([151.0, 0.0, 0.0], now), velocity);
+        // A frame that came after more than a quarter of a second: no velocity.
+        let late = now + std::time::Duration::from_millis(260);
+        assert_eq!(motion.observe([190.0, 0.0, 0.0], late), [0.0; 3]);
+        // Measuring starts again from there.
+        let next = late + std::time::Duration::from_millis(5);
+        let v = motion.observe([190.75, 0.0, 0.0], next);
+        assert!(v[0] > 0.0 && v[0] < 150.0, "{v:?}");
+        // A jump faster than MOST_LEAD_SPEED (a teleport): no velocity either.
+        let jump = next + std::time::Duration::from_millis(5);
+        let far = 190.75 + MOST_LEAD_SPEED * 0.005 * 2.0;
+        assert_eq!(motion.observe([far, 0.0, 0.0], jump), [0.0; 3]);
+    }
+
+    #[test]
+    fn recentre_hands_on_the_measured_velocity_only_while_the_lead_is_on() {
+        let base = std::time::Instant::now();
+        let (mut world, _server) = world();
+        let mut on = [0.0; 3];
+        for n in 0..=200 {
+            on = world.lead_velocity([0.75 * f64::from(n), 0.0, 0.0], frames(base, n));
+        }
+        assert!((on[0] - 150.0).abs() < 1.0, "{on:?}");
+        world.set_lead(false);
+        let off = world.lead_velocity([151.5, 0.0, 0.0], frames(base, 202));
+        assert_eq!(off, [0.0; 3]);
     }
 
     #[test]
