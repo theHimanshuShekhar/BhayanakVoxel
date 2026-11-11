@@ -28,7 +28,7 @@ BhayanakVoxel is a hobby / tech-demo voxel game. It has one fully voxel, editabl
 | Terrain | Earth-like with fantasy accents. ~50% ocean, ±2 km relief, 4 biomes, dense vegetation, rivers and lakes, caves to ~300 m, a molten core. A **precomputed per-seed cube-sphere world map** that is coarse (~240 m a texel: continents, climate, biomes, large drainage), with everything finer made by deterministic functions at generation, then per-brick generation at any LOD. Relief, caves and strata are in metres and continents have a fixed size in km, so a bigger Planet has more of them (ADR 0008). Deterministic on the CPU. | [Choose terrain generation for M1](https://github.com/theHimanshuShekhar/bhayanakvoxel/issues/14), [Research: bit-identical Planet generation](https://github.com/theHimanshuShekhar/bhayanakvoxel/issues/12) |
 | Materials and Edits | A creative palette of ~55 data-defined Materials with PBR and physical properties. Sphere, cube and cylinder Brushes up to ~4 m, plus smooth/flatten. Local-tangent snapping. Hardness-timed digging. **Pieces**: 1 m ready-made Voxel models placed in one Edit, which become ordinary Voxels and line up with their neighbours (ADR 0011). | [ADR 0011](adr/0011-pieces-are-stamped-voxels.md), [Choose M1 Materials & Edit tools](https://github.com/theHimanshuShekhar/bhayanakvoxel/issues/15) |
 | Player | Walk, run, crouch, jump, swim, stamina-limited climbing, and fly up to 50 m/s. The capsule sweeps against Voxels, with the same code on client and server. Over-shoulder third person. Zoom by scroll or a cinematic key. A voxel humanoid avatar. | [Choose character controller, camera & Zoom control](https://github.com/theHimanshuShekhar/bhayanakvoxel/issues/16) |
-| Network | **Clients generate terrain; the server replicates only ~24 B Edit operations Planet-wide.** The server is authoritative at 60 Hz, using renet. Join and brick-hash checks. Single-player runs the real server in-process over a loopback. | [ADR 0003](https://github.com/theHimanshuShekhar/bhayanakvoxel/blob/main/docs/adr/0003-client-generated-terrain-edit-ops.md), [Choose network architecture](https://github.com/theHimanshuShekhar/bhayanakvoxel/issues/11) |
+| Network | **Clients generate terrain; the server replicates only ~24 B Edit operations Planet-wide.** The server is authoritative at 60 Hz. The transport is **iroh if its prototype passes, otherwise renet** (decided 2026-11-11, ADR 0003 as amended); the `net` crate hides it behind the message protocol. Join and brick-hash checks. Single-player runs the real server in-process over a loopback. | [ADR 0003](https://github.com/theHimanshuShekhar/bhayanakvoxel/blob/main/docs/adr/0003-client-generated-terrain-edit-ops.md), [Choose network architecture](https://github.com/theHimanshuShekhar/bhayanakvoxel/issues/11) |
 | Persistence | One SQLite `world.db` per world. Every accepted Edit is appended to a journal as it is applied; a checkpoint of the diverged bricks every ~1 min lets the journal be truncated; 3 backups kept (ADR 0010). A generator-version guard. A ~2 GB client cache. | [Choose save format & world persistence](https://github.com/theHimanshuShekhar/bhayanakvoxel/issues/17) |
 | Debris | Connectivity flood fill. rapier3d with parry3d `Voxels` colliders, simulated on the server. Fracture by hardness. Debris merges back after ~3 s at rest. ≤ ~1,000 live pieces, each ≤ 500 m³. | [Choose Debris detection & physics](https://github.com/theHimanshuShekhar/bhayanakvoxel/issues/18) |
 | Fluids | A server-side cellular automaton (fill levels, granular sand) with 26-direction radial down. Rivers and the ocean simulate near players. 20 Hz, ≤ 2M active Voxels, ≤ 4 ms. | [Choose Fluid simulation model](https://github.com/theHimanshuShekhar/bhayanakvoxel/issues/19) |
@@ -160,25 +160,29 @@ During M1b a throwaway **Debris and Fluids prototype** at 5 cm (CPU only, on the
 ### M2: Multiplayer
 
 **Scope**
-- A dedicated headless server with renet transport replacing the loopback.
+- **Two ways to host**, on the same server code: a player opens their world to friends from the client (the in-process server starts listening, and the world stops when the host quits), or a dedicated headless server keeps a world always on.
+- **The transport replaces the loopback.** Iroh, if its prototype passes: Edit operations on a reliable stream, state snapshots as datagrams, connections that pass home routers, joined by an id or ticket. Otherwise renet, joined by address and port. The prototype runs during M1b, before this Milestone is broken into tickets.
+- **Relays:** when two networks cannot connect directly, iroh's public relays carry the traffic by default. A server can name its own relay or turn relays off.
 - The join flow: version and probe hashes, then edited-brick snapshots.
 - Prediction and reconciliation, and interpolation of other players.
 - Prioritised snapshots, Edit-op broadcast, and brick-hash checks near Edits.
 - Server config (one world per process) and the ~2 GB client cache.
-- Player identity from a persistent id the client generates.
-- **Friends-only servers**: a password or an allow-list, and an admin who can kick a player and restore a backup. Everyone on a server is trusted; there are no claims or roles.
-- One seeded world spawn where every player starts (ADR 0008).
+- **Player identity is a keypair** the client makes on first run. The public key names the player's record in the save, and nobody can join as another player.
+- **Friends-only servers**: a server has a password, and optionally an allow-list of keys that an admin fills by approving join requests. Everyone on a server is trusted; there are no claims or roles.
+- **Admins** are keys named in the server config; the host is one. They can kick, ban a key, approve a join, set or pause the world clock, save now and list backups, from an in-game prompt or the dedicated server's console. Restoring a backup is done with the server stopped.
+- **Playing together:** a player rejoins where they left, and a new player starts at the Spawn (ADR 0008). Other players have name tags nearby, a direction-and-distance marker beyond that, and a marker in the Zoom. Text chat; no voice.
 - The server owns the world clock (#138), and undo is tested with two players.
 
 **Acceptance**
-- The server holds **60 Hz with 32 scripted bot clients** (walking, flying and digging at the rate limits, spread over the Planet) **plus 2 human players**.
+- The server holds **60 Hz with 16 players**: 14 scripted bot clients (walking, flying and digging at the rate limits, spread over the Planet) plus 2 humans. A run with 32 bots is reported and does not gate. The protocol allows 64.
+- The same holds when a player hosts from the client, with the frame-time gates of M1a still met on the host.
 - ≤ ~1 Mbit/s per client.
 - **Zero brick-hash mismatches over a 1-hour soak.**
-- Server memory stays within ~0.25 GB of voxel working set for 30 spread-out players, plus overhead.
+- Server memory per player stays within a budget set from the bot soak (#169). The earlier figure, ~0.25 GB for 30 players, was worked out at 10 cm.
 
 A headless bot soak against the in-process server runs from M1a on (tick time and memory per player), so the server's per-tick Edit budget and the memory target are measured before this Milestone.
 
-**Playtest checklist:** two humans on separate PCs see each other move smoothly, dig and build together, see each other's Edits from orbit, and rejoin to a cached world.
+**Playtest checklist:** two humans on separate PCs see each other move smoothly, dig and build together, see each other's Edits from orbit, find each other by their markers, chat, and rejoin where they left to a cached world. One of them hosts from the client; then both join a dedicated server.
 
 ### M3: Debris
 
