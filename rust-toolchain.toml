@@ -1,0 +1,5 @@
+# The exact Rust that CI and every checkout use. To change it, see docs/agents/ci.md.
+[toolchain]
+channel = "1.99.1"
+profile = "minimal"
+components = ["rustfmt", "clippy"]

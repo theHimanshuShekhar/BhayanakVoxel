@@ -1,0 +1,26 @@
+# Client tests that start real threads: the loader's workers (`Loader::new`), the scene thread
+# (`World::with_loader`), or a plain thread. Some of them wait on wall-clock time, so they do not
+# gate merges (see docs/agents/ci.md).
+#
+# One test-name filter per line. libtest matches a filter anywhere in the full test name. The
+# `linux` and `windows-tests` jobs `--skip` each line; the `real-thread-tests` job runs only these.
+# Every client test therefore runs in exactly one of the two.
+#
+# A new test that starts a loader or the scene thread must be added here.
+
+# Every test in bins/client/src/streaming_tests.rs (this includes its two ignored full-size tests).
+streaming_tests::
+
+# The tests in bins/client/src/loader.rs that call `new_loader`, which starts two workers. The
+# other three tests there (queue order, job classes by order, workers_for) start none.
+loader::tests::a_job_is_classed_by_who_wants_it_and_the_queue_follows_the_reach
+loader::tests::a_job_that_only_the_lead_wants_is_prefetch_not_drawn
+loader::tests::the_workers_go_no_further_ahead_than_what_the_frame_thread_has_taken_in
+loader::tests::a_brick_wanted_newly_and_near_is_not_queued_behind_the_far_ones_asked_for_before
+loader::tests::a_job_generates_only_the_children_that_can_be_drawn_and_counts_those
+loader::tests::a_job_that_was_given_up_on_is_not_generated
+loader::tests::a_late_drop_does_not_undo_a_brick_that_was_asked_for_again
+loader::tests::a_worker_that_panics_panics_the_frame_thread_instead_of_loading_stopping_silently
+
+# bins/client/src/priority.rs: spawns a thread to lower its priority (Linux only).
+priority::tests::

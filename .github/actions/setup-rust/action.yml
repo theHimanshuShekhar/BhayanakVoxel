@@ -1,0 +1,27 @@
+name: Set up Rust
+description: >
+  Installs the Rust that rust-toolchain.toml pins, and caches the build. Run it after checkout.
+  dtolnay/rust-toolchain does not read rust-toolchain.toml (it takes the version from its own ref),
+  so this asks rustup, which does.
+
+inputs:
+  cache-key:
+    description: Extra key for the build cache, for jobs that build the same crates differently.
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    # With no arguments, rustup installs the toolchain named in rust-toolchain.toml, with its
+    # components and profile. Since rustup 1.28 it does not do that by itself on first use.
+    - name: Install the pinned toolchain
+      shell: bash
+      run: rustup toolchain install
+    - name: Show the toolchain
+      shell: bash
+      run: |
+        rustc --version
+        cargo --version
+    - uses: Swatinem/rust-cache@v2
+      with:
+        key: ${{ inputs.cache-key }}
