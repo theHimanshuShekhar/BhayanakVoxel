@@ -1565,6 +1565,7 @@ fn an_edit_a_busy_scene_thread_has_not_packed_is_waited_for_edit_wait_and_shows_
         pace(&world, FRAME);
         let looked_at = world.time();
         let update = world.recentre(aim.position).unwrap();
+        assert_eq!(world.time(), looked_at, "a later look does not wait");
         if (depth(&world) - whole).abs() >= 0.5 {
             assert!(update.is_some(), "the Edit comes in an update");
             shown = Some((frame, looked_at));
