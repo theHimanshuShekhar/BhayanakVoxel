@@ -143,9 +143,11 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
-CI runs those on Linux, builds the Windows client, and runs the golden-hash determinism tests
-across debug and release builds on both Linux and Windows. Render tests run on lavapipe, the
-software Vulkan driver, so they need no GPU.
+CI runs those on Linux, builds the Windows client, runs the non-GPU tests on Windows, and runs the
+golden-hash determinism tests across debug and release builds on both Linux and Windows. Render
+tests run on lavapipe, the software Vulkan driver, so they need no GPU. The client tests that
+start real threads run in a separate job that does not gate merges. Rust and the runner images are
+pinned. Details are in [`docs/agents/ci.md`](docs/agents/ci.md).
 
 Contributor and agent guidance lives in [`AGENTS.md`](AGENTS.md), with the issue tracker,
 triage labels and domain-doc conventions in [`docs/agents/`](docs/agents/).
