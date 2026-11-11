@@ -108,14 +108,14 @@ Every Milestone is **done** only when all of the following hold:
 
 **M1a-2 order (2026-11-11, after the review of what is built).** The tracking issue is [#41](https://github.com/theHimanshuShekhar/bhayanakvoxel/issues/41). Measured numbers are in [`docs/measurements.md`](measurements.md).
 1. CI (#177): the client tests that run real threads move to a job that does not gate; Rust and the runner images are pinned; the crates that need no GPU are tested on Windows.
-2. A stepped mode for the client's tests: the scene thread and the loader are driven a step at a time on one thread, so the tests that gate do not depend on the clock.
-3. The streaming bench, in two parts: the streaming mode on the test Planet in CI with residency and soft-miss counts and the measured sizing constants, then the full-size run in real time on the 4090 with its four gates (#162 with #64's measurement part).
+2. #180, a stepped mode for the client's tests: the scene thread and the loader are driven a step at a time on one thread, so the tests that gate do not depend on the clock.
+3. The streaming bench, in two parts (with #64's measurement part): #181, the streaming mode on the test Planet in CI with residency and soft-miss counts and the measured sizing constants; then #162, the full-size run in real time on the 4090 with its four gates.
 4. #145 uploads: per-buffer growth and a per-frame budget, before the buffers grow.
 5. #166 the 320 km generator, then the look-dev flythrough (#148) on it.
 6. #167 the renderer's levels, Guard and sizes, #146 the horizon cap, then #168 speed-scaled LOD and the 20 m spawn. #166 and #168 measure the sizing constants again.
 7. **A playtest on the 4090**: walk, fly, orbit and edit at 320 km. What it finds becomes tickets before saves start.
-8. The wire codec (every message encoded, with a protocol version, the Planet's id in an Edit, golden bytes, and seeded delay, loss and reordering on the loopback), then a throwaway prototype that recovers a Piece's frame from its stamped Voxels. The prototype's result decides whether a stamped Piece also keeps a record, before saves are designed.
-9. #62 saves in two parts: first the schema, the Edit Journal (the codec's bytes), checkpoints, loading and crash tests; then #144 Edit epochs and #163 uploads; then backups, the generator guard and migrations, any time before #63.
+8. #182, the wire codec (every message encoded, with a protocol version, the Planet's id in an Edit, golden bytes, and seeded delay, loss and reordering on the loopback), then #183, a throwaway prototype that recovers a Piece's frame from its stamped Voxels. The prototype's result decides whether a stamped Piece also keeps a record, before saves are designed.
+9. Saves in two parts: first #62, the schema, the Edit Journal (the codec's bytes), checkpoints, loading and crash tests; then #144 Edit epochs and #163 uploads; then #184, backups, the generator guard and migrations, any time before #63.
 10. The server bot soak (#169).
 11. #52 sun shadows, #53 atmosphere, #54 GI, #55 denoiser, then the #50 hardware RT spike.
 12. #57 swim, climb and fly, #58 camera and Zoom, #59 avatar, #150 and #151 bindings and HUD, Pieces (the system and about 12 Pieces, ADR 0011), #149 heatmap, #63 start menu, #64 final budgets and soak.
