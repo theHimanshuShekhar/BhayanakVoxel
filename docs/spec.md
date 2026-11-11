@@ -12,6 +12,8 @@ Break this spec into build tickets with `/to-tickets`, one Milestone at a time.
 
 BhayanakVoxel is a hobby / tech-demo voxel game. It has one fully voxel, editable, spherical **Planet**, **320 km in radius** (ADR 0008, was 16 km), made of **5 cm Voxels** (ADR 0007, was 10 cm). Lighting is path-traced, inspired by John Lin's *Crystal Islands*. The **Zoom** runs continuously from first person out to the whole Planet as a small disc. The game targets native desktop (Windows and Linux, Vulkan). It ends up as dedicated-server multiplayer for dozens of players, with **Debris** and **Fluids**.
 
+**What the game is** (decided 2026-11-11). The Vertical slice is a shared creative sandbox: shape the Planet with Brushes and build on it with **Pieces**, with friends, with free Materials and no rules. The headline is the Planet itself: its scale, its Zoom and its look. After the slice it grows, in this order, into moving Pieces, survival with Tools, and a solar system of Planets (see *After the Vertical slice*).
+
 - **Who builds it:** AI agents write most of the code. The dev, a graphics beginner, steers, reviews, playtests and merges.
 - **Reference hardware:** M0–M4 target an **RTX 4090** at 1440p60. M5 brings the game down to RTX 3060 / RX 6700-class cards.
 
@@ -24,7 +26,7 @@ BhayanakVoxel is a hobby / tech-demo voxel game. It has one fully voxel, editabl
 | Storage and LOD | Sparse **8³ bricks**: an occupancy mask plus palette-compressed 16-bit Materials. Unedited bricks are a regenerable cache; edited bricks persist. **All-voxel LOD rings to orbit** using majority downsampling, with Edits propagated to every level. The LOD band distance shrinks with camera speed, so a fast camera draws coarser levels (ADR 0009). | [ADR 0002](adr/0002-brick-store-all-voxel-lod.md), [ADR 0009](adr/0009-speed-scaled-lod.md), [Choose voxel data structure & LOD scheme](https://github.com/theHimanshuShekhar/bhayanakvoxel/issues/9) |
 | Rendering | **Compute DDA** behind one `trace()` function; every lighting pass is built on it first. Hardware RT (wgpu ray queries over brick AABBs) is a time-boxed spike after GI, adopted only if it is faster on real secondary rays (ADR 0001). 1-bounce GI plus a world-space radiance cache. Emissives, glossy reflections, glass, volumetrics, and a Hillaire atmosphere. Tracing at half resolution per axis, followed by our own WGSL denoiser (growing toward A-SVGF) and TAAU. A reference path-tracer mode. **≈ 8.6 ms of GPU work on the 4090.** | [Choose lighting & rendering pipeline](https://github.com/theHimanshuShekhar/bhayanakvoxel/issues/10), [Research: voxel path tracing](https://github.com/theHimanshuShekhar/bhayanakvoxel/issues/5) |
 | Terrain | Earth-like with fantasy accents. ~50% ocean, ±2 km relief, 4 biomes, dense vegetation, rivers and lakes, caves to ~300 m, a molten core. A **precomputed per-seed cube-sphere world map** that is coarse (~240 m a texel: continents, climate, biomes, large drainage), with everything finer made by deterministic functions at generation, then per-brick generation at any LOD. Relief, caves and strata are in metres and continents have a fixed size in km, so a bigger Planet has more of them (ADR 0008). Deterministic on the CPU. | [Choose terrain generation for M1](https://github.com/theHimanshuShekhar/bhayanakvoxel/issues/14), [Research: bit-identical Planet generation](https://github.com/theHimanshuShekhar/bhayanakvoxel/issues/12) |
-| Materials and Edits | A creative palette of ~55 data-defined Materials with PBR and physical properties. Sphere, cube and cylinder Brushes up to ~4 m, plus smooth/flatten. Local-tangent snapping. Hardness-timed digging. | [Choose M1 Materials & Edit tools](https://github.com/theHimanshuShekhar/bhayanakvoxel/issues/15) |
+| Materials and Edits | A creative palette of ~55 data-defined Materials with PBR and physical properties. Sphere, cube and cylinder Brushes up to ~4 m, plus smooth/flatten. Local-tangent snapping. Hardness-timed digging. **Pieces**: 1 m ready-made Voxel models placed in one Edit, which become ordinary Voxels and line up with their neighbours (ADR 0011). | [ADR 0011](adr/0011-pieces-are-stamped-voxels.md), [Choose M1 Materials & Edit tools](https://github.com/theHimanshuShekhar/bhayanakvoxel/issues/15) |
 | Player | Walk, run, crouch, jump, swim, stamina-limited climbing, and fly up to 50 m/s. The capsule sweeps against Voxels, with the same code on client and server. Over-shoulder third person. Zoom by scroll or a cinematic key. A voxel humanoid avatar. | [Choose character controller, camera & Zoom control](https://github.com/theHimanshuShekhar/bhayanakvoxel/issues/16) |
 | Network | **Clients generate terrain; the server replicates only ~24 B Edit operations Planet-wide.** The server is authoritative at 60 Hz, using renet. Join and brick-hash checks. Single-player runs the real server in-process over a loopback. | [ADR 0003](https://github.com/theHimanshuShekhar/bhayanakvoxel/blob/main/docs/adr/0003-client-generated-terrain-edit-ops.md), [Choose network architecture](https://github.com/theHimanshuShekhar/bhayanakvoxel/issues/11) |
 | Persistence | One SQLite `world.db` per world. Every accepted Edit is appended to a journal as it is applied; a checkpoint of the diverged bricks every ~1 min lets the journal be truncated; 3 backups kept (ADR 0010). A generator-version guard. A ~2 GB client cache. | [Choose save format & world persistence](https://github.com/theHimanshuShekhar/bhayanakvoxel/issues/17) |
@@ -112,12 +114,12 @@ Every Milestone is **done** only when all of the following hold:
 5. The server bot soak.
 6. The reference view's decisions (#100–#103) and ADR 0005, before any lighting ticket.
 7. #52 sun shadows, #53 atmosphere, #54 GI, #55 denoiser, then the #50 hardware RT spike.
-8. #57 swim, climb and fly, #58 camera and Zoom, #59 avatar, #150 and #151 bindings and HUD, #149 heatmap, #63 start menu, #64 final budgets and soak.
+8. #57 swim, climb and fly, #58 camera and Zoom, #59 avatar, #150 and #151 bindings and HUD, Pieces (the system and about 12 Pieces, ADR 0011), #149 heatmap, #63 start menu, #64 final budgets and soak.
 
 **Playtest checklist**
 1. Create a world and spawn.
 2. Walk, climb and swim.
-3. Dig a tunnel and build a wall that stands upright on the curve.
+3. Dig a tunnel, and build a wall of Pieces that stands upright on the curve.
 4. Fly at 50 m/s with no holes in the terrain.
 5. Zoom from first person to the Planet disc (~20 R) and back without hitches.
 6. See the crater from orbit.
@@ -135,6 +137,9 @@ M1b is built in three ordered parts (2026-11-10; this replaces the single M1b of
 - **Rivers and lakes** as static water. With the coarse world map (ADR 0008) rivers need a new design: the map gives large drainage only.
 - The **day/night cycle**: a world clock that can be paused and set, moon light and a starfield (#138).
 - **Undo** of a player's own last ~32 Edits (#138, ADR 0010).
+- The **Piece catalogue** grows to 50 or more as data: walls, slabs, stairs, posts, fences, roofs, window and door frames, lamps (ADR 0011).
+
+During M1b a throwaway **Debris and Fluids prototype** at 5 cm (CPU only, on the real brick store) measures active Voxels per millisecond, so that M3 and M4 are known to be feasible as specified, or re-specified, before M2 shapes the server.
 
 **M1b-2: Light transport**
 - Glossy reflections, glass (one layer, #136) and transparency, transparent water, and volumetric fog with god rays.
@@ -161,6 +166,7 @@ M1b is built in three ordered parts (2026-11-10; this replaces the single M1b of
 - Prioritised snapshots, Edit-op broadcast, and brick-hash checks near Edits.
 - Server config (one world per process) and the ~2 GB client cache.
 - Player identity from a persistent id the client generates.
+- **Friends-only servers**: a password or an allow-list, and an admin who can kick a player and restore a backup. Everyone on a server is trusted; there are no claims or roles.
 - One seeded world spawn where every player starts (ADR 0008).
 - The server owns the world clock (#138), and undo is tested with two players.
 
@@ -220,21 +226,39 @@ A headless bot soak against the in-process server runs from M1a on (tick time an
 
 **Playtest checklist:** the full M1a/M1b checklist on a 3060-class GPU at 1080p.
 
+## After the Vertical slice
+
+Decided 2026-11-11. These are ordered but not designed; each is grilled when it is near.
+
+- **M6: Moving Pieces.** Doors and hatches, on Debris's moving bodies.
+- **M7: Survival and Tools.** Gathering, an inventory, health. A Tool is what a character holds; it owns the Brushes its holder can use, and replaces free Brush choice.
+- **M8: Solar system.** More than one Planet, and travel between them.
+
+Two seams are kept open for them now, and nothing else is built:
+
+- **For more Planets:** code takes the Planet as a value (radius, seed), not as global constants, and saves and the Edit protocol carry a Planet id.
+- **For survival:** an applied Edit reports the Voxels it removed and added of each Material, and a save holds a record for each player that can grow.
+
 ## Explicitly out of scope
 
-- Multiple planets, moons or space travel.
+Of the Vertical slice; the first two items are M7 and M8's.
+
 - Gameplay loop, progression, crafting, survival, inventory, health and fall damage.
+- Multiple planets, moons or space travel.
 - MMO scale and sharding.
 - Web, console and mobile.
 - Commercial concerns.
 - Paint, line/box and copy-paste tools, and landscape-scale area sculpting.
 - Travel aids: teleport and fast travel. The Planet is crossed by walking and flying, and seen whole from orbit.
-- Ambient creatures, vehicles, fire and explosives, mechanisms, and recreating real places (#138).
+- Ambient creatures, vehicles, fire and explosives, mechanisms (moving Pieces are M6's), and recreating real places (#138).
+- Public servers, claims and per-player rollback.
 - Structural-stress collapse.
 - NRD and DLSS integration.
 
 ## Known risks
 
+- **Snapping a Piece to a build whose Voxels do not remember being Pieces** (ADR 0011). The Piece ticket must show it working on a build picked up again after a reload.
+- **Debris and Fluids at 5 cm are unproven.** The M1b prototype measures them.
 - **Generation is 7–8× short of strict full detail at 50 m/s at 5 cm** (about 150 K generated bricks/s against 1.1–1.3 M). Mitigated by speed-scaled LOD (ADR 0009), the Guard, and the streaming bench's soft-miss gate.
 - **Terrain below the world map's ~240 m texels has no precomputed erosion** (ADR 0008). Mitigated by the look-dev prototype and a landscape golden; rivers need a new design in M1b-1.
 - **Voxel-count budgets for Debris and Fluids cover an eighth of the volume at 5 cm** (ADR 0007). M3 and M4 re-tune them.
