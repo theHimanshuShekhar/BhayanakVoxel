@@ -1,5 +1,11 @@
 name: CI
 
+# Which jobs gate and which do not, and how to bump the pins: docs/agents/ci.md.
+#
+# Runner images are named, not `-latest`, so that a new image cannot break main with no code change.
+# `windows-2025-vs2026` is what `windows-latest` resolved to on 2026-11-11. Rust is pinned in
+# rust-toolchain.toml and installed by .github/actions/setup-rust.
+
 on:
   pull_request:
   push:
@@ -10,13 +16,10 @@ env:
 
 jobs:
   linux:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/setup-rust
       # lavapipe is a software Vulkan driver, so render tests can create a device without a GPU.
       - name: Install lavapipe
         run: sudo apt-get update && sudo apt-get install -y mesa-vulkan-drivers
@@ -24,7 +27,16 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       # This includes the bench smoke test (bins/client/tests/bench.rs): `client bench --short` on
       # lavapipe, with the report's schema checked. Its timings are not looked at.
-      - run: cargo test --workspace
+      # The client tests that start real threads are skipped here; the real-thread-tests job runs
+      # them (.github/real-thread-tests.txt lists them).
+      - name: cargo test --workspace, without the real-thread tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t filters < <(tr -d '\r' < .github/real-thread-tests.txt | grep -vE '^\s*(#|$)')
+          skips=()
+          for f in "${filters[@]}"; do skips+=(--skip "$f"); done
+          cargo test --workspace -- "${skips[@]}"
         env:
           # Where the golden image test writes actual.png, expected.png and diff.png on a mismatch.
           GOLDEN_FAILURE_DIR: ${{ github.workspace }}/golden-failures
@@ -45,12 +57,57 @@ jobs:
             exit 1
           fi
 
-  windows-client:
-    runs-on: windows-latest
+  # The client tests that start real loader workers or the scene thread, on both platforms. Some
+  # of them wait on wall-clock time and so fail now and then. `continue-on-error` keeps a failure
+  # here from failing the workflow. A later ticket gives them a stepped, single-threaded mode.
+  real-thread-tests:
+    name: real-thread-tests (${{ matrix.os }})
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-2025-vs2026]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/setup-rust
+      # These tests need no GPU. The client's unit tests are one binary, so `--bin client` leaves
+      # out tests/bench.rs, which does.
+      - name: Run the real-thread tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t filters < <(tr -d '\r' < .github/real-thread-tests.txt | grep -vE '^\s*(#|$)')
+          cargo test -p client --bin client -- "${filters[@]}"
+
+  # Windows is the game's target. The runners have no Vulkan driver, so nothing here may need a GPU:
+  # no `render` tests and no tests/bench.rs.
+  windows-tests:
+    runs-on: windows-2025-vs2026
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-rust
+      - name: Tests of the crates that need no GPU
+        run: cargo test -p brick-store -p materials -p net -p planet-gen -p sim -p prefetch-sim -p server
+      # The client's unit tests, minus the real-thread tests and the two that make an Offscreen
+      # renderer (a Vulkan device): the cave stills and the Edit stress of the bench.
+      - name: Client tests that need no GPU and start no real threads
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t filters < <(tr -d '\r' < .github/real-thread-tests.txt | grep -vE '^\s*(#|$)')
+          skips=(
+            --skip bench::caves::tests::the_stills_are_timed_and_photographed
+            --skip bench::edits::tests::the_largest_brush_is_dug_and_placed_in_turn_at_no_more_than_the_metric_rate
+          )
+          for f in "${filters[@]}"; do skips+=(--skip "$f"); done
+          cargo test -p client --bin client -- "${skips[@]}"
+
+  windows-client:
+    runs-on: windows-2025-vs2026
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-rust
       - run: cargo build --release -p client
       - uses: actions/upload-artifact@v4
         with:
@@ -65,7 +122,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        os: [ubuntu-24.04, windows-2025-vs2026]
         profile: [debug, release]
         include:
           # The workspace optimises these crates in dev builds so that tests run fast; undo that
@@ -77,8 +134,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/setup-rust
         with:
-          key: ${{ matrix.profile }}
+          cache-key: ${{ matrix.profile }}
       - run: cargo test ${{ matrix.flags }} -p planet-gen -p sim golden
