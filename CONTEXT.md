@@ -68,6 +68,18 @@ _Avoid_: Spawn point, start position
 The continuous camera transition from a player's first/third-person view out to an orbital view of the whole Planet and back. It moves the camera, never the character.
 _Avoid_: Map view, space view
 
+**Primary view**:
+The real-time view of the world that a player plays in.
+_Avoid_: Real-time view, game view
+
+**Reference view**:
+The unbiased view of the same world that the Primary view is measured against. It is shown when the view is Still and gets cleaner the longer it stays so.
+_Avoid_: Ground truth, path-traced mode, reference mode
+
+**Still**:
+The camera, the sun and the window have not changed and no Edit has happened. The Reference view is shown only while the view is Still.
+_Avoid_: Idle, paused
+
 ### Walking
 
 **Ground**:
