@@ -129,3 +129,19 @@ The 16 km Planet's extreme Voxel is 360 000 from the centre; the Zoom at 800 km 
 | `BUDGET_OVERFLOW` | 0.1 | ADR 0004's 10–20% |
 
 The streaming bench (#162) reports the measured values, and the 320 km and speed-scaled LOD tickets (#166–#168) measure them again.
+
+## The Reference view (ADR 0005)
+
+Measured on the RTX 4090 on 2026-11-01 ([#99](https://github.com/theHimanshuShekhar/bhayanakvoxel/issues/99) has every checkpoint), at 2560×1440 output, with the estimator as it was then (white noise, 4 bounces, flat colours). FLIP is LDR-FLIP at ppd 67.02 on the 8-bit image; each truth is 8192 samples. #187 and #188 measure these again.
+
+| view | per-sample ms, mean / p95 | samples to FLIP ≤ 0.02 | GPU s | samples to FLIP ≤ 0.05 | FLIP at 64 samples | floor, FLIP / linear MSE |
+|---|---|---:|---:|---:|---:|---|
+| open (golden), traced at 1440p | 2.58 / 2.61 | 18.6 | 0.05 | 1.2 | 0.0145 | 0.0034 / 3.6e-7 |
+| open (golden), traced at 720p | 0.76 / 0.78 | 54.4 | 0.04 | 3.4 | 0.0191 | 0.0051 / 4.0e-7 |
+| pit, traced at 1440p | 6.15 / 7.92 | 330 | 2.03 | 6.2 | 0.0267 | 0.0092 / 9.2e-7 |
+| pit, traced at 720p | 1.59 / 1.61 | about 1048 (extrapolated) | about 1.66 | 16.9 | 0.0346 | 0.0139 / 9.5e-7 |
+
+- **Batching:** k samples in one dispatch cost 1.00 to 1.06 times k single samples.
+- **One sample by part**, open view at 1440p (2.59 ms): the primary ray 0.52 ms, the sun's shadow ray 0.34 ms, bounces 1 to 4 1.04, 0.37, 0.21 and 0.12 ms. In the pit the bounces are 85 % of 6.1 ms.
+- **Stopping tiles early** would save 3.7 times the work at the 0.02 line on the open view and 1.5 times in the pit; 8 to 13 times at the 0.05 line. About 41 % of the open view's tiles, the sky, pass at 1 sample.
+

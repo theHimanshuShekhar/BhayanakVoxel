@@ -117,10 +117,10 @@ Every Milestone is **done** only when all of the following hold:
 8. #182, the wire codec (every message encoded, with a protocol version, the Planet's id in an Edit, golden bytes, and seeded delay, loss and reordering on the loopback), then #183, a throwaway prototype that recovers a Piece's frame from its stamped Voxels. The prototype's result decides whether a stamped Piece also keeps a record, before saves are designed.
 9. Saves in two parts: first #62, the schema, the Edit Journal (the codec's bytes), checkpoints, loading and crash tests; then #144 Edit epochs and #163 uploads; then #184, backups, the generator guard and migrations, any time before #63.
 10. The server bot soak (#169).
-11. #52 sun shadows, #53 atmosphere, #54 GI, #55 denoiser, then the #50 hardware RT spike.
+11. The Reference view first (ADR 0005): #187 the bench's convergence phase, #188 the reference estimator, #189 the still-frame policy. Then #52 sun shadows, #53 atmosphere, #54 GI, #55 denoiser, then the #50 hardware RT spike.
 12. #57 swim, climb and fly, #58 camera and Zoom, #59 avatar, #150 and #151 bindings and HUD, Pieces (the system and about 12 Pieces, ADR 0011), #149 heatmap, #63 start menu, #64 final budgets and soak.
 
-The reference view's decisions (#100–#103) and ADR 0005 need no code. They are decided now, beside the steps above, and must be done before step 11.
+The Reference view's contract (#100–#103) was decided on 2026-11-12 and is [ADR 0005](adr/0005-reference-view-contract.md). It adds scope to #53 (a sun-free sky table, sky sampling in the Reference, the haze bound), #54 (direct sampling of emissive Voxels in the Reference) and #55 (its gate is derived from the Reference's curve).
 
 **Playtest checklist**
 1. Create a world and spawn.
@@ -159,7 +159,7 @@ During M1b a throwaway **Debris and Fluids prototype** at 5 cm (CPU only, on the
 **Acceptance**
 - 60 fps at 1440p on the 4090 within the **full ≈ 8.6 ms GPU budget**. The added stages are reflections 0.7 ms, glass 0.7 ms and volumetrics 1.0 ms.
 - Generation and streaming targets still hold with dense vegetation.
-- The image-difference metric against the reference path tracer stays under its threshold on fixed camera paths. The metric and threshold are ADR 0005's (#102).
+- The image-difference metric against the reference path tracer stays under its threshold on fixed camera paths. The metric and threshold are [ADR 0005](adr/0005-reference-view-contract.md)'s.
 
 **Playtest checklist:** visit each biome and each fantasy feature, see a crystal cave lit by emissive GI, look through glass and water, see god rays in a forest, follow a river to the sea, watch a day pass into night, undo a dig, and repeat the full M1a checklist.
 
