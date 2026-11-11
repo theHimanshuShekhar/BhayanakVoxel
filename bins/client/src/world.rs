@@ -10,6 +10,7 @@ use render::reference::{Hit, Ray, trace};
 use render::{Camera, Mode, RingsFull, Scene, SceneUpdate, camera};
 use sim::{Predictor, dig_seconds, target_hardness};
 
+use crate::clock::Clock;
 use crate::ghost::Ghost;
 use crate::loader::Loader;
 use crate::scene_worker::{LoaderStats, SceneWorker, Stats};
@@ -172,6 +173,8 @@ pub struct World {
     /// Whether [`World::recentre`] tells the scene thread how the camera is moving, for prefetch.
     lead: bool,
     motion: Motion,
+    /// The time that the camera's velocity is measured in: the machine's, or a stepped world's.
+    clock: Clock,
 }
 
 /// The camera's velocity as the frames show it: a running mean over about a tenth of a second, so
@@ -257,6 +260,7 @@ impl World {
             edit_wait: EDIT_WAIT,
             lead: true,
             motion: Motion::default(),
+            clock: Clock::real(),
         }
     }
 
@@ -273,6 +277,51 @@ impl World {
             SceneWorker::start(scene, loader, self.predictor.shared_store());
         (self.worker, self.scene, self.stats) = (Some(worker), mirror, stats);
         self
+    }
+
+    /// [`World::with_loader`] with no threads, for a test: `loader` should be [`Loader::stepped`].
+    /// The scene thread's work, the loader's too, is done on the calling thread by the code the
+    /// thread runs, one step for each time the camera is told ([`World::recentre`]) and as many as a
+    /// call that waits for the thread needs ([`World::sync`], [`World::set_bands`]). Nothing waits
+    /// for time and nothing reads the machine's: the world has a clock that only the test moves
+    /// ([`World::advance`]), which the scene thread and the camera's velocity read.
+    #[cfg(test)]
+    pub fn with_stepped_loader(mut self, loader: Loader) -> Self {
+        let scene = std::mem::take(&mut self.scene);
+        self.predictor.defer_lod();
+        self.clock = Clock::stepped();
+        let (worker, mirror, stats) = SceneWorker::start_stepped(
+            scene,
+            loader,
+            self.predictor.shared_store(),
+            self.clock.clone(),
+        );
+        (self.worker, self.scene, self.stats) = (Some(worker), mirror, stats);
+        self
+    }
+
+    /// Whether the world's scene thread is stepped (see [`World::with_stepped_loader`]).
+    #[cfg(test)]
+    pub fn is_stepped(&self) -> bool {
+        self.clock.is_stepped()
+    }
+
+    /// Moves a stepped world's clock on by `time`.
+    #[cfg(test)]
+    pub fn advance(&self, time: std::time::Duration) {
+        self.clock.advance(time);
+    }
+
+    /// The time on the world's clock.
+    #[cfg(test)]
+    pub fn time(&self) -> std::time::Instant {
+        self.clock.now()
+    }
+
+    /// How long [`World::edit_due`] waits for an Edit at a look at the scene.
+    #[cfg(test)]
+    pub fn edit_wait_time(&self) -> std::time::Duration {
+        self.edit_wait
     }
 
     /// What the loader is doing, as of the scene the world has, if there is one.
@@ -433,7 +482,7 @@ impl World {
     /// camera is, and returns what it has made since the last call, which is of an earlier camera:
     /// the rings are never half moved.
     pub fn recentre(&mut self, camera: [f64; 3]) -> Result<Option<SceneUpdate>, RingsFull> {
-        let velocity = self.lead_velocity(camera, std::time::Instant::now());
+        let velocity = self.lead_velocity(camera, self.clock.now());
         self.recentre_moving(camera, velocity)
     }
 
@@ -457,6 +506,9 @@ impl World {
         match &self.worker {
             Some(worker) => {
                 worker.follow_moving(camera, velocity);
+                // A stepped scene thread does its round now, with the camera it was just told.
+                #[cfg(test)]
+                worker.step();
                 let wait = self.edit_due()?;
                 self.take_ready(wait)
             }

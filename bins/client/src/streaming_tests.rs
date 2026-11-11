@@ -1,6 +1,14 @@
-//! The ring loader at work (#86): the loader's threads, the world that takes in what they make, and
-//! the scene that is drawn from it, on the test world map. Bands of `d0` = 64 Voxels make a few
-//! levels fit in a test; the Guard is levels 11 to 13.
+//! The ring loader at work (#86): the loader, the world that takes in what it makes, and the scene
+//! that is drawn from it, on the test world map. Bands of `d0` = 64 Voxels make a few levels fit in a
+//! test; the Guard is levels 11 to 13.
+//!
+//! Most of these tests run **stepped** (#180, docs/agents/ci.md): [`Run::Stepped`] has no threads,
+//! no sleeps and no machine clock. The loader's jobs and the scene thread's rounds are done on the
+//! test's thread, a step each time the camera is told, by the code the threads run, and time is a
+//! clock that the test moves ([`pace`]). They give the same run every time, so they gate merges.
+//! The tests that are about real threads or real time ([`Run::Threads`]: how long the frame thread
+//! waits, a thread that panics or is busy, the full-size runs) are listed in
+//! `.github/real-thread-tests.txt` and run in the job that does not gate.
 
 use std::collections::HashMap;
 use std::sync::OnceLock;
@@ -53,15 +61,81 @@ fn spawned_store() -> BrickStore {
     store
 }
 
-/// The world right after the spawn, with a loader of `workers` threads.
-fn spawned_world(workers: usize) -> (World, ServerEnd, Camera) {
+/// How the loader and the scene thread run in a test: on the test's thread a step at a time, with
+/// a clock the test moves (see [`World::with_stepped_loader`]), or on real threads, `n` of them for
+/// the loader.
+#[derive(Clone, Copy)]
+enum Run {
+    Stepped,
+    Threads(usize),
+}
+
+/// The world right after the spawn, with a loader that runs as `run` says.
+fn spawned_world(run: Run) -> (World, ServerEnd, Camera) {
     let store = spawned_store();
     let camera = crate::spawn_camera(ground());
     let scene = Scene::rings(&store, camera.position, bands(), bound()).unwrap();
-    let loader = Loader::new(store.source().unwrap(), camera.position, bands(), workers);
-    let (client, server) = loopback();
-    let world = World::new(scene, Predictor::new(store), client).with_loader(loader);
+    let (world, server) = streamed(store, scene, camera.position, run);
     (world, server, camera)
+}
+
+/// A world that streams `store`, `scene` being the packing of it, with a loader that runs as `run`
+/// says.
+fn streamed(store: BrickStore, scene: Scene, camera: [f64; 3], run: Run) -> (World, ServerEnd) {
+    let source = store.source().unwrap();
+    let (client, server) = loopback();
+    let world = World::new(scene, Predictor::new(store), client);
+    let world = match run {
+        Run::Stepped => world.with_stepped_loader(Loader::stepped(source, camera, bands())),
+        Run::Threads(workers) => world.with_loader(Loader::new(source, camera, bands(), workers)),
+    };
+    (world, server)
+}
+
+/// A frame at 60 a second.
+const FRAME: Duration = Duration::from_micros(16_667);
+
+/// Lets `time` go by: a stepped world's clock is moved on by it, and a world with threads sleeps.
+fn pace(world: &World, time: Duration) {
+    if world.is_stepped() {
+        world.advance(time);
+    } else {
+        std::thread::sleep(time);
+    }
+}
+
+/// The most steps that a test of a stepped world takes before it says that something never came.
+const MOST_STEPS: usize = 50_000;
+
+/// How long a test waits for something to happen, a wait at a time: a number of steps (each a frame
+/// of the world's clock) for a stepped world, which has no wall clock to run out, and seconds of the
+/// machine's time for one with threads.
+struct Patience {
+    steps: usize,
+    began: Instant,
+    limit: Duration,
+}
+
+impl Patience {
+    fn new(limit: Duration) -> Self {
+        Self {
+            steps: 0,
+            began: Instant::now(),
+            limit,
+        }
+    }
+
+    /// Lets a frame go by, or fails with `what` if the wait has gone on too long.
+    fn wait(&mut self, world: &World, what: impl FnOnce() -> String) {
+        self.steps += 1;
+        if world.is_stepped() {
+            assert!(self.steps < MOST_STEPS, "{}", what());
+            pace(world, FRAME);
+        } else {
+            assert!(self.began.elapsed() < self.limit, "{}", what());
+            pace(world, Duration::from_millis(1));
+        }
+    }
 }
 
 /// [`World::stream`] with no GPU to copy to, and the updates it made.
@@ -83,24 +157,20 @@ fn idle(world: &World) -> bool {
 /// Streams with the camera at `camera` until the resident set is complete for the bands. Returns
 /// how many frames that took.
 fn fill(world: &mut World, camera: [f64; 3]) -> usize {
-    let started = Instant::now();
+    let mut patience = Patience::new(Duration::from_secs(180));
     for frame in 0.. {
         stream(world, camera);
         if idle(world) {
             return frame;
         }
-        assert!(
-            started.elapsed() < Duration::from_secs(180),
-            "the resident set does not fill"
-        );
-        std::thread::sleep(Duration::from_millis(1));
+        patience.wait(world, || "the resident set does not fill".into());
     }
     unreachable!()
 }
 
 #[test]
 fn with_the_camera_still_the_loader_makes_the_resident_set_complete_and_then_has_no_work() {
-    let (mut world, _server, camera) = spawned_world(2);
+    let (mut world, _server, camera) = spawned_world(Run::Stepped);
     assert!(world.waiting() > 0, "the Guard stands in for everything");
     let frames = fill(&mut world, camera.position);
     assert!(frames > 3, "it takes frames, not one: {frames}");
@@ -112,7 +182,7 @@ fn with_the_camera_still_the_loader_makes_the_resident_set_complete_and_then_has
     // Standing still, nothing more is asked for and nothing more is generated.
     for _ in 0..20 {
         assert!(stream(&mut world, camera.position).is_empty());
-        std::thread::sleep(Duration::from_millis(10));
+        pace(&world, Duration::from_millis(10));
     }
     assert_eq!(world.loader().unwrap().generated, generated);
     assert_eq!(world.loader().unwrap().pending, 0);
@@ -123,7 +193,7 @@ fn with_the_camera_still_the_loader_makes_the_resident_set_complete_and_then_has
 fn a_brick_the_camera_has_left_has_its_children_dropped_not_generated() {
     let store = spawned_store();
     let camera = crate::spawn_camera(ground()).position;
-    let mut loader = Loader::new(store.source().unwrap(), camera, bands(), 1);
+    let mut loader = Loader::stepped(store.source().unwrap(), camera, bands());
     // A brick of level 5 is split within 64 * 32 = 2048 Voxels; this one is 100 times that away.
     let far = (5, brick_store::BrickCoord([5000, 0, 0]));
     let near = (5, brick_store::BrickCoord(camera.map(|c| c as i32 >> 8)));
@@ -132,12 +202,13 @@ fn a_brick_the_camera_has_left_has_its_children_dropped_not_generated() {
     assert_eq!(loader.pending(), 2, "asked for once");
     loader.sync(camera, bands());
     let mut got = Vec::new();
-    let started = Instant::now();
+    let mut steps = 0;
     while got.len() < 2 {
+        loader.step(10);
         got.extend(loader.receive(10));
-        assert!(started.elapsed() < Duration::from_secs(20));
+        steps += 1;
+        assert!(steps < MOST_STEPS, "{} of 2 came", got.len());
         loader.sync(camera, bands());
-        std::thread::sleep(Duration::from_millis(1));
     }
     assert_eq!(loader.pending(), 0);
     assert!(
@@ -218,7 +289,7 @@ fn within_reach(world: &World, camera: &Camera) -> Camera {
 
 #[test]
 fn a_dig_near_the_camera_shows_at_every_band_that_covers_it() {
-    let (mut world, _server, spawn) = spawned_world(2);
+    let (mut world, _server, spawn) = spawned_world(Run::Stepped);
     fill(&mut world, spawn.position);
 
     // Dig where the camera looks, as a click does.
@@ -310,8 +381,33 @@ fn over_the_ground(store: &BrickStore, point: [f64; 3]) -> [f64; 3] {
 }
 
 #[test]
+fn after_walking_at_5_m_per_s_the_loader_fills_in_and_the_ground_under_the_camera_is_level_0() {
+    let (mut world, _server, mut camera) = spawned_world(Run::Stepped);
+    let (ahead, _) = tangents(camera.horizon_up);
+    let step = 50.0 / 60.0;
+    let mut walked = camera.position;
+    for _ in 0..360 {
+        walked = std::array::from_fn(|a| walked[a] + ahead[a] * step);
+        let position = over_the_ground(&world.store(), walked);
+        camera.position = position;
+        camera.carry_up(position);
+        world.recentre(position).unwrap();
+        stream(&mut world, position);
+        pace(&world, FRAME);
+    }
+    // Left alone it fills in, and the ground under the camera is level 0.
+    fill(&mut world, camera.position);
+    let down = ray_through(
+        camera.position,
+        std::array::from_fn(|a| camera.position[a] - camera.horizon_up[a]),
+    );
+    let hit = trace(world.scene(), &down).expect("ground under the camera");
+    assert_eq!(world.scene().level_at(hit.voxel), Some(0));
+}
+
+#[test]
 fn walking_at_5_m_per_s_while_the_loader_runs_reports_the_scene_work_of_every_frame() {
-    let (mut world, _server, mut camera) = spawned_world(2);
+    let (mut world, _server, mut camera) = spawned_world(Run::Threads(2));
     let (ahead, _) = tangents(camera.horizon_up);
     let step = 50.0 / 60.0;
     let mut work = SceneWork::default();
@@ -945,24 +1041,26 @@ fn the_full_size_planet_streams_in_and_walking_over_it_does_not_stall() {
 
 #[test]
 fn the_spawn_ring_is_drawn_at_level_0_within_seconds_and_before_the_far_bricks_are_resident() {
-    let (mut world, _server, camera) = spawned_world(2);
+    let (mut world, _server, camera) = spawned_world(Run::Stepped);
     let down = ray_through(
         camera.position,
         std::array::from_fn(|a| camera.position[a] - camera.horizon_up[a]),
     );
-    let begun = Instant::now();
+    // The seconds are the world's clock, which a frame moves on by 1/60 s.
+    let mut frames = 0u32;
     let level_0_at = loop {
         stream(&mut world, camera.position);
         let hit = trace(world.scene(), &down).expect("ground under the camera");
         if world.scene().level_at(hit.voxel) == Some(0) {
-            break begun.elapsed();
+            break FRAME * frames;
         }
         assert!(
-            begun.elapsed() < Duration::from_secs(20),
+            FRAME * frames < Duration::from_secs(20),
             "still level {:?} under the camera",
             world.scene().level_at(hit.voxel)
         );
-        std::thread::sleep(Duration::from_millis(2));
+        pace(&world, FRAME);
+        frames += 1;
     };
     // The ground under the camera comes before the set is complete: nearest first, end to end.
     assert!(
@@ -970,17 +1068,17 @@ fn the_spawn_ring_is_drawn_at_level_0_within_seconds_and_before_the_far_bricks_a
         "{} waiting after {level_0_at:?}",
         world.waiting()
     );
-    eprintln!("level 0 under the camera after {level_0_at:?} (debug build)");
+    eprintln!("level 0 under the camera after {level_0_at:?} of the clock");
 }
 
-/// Frames, a few milliseconds apart, until the loader's threads have taken `MAX_AHEAD` jobs and
-/// finished every one they had in flight, which leaves them nothing to do until something is
-/// taken in. None of the frames takes anything in. Then nothing more is generated, however long
-/// it waits: this does not depend on how fast the machine is.
+/// Frames until the loader's workers have taken `MAX_AHEAD` jobs and finished every one they had
+/// in flight, which leaves them nothing to do until something is taken in. None of the frames takes
+/// anything in. Then nothing more is generated, however long it waits: this does not depend on how
+/// fast the machine is.
 fn let_the_workers_run_ahead(world: &mut World, camera: [f64; 3]) {
     // What the scene thread was taking in when loading was paused is done by now.
     world.sync().unwrap();
-    let started = Instant::now();
+    let mut patience = Patience::new(Duration::from_secs(60));
     loop {
         assert!(stream(world, camera).is_empty());
         let loader = world.loader().unwrap();
@@ -989,14 +1087,13 @@ fn let_the_workers_run_ahead(world: &mut World, camera: [f64; 3]) {
         if loader.ahead == crate::loader::MAX_AHEAD && loader.in_flight == 0 {
             return;
         }
-        assert!(started.elapsed() < Duration::from_secs(60), "no work ahead");
-        std::thread::sleep(Duration::from_millis(2));
+        patience.wait(world, || "no work ahead".into());
     }
 }
 
 #[test]
 fn while_loading_is_held_nothing_is_taken_in_and_what_waits_is_bounded() {
-    let (mut world, _server, camera) = spawned_world(2);
+    let (mut world, _server, camera) = spawned_world(Run::Stepped);
     let waiting = world.waiting();
     assert!(waiting > 0, "the Guard stands in for everything");
     world.pause_loading(true);
@@ -1011,11 +1108,10 @@ fn while_loading_is_held_nothing_is_taken_in_and_what_waits_is_bounded() {
     let loader = world.loader().unwrap();
     assert_eq!(loader.ahead, crate::loader::MAX_AHEAD);
     let generated = loader.generated;
-    // The wait is only for there to be time for a worker that has not stopped to generate: that
-    // none has is not a matter of how long the wait is, so no runner can outlast it.
+    // Frames go by, with every chance for a worker that has not stopped to generate.
     for _ in 0..20 {
         assert!(stream(&mut world, camera.position).is_empty());
-        std::thread::sleep(Duration::from_millis(5));
+        pace(&world, Duration::from_millis(5));
     }
     assert_eq!(world.loader().unwrap().ahead, crate::loader::MAX_AHEAD);
     assert_eq!(world.loader().unwrap().generated, generated);
@@ -1023,16 +1119,17 @@ fn while_loading_is_held_nothing_is_taken_in_and_what_waits_is_bounded() {
 
 #[test]
 fn letting_go_takes_in_what_was_held_and_the_bands_fill_as_before() {
-    let (mut world, _server, camera) = spawned_world(2);
+    let (mut world, _server, camera) = spawned_world(Run::Stepped);
     world.pause_loading(true);
     let_the_workers_run_ahead(&mut world, camera.position);
     world.pause_loading(false);
     assert!(!world.loading_paused());
     // What was held is waiting, so the first frame to see a change has some taken in.
     let mut first = Vec::new();
+    let mut patience = Patience::new(Duration::from_secs(60));
     while first.is_empty() {
         first = stream(&mut world, camera.position);
-        std::thread::sleep(Duration::from_millis(1));
+        patience.wait(&world, || "nothing was taken in".into());
     }
     // The scene thread takes in what was held a slice at a time, not all of it at once.
     assert!(world.waiting() > 0, "not all in one slice");
@@ -1043,7 +1140,7 @@ fn letting_go_takes_in_what_was_held_and_the_bands_fill_as_before() {
 
 #[test]
 fn an_edit_while_loading_is_held_is_shown() {
-    let (mut world, _server, camera) = spawned_world(2);
+    let (mut world, _server, camera) = spawned_world(Run::Stepped);
     fill(&mut world, camera.position);
     let aim = within_reach(&world, &camera);
     let before = crate::world::centre_hit(world.scene(), &aim).expect("ground to dig");
@@ -1055,7 +1152,7 @@ fn an_edit_while_loading_is_held_is_shown() {
     world.sync().unwrap();
     for _ in 0..20 {
         assert!(stream(&mut world, moved).is_empty());
-        std::thread::sleep(Duration::from_millis(5));
+        pace(&world, Duration::from_millis(5));
     }
     assert!(world.loader().unwrap().pending > 0, "the loader has work");
     let update = dig_and_wait(&mut world, &aim);
@@ -1072,7 +1169,7 @@ fn an_edit_while_loading_is_held_is_shown() {
 
 #[test]
 fn flying_far_while_loading_is_paused_does_not_grow_the_queue_without_bound() {
-    let (mut world, _server, camera) = spawned_world(2);
+    let (mut world, _server, camera) = spawned_world(Run::Stepped);
     fill(&mut world, camera.position);
     world.pause_loading(true);
     let (ahead, _) = tangents(camera.horizon_up);
@@ -1096,7 +1193,7 @@ fn flying_far_while_loading_is_paused_does_not_grow_the_queue_without_bound() {
             cancelled <= 2 * (queued / 4).max(256),
             "step {step}: {queued} queued, {cancelled} cancelled"
         );
-        std::thread::sleep(Duration::from_millis(2));
+        pace(&world, FRAME);
     }
 }
 
@@ -1125,7 +1222,7 @@ fn loading_pauses_only_for_a_reference_that_has_a_still_view() {
 
 #[test]
 fn a_still_reference_takes_in_nothing_once_it_has_been_still_for_a_while() {
-    let (mut world, _server, camera) = spawned_world(2);
+    let (mut world, _server, camera) = spawned_world(Run::Stepped);
     let mut still = Stillness::default();
     // The first frames of a view are not paused.
     for _ in 0..=STILL_FRAMES {
@@ -1143,10 +1240,10 @@ fn a_still_reference_takes_in_nothing_once_it_has_been_still_for_a_while() {
 
 #[test]
 fn a_moving_reference_takes_in_arrivals_and_the_ground_under_it_reaches_level_0() {
-    let (mut world, _server, camera) = spawned_world(2);
+    let (mut world, _server, camera) = spawned_world(Run::Stepped);
     let (ahead, _) = tangents(camera.horizon_up);
     let mut still = Stillness::default();
-    let begun = Instant::now();
+    let mut patience = Patience::new(Duration::from_secs(60));
     let mut taken = 0;
     for step in 0u32.. {
         // Back and forth over a few metres: never the same view in two frames.
@@ -1166,19 +1263,19 @@ fn a_moving_reference_takes_in_arrivals_and_the_ground_under_it_reaches_level_0(
         if world.scene().level_at(hit.voxel) == Some(0) {
             break;
         }
-        assert!(
-            begun.elapsed() < Duration::from_secs(60),
-            "still level {:?} under the camera",
-            world.scene().level_at(hit.voxel)
-        );
-        std::thread::sleep(Duration::from_millis(2));
+        patience.wait(&world, || {
+            format!(
+                "still level {:?} under the camera",
+                world.scene().level_at(hit.voxel)
+            )
+        });
     }
     assert!(taken > 0, "arrivals were taken in");
 }
 
 #[test]
 fn still_then_moving_then_still_pauses_loading_resumes_it_the_frame_it_moves_and_pauses_again() {
-    let (mut world, _server, camera) = spawned_world(2);
+    let (mut world, _server, camera) = spawned_world(Run::Stepped);
     let (ahead, _) = tangents(camera.horizon_up);
     let mut still = Stillness::default();
     let reference = |world: &mut World, still: &mut Stillness<[f64; 3]>, at: [f64; 3]| {
@@ -1197,7 +1294,7 @@ fn still_then_moving_then_still_pauses_loading_resumes_it_the_frame_it_moves_and
     // not in the first if the thread is kept from running for a while).
     let step = |at: [f64; 3]| -> [f64; 3] { std::array::from_fn(|a| at[a] + 0.5 * ahead[a]) };
     let mut at = camera.position;
-    let started = Instant::now();
+    let mut patience = Patience::new(Duration::from_secs(60));
     loop {
         at = step(at);
         let updates = reference(&mut world, &mut still, at);
@@ -1205,11 +1302,7 @@ fn still_then_moving_then_still_pauses_loading_resumes_it_the_frame_it_moves_and
         if !updates.is_empty() {
             break;
         }
-        assert!(
-            started.elapsed() < Duration::from_secs(60),
-            "nothing taken in"
-        );
-        std::thread::sleep(Duration::from_millis(1));
+        patience.wait(&world, || "nothing taken in".into());
     }
     let moved_again = at;
 
@@ -1261,12 +1354,13 @@ fn listed(scene: &Scene) -> Vec<usize> {
 
 #[test]
 fn what_the_scene_thread_counts_as_drawn_is_what_the_frame_threads_copy_lists() {
-    let (mut world, _server, camera) = spawned_world(2);
+    let (mut world, _server, camera) = spawned_world(Run::Stepped);
     // Part way through the fill, and when it is done.
     for _ in 0..30 {
         stream(&mut world, camera.position);
-        std::thread::sleep(Duration::from_millis(3));
+        pace(&world, Duration::from_millis(3));
     }
+    assert!(world.waiting() > 0, "the fill is not done yet");
     world.sync().unwrap();
     assert_eq!(listed(world.scene()), world.stats().level_bricks[..LEVELS]);
     fill(&mut world, camera.position);
@@ -1282,7 +1376,63 @@ fn what_the_scene_thread_counts_as_drawn_is_what_the_frame_threads_copy_lists() 
 
 #[test]
 fn an_edit_is_in_the_scene_the_frame_after_the_one_that_makes_it_while_the_camera_is_followed() {
-    let (mut world, server, camera) = spawned_world(2);
+    let (mut world, server, camera) = spawned_world(Run::Stepped);
+    fill(&mut world, camera.position);
+    let aim = up_close(&mut world, &camera);
+    let depth = |world: &World| {
+        crate::world::centre_hit(world.scene(), &aim)
+            .expect("ground")
+            .t
+    };
+    let whole = depth(&world);
+
+    // The camera is on the move, so the scene thread has the rings to follow when the Edit is
+    // made.
+    let (ahead, _) = tangents(camera.horizon_up);
+    let at = |n: i32| -> [f64; 3] {
+        std::array::from_fn(|a| aim.position[a] + 2.0 * f64::from(n) * ahead[a])
+    };
+    for n in 1..=5 {
+        world.recentre(at(n)).unwrap();
+        pace(&world, FRAME);
+    }
+    world.edit(&aim, &crate::tool::Tool::default()).unwrap();
+    // The frame of the click does not show it: the scene thread has not been looked at since.
+    assert!(
+        (depth(&world) - whole).abs() < 0.5,
+        "the click does not show its own Edit"
+    );
+    pace(&world, FRAME);
+    // The frame of the click goes on and looks at the scene, which has the Edit by then.
+    world.recentre(at(6)).unwrap();
+    pace(&world, FRAME);
+    // And the frame after has it, in any case.
+    world.recentre(at(7)).unwrap();
+    let dug = depth(&world);
+    assert!(dug > whole + 1.0, "the hole shows: {whole}, then {dug}");
+
+    // The server turns it down: the ground is back in the call that hears of it.
+    let Ok(ClientMessage::Edit { .. }) = server.try_recv() else {
+        panic!("no Edit was sent");
+    };
+    server
+        .send(ServerMessage::Rejected {
+            client_seq: 0,
+            reason: RejectReason::BrushTooLarge,
+        })
+        .unwrap();
+    assert!(world.poll().unwrap().is_some());
+    assert!(
+        (depth(&world) - whole).abs() < 0.5,
+        "{whole} before, {} after the undo",
+        depth(&world)
+    );
+}
+
+#[test]
+fn an_edit_the_frame_after_does_not_wait_for_slow_coarse_levels_and_reads_of_the_store_wait_a_step_at_most()
+ {
+    let (mut world, _server, camera) = spawned_world(Run::Threads(2));
     fill(&mut world, camera.position);
     let aim = up_close(&mut world, &camera);
     let depth = |world: &World| {
@@ -1334,28 +1484,11 @@ fn an_edit_is_in_the_scene_the_frame_after_the_one_that_makes_it_while_the_camer
     }
     assert!(longest < Duration::from_millis(25), "{longest:?}");
     world.worker().slow_coarse(Duration::ZERO);
-
-    // The server turns it down: the ground is back in the call that hears of it.
-    let Ok(ClientMessage::Edit { .. }) = server.try_recv() else {
-        panic!("no Edit was sent");
-    };
-    server
-        .send(ServerMessage::Rejected {
-            client_seq: 0,
-            reason: RejectReason::BrushTooLarge,
-        })
-        .unwrap();
-    assert!(world.poll().unwrap().is_some());
-    assert!(
-        (depth(&world) - whole).abs() < 0.5,
-        "{whole} before, {} after the undo",
-        depth(&world)
-    );
 }
 
 #[test]
 fn an_edit_the_scene_thread_is_too_busy_to_pack_shows_when_it_has_and_the_frame_does_not_wait() {
-    let (mut world, _server, camera) = spawned_world(2);
+    let (mut world, _server, camera) = spawned_world(Run::Threads(2));
     fill(&mut world, camera.position);
     let aim = up_close(&mut world, &camera);
     let depth = |world: &World| {
@@ -1383,9 +1516,86 @@ fn an_edit_the_scene_thread_is_too_busy_to_pack_shows_when_it_has_and_the_frame_
     }
 }
 
+/// ADR 0006's bound on the stepped clock: the frame thread waits `EDIT_WAIT` for an Edit and no
+/// more, and the Edit is in the first look after the scene thread has packed it, with the result
+/// kept until it is taken. (`an_edit_the_scene_thread_is_too_busy_to_pack_shows_when_it_has_and_
+/// the_frame_does_not_wait` is the same on real threads, where the wait is a condition variable's.)
+#[test]
+fn an_edit_a_busy_scene_thread_has_not_packed_is_waited_for_edit_wait_and_shows_in_the_first_look_after_it_has()
+ {
+    let (mut world, _server, camera) = spawned_world(Run::Stepped);
+    fill(&mut world, camera.position);
+    let aim = up_close(&mut world, &camera);
+    let depth = |world: &World| {
+        crate::world::centre_hit(world.scene(), &aim)
+            .expect("ground")
+            .t
+    };
+    let whole = depth(&world);
+    // The thread is busy for 300 ms of the world's time from now, as a frame's worth of the camera
+    // and the arrivals would keep it: it does nothing until then, the Edit's pack included.
+    let busy = Duration::from_millis(300);
+    let began = world.time();
+    world.worker().busy_for(busy);
+    world.edit(&aim, &crate::tool::Tool::default()).unwrap();
+
+    // The frame of the click looks without waiting. The frame after waits for the Edit, gives up
+    // at `EDIT_WAIT` on the clock with the thread still busy, and has taken nothing.
+    let waited = world.time();
+    assert!(
+        world.recentre(aim.position).unwrap().is_none(),
+        "nothing is made while the thread is busy"
+    );
+    assert_eq!(world.time(), waited, "the first look does not wait");
+    assert!(
+        world.recentre(aim.position).unwrap().is_none(),
+        "nothing is taken while the thread is busy"
+    );
+    assert_eq!(
+        world.time() - waited,
+        world.edit_wait_time(),
+        "the second look waits for the Edit, no more"
+    );
+    assert!((depth(&world) - whole).abs() < 0.5, "not shown yet");
+
+    // Frames go by. Every look until the thread is free takes nothing (never an empty result that
+    // the Edit would be lost to), and the first look after it has packed the Edit shows it.
+    let mut shown = None;
+    for frame in 1..=40 {
+        pace(&world, FRAME);
+        let looked_at = world.time();
+        let update = world.recentre(aim.position).unwrap();
+        assert_eq!(world.time(), looked_at, "a later look does not wait");
+        if (depth(&world) - whole).abs() >= 0.5 {
+            assert!(update.is_some(), "the Edit comes in an update");
+            shown = Some((frame, looked_at));
+            break;
+        }
+        assert!(update.is_none(), "nothing is taken before the Edit is");
+        assert!(
+            looked_at < began + busy,
+            "a thread that is free has packed it by the look after: {:?} of {busy:?}",
+            looked_at - began
+        );
+    }
+    let (frame, looked_at) = shown.expect("the Edit never showed");
+    assert!(
+        looked_at >= began + busy,
+        "it shows only once the thread was free: {:?}",
+        looked_at - began
+    );
+    assert!(
+        looked_at - FRAME < began + busy,
+        "and in the first look after: frame {frame}, at {:?}",
+        looked_at - began
+    );
+    let dug = depth(&world);
+    assert!(dug > whole + 1.0, "the hole shows: {whole}, then {dug}");
+}
+
 #[test]
 fn changes_made_while_a_copy_of_the_whole_scene_waits_go_into_the_copy() {
-    let (mut world, _server, camera) = spawned_world(2);
+    let (mut world, _server, camera) = spawned_world(Run::Stepped);
     fill(&mut world, camera.position);
     world.sync().unwrap();
     // Other bands pack the scene again, and the camera then moves, with nothing taken in between:
@@ -1406,7 +1616,7 @@ fn changes_made_while_a_copy_of_the_whole_scene_waits_go_into_the_copy() {
 
 #[test]
 fn a_job_that_is_done_is_always_there_to_be_taken_even_as_the_thread_goes_on_publishing() {
-    let (mut world, _server, camera) = spawned_world(2);
+    let (mut world, _server, camera) = spawned_world(Run::Threads(2));
     let (ahead, _) = tangents(camera.horizon_up);
     for n in 0..30 {
         // The thread has the loader's arrivals and the camera to publish all the time.
@@ -1421,7 +1631,7 @@ fn a_job_that_is_done_is_always_there_to_be_taken_even_as_the_thread_goes_on_pub
 #[test]
 #[should_panic(expected = "the scene thread panicked")]
 fn a_panic_on_the_scene_thread_is_a_panic_on_the_frame_thread_not_a_wait() {
-    let (world, _server, _camera) = spawned_world(1);
+    let (world, _server, _camera) = spawned_world(Run::Threads(1));
     world.worker().panic();
 }
 
@@ -1438,7 +1648,7 @@ fn the_frame_thread_takes_a_few_milliseconds_of_the_largest_edit_at_the_spawn_wi
     use net::{EditMode, Shape};
 
     let release = !cfg!(debug_assertions);
-    let (mut world, _server, camera) = spawned_world(2);
+    let (mut world, _server, camera) = spawned_world(Run::Threads(2));
     fill(&mut world, camera.position);
     let aim = up_close(&mut world, &camera);
     let radius = if release { sim::MAX_BRUSH_RADIUS } else { 12 };
@@ -1504,14 +1714,12 @@ fn the_frame_thread_takes_a_few_milliseconds_of_the_largest_edit_at_the_spawn_wi
 }
 
 /// A world like [`spawned_world`] whose store has the `budget`.
-fn budgeted_world(workers: usize, budget: brick_store::Budget) -> (World, ServerEnd, Camera) {
+fn budgeted_world(run: Run, budget: brick_store::Budget) -> (World, ServerEnd, Camera) {
     let mut store = spawned_store();
     store.set_budget(budget);
     let camera = crate::spawn_camera(ground());
     let scene = Scene::rings(&store, camera.position, bands(), bound()).unwrap();
-    let loader = Loader::new(store.source().unwrap(), camera.position, bands(), workers);
-    let (client, server) = loopback();
-    let world = World::new(scene, Predictor::new(store), client).with_loader(loader);
+    let (world, server) = streamed(store, scene, camera.position, run);
     (world, server, camera)
 }
 
@@ -1530,7 +1738,7 @@ fn fly(
         position = over_the_ground(&world.store(), moved);
         world.recentre(position).unwrap();
         stream(world, position);
-        std::thread::sleep(Duration::from_millis(2));
+        pace(world, FRAME);
     }
     position
 }
@@ -1538,23 +1746,23 @@ fn fly(
 /// Streams with the camera at `camera` until the resident set is complete and the store is within
 /// its budget's limit.
 fn settle(world: &mut World, camera: [f64; 3]) {
-    let started = Instant::now();
+    let mut patience = Patience::new(Duration::from_secs(120));
     loop {
         stream(world, camera);
         world.sync().unwrap();
         if idle(world) && !world.store().over_limit() {
             return;
         }
-        assert!(
-            started.elapsed() < Duration::from_secs(120),
-            "does not settle: idle {}, {} held of a limit of {}, {} evicted, {} edited",
-            idle(world),
-            world.store().streamed_len(),
-            world.store().budget().unwrap().limit(),
-            world.store().evicted_len(),
-            world.store().diverged_len()
-        );
-        std::thread::sleep(Duration::from_millis(2));
+        patience.wait(world, || {
+            format!(
+                "does not settle: idle {}, {} held of a limit of {}, {} evicted, {} edited",
+                idle(world),
+                world.store().streamed_len(),
+                world.store().budget().unwrap().limit(),
+                world.store().evicted_len(),
+                world.store().diverged_len()
+            )
+        });
     }
 }
 
@@ -1569,7 +1777,7 @@ fn flying_away_and_back_keeps_the_store_within_its_budget_and_leaves_no_hole_or_
     // the complete set elsewhere is a few per cent more or less, and a store that cannot get under
     // its limit with everything wanted is left alone by eviction for a while (`EVICT_RETRY`), so
     // the margin is the most that the flight takes the store over (3 per cent a shell), less a little.
-    let (mut first, _s, spawn) = spawned_world(2);
+    let (mut first, _s, spawn) = spawned_world(Run::Stepped);
     fill(&mut first, spawn.position);
     first.sync().unwrap();
     let full = first.store().streamed_len();
@@ -1578,7 +1786,7 @@ fn flying_away_and_back_keeps_the_store_within_its_budget_and_leaves_no_hole_or_
         bricks: full * 107 / 100,
         overflow: 0.01,
     };
-    let (mut world, _server, spawn) = budgeted_world(2, budget);
+    let (mut world, _server, spawn) = budgeted_world(Run::Stepped, budget);
     fill(&mut world, spawn.position);
 
     // Dig at the spawn, so that there is an Edit to keep.
@@ -1663,10 +1871,7 @@ fn flying_away_and_back_keeps_the_store_within_its_budget_and_leaves_no_hole_or_
 }
 
 /// A world like [`spawned_world`] with the residency margins of ADR 0004 and a `budget` if given.
-fn margined_world(
-    workers: usize,
-    budget: Option<brick_store::Budget>,
-) -> (World, ServerEnd, Camera) {
+fn margined_world(run: Run, budget: Option<brick_store::Budget>) -> (World, ServerEnd, Camera) {
     let mut store = spawned_store();
     if let Some(budget) = budget {
         store.set_budget(budget);
@@ -1674,19 +1879,27 @@ fn margined_world(
     let camera = crate::spawn_camera(ground());
     let mut scene = Scene::rings(&store, camera.position, bands(), bound()).unwrap();
     scene.set_margins(&store, render::lod::Margins::standard());
-    let loader = Loader::new(store.source().unwrap(), camera.position, bands(), workers);
-    let (client, server) = loopback();
-    let world = World::new(scene, Predictor::new(store), client).with_loader(loader);
+    let (world, server) = streamed(store, scene, camera.position, run);
     (world, server, camera)
 }
 
 #[test]
 fn margins_make_more_of_the_store_resident_and_draw_no_more() {
-    let (mut plain, _s, camera) = spawned_world(2);
+    let (mut plain, _s, camera) = spawned_world(Run::Stepped);
     fill(&mut plain, camera.position);
     plain.sync().unwrap();
-    let (mut margined, _s2, camera) = margined_world(2, None);
-    fill(&mut margined, camera.position);
+    let (mut margined, _s2, camera) = margined_world(Run::Stepped, None);
+    margined.count_soft_misses();
+    // The count is live: with the Guard standing in for what the bands split, bricks are drawn
+    // coarser than they ask until the fill is done.
+    let mut missed = 0;
+    let mut patience = Patience::new(Duration::from_secs(180));
+    while !idle(&margined) {
+        stream(&mut margined, camera.position);
+        missed = missed.max(margined.stats().soft_misses);
+        patience.wait(&margined, || "the resident set does not fill".into());
+    }
+    assert!(missed > 0, "the fill has soft misses to count");
     margined.sync().unwrap();
     let drawn = |w: &World| (0..LEVELS).map(|l| w.level_bricks(l)).collect::<Vec<_>>();
     // A margin is not drawn: the bricks that are, are the bands'. It draws fewer, even, since the
@@ -1700,15 +1913,16 @@ fn margins_make_more_of_the_store_resident_and_draw_no_more() {
     );
     eprintln!("store counted {a} without margins, {b} with");
     assert!(b > a + a / 50, "the margin adds units: {a} {b}");
-    // Nothing the bands do not ask for yet is a soft miss.
-    margined.count_soft_misses();
+    // Nothing the bands do not ask for yet is a soft miss. The scene thread counts every so often
+    // (the world's clock moves on past that).
+    pace(&margined, Duration::from_secs(1));
     stream(&mut margined, camera.position);
     assert_eq!(margined.stats().soft_misses, 0);
 }
 
 #[test]
 fn flying_with_margins_evicts_the_trail_and_keeps_the_margin_the_camera_is_in() {
-    let (mut first, _s, spawn) = margined_world(2, None);
+    let (mut first, _s, spawn) = margined_world(Run::Stepped, None);
     fill(&mut first, spawn.position);
     first.sync().unwrap();
     let full = first.store().streamed_len();
@@ -1717,7 +1931,7 @@ fn flying_with_margins_evicts_the_trail_and_keeps_the_margin_the_camera_is_in() 
         bricks: full * 102 / 100,
         overflow: 0.01,
     };
-    let (mut world, _server, spawn) = margined_world(2, Some(budget));
+    let (mut world, _server, spawn) = margined_world(Run::Stepped, Some(budget));
     world.count_soft_misses();
     fill(&mut world, spawn.position);
     let (ahead, right) = tangents(spawn.horizon_up);
@@ -1737,6 +1951,8 @@ fn flying_with_margins_evicts_the_trail_and_keeps_the_margin_the_camera_is_in() 
     drop(store);
     // Settled: nothing the margin wants is missing, and eviction left the units it wants alone
     // (else the scene thread would be generating them again, and the loader would not be idle).
+    // The scene thread counts every so often: the world's clock moves on past that.
+    pace(&world, Duration::from_secs(1));
     stream(&mut world, away);
     world.sync().unwrap();
     assert!(idle(&world));
@@ -1745,10 +1961,10 @@ fn flying_with_margins_evicts_the_trail_and_keeps_the_margin_the_camera_is_in() 
 
 #[test]
 fn a_prefetch_lead_makes_bricks_ahead_that_a_camera_without_one_does_not() {
-    let (mut without, _s, camera) = spawned_world(2);
+    let (mut without, _s, camera) = spawned_world(Run::Stepped);
     fill(&mut without, camera.position);
     let (ahead, _) = tangents(camera.horizon_up);
-    let (mut leading, _s2, _) = spawned_world(2);
+    let (mut leading, _s2, _) = spawned_world(Run::Stepped);
     fill(&mut leading, camera.position);
     // Both stand at the same place 120 Voxels on, and the one that looks ahead is given a
     // velocity of 7.5 m/s (the test Planet is small, so the places a lead looks at are near its
@@ -1759,7 +1975,7 @@ fn a_prefetch_lead_makes_bricks_ahead_that_a_camera_without_one_does_not() {
     let velocity = ahead.map(|c| c * speed);
     let end: [f64; 3] = std::array::from_fn(|a| camera.position[a] + ahead[a] * 120.0);
     for (world, velocity) in [(&mut without, [0.0; 3]), (&mut leading, velocity)] {
-        let began = Instant::now();
+        let mut patience = Patience::new(Duration::from_secs(180));
         loop {
             world.recentre_moving(end, velocity).unwrap();
             world.sync().unwrap();
@@ -1769,10 +1985,7 @@ fn a_prefetch_lead_makes_bricks_ahead_that_a_camera_without_one_does_not() {
             if idle(world) && world.lag(end) == 0.0 {
                 break;
             }
-            assert!(
-                began.elapsed() < Duration::from_secs(180),
-                "does not settle"
-            );
+            patience.wait(world, || "does not settle".into());
         }
     }
     // The bricks that only the leading world holds are ahead of the camera: the lead made them.
@@ -1815,7 +2028,7 @@ fn a_prefetch_lead_makes_bricks_ahead_that_a_camera_without_one_does_not() {
 #[test]
 fn at_the_cap_the_farthest_bands_are_coarsened_instead_of_a_wanted_brick_dropped() {
     // The budget is a share of the complete set with the margins: less than the bands want.
-    let (mut full, _s, camera) = margined_world(2, None);
+    let (mut full, _s, camera) = margined_world(Run::Stepped, None);
     fill(&mut full, camera.position);
     full.sync().unwrap();
     let complete = full.store().streamed_len();
@@ -1825,23 +2038,23 @@ fn at_the_cap_the_farthest_bands_are_coarsened_instead_of_a_wanted_brick_dropped
         bricks: complete * 90 / 100,
         overflow: 0.02,
     };
-    let (mut world, _server, camera) = margined_world(2, Some(budget));
+    let (mut world, _server, camera) = margined_world(Run::Stepped, Some(budget));
     world.count_soft_misses();
-    let began = Instant::now();
+    let mut patience = Patience::new(Duration::from_secs(120));
     loop {
         stream(&mut world, camera.position);
         world.sync().unwrap();
         if idle(&world) && !world.store().over_limit() && world.stats().coarsening > 0 {
             break;
         }
-        assert!(
-            began.elapsed() < Duration::from_secs(120),
-            "does not settle: {} counted of {}, coarsening {}",
-            world.store().streamed_len(),
-            budget.limit(),
-            world.stats().coarsening
-        );
-        std::thread::sleep(Duration::from_millis(2));
+        patience.wait(&world, || {
+            format!(
+                "does not settle: {} counted of {}, coarsening {}",
+                world.store().streamed_len(),
+                budget.limit(),
+                world.stats().coarsening
+            )
+        });
     }
     let now: usize = (0..LEVELS).map(|l| world.level_bricks(l)).sum();
     eprintln!(
@@ -1863,7 +2076,7 @@ fn at_the_cap_the_farthest_bands_are_coarsened_instead_of_a_wanted_brick_dropped
 
 #[test]
 fn coarsening_stands_while_what_is_wanted_does_not_fit_and_is_taken_back_when_it_does() {
-    let (mut full, _s, camera) = margined_world(2, None);
+    let (mut full, _s, camera) = margined_world(Run::Stepped, None);
     fill(&mut full, camera.position);
     full.sync().unwrap();
     let complete = full.store().streamed_len();
@@ -1872,22 +2085,22 @@ fn coarsening_stands_while_what_is_wanted_does_not_fit_and_is_taken_back_when_it
         bricks: complete * share / 100,
         overflow: 0.02,
     };
-    let (mut world, _server, camera) = margined_world(2, Some(budget(90)));
-    let began = Instant::now();
-    let settle = |world: &mut World, done: &dyn Fn(&World) -> bool, what: &str| loop {
+    let (mut world, _server, camera) = margined_world(Run::Stepped, Some(budget(90)));
+    let mut patience = Patience::new(Duration::from_secs(240));
+    let mut settle = |world: &mut World, done: &dyn Fn(&World) -> bool, what: &str| loop {
         stream(world, camera.position);
         world.sync().unwrap();
         if idle(world) && done(world) {
             return;
         }
-        assert!(
-            began.elapsed() < Duration::from_secs(240),
-            "{what}: coarsening {}, {} held of a limit of {}",
-            world.stats().coarsening,
-            world.store().streamed_len(),
-            world.store().budget().unwrap().limit()
-        );
-        std::thread::sleep(Duration::from_millis(2));
+        patience.wait(world, || {
+            format!(
+                "{what}: coarsening {}, {} held of a limit of {}",
+                world.stats().coarsening,
+                world.store().streamed_len(),
+                world.store().budget().unwrap().limit()
+            )
+        });
     };
     // Less room than the bands want: it coarsens, and settles within the limit.
     settle(
@@ -1899,7 +2112,7 @@ fn coarsening_stands_while_what_is_wanted_does_not_fit_and_is_taken_back_when_it
     // each in a test) the steps are what they were, not taken back and made again.
     let steps = world.stats().coarsening;
     for _ in 0..30 {
-        std::thread::sleep(Duration::from_millis(100));
+        pace(&world, Duration::from_millis(100));
         stream(&mut world, camera.position);
         world.sync().unwrap();
     }
@@ -1907,6 +2120,50 @@ fn coarsening_stands_while_what_is_wanted_does_not_fit_and_is_taken_back_when_it
     eprintln!("stands at {steps} steps");
     // Room for it (what the camera wants fell, or the budget grew): the steps are taken back,
     // one each hold, to none, and it is not coarsened again.
+    world.set_budget(budget(140));
+    let mut patience = Patience::new(Duration::from_secs(60));
+    while world.stats().coarsening > 0 {
+        stream(&mut world, camera.position);
+        patience.wait(&world, || {
+            format!(
+                "the steps are never taken back: {} steps",
+                world.stats().coarsening
+            )
+        });
+    }
+    pace(&world, Duration::from_millis(1000));
+    stream(&mut world, camera.position);
+    world.sync().unwrap();
+    assert_eq!(world.stats().coarsening, 0);
+    assert!(!world.store().over_limit());
+}
+
+/// A scene thread that is parked (nothing asked of it, the camera exactly still) wakes by itself
+/// when a coarsening hold is over, and takes the steps back: that is the thread's wait, which a
+/// stepped scene thread does not have, so this one runs with real threads.
+#[test]
+fn a_parked_scene_thread_takes_the_coarsening_steps_back_when_the_hold_is_over() {
+    let (mut full, _s, camera) = margined_world(Run::Threads(2), None);
+    fill(&mut full, camera.position);
+    full.sync().unwrap();
+    let complete = full.store().streamed_len();
+    drop(full);
+    let budget = |share: usize| brick_store::Budget {
+        bricks: complete * share / 100,
+        overflow: 0.02,
+    };
+    let (mut world, _server, camera) = margined_world(Run::Threads(2), Some(budget(90)));
+    let mut patience = Patience::new(Duration::from_secs(240));
+    loop {
+        stream(&mut world, camera.position);
+        world.sync().unwrap();
+        if idle(&world) && world.stats().coarsening > 0 && !world.store().over_limit() {
+            break;
+        }
+        patience.wait(&world, || {
+            format!("does not coarsen: {} steps", world.stats().coarsening)
+        });
+    }
     // The camera is exactly still and nothing is waited for with `sync` (which wakes the scene
     // thread): the thread looks at the clock itself, or it stays coarse for good.
     world.set_budget(budget(140));
@@ -1925,6 +2182,85 @@ fn coarsening_stands_while_what_is_wanted_does_not_fit_and_is_taken_back_when_it
     world.sync().unwrap();
     assert_eq!(world.stats().coarsening, 0);
     assert!(!world.store().over_limit());
+}
+
+/// What the world was after each frame of [`scenario`], and what was resident and drawn at its end.
+#[derive(Debug, PartialEq)]
+struct Trace {
+    /// After each frame: the bricks the store counts, the bricks drawn at each level, the soft misses
+    /// the scene thread reported, the bricks waiting, and what the loader had generated.
+    frames: Vec<(usize, [usize; LEVELS], usize, usize, u64)>,
+    /// A hash of every brick the store holds, level by level, and of the words that the drawn scene
+    /// is made of.
+    resident: u64,
+    drawn: u64,
+}
+
+/// The camera standing at the spawn for a while and then walking, a frame at a time, with the soft
+/// misses counted, and an Edit in the middle of it.
+fn scenario(run: Run) -> Trace {
+    use std::hash::{Hash, Hasher};
+    let (mut world, _server, spawn) = spawned_world(run);
+    world.count_soft_misses();
+    let (ahead, _) = tangents(spawn.horizon_up);
+    let mut frames = Vec::new();
+    let mut at = spawn.position;
+    for frame in 0..240 {
+        if frame >= 60 {
+            at = over_the_ground(
+                &world.store(),
+                std::array::from_fn(|a| at[a] + ahead[a] * 0.4 * VOXELS_PER_METRE),
+            );
+        }
+        if frame == 150 {
+            world
+                .edit(&within_reach(&world, &spawn), &crate::tool::Tool::default())
+                .unwrap();
+        }
+        stream(&mut world, at);
+        pace(&world, FRAME);
+        let stats = world.stats();
+        frames.push((
+            world.store().streamed_len(),
+            stats.level_bricks,
+            stats.soft_misses,
+            stats.waiting,
+            stats.loader.generated,
+        ));
+    }
+    world.sync().unwrap();
+    let mut resident = std::collections::hash_map::DefaultHasher::new();
+    let store = world.store();
+    for level in 0..LEVELS {
+        store
+            .level(level)
+            .unwrap()
+            .sorted_coords()
+            .hash(&mut resident);
+    }
+    let mut drawn = std::collections::hash_map::DefaultHasher::new();
+    world.scene().table.hash(&mut drawn);
+    world.scene().regions.hash(&mut drawn);
+    Trace {
+        frames,
+        resident: resident.finish(),
+        drawn: drawn.finish(),
+    }
+}
+
+#[test]
+fn two_stepped_runs_of_one_scenario_give_the_same_residency_drawn_sets_and_soft_misses() {
+    let (first, second) = (scenario(Run::Stepped), scenario(Run::Stepped));
+    // The scenario is not still: bricks come, the soft misses are counted, an Edit is made.
+    assert!(
+        first.frames.iter().any(|f| f.2 > 0),
+        "soft misses are counted"
+    );
+    assert!(
+        first.frames.last().unwrap().0 > first.frames[0].0,
+        "bricks come in"
+    );
+    assert_eq!(first, second);
 }
 
 /// One frame of a path at 60 a second, in real time: the camera is at `position`, the scene

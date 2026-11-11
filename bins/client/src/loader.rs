@@ -33,6 +33,11 @@
 //! nothing is generated beyond the bands. The workers run at the lowest priority
 //! ([`crate::priority`]), and there are two fewer of them than cores, for the simulation and the
 //! frame thread. A worker that panics is reported on the frame thread, which panics too.
+//!
+//! **Stepped** (#180, test builds only): [`Loader::stepped`] has no workers, and [`Loader::step`]
+//! does the jobs of the queue on the calling thread, by [`poll`], [`generate`] and [`complete`],
+//! which are what a worker's loop is made of. So a test gets the same bricks in the same order
+//! every time, with nothing to wait for.
 
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet};
@@ -165,12 +170,23 @@ pub enum Arrival {
     Dropped(Key),
 }
 
+/// What a loader is made of before it has workers: the state they share and the two ends of the
+/// channel their arrivals go through.
+type Parts = (
+    Arc<Shared>,
+    Sender<(u64, Arrival)>,
+    Receiver<(u64, Arrival)>,
+);
+
 /// The workers, and the work they have been asked for. Lives on the frame thread, which is the
 /// only one that talks to it.
 pub struct Loader {
     shared: Arc<Shared>,
     arrivals: Receiver<(u64, Arrival)>,
     workers: Vec<JoinHandle<()>>,
+    /// Where a stepped loader's jobs send what they make (see [`Loader::stepped`]); it has no workers.
+    #[cfg(test)]
+    stepper: Option<Sender<(u64, Arrival)>>,
     /// Jobs not yet handed to the workers, for when they are busy with the lock.
     outbox: Vec<Job>,
     /// Tickets given up on that the workers have not been told of yet.
@@ -198,6 +214,54 @@ impl Loader {
         bands: Bands,
         workers: usize,
     ) -> Self {
+        let (shared, sender, arrivals) = Self::parts(source, camera, bands);
+        let workers = (0..workers.max(1))
+            .map(|n| {
+                let (shared, sender) = (Arc::clone(&shared), sender.clone());
+                std::thread::Builder::new()
+                    .name(format!("ring loader {n}"))
+                    .spawn(move || work(&shared, &sender))
+                    .expect("a thread for the loader")
+            })
+            .collect();
+        Self::with(shared, arrivals, workers, bands)
+    }
+
+    /// A loader with no threads, for a test: its jobs are done on the calling thread, a step at a
+    /// time ([`Loader::step`]), by the code that the threads run, so the same bricks come in the
+    /// same order every time.
+    #[cfg(test)]
+    pub fn stepped(source: Arc<dyn BrickSource>, camera: [f64; 3], bands: Bands) -> Self {
+        let (shared, sender, arrivals) = Self::parts(source, camera, bands);
+        let mut loader = Self::with(shared, arrivals, Vec::new(), bands);
+        // Kept, so that the channel is open for as long as the loader is.
+        loader.stepper = Some(sender);
+        loader
+    }
+
+    /// Does up to `most` jobs of the queue on the calling thread, the nearest first, as a worker
+    /// would, and stops when the queue has none that it may take (it is empty, or the workers are
+    /// [`MAX_AHEAD`] ahead of what has been taken in). Returns how many it did. Only a stepped
+    /// loader is stepped; one with threads has no work to do here.
+    #[cfg(test)]
+    pub fn step(&mut self, most: usize) -> usize {
+        let Some(arrivals) = self.stepper.as_ref() else {
+            return 0;
+        };
+        let mut done = 0;
+        while done < most {
+            let Next::Job(job, camera, bands, reach) = poll(&self.shared, self.shared.lock())
+            else {
+                break;
+            };
+            let arrival = generate(&self.shared, &job, camera, bands, reach);
+            complete(&self.shared, arrivals, job.ticket, arrival);
+            done += 1;
+        }
+        done
+    }
+
+    fn parts(source: Arc<dyn BrickSource>, camera: [f64; 3], bands: Bands) -> Parts {
         let shared = Arc::new(Shared {
             state: Mutex::new(State {
                 queue: BinaryHeap::new(),
@@ -217,19 +281,21 @@ impl Loader {
             working: AtomicUsize::new(0),
         });
         let (sender, arrivals) = mpsc::channel();
-        let workers = (0..workers.max(1))
-            .map(|n| {
-                let (shared, sender) = (Arc::clone(&shared), sender.clone());
-                std::thread::Builder::new()
-                    .name(format!("ring loader {n}"))
-                    .spawn(move || work(&shared, &sender))
-                    .expect("a thread for the loader")
-            })
-            .collect();
+        (shared, sender, arrivals)
+    }
+
+    fn with(
+        shared: Arc<Shared>,
+        arrivals: Receiver<(u64, Arrival)>,
+        workers: Vec<JoinHandle<()>>,
+        bands: Bands,
+    ) -> Self {
         Self {
             shared,
             arrivals,
             workers,
+            #[cfg(test)]
+            stepper: None,
             outbox: Vec::new(),
             cancels: Vec::new(),
             requested: HashMap::new(),
@@ -490,6 +556,101 @@ fn reordered(mut jobs: Vec<Job>, camera: [f64; 3], bands: Bands, reach: Reach) -
     BinaryHeap::from(jobs)
 }
 
+/// What a worker finds when it looks at the queue.
+enum Next<'a> {
+    /// A job it has taken (it is counted in flight and ahead), and the camera, bands and reach to
+    /// do it for.
+    Job(Job, [f64; 3], Bands, Reach),
+    /// Nothing that it may do now: a thread waits for a change, a stepped loader stops.
+    Idle(MutexGuard<'a, State>),
+    Shutdown,
+}
+
+/// What a worker does when it looks at the queue with `state` locked: the queue is put in order
+/// again if the camera has gone far enough, and else the nearest job is taken, if the frame thread
+/// is not too far behind. This is the whole of a worker's deciding. A thread calls it and waits on
+/// [`Next::Idle`]; a stepped loader (see [`Loader::step`]) calls it on the calling thread and stops.
+fn poll<'a>(shared: &'a Shared, mut state: MutexGuard<'a, State>) -> Next<'a> {
+    loop {
+        if state.shutdown {
+            return Next::Shutdown;
+        }
+        if state.reordering {
+            // The queue is with the worker that is putting it in order.
+        } else if state.stale {
+            state.stale = false;
+            state.reordering = true;
+            state.ordered_for = state.camera;
+            let jobs = std::mem::take(&mut state.queue).into_vec();
+            let (camera, bands, reach) = (state.camera, state.bands, state.reach);
+            drop(state);
+            let mut queue = reordered(jobs, camera, bands, reach);
+            state = shared.lock();
+            // What was queued meanwhile joins it.
+            queue.append(&mut state.queue);
+            state.queue = queue;
+            state.reordering = false;
+            shared.wake.notify_all();
+            continue;
+        } else if state.queue.is_empty() {
+            // Whatever is left was for jobs that are gone.
+            state.cancelled.clear();
+        } else if shared.ahead.load(Atomic::Relaxed) < MAX_AHEAD {
+            let job = state.queue.pop().expect("it is not empty");
+            if state.cancelled.remove(&job.ticket) {
+                continue;
+            }
+            // In flight before ahead, so that no one who sees the job counted in
+            // `ahead` can see it not in flight (see `Loader::in_flight`).
+            shared.working.fetch_add(1, Atomic::AcqRel);
+            shared.ahead.fetch_add(1, Atomic::AcqRel);
+            return Next::Job(job, state.camera, state.bands, state.reach);
+        }
+        return Next::Idle(state);
+    }
+}
+
+/// What a worker makes of `job`: the children of its brick, or the news that the camera has gone
+/// from it. Runs with no lock held.
+fn generate(shared: &Shared, job: &Job, camera: [f64; 3], bands: Bands, reach: Reach) -> Arrival {
+    let (level, coord) = job.key;
+    // The bands split a brick nearer than its level is used from, and the margin and the lead
+    // want its children before; with the hysteresis that a brick that is split keeps (see
+    // `Bands::split`), so that a job is only dropped for a brick that the camera has really
+    // left.
+    if reach.class(bands, camera, level, coord).is_some() {
+        let kids = coord.children();
+        let held = |c: BrickCoord| {
+            kids.iter()
+                .position(|&k| k == c)
+                .is_some_and(|i| job.held >> i & 1 == 1)
+        };
+        let (bricks, generated) = children_generated(&*shared.source, level, coord, held);
+        shared
+            .generated
+            .fetch_add(generated as u64, Atomic::Relaxed);
+        Arrival::Children {
+            key: job.key,
+            bricks,
+        }
+    } else {
+        Arrival::Dropped(job.key)
+    }
+}
+
+/// Sends the `arrival` of the job `ticket` and ends its time in flight. False if nobody is there
+/// to take it.
+fn complete(
+    shared: &Shared,
+    arrivals: &Sender<(u64, Arrival)>,
+    ticket: u64,
+    arrival: Arrival,
+) -> bool {
+    let sent = arrivals.send((ticket, arrival));
+    shared.working.fetch_sub(1, Atomic::Release);
+    sent.is_ok()
+}
+
 /// A worker: takes the nearest job when the frame thread is not too far behind, drops it if the
 /// camera has gone from it, and generates it.
 fn work(shared: &Shared, arrivals: &Sender<(u64, Arrival)>) {
@@ -498,72 +659,20 @@ fn work(shared: &Shared, arrivals: &Sender<(u64, Arrival)>) {
         let (job, camera, bands, reach) = {
             let mut state = shared.lock();
             loop {
-                if state.shutdown {
-                    return;
-                }
-                if state.reordering {
-                    // The queue is with the worker that is putting it in order.
-                } else if state.stale {
-                    state.stale = false;
-                    state.reordering = true;
-                    state.ordered_for = state.camera;
-                    let jobs = std::mem::take(&mut state.queue).into_vec();
-                    let (camera, bands, reach) = (state.camera, state.bands, state.reach);
-                    drop(state);
-                    let mut queue = reordered(jobs, camera, bands, reach);
-                    state = shared.lock();
-                    // What was queued meanwhile joins it.
-                    queue.append(&mut state.queue);
-                    state.queue = queue;
-                    state.reordering = false;
-                    shared.wake.notify_all();
-                    continue;
-                } else if state.queue.is_empty() {
-                    // Whatever is left was for jobs that are gone.
-                    state.cancelled.clear();
-                } else if shared.ahead.load(Atomic::Relaxed) < MAX_AHEAD {
-                    let job = state.queue.pop().expect("it is not empty");
-                    if state.cancelled.remove(&job.ticket) {
-                        continue;
+                match poll(shared, state) {
+                    Next::Job(job, camera, bands, reach) => break (job, camera, bands, reach),
+                    Next::Shutdown => return,
+                    Next::Idle(idle) => {
+                        state = shared
+                            .wake
+                            .wait(idle)
+                            .expect("a ring loader thread panicked");
                     }
-                    // In flight before ahead, so that no one who sees the job counted in
-                    // `ahead` can see it not in flight (see `Loader::in_flight`).
-                    shared.working.fetch_add(1, Atomic::AcqRel);
-                    shared.ahead.fetch_add(1, Atomic::AcqRel);
-                    break (job, state.camera, state.bands, state.reach);
                 }
-                state = shared
-                    .wake
-                    .wait(state)
-                    .expect("a ring loader thread panicked");
             }
         };
-        let (level, coord) = job.key;
-        // The bands split a brick nearer than its level is used from, and the margin and the lead
-        // want its children before; with the hysteresis that a brick that is split keeps (see
-        // `Bands::split`), so that a job is only dropped for a brick that the camera has really
-        // left.
-        let arrival = if reach.class(bands, camera, level, coord).is_some() {
-            let kids = coord.children();
-            let held = |c: BrickCoord| {
-                kids.iter()
-                    .position(|&k| k == c)
-                    .is_some_and(|i| job.held >> i & 1 == 1)
-            };
-            let (bricks, generated) = children_generated(&*shared.source, level, coord, held);
-            shared
-                .generated
-                .fetch_add(generated as u64, Atomic::Relaxed);
-            Arrival::Children {
-                key: job.key,
-                bricks,
-            }
-        } else {
-            Arrival::Dropped(job.key)
-        };
-        let sent = arrivals.send((job.ticket, arrival));
-        shared.working.fetch_sub(1, Atomic::Release);
-        if sent.is_err() {
+        let arrival = generate(shared, &job, camera, bands, reach);
+        if !complete(shared, arrivals, job.ticket, arrival) {
             return;
         }
     }
@@ -669,6 +778,33 @@ mod tests {
     }
 
     #[test]
+    fn a_stepped_loader_makes_the_bricks_of_its_queue_in_the_queue_order_on_the_calling_thread() {
+        let source = Arc::new(Counting::default());
+        let mut loader = Loader::stepped(source.clone(), [0.0; 3], bands());
+        let mut keys = near_the_origin();
+        // The order the queue is documented to have: nearest first, and the key for a tie.
+        keys.sort_by(|a, b| {
+            let d = |&(l, c): &Key| brick_distance([0.0; 3], l, c);
+            d(a).total_cmp(&d(b)).then(a.cmp(b))
+        });
+        loader.request(&BrickStore::new(), keys.iter().copied(), [0.0; 3]);
+        // Nothing is made until it is stepped: there are no threads to make it.
+        loader.sync([0.0; 3], bands());
+        assert_eq!(source.made.load(Atomic::Relaxed), 0);
+        assert_eq!(loader.step(100), 100);
+        assert_eq!(source.made.load(Atomic::Relaxed), 100 * 8);
+        let got: Vec<Key> = loader
+            .receive(1000)
+            .into_iter()
+            .map(|arrival| match arrival {
+                Arrival::Children { key, .. } => key,
+                Arrival::Dropped(key) => panic!("{key:?} was dropped"),
+            })
+            .collect();
+        assert_eq!(got, keys[..100]);
+    }
+
+    #[test]
     fn a_loader_has_two_fewer_workers_than_cores_and_at_least_one() {
         assert_eq!(workers_for(8), 6);
         assert_eq!(workers_for(3), 1);
@@ -713,26 +849,21 @@ mod tests {
         keys
     }
 
+    /// A loader with no threads, whose jobs the test does with [`Loader::step`].
     fn new_loader(source: Arc<dyn BrickSource>) -> Loader {
-        Loader::new(source, [0.0; 3], bands(), 2)
+        Loader::stepped(source, [0.0; 3], bands())
     }
 
-    /// Syncs until the workers have taken `n` jobs (they take no more than [`MAX_AHEAD`]) and
-    /// have stopped taking them.
-    fn wait_for_ahead(loader: &mut Loader, n: usize) {
-        let started = std::time::Instant::now();
-        let mut last = usize::MAX;
-        loop {
-            loader.sync([0.0; 3], bands());
-            let now = loader.ahead();
-            if now >= n && now == last {
-                return;
-            }
-            last = now;
-            assert!(started.elapsed().as_secs() < 30, "{now} of {n} taken");
-            std::thread::sleep(std::time::Duration::from_millis(50));
-        }
+    /// Hands the workers' jobs over and does them until the loader will take no more: it has taken
+    /// `n` jobs (it takes no more than [`MAX_AHEAD`] before something is taken in).
+    fn run_ahead(loader: &mut Loader, n: usize) {
+        loader.sync([0.0; 3], bands());
+        loader.step(usize::MAX);
+        assert!(loader.ahead() >= n, "{} of {n} taken", loader.ahead());
     }
+
+    /// The most steps a test takes before it says that something never came.
+    const MOST_STEPS: usize = 10_000;
 
     #[test]
     fn the_workers_go_no_further_ahead_than_what_the_frame_thread_has_taken_in() {
@@ -741,13 +872,13 @@ mod tests {
         let keys = near_the_origin();
         assert!(keys.len() > 3 * MAX_AHEAD, "{}", keys.len());
         loader.request(&BrickStore::new(), keys.iter().copied(), [0.0; 3]);
-        wait_for_ahead(&mut loader, MAX_AHEAD);
+        run_ahead(&mut loader, MAX_AHEAD);
         assert_eq!(loader.ahead(), MAX_AHEAD);
         assert_eq!(source.made.load(Atomic::Relaxed), MAX_AHEAD * 8);
         // Taking some in lets the workers go on, by as many.
         let taken = loader.receive(100).len();
         assert_eq!(taken, 100);
-        wait_for_ahead(&mut loader, MAX_AHEAD);
+        run_ahead(&mut loader, MAX_AHEAD);
         assert_eq!(loader.ahead(), MAX_AHEAD);
         assert_eq!(source.made.load(Atomic::Relaxed), (MAX_AHEAD + 100) * 8);
     }
@@ -759,22 +890,23 @@ mod tests {
         let mut keys = near_the_origin();
         let newly = keys.remove(0);
         loader.request(&BrickStore::new(), keys.iter().copied(), [0.0; 3]);
-        wait_for_ahead(&mut loader, MAX_AHEAD);
+        run_ahead(&mut loader, MAX_AHEAD);
         // Now the nearest brick of all is wanted. It is behind what the workers took already, and
         // nothing else.
         loader.request(&BrickStore::new(), [newly], [0.0; 3]);
         let mut seen = 0;
-        let started = std::time::Instant::now();
+        let mut steps = 0;
         let at = 'found: loop {
             loader.sync([0.0; 3], bands());
+            loader.step(16);
             for arrival in loader.receive(16) {
                 if matches!(&arrival, Arrival::Children { key, .. } if *key == newly) {
                     break 'found seen;
                 }
                 seen += 1;
             }
-            assert!(started.elapsed().as_secs() < 30, "never came");
-            std::thread::sleep(std::time::Duration::from_millis(1));
+            steps += 1;
+            assert!(steps < MOST_STEPS, "never came");
         };
         assert!(at < MAX_AHEAD + 32, "it was number {at}");
         // The far ones are still queued: not everything was generated.
@@ -809,14 +941,10 @@ mod tests {
         // above them that is not known to be solid.
         let key = (3, BrickCoord([0, -1, 0]));
         loader.request(&BrickStore::new(), [key], [0.0; 3]);
-        let started = std::time::Instant::now();
-        let bricks = loop {
-            loader.sync([0.0; 3], bands());
-            if let Some(Arrival::Children { bricks, .. }) = loader.receive(1).pop() {
-                break bricks;
-            }
-            assert!(started.elapsed().as_secs() < 30, "never came");
-            std::thread::sleep(std::time::Duration::from_millis(1));
+        loader.sync([0.0; 3], bands());
+        assert_eq!(loader.step(1), 1);
+        let Some(Arrival::Children { bricks, .. }) = loader.receive(1).pop() else {
+            panic!("its children did not come");
         };
         assert_eq!(bricks.len(), 4);
         assert!(bricks.iter().all(|(c, _, _)| c.0[1] == -1));
@@ -830,7 +958,7 @@ mod tests {
         let mut loader = new_loader(source.clone());
         let keys = near_the_origin();
         loader.request(&BrickStore::new(), keys.iter().copied(), [0.0; 3]);
-        wait_for_ahead(&mut loader, MAX_AHEAD);
+        run_ahead(&mut loader, MAX_AHEAD);
         // The farthest hundred are given up on: some while they wait for the next sync, some
         // after.
         let gone: Vec<Key> = keys[keys.len() - 100..].to_vec();
@@ -839,16 +967,17 @@ mod tests {
         loader.cancel(gone[50..].iter().copied());
         assert_eq!(loader.pending(), keys.len() - 100);
         let mut arrived = HashSet::new();
-        let started = std::time::Instant::now();
+        let mut steps = 0;
         while loader.pending() > 0 || arrived.len() < keys.len() - 100 {
             loader.sync([0.0; 3], bands());
+            loader.step(256);
             for arrival in loader.receive(256) {
                 if let Arrival::Children { key, .. } = arrival {
                     arrived.insert(key);
                 }
             }
-            assert!(started.elapsed().as_secs() < 60, "{} came", arrived.len());
-            std::thread::sleep(std::time::Duration::from_millis(1));
+            steps += 1;
+            assert!(steps < MOST_STEPS, "{} came", arrived.len());
         }
         assert!(gone.iter().all(|key| !arrived.contains(key)));
         assert_eq!(
@@ -867,13 +996,8 @@ mod tests {
         // The camera is far from it: the worker drops the job, and the drop waits to be taken.
         loader.request(&BrickStore::new(), [key], far);
         loader.sync(far, bands());
-        let started = std::time::Instant::now();
-        while loader.ahead() == 0 {
-            loader.sync(far, bands());
-            assert!(started.elapsed().as_secs() < 30);
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert_eq!(loader.step(1), 1);
+        assert_eq!(loader.ahead(), 1, "the drop is made, and waits to be taken");
         // The scene gave up on it, wanted it again, and the camera came back.
         loader.cancel([key]);
         let near = [5000.0 * 256.0, 0.0, 0.0];
@@ -881,16 +1005,18 @@ mod tests {
         loader.sync(near, bands());
         let mut dropped = 0;
         let mut children = 0;
+        let mut steps = 0;
         while children == 0 {
             loader.sync(near, bands());
+            loader.step(8);
             for arrival in loader.receive(8) {
                 match arrival {
                     Arrival::Dropped(_) => dropped += 1,
                     Arrival::Children { .. } => children += 1,
                 }
             }
-            assert!(started.elapsed().as_secs() < 30);
-            std::thread::sleep(std::time::Duration::from_millis(5));
+            steps += 1;
+            assert!(steps < MOST_STEPS);
         }
         assert_eq!(dropped, 0, "the old request's drop was not reported");
         assert_eq!(loader.pending(), 0);
@@ -908,7 +1034,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "ring loader")]
     fn a_worker_that_panics_panics_the_frame_thread_instead_of_loading_stopping_silently() {
-        let mut loader = new_loader(Arc::new(Panicking));
+        let mut loader = Loader::new(Arc::new(Panicking), [0.0; 3], bands(), 2);
         loader.request(&BrickStore::new(), [(3, BrickCoord([0, 0, 0]))], [0.0; 3]);
         let started = std::time::Instant::now();
         loop {

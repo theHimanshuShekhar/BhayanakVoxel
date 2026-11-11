@@ -47,6 +47,7 @@ use render::lod::{AHEAD, Bands, Class, LEVELS, brick_distance};
 use render::{PatchCopy, RingPatch, RingsFull, Scene, SceneUpdate};
 use sim::SharedStore;
 
+use crate::clock::Clock;
 use crate::loader::{Arrival, Loader};
 
 /// The time this thread spends taking in bricks before it looks at what the frame thread has
@@ -55,6 +56,14 @@ const SLICE: Duration = Duration::from_millis(2);
 /// How long it sleeps when there was nothing to do but the loader has bricks on their way, before
 /// it looks again: the arrivals do not wake it. With nothing asked for it sleeps until it is told.
 const IDLE: Duration = Duration::from_millis(1);
+/// How many jobs of the loader are done in one step of a stepped scene thread (see
+/// [`SceneWorker::step`]): about what the real workers make between two frames of a test, so that a
+/// stepped fill takes about as many frames. Only the stepped mode reads it.
+#[cfg(test)]
+const STEP_JOBS: usize = 256;
+/// The most steps a stepped wait for a job takes before it says that the job is never done.
+#[cfg(test)]
+const MOST_STEPS_FOR_A_JOB: usize = 100_000;
 /// How often it works out the sizes of the tables, which costs a walk over the scene's free
 /// ranges.
 const TABLES_EVERY: Duration = Duration::from_millis(250);
@@ -396,6 +405,14 @@ pub struct SceneWorker {
     shared: Arc<Shared>,
     garbage: Sender<Garbage>,
     thread: Option<JoinHandle<()>>,
+    /// The engine of a stepped scene thread, which has no thread (see
+    /// [`SceneWorker::start_stepped`]).
+    #[cfg(test)]
+    stepped: Option<Mutex<Engine>>,
+    /// Until when (on the stepped clock) a stepped thread is busy and does nothing: what a wait of
+    /// the frame thread's that has a timeout runs out against (see [`SceneWorker::busy_for`]).
+    #[cfg(test)]
+    busy_until: Mutex<Option<Instant>>,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -407,6 +424,39 @@ impl SceneWorker {
     /// waits for, reading and holding bricks in `store`. Returns the frame thread's end of it, a
     /// copy of the scene to draw (see [`Scene::mirror`]), and its counts.
     pub fn start(scene: Scene, loader: Loader, store: SharedStore) -> (Self, Scene, Stats) {
+        let (engine, mut worker, mirror, stats) = Self::build(scene, loader, store, Clock::real());
+        let thread = std::thread::Builder::new()
+            .name("scene".into())
+            .spawn(move || engine.run())
+            .expect("a thread for the scene");
+        worker.thread = Some(thread);
+        (worker, mirror, stats)
+    }
+
+    /// A scene thread with no thread, for a test: what the thread does in a round is done on the
+    /// calling thread a step at a time ([`SceneWorker::step`], and the calls that wait for a job),
+    /// by the code that the thread runs, with the loader (which should be [`Loader::stepped`]) done
+    /// a step in each. It reads the time from `clock`, which should be stepped.
+    #[cfg(test)]
+    pub fn start_stepped(
+        scene: Scene,
+        loader: Loader,
+        store: SharedStore,
+        clock: Clock,
+    ) -> (Self, Scene, Stats) {
+        let (engine, mut worker, mirror, stats) = Self::build(scene, loader, store, clock);
+        worker.stepped = Some(Mutex::new(engine));
+        (worker, mirror, stats)
+    }
+
+    /// The engine, its frame thread's end with no thread started, and what the frame thread starts
+    /// with.
+    fn build(
+        scene: Scene,
+        loader: Loader,
+        store: SharedStore,
+        clock: Clock,
+    ) -> (Engine, Self, Scene, Stats) {
         assert!(scene.is_rings(), "only a scene of rings follows a camera");
         let mirror = scene.mirror();
         let slow = slow_of(&scene, &loader);
@@ -446,7 +496,7 @@ impl SceneWorker {
             graveyard,
             spare: Vec::new(),
             slow,
-            slow_at: Instant::now(),
+            slow_at: clock.now(),
             coarse: VecDeque::new(),
             sync_waiting: None,
             evicting: None,
@@ -454,31 +504,67 @@ impl SceneWorker {
             eviction: EvictionStats::default(),
             user_bands,
             coarsening: 0,
-            coarsened_at: Instant::now(),
+            coarsened_at: clock.now(),
             units_per_node: 0.0,
             relaxed: false,
             barred: None,
             over_the_cap: false,
             soft_misses: 0,
-            soft_misses_at: Instant::now(),
+            soft_misses_at: clock.now(),
             ahead: [None; AHEAD],
             velocity: [0.0; 3],
+            idle: false,
+            clock,
             #[cfg(test)]
             coarse_sleep: Duration::ZERO,
         };
-        let thread = std::thread::Builder::new()
-            .name("scene".into())
-            .spawn(move || engine.run())
-            .expect("a thread for the scene");
-        (
-            Self {
-                shared,
-                garbage,
-                thread: Some(thread),
-            },
-            mirror,
-            stats,
-        )
+        let worker = Self {
+            shared,
+            garbage,
+            thread: None,
+            #[cfg(test)]
+            stepped: None,
+            #[cfg(test)]
+            busy_until: Mutex::new(None),
+        };
+        (engine, worker, mirror, stats)
+    }
+
+    /// One step of a stepped scene thread: the loader makes up to [`STEP_JOBS`] jobs, and the
+    /// thread does a round of its work (following the camera it was last told, its jobs, taking in
+    /// what was made, publishing). Does nothing for one with a thread, nor for one that is busy
+    /// ([`SceneWorker::busy_for`]). The frame thread's calls that wait for the thread step it until
+    /// it has done.
+    #[cfg(test)]
+    pub fn step(&self) {
+        if let Some(engine) = &self.stepped {
+            let mut engine = engine.lock().expect("the engine is not poisoned");
+            if let Some(until) = *lock(&self.busy_until)
+                && engine.clock.now() < until
+            {
+                return;
+            }
+            engine.step();
+        }
+    }
+
+    /// Has a stepped thread busy for `time` of its clock from now, as the camera or the arrivals
+    /// keep a real one: it does nothing until then, the jobs it has included. A wait for a job with
+    /// a timeout that is over before that gives up with the clock moved on to the timeout, and the
+    /// job is done by the first step after the thread is free; a wait with no timeout moves the
+    /// clock on to when it is free.
+    #[cfg(test)]
+    pub fn busy_for(&self, time: Duration) {
+        let engine = self
+            .stepped
+            .as_ref()
+            .expect("only a stepped thread is busy");
+        let now = engine
+            .lock()
+            .expect("the engine is not poisoned")
+            .clock
+            .now();
+        *lock(&self.busy_until) = Some(now + time);
     }
 
     /// Tells the thread where the camera is, a position in Voxels: it follows it when it has the
@@ -588,6 +674,49 @@ impl SceneWorker {
     /// [`SceneWorker::wait`], for `timeout` at the most if there is one. Whether the job is
     /// published.
     pub fn wait_for(&self, ticket: u64, timeout: Option<Duration>) -> Result<bool, RingsFull> {
+        // A stepped thread steps until the job is done. It is as quick as the frame thread needs it
+        // to be unless the test has it busy ([`SceneWorker::busy_for`]): then a timeout runs out on
+        // the stepped clock if the thread is still busy at the end of it, and the wait is over.
+        #[cfg(test)]
+        if let Some(engine) = &self.stepped {
+            let clock = engine
+                .lock()
+                .expect("the engine is not poisoned")
+                .clock
+                .clone();
+            let until = timeout.map(|t| clock.now() + t);
+            for _ in 0..MOST_STEPS_FOR_A_JOB {
+                {
+                    let outbox = lock(&self.shared.outbox);
+                    if outbox.done >= ticket || outbox.failed {
+                        break;
+                    }
+                }
+                let free = *lock(&self.busy_until);
+                if let Some(free) = free
+                    && free > clock.now()
+                {
+                    if let Some(until) = until
+                        && free > until
+                    {
+                        clock.advance(until.saturating_duration_since(clock.now()));
+                        return Ok(false);
+                    }
+                    clock.advance(free - clock.now());
+                }
+                self.step();
+            }
+            let outbox = lock(&self.shared.outbox);
+            assert!(
+                outbox.done >= ticket || outbox.failed,
+                "the job was never done"
+            );
+            return if outbox.failed {
+                Err(RingsFull)
+            } else {
+                Ok(true)
+            };
+        }
         let until = timeout.map(|t| Instant::now() + t);
         let mut outbox = lock(&self.shared.outbox);
         while outbox.done < ticket && !outbox.failed && !outbox.died {
@@ -739,8 +868,27 @@ struct Engine {
     /// camera that was looked at last.
     ahead: [Option<[f64; 3]>; AHEAD],
     velocity: [f64; 3],
+    /// The last round did nothing, so a thread waits to be told (see [`Engine::await_work`]).
+    idle: bool,
+    /// The time that holds and slices are measured in: the machine's, or a test's.
+    clock: Clock,
     #[cfg(test)]
     coarse_sleep: Duration,
+}
+
+/// What the thread was told: the camera, how it moves, and the jobs.
+type Work = ([f64; 3], [f64; 3], VecDeque<(u64, Job)>);
+
+/// What the thread was told since it looked last, taken. None when it is to stop.
+fn take_work(inbox: &mut Inbox) -> Option<Work> {
+    if inbox.shutdown {
+        return None;
+    }
+    Some((
+        inbox.camera,
+        inbox.velocity,
+        std::mem::take(&mut inbox.jobs),
+    ))
 }
 
 /// Eviction that has begun.
@@ -790,129 +938,151 @@ fn wanted<'a>(
 impl Engine {
     fn run(mut self) {
         let _watch = DeathWatch(Arc::clone(&self.shared));
-        let mut idle = false;
         loop {
-            let (camera, velocity, jobs) = {
-                let mut inbox = lock(&self.shared.inbox);
-                if idle
-                    && inbox.jobs.is_empty()
-                    && Some(inbox.camera) == self.camera
-                    && inbox.velocity == self.velocity
-                {
-                    let shared = Arc::clone(&self.shared);
-                    let (camera, paused, moving) = (self.camera, self.paused, self.velocity);
-                    let quiet = |inbox: &mut Inbox| {
-                        inbox.jobs.is_empty()
-                            && Some(inbox.camera) == camera
-                            && inbox.velocity == moving
-                            && !inbox.shutdown
-                            && shared.paused.load(Ordering::Acquire) == paused
-                    };
-                    // While the bands are coarsened the thread looks at the clock, to take a step
-                    // back when what is wanted fits: when the hold is over, and then once in
-                    // each hold. A camera that is exactly still wakes nothing else.
-                    let held = if self.coarsening > 0 {
-                        match COARSEN_HOLD.saturating_sub(self.coarsened_at.elapsed()) {
-                            Duration::ZERO => COARSEN_HOLD,
-                            left => left,
-                        }
-                    } else {
-                        Duration::ZERO
-                    };
-                    inbox = if self.published.loader.pending == 0 && !self.over_the_cap {
-                        // Nothing is on its way: only the frame thread can give it something to do.
-                        if held.is_zero() {
-                            self.shared
-                                .wake
-                                .wait_while(inbox, |inbox| quiet(inbox))
-                                .expect("the frame thread panicked")
-                        } else {
-                            self.shared
-                                .wake
-                                .wait_timeout_while(inbox, held, |inbox| quiet(inbox))
-                                .expect("the frame thread panicked")
-                                .0
-                        }
-                    } else {
-                        self.shared
-                            .wake
-                            .wait_timeout(inbox, IDLE)
-                            .expect("the frame thread panicked")
-                            .0
-                    };
-                }
-                if inbox.shutdown {
-                    return;
-                }
-                (
-                    inbox.camera,
-                    inbox.velocity,
-                    std::mem::take(&mut inbox.jobs),
-                )
+            let Some((camera, velocity, jobs)) = self.await_work() else {
+                return;
             };
-            self.look_ahead(camera, velocity);
-            self.paused = self.shared.paused.load(Ordering::Acquire);
-            let mut worked = !jobs.is_empty();
-            // A sync is done when the rest of what the thread does in this round is.
-            #[cfg_attr(not(test), allow(unused_mut))]
-            let mut synced: Option<u64> = None;
-            for (ticket, job) in jobs {
-                #[cfg(test)]
-                match job {
-                    Job::Sync => {
-                        synced = Some(ticket);
-                        continue;
-                    }
-                    Job::Panic => panic!("a panic that a test asked for"),
-                    Job::Stall(time) => {
-                        std::thread::sleep(time);
-                        self.publish(Some(ticket));
-                        continue;
-                    }
-                    Job::SlowCoarse(time) => {
-                        self.coarse_sleep = time;
-                        self.publish(Some(ticket));
-                        continue;
-                    }
-                    _ => {}
-                }
-                if self.run_job(job).is_err() {
-                    self.fail();
-                    return;
-                }
-                self.publish(Some(ticket));
+            if !self.round(camera, velocity, jobs) {
+                return;
             }
-            let outcome = self
-                .remake_coarse()
-                .and_then(|remade| {
-                    worked |= remade;
-                    self.follow(camera)
-                })
-                .and_then(|moved| {
-                    worked |= moved;
-                    self.stream(camera)
-                });
-            match outcome {
-                Ok(took) => worked |= took,
-                Err(RingsFull) => {
-                    self.fail();
-                    return;
-                }
-            }
-            worked |= self.evict();
-            self.coarsen_more();
-            self.relax();
-            // A sync is done when the coarse levels over the Edits before it are made, too.
-            let busy = !self.coarse.is_empty();
-            let synced = if busy {
-                self.sync_waiting = synced.or(self.sync_waiting);
-                None
-            } else {
-                synced.or(self.sync_waiting.take())
-            };
-            self.publish(synced);
-            idle = !worked && !busy;
         }
+    }
+
+    /// One step of a stepped scene thread (see [`SceneWorker::step`]): what it was told since the
+    /// last (the camera, the jobs) is taken without waiting for more, and a round of the thread's
+    /// work is done on the calling thread, the loader's included. Whether the scene is still good.
+    #[cfg(test)]
+    fn step(&mut self) -> bool {
+        let work = take_work(&mut lock(&self.shared.inbox));
+        let Some((camera, velocity, jobs)) = work else {
+            return false;
+        };
+        self.round(camera, velocity, jobs)
+    }
+
+    /// What the thread was told since its last round, once there is something to do: it sleeps
+    /// until the camera moves or a job comes if its last round did nothing, and wakes for a
+    /// coarsening hold that is over. None when it is to stop.
+    fn await_work(&mut self) -> Option<Work> {
+        let mut inbox = lock(&self.shared.inbox);
+        if self.idle
+            && inbox.jobs.is_empty()
+            && Some(inbox.camera) == self.camera
+            && inbox.velocity == self.velocity
+        {
+            let shared = Arc::clone(&self.shared);
+            let (camera, paused, moving) = (self.camera, self.paused, self.velocity);
+            let quiet = |inbox: &mut Inbox| {
+                inbox.jobs.is_empty()
+                    && Some(inbox.camera) == camera
+                    && inbox.velocity == moving
+                    && !inbox.shutdown
+                    && shared.paused.load(Ordering::Acquire) == paused
+            };
+            // While the bands are coarsened the thread looks at the clock, to take a step
+            // back when what is wanted fits: when the hold is over, and then once in
+            // each hold. A camera that is exactly still wakes nothing else.
+            let held = if self.coarsening > 0 {
+                match COARSEN_HOLD.saturating_sub(self.clock.since(self.coarsened_at)) {
+                    Duration::ZERO => COARSEN_HOLD,
+                    left => left,
+                }
+            } else {
+                Duration::ZERO
+            };
+            inbox = if self.published.loader.pending == 0 && !self.over_the_cap {
+                // Nothing is on its way: only the frame thread can give it something to do.
+                if held.is_zero() {
+                    self.shared
+                        .wake
+                        .wait_while(inbox, |inbox| quiet(inbox))
+                        .expect("the frame thread panicked")
+                } else {
+                    self.shared
+                        .wake
+                        .wait_timeout_while(inbox, held, |inbox| quiet(inbox))
+                        .expect("the frame thread panicked")
+                        .0
+                }
+            } else {
+                self.shared
+                    .wake
+                    .wait_timeout(inbox, IDLE)
+                    .expect("the frame thread panicked")
+                    .0
+            };
+        }
+        take_work(&mut inbox)
+    }
+
+    /// One round of the thread's work, for the `camera` it was told, and the `jobs` it was given:
+    /// the jobs, the coarse levels of Edits, following the camera, taking in what the loader made,
+    /// eviction, coarsening, and publishing. A thread does this over and over; a stepped one does
+    /// it once a step. False if the scene ran out of room, and is not to be used again.
+    fn round(&mut self, camera: [f64; 3], velocity: [f64; 3], jobs: VecDeque<(u64, Job)>) -> bool {
+        self.look_ahead(camera, velocity);
+        self.paused = self.shared.paused.load(Ordering::Acquire);
+        let mut worked = !jobs.is_empty();
+        // A sync is done when the rest of what the thread does in this round is.
+        #[cfg_attr(not(test), allow(unused_mut))]
+        let mut synced: Option<u64> = None;
+        for (ticket, job) in jobs {
+            #[cfg(test)]
+            match job {
+                Job::Sync => {
+                    synced = Some(ticket);
+                    continue;
+                }
+                Job::Panic => panic!("a panic that a test asked for"),
+                Job::Stall(time) => {
+                    self.clock.pause(time);
+                    self.publish(Some(ticket));
+                    continue;
+                }
+                Job::SlowCoarse(time) => {
+                    self.coarse_sleep = time;
+                    self.publish(Some(ticket));
+                    continue;
+                }
+                _ => {}
+            }
+            if self.run_job(job).is_err() {
+                self.fail();
+                return false;
+            }
+            self.publish(Some(ticket));
+        }
+        let outcome = self
+            .remake_coarse()
+            .and_then(|remade| {
+                worked |= remade;
+                self.follow(camera)
+            })
+            .and_then(|moved| {
+                worked |= moved;
+                self.stream(camera)
+            });
+        match outcome {
+            Ok(took) => worked |= took,
+            Err(RingsFull) => {
+                self.fail();
+                return false;
+            }
+        }
+        worked |= self.evict();
+        self.coarsen_more();
+        self.relax();
+        // A sync is done when the coarse levels over the Edits before it are made, too.
+        let busy = !self.coarse.is_empty();
+        let synced = if busy {
+            self.sync_waiting = synced.or(self.sync_waiting);
+            None
+        } else {
+            synced.or(self.sync_waiting.take())
+        };
+        self.publish(synced);
+        self.idle = !worked && !busy;
+        true
     }
 
     /// The scene ran out of room: the frame thread is told, and waiting jobs end.
@@ -978,7 +1148,7 @@ impl Engine {
             return Ok(false);
         };
         #[cfg(test)]
-        std::thread::sleep(self.coarse_sleep);
+        self.clock.pause(self.coarse_sleep);
         let work = match &mut front.work {
             Some(work) => work,
             None => {
@@ -993,7 +1163,7 @@ impl Engine {
                 .store
                 .write()
                 .expect("the store's lock is not poisoned");
-            store.step_lod(work, Some(Instant::now() + COARSE_STEP))
+            store.step_lod(work, self.clock.deadline(self.clock.now() + COARSE_STEP))
         };
         if done {
             let finished = self.coarse.pop_front().expect("there is a front");
@@ -1003,7 +1173,7 @@ impl Engine {
             self.note(Some(update));
         } else {
             // Long enough for a reader that waits for the lock to take it.
-            std::thread::sleep(COARSE_PAUSE);
+            self.clock.pause(COARSE_PAUSE);
         }
         Ok(true)
     }
@@ -1031,7 +1201,7 @@ impl Engine {
         let Some(bands) = self.scene.bands() else {
             return Ok(false);
         };
-        let started = Instant::now();
+        let started = self.clock.now();
         // The reach first: what is asked for is classed by it.
         self.loader.set_reach(self.scene.reach());
         {
@@ -1044,17 +1214,20 @@ impl Engine {
             );
         }
         self.loader.sync(camera, bands);
+        // A stepped loader has no workers: they do their jobs here, as far ahead as they may go.
+        #[cfg(test)]
+        self.loader.step(STEP_JOBS);
         if self.paused {
             return Ok(false);
         }
         let mut worst = Duration::ZERO;
         let mut took = false;
         loop {
-            let left = SLICE.saturating_sub(started.elapsed());
+            let left = SLICE.saturating_sub(self.clock.since(started));
             let Some(most) = batch_size(left, self.arrival_cost) else {
                 break;
             };
-            let batch_started = Instant::now();
+            let batch_started = self.clock.now();
             let mut resident = Vec::new();
             let arrivals = self.loader.receive(most);
             if arrivals.is_empty() {
@@ -1087,7 +1260,7 @@ impl Engine {
             let update = self.scene.arrive(&store, &resident)?;
             drop(store);
             self.note(update);
-            worst = worst.max(batch_started.elapsed() / resident.len() as u32);
+            worst = worst.max(self.clock.since(batch_started) / resident.len() as u32);
         }
         // What the next slice expects one to cost: a running mean of the worst batch of each
         // slice, and never more than [`MOST_ARRIVAL_COST`].
@@ -1135,7 +1308,7 @@ impl Engine {
             }
             self.evicting = Some(Evicting::Listing {
                 pass: store.begin_eviction_pass(),
-                began: Instant::now(),
+                began: self.clock.now(),
                 next: 0,
                 found: Vec::new(),
             });
@@ -1189,7 +1362,7 @@ impl Engine {
     /// At the memory cap, takes the next step of [`COARSENING`] once the last has stood for
     /// [`COARSEN_HOLD`], and has eviction look again.
     fn coarsen_more(&mut self) {
-        if !self.over_the_cap || self.coarsened_at.elapsed() < COARSEN_HOLD {
+        if !self.over_the_cap || self.clock.since(self.coarsened_at) < COARSEN_HOLD {
             return;
         }
         // What the store holds for each node, while all it holds is wanted: taken before the
@@ -1218,7 +1391,7 @@ impl Engine {
         let Some(bands) = self.user_bands else {
             return false;
         };
-        if self.coarsened_at.elapsed() < COARSEN_HOLD {
+        if self.clock.since(self.coarsened_at) < COARSEN_HOLD {
             return false;
         }
         let store = self.store.read().expect("the store's lock is not poisoned");
@@ -1227,14 +1400,14 @@ impl Engine {
         match update {
             Ok(update) => {
                 self.coarsening = step;
-                self.coarsened_at = Instant::now();
+                self.coarsened_at = self.clock.now();
                 self.note(update);
                 true
             }
             // The scene is not to be used again, which the next job finds. It is not selected
             // again every round meanwhile.
             Err(RingsFull) => {
-                self.coarsened_at = Instant::now();
+                self.coarsened_at = self.clock.now();
                 false
             }
         }
@@ -1253,7 +1426,7 @@ impl Engine {
         if self.coarsening == 0
             || self.loader.pending() != 0
             || self.evicting.is_some()
-            || self.coarsened_at.elapsed() < COARSEN_HOLD
+            || self.clock.since(self.coarsened_at) < COARSEN_HOLD
         {
             return;
         }
@@ -1334,12 +1507,12 @@ impl Engine {
             let owner = bands.level_at(brick_distance(camera, level, coord), LEVELS - 1);
             (level as i64 - 1 - owner as i64).unsigned_abs() as u32
         };
-        let started = Instant::now();
-        while next < BrickStore::EVICTION_PARTS && started.elapsed() < EVICT_LOOK {
+        let started = self.clock.now();
+        while next < BrickStore::EVICTION_PARTS && self.clock.since(started) < EVICT_LOOK {
             let store = self.store.read().expect("the store's lock is not poisoned");
-            let held = Instant::now();
+            let held = self.clock.now();
             store.eviction_candidates(next, pass, &wanted, gap, &mut found);
-            let took = held.elapsed();
+            let took = self.clock.since(held);
             self.eviction.longest_read = self.eviction.longest_read.max(took);
             self.eviction.reads += 1;
             self.eviction.read_total += took;
@@ -1367,7 +1540,7 @@ impl Engine {
             found.truncate(over);
         }
         found.sort_unstable_by_key(Candidate::order);
-        let listing = began.elapsed();
+        let listing = self.clock.since(began);
         self.eviction.listing = listing;
         self.eviction.longest_listing = self.eviction.longest_listing.max(listing);
         let done = found.is_empty();
@@ -1398,11 +1571,11 @@ impl Engine {
                 .store
                 .write()
                 .expect("the store's lock is not poisoned");
-            let held = Instant::now();
+            let held = self.clock.now();
             let until = held + EVICT_HOLD;
             // Edits are counted first, a brick at a time, so that what they keep is known.
-            if store.sync_diverged(Some(until)) {
-                while Instant::now() < until {
+            if store.sync_diverged(self.clock.deadline(until)) {
+                while self.clock.now() < until {
                     if !store.over_budget() {
                         done = true;
                         break;
@@ -1423,11 +1596,11 @@ impl Engine {
                 }
             }
             drop(store);
-            self.eviction.longest_write = self.eviction.longest_write.max(held.elapsed());
+            self.eviction.longest_write = self.eviction.longest_write.max(self.clock.since(held));
             if done {
                 break;
             }
-            std::thread::sleep(EVICT_PAUSE);
+            self.clock.pause(EVICT_PAUSE);
         }
         done
     }
@@ -1438,8 +1611,8 @@ impl Engine {
     /// that it takes with, so that it never finds the outbox empty when a job is done; it takes
     /// with a try-lock, except after a job, so the copying costs it nothing.
     fn publish(&mut self, job: Option<u64>) {
-        if self.slow_at.elapsed() >= TABLES_EVERY {
-            self.slow_at = Instant::now();
+        if self.clock.since(self.slow_at) >= TABLES_EVERY {
+            self.slow_at = self.clock.now();
             self.slow = slow_of(&self.scene, &self.loader);
         }
         while let Ok(garbage) = self.graveyard.try_recv() {
@@ -1454,8 +1627,8 @@ impl Engine {
         if self.shared.count_soft_misses.load(Ordering::Relaxed) {
             // Looking at every brick that waits takes milliseconds in a fill, so it is done a
             // few times a second, and the count is the last one in between.
-            if self.soft_misses_at.elapsed() >= SOFT_MISSES_EVERY {
-                self.soft_misses_at = Instant::now();
+            if self.clock.since(self.soft_misses_at) >= SOFT_MISSES_EVERY {
+                self.soft_misses_at = self.clock.now();
                 self.soft_misses = self.scene.soft_misses();
             }
             stats.soft_misses = self.soft_misses;

@@ -27,8 +27,9 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       # This includes the bench smoke test (bins/client/tests/bench.rs): `client bench --short` on
       # lavapipe, with the report's schema checked. Its timings are not looked at.
-      # The client tests that start real threads are skipped here; the real-thread-tests job runs
-      # them (.github/real-thread-tests.txt lists them).
+      # The client tests that are about real threads or real time are skipped here; the
+      # real-thread-tests job runs them (.github/real-thread-tests.txt lists them). The streaming
+      # tests that are about behaviour run stepped (no threads, no sleeps) and are run here.
       - name: cargo test --workspace, without the real-thread tests
         shell: bash
         run: |
@@ -40,6 +41,10 @@ jobs:
         env:
           # Where the golden image test writes actual.png, expected.png and diff.png on a mismatch.
           GOLDEN_FAILURE_DIR: ${{ github.workspace }}/golden-failures
+      # The gating jobs skip a listed filter in the whole workspace, the real-thread job runs it in
+      # the client binary only: a line that matches another crate's test would run it nowhere.
+      - name: Real-thread list matches no test outside the client binary
+        run: bash .github/scripts/check-real-thread-list.sh outside
       - name: Upload golden image failures
         if: failure()
         uses: actions/upload-artifact@v4
@@ -57,9 +62,10 @@ jobs:
             exit 1
           fi
 
-  # The client tests that start real loader workers or the scene thread, on both platforms. Some
-  # of them wait on wall-clock time and so fail now and then. `continue-on-error` keeps a failure
-  # here from failing the workflow. A later ticket gives them a stepped, single-threaded mode.
+  # The client tests that are about real threads or real time (the frame thread's milliseconds, a
+  # thread that is busy or panics), on both platforms. Some of them wait on wall-clock time and so
+  # fail now and then. `continue-on-error` keeps a failure here from failing the workflow. The
+  # streaming tests of behaviour run stepped, single-threaded, in the gating jobs.
   real-thread-tests:
     name: real-thread-tests (${{ matrix.os }})
     continue-on-error: true
@@ -71,6 +77,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup-rust
+      # A line of the list that matches no test is a stale line: this job fails. The Linux leg
+      # checks, since the `priority::` test is Linux's only.
+      - name: Every line of the list matches a test
+        if: runner.os == 'Linux'
+        run: bash .github/scripts/check-real-thread-list.sh unmatched
       # These tests need no GPU. The client's unit tests are one binary, so `--bin client` leaves
       # out tests/bench.rs, which does.
       - name: Run the real-thread tests
@@ -91,7 +102,7 @@ jobs:
         run: cargo test -p brick-store -p materials -p net -p planet-gen -p sim -p prefetch-sim -p server
       # The client's unit tests, minus the real-thread tests and the two that make an Offscreen
       # renderer (a Vulkan device): the cave stills and the Edit stress of the bench.
-      - name: Client tests that need no GPU and start no real threads
+      - name: Client tests that need no GPU, without the real-thread tests
         shell: bash
         run: |
           set -euo pipefail
