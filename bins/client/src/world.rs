@@ -168,6 +168,14 @@ pub struct World {
     resim: std::time::Duration,
     /// The Edits given to the scene thread that have not been waited for ([`World::edit`]).
     unshown_edit: Option<UnshownEdit>,
+    /// The scene thread's job of the newest Edit made, and the last job done that a take brought in:
+    /// the Edit is in the scene that is drawn once the second is at least the first (see
+    /// [`World::edit_taken`]).
+    edit_ticket: u64,
+    taken_done: u64,
+    /// The longest a result that the scene thread published waited, since it was last asked for,
+    /// when the counts are exact (see [`World::take_outbox_wait`]).
+    outbox_wait: std::time::Duration,
     /// How long [`World::edit_due`] waits: [`EDIT_WAIT`], or more in a test on a slow build.
     edit_wait: std::time::Duration,
     /// Whether [`World::recentre`] tells the scene thread how the camera is moving, for prefetch.
@@ -257,6 +265,9 @@ impl World {
             ghost_next: None,
             resim: std::time::Duration::ZERO,
             unshown_edit: None,
+            edit_ticket: 0,
+            taken_done: 0,
+            outbox_wait: std::time::Duration::ZERO,
             edit_wait: EDIT_WAIT,
             lead: true,
             motion: Motion::default(),
@@ -285,7 +296,6 @@ impl World {
     /// call that waits for the thread needs ([`World::sync`], [`World::set_bands`]). Nothing waits
     /// for time and nothing reads the machine's: the world has a clock that only the test moves
     /// ([`World::advance`]), which the scene thread and the camera's velocity read.
-    #[cfg(test)]
     pub fn with_stepped_loader(mut self, loader: Loader) -> Self {
         let scene = std::mem::take(&mut self.scene);
         self.predictor.defer_lod();
@@ -306,8 +316,21 @@ impl World {
         self.clock.is_stepped()
     }
 
+    /// Whether the scene thread has packed the newest Edit made ([`World::edit`]) and this world has
+    /// taken it in: the scene that is drawn shows it. Not the same as the wait for it being over,
+    /// which a timeout also ends. False before any Edit.
+    pub fn edit_taken(&self) -> bool {
+        self.edit_ticket > 0 && self.taken_done >= self.edit_ticket
+    }
+
+    /// The longest that what the scene thread published waited in the outbox before this world took
+    /// it, since this was last called (ADR 0006), if the counts are exact ([`World::count_exactly`]);
+    /// zero when it was taken in the frame it was published in, and always zero otherwise.
+    pub fn take_outbox_wait(&mut self) -> std::time::Duration {
+        std::mem::take(&mut self.outbox_wait)
+    }
+
     /// Moves a stepped world's clock on by `time`.
-    #[cfg(test)]
     pub fn advance(&self, time: std::time::Duration) {
         self.clock.advance(time);
     }
@@ -331,7 +354,6 @@ impl World {
 
     /// What the scene thread said of the scene and the loader with the words the world has. Empty
     /// before [`World::with_loader`].
-    #[cfg(test)]
     pub fn stats(&self) -> &Stats {
         &self.stats
     }
@@ -344,8 +366,8 @@ impl World {
     }
 
     /// Gives the store another budget while the scene thread runs (a test of what it does when
-    /// there is less, or more, to want than it had room for).
-    #[cfg(test)]
+    /// there is less, or more, to want than it had room for; the streaming bench's walk, which is held
+    /// to the complete set).
     pub fn set_budget(&self, budget: brick_store::Budget) {
         self.predictor
             .shared_store()
@@ -358,6 +380,14 @@ impl World {
     #[cfg(test)]
     pub fn count_soft_misses(&self) {
         self.worker().count_soft_misses(true);
+    }
+
+    /// Has the scene thread count the soft misses (by level) and the holes for every publish, so
+    /// that the stats the world has are exact for each frame (see [`SceneWorker::count_exactly`]).
+    pub fn count_exactly(&self) {
+        if let Some(worker) = &self.worker {
+            worker.count_exactly();
+        }
     }
 
     /// Holds back (or lets go of) what the loader generates: while paused, nothing it generated
@@ -425,7 +455,6 @@ impl World {
     }
 
     /// The Planet's bricks as the client holds them.
-    #[cfg(test)]
     pub fn store(&self) -> std::sync::RwLockReadGuard<'_, brick_store::BrickStore> {
         self.predictor.store()
     }
@@ -507,7 +536,6 @@ impl World {
             Some(worker) => {
                 worker.follow_moving(camera, velocity);
                 // A stepped scene thread does its round now, with the camera it was just told.
-                #[cfg(test)]
                 worker.step();
                 let wait = self.edit_due()?;
                 self.take_ready(wait)
@@ -595,6 +623,10 @@ impl World {
             return Ok(None);
         };
         let ready = worker.take(wait)?;
+        self.taken_done = self.taken_done.max(ready.done);
+        if let Some(published) = ready.published_at {
+            self.outbox_wait = self.outbox_wait.max(self.clock.since(published));
+        }
         let update = if let Some(mirror) = ready.mirror {
             // The old copy is freed by the thread that made the new one.
             worker.discard_scene(std::mem::replace(&mut self.scene, *mirror));
@@ -758,6 +790,7 @@ impl World {
         }
         // A second Edit before the first is waited for keeps the first one's frame.
         let newest = worker.edit_later(changed);
+        self.edit_ticket = newest;
         self.unshown_edit = Some(UnshownEdit {
             newest,
             looked_since_oldest: self.unshown_edit.is_some_and(|e| e.looked_since_oldest),

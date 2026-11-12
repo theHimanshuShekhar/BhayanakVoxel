@@ -119,16 +119,26 @@ The 16 km Planet's extreme Voxel is 360 000 from the centre; the Zoom at 800 km 
 
 `bins/client/src/main.rs` sizes the GPU buffers and the store's budget from these. Each was measured once, by hand.
 
-| Constant | Value | From |
-|---|---|---|
-| `BRICKS_PER_D0_SQUARED` | 3.25 | drawn bricks of the full fill after #142 |
-| `REFS_PER_BRICK` | 1.0 | full fill |
-| `WORDS_PER_BRICK` | 34.2 | full fill |
-| `STREAMED_PER_D0_SQUARED` | 19.8 | store at the complete shell with the margins (#143) |
-| `HEADROOM` | 1.25 | chosen |
-| `BUDGET_OVERFLOW` | 0.1 | ADR 0004's 10–20% |
+| Constant | Value | From | Test Planet (#181), limit = value × `HEADROOM` |
+|---|---|---|---|
+| `BRICKS_PER_D0_SQUARED` | 3.25 | drawn bricks of the full fill after #142 | 3.51 (limit 4.06) |
+| `REFS_PER_BRICK` | 1.0 | full fill | 1.01 (limit 1.25) |
+| `WORDS_PER_BRICK` | 34.2 | full fill | 40.01 (limit 42.75) |
+| `STREAMED_PER_D0_SQUARED` | 19.8 | store at the complete shell with the margins (#143) | 13.09 (limit 24.75) |
+| `HEADROOM` | 1.25 | chosen | |
+| `BUDGET_OVERFLOW` | 0.1 | ADR 0004's 10–20% | |
 
-The streaming bench (#162) reports the measured values, and the 320 km and speed-scaled LOD tickets (#166–#168) measure them again.
+The streaming bench (`client bench --streaming`, #181) measures the four on the test Planet in CI and a stepped test fails when one is over its limit (see the entry below). The full-size, real-time run (#162) and the 320 km and speed-scaled LOD tickets (#166–#168) measure them again.
+
+### The streaming bench on the test Planet (#181, 2026-11-12)
+
+`client bench --streaming`: the world-map test Planet (512 texels a face), `d0` of 64 Voxels, the game's Guard (levels 9 to 13), the margins of ADR 0004, stepped (#180) on a fixed schedule: the fill until the resident set is complete (51 frames), 60 frames standing, 180 frames walking at 24 m/s, an Edit at frame 150 of the 240, and the store held to 102% of the complete set. Identical on every run: the debug and the release binary, and the unit tests, give the counts hash `b37e0fb7cd3a2c78` (committed in `bins/client/src/bench/streaming-counts.golden`). Measured on the 8-core dev box.
+
+- **Sizing, with the resident set complete:** 3.51 bricks drawn per d0² below the Guard (the constant is 3.25), 1.000 refs and 39.78 words per Ring brick (1.0 and 34.2), 13.09 store bricks per d0² beyond the spawn ring (19.8, of which the ring is 5.33 and level 0 beyond the ring 1.29, so 13.19 is what the test Planet can show). The test Planet's `d0` is small against the Planet, so what does not scale with `d0` is left out of the measurement: the Guard's levels (6 627 bricks, 32% of the bricks drawn here, 5% at full size; the scene counts their words exactly: 53.8 a brick, 356 601 in all) and the 226 964 bricks of the spawn ring that the store starts with (all of them level 0, as the 5.63 million taken out of the constant is; level 0 does not grow in the fill, so there is none beyond the ring when the set is complete, which is where the check measures; the walk that follows does add level-0 bricks beyond the ring). Counting everything instead gives 5.12 and 68.5 for the bricks and the store, which are not per-`d0²` numbers. The constants had the Guard and the ring in, so **the limits are not 1.25 times what the Planet shows, like for like**: bricks 4.06 against the full-size Rings' 3.09 (1.32 times), words 42.75 against 33.1 (1.29 times, if the Guard weighs at full size what it does here: #162 measures that), refs 1.25 against 1.0, and the store 16.49 (the constant less the ring's and level 0's shares, times 1.25) against 13.19. The words (20% over what the full-size Rings took) and the bricks (8% over the constant, 14% over the full-size Rings') differ from the full-size values because `d0` is 1028 Voxels there, and the mix of bricks differs with the scale. Level 0 was not like for like until it was taken out of the constant too: its band lies inside the spawn ring when the set is complete, so there are no level-0 bricks in what is streamed at the point the check measures (before the walk), and at full size it held 1.36 million beyond the ring (1.29 per d0²); the part is 13.19 (limit 16.49) and 13.09 passes (99% of the part, 79% of the limit). The words are counted for the scene of every publish: an earlier version of the measurement took them from a snapshot of the round's first publish (14 540 references for 14 363 bricks, 40.08 words a brick), which the references-equal-bricks test now catches. All are inside the limits.
+- **Upload:** 69.8 MB in 228 updates over 293 frames, one rebuild, 56.7 MB of it patches, at most 12.9 MB in a frame. The GPU's own count (lavapipe) is equal to the one worked out on the CPU, to the byte.
+- **Soft misses:** 68 884 bricks in 38 of the 51 fill frames (3 407 at most in a frame), none while standing and none while walking at 24 m/s: the margins and the lead are ahead of the walk.
+- **Scene work:** follow 179 steps and 53 335 bricks changed; pack 1 717 steps, 46 187 bricks changed from 158 488 made by the loader; upload 228 steps; eviction 52 steps, 33 641 units, 113 091 bricks.
+- **Residency:** 280 570 counted bricks at the complete set, 288 776 at most, 287 041 at the end (budget 286 181 plus the 1% overflow); 67 Diverged bricks after the one Edit; the frame that made the Edit takes it (Edit latency 0: the Edit is made before the frame's look, as the game makes it, and a stepped scene thread finishes its round inside the look, so this field cannot show ADR 0006's bound; the stepped test of a busy scene thread and the real-thread tests hold that, and #162's real-time run on the 4090 measures it), and results are taken in the frame they are published in (Outbox latency 0 in all 293 frames, until #145). **Holes:** none in 293 frames.
 
 ## The Reference view (ADR 0005)
 

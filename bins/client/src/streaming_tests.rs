@@ -189,6 +189,59 @@ fn with_the_camera_still_the_loader_makes_the_resident_set_complete_and_then_has
     assert_eq!(world.waiting(), 0);
 }
 
+/// The scene thread's counts of what it did (`Done`) after `frames` frames of a camera that creeps
+/// by a tenth of a Voxel a frame once the resident set is complete: it follows the camera every
+/// frame and changes nothing that is drawn.
+fn work_after_creeping(exactly: bool, frames: usize) -> (crate::scene_worker::Done, usize) {
+    let (mut world, _server, camera) = spawned_world(Run::Stepped);
+    if exactly {
+        world.count_exactly();
+    }
+    fill(&mut world, camera.position);
+    // Let it publish what it had left (its sizes are looked at by the second), then stand.
+    pace(&world, Duration::from_secs(1));
+    for _ in 0..5 {
+        stream(&mut world, camera.position);
+        pace(&world, FRAME);
+    }
+    let before = world.stats().work;
+    let mut changed = 0;
+    for i in 1..=frames {
+        let mut at = camera.position;
+        at[0] += 0.1 * i as f64;
+        changed += stream(&mut world, at).len();
+        pace(&world, FRAME);
+    }
+    let after = world.stats().work;
+    assert!(after.follow_steps >= before.follow_steps);
+    (
+        crate::scene_worker::Done {
+            follow_steps: after.follow_steps - before.follow_steps,
+            ..Default::default()
+        },
+        changed,
+    )
+}
+
+#[test]
+fn a_round_that_changes_nothing_is_not_published_in_the_games_mode_but_is_when_counting_exactly() {
+    // The game counts nothing exactly, so the scene thread's counts of what it did (which rise on
+    // every round) must not make it publish: it publishes as it did before #181. The bench counts
+    // exactly, and publishes for them.
+    let (game, changed) = work_after_creeping(false, 20);
+    assert_eq!(changed, 0, "the scene does not change in this creep");
+    assert_eq!(
+        game.follow_steps, 0,
+        "a round that changed nothing was published in the game's mode"
+    );
+    let (bench, changed) = work_after_creeping(true, 20);
+    assert_eq!(changed, 0, "the scene does not change in this creep");
+    assert!(
+        bench.follow_steps > 0,
+        "the creep is rounds that change nothing, and the bench's counts see them"
+    );
+}
+
 #[test]
 fn a_brick_the_camera_has_left_has_its_children_dropped_not_generated() {
     let store = spawned_store();

@@ -59,10 +59,8 @@ const IDLE: Duration = Duration::from_millis(1);
 /// How many jobs of the loader are done in one step of a stepped scene thread (see
 /// [`SceneWorker::step`]): about what the real workers make between two frames of a test, so that a
 /// stepped fill takes about as many frames. Only the stepped mode reads it.
-#[cfg(test)]
 const STEP_JOBS: usize = 256;
 /// The most steps a stepped wait for a job takes before it says that the job is never done.
-#[cfg(test)]
 const MOST_STEPS_FOR_A_JOB: usize = 100_000;
 /// How often it works out the sizes of the tables, which costs a walk over the scene's free
 /// ranges.
@@ -214,6 +212,14 @@ pub struct Stats {
     /// Bricks drawn coarser than the bands ask because their children are not resident; counted
     /// only if [`SceneWorker::count_soft_misses`] says to.
     pub soft_misses: usize,
+    /// [`Stats::soft_misses`] by the level of the brick drawn whole (the Ring that is behind), and
+    /// the bricks that are split with the bricks under them not resident (holes, which are none);
+    /// both counted with the soft misses, and only when counted exactly (see
+    /// [`SceneWorker::count_exactly`]).
+    pub soft_misses_by_level: [usize; LEVELS],
+    pub holes: usize,
+    /// What the thread has done, by category, since the start.
+    pub work: Done,
     pub loader: LoaderStats,
     /// What costs more to find out, as of a few times a second.
     pub slow: Arc<Slow>,
@@ -222,6 +228,26 @@ pub struct Stats {
     /// Where the scene had been moved to.
     #[cfg(test)]
     pub camera: Option<[f64; 3]>,
+}
+
+/// What the scene thread has done since the start, in steps and bricks, not milliseconds (#181):
+/// the same count on every machine and every run when it is stepped.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Done {
+    /// Rounds in which the thread moved the scene to a new camera (selecting again), and the
+    /// bricks drawn that changed in them, which came or went.
+    pub follow_steps: u64,
+    pub follow_bricks: u64,
+    /// Batches of the loader's arrivals that the thread took in and packed, and the bricks drawn
+    /// that changed in them.
+    pub pack_steps: u64,
+    pub pack_bricks: u64,
+    /// Bricks the loader's arrivals held in the store, which the packing is for.
+    pub arrived_bricks: u64,
+    /// Rounds in which eviction was going on, the units it took, and the bricks they held.
+    pub evict_steps: u64,
+    pub evicted_units: u64,
+    pub evicted_bricks: u64,
 }
 
 /// What eviction has done and what it cost the other threads, since the start.
@@ -249,16 +275,28 @@ pub struct Slow {
     pub tables: Vec<TableSize>,
     /// Bytes of the scene's buffers that hold something (see [`Scene::used_bytes`]).
     pub used_bytes: u64,
+    /// The words of `brick_refs` and of `bricks` that the bricks drawn at each level take (see
+    /// [`Scene::words_by_level`]), worked out only when the counts are asked for exactly (see
+    /// [`SceneWorker::count_exactly`]), and then at every publish, so that they are of the scene
+    /// that the bricks drawn are of: it looks at every brick drawn. Zero otherwise.
+    pub words_by_level: [(usize, usize); LEVELS],
 }
 
 impl Stats {
     /// Whether `other` has the same counts, which are cheap to look at: the rest changes slowly.
-    fn same_counts(&self, other: &Stats) -> bool {
+    /// What the thread has done (see [`Done`]) and the soft misses by level and the holes are only
+    /// compared when the counts are exact (the bench's): they change on rounds that change nothing
+    /// else, and the game does not publish for them.
+    fn same_counts(&self, other: &Stats, exactly: bool) -> bool {
         self.waiting == other.waiting
             && self.soft_misses == other.soft_misses
             && self.coarsening == other.coarsening
             && self.loader == other.loader
             && self.level_bricks == other.level_bricks
+            && (!exactly
+                || (self.holes == other.holes
+                    && self.soft_misses_by_level == other.soft_misses_by_level
+                    && self.work == other.work))
     }
 }
 
@@ -274,6 +312,9 @@ fn stats_of(scene: &Scene, loader: &Loader, slow: &Arc<Slow>, eviction: Eviction
         bands: scene.bands(),
         coarsening: 0,
         soft_misses: 0,
+        soft_misses_by_level: [0; LEVELS],
+        holes: 0,
+        work: Done::default(),
         loader: LoaderStats::of(loader),
         slow: Arc::clone(slow),
         eviction,
@@ -283,12 +324,17 @@ fn stats_of(scene: &Scene, loader: &Loader, slow: &Arc<Slow>, eviction: Eviction
 }
 
 /// The parts of [`Stats`] that cost more to find out.
-fn slow_of(scene: &Scene, loader: &Loader) -> Arc<Slow> {
+fn slow_of(scene: &Scene, loader: &Loader, exactly: bool) -> Arc<Slow> {
     let mut tables = scene.table_sizes();
     tables.extend(loader.table_sizes());
     Arc::new(Slow {
         tables,
         used_bytes: scene.used_bytes(),
+        words_by_level: if exactly {
+            scene.words_by_level()
+        } else {
+            [(0, 0); LEVELS]
+        },
     })
 }
 
@@ -304,6 +350,12 @@ pub struct Ready {
     pub patch: Option<PatchCopy>,
     /// The counts, of the same state as the words.
     pub stats: Option<Stats>,
+    /// The number of the last job that was done and published when this was taken (see
+    /// [`SceneWorker::wait_for`]): an Edit is in the scene that this makes once it is that.
+    pub done: u64,
+    /// When the oldest of what this holds was published, if the counts are exact (see
+    /// [`SceneWorker::count_exactly`]); else not stamped, since reading the clock is not free.
+    pub published_at: Option<Instant>,
 }
 
 /// A job for the thread that is not following the camera.
@@ -373,6 +425,9 @@ struct Shared {
     /// Whether [`Stats::soft_misses`] is counted, which looks at every brick that waits (a
     /// diagnostic: see [`SceneWorker::count_soft_misses`]).
     count_soft_misses: AtomicBool,
+    /// Whether the soft misses and the holes are counted at every publish, not a few times a second
+    /// (see [`SceneWorker::count_exactly`]).
+    count_exactly: AtomicBool,
 }
 
 /// What the frame thread has no more use for, which it hands back for the scene thread to use
@@ -406,12 +461,10 @@ pub struct SceneWorker {
     garbage: Sender<Garbage>,
     thread: Option<JoinHandle<()>>,
     /// The engine of a stepped scene thread, which has no thread (see
-    /// [`SceneWorker::start_stepped`]).
-    #[cfg(test)]
-    stepped: Option<Mutex<Engine>>,
+    /// [`SceneWorker::start_stepped`]). `None` in the game.
+    stepped: Option<Box<Mutex<Engine>>>,
     /// Until when (on the stepped clock) a stepped thread is busy and does nothing: what a wait of
     /// the frame thread's that has a timeout runs out against (see [`SceneWorker::busy_for`]).
-    #[cfg(test)]
     busy_until: Mutex<Option<Instant>>,
 }
 
@@ -437,7 +490,6 @@ impl SceneWorker {
     /// calling thread a step at a time ([`SceneWorker::step`], and the calls that wait for a job),
     /// by the code that the thread runs, with the loader (which should be [`Loader::stepped`]) done
     /// a step in each. It reads the time from `clock`, which should be stepped.
-    #[cfg(test)]
     pub fn start_stepped(
         scene: Scene,
         loader: Loader,
@@ -445,7 +497,7 @@ impl SceneWorker {
         clock: Clock,
     ) -> (Self, Scene, Stats) {
         let (engine, mut worker, mirror, stats) = Self::build(scene, loader, store, clock);
-        worker.stepped = Some(Mutex::new(engine));
+        worker.stepped = Some(Box::new(Mutex::new(engine)));
         (worker, mirror, stats)
     }
 
@@ -459,7 +511,7 @@ impl SceneWorker {
     ) -> (Engine, Self, Scene, Stats) {
         assert!(scene.is_rings(), "only a scene of rings follows a camera");
         let mirror = scene.mirror();
-        let slow = slow_of(&scene, &loader);
+        let slow = slow_of(&scene, &loader, false);
         let stats = stats_of(&scene, &loader, &slow, EvictionStats::default());
         let camera = scene.camera().expect("a scene of rings has a camera");
         let shared = Arc::new(Shared {
@@ -480,6 +532,7 @@ impl SceneWorker {
             finished: Condvar::new(),
             paused: AtomicBool::new(false),
             count_soft_misses: AtomicBool::new(false),
+            count_exactly: AtomicBool::new(false),
         });
         let (garbage, graveyard) = mpsc::channel();
         let user_bands = scene.bands();
@@ -510,7 +563,10 @@ impl SceneWorker {
             barred: None,
             over_the_cap: false,
             soft_misses: 0,
+            soft_misses_by_level: [0; LEVELS],
+            holes: 0,
             soft_misses_at: clock.now(),
+            work: Done::default(),
             ahead: [None; AHEAD],
             velocity: [0.0; 3],
             idle: false,
@@ -522,9 +578,7 @@ impl SceneWorker {
             shared,
             garbage,
             thread: None,
-            #[cfg(test)]
             stepped: None,
-            #[cfg(test)]
             busy_until: Mutex::new(None),
         };
         (engine, worker, mirror, stats)
@@ -535,7 +589,6 @@ impl SceneWorker {
     /// what was made, publishing). Does nothing for one with a thread, nor for one that is busy
     /// ([`SceneWorker::busy_for`]). The frame thread's calls that wait for the thread step it until
     /// it has done.
-    #[cfg(test)]
     pub fn step(&self) {
         if let Some(engine) = &self.stepped {
             let mut engine = engine.lock().expect("the engine is not poisoned");
@@ -587,6 +640,15 @@ impl SceneWorker {
     #[cfg(test)]
     pub fn count_soft_misses(&self, on: bool) {
         self.shared.count_soft_misses.store(on, Ordering::Relaxed);
+    }
+
+    /// Has the thread count the soft misses (by level) and the holes at every publish, not a few
+    /// times a second by the clock (which a stepped clock that a frame moves on by a sixtieth of a
+    /// second would make one in six): for the bench, which wants a count for each frame. Counting
+    /// them is turned on too. It looks at every brick that waits and every brick that is split.
+    pub fn count_exactly(&self) {
+        self.shared.count_soft_misses.store(true, Ordering::Relaxed);
+        self.shared.count_exactly.store(true, Ordering::Relaxed);
     }
 
     /// Holds back (or lets go of) taking in what the loader generated (see
@@ -677,7 +739,6 @@ impl SceneWorker {
         // A stepped thread steps until the job is done. It is as quick as the frame thread needs it
         // to be unless the test has it busy ([`SceneWorker::busy_for`]): then a timeout runs out on
         // the stepped clock if the thread is still busy at the end of it, and the wait is over.
-        #[cfg(test)]
         if let Some(engine) = &self.stepped {
             let clock = engine
                 .lock()
@@ -765,6 +826,7 @@ impl SceneWorker {
         if outbox.failed {
             return Err(RingsFull);
         }
+        outbox.ready.done = outbox.done;
         Ok(std::mem::take(&mut outbox.ready))
     }
 
@@ -863,7 +925,11 @@ struct Engine {
     over_the_cap: bool,
     /// The last count of soft misses, and when (see [`SOFT_MISSES_EVERY`]).
     soft_misses: usize,
+    soft_misses_by_level: [usize; LEVELS],
+    holes: usize,
     soft_misses_at: Instant,
+    /// What was done, by category (see [`Done`]).
+    work: Done,
     /// The places the scene looks ahead to (see [`Engine::look_ahead`]), and the velocity of the
     /// camera that was looked at last.
     ahead: [Option<[f64; 3]>; AHEAD],
@@ -951,7 +1017,6 @@ impl Engine {
     /// One step of a stepped scene thread (see [`SceneWorker::step`]): what it was told since the
     /// last (the camera, the jobs) is taken without waiting for more, and a round of the thread's
     /// work is done on the calling thread, the loader's included. Whether the scene is still good.
-    #[cfg(test)]
     fn step(&mut self) -> bool {
         let work = take_work(&mut lock(&self.shared.inbox));
         let Some((camera, velocity, jobs)) = work else {
@@ -1069,7 +1134,9 @@ impl Engine {
                 return false;
             }
         }
-        worked |= self.evict();
+        let evicting = self.evict();
+        self.work.evict_steps += u64::from(evicting);
+        worked |= evicting;
         self.coarsen_more();
         self.relax();
         // A sync is done when the coarse levels over the Edits before it are made, too.
@@ -1185,8 +1252,11 @@ impl Engine {
             return Ok(false);
         }
         let store = self.store.read().expect("the store's lock is not poisoned");
+        let before = self.scene.bricks_changed();
         let update = self.scene.recentre(&store, camera)?;
         drop(store);
+        self.work.follow_steps += 1;
+        self.work.follow_bricks += self.scene.bricks_changed() - before;
         self.camera = Some(camera);
         self.note(update);
         Ok(true)
@@ -1215,7 +1285,6 @@ impl Engine {
         }
         self.loader.sync(camera, bands);
         // A stepped loader has no workers: they do their jobs here, as far ahead as they may go.
-        #[cfg(test)]
         self.loader.step(STEP_JOBS);
         if self.paused {
             return Ok(false);
@@ -1241,6 +1310,7 @@ impl Engine {
                 for arrival in arrivals {
                     match arrival {
                         Arrival::Children { key, bricks } => {
+                            self.work.arrived_bricks += bricks.len() as u64;
                             store.hold_children_solid(key.0, key.1, bricks);
                             resident.push(key);
                         }
@@ -1257,8 +1327,11 @@ impl Engine {
             }
             took = true;
             let store = self.store.read().expect("the store's lock is not poisoned");
+            let before = self.scene.bricks_changed();
             let update = self.scene.arrive(&store, &resident)?;
             drop(store);
+            self.work.pack_steps += 1;
+            self.work.pack_bricks += self.scene.bricks_changed() - before;
             self.note(update);
             worst = worst.max(self.clock.since(batch_started) / resident.len() as u32);
         }
@@ -1590,7 +1663,11 @@ impl Engine {
                         break;
                     };
                     match store.evict_children(level, coord, &wanted) {
-                        Some(_) => *took = true,
+                        Some(bricks) => {
+                            *took = true;
+                            self.work.evicted_units += 1;
+                            self.work.evicted_bricks += bricks as u64;
+                        }
                         None => deferred.push((level, coord)),
                     }
                 }
@@ -1611,9 +1688,19 @@ impl Engine {
     /// that it takes with, so that it never finds the outbox empty when a job is done; it takes
     /// with a try-lock, except after a job, so the copying costs it nothing.
     fn publish(&mut self, job: Option<u64>) {
+        let exactly = self.shared.count_exactly.load(Ordering::Relaxed);
         if self.clock.since(self.slow_at) >= TABLES_EVERY {
             self.slow_at = self.clock.now();
-            self.slow = slow_of(&self.scene, &self.loader);
+            self.slow = slow_of(&self.scene, &self.loader, exactly);
+        } else if exactly {
+            // The words by level are of the scene as it is in this publish, with the bricks drawn
+            // in it: a round publishes several times, and the others would keep the words of an
+            // earlier one. The game does not count exactly and does not pay for this.
+            self.slow = Arc::new(Slow {
+                tables: self.slow.tables.clone(),
+                used_bytes: self.slow.used_bytes,
+                words_by_level: self.scene.words_by_level(),
+            });
         }
         while let Ok(garbage) = self.graveyard.try_recv() {
             if let Garbage::Copy(copy) = garbage
@@ -1624,17 +1711,29 @@ impl Engine {
         }
         let mut stats = stats_of(&self.scene, &self.loader, &self.slow, self.eviction);
         stats.coarsening = self.coarsening;
+        stats.work = self.work;
         if self.shared.count_soft_misses.load(Ordering::Relaxed) {
             // Looking at every brick that waits takes milliseconds in a fill, so it is done a
-            // few times a second, and the count is the last one in between.
-            if self.clock.since(self.soft_misses_at) >= SOFT_MISSES_EVERY {
+            // few times a second, and the count is the last one in between, unless the counts are
+            // asked for exactly (the bench's: one for each frame).
+            if exactly || self.clock.since(self.soft_misses_at) >= SOFT_MISSES_EVERY {
                 self.soft_misses_at = self.clock.now();
-                self.soft_misses = self.scene.soft_misses();
+                self.soft_misses_by_level = self.scene.soft_misses_by_level();
+                self.soft_misses = self.soft_misses_by_level.iter().sum();
+                if exactly {
+                    let store = self.store.read().expect("the store's lock is not poisoned");
+                    self.holes = self.scene.holes(&store);
+                }
             }
             stats.soft_misses = self.soft_misses;
+            stats.soft_misses_by_level = self.soft_misses_by_level;
+            stats.holes = self.holes;
         }
         let changes = std::mem::replace(&mut self.changes, Changes::None);
-        if matches!(changes, Changes::None) && stats.same_counts(&self.published) && job.is_none() {
+        if matches!(changes, Changes::None)
+            && stats.same_counts(&self.published, exactly)
+            && job.is_none()
+        {
             return;
         }
         // A copy of all of the scene is tens of milliseconds: it is made before the lock is taken.
@@ -1663,6 +1762,9 @@ impl Engine {
             (Changes::None | Changes::Rebuilt, None) => {}
         }
         outbox.ready.stats = Some(stats.clone());
+        if exactly {
+            outbox.ready.published_at.get_or_insert(self.clock.now());
+        }
         if let Some(ticket) = job {
             outbox.done = outbox.done.max(ticket);
         }

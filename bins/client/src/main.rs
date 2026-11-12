@@ -111,6 +111,9 @@ fn planet_scene(
 /// How much more room than the most a table held in the measured fill the tables and the scene are
 /// made with, for what the measurement did not see (the camera going elsewhere on the Planet, a
 /// table that is full of deleted entries and cleans itself out).
+///
+/// It is also how far over its constant a value that the streaming bench measures on the test
+/// Planet may be (the tests of `bench::stream`).
 const HEADROOM: f64 = 1.25;
 
 /// The measurements that `room_for` and `expected_words` are sized from: the full-size Planet's
@@ -126,11 +129,35 @@ const HEADROOM: f64 = 1.25;
 /// the levels above. The Guard's 178 000 bricks that are drawn first are in that count, as they
 /// are split. (It was 3 560 809 before #142: the bricks of the deep sea, which no ray reaches,
 /// were drawn while a neighbour was not known to be full.)
+///
+/// Checked against `streaming.sizing.measured.bricks_per_d0_squared` of the bench report (`client
+/// bench --streaming`): the bricks drawn at the levels below the Guard on the test Planet when its
+/// resident set is complete, per `d0` squared. It must not be over this times [`HEADROOM`], 4.06.
+///
+/// That is not 1.25 times what the constant counted: it counted the Guard's 178 000 bricks, which
+/// the measurement leaves out (they do not scale with `d0`), so the like-for-like value at full
+/// size is (3 439 848 - 178 000) / 1028.2² = 3.09, and the limit is 1.32 times it. The test Planet
+/// measures 3.51: 8% over the constant, 14% over the full-size Rings' 3.09, and 86% of the limit.
 const BRICKS_PER_D0_SQUARED: f64 = 3.25;
 /// Words of `brick_refs` and of `bricks` per brick drawn when the resident set was complete: 3.44
 /// million and 117.6 million words of them. The scene's first reservation, 28 words a brick and a
 /// tenth over, ran out 3.09 million bricks into the fill at 10 cm: the 10.4 s frame of #119 was
 /// the scene packed again with the words that were left in pieces too small.
+///
+/// Checked against `streaming.sizing.measured.refs_per_brick` and `.words_per_brick` of the bench
+/// report (`client bench --streaming`): the words in use per brick drawn below the Guard on the
+/// test Planet when its resident set is complete, the Guard's counted apart and exactly (the
+/// scene's `words_by_level`). Each must not be over its constant times [`HEADROOM`]: 1.25 and
+/// 42.75.
+///
+/// The constants counted the Guard's bricks too, so the limits are not exactly 1.25 times what the
+/// Rings alone came to. A Guard brick takes one reference and 53.8 words on the test Planet (6 627
+/// bricks, 356 601 words), so the 178 000 of full size, if they weigh the same there (they are the
+/// same levels, but another Planet: #162 measures at full size), take 9.6 of the 117.6 million
+/// words, and the Rings alone were 33.1 words a brick: the limit of 42.75 is 1.29 times that, and
+/// the references' limit is 1.25 times 1.0. The test Planet measures 1.000 and 39.78 words, 2.97
+/// words (6.9% of the limit) under it, and its Rings take 20% more words a brick than the full-size
+/// Planet's did.
 const REFS_PER_BRICK: f64 = 1.0;
 const WORDS_PER_BRICK: f64 = 34.2;
 
@@ -223,7 +250,38 @@ fn room_for(bands: Bands) -> Room {
 /// holds. The host store holds about four times as many bricks as are drawn: the ancestors of
 /// every drawn brick, and the bricks beside and under them that the bands do not draw but split.
 /// That is what is budgeted here, since it is what grows.
+///
+/// Checked against `streaming.sizing.measured.streamed_per_d0_squared` of the bench report
+/// (`client bench --streaming`): what the store counts on the test Planet when its resident set is
+/// complete, less the spawn ring it started with (which is not scaled with `d0`), per `d0`
+/// squared. It must not be over this times [`HEADROOM`], once the constant has the spawn ring's
+/// and level 0's share beyond the ring taken out (below): 16.49, not 24.75.
 const STREAMED_PER_D0_SQUARED: f64 = 19.8;
+/// The spawn ring's share of what the store counted at full size: 5.63 million of the 20.90 million
+/// (level 0's bricks round the spawn, held before the fill starts), at the `d0` of 1028.2 Voxels
+/// that the constant was measured at. It does not scale with `d0`.
+const SPAWN_RING_STREAMED_AT_FULL_SIZE: f64 = 5_630_000.0;
+/// Level 0's bricks beyond the spawn ring at full size: 1.36 million of the 6.99 million that level
+/// 0 held (6.99 less the ring's 5.63), at the same `d0`. They scale with `d0`, but on the test
+/// Planet level 0 (0 to 128 Voxels, 160 with the radial margin) is the spawn ring and no more, so
+/// the measurement has none.
+const LEVEL_0_BEYOND_THE_RING_AT_FULL_SIZE: f64 = 1_360_000.0;
+const D0_OF_THE_MEASUREMENT: f64 = 1028.2;
+/// The spawn ring's share of [`STREAMED_PER_D0_SQUARED`], 5.33. The bench's measurement takes the
+/// ring out (it is held at the start, and is 160 Voxels whatever `d0` is): the store at the start
+/// is its level 0 and nothing else under the Guard, 226 964 bricks, which are the 5.63 million's
+/// counterpart, level 0 only on both sides. So the measurement is held to what is left of the
+/// constant, and this is one of the two shares that are taken out of it (see
+/// [`STREAMED_LEVEL_0_BEYOND_THE_RING_PER_D0_SQUARED`]).
+const STREAMED_SPAWN_RING_PER_D0_SQUARED: f64 =
+    SPAWN_RING_STREAMED_AT_FULL_SIZE / (D0_OF_THE_MEASUREMENT * D0_OF_THE_MEASUREMENT);
+/// Level 0's bricks beyond the ring, 1.29 per `d0` squared, the other share that is taken out. The
+/// measurement is held to [`STREAMED_PER_D0_SQUARED`] less both, 19.8 − 5.33 − 1.29 = 13.19, times
+/// [`HEADROOM`]: 16.49, against the 13.09 measured (99% of that part, 79% of the limit). Held to
+/// the whole constant the limit would be 24.75, 1.89 times what is measured and 1.71 times what
+/// the measurement can show of the constant without the ring (14.47), and not 1.25.
+const STREAMED_LEVEL_0_BEYOND_THE_RING_PER_D0_SQUARED: f64 =
+    LEVEL_0_BEYOND_THE_RING_AT_FULL_SIZE / (D0_OF_THE_MEASUREMENT * D0_OF_THE_MEASUREMENT);
 /// How far over the budget the store may go before eviction starts (ADR 0004 says 10 to 20%).
 /// A flight leaves a trail of the shells it passed through, and takes the store over the complete
 /// set by 12% in 840 m, 28% in 2.5 km and 57% in 5 km, measured with nothing evicted (#142, with

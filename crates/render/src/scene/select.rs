@@ -863,15 +863,37 @@ impl Selection {
     /// would split them if the bricks under them were resident. Those that wait only for the margin
     /// or the lead are not drawn coarser than the bands ask, and are not counted.
     pub fn soft_misses(&self) -> usize {
-        self.waiting
+        self.soft_misses_by_level().iter().sum()
+    }
+
+    /// [`Selection::soft_misses`] by the level of the brick that is drawn whole.
+    pub fn soft_misses_by_level(&self) -> [usize; LEVELS] {
+        let mut by_level = [0; LEVELS];
+        for &(level, coord) in &self.waiting {
+            if self
+                .nodes
+                .get(&(level, coord))
+                .is_some_and(|node| node.draws)
+                && self
+                    .bands
+                    .split(level, brick_distance(self.camera, level, coord), None)
+                && let Some(count) = by_level.get_mut(level)
+            {
+                *count += 1;
+            }
+        }
+        by_level
+    }
+
+    /// Bricks that are split although the bricks under them are not resident in `store`: what a
+    /// ray would find nothing in. A split node's children are resident by construction (it is split
+    /// when they arrive, and eviction leaves what the scene has split), so this is the check of
+    /// that, and is zero.
+    pub fn holes(&self, store: &BrickStore) -> usize {
+        self.nodes
             .iter()
-            .filter(|&&(level, coord)| {
-                self.nodes
-                    .get(&(level, coord))
-                    .is_some_and(|node| node.draws)
-                    && self
-                        .bands
-                        .split(level, brick_distance(self.camera, level, coord), None)
+            .filter(|&(&(level, coord), node)| {
+                node.state == State::Split && !store.children_resident(level, coord)
             })
             .count()
     }
@@ -2633,5 +2655,26 @@ mod tests {
                 "{level} {coord:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_brick_that_is_split_with_its_children_gone_from_the_store_is_a_hole_and_none_is_otherwise()
+    {
+        let camera = [0.5, 20.0, 0.5];
+        let mut store = streamed(64, 4, 2);
+        let mut selection = select(&store, camera, D0);
+        load_everything(&mut store, &mut selection);
+        assert_eq!(selection.holes(&store), 0);
+        assert_eq!(selection.soft_misses_by_level(), [0; LEVELS]);
+        let (level, coord) = selection
+            .nodes
+            .iter()
+            .find(|&(&(level, _), node)| level == 1 && node.state == State::Split)
+            .map(|(&key, _)| key)
+            .expect("the camera is near enough to split a brick of level 1");
+        // Eviction does this only to what is not drawn split: a store that did it anyway is what the
+        // count is there to find.
+        assert!(store.evict_children(level, coord, |_, _| false).is_some());
+        assert_eq!(selection.holes(&store), 1);
     }
 }

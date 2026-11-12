@@ -73,8 +73,7 @@ How the stepped mode shares code with the real one: the loader's worker loop is 
 thread's loop is a wait (`Engine::await_work`) and a round (`Engine::round`); a stepped scene
 thread calls the round. What a stepped mode does not have is the waiting itself, so a test of how a
 parked thread wakes is a real-thread test. A step takes no time on the clock, and a pause moves the
-clock on by the pause. The stepped parts are compiled in test builds only. In the game the clock
-(`bins/client/src/clock.rs`) has no fields and each call is the standard library's.
+clock on by the pause. The stepped parts are in the shipped binary, since `client bench --streaming` (#181) steps the same code and is that binary: the game starts threads and never steps. Its clock (`bins/client/src/clock.rs`) is the machine's, `Instant::now` and `thread::sleep`, behind a test of whether the clock is stepped that is never true there. The streaming bench's counts are checked by stepped tests (`bench::stream`) that gate on Linux and on Windows; see `docs/agents/benchmarking.md`.
 
 ## No GPU on Windows
 

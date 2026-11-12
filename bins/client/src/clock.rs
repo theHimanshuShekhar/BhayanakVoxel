@@ -1,72 +1,47 @@
-//! The time that the loader's and the scene thread's code reads (#180).
+//! The time that the loader's and the scene thread's code reads (#180, #181).
 //!
 //! Streaming code asks the time for its holds (the coarsening's, the wait for an Edit), for how long
 //! a slice of work has gone on, and for how often something is looked at. It reads a [`Clock`]
-//! instead of the machine's, so that a test that drives the code a step at a time (see
-//! [`crate::loader::Loader::step`] and [`crate::scene_worker::SceneWorker::step`]) can say what
-//! time it is and move it on, and get the same run every time.
+//! instead of the machine's, so that a driver that runs the code a step at a time (see
+//! [`crate::loader::Loader::step`] and [`crate::scene_worker::SceneWorker::step`]: the tests, and
+//! the streaming mode of `client bench`) can say what time it is and move it on, and get the same
+//! run every time.
 //!
-//! **No cost in the game.** Outside tests a `Clock` has no fields and each of its methods is the
-//! standard library's call, inlined: `now` is `Instant::now`, `pause` is `thread::sleep`. The
-//! stepped clock exists only in test builds.
+//! **What the game pays.** A real clock is a clock with no stepped time in it: `now` is
+//! `Instant::now` and `pause` is `thread::sleep`, as before, with a test of whether the clock is
+//! stepped in front, a null check of a field that is never set in the game, which the compiler lays
+//! out as the branch that is not taken (the stepped arm is `#[cold]` and out of line). Stepping
+//! needs the stepped arm to be in the shipped binary, since `client bench` is: no feature or
+//! `cfg` can leave it out of the one binary that has both.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-#[cfg(not(test))]
-#[derive(Clone, Copy, Debug)]
-pub struct Clock;
-
-#[cfg(not(test))]
-impl Clock {
-    /// The machine's clock.
-    #[inline]
-    pub fn real() -> Self {
-        Self
-    }
-
-    /// The time now.
-    #[inline]
-    pub fn now(&self) -> Instant {
-        Instant::now()
-    }
-
-    /// How long it is since `then`.
-    #[inline]
-    pub fn since(&self, then: Instant) -> Duration {
-        Instant::now().saturating_duration_since(then)
-    }
-
-    /// Lets `time` go by with nothing done, so that another thread can have a lock.
-    #[inline]
-    pub fn pause(&self, time: Duration) {
-        std::thread::sleep(time);
-    }
-
-    /// The store's deadline for a job that is to let go of its lock at `at`.
-    #[inline]
-    pub fn deadline(&self, at: Instant) -> Option<Instant> {
-        Some(at)
-    }
-}
-
-/// The time of the machine, or, in a test, a time that only the test moves.
-#[cfg(test)]
+/// The time of the machine, or a time that only a driver moves.
 #[derive(Clone, Debug)]
 pub struct Clock {
-    stepped: Option<std::sync::Arc<Stepped>>,
+    stepped: Option<Arc<Stepped>>,
 }
 
 /// A clock that is where it was left: an instant to count from and how far it has been moved.
-#[cfg(test)]
 #[derive(Debug)]
 struct Stepped {
     from: Instant,
-    nanos: std::sync::atomic::AtomicU64,
+    nanos: AtomicU64,
 }
 
-#[cfg(test)]
+impl Stepped {
+    #[cold]
+    #[inline(never)]
+    fn now(&self) -> Instant {
+        self.from + Duration::from_nanos(self.nanos.load(Ordering::Relaxed))
+    }
+}
+
 impl Clock {
     /// The machine's clock.
+    #[inline]
     pub fn real() -> Self {
         Self { stepped: None }
     }
@@ -74,14 +49,15 @@ impl Clock {
     /// A clock that stands still until [`Clock::advance`]d, and is the same for every copy of it.
     pub fn stepped() -> Self {
         Self {
-            stepped: Some(std::sync::Arc::new(Stepped {
+            stepped: Some(Arc::new(Stepped {
                 from: Instant::now(),
-                nanos: std::sync::atomic::AtomicU64::new(0),
+                nanos: AtomicU64::new(0),
             })),
         }
     }
 
     /// Whether this is a stepped clock.
+    #[cfg(test)]
     pub fn is_stepped(&self) -> bool {
         self.stepped.is_some()
     }
@@ -93,41 +69,43 @@ impl Clock {
             .as_ref()
             .expect("only a stepped clock is moved");
         let nanos = u64::try_from(time.as_nanos()).expect("a time that fits");
-        stepped
-            .nanos
-            .fetch_add(nanos, std::sync::atomic::Ordering::Relaxed);
+        stepped.nanos.fetch_add(nanos, Ordering::Relaxed);
     }
 
+    /// The time now.
+    #[inline]
     pub fn now(&self) -> Instant {
         match &self.stepped {
-            Some(stepped) => {
-                stepped.from
-                    + Duration::from_nanos(stepped.nanos.load(std::sync::atomic::Ordering::Relaxed))
-            }
             None => Instant::now(),
+            Some(stepped) => stepped.now(),
         }
     }
 
+    /// How long it is since `then`.
+    #[inline]
     pub fn since(&self, then: Instant) -> Duration {
         self.now().saturating_duration_since(then)
     }
 
-    /// A pause on a stepped clock is not waited: the clock is moved on by it, so what the pause was
-    /// for (time to go by) has happened.
+    /// Lets `time` go by with nothing done, so that another thread can have a lock. A pause on a
+    /// stepped clock is not waited: the clock is moved on by it, so what the pause was for (time to
+    /// go by) has happened.
+    #[inline]
     pub fn pause(&self, time: Duration) {
-        if self.stepped.is_some() {
-            self.advance(time);
-        } else {
-            std::thread::sleep(time);
+        match &self.stepped {
+            None => std::thread::sleep(time),
+            Some(_) => self.advance(time),
         }
     }
 
-    /// A stepped job has nobody to let go of a lock for, so it has no deadline and runs to its end.
-    /// The store reads the machine's clock for a deadline, which is not this one.
+    /// The store's deadline for a job that is to let go of its lock at `at`. A stepped job has
+    /// nobody to let go of a lock for, so it has no deadline and runs to its end. The store reads
+    /// the machine's clock for a deadline, which is not this one.
+    #[inline]
     pub fn deadline(&self, at: Instant) -> Option<Instant> {
-        match self.stepped {
-            Some(_) => None,
+        match &self.stepped {
             None => Some(at),
+            Some(_) => None,
         }
     }
 }
