@@ -376,9 +376,10 @@ fn check_streaming(streaming: &Value) {
     ] {
         assert!(residency[key].is_u64(), "{key}");
     }
-    // An Edit made in a frame is taken in the next (ADR 0006); results are taken in the frame they
-    // are published in until #145 caps the uploads.
-    assert_eq!(residency["edit_latency_frames"], 1);
+    // The Edit is made before the frame's look and a stepped scene thread finishes its round in
+    // it, so the frame that made the Edit takes it: 0, which does not show ADR 0006's bound. Results
+    // are taken in the frame they are published in until #145 caps the uploads.
+    assert_eq!(residency["edit_latency_frames"], 0);
     series(&residency["outbox_latency_frames"]);
     assert_eq!(residency["outbox_latency_frames"]["total"], 0);
     assert!(residency["diverged_bricks"].as_u64().unwrap() > 0);
@@ -415,9 +416,14 @@ fn check_streaming(streaming: &Value) {
         "guard_bricks_words",
         "streamed",
         "streamed_at_start",
+        "level_0_bricks_at_start",
+        "level_0_bricks_when_complete",
     ] {
         assert!(measured[key].as_u64().unwrap() > 0, "{key}");
     }
+    // A brick drawn has one reference: the words are of the scene the bricks are of.
+    assert_eq!(measured["ring_refs_words"], measured["ring_bricks"]);
+    assert_eq!(measured["guard_refs_words"], measured["guard_bricks"]);
     // What the GPU wrote is what the CPU worked out that it would: the count that the Linux and
     // Windows runners compare is made without a GPU, and this is what ties it to one.
     let timing = &streaming["timing"];

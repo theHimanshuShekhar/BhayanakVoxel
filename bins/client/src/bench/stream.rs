@@ -341,8 +341,13 @@ pub struct Residency {
     pub store_at_end: usize,
     pub budget: usize,
     /// **Edit latency**: frames from the frame in which the Edit was made to the frame that took it
-    /// in from the scene thread (the one in which [`World::edit_taken`] first holds). An Edit made
-    /// in frame N and taken in frame N+1 is 1, which is ADR 0006's bound.
+    /// in from the scene thread (the one in which [`World::edit_taken`] first holds). The Edit is
+    /// made before the frame's look at the scene, as the game makes it. **A stepped scene thread
+    /// finishes its round inside that look**, so this is 0 here, and the field cannot show ADR
+    /// 0006's bound (an Edit made in frame N shows in N+1 if the real thread has packed it by
+    /// then): the stepped test `an_edit_a_busy_scene_thread_has_not_packed_is_waited_for_...` and
+    /// the real-thread tests hold that, and #162's real-time run measures it. It is here to show
+    /// when a change makes an Edit later than the look that made it.
     pub edit_latency_frames: u32,
     /// **Outbox latency**: frames that a result the scene thread published waited in its outbox
     /// before the frame thread took it (ADR 0006; the cap on uploads of #145 is what makes it more
@@ -369,6 +374,13 @@ pub struct Measured {
     /// spawn.
     pub streamed: u64,
     pub streamed_at_start: u64,
+    /// The bricks of level 0 held at the spawn and when the resident set was complete. At the
+    /// spawn the store holds nothing else under the Guard, so the first is all of
+    /// `streamed_at_start`: what is taken out is the spawn ring's level 0, as the 5.63 million
+    /// taken out of the constant is. They are equal: level 0 beyond the ring is not held here (see
+    /// `STREAMED_LEVEL_0_BEYOND_THE_RING_PER_D0_SQUARED`).
+    pub level_0_bricks_at_start: u64,
+    pub level_0_bricks_when_complete: u64,
     /// Ring bricks drawn per `d0` squared (`BRICKS_PER_D0_SQUARED`).
     pub bricks_per_d0_squared: f64,
     /// Words of `brick_refs` and of `bricks` in use per Ring brick (`REFS_PER_BRICK`,
@@ -392,7 +404,8 @@ pub struct Check {
     /// The constant.
     pub value: f64,
     /// The part of it that the measurement is held to: the whole of it, but for
-    /// `STREAMED_PER_D0_SQUARED`, whose spawn ring's share is not in what is measured.
+    /// `STREAMED_PER_D0_SQUARED`, whose spawn ring's and level 0 beyond the ring's shares are not
+    /// in what is measured.
     pub compared: f64,
     /// The most that may be measured: `compared` times `HEADROOM`.
     pub limit: f64,
@@ -414,8 +427,11 @@ pub struct Constants {
     pub refs_per_brick: f64,
     pub words_per_brick: f64,
     pub streamed_per_d0_squared: f64,
-    /// The spawn ring's share of `streamed_per_d0_squared`, which is not what grows with `d0`.
+    /// The shares of `streamed_per_d0_squared` that the measurement does not have: the spawn ring's
+    /// (not what grows with `d0`), and level 0 beyond the ring (the test Planet's level 0 is
+    /// within the ring).
     pub streamed_spawn_ring_per_d0_squared: f64,
+    pub streamed_level_0_beyond_the_ring_per_d0_squared: f64,
     pub headroom: f64,
 }
 
@@ -428,6 +444,8 @@ impl Constants {
             words_per_brick: crate::WORDS_PER_BRICK,
             streamed_per_d0_squared: crate::STREAMED_PER_D0_SQUARED,
             streamed_spawn_ring_per_d0_squared: crate::STREAMED_SPAWN_RING_PER_D0_SQUARED,
+            streamed_level_0_beyond_the_ring_per_d0_squared:
+                crate::STREAMED_LEVEL_0_BEYOND_THE_RING_PER_D0_SQUARED,
             headroom: crate::HEADROOM,
         }
     }
@@ -475,7 +493,8 @@ impl Sizing {
                 "STREAMED_PER_D0_SQUARED",
                 "streaming.sizing.measured.streamed_per_d0_squared",
                 constants.streamed_per_d0_squared,
-                constants.streamed_spawn_ring_per_d0_squared,
+                constants.streamed_spawn_ring_per_d0_squared
+                    + constants.streamed_level_0_beyond_the_ring_per_d0_squared,
                 measured.streamed_per_d0_squared,
             ),
         ];
@@ -600,6 +619,8 @@ impl Tally {
 #[derive(Clone, Copy)]
 struct Start {
     streamed: usize,
+    /// The bricks of level 0 held (the spawn ring's: level 0 within the ring's reach).
+    level_0: usize,
 }
 
 /// The test Planet, streamed in stepped.
@@ -693,6 +714,7 @@ impl Streamer {
         .radial();
         let start = Start {
             streamed: store.streamed_len(),
+            level_0: store.level(0).map_or(0, BrickStore::len),
         };
         let source = store.source().expect("the store has a source");
         let (client, server) = loopback();
@@ -788,7 +810,7 @@ impl Streamer {
         // goes by, and a frame later they are the ones of the complete set.
         self.world.advance(Duration::from_secs(1));
         self.step(Phase::Steady, &first, sink)?;
-        let measured = self.measure(store_when_complete);
+        let measured = self.measure(store_when_complete)?;
         // The walk is held to the complete set, so that it evicts what it leaves behind.
         let budget = Budget {
             bricks: store_when_complete * BUDGET_PERCENT / 100,
@@ -809,6 +831,18 @@ impl Streamer {
                     Phase::Moving,
                 )
             };
+            // The Edit is made before the frame's look at the scene, where the game makes it (its
+            // input is handled before `recentre`).
+            if frame == EDIT_FRAME {
+                let aim = within_reach(&self.world, &self.reach);
+                let update = self.world.edit(&aim, &crate::tool::Tool::default())?;
+                // The call takes what the scene thread has published, which a stepped one has not
+                // done since the last frame took it. An update here would reach no GPU: say so.
+                if update.is_some() {
+                    return Err("the Edit's own look at the scene took an update".into());
+                }
+                edited = Some(self.frame);
+            }
             self.step(phase, &camera, sink)?;
             // The frame this one was (`step` counted it): the one that took the Edit in, if it did.
             if let Some(since) = edited
@@ -816,16 +850,6 @@ impl Streamer {
                 && self.world.edit_taken()
             {
                 latency = Some(self.frame - 1 - since);
-            }
-            // The Edit is made after the frame's look at the scene, not before it: the real scene
-            // thread has only just begun on it at that look (ADR 0006), and a stepped one does a
-            // whole round in it, so an Edit made before the look would be taken by it, in the same
-            // frame (that is 0, and says nothing of the bound). After the look, it is taken by the
-            // next frame's, which is what the thread's time between the two is for.
-            if frame == EDIT_FRAME {
-                let aim = within_reach(&self.world, &self.reach);
-                self.world.edit(&aim, &crate::tool::Tool::default())?;
-                edited = Some(self.frame - 1);
             }
         }
         let latency = latency.ok_or("the Edit was not taken in by the end of the path")?;
@@ -904,7 +928,7 @@ impl Streamer {
     /// size), so each of the Ring values is held to a constant that has the Guard in: the check is
     /// lenient by what the Guard changes the constant by, which `words_per_guard_brick` and the
     /// docs of the constants put in numbers.
-    fn measure(&self, streamed: usize) -> Measured {
+    fn measure(&self, streamed: usize) -> Result<Measured, Box<dyn Error>> {
         let d0_squared = D0 * D0;
         let stats = self.world.stats();
         let (ring, guard) = stats.level_bricks.split_at(GUARD_FIRST);
@@ -917,8 +941,17 @@ impl Streamer {
         };
         let ((ring_refs, ring_bricks_words), (guard_refs, guard_bricks_words)) =
             (sum(ring_words), sum(guard_words));
+        // A brick drawn has one reference, so the references are the bricks: if they are not, the
+        // words are of another state of the scene than the bricks (a stale snapshot).
+        if (ring_refs, guard_refs) != (ring, guard) {
+            return Err(format!(
+                "the words by level are not of the scene the bricks are of: {ring_refs} references \
+                 for {ring} Ring bricks, {guard_refs} for {guard} of the Guard's"
+            )
+            .into());
+        }
         let per = |words: usize, bricks: usize| words as f64 / bricks.max(1) as f64;
-        Measured {
+        Ok(Measured {
             ring_bricks: ring as u64,
             guard_bricks: guard as u64,
             ring_refs_words: ring_refs as u64,
@@ -927,12 +960,15 @@ impl Streamer {
             guard_bricks_words: guard_bricks_words as u64,
             streamed: streamed as u64,
             streamed_at_start: self.start.streamed as u64,
+            level_0_bricks_at_start: self.start.level_0 as u64,
+            level_0_bricks_when_complete: self.world.store().level(0).map_or(0, BrickStore::len)
+                as u64,
             bricks_per_d0_squared: ring as f64 / d0_squared,
             refs_per_brick: per(ring_refs, ring),
             words_per_brick: per(ring_bricks_words, ring),
             words_per_guard_brick: per(guard_bricks_words, guard),
             streamed_per_d0_squared: (streamed - self.start.streamed) as f64 / d0_squared,
-        }
+        })
     }
 }
 
@@ -1068,7 +1104,9 @@ mod tests {
             ("REFS_PER_BRICK", |c, v| c.refs_per_brick = v),
             ("WORDS_PER_BRICK", |c, v| c.words_per_brick = v),
             ("STREAMED_PER_D0_SQUARED", |c, v| {
-                c.streamed_per_d0_squared = v + c.streamed_spawn_ring_per_d0_squared
+                c.streamed_per_d0_squared = v
+                    + c.streamed_spawn_ring_per_d0_squared
+                    + c.streamed_level_0_beyond_the_ring_per_d0_squared
             }),
         ];
         for (name, lower) in lowered {
@@ -1167,15 +1205,26 @@ mod tests {
     }
 
     #[test]
-    fn an_edit_made_in_a_frame_is_taken_in_the_next_and_the_guard_is_counted_exactly() {
+    fn the_words_are_of_the_scene_the_bricks_are_of_and_the_latencies_are_what_a_stepped_run_gives()
+    {
         let report = report();
-        // ADR 0006: an Edit made in frame N is taken in frame N+1.
-        assert_eq!(report.residency.edit_latency_frames, 1);
+        // The Edit is made before the frame's look, as the game makes it, and a stepped scene thread
+        // finishes its round in that look: the frame that made the Edit takes it. This is not ADR
+        // 0006's bound, which a stepped run cannot show (see `Residency::edit_latency_frames`).
+        assert_eq!(report.residency.edit_latency_frames, 0);
         // Results published in a frame are taken in it, until #145's cap on uploads.
         assert_eq!(report.residency.outbox_latency_frames.total, 0);
         // Words are counted by level, not guessed: the Rings' and the Guard's add up to those in use.
         let m = &report.sizing.measured;
         assert!(m.ring_bricks > 0 && m.guard_bricks > 0);
         assert!(m.guard_bricks_words > 0 && m.ring_bricks_words > 0);
+        // A brick drawn has one reference: words of an earlier state of the scene than the bricks
+        // (a snapshot taken before a later publish of the round) would not add up to that.
+        assert_eq!(m.ring_refs_words, m.ring_bricks);
+        assert_eq!(m.guard_refs_words, m.guard_bricks);
+        // The premises of the streamed check: the store holds only the spawn ring's level 0 at the
+        // start, and no level 0 beyond it when the set is complete.
+        assert_eq!(m.level_0_bricks_at_start, m.streamed_at_start);
+        assert_eq!(m.level_0_bricks_when_complete, m.level_0_bricks_at_start);
     }
 }

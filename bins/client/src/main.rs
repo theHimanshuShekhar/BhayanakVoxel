@@ -155,8 +155,8 @@ const BRICKS_PER_D0_SQUARED: f64 = 3.25;
 /// bricks, 356 601 words), so the 178 000 of full size, if they weigh the same there (they are the
 /// same levels, but another Planet: #162 measures at full size), take 9.6 of the 117.6 million
 /// words, and the Rings alone were 33.1 words a brick: the limit of 42.75 is 1.29 times that, and
-/// the references' limit is 1.25 times 1.0. The test Planet measures 1.012 and 40.08 words, 2.67
-/// words (6.7%) under the limit, and its Rings take 21% more words a brick than the full-size
+/// the references' limit is 1.25 times 1.0. The test Planet measures 1.000 and 39.78 words, 2.97
+/// words (6.9% of the limit) under it, and its Rings take 20% more words a brick than the full-size
 /// Planet's did.
 const REFS_PER_BRICK: f64 = 1.0;
 const WORDS_PER_BRICK: f64 = 34.2;
@@ -254,26 +254,34 @@ fn room_for(bands: Bands) -> Room {
 /// Checked against `streaming.sizing.measured.streamed_per_d0_squared` of the bench report
 /// (`client bench --streaming`): what the store counts on the test Planet when its resident set is
 /// complete, less the spawn ring it started with (which is not scaled with `d0`), per `d0`
-/// squared. It must not be over this times [`HEADROOM`].
+/// squared. It must not be over this times [`HEADROOM`], once the constant has the spawn ring's
+/// and level 0's share beyond the ring taken out (below): 16.49, not 24.75.
 const STREAMED_PER_D0_SQUARED: f64 = 19.8;
 /// The spawn ring's share of what the store counted at full size: 5.63 million of the 20.90 million
 /// (level 0's bricks round the spawn, held before the fill starts), at the `d0` of 1028.2 Voxels
 /// that the constant was measured at. It does not scale with `d0`.
 const SPAWN_RING_STREAMED_AT_FULL_SIZE: f64 = 5_630_000.0;
+/// Level 0's bricks beyond the spawn ring at full size: 1.36 million of the 6.99 million that level
+/// 0 held (6.99 less the ring's 5.63), at the same `d0`. They scale with `d0`, but on the test
+/// Planet level 0 (0 to 128 Voxels, 160 with the radial margin) is the spawn ring and no more, so
+/// the measurement has none.
+const LEVEL_0_BEYOND_THE_RING_AT_FULL_SIZE: f64 = 1_360_000.0;
 const D0_OF_THE_MEASUREMENT: f64 = 1028.2;
 /// The spawn ring's share of [`STREAMED_PER_D0_SQUARED`], 5.33. The bench's measurement takes the
-/// ring out (it is held at the start, and is 160 Voxels whatever `d0` is), so it is held to what is
-/// left of the constant, [`STREAMED_PER_D0_SQUARED`] less this, 14.47, times [`HEADROOM`]: 18.09.
-/// The test Planet measures 13.09. Held to the whole constant the limit would be 24.75, 1.71 times
-/// what scales with `d0` and not 1.25.
-///
-/// This is still not exact: level 0's band reaches 128 Voxels on the test Planet, inside the ring,
-/// so the walk and the fill add no level-0 bricks to what is measured, and at full size level 0
-/// held 1.36 million beyond the ring (1.29 per `d0` squared). Without them the part of the constant
-/// that the test Planet can show is 13.19, its limit 16.49, 1.26 times the 13.09 measured, which
-/// is 99% of that part: the Planet is not far from what the constant says.
+/// ring out (it is held at the start, and is 160 Voxels whatever `d0` is): the store at the start
+/// is its level 0 and nothing else under the Guard, 226 964 bricks, which are the 5.63 million's
+/// counterpart, level 0 only on both sides. So the measurement is held to what is left of the
+/// constant, and this is one of the two shares that are taken out of it (see
+/// [`STREAMED_LEVEL_0_BEYOND_THE_RING_PER_D0_SQUARED`]).
 const STREAMED_SPAWN_RING_PER_D0_SQUARED: f64 =
     SPAWN_RING_STREAMED_AT_FULL_SIZE / (D0_OF_THE_MEASUREMENT * D0_OF_THE_MEASUREMENT);
+/// Level 0's bricks beyond the ring, 1.29 per `d0` squared, the other share that is taken out. The
+/// measurement is held to [`STREAMED_PER_D0_SQUARED`] less both, 19.8 − 5.33 − 1.29 = 13.19, times
+/// [`HEADROOM`]: 16.49, against the 13.09 measured (99% of that part, 79% of the limit). Held to
+/// the whole constant the limit would be 24.75, 1.88 times what is measured and 1.71 times what
+/// the measurement can show of the constant without the ring (14.47), and not 1.25.
+const STREAMED_LEVEL_0_BEYOND_THE_RING_PER_D0_SQUARED: f64 =
+    LEVEL_0_BEYOND_THE_RING_AT_FULL_SIZE / (D0_OF_THE_MEASUREMENT * D0_OF_THE_MEASUREMENT);
 /// How far over the budget the store may go before eviction starts (ADR 0004 says 10 to 20%).
 /// A flight leaves a trail of the shells it passed through, and takes the store over the complete
 /// set by 12% in 840 m, 28% in 2.5 km and 57% in 5 km, measured with nothing evicted (#142, with

@@ -277,7 +277,8 @@ pub struct Slow {
     pub used_bytes: u64,
     /// The words of `brick_refs` and of `bricks` that the bricks drawn at each level take (see
     /// [`Scene::words_by_level`]), worked out only when the counts are asked for exactly (see
-    /// [`SceneWorker::count_exactly`]): it looks at every brick drawn. Zero otherwise.
+    /// [`SceneWorker::count_exactly`]), and then at every publish, so that they are of the scene
+    /// that the bricks drawn are of: it looks at every brick drawn. Zero otherwise.
     pub words_by_level: [(usize, usize); LEVELS],
 }
 
@@ -1691,6 +1692,15 @@ impl Engine {
         if self.clock.since(self.slow_at) >= TABLES_EVERY {
             self.slow_at = self.clock.now();
             self.slow = slow_of(&self.scene, &self.loader, exactly);
+        } else if exactly {
+            // The words by level are of the scene as it is in this publish, with the bricks drawn
+            // in it: a round publishes several times, and the others would keep the words of an
+            // earlier one. The game does not count exactly and does not pay for this.
+            self.slow = Arc::new(Slow {
+                tables: self.slow.tables.clone(),
+                used_bytes: self.slow.used_bytes,
+                words_by_level: self.scene.words_by_level(),
+            });
         }
         while let Ok(garbage) = self.graveyard.try_recv() {
             if let Garbage::Copy(copy) = garbage

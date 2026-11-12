@@ -155,11 +155,15 @@ except `timing`.
   are not the same thing:
   - `edit_latency_frames` (**Edit latency**): frames from the frame in which the Edit was made to
     the frame that took it in from the scene thread (the first in which `World::edit_taken`
-    holds, which is not when the wait for it ended: a timeout ends that too). An Edit made in
-    frame N and taken in frame N+1 is **1**, ADR 0006's bound. The Edit is made after frame N's
-    look at the scene: a real scene thread has only just begun on it at that look, and a stepped
-    one does a whole round in it, so an Edit made before the look is taken by it, in the same
-    frame, which is 0 and says nothing of the bound.
+    holds, which is not when the wait for it ended: a timeout ends that too). The Edit is made
+    before the frame's look at the scene, where the game makes it (its input is handled before
+    `recentre`). **A stepped scene thread finishes its round inside that look**, so the frame that
+    made the Edit takes it: the field is **0**, and it cannot show ADR 0006's bound (an Edit made
+    in frame N shows in frame N+1 if the real thread has packed it by then, which a thread that
+    takes time can fail to do). The bound is held by the stepped test
+    `an_edit_a_busy_scene_thread_has_not_packed_is_waited_for_edit_wait_and_shows_in_the_first_look_after_it_has`
+    and the real-thread tests, and measured in real time by #162's run on the 4090. The field is
+    there to show a change that makes an Edit later than the look that made it.
   - `outbox_latency_frames` (**Outbox latency**): frames that a result the scene thread published
     waited in its outbox (ADR 0006) before the frame thread took it, for each frame that took one
     (frames, total, max, frames with any). 0 in a stepped run, in which a frame takes what was
@@ -184,25 +188,29 @@ against.
 
 The constants are per `d0` squared, and the test Planet's `d0` is a sixteenth of the full-size
 bench's in length, so what does not scale with `d0` is left out of the measurement: the bricks of
-the Guard's levels (drawn, and their words, which the scene counts exactly by level:
-`Scene::words_by_level`), and the store as it was at the spawn (the spawn ring). The constants had
-the Guard and the ring in, so the limits are not exactly 1.25 times what they scale with. Like for
-like, with real figures (the doc comment of each constant in `main.rs` has the working):
+the Guard's levels (drawn, and their words, which the scene counts exactly by level, for the
+scene of each publish: `Scene::words_by_level`; a test fails if the references are not the bricks
+drawn, which a snapshot of an earlier state would not be), and the store as it was at the spawn
+(the spawn ring: all of it level 0, 226 964 bricks, as the 5.63 million taken out of the constant
+is). The constants had the Guard and the ring in, so the limits are not exactly 1.25 times what
+they scale with. Like for like, with real figures (the doc comment of each constant in `main.rs`
+has the working):
 
 | Constant | Limit | What it is a limit of | Limit ÷ that | Measured |
 |---|---|---|---|---|
 | `BRICKS_PER_D0_SQUARED` 3.25 | 4.06 | 3.09: the full-size Rings, without the Guard's 178 000 bricks | 1.32 | 3.51 |
-| `REFS_PER_BRICK` 1.0 | 1.25 | 1.0 (a Guard brick has one reference too) | 1.25 | 1.012 |
-| `WORDS_PER_BRICK` 34.2 | 42.75 | 33.1: the Rings, if the Guard weighs 53.8 words a brick at full size as on the test Planet (#162 measures it there) | 1.29 | 40.08 |
-| `STREAMED_PER_D0_SQUARED` 19.8 | 18.09 | 14.47: the constant less the spawn ring's 5.33 (`STREAMED_SPAWN_RING_PER_D0_SQUARED`), which the measurement takes out | 1.25 | 13.09 |
+| `REFS_PER_BRICK` 1.0 | 1.25 | 1.0 (a Guard brick has one reference too) | 1.25 | 1.000 |
+| `WORDS_PER_BRICK` 34.2 | 42.75 | 33.1: the Rings, if the Guard weighs 53.8 words a brick at full size as on the test Planet (#162 measures it there) | 1.29 | 39.78 |
+| `STREAMED_PER_D0_SQUARED` 19.8 | 16.49 | 13.19: the constant less the spawn ring's 5.33 (`STREAMED_SPAWN_RING_PER_D0_SQUARED`) and level 0's 1.29 beyond the ring (`STREAMED_LEVEL_0_BEYOND_THE_RING_PER_D0_SQUARED`), which the measurement does not have | 1.25 | 13.09 |
 
-The streamed value is held to the part that scales, not to the whole constant (whose limit,
-24.75, would be 1.71 times that part). Level 0 is not like for like on the test Planet: its band
-(128 Voxels) lies inside the spawn ring (160), so no level-0 bricks are added to what is measured,
-while at full size level 0 held 1.36 million bricks beyond the ring (1.29 per `d0` squared).
-Without them the part of the constant that the test Planet can show is 13.19, its limit 16.49,
-and the check still passes (13.09 is 99% of that part and 79% of that limit); the check as it is
-is not tuned to that.
+The streamed value is held to the part of the constant that the test Planet can show, not to the
+whole of it (whose limit, 24.75, would be 1.88 times what is measured). Level 0 is what is not
+like for like: its band (128 Voxels, 160 with the radial margin) is the spawn ring (160) and no
+more, so no level-0 bricks are added to what is measured (the report has level 0 at the start and
+when complete: both 226 964, and a test holds them equal), while at full size level 0 held 1.36
+million bricks beyond the ring (1.29 per `d0` squared). That share is taken out of the constant as
+well, so the check is 19.8 − 5.33 − 1.29 = 13.19 times 1.25 = 16.49 against 13.09 measured (99%
+of that part, 79% of the limit). It passes; nothing was tuned to make it.
 
 The camera is a function of the frame index only (keyframes, interpolated in a straight line at
 constant speed), never of the clock, so every run on every machine shows the GPU the same views.
