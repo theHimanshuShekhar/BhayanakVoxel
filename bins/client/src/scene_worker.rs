@@ -69,6 +69,12 @@ const SLICE: Duration = Duration::from_millis(2);
 /// costs, and an Edit is packed whatever the backlog is (it is never behind streamed bricks: it
 /// goes into the same patch, ahead of what is not yet packed). A jump or other bands pack the
 /// whole scene and are not limited either (`Rebuilt`).
+///
+/// **How the value was chosen:** a first value, not one tuned on the 4090. 8 MiB is about a
+/// millisecond or two of copying at a few GB/s (arithmetic, not a measurement), well under a
+/// frame, and several times the largest frame the stepped bench has once the rebuild is gone
+/// (451 KB, 43 copies); 128 copies is three times that frame's. It is to be set again from the
+/// real-time bench's `upload` figures (`cut_frames`, `longest_backlog_frames`, the largest frame).
 pub const UPLOAD_BUDGET: UploadCost = UploadCost {
     bytes: 8 << 20,
     writes: 128,

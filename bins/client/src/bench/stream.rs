@@ -366,9 +366,10 @@ pub struct Residency {
     /// when a change makes an Edit later than the look that made it.
     pub edit_latency_frames: u32,
     /// **Outbox latency**: frames that a result the scene thread published waited in its outbox
-    /// before the frame thread took it (ADR 0006; the cap on uploads of #145 is what makes it more
-    /// than 0), a count for each frame that took one. 0 in a stepped run, in which a frame takes
-    /// what was published in it, until #145.
+    /// before the frame thread took it (ADR 0006), a count for each frame that took one. 0 in a
+    /// stepped run, in which a frame takes what was published in it. The upload budget of #145
+    /// holds work back in the scene thread, before it is published, so it does not make this more
+    /// than 0.
     pub outbox_latency_frames: Series,
 }
 
@@ -1306,7 +1307,8 @@ mod tests {
         // finishes its round in that look: the frame that made the Edit takes it. This is not ADR
         // 0006's bound, which a stepped run cannot show (see `Residency::edit_latency_frames`).
         assert_eq!(report.residency.edit_latency_frames, 0);
-        // Results published in a frame are taken in it, until #145's cap on uploads.
+        // Results published in a frame are taken in it (the upload budget of #145 holds work back
+        // before it is published).
         assert_eq!(report.residency.outbox_latency_frames.total, 0);
         // Words are counted by level, not guessed: the Rings' and the Guard's add up to those in use.
         let m = &report.sizing.measured;

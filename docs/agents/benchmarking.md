@@ -155,9 +155,17 @@ except `timing`.
   GPU) and `tests/bench.rs` check it. When a change to the streaming code moves the counts on
   purpose, the test prints the new hash; put it in the file and say why in the PR.
 - `upload`: bytes written to the GPU per frame (`bytes`: `total`, `max`, frames and frames with
-  any), `patch_bytes` (what patches wrote, a rebuild's all-buffers write excluded), `rebuilds` and
-  `updates`. They are worked out on the CPU (`render::tracer::upload_bytes`); `timing.gpu_uploaded_bytes`
-  is what the GPU counted, and the smoke test checks that they are equal.
+  any) and the `write_buffer` calls per frame (`writes`, the same, each a copy with a barrier of
+  its own: neighbouring ranges of a patch are joined into one when they are within `COPY_GAP`
+  words), `bytes_p99` and `writes_p99` (99th percentile, nearest rank, of the frames that had an
+  update), `patch_bytes` (what patches wrote, a rebuild's all-buffers write excluded), `rebuilds`
+  and `updates`. They are worked out on the CPU (`render::tracer::upload_cost`);
+  `timing.gpu_uploaded_bytes` is what the GPU counted, and the smoke test checks that they are
+  equal. A buffer that grew (#145) copies the old one on the GPU: that is not an upload and is not
+  counted. The upload budget (`scene_worker::UPLOAD_BUDGET`) adds `cut_frames`, the frames in
+  which the scene thread held work back for it, and `longest_backlog_frames`, the most such frames
+  in a row. Both are counts and are in the hash. **The budget does not engage on the test Planet**
+  (the biggest frame is a fraction of it): the stepped tests run it with a small one.
 - `soft_misses`: bricks drawn whole although the bands split them, per frame, for `fill`, `steady`
   and `moving` (frames, total, max, frames with any), and the total by the level of the brick
   drawn whole. Counted for every frame, not a few times a second. The fill has them; with the
@@ -184,8 +192,9 @@ except `timing`.
   - `outbox_latency_frames` (**Outbox latency**): frames that a result the scene thread published
     waited in its outbox (ADR 0006) before the frame thread took it, for each frame that took one
     (frames, total, max, frames with any). 0 in a stepped run, in which a frame takes what was
-    published in it, until #145's cap on uploads holds results back; it is there to show when that
-    changes.
+    published in it. The upload budget (#145) does not change that: it holds work back in the
+    scene thread, before it is published, so every patch the frame takes is whole and the field
+    stays 0; it is there to show when a change makes the outbox hold results.
 - `holes`: Split bricks whose children are not resident in the store, per frame. **The gate:** any
   hole fails the run with status 2 (unless `--no-fail`).
 - `sizing`: see below.
@@ -249,7 +258,7 @@ Voxels) with the **real loader workers and the real scene thread**, on the machi
 frame at 60 a second, drawn on the GPU. What the threads have done by a frame depends on what the
 operating system let them do, so **everything in `streaming_real_time` is not deterministic**, is
 made by this mode only, and is not in the counts hash. The stepped test Planet mode and its hash
-`b37e0fb7cd3a2c78` are unchanged and still run first.
+(`e621feef18ef1801` since #145, which added the `upload` writes and budget counts) still run first.
 
 It runs after the stepped mode, and takes tens of minutes at full size: each run generates the
 world map (about 25 s), loads, fills (a few minutes) and flies the paths, with the loader caught
@@ -378,6 +387,15 @@ is made there (below): the run's **Edit latency**. Its frames are not those of a
     The measuring costs a few clock reads a frame. In `min` and `max` the i-th slowest frame of each
     run is taken with the i-th of the others, member by member (a `slowest` of runs that did not
     keep the same number of frames is null there): read the runs for a frame's own parts.
+  - `upload` (#145): what the path's updates cost: `updates` (frames with one), `time` (the CPU's
+    time of the copy: mean, p99 and worst, in milliseconds), `bytes_p99` and `bytes_max`,
+    `writes_p99` and `writes_max` (the `write_buffer` calls: a rebuild has none), `cut_frames` (the
+    frames in which the scene thread held work back for the upload budget) and
+    `longest_backlog_frames` and `longest_backlog_ms` (the longest run of those frames in a row, in
+    frames and in time). Nothing here is gated. The budget bounds what the scene thread adds to a
+    frame's upload, not what a frame takes: a frame's upload stays within the budget plus one
+    operation and the words between ranges that were joined, and an Edit's patch is never held
+    back.
   - `soft_misses` (a `Series` of what each frame reported: frames, total, max, frames with any) and
     `soft_misses_per_frame`. The scene thread counts them a few times a second, so a frame
     reports the last count, and the count stays within about 100 ms of the truth. Not gated yet
@@ -565,7 +583,7 @@ those cases the output on stderr is all there is.
 
 ```
 {
-  "schema_version": 10,
+  "schema_version": 11,
   "build":   { "version", "commit" },          // commit: CI builds only, else null; on a PR
                                                // build it is GitHub's merge commit, not the head
   "machine": { "gpu", "device_type", "driver", "driver_info", "backend", "os", "arch",
