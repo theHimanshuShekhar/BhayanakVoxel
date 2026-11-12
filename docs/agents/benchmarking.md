@@ -20,11 +20,12 @@ dev's RTX 4090.
 - **A pass over its budget blocks the merge** (#13). The agent removes the label once the report is
   in and nothing is over, and merges on green CI and review. Budgets are in `bins/client/bench-budgets.toml`; a PR that deliberately
   changes one says so and why.
-- **Streaming gates** (decided 2026-11-10, built by the streaming bench ticket): on the full-size
-  Planet the bench also gates frame time p99 (16.7 ms), frame-thread CPU p99 (8 ms), holes (none),
-  soft misses at the speed-scaled level (none, ADR 0009) and memory. CPU-only PRs that touch
-  streaming (the loader, the prefetcher, eviction, generation) get a `needs-stream-bench` label
-  and the same run, since CI cannot see them.
+- **Streaming gates** (decided 2026-11-10): on the full-size Planet the bench also gates frame
+  time p99 (16.7 ms), frame-thread CPU p99 (8 ms), holes (none), soft misses at the speed-scaled
+  level (none, ADR 0009) and memory. CPU-only PRs that touch streaming (the loader, the
+  prefetcher, eviction, generation) get a `needs-stream-bench` label and the same run, since CI
+  cannot see them. The part of this that CI can do, with counts and no times, is the streaming
+  mode of #181 (`--streaming`, below); the full-size run in real time on the 4090 is #162.
 - CI runs the bench too, but only as a smoke test on lavapipe (software Vulkan): it checks that
   it runs and that the report has the right shape, and its timings mean nothing.
 
@@ -47,14 +48,15 @@ release: a debug build's CPU side is slow enough to distort the frame times.
 | `--bias F` | LOD bias: output pixels one Voxel may cover, default 1. Every switch distance between levels of detail scales with it (see `CONTEXT.md`, LOD band); 2 does about a quarter of the work for up to a pixel more of error. The report records it. A report with another bias is not comparable with the budgets. |
 | `--diag LIST` | Switches for finding out where time goes, separated by commas: `no-follow` (the Planet does not follow the camera), `no-upload` (it does, on the CPU, but the GPU is not told), `no-flush` (writes to the GPU go with the next frame's commands, not at once) and `gap-ms=F` (sleep F ms before each frame, as the CPU work of following would). The report lists them in `config.diag`, the summary warns, and the budgets are not checked (`budgets.skipped` says why; the exit status is 0). See "Reading a regression" below. |
 | `--short` | A tiny run (160x90, a handful of frames, a patch of the Planet): the CI smoke test. |
-| `--no-fail` | Exit with status 0 even if a pass is over budget. |
+| `--streaming` | Also runs the streaming mode (below): the test Planet streamed in, stepped, on a fixed frame schedule, with counts that are the same on every run. The report's `streaming` is null without it. |
+| `--no-fail` | Exit with status 0 even if a pass is over budget, or a frame of the streaming mode has a hole. |
 
 It runs unattended and takes a minute or so (generating the whole Planet is about 22 s of it).
 The report is written to `DIR/report.json` and also printed on stdout; progress and a table go
 to stderr.
 
 **Exit status:** 0 if every budget is met, 2 if a pass is over its budget (or has a budget but
-could not be timed), 1 if the bench could not run (no Vulkan device, an unreadable budgets
+could not be timed) or, with `--streaming`, if any frame had a hole, 1 if the bench could not run (no Vulkan device, an unreadable budgets
 file, a bad option).
 
 ### What it does
@@ -91,14 +93,82 @@ file, a bad option).
    the view to seconds to make, and the numbers say what the cave costs, not the far ground. The
    flight and the sweep are left alone. `--short` has no stills.
 
-The bench does not stream: it draws a Planet that is generated whole, so the ring loader (#86)
-and its uploads are not in these numbers. The loader's own costs (the spawn ring, the Guard, how
+6. With `--streaming`, after all of that, the streaming mode (#181), on a GPU of its own. See
+   "The streaming mode" below.
+
+The flight above does not stream: it draws a Planet that is generated whole, so the ring loader
+(#86) and its uploads are not in these numbers. The loader's own costs (the spawn ring, the Guard, how
 long the bands take to fill, and the frame thread's scene work per frame while walking, worst and
 p99) are read from the ignored full-size test:
 `cargo test --release -p client -- --ignored --nocapture full_size`. The scene's selection and
 packing run on a thread of their own there (ADR 0006), so those numbers are what the frame thread
 pays for it: copying what the scene thread made. The bench's `scene_update_ms` is still the whole
 of following the camera, done inline.
+
+### The streaming mode
+
+`--streaming` runs the loader, the rings' recentring, the scene thread's packing and the copy to
+the GPU on the test Planet (the world map of 512 texels a face, the one the stepped tests use),
+which the flight above leaves out. It runs **stepped** (#180, `docs/agents/ci.md`): no threads, no
+sleeps, and a clock that only the bench moves, a frame (16.667 ms) at a time, so the work of each
+frame does not depend on how long anything took. The code is the game's (`World`, `Loader`,
+`SceneWorker`); the game starts threads and never steps, and its clock is the machine's (see
+`bins/client/src/clock.rs`). The flight above does not use the world or the clock at all.
+
+The schedule is fixed by frame index (`bins/client/src/bench/stream.rs`): the camera at the spawn
+until the resident set is complete (**fill**); then 60 frames standing (**steady**) and 180 frames
+walking at 24 m/s along three segments (**moving**), with an Edit at frame 150 of them and the
+store held to 102% of the complete set so that the walk evicts. The bands have a `d0` of 64
+Voxels, so that the fill is a few seconds, and the Guard is the game's (levels 9 to 13).
+Everything in `streaming` is made by that mode and is the same on every run and every machine,
+except `timing`.
+
+`streaming` has `deterministic: true`, the `schedule`, and:
+
+- `counts_hash`: FNV-1a of every count of every frame and of the end state. It is the one number
+  to compare: `bins/client/src/bench/streaming-counts.golden` has the committed value, a unit
+  test (`the_counts_are_the_committed_ones`, which runs on Linux and on Windows, since it needs no
+  GPU) and `tests/bench.rs` check it. When a change to the streaming code moves the counts on
+  purpose, the test prints the new hash; put it in the file and say why in the PR.
+- `upload`: bytes written to the GPU per frame (`bytes`: `total`, `max`, frames and frames with
+  any), `patch_bytes` (what patches wrote, a rebuild's all-buffers write excluded), `rebuilds` and
+  `updates`. They are worked out on the CPU (`render::tracer::upload_bytes`); `timing.gpu_uploaded_bytes`
+  is what the GPU counted, and the smoke test checks that they are equal.
+- `soft_misses`: bricks drawn whole although the bands split them, per frame, for `fill`, `steady`
+  and `moving` (frames, total, max, frames with any), and the total by the level of the brick
+  drawn whole. Counted for every frame, not a few times a second. The fill has them; with the
+  camera steady or moving on the margins and the lead, there are none today.
+- `rings`: for each level (a Ring), where its LOD band starts, and the bricks drawn at the first
+  frame, when the resident set was complete, and at the end.
+- `work`: what the scene thread did, in steps and bricks, not milliseconds: `follow` (selecting
+  again for a new camera), `pack` (taking in what the loader made), `upload` (frames with an
+  update, and bytes: patches are words, not bricks) and eviction.
+- `residency`: the Diverged bricks (those an Edit changed), the store's size as its budget counts
+  it (at the start, when complete, the most, at the end) and the budget, and
+  `edit_latency_frames`: frames from the Edit to the frame that took it in from the scene thread (2,
+  the bound of ADR 0006: the Edit is looked at in the second frame after).
+- `holes`: Split bricks whose children are not resident in the store, per frame. **The gate:** any
+  hole fails the run with status 2 (unless `--no-fail`).
+- `sizing`: see below.
+- `timing`: the one part that is not deterministic: CPU time of each copy to the GPU and of each
+  draw (every frame in a measurement, every tenth with `--short`), and the bytes the GPU counted.
+
+#### Sizing constants
+
+`bins/client/src/main.rs` sizes its tables from `BRICKS_PER_D0_SQUARED`, `REFS_PER_BRICK`,
+`WORDS_PER_BRICK` and `STREAMED_PER_D0_SQUARED`, each measured once at full size by hand (see
+`docs/measurements.md`). `streaming.sizing` has the same four measured on the test Planet with the
+resident set complete, and each beside its constant and `limit` (the constant times `HEADROOM`). A
+unit test (`the_sizes_measured_on_the_test_planet_are_within_the_constants_with_headroom`) fails
+when one is over, which means the constant in `main.rs` is too small for the Planet: raise it with
+a measurement, not to get green. Each constant's doc comment names the field it is checked
+against.
+
+The constants are per `d0` squared, and the test Planet's `d0` is a sixteenth of the full-size
+bench's in length, so what does not scale with `d0` is left out of the measurement: the bricks of
+the Guard's levels (drawn, and their words, estimated at what a Guard brick weighed at the spawn),
+and the store as it was at the spawn (the spawn ring). The constants have those in, so the check
+is a little lenient, by 5% of the bricks at full size.
 
 The camera is a function of the frame index only (keyframes, interpolated in a straight line at
 constant speed), never of the clock, so every run on every machine shows the GPU the same views.
@@ -116,7 +186,7 @@ before reading anything into the times.
 
 ```
 {
-  "schema_version": 4,
+  "schema_version": 7,
   "build":   { "version", "commit" },          // commit: CI builds only, else null; on a PR
                                                // build it is GitHub's merge commit, not the head
   "machine": { "gpu", "device_type", "driver", "driver_info", "backend", "os", "arch",
@@ -134,7 +204,11 @@ before reading anything into the times.
   "caves":   [ { "name": "mouth" | "tunnel", "bricks": [n...], "primary": STATS,
                  "upscale": STATS, "reference": STATS }... ],
   "screenshots": [ "primary-frame0000.png", ..., "primary-cave-mouth.png", ... ],
-  "budgets": { "source", "ok", "failed": ["primary/primary"], "unmatched": [] }
+  "budgets": { "source", "ok", "failed": ["primary/primary"], "unmatched": [] },
+  "edits":   { ... } | null,                       // the Edit stress; null for --short
+  "streaming": { "deterministic": true, "schedule", "counts_hash", "upload", "soft_misses",
+                 "rings", "work", "residency", "holes", "sizing",
+                 "timing": { "deterministic": false, ... } } | null   // --streaming only
 }
 ```
 
@@ -229,7 +303,11 @@ its 3.0 ms (a sample, pass and total) catches a gross regression, set from the f
 ## Tests
 
 The statistics, budget evaluation and exit status, camera path, argument parsing and report shape
-are unit tests in `bins/client/src/bench/`. `bins/client/tests/bench.rs` runs the real
-`client bench --short` and checks the report's schema, the screenshots and the exit codes: it
-runs in `cargo test` (and so in CI) on lavapipe. `--short` uses a patch of the Planet, the one the
+are unit tests in `bins/client/src/bench/`. So are the streaming mode's, in `bench/stream.rs`: two
+runs give identical counts, the counts have the committed hash, the holes gate gives status 2, and
+the sizing check passes and fails when a constant is lowered below its measured value. They are
+stepped and need no GPU, so they gate on Linux and on Windows, which is how the two operating
+systems are compared. `bins/client/tests/bench.rs` runs the real
+`client bench --short` (and `--short --streaming`) and checks the report's schema, the
+screenshots and the exit codes: it runs in `cargo test` (and so in CI) on lavapipe. `--short` uses a patch of the Planet, the one the
 golden image test renders, because the whole Planet takes about 22 s to generate in release.

@@ -119,16 +119,26 @@ The 16 km Planet's extreme Voxel is 360 000 from the centre; the Zoom at 800 km 
 
 `bins/client/src/main.rs` sizes the GPU buffers and the store's budget from these. Each was measured once, by hand.
 
-| Constant | Value | From |
-|---|---|---|
-| `BRICKS_PER_D0_SQUARED` | 3.25 | drawn bricks of the full fill after #142 |
-| `REFS_PER_BRICK` | 1.0 | full fill |
-| `WORDS_PER_BRICK` | 34.2 | full fill |
-| `STREAMED_PER_D0_SQUARED` | 19.8 | store at the complete shell with the margins (#143) |
-| `HEADROOM` | 1.25 | chosen |
-| `BUDGET_OVERFLOW` | 0.1 | ADR 0004's 10–20% |
+| Constant | Value | From | Test Planet (#181), limit = value × `HEADROOM` |
+|---|---|---|---|
+| `BRICKS_PER_D0_SQUARED` | 3.25 | drawn bricks of the full fill after #142 | 3.51 (limit 4.06) |
+| `REFS_PER_BRICK` | 1.0 | full fill | 1.01 (limit 1.25) |
+| `WORDS_PER_BRICK` | 34.2 | full fill | 40.01 (limit 42.75) |
+| `STREAMED_PER_D0_SQUARED` | 19.8 | store at the complete shell with the margins (#143) | 13.09 (limit 24.75) |
+| `HEADROOM` | 1.25 | chosen | |
+| `BUDGET_OVERFLOW` | 0.1 | ADR 0004's 10–20% | |
 
-The streaming bench (#162) reports the measured values, and the 320 km and speed-scaled LOD tickets (#166–#168) measure them again.
+The streaming bench (`client bench --streaming`, #181) measures the four on the test Planet in CI and a stepped test fails when one is over its limit (see the entry below). The full-size, real-time run (#162) and the 320 km and speed-scaled LOD tickets (#166–#168) measure them again.
+
+### The streaming bench on the test Planet (#181, 2026-11-12)
+
+`client bench --streaming`: the world-map test Planet (512 texels a face), `d0` of 64 Voxels, the game's Guard (levels 9 to 13), the margins of ADR 0004, stepped (#180) on a fixed schedule: the fill until the resident set is complete (51 frames), 60 frames standing, 180 frames walking at 24 m/s, an Edit at frame 150 of the 240, and the store held to 102% of the complete set. Identical on every run: the debug and the release binary, and the unit tests, give the counts hash `49c09b2faf3abbb1` (committed in `bins/client/src/bench/streaming-counts.golden`). Measured on the 8-core dev box.
+
+- **Sizing, with the resident set complete:** 3.51 bricks drawn per d0² below the Guard (the constant is 3.25), 1.01 refs and 40.0 words per brick (1.0 and 34.2), 13.09 store bricks per d0² (19.8). The test Planet's `d0` is small against the Planet, so what does not scale with `d0` is left out of the measurement and the constants have it in (the check is lenient by it): the Guard's levels (30% of the bricks drawn here, 5% at full size; the words of the Guard's bricks that are drawn are taken to be what a Guard brick weighed at the spawn) and the 226 964 bricks of the spawn ring that the store starts with. Counting everything instead gives 5.12, 1.01, 44.4 and 68.5, which are not per-`d0²` numbers and would fail the check for what the Planet is and not for the constants. The bricks (8%) and the words (17%) are over the full-size constants, and the store is under (the refs are 1% over): the full-size values were taken with `d0` of 1028 Voxels, and the mix of bricks differs with the scale. All are inside the headroom.
+- **Upload:** 69.8 MB in 228 updates over 293 frames, one rebuild, 56.7 MB of it patches, at most 12.9 MB in a frame. The GPU's own count (lavapipe) is equal to the one worked out on the CPU, to the byte.
+- **Soft misses:** 68 884 bricks in 38 of the 51 fill frames (3 407 at most in a frame), none while standing and none while walking at 24 m/s: the margins and the lead are ahead of the walk.
+- **Scene work:** follow 179 steps and 53 335 bricks changed; pack 1 717 steps, 46 187 bricks changed from 158 488 made by the loader; upload 228 steps; eviction 52 steps, 33 641 units, 113 091 bricks.
+- **Residency:** 280 570 counted bricks at the complete set, 288 776 at most, 287 041 at the end (budget 286 181 plus the 1% overflow); 67 Diverged bricks after the one Edit; an Edit shows in the frame after the next (2 frames). **Holes:** none in 293 frames.
 
 ## The Reference view (ADR 0005)
 

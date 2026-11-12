@@ -6,8 +6,9 @@ use serde::Serialize;
 use super::budget::{Budgets, Status, status};
 use super::edits::EditsReport;
 use super::stats::Stats;
+use super::stream::StreamReport;
 
-pub const SCHEMA_VERSION: u32 = 6;
+pub const SCHEMA_VERSION: u32 = 7;
 
 /// One timed thing (a pass, or the GPU total of a profiler frame) in one mode, against its
 /// budget. In reference mode a profiler frame is one sample, so the entries of that mode have
@@ -289,6 +290,9 @@ pub struct Report {
     /// The Edit stress: the largest Brush, dug and placed in turn at the metric rate, on the
     /// whole Planet; null for `--short`.
     pub edits: Option<EditsReport>,
+    /// The streaming mode (`--streaming`): counts made by the stepped, deterministic mode on the
+    /// test Planet, and the GPU's timing of it, which is not deterministic; null without the flag.
+    pub streaming: Option<StreamReport>,
 }
 
 #[cfg(test)]
@@ -467,6 +471,7 @@ mod tests {
             screenshots: vec!["primary-0.png".into()],
             budgets: summarize("embedded", &budgets(), &modes(0.5), &[], &[]),
             edits: None,
+            streaming: None,
         };
         let json = serde_json::to_value(&report).unwrap();
         let keys = |v: &serde_json::Value| -> Vec<String> {
@@ -484,10 +489,12 @@ mod tests {
                 "machine",
                 "modes",
                 "schema_version",
-                "screenshots"
+                "screenshots",
+                "streaming"
             ]
         );
-        assert_eq!(json["schema_version"], 6);
+        assert_eq!(json["schema_version"], 7);
+        assert_eq!(json["streaming"], serde_json::Value::Null);
         assert_eq!(
             keys(&json["caves"][0]),
             ["bricks", "name", "primary", "reference", "upscale"]

@@ -24,7 +24,11 @@ Options:
                    the camera. no-upload: it does, on the CPU, but the GPU is not told.
                    no-flush: writes to the GPU go with the next frame's commands. gap-ms=F:
                    sleep F milliseconds before each frame, as the CPU work of following would
-  --no-fail        Exit with status 0 even if a pass is over its budget
+  --streaming      Also run the streaming mode: the loader, the rings' recentring, packing and
+                   the copy to the GPU, on the test Planet, stepped on a fixed frame schedule,
+                   so that its counts (residency, soft misses, holes, upload bytes) are the same
+                   on every run. Exits with status 2 if a frame has a hole
+  --no-fail        Exit with status 0 even if a pass is over its budget or there is a hole
   -h, --help       Print this";
 
 /// What `--diag` switches on. Everything off is a measurement.
@@ -56,6 +60,7 @@ pub struct Args {
     pub out: PathBuf,
     pub budgets: Option<PathBuf>,
     pub short: bool,
+    pub streaming: bool,
     pub no_fail: bool,
     pub size: Option<(u32, u32)>,
     pub bias: f64,
@@ -74,6 +79,7 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Parsed, String> {
         out: "bench-out".into(),
         budgets: None,
         short: false,
+        streaming: false,
         no_fail: false,
         size: None,
         bias: 1.0,
@@ -85,6 +91,7 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Parsed, String> {
         match arg.as_str() {
             "-h" | "--help" => return Ok(Parsed::Help),
             "--short" => parsed.short = true,
+            "--streaming" => parsed.streaming = true,
             "--no-fail" => parsed.no_fail = true,
             "--out" => parsed.out = value("--out")?.into(),
             "--budgets" => parsed.budgets = Some(value("--budgets")?.into()),
@@ -157,6 +164,7 @@ mod tests {
                 out: "bench-out".into(),
                 budgets: None,
                 short: false,
+                streaming: false,
                 no_fail: false,
                 size: None,
                 bias: 1.0,
@@ -178,10 +186,11 @@ mod tests {
             "640x360",
             "--bias",
             "2",
+            "--streaming",
         ]);
         assert_eq!(args.out, PathBuf::from("o"));
         assert_eq!(args.budgets, Some(PathBuf::from("b.toml")));
-        assert!(args.short && args.no_fail);
+        assert!(args.short && args.no_fail && args.streaming);
         assert_eq!(args.size, Some((640, 360)));
         assert_eq!(args.bias, 2.0);
     }

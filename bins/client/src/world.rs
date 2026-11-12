@@ -285,7 +285,6 @@ impl World {
     /// call that waits for the thread needs ([`World::sync`], [`World::set_bands`]). Nothing waits
     /// for time and nothing reads the machine's: the world has a clock that only the test moves
     /// ([`World::advance`]), which the scene thread and the camera's velocity read.
-    #[cfg(test)]
     pub fn with_stepped_loader(mut self, loader: Loader) -> Self {
         let scene = std::mem::take(&mut self.scene);
         self.predictor.defer_lod();
@@ -306,8 +305,13 @@ impl World {
         self.clock.is_stepped()
     }
 
+    /// Whether an Edit that was made has not been taken in from the scene thread yet (see
+    /// [`World::edit`]).
+    pub fn edit_pending(&self) -> bool {
+        self.unshown_edit.is_some()
+    }
+
     /// Moves a stepped world's clock on by `time`.
-    #[cfg(test)]
     pub fn advance(&self, time: std::time::Duration) {
         self.clock.advance(time);
     }
@@ -331,7 +335,6 @@ impl World {
 
     /// What the scene thread said of the scene and the loader with the words the world has. Empty
     /// before [`World::with_loader`].
-    #[cfg(test)]
     pub fn stats(&self) -> &Stats {
         &self.stats
     }
@@ -344,8 +347,8 @@ impl World {
     }
 
     /// Gives the store another budget while the scene thread runs (a test of what it does when
-    /// there is less, or more, to want than it had room for).
-    #[cfg(test)]
+    /// there is less, or more, to want than it had room for; the streaming bench's walk, which is held
+    /// to the complete set).
     pub fn set_budget(&self, budget: brick_store::Budget) {
         self.predictor
             .shared_store()
@@ -358,6 +361,14 @@ impl World {
     #[cfg(test)]
     pub fn count_soft_misses(&self) {
         self.worker().count_soft_misses(true);
+    }
+
+    /// Has the scene thread count the soft misses (by level) and the holes for every publish, so
+    /// that the stats the world has are exact for each frame (see [`SceneWorker::count_exactly`]).
+    pub fn count_exactly(&self) {
+        if let Some(worker) = &self.worker {
+            worker.count_exactly();
+        }
     }
 
     /// Holds back (or lets go of) what the loader generates: while paused, nothing it generated
@@ -425,7 +436,6 @@ impl World {
     }
 
     /// The Planet's bricks as the client holds them.
-    #[cfg(test)]
     pub fn store(&self) -> std::sync::RwLockReadGuard<'_, brick_store::BrickStore> {
         self.predictor.store()
     }
@@ -507,7 +517,6 @@ impl World {
             Some(worker) => {
                 worker.follow_moving(camera, velocity);
                 // A stepped scene thread does its round now, with the camera it was just told.
-                #[cfg(test)]
                 worker.step();
                 let wait = self.edit_due()?;
                 self.take_ready(wait)

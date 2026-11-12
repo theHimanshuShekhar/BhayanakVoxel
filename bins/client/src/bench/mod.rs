@@ -16,6 +16,7 @@ mod edits;
 mod path;
 mod report;
 mod stats;
+mod stream;
 
 use std::error::Error;
 use std::fs::{self, File};
@@ -242,6 +243,11 @@ fn run(args: &Args) -> Result<u8, Box<dyn Error>> {
     // The cave stills are of another scene, and another GPU context: this one's is done with.
     drop(gpu);
     drop(flight);
+    let streaming = if args.streaming {
+        Some(run_streaming(&plan, resolution)?)
+    } else {
+        None
+    };
     let (caves, cave_shots) = if plan.patch {
         (Vec::new(), Vec::new())
     } else {
@@ -288,6 +294,7 @@ fn run(args: &Args) -> Result<u8, Box<dyn Error>> {
         ),
         edits,
         modes,
+        streaming,
     };
     let json = serde_json::to_string_pretty(&report)?;
     let file = args.out.join(REPORT_FILE);
@@ -305,6 +312,20 @@ fn run(args: &Args) -> Result<u8, Box<dyn Error>> {
     } else {
         0
     };
+    // A hole is a failure of the streaming mode whatever `--diag` said of the floating one.
+    let streaming_code = report
+        .streaming
+        .as_ref()
+        .map_or(0, |s| stream::exit_code(s, args.no_fail));
+    if streaming_code != 0
+        && let Some(s) = &report.streaming
+    {
+        eprintln!(
+            "streaming: {} bricks were split with the bricks under them not resident, in {} frames",
+            s.holes.total, s.holes.frames_with
+        );
+    }
+    let code = code.max(streaming_code);
     if code != 0 {
         let (no_data, over) = failures(&report.modes);
         if !over.is_empty() {
@@ -315,6 +336,23 @@ fn run(args: &Args) -> Result<u8, Box<dyn Error>> {
         }
     }
     Ok(code)
+}
+
+/// The streaming mode (see [`stream`]): the test Planet streamed in, stepped, and drawn on a GPU of
+/// its own, which is the one thing in the report that is timed.
+fn run_streaming(
+    plan: &Plan,
+    resolution: Resolution,
+) -> Result<stream::StreamReport, Box<dyn Error>> {
+    eprintln!("streaming: making the test Planet's world (this takes a while)...");
+    let streamer = stream::Streamer::new();
+    let mut gpu = Offscreen::with_resolution(resolution, streamer.scene())?;
+    // A frame is drawn every frame in a measurement, and every tenth in a smoke test, where a
+    // software driver takes long to draw one.
+    let mut sink = stream::GpuSink::new(&mut gpu, if plan.patch { 10 } else { 1 });
+    let mut report = streamer.run(&mut sink)?;
+    report.timing = Some(sink.timing());
+    Ok(report)
 }
 
 /// `mode/name` of the entries with no times to check their budget, and of those over budget.
@@ -600,6 +638,9 @@ fn print_summary(report: &Report) {
             report.config.diag.join(",")
         );
     }
+    if let Some(s) = &report.streaming {
+        print_streaming(s);
+    }
     for a in &report.altitudes {
         eprintln!(
             "at {:>7.1} m: primary {} (p95 {}), upscale {}, reference {} (p95 {}) ms; bricks {:?}",
@@ -688,4 +729,73 @@ fn print_summary(report: &Report) {
         }
     }
     eprintln!();
+}
+
+/// The streaming mode's counts, in brief.
+fn print_streaming(s: &stream::StreamReport) {
+    eprintln!(
+        "streaming ({}, d0 {}; {} fill, {} steady, {} moving frames; counts {}):",
+        s.planet,
+        s.d0,
+        s.schedule.fill_frames,
+        s.soft_misses.steady.bricks.frames,
+        s.soft_misses.moving.bricks.frames,
+        s.counts_hash
+    );
+    eprintln!(
+        "  upload {} bytes in {} updates ({} patch bytes, {} rebuilds), at most {} in a frame",
+        s.upload.bytes.total,
+        s.upload.updates,
+        s.upload.patch_bytes,
+        s.upload.rebuilds,
+        s.upload.bytes.max
+    );
+    for (phase, m) in [
+        ("fill", &s.soft_misses.fill),
+        ("steady", &s.soft_misses.steady),
+        ("moving", &s.soft_misses.moving),
+    ] {
+        eprintln!(
+            "  soft misses, {phase}: {} bricks in {} of {} frames, at most {}",
+            m.bricks.total, m.bricks.frames_with, m.bricks.frames, m.bricks.max
+        );
+    }
+    eprintln!(
+        "  holes: {} in {} frames. Diverged bricks {}, store {} at the complete set and {} at the end (budget {}), an Edit shows after {} frames",
+        s.holes.total,
+        s.holes.frames_with,
+        s.residency.diverged_bricks,
+        s.residency.store_when_complete,
+        s.residency.store_at_end,
+        s.residency.budget,
+        s.residency.edit_latency_frames
+    );
+    eprintln!(
+        "  scene work: follow {} steps {} bricks, pack {} steps {} bricks, upload {} steps {} bytes, eviction {} steps {} units {} bricks",
+        s.work.follow_steps,
+        s.work.follow_bricks,
+        s.work.pack_steps,
+        s.work.pack_bricks,
+        s.work.upload_steps,
+        s.work.upload_bytes,
+        s.work.evict_steps,
+        s.work.evicted_units,
+        s.work.evicted_bricks
+    );
+    for c in &s.sizing.checks {
+        eprintln!(
+            "  {:<24} constant {:>7.2} (limit {:>7.2}), measured {:>7.2}{}",
+            c.constant,
+            c.value,
+            c.limit,
+            c.measured,
+            if c.over { "  OVER" } else { "" }
+        );
+    }
+    if let Some(t) = &s.timing {
+        eprintln!(
+            "  (not deterministic) copy {:?} ms, draw {:?} ms over {} drawn frames; the GPU wrote {} bytes",
+            t.upload_ms.mean_ms, t.draw_ms.mean_ms, t.drawn_frames, t.gpu_uploaded_bytes
+        );
+    }
 }

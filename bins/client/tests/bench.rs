@@ -63,10 +63,16 @@ fn check_entry(entry: &Value) {
     );
 }
 
+/// The hash of the counts of the streaming run that is committed, which the unit tests of
+/// `bench::stream` check as well (on Windows too, where there is no GPU for this test).
+const GOLDEN_COUNTS: &str = include_str!("../src/bench/streaming-counts.golden");
+
 fn check_schema(report: &Value, out: &Path) {
-    assert_eq!(report["schema_version"], 6);
+    assert_eq!(report["schema_version"], 7);
     // The Edit stress is of the whole Planet, which the patch is not.
     assert!(report["edits"].is_null());
+    // The streaming mode is asked for (see its own test); the other tests do not.
+    assert!(report["streaming"].is_null() || report["streaming"].is_object());
     assert!(!string(&report["build"]["version"]).is_empty());
     assert!(report["build"]["commit"].is_null() || report["build"]["commit"].is_string());
 
@@ -304,4 +310,122 @@ fn a_diagnostic_run_is_marked_in_its_report_and_is_not_held_to_the_budgets() {
     assert!(report["budgets"]["skipped"].is_null());
     let _ = std::fs::remove_dir_all(&out);
     let _ = std::fs::remove_dir_all(&plain);
+}
+
+/// The streaming section of a report made with `--streaming` (#181).
+fn check_streaming(streaming: &Value) {
+    // Everything outside `timing` is made by the stepped mode.
+    assert_eq!(streaming["deterministic"], true);
+    assert_eq!(string(&streaming["counts_hash"]), GOLDEN_COUNTS.trim());
+    let series = |v: &Value| {
+        for key in ["frames", "total", "max", "frames_with"] {
+            assert!(v[key].is_u64(), "{v}");
+        }
+    };
+    let schedule = &streaming["schedule"];
+    for key in [
+        "fill_frames",
+        "steady_frames",
+        "moving_frames",
+        "edit_frame",
+    ] {
+        assert!(schedule[key].as_u64().unwrap() > 0, "{key}");
+    }
+    let upload = &streaming["upload"];
+    series(&upload["bytes"]);
+    assert!(upload["bytes"]["total"].as_u64().unwrap() > 0);
+    assert!(upload["patch_bytes"].is_u64() && upload["rebuilds"].as_u64().unwrap() >= 1);
+    for phase in ["fill", "steady", "moving"] {
+        let misses = &streaming["soft_misses"][phase];
+        series(&misses["bricks"]);
+        assert_eq!(misses["by_level"].as_array().unwrap().len(), 14, "{phase}");
+    }
+    let rings = streaming["rings"].as_array().unwrap();
+    assert_eq!(rings.len(), 14);
+    for ring in rings {
+        for key in ["level", "at_start", "when_complete", "at_end"] {
+            assert!(ring[key].is_u64(), "{ring}");
+        }
+        number(&ring["band_start"]);
+    }
+    let work = &streaming["work"];
+    for key in [
+        "follow_steps",
+        "follow_bricks",
+        "pack_steps",
+        "pack_bricks",
+        "arrived_bricks",
+        "upload_steps",
+        "upload_bytes",
+        "evict_steps",
+        "evicted_units",
+        "evicted_bricks",
+    ] {
+        assert!(work[key].is_u64(), "{key}");
+    }
+    assert_eq!(work["upload_bytes"], upload["bytes"]["total"]);
+    let residency = &streaming["residency"];
+    for key in [
+        "diverged_bricks",
+        "store_at_start",
+        "store_when_complete",
+        "store_max",
+        "store_at_end",
+        "budget",
+        "edit_latency_frames",
+    ] {
+        assert!(residency[key].is_u64(), "{key}");
+    }
+    assert!(residency["diverged_bricks"].as_u64().unwrap() > 0);
+    // The gate: no frame has a hole.
+    series(&streaming["holes"]);
+    assert_eq!(streaming["holes"]["total"], 0);
+    // The sizing constants beside what was measured, and none of them is over.
+    let checks = streaming["sizing"]["checks"].as_array().unwrap();
+    let constants: Vec<&str> = checks.iter().map(|c| string(&c["constant"])).collect();
+    assert_eq!(
+        constants,
+        [
+            "BRICKS_PER_D0_SQUARED",
+            "REFS_PER_BRICK",
+            "WORDS_PER_BRICK",
+            "STREAMED_PER_D0_SQUARED"
+        ]
+    );
+    for check in checks {
+        assert!(string(&check["field"]).starts_with("streaming.sizing.measured."));
+        assert!(number(&check["measured"]) > 0.0);
+        assert!(number(&check["limit"]) >= number(&check["value"]));
+        assert_eq!(check["over"], false, "{check}");
+    }
+    // What the GPU wrote is what the CPU worked out that it would: the count that the Linux and
+    // Windows runners compare is made without a GPU, and this is what ties it to one.
+    let timing = &streaming["timing"];
+    assert_eq!(timing["deterministic"], false);
+    assert_eq!(timing["gpu_uploaded_bytes"], upload["bytes"]["total"]);
+    check_stats(&timing["upload_ms"]);
+    check_stats(&timing["draw_ms"]);
+    assert!(timing["drawn_frames"].as_u64().unwrap() > 0);
+}
+
+#[test]
+fn the_streaming_mode_reports_the_counts_of_a_stepped_run_that_has_the_committed_hash() {
+    let out = scratch("streaming");
+    let run = bench(&[
+        "--short",
+        "--streaming",
+        "--no-fail",
+        "--out",
+        out.join("run").to_str().unwrap(),
+    ]);
+    assert_eq!(
+        run.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let report = read_report(&out.join("run"));
+    check_schema(&report, &out.join("run"));
+    check_streaming(&report["streaming"]);
+    let _ = std::fs::remove_dir_all(&out);
 }

@@ -111,6 +111,9 @@ fn planet_scene(
 /// How much more room than the most a table held in the measured fill the tables and the scene are
 /// made with, for what the measurement did not see (the camera going elsewhere on the Planet, a
 /// table that is full of deleted entries and cleans itself out).
+///
+/// It is also how far over its constant a value that the streaming bench measures on the test
+/// Planet may be (the tests of `bench::stream`).
 const HEADROOM: f64 = 1.25;
 
 /// The measurements that `room_for` and `expected_words` are sized from: the full-size Planet's
@@ -126,11 +129,20 @@ const HEADROOM: f64 = 1.25;
 /// the levels above. The Guard's 178 000 bricks that are drawn first are in that count, as they
 /// are split. (It was 3 560 809 before #142: the bricks of the deep sea, which no ray reaches,
 /// were drawn while a neighbour was not known to be full.)
+///
+/// Checked against `streaming.sizing.measured.bricks_per_d0_squared` of the bench report (`client
+/// bench --streaming`): the bricks drawn at the levels below the Guard on the test Planet when its
+/// resident set is complete, per `d0` squared. It must not be over this times [`HEADROOM`].
 const BRICKS_PER_D0_SQUARED: f64 = 3.25;
 /// Words of `brick_refs` and of `bricks` per brick drawn when the resident set was complete: 3.44
 /// million and 117.6 million words of them. The scene's first reservation, 28 words a brick and a
 /// tenth over, ran out 3.09 million bricks into the fill at 10 cm: the 10.4 s frame of #119 was
 /// the scene packed again with the words that were left in pieces too small.
+///
+/// Checked against `streaming.sizing.measured.refs_per_brick` and `.words_per_brick` of the bench
+/// report (`client bench --streaming`): the words in use per brick drawn below the Guard on the
+/// test Planet when its resident set is complete. Each must not be over its constant times
+/// [`HEADROOM`].
 const REFS_PER_BRICK: f64 = 1.0;
 const WORDS_PER_BRICK: f64 = 34.2;
 
@@ -223,6 +235,11 @@ fn room_for(bands: Bands) -> Room {
 /// holds. The host store holds about four times as many bricks as are drawn: the ancestors of
 /// every drawn brick, and the bricks beside and under them that the bands do not draw but split.
 /// That is what is budgeted here, since it is what grows.
+///
+/// Checked against `streaming.sizing.measured.streamed_per_d0_squared` of the bench report
+/// (`client bench --streaming`): what the store counts on the test Planet when its resident set is
+/// complete, less the spawn ring it started with (which is not scaled with `d0`), per `d0`
+/// squared. It must not be over this times [`HEADROOM`].
 const STREAMED_PER_D0_SQUARED: f64 = 19.8;
 /// How far over the budget the store may go before eviction starts (ADR 0004 says 10 to 20%).
 /// A flight leaves a trail of the shells it passed through, and takes the store over the complete

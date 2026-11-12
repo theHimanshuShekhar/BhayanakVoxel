@@ -203,6 +203,9 @@ pub struct Scene {
     shown_coarsest: Option<usize>,
     /// Likewise, why the scene it is a copy of was last packed again.
     shown_rebuilt: Option<Rebuild>,
+    /// Bricks drawn that changed (came or went) in the selections that packed the scene so far,
+    /// which a scene made again keeps (see [`Scene::bricks_changed`]).
+    changed: u64,
 }
 
 /// Room to leave in a buffer of `len` words for it to grow by: a sixteenth, and some. The GPU

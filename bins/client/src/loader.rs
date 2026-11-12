@@ -34,10 +34,11 @@
 //! ([`crate::priority`]), and there are two fewer of them than cores, for the simulation and the
 //! frame thread. A worker that panics is reported on the frame thread, which panics too.
 //!
-//! **Stepped** (#180, test builds only): [`Loader::stepped`] has no workers, and [`Loader::step`]
-//! does the jobs of the queue on the calling thread, by [`poll`], [`generate`] and [`complete`],
-//! which are what a worker's loop is made of. So a test gets the same bricks in the same order
-//! every time, with nothing to wait for.
+//! **Stepped** (#180, #181): [`Loader::stepped`] has no workers, and [`Loader::step`] does the jobs
+//! of the queue on the calling thread, by [`poll`], [`generate`] and [`complete`], which are what a
+//! worker's loop is made of. So a test, or the streaming mode of `client bench`, gets the same
+//! bricks in the same order every time, with nothing to wait for. The game starts workers and never
+//! steps; a stepped loader is one more field, which is `None` there.
 
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet};
@@ -185,7 +186,6 @@ pub struct Loader {
     arrivals: Receiver<(u64, Arrival)>,
     workers: Vec<JoinHandle<()>>,
     /// Where a stepped loader's jobs send what they make (see [`Loader::stepped`]); it has no workers.
-    #[cfg(test)]
     stepper: Option<Sender<(u64, Arrival)>>,
     /// Jobs not yet handed to the workers, for when they are busy with the lock.
     outbox: Vec<Job>,
@@ -227,10 +227,9 @@ impl Loader {
         Self::with(shared, arrivals, workers, bands)
     }
 
-    /// A loader with no threads, for a test: its jobs are done on the calling thread, a step at a
-    /// time ([`Loader::step`]), by the code that the threads run, so the same bricks come in the
-    /// same order every time.
-    #[cfg(test)]
+    /// A loader with no threads, for a test or the bench: its jobs are done on the calling thread, a
+    /// step at a time ([`Loader::step`]), by the code that the threads run, so the same bricks come
+    /// in the same order every time.
     pub fn stepped(source: Arc<dyn BrickSource>, camera: [f64; 3], bands: Bands) -> Self {
         let (shared, sender, arrivals) = Self::parts(source, camera, bands);
         let mut loader = Self::with(shared, arrivals, Vec::new(), bands);
@@ -243,7 +242,6 @@ impl Loader {
     /// would, and stops when the queue has none that it may take (it is empty, or the workers are
     /// [`MAX_AHEAD`] ahead of what has been taken in). Returns how many it did. Only a stepped
     /// loader is stepped; one with threads has no work to do here.
-    #[cfg(test)]
     pub fn step(&mut self, most: usize) -> usize {
         let Some(arrivals) = self.stepper.as_ref() else {
             return 0;
@@ -294,7 +292,6 @@ impl Loader {
             shared,
             arrivals,
             workers,
-            #[cfg(test)]
             stepper: None,
             outbox: Vec::new(),
             cancels: Vec::new(),

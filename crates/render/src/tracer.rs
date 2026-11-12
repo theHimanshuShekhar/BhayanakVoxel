@@ -350,6 +350,49 @@ fn runs(sorted: &[usize]) -> Vec<std::ops::Range<usize>> {
     out
 }
 
+/// The bytes that copying `update` to the GPU copy of `scene` writes, worked out on the CPU: what
+/// [`Tracer::update_scene`] adds to [`Tracer::uploaded_bytes`], the same on every machine. A
+/// rebuild writes all five buffers (the Planet's buffers have no room to spare for rings), and a
+/// patch of rings the header, if the levels changed, and the words it lists. A `Patched` update is
+/// counted as if it fits the buffers; it is not made for rings, which the bench streams.
+pub fn upload_bytes(scene: &Scene, update: &SceneUpdate) -> u64 {
+    match update {
+        SceneUpdate::Rebuilt => {
+            let spare = |len: usize| {
+                if scene.is_rings() {
+                    0
+                } else {
+                    spare_words(len)
+                }
+            };
+            let words = |len: usize, spare: usize| (len + spare).max(4) as u64 * 4;
+            size_of::<SceneHeader>() as u64
+                + words(scene.table.len(), 0)
+                + words(scene.regions.len(), 0)
+                + words(scene.brick_refs.len(), spare(scene.brick_refs.len()))
+                + words(scene.bricks.len(), spare(scene.bricks.len()))
+        }
+        SceneUpdate::Rings(patch) => {
+            let header = if patch.levels {
+                size_of::<SceneHeader>() as u64
+            } else {
+                0
+            };
+            header + patch.words() as u64 * 4
+        }
+        SceneUpdate::Patched {
+            regions,
+            brick_refs_from,
+            bricks_from,
+        } => {
+            let tail = |words: &[u32], from: usize| words.len().saturating_sub(from) as u64 * 4;
+            regions.len() as u64 * REGION_WORDS as u64 * 4
+                + tail(&scene.brick_refs, *brick_refs_from)
+                + tail(&scene.bricks, *bricks_from)
+        }
+    }
+}
+
 /// The Planet's packed bricks on the GPU. The buffers of an ordinary scene have room to grow,
 /// since an Edit appends to `brick_refs` and `bricks` (see [`Scene::update`]); those of rings
 /// are as big as the scene's, which has all its room already.
