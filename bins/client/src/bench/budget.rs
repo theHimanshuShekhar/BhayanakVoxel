@@ -25,11 +25,42 @@ pub struct Budgets {
     /// mode that is one sample.
     #[serde(default)]
     pub gpu_total: BTreeMap<String, f64>,
+    /// The gates of the real-time streaming mode (`--streaming --real-time`, #162). Every key is
+    /// required when the table is there, so that a missing one does not turn a gate off.
+    #[serde(default)]
+    pub streaming: Option<StreamingBudgets>,
+}
+
+/// What the real-time streaming mode is held to: the worst of its runs must be within each.
+#[derive(Clone, Copy, Debug, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StreamingBudgets {
+    /// Frame time, p99 over the frames of each path: milliseconds (a 60 Hz frame).
+    pub frame_time_p99_ms: f64,
+    /// CPU time of the frame thread, p99: milliseconds.
+    pub frame_cpu_p99_ms: f64,
+    /// Holes found by the scene thread's looks, summed: none.
+    pub holes: u64,
+    /// The scene the client draws from, at its most: MiB of its buffers in use.
+    pub scene_mib: f64,
 }
 
 impl Budgets {
     pub fn parse(text: &str) -> Result<Self, String> {
         let budgets: Self = toml::from_str(text).map_err(|e| e.to_string())?;
+        if let Some(s) = &budgets.streaming {
+            for (name, value) in [
+                ("frame_time_p99_ms", s.frame_time_p99_ms),
+                ("frame_cpu_p99_ms", s.frame_cpu_p99_ms),
+                ("scene_mib", s.scene_mib),
+            ] {
+                if !(value.is_finite() && value > 0.0) {
+                    return Err(format!(
+                        "the budget `streaming.{name}` is {value}, which is not a positive number"
+                    ));
+                }
+            }
+        }
         if let Some(mode) = budgets
             .gpu_total
             .keys()
@@ -165,5 +196,61 @@ mod tests {
         assert_eq!(budgets.passes["edits"], 1.0);
         assert_eq!(budgets.passes["edit_frame_thread"], 4.0);
         assert!(budgets.gpu_total.contains_key("primary"));
+        // The four gates of the real-time streaming mode (#162).
+        assert_eq!(
+            budgets.streaming,
+            Some(StreamingBudgets {
+                frame_time_p99_ms: 16.7,
+                frame_cpu_p99_ms: 8.0,
+                holes: 0,
+                scene_mib: 512.0,
+            })
+        );
+    }
+
+    #[test]
+    fn the_streaming_table_needs_every_key_and_positive_numbers_and_is_optional() {
+        let table = |body: &str| format!("[streaming]\n{body}");
+        let all = "frame_time_p99_ms = 16.7\nframe_cpu_p99_ms = 8\nholes = 0\nscene_mib = 512\n";
+        let parsed = Budgets::parse(&table(all)).unwrap().streaming.unwrap();
+        assert_eq!((parsed.frame_cpu_p99_ms, parsed.holes), (8.0, 0));
+        // Without the table there is no gate to hold, which the real-time mode refuses to run on.
+        assert_eq!(Budgets::parse("").unwrap().streaming, None);
+        // A key that is missing would turn its gate off: it is an error, as a misspelt one is.
+        for key in [
+            "frame_time_p99_ms",
+            "frame_cpu_p99_ms",
+            "holes",
+            "scene_mib",
+        ] {
+            let without: String = all
+                .lines()
+                .filter(|l| !l.starts_with(key))
+                .map(|l| format!("{l}\n"))
+                .collect();
+            assert!(Budgets::parse(&table(&without)).is_err(), "without {key}");
+        }
+        assert!(Budgets::parse(&table(&format!("{all}extra = 1"))).is_err());
+        for bad in [
+            "frame_time_p99_ms = 0",
+            "frame_cpu_p99_ms = -1",
+            "scene_mib = nan",
+            "holes = -1",
+            "holes = 0.5",
+        ] {
+            let key = bad.split(' ').next().unwrap();
+            let replaced: String = all
+                .lines()
+                .map(|l| {
+                    if l.starts_with(key) {
+                        bad.to_string()
+                    } else {
+                        l.to_string()
+                    }
+                })
+                .map(|l| format!("{l}\n"))
+                .collect();
+            assert!(Budgets::parse(&table(&replaced)).is_err(), "{bad}");
+        }
     }
 }

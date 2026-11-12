@@ -14,6 +14,8 @@ mod budget;
 mod caves;
 mod edits;
 mod path;
+mod process;
+mod realtime;
 mod report;
 mod stats;
 mod stream;
@@ -148,6 +150,17 @@ fn run(args: &Args) -> Result<u8, Box<dyn Error>> {
             "embedded".to_string(),
         ),
     };
+    // The real-time mode takes tens of minutes: a budgets file that cannot gate it is found out now.
+    let real_time_budgets = match (args.real_time, budgets.streaming) {
+        (true, None) => {
+            return Err(format!(
+                "budgets {source}: --real-time needs the [streaming] table (frame_time_p99_ms, \
+                 frame_cpu_p99_ms, holes, scene_mib)"
+            )
+            .into());
+        }
+        (_, budgets) => budgets,
+    };
     let mut plan = if args.short {
         Plan::short()
     } else {
@@ -257,6 +270,13 @@ fn run(args: &Args) -> Result<u8, Box<dyn Error>> {
     } else {
         None
     };
+    // The real-time mode runs after the stepped one, for the same reason: its own world and GPU.
+    let streaming_real_time = match real_time_budgets {
+        Some(budgets) if args.real_time => {
+            Some(realtime::run(!plan.patch, args.runs, resolution, &budgets)?)
+        }
+        _ => None,
+    };
 
     let report = Report {
         schema_version: SCHEMA_VERSION,
@@ -298,6 +318,7 @@ fn run(args: &Args) -> Result<u8, Box<dyn Error>> {
         edits,
         modes,
         streaming,
+        streaming_real_time,
     };
     let json = serde_json::to_string_pretty(&report)?;
     let file = args.out.join(REPORT_FILE);
@@ -328,7 +349,20 @@ fn run(args: &Args) -> Result<u8, Box<dyn Error>> {
             s.holes.total, s.holes.frames_with
         );
     }
-    let code = code.max(streaming_code);
+    // A gate of the real-time mode is a failure whatever `--diag` said of the floating one.
+    let real_time_code = report
+        .streaming_real_time
+        .as_ref()
+        .map_or(0, |r| realtime::exit_code(r, args.no_fail));
+    if real_time_code != 0
+        && let Some(r) = &report.streaming_real_time
+    {
+        eprintln!(
+            "streaming (real time): over its gates: {}",
+            r.gates.over.join(", ")
+        );
+    }
+    let code = code.max(streaming_code).max(real_time_code);
     if code != 0 {
         let (no_data, over) = failures(&report.modes);
         if !over.is_empty() {
@@ -644,6 +678,9 @@ fn print_summary(report: &Report) {
     if let Some(s) = &report.streaming {
         print_streaming(s);
     }
+    if let Some(r) = &report.streaming_real_time {
+        print_real_time(r);
+    }
     for a in &report.altitudes {
         eprintln!(
             "at {:>7.1} m: primary {} (p95 {}), upscale {}, reference {} (p95 {}) ms; bricks {:?}",
@@ -732,6 +769,95 @@ fn print_summary(report: &Report) {
         }
     }
     eprintln!();
+}
+
+/// The real-time mode's paths and gates, in brief: the worst of the runs.
+fn print_real_time(r: &realtime::RealTimeReport) {
+    eprintln!(
+        "streaming, real time ({} Planet, d0 {}; {} runs; not deterministic):",
+        r.planet,
+        r.d0,
+        r.runs.len()
+    );
+    for (n, run) in r.runs.iter().enumerate() {
+        let c = &run.cold_start;
+        eprintln!(
+            "  run {}: time to control {:.1} s (load {:.1} s), resident set complete after {:.1} s",
+            n + 1,
+            c.time_to_control_s,
+            c.load_s,
+            c.fill_s
+        );
+        for p in &run.paths {
+            eprintln!(
+                "    {:<20} {:>5} frames: frame p99 {:>6.2} worst {:>7.2} ms, cpu p99 {:>6.2} worst {:>7.2} ms, soft misses {:.2} a frame, holes {} in {} looks{}",
+                p.name,
+                p.frames,
+                p.frame_time.p99_ms,
+                p.frame_time.worst_ms,
+                p.frame_cpu.p99_ms,
+                p.frame_cpu.worst_ms,
+                p.soft_misses_per_frame,
+                p.holes,
+                p.hole_scans,
+                p.settle.map_or(String::new(), |s| format!(
+                    ", settled after {:.1} s{}",
+                    s.seconds,
+                    if s.settled {
+                        ""
+                    } else {
+                        " (not settled: the cap)"
+                    }
+                ))
+            );
+        }
+        let t = &run.scene_thread;
+        eprintln!(
+            "    scene thread: follow {:.0}, pack {:.0}, upload {:.0}, eviction {:.0}, coarse {:.0}, hole scans {:.0} ms; scene peak {:.0} MiB, store peak {} of {} bricks, process peak {} MiB",
+            t.follow_ms,
+            t.pack_ms,
+            t.upload_ms,
+            t.evict_ms,
+            t.coarse_ms,
+            t.hole_scan_ms,
+            run.memory.scene_peak_mib,
+            run.memory.store_peak_bricks,
+            run.memory.store_limit_bricks,
+            run.memory
+                .process_peak_mib
+                .map_or("n/a".to_string(), |m| format!("{m:.0}"))
+        );
+        for c in &run.sizing.checks {
+            eprintln!(
+                "    {:<24} constant {:>7.2} (limit {:>7.2}), measured {:>7.2}{}",
+                c.constant,
+                c.value,
+                c.limit,
+                c.measured,
+                if c.over { "  OVER" } else { "" }
+            );
+        }
+    }
+    let g = &r.gates;
+    for (name, limit) in [
+        ("frame time p99 (ms)", g.frame_time_p99_ms),
+        ("frame cpu p99 (ms)", g.frame_cpu_p99_ms),
+        ("holes", g.holes),
+        ("scene (MiB)", g.scene_mib),
+        ("store (bricks)", g.store_bricks),
+    ] {
+        eprintln!(
+            "  gate {name:<20} worst {:>12.2} limit {:>12.2}{}",
+            limit.worst,
+            limit.limit,
+            if limit.worst > limit.limit {
+                "  OVER"
+            } else {
+                ""
+            }
+        );
+    }
+    eprintln!("  edit latency: {}", r.edit_latency);
 }
 
 /// The streaming mode's counts, in brief.

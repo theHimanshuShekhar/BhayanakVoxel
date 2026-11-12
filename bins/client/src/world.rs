@@ -13,7 +13,7 @@ use sim::{Predictor, dig_seconds, target_hardness};
 use crate::clock::Clock;
 use crate::ghost::Ghost;
 use crate::loader::Loader;
-use crate::scene_worker::{LoaderStats, SceneWorker, Stats};
+use crate::scene_worker::{LoaderStats, SceneWorker, Spent, Stats};
 use crate::tool::{Tool, rotation_for};
 
 /// How many frames in a row the view must be unchanged before the reference image is taken to be
@@ -376,10 +376,30 @@ impl World {
             .set_budget(budget);
     }
 
-    /// Has the scene thread count soft misses in [`Stats::soft_misses`] (a diagnostic).
-    #[cfg(test)]
+    /// Has the scene thread count soft misses in [`Stats::soft_misses`], a few times a second (a
+    /// diagnostic: the real-time bench's, #162).
     pub fn count_soft_misses(&self) {
-        self.worker().count_soft_misses(true);
+        if let Some(worker) = &self.worker {
+            worker.count_soft_misses(true);
+        }
+    }
+
+    /// Has the scene thread look at every split brick for a hole every few seconds, and the time of
+    /// the parts of its rounds be added up (see [`World::scene_thread_time`]): what the real-time
+    /// bench asks for (#162).
+    pub fn measure_scene_thread(&self) {
+        if let Some(worker) = &self.worker {
+            worker.count_holes(true);
+            worker.time_work(true);
+        }
+    }
+
+    /// How long the scene thread has spent on the parts of its rounds since
+    /// [`World::measure_scene_thread`].
+    pub fn scene_thread_time(&self) -> Spent {
+        self.worker
+            .as_ref()
+            .map_or_else(Spent::default, SceneWorker::spent)
     }
 
     /// Has the scene thread count the soft misses (by level) and the holes for every publish, so
@@ -388,6 +408,22 @@ impl World {
         if let Some(worker) = &self.worker {
             worker.count_exactly();
         }
+    }
+
+    /// Has the scene thread count everything exactly once, for the scene as it is: the soft misses
+    /// by level, the holes and the words by level (see [`World::count_exactly`]), and takes what it
+    /// published, which the caller copies to the GPU. For the real-time bench, at full size, where
+    /// counting at every publish is a pass over every brick each time.
+    pub fn count_once_exactly(&mut self) -> Result<Option<SceneUpdate>, RingsFull> {
+        let Some(worker) = &self.worker else {
+            return Ok(None);
+        };
+        worker.count_exactly();
+        // A job is published with the counts of its own round, which are exact now.
+        let counted = worker.edit(Vec::new());
+        worker.stop_counting_exactly();
+        counted?;
+        self.take_ready(true)
     }
 
     /// Holds back (or lets go of) what the loader generates: while paused, nothing it generated

@@ -254,6 +254,14 @@ impl Offscreen {
     /// pictures are not looked at (the bench), where reading back every output image (15 MB at
     /// 1440p) would be most of the CPU time of a frame and leave the GPU idle between frames.
     pub fn draw_upscaled(&mut self, camera: &Camera) {
+        self.draw_upscaled_timed(camera);
+    }
+
+    /// [`Offscreen::draw_upscaled`], and how long the CPU took to encode the frame and submit it,
+    /// before it waited for the GPU: what the frame thread of a window spends on drawing (the wait
+    /// is the GPU's time, which the window does not wait for on the CPU).
+    pub fn draw_upscaled_timed(&mut self, camera: &Camera) -> std::time::Duration {
+        let began = std::time::Instant::now();
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
@@ -270,11 +278,13 @@ impl Offscreen {
         self.profiler.resolve(&mut encoder);
         // The uniforms of the next frame are written over these.
         self.queue.submit([encoder.finish()]);
+        let encoded = began.elapsed();
         self.profiler.collect(&self.device, true);
         // Without timers `collect` does not wait, and the frame is not over until it has.
         self.device
             .poll(wgpu::PollType::wait_indefinitely())
             .expect("device poll failed");
+        encoded
     }
 
     /// The G-buffer of the last frame of primary visibility ([`Offscreen::render`] or
