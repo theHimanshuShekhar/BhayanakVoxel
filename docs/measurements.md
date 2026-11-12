@@ -128,7 +128,7 @@ The 16 km Planet's extreme Voxel is 360 000 from the centre; the Zoom at 800 km 
 | `HEADROOM` | 1.25 | chosen | |
 | `BUDGET_OVERFLOW` | 0.1 | ADR 0004's 10–20% | |
 
-The streaming bench (`client bench --streaming`, #181) measures the four on the test Planet in CI and a stepped test fails when one is over its limit (see the entry below). The full-size, real-time run (#162, `client bench --streaming --real-time`; its section below is to be filled from the 4090 baseline) and the 320 km and speed-scaled LOD tickets (#166–#168) measure them again.
+The streaming bench (`client bench --streaming`, #181) measures the four on the test Planet in CI and a stepped test fails when one is over its limit (see the entry below). The full-size, real-time run (#162, `client bench --streaming --real-time`; its section is below) and the 320 km and speed-scaled LOD tickets (#166–#168) measure them again.
 
 ### The streaming bench on the test Planet (#181, 2026-11-12)
 
@@ -140,48 +140,51 @@ The streaming bench (`client bench --streaming`, #181) measures the four on the 
 - **Scene work:** follow 179 steps and 53 335 bricks changed; pack 1 717 steps, 46 187 bricks changed from 158 488 made by the loader; upload 228 steps; eviction 52 steps, 33 641 units, 113 091 bricks.
 - **Residency:** 280 570 counted bricks at the complete set, 288 776 at most, 287 041 at the end (budget 286 181 plus the 1% overflow); 67 Diverged bricks after the one Edit; the frame that made the Edit takes it (Edit latency 0: the Edit is made before the frame's look, as the game makes it, and a stepped scene thread finishes its round inside the look, so this field cannot show ADR 0006's bound; the stepped test of a busy scene thread and the real-thread tests hold that, and the real-time mode of #162 reports it: `streaming_real_time.runs[].edit_latency`, from the 4090), and results are taken in the frame they are published in (Outbox latency 0 in all 293 frames, until #145). **Holes:** none in 293 frames.
 
-### The streaming bench in real time at full size (#162, baseline to be filled)
+### The streaming bench in real time at full size (#162, 2026-11-12)
 
-`client bench --streaming --real-time`: the full-size Planet with real loader workers and a real scene thread, on the machine's clock, three runs of the paths in `docs/agents/benchmarking.md` ("The real-time mode"), on the RTX 4090. **No number below has been measured yet: each `to be filled from the 4090 baseline` is for the dev to fill from the first report** (`streaming_real_time`, the least and the most over the three runs, with the commit and the date), and #168 sets the soft-miss, settle-time and Edit-latency gates from it (time to control as the spec means it needs a server, which the bench does not have). The gates (`bins/client/bench-budgets.toml`, `[streaming]`) are frame time p99 16.7 ms, frame-thread CPU p99 8 ms, no holes, and memory within the scene's 512 MiB and the store's limit.
+`client bench --streaming --real-time`: the full-size Planet (`d0` of 1028.27 Voxels) with real loader workers and a real scene thread, on the machine's clock, three runs in one process of the paths in `docs/agents/benchmarking.md` ("The real-time mode"). Measured on the RTX 4090 (Vulkan, driver 616.92, offscreen at 1280×720, GPU clock locked) at `3934846` on 2026-11-12: the least and the most over the three runs. Where a row is for each path, the six values are in the order cold start / flight at 2 m / flight at 50 m / vertical take-off / 180 degree turn / stop after a flight. #168 sets the soft-miss, settle-time and Edit-latency gates from this baseline (time to control as the spec means it needs a server, which the bench does not have). The gates (`bins/client/bench-budgets.toml`, `[streaming]`) are frame time p99 16.7 ms, frame-thread CPU p99 8 ms, no holes, and memory within the scene's 512 MiB and the store's limit.
+
+**The frame-time gate fails at this baseline** (exit status 2): the p99 of the two flights is 23.5 to 31.3 ms at 2 m and 10.0 to 32.0 ms at 50 m. Every other gate is within its limit. The frames over the limit are of two kinds. One frame a flight (and one in the take-off of two runs, and in the stop) copies a very large patch: 13.5 to 37.3 MB in 3 260 to 12 841 writes, 9 to 41 ms of the frame thread's own time and 7 to 51 ms of GPU wait. The others, most of them (3 to 19 a flight), have no update at all, 0.3 ms of the frame thread's time, and a GPU wait of 19 to 33 ms where an ordinary frame of the same path waits 1.5 to 2 ms; they come in the half second after the large patch and again seconds later. **The GPU's own passes take 0.6 to 1.7 ms in those frames**, as in any other, so the wait is not the passes of the frame: 19 to 32 ms of it is something else (the copies of earlier frames still being worked on, the driver, wgpu's poll), which this report cannot tell apart. No slow frame overlapped a look for holes. The first frame of each cold start waits 60 to 65 ms with a 1.9 MB patch and passes of 0.6 ms.
 
 | Measure | Path | Least over the runs | Most over the runs | Gate |
 |---|---|---|---|---|
-| Frame time p99 (ms) | cold start | to be filled from the 4090 baseline | to be filled from the 4090 baseline | 16.7 |
-| | flight at 2 m | to be filled from the 4090 baseline | to be filled from the 4090 baseline | 16.7 |
-| | flight at 50 m | to be filled from the 4090 baseline | to be filled from the 4090 baseline | 16.7 |
-| | vertical take-off | to be filled from the 4090 baseline | to be filled from the 4090 baseline | 16.7 |
-| | 180 degree turn | to be filled from the 4090 baseline | to be filled from the 4090 baseline | 16.7 |
-| | stop after a flight | to be filled from the 4090 baseline | to be filled from the 4090 baseline | 16.7 |
-| Frame time worst (ms) | each path | to be filled from the 4090 baseline | to be filled from the 4090 baseline | |
-| Frame-thread CPU p99 (ms) | each path | to be filled from the 4090 baseline | to be filled from the 4090 baseline | 8.0 |
-| Frame-thread CPU worst (ms) | each path | to be filled from the 4090 baseline | to be filled from the 4090 baseline | |
-| Frames over the frame-time limit | each path | to be filled from the 4090 baseline | to be filled from the 4090 baseline | not gated |
-| Frames over the limit by the update they had (none, patch, rebuild) | each path | to be filled from the 4090 baseline | to be filled from the 4090 baseline | not gated |
-| The slowest frame of a path: where its time went (recentre, update with its writes and bytes, encode, submit, GPU wait, the GPU's own pass times; `slowest[0]`) | each path | to be filled from the 4090 baseline | to be filled from the 4090 baseline | not gated |
-| Soft misses per frame | each path | to be filled from the 4090 baseline | to be filled from the 4090 baseline | not gated (#168) |
-| Holes found by the scene thread's looks (sampled, see "What the holes gate can and cannot catch") | whole run | to be filled from the 4090 baseline | to be filled from the 4090 baseline | 0 |
-| Looks for holes | whole run, fewest in a path | to be filled from the 4090 baseline | to be filled from the 4090 baseline | at least 1 |
-| Hole looks' share of the scene thread's busy time (the forced end look is not in a path's) | each path | to be filled from the 4090 baseline | to be filled from the 4090 baseline | |
-| Level 0 under the camera, from the start of the load (s; not the spec's time to control) | cold start | to be filled from the 4090 baseline | to be filled from the 4090 baseline | not gated |
-| Settle time after a flight (s) | stop after a flight | to be filled from the 4090 baseline | to be filled from the 4090 baseline | not gated (#168) |
-| Edit latency (frames; ADR 0006's bound is 1) | one dig at the Spawn | to be filled from the 4090 baseline | to be filled from the 4090 baseline | not gated |
-| Edit latency (ms), and the Edit's own call (ms) | one dig at the Spawn | to be filled from the 4090 baseline | to be filled from the 4090 baseline | not gated |
-| Scene thread, ms by category: follow, pack, upload, eviction | whole run | to be filled from the 4090 baseline | to be filled from the 4090 baseline | |
-| Scene's buffers in use, peak (MiB; not VRAM) | whole run | to be filled from the 4090 baseline | to be filled from the 4090 baseline | 512 |
-| Scene's buffers as the GPU reserves them (MiB; the VRAM) | whole run | to be filled from the 4090 baseline | to be filled from the 4090 baseline | not gated |
-| Store peak (bricks) against its limit | whole run | to be filled from the 4090 baseline | to be filled from the 4090 baseline | the store's limit |
-| The largest resident set sampled during the run (MiB; every 30 frames of the paths; run 1 is the cleanest reading) | whole run | to be filled from the 4090 baseline | to be filled from the 4090 baseline | not gated |
-| The whole process's peak (MiB; includes the normal bench and earlier runs) | whole run | to be filled from the 4090 baseline | to be filled from the 4090 baseline | not gated |
+| Frame time p99 (ms) | cold start | 4.9 | 4.9 | 16.7 |
+|  | flight at 2 m | 23.5 | 31.3 | 16.7 |
+|  | flight at 50 m | 10.0 | 32.0 | 16.7 |
+|  | vertical take-off | 2.0 | 2.9 | 16.7 |
+|  | 180 degree turn | 1.9 | 1.9 | 16.7 |
+|  | stop after a flight | 3.3 | 4.4 | 16.7 |
+| Frame time worst (ms) | each path, in the order above | 61.6 / 54.9 / 31.5 / 10.7 / 1.9 / 42.4 | 66.3 / 91.6 / 55.8 / 58.9 / 2.0 / 42.8 |  |
+| Frame-thread CPU p99 (ms) | each path, in the order above | 2.19 / 0.60 / 0.55 / 0.39 / 0.16 / 1.51 | 2.26 / 0.68 / 0.70 / 0.58 / 0.17 / 1.69 | 8.0 |
+| Frame-thread CPU worst (ms) | each path, in the order above | 4.1 / 35.5 / 9.2 / 6.0 / 0.3 / 27.1 | 4.8 / 40.9 / 25.3 / 25.1 / 0.3 / 28.8 |  |
+| Frames over the frame-time limit | each path, in the order above | 1 / 10 / 4 / 0 / 0 / 1 | 1 / 20 / 12 / 1 / 0 / 4 | not gated |
+| Frames over the limit by the update they had (none, patch, rebuild; each taken on its own across the runs) | each path, in the order above | 0, 1, 0 / 9, 1, 0 / 3, 1, 0 / 0, 0, 0 / 0, 0, 0 / 0, 1, 0 | 0, 1, 0 / 19, 1, 0 / 11, 1, 0 / 0, 1, 0 / 0, 0, 0 / 3, 1, 0 | not gated |
+| Soft misses per frame | each path, in the order above | 99 503 / 15 156 / 108 / 0 / 0 / 50 881 | 99 918 / 17 832 / 213 / 0 / 0 / 67 556 | not gated (#168) |
+| Holes found by the scene thread's looks (sampled, see "What the holes gate can and cannot catch") | whole run | 0 | 0 | 0 |
+| Looks for holes | whole run; fewest in a path | 80; 1 | 85; 1 | at least 1 |
+| Hole looks' share of the scene thread's busy time (the forced end look is not in a path's) | whole run | 5.7% | 5.9% |  |
+| The forced look at the end of a path (ms) | each path, in the order above | 376 / 717 / 752 / 620 / 414 / 403 | 384 / 739 / 756 / 712 / 416 / 420 |  |
+| Level 0 under the camera, from the start of the load (s; not the spec's time to control) | cold start | 7.8 | 7.9 | not gated |
+| The fill, until the resident set is complete (s) | cold start | 254 | 265 | not gated |
+| Settle time after a flight (s) | stop after a flight | 61.7 | 83.6 | not gated (#168) |
+| Edit latency (frames; ADR 0006's bound is 1) | one dig at the Spawn | 1 | 1 | not gated |
+| Edit latency (ms), and the Edit's own call (ms) | one dig at the Spawn | 19.2, 2.3 | 20.4, 2.8 | not gated |
+| Scene thread, seconds by category: follow, pack, upload, eviction | whole run | 127.3, 122.4, 156.5, 5.8 | 138.7, 138.9, 165.1, 6.3 |  |
+| Scene's buffers in use, peak (MiB; not VRAM) | whole run | 472.5 | 472.5 | 512 |
+| Scene's buffers as the GPU reserves them (MiB; the VRAM) | whole run | 942.9 | 942.9 | not gated |
+| Store peak (bricks) against its limit | whole run | 22 053 420 | 22 069 755 | 23 028 693 |
+| The largest resident set sampled during the run (MiB; every 30 frames of the paths; run 1 is the cleanest reading) | whole run | 10 532 | 10 756 | not gated |
+| The whole process's peak (MiB; includes the normal bench and earlier runs) | whole run | 11 052 | 11 181 | not gated |
 
-The sizing constants at full size, measured with the resident set complete (`streaming_real_time.runs[].sizing`), which replace the hand measurements in the table above and settle what the test Planet could only bound (the Guard's words per brick at full size, `WORDS_PER_BRICK`):
+The sizing constants at full size, measured with the resident set complete (`streaming_real_time.runs[].sizing`; the three runs give the same counts), which replace the hand measurements in the table above and settle what the test Planet could only bound (the Guard's words per brick at full size, `WORDS_PER_BRICK`):
 
 | Constant | Value | Measured at full size (4090 baseline run) | Limit |
 |---|---|---|---|
-| `BRICKS_PER_D0_SQUARED` | 3.25 | to be filled from the 4090 baseline | 4.06 |
-| `REFS_PER_BRICK` | 1.0 | to be filled from the 4090 baseline | 1.25 |
-| `WORDS_PER_BRICK` | 34.2 | to be filled from the 4090 baseline | 42.75 |
-| `STREAMED_PER_D0_SQUARED` | 19.8 | to be filled from the 4090 baseline | 24.75 (no share of level 0 taken out at full size) |
-| Words per Guard brick | | to be filled from the 4090 baseline | |
+| `BRICKS_PER_D0_SQUARED` | 3.25 | 3.177 (3 359 242 Ring bricks) | 4.06 |
+| `REFS_PER_BRICK` | 1.0 | 1.000 | 1.25 |
+| `WORDS_PER_BRICK` | 34.2 | 33.95 | 42.75 |
+| `STREAMED_PER_D0_SQUARED` | 19.8 | 14.45 beyond the start (20 899 843 streamed, 5 626 235 at the start), against 14.47: the constant less the start's share | 18.09 |
+| Words per Guard brick | | 51.49 (57 236 Guard bricks) | |
 
 Edit latency is measured in this mode, once a run: one dig at the Spawn after the stop path, made before the frame's look at the scene as the game does, in frames and in milliseconds (`runs[].edit_latency`, with `min` and `max`; null with `edit_not_made` saying why if the dig could not be made). It is reported, not gated; the table above has its place.
 
