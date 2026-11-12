@@ -582,6 +582,12 @@ pub struct PathReport {
     /// `slowest`: with `index` and `at_ms` to read against the slow frames, and each one's time,
     /// copies and wait.
     pub largest_updates: Vec<SlowFrame>,
+    /// The most that the scene was behind the camera at a publish during the path: the distance
+    /// between the camera the scene thread had been told and the scene's centre, in Voxels and in
+    /// `d0` (the report's, so that it reads against the jump: 2 `d0`). A scene that is always
+    /// walked to, never made again, falls behind without limit above the speed it keeps up at.
+    pub scene_lag_voxels_max: f64,
+    pub scene_lag_d0_max: f64,
     /// What the frames' uploads came to, and how often the budget cut them.
     pub upload: PathUpload,
     /// Soft misses a frame reported (counted by the scene thread a few times a second, so a frame
@@ -861,6 +867,11 @@ impl RealTimeReport {
     }
 }
 
+/// The members that have no least and most over the runs, and are in the runs only: a list of the
+/// places of frames (`over_limit_at`) is a different list in each run, and the i-th place of one
+/// run is not comparable with the i-th of another.
+const NOT_IN_THE_ENVELOPE: &[&str] = &["over_limit_at"];
+
 /// Each number of `values`, which are of one shape, at its least and its most. Objects and arrays
 /// of one length are done member by member. A boolean is least when every run's is true and most
 /// when any is (false below true), so a flag that says "over" says it for the worst run. Anything
@@ -871,6 +882,9 @@ fn envelope(values: &[&Value]) -> (Value, Value) {
         Value::Object(fields) if values.iter().all(|v| v.is_object()) => {
             let (mut least, mut most) = (serde_json::Map::new(), serde_json::Map::new());
             for name in fields.keys() {
+                if NOT_IN_THE_ENVELOPE.contains(&name.as_str()) {
+                    continue;
+                }
                 let members: Option<Vec<&Value>> = values.iter().map(|v| v.get(name)).collect();
                 let (low, high) = members.map_or((Value::Null, Value::Null), |m| envelope(&m));
                 least.insert(name.clone(), low);
@@ -1039,6 +1053,8 @@ struct Frame {
     soft_misses: usize,
     /// Whether the scene thread held work back in this frame for the upload budget.
     throttled: bool,
+    /// The scene's lag behind the camera in Voxels (see [`PathReport::scene_lag_voxels_max`]).
+    lag: f64,
     /// Whether the look at the scene in this frame has the newest Edit in it (from this frame or an
     /// earlier one), and when it was done.
     edit_taken: bool,
@@ -1083,6 +1099,8 @@ struct Capture {
     over_limit_at: Vec<usize>,
     /// The updates with the most bytes.
     largest: Worst,
+    /// The largest lag of the scene behind the camera, in Voxels.
+    lag_max: f64,
 }
 
 impl Capture {
@@ -1104,6 +1122,7 @@ impl Capture {
             worst: Worst::new(),
             over_limit_at: Vec::new(),
             largest: Worst::by(|f| f.upload_bytes as f64),
+            lag_max: 0.0,
             spent: world.scene_thread_time(),
             scans: work.hole_scans,
             holes: work.holes_found,
@@ -1127,6 +1146,7 @@ impl Capture {
             self.over_limit += 1;
             self.over_by_update.add(frame.parts.update);
         }
+        self.lag_max = self.lag_max.max(frame.lag);
         self.over_budget.add(frame.parts.over_budget);
         if frame.parts.grown_bytes > 0 {
             self.growth_frames += 1;
@@ -1195,6 +1215,11 @@ impl Capture {
             slowest: self.worst.sorted(),
             over_limit_at: self.over_limit_at,
             largest_updates: self.largest.sorted(),
+            scene_lag_voxels_max: self.lag_max,
+            scene_lag_d0_max: world
+                .stats()
+                .bands
+                .map_or(0.0, |bands| self.lag_max / bands.d0()),
             upload: PathUpload {
                 updates: self.update_ms.len(),
                 time: Spread::of(&self.update_ms),
@@ -1410,6 +1435,7 @@ impl<'a> Session<'a> {
             parts,
             soft_misses: self.world.stats().soft_misses,
             throttled: self.world.stats().throttled,
+            lag: self.world.stats().lag,
             edit_taken,
             taken_at,
         })
@@ -1908,6 +1934,8 @@ mod tests {
             slowest: vec![slow_frame(0, frame_p99 * 2.0)],
             over_limit_at: Vec::new(),
             largest_updates: Vec::new(),
+            scene_lag_voxels_max: 0.0,
+            scene_lag_d0_max: 0.0,
             upload: PathUpload::default(),
             soft_misses: Series::default(),
             soft_misses_per_frame: 0.0,
@@ -2341,6 +2369,8 @@ mod tests {
                 "largest_updates",
                 "name",
                 "over_limit_at",
+                "scene_lag_d0_max",
+                "scene_lag_voxels_max",
                 "scene_thread",
                 "seconds",
                 "settle",
@@ -2683,6 +2713,63 @@ mod tests {
                 rebuild: 1
             }
         );
+    }
+
+    #[test]
+    fn the_places_of_the_frames_over_the_limit_are_in_each_run_and_not_in_the_min_and_max() {
+        use serde_json::json;
+        // Two runs with lists of the same length, which the envelope used to take place by place
+        // (the least and most of the i-th frame's index, which means nothing), and one more.
+        let report = RealTimeReport::new(
+            "test".into(),
+            64.0,
+            vec![
+                run_with(|r| r.paths[1].over_limit_at = vec![10, 50, 90]),
+                run_with(|r| r.paths[1].over_limit_at = vec![300, 310, 700]),
+            ],
+            &BUDGETS,
+        );
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(
+            json["runs"][0]["paths"][1]["over_limit_at"],
+            json!([10, 50, 90])
+        );
+        assert_eq!(
+            json["runs"][1]["paths"][1]["over_limit_at"],
+            json!([300, 310, 700])
+        );
+        for edge in ["min", "max"] {
+            let path = json[edge]["paths"][1].as_object().unwrap();
+            assert!(
+                !path.contains_key("over_limit_at"),
+                "{edge} has the places of one run's frames"
+            );
+            // The rest of the path is still in it.
+            assert!(path.contains_key("largest_updates") && path.contains_key("upload"));
+        }
+    }
+
+    #[test]
+    fn the_scene_lag_of_a_path_is_in_the_report_and_its_min_and_max_are_the_runs() {
+        let report = RealTimeReport::new(
+            "test".into(),
+            64.0,
+            vec![
+                run_with(|r| {
+                    r.paths[1].scene_lag_voxels_max = 640.0;
+                    r.paths[1].scene_lag_d0_max = 10.0;
+                }),
+                run_with(|r| {
+                    r.paths[1].scene_lag_voxels_max = 6400.0;
+                    r.paths[1].scene_lag_d0_max = 100.0;
+                }),
+            ],
+            &BUDGETS,
+        );
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["min"]["paths"][1]["scene_lag_voxels_max"], 640.0);
+        assert_eq!(json["max"]["paths"][1]["scene_lag_voxels_max"], 6400.0);
+        assert_eq!(json["max"]["paths"][1]["scene_lag_d0_max"], 100.0);
     }
 
     #[test]

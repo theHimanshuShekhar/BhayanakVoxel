@@ -29,7 +29,13 @@ use super::stream::StreamReport;
 /// (the five frames whose update copied the most bytes, in the form of `slowest`) and
 /// `over_limit_at` (the places of the first frames over the limit), to read the slow frames against
 /// the big updates. The stepped mode's counts and hash are not changed by these.
-pub const SCHEMA_VERSION: u32 = 13;
+///
+/// 14 added in each real-time path how far the scene was behind the camera (`scene_lag_voxels_max`
+/// and `scene_lag_d0_max`: the largest distance, at a publish, between the camera the scene thread
+/// had been told and the scene's centre), and took `over_limit_at` out of `min` and `max`: a list
+/// of the places of frames is of one run, and stays under `runs` only. The stepped mode's counts
+/// and hash are not changed.
+pub const SCHEMA_VERSION: u32 = 14;
 
 /// One timed thing (a pass, or the GPU total of a profiler frame) in one mode, against its
 /// budget. In reference mode a profiler frame is one sample, so the entries of that mode have
@@ -520,7 +526,7 @@ mod tests {
                 "streaming_real_time"
             ]
         );
-        assert_eq!(json["schema_version"], 13);
+        assert_eq!(json["schema_version"], 14);
         assert_eq!(json["streaming"], serde_json::Value::Null);
         assert_eq!(json["streaming_real_time"], serde_json::Value::Null);
         assert_eq!(

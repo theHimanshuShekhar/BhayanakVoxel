@@ -3247,9 +3247,62 @@ fn put_the_camera_far_away(
     far: f64,
     teleport: bool,
 ) -> (usize, usize, render::UploadCost, u64, usize, bool) {
+    let (rebuilds, patches, follow, listed, frames, there, _) =
+        put_the_camera_far_away_after(Before::Nothing, budget, far, teleport);
+    (rebuilds, patches, follow, listed, frames, there)
+}
+
+/// What the scene thread has been through before the camera is put far away (see
+/// [`put_the_camera_far_away_after`]), that its rate of what a Voxel of the move costs learns from.
+#[derive(Clone, Copy, Debug)]
+enum Before {
+    Nothing,
+    /// 40 rounds in which the camera moves a Voxel (to and fro within one bucket of the
+    /// selection) and nothing changes: each is a step that moved and cost nothing.
+    QuietSteps,
+    /// 20 teleports (to the far place and back), each a rebuild, which no patch's cost is of.
+    Teleports,
+}
+
+/// [`put_the_camera_far_away`] after `before`, and the largest lag of the scene behind the camera
+/// that a frame saw ([`Stats::lag`]) as the last of the tuple.
+fn put_the_camera_far_away_after(
+    before: Before,
+    budget: render::UploadCost,
+    far: f64,
+    teleport: bool,
+) -> (usize, usize, render::UploadCost, u64, usize, bool, f64) {
     let (mut world, _server, camera) = spawned_world(Run::Stepped);
     world.count_exactly();
     fill(&mut world, camera.position);
+    {
+        let (ahead, _) = tangents(camera.horizon_up);
+        let at = |metres: f64| -> [f64; 3] {
+            std::array::from_fn(|a| camera.position[a] + ahead[a] * metres)
+        };
+        match before {
+            Before::Nothing => {}
+            Before::QuietSteps => {
+                let patches_before = world.stats().work.follow_bricks;
+                for n in 0..40 {
+                    world.recentre(at((n % 2) as f64)).unwrap();
+                }
+                let changed = world.stats().work.follow_bricks - patches_before;
+                // The steps were quiet: the bricks that changed are those of the first (the
+                // selection settling on a camera that is a Voxel off the one it was filled at).
+                assert!(changed < 200, "{changed} bricks changed in the quiet steps");
+            }
+            Before::Teleports => {
+                let there = over_the_ground(&world.store(), at(far));
+                for _ in 0..20 {
+                    world.recentre(there).unwrap();
+                    world.recentre(camera.position).unwrap();
+                }
+            }
+        }
+        world.recentre(camera.position).unwrap();
+        fill(&mut world, camera.position);
+    }
     world.worker().set_upload_budget(budget);
     world.worker().forget_largest();
     let mut gpu = GpuCopy::of(world.scene());
@@ -3266,10 +3319,12 @@ fn put_the_camera_far_away(
         }
     }
     let (mut rebuilds, mut patches, mut listed_most) = (0, 0, 0);
-    let mut frames = 0;
+    let (mut frames, mut lag) = (0, 0.0f64);
     let mut patience = Patience::new(Duration::from_secs(180));
     loop {
-        match world.recentre(target).unwrap() {
+        let update = world.recentre(target).unwrap();
+        lag = lag.max(world.stats().lag);
+        match update {
             Some(SceneUpdate::Rebuilt) => {
                 rebuilds += 1;
                 gpu.write(world.scene(), &SceneUpdate::Rebuilt);
@@ -3296,6 +3351,7 @@ fn put_the_camera_far_away(
         listed_most,
         frames,
         world.stats().camera == Some(target),
+        lag,
     )
 }
 
@@ -3335,6 +3391,106 @@ fn a_camera_that_the_scene_fell_far_behind_is_walked_to_in_steps_within_the_budg
     // is cheaper than walking.
     let (rebuilds, ..) = put_the_camera_far_away(WALKING_BUDGET, far, true);
     assert_eq!(rebuilds, 1, "a teleport is not made again");
+}
+
+/// A budget at which the floor under the rate of a follow step's cost is what keeps a step in it,
+/// on this Planet: a step of the least size (a bucket of 4 Voxels of travel) costs 100 to 140 KB,
+/// and one of the cap, 64 Voxels, 200 to 260 KB. The stepped runs are the same every time, so the
+/// margins hold.
+const FLOOR_BUDGET: render::UploadCost = render::UploadCost {
+    bytes: 192 << 10,
+    writes: 32,
+};
+
+/// What a follow step costs when the measured cost of a Voxel is what limits it and not the cap of
+/// half a jump (64 Voxels here, 1 028 at full size). The rate that sizes a step learns from the
+/// steps before; one that moved and changed nothing, and a rebuild, cost nothing, and a rate that
+/// followed them down made the next step as long as the cap (the 34 MB operation of the first
+/// 4090 run). A floor under the rate stops that, and bounds a step whatever came before.
+#[test]
+fn a_follow_step_is_within_the_budget_after_a_run_of_quiet_steps_and_after_teleports() {
+    let far = 4.0 * render::scene::JUMP * D0;
+    for before in [Before::Nothing, Before::QuietSteps, Before::Teleports] {
+        let (rebuilds, patches, follow, _, frames, there, lag) =
+            put_the_camera_far_away_after(before, FLOOR_BUDGET, far, false);
+        eprintln!(
+            "{before:?}: {rebuilds} rebuilds, {patches} patches, {follow:?}, {frames} frames, lag {lag}"
+        );
+        assert!(there, "{before:?}: the scene did not reach the camera");
+        assert_eq!(rebuilds, 0, "{before:?}: the scene was made again");
+        // Every step costs what the budget lets it, though the cap would let it be 64 Voxels
+        // (over the budget here): the budget sized it.
+        assert!(
+            follow.bytes <= FLOOR_BUDGET.bytes && follow.writes <= FLOOR_BUDGET.writes,
+            "{before:?}: a follow step of {follow:?} is over the budget of {FLOOR_BUDGET:?}"
+        );
+        assert!(patches > 8, "{before:?}: {patches} patches");
+        // The scene was behind by about all of the way when it first published: what `Stats::lag`
+        // is for, and it is a distance and not a count.
+        assert!(
+            lag > far * 0.5 && lag <= far + 1.0,
+            "{before:?}: the scene was at most {lag} Voxels behind a camera {far} away"
+        );
+    }
+}
+
+/// A camera that is put somewhere in one move (a teleport) but ends within a jump of where the
+/// scene is (the scene was behind it, and it was put back toward it) is walked to, in steps
+/// within the budget: it is not patched in one operation of up to two `d0`, outside the budget
+/// (here 250 KB in one, against steps of 100 to 130 KB, and a budget of 192 KB between).
+#[test]
+fn a_teleport_that_ends_within_a_jump_of_the_scene_is_walked_to_within_the_budget() {
+    let (mut world, _server, camera) = spawned_world(Run::Stepped);
+    world.count_exactly();
+    fill(&mut world, camera.position);
+    world.worker().set_upload_budget(FLOOR_BUDGET);
+    world.worker().forget_largest();
+    let mut gpu = GpuCopy::of(world.scene());
+    let (ahead, _) = tangents(camera.horizon_up);
+    let jump = render::scene::JUMP * D0;
+    let along = |world: &World, voxels: f64| {
+        let moved = std::array::from_fn(|a| camera.position[a] + ahead[a] * voxels);
+        over_the_ground(&world.store(), moved)
+    };
+    // The camera is told of a place a jump behind the scene, then put 0.9 of a jump ahead of it:
+    // a move of 1.9 jumps, ending 0.9 jump from the scene, which has not looked.
+    let behind = along(&world, -jump * 0.9);
+    let target = along(&world, jump * 0.9);
+    world.worker().follow_moving(behind, [0.0; 3]);
+    world.worker().follow_moving(target, [0.0; 3]);
+    let (mut rebuilds, mut patches, mut frames) = (0, 0, 0);
+    let mut patience = Patience::new(Duration::from_secs(180));
+    loop {
+        match world.recentre(target).unwrap() {
+            Some(SceneUpdate::Rebuilt) => {
+                rebuilds += 1;
+                gpu.write(world.scene(), &SceneUpdate::Rebuilt);
+            }
+            Some(update) => {
+                patches += 1;
+                gpu.write(world.scene(), &update);
+            }
+            None => {}
+        }
+        gpu.assert_is(world.scene(), frames);
+        assert_eq!(world.stats().holes, 0, "frame {frames}: a hole");
+        frames += 1;
+        if idle(&world) && !world.stats().throttled && world.stats().camera == Some(target) {
+            break;
+        }
+        patience.wait(&world, || "the backlog does not drain".into());
+    }
+    let follow = world.stats().largest_follow;
+    eprintln!("{rebuilds} rebuilds, {patches} patches, {follow:?}");
+    assert_eq!(
+        rebuilds, 0,
+        "the scene was made again for a move within a jump"
+    );
+    assert!(
+        follow.bytes <= FLOOR_BUDGET.bytes && follow.writes <= FLOOR_BUDGET.writes,
+        "a follow step of {follow:?} is over the budget of {FLOOR_BUDGET:?}"
+    );
+    assert!(patches > 2, "{patches} patches: it was not walked");
 }
 
 #[test]
@@ -3388,12 +3544,18 @@ fn with_the_default_budget_a_fill_takes_about_as_many_frames_as_one_with_no_budg
 
 /// A scene thread that holds work back for the budget goes on as soon as the frame thread has
 /// taken what waited, not when its own sleep ends. With a budget of one byte every round ends with
-/// the thread holding work back, and a frame every 2 ms takes what it published: the camera is
-/// still, so nothing but the take can wake it. A thread that slept out `THROTTLED_WAIT` (20 ms)
-/// instead would publish for a tenth of the frames (with the machine busy, as in a full run of the
-/// module, the thread that is woken does about half, so the bound is a quarter); on the 4090, where a timed wait of a
-/// millisecond lasts a clock tick, the fill was cut to every second frame. Real threads, so it is
-/// in `.github/real-thread-tests.txt`.
+/// the thread holding work back and waiting for the frame thread, and a frame every 2 ms takes what
+/// it published: the camera is still, so nothing but the take can wake it. The measure is how the
+/// thread's waits ended (`SceneWorker::throttled_waits`): by the wake or by the timeout
+/// (`THROTTLED_WAIT`, 20 ms). The share of frames that had an update, which this test counted
+/// before, depends on how much CPU the scene thread gets (5 of 250 in the real-thread job, where
+/// the other tests are running, and 270 of 287 alone), and a thread that is woken late looks like
+/// one that slept out its wait. A wait that ends by the timeout is one that nothing woke in 20 ms,
+/// which a frame every 2 ms does not allow unless the frame thread itself was stalled, so a loaded
+/// machine adds few; the allowance is half. The loop goes on until the thread has waited 40 times
+/// (or 8 s), as a starved thread waits few times in a short run. With the `notify_one` of
+/// `SceneWorker::take` removed every wait ends by the timeout (10 of 10, 22 of 22 in scratch
+/// runs). Real threads, so it is in `.github/real-thread-tests.txt`.
 #[test]
 fn a_throttled_scene_thread_goes_on_when_the_frame_thread_takes_what_waited() {
     let (mut world, _server, camera) = spawned_world(Run::Threads(2));
@@ -3403,7 +3565,10 @@ fn a_throttled_scene_thread_goes_on_when_the_frame_thread_takes_what_waited() {
     });
     let (mut frames, mut with_update) = (0, 0);
     let began = Instant::now();
-    while began.elapsed() < Duration::from_millis(600) && !idle(&world) {
+    while began.elapsed() < Duration::from_secs(8)
+        && world.worker().throttled_waits().0 < 40
+        && !idle(&world)
+    {
         // Updates counted only while the loader still has work: a world that has filled in
         // publishes nothing, whatever wakes the thread.
         let loading = world.loader().is_some_and(|l| l.pending > 0);
@@ -3414,12 +3579,20 @@ fn a_throttled_scene_thread_goes_on_when_the_frame_thread_takes_what_waited() {
         }
         std::thread::sleep(Duration::from_millis(2));
     }
-    eprintln!("{with_update} of {frames} frames had an update");
+    let (waits, timeouts) = world.worker().throttled_waits();
+    eprintln!(
+        "{with_update} of {frames} frames had an update; {timeouts} of {waits} waits timed out"
+    );
     assert!(frames >= 50, "only {frames} frames while the loader worked");
     assert!(
-        with_update * 4 >= frames,
-        "only {with_update} of {frames} frames had an update: the thread slept on after the frame \
-         thread took what waited"
+        waits >= 10,
+        "the thread waited {waits} times in {:?}: it did not hold work back, or was starved",
+        began.elapsed()
+    );
+    assert!(
+        timeouts * 2 <= waits,
+        "{timeouts} of {waits} waits of the scene thread ended by the timeout: it slept on after \
+         the frame thread took what waited"
     );
 }
 

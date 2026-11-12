@@ -117,6 +117,14 @@ const FOLLOW_SHARE: (u64, u64) = (1, 4);
 /// little over the 4090's flights (34 KB and 1.9 copies a Voxel at 2 m): so that the first step
 /// of a long walk is not the one that is too long.
 const FOLLOW_RATE: (f64, f64) = (64.0 * 1024.0, 4.0);
+/// The least that a Voxel of the camera's move is taken to cost, whatever the steps measured:
+/// half of [`FOLLOW_RATE`], a little under the 4090's 34 KB at 2 m. A step that moved the scene
+/// a Voxel and changed nothing costs nothing, and a rebuild is counted as costing nothing over a
+/// long distance, so without a floor a run of such steps halved the rate to nothing and the next
+/// step was as long as the cap (half a jump, 1 028 Voxels at full size, the 34 MB operation of
+/// the first 4090 run). With it a step is at most `FOLLOW_SHARE` of the budget over this, 64
+/// Voxels at the default budget, whatever came before.
+const FOLLOW_RATE_FLOOR: (f64, f64) = (32.0 * 1024.0, 2.0);
 
 /// How many jobs of the loader are done in one step of a stepped scene thread (see
 /// [`SceneWorker::step`]): about what the real workers make between two frames of a test, so that a
@@ -291,6 +299,11 @@ pub struct Stats {
     /// The thread is holding work back, to keep what the frame thread uploads to its budget (see
     /// [`UPLOAD_BUDGET`]): as of this publish.
     pub throttled: bool,
+    /// The most, in Voxels, that the scene's centre was from the camera the thread was last told
+    /// at a publish since the frame thread last took one (a publish that merged into the one that
+    /// waited keeps the larger): how far behind the camera the scene was. 0 for a scene that is
+    /// where the camera is. See [`Engine::follow`].
+    pub lag: f64,
     pub loader: LoaderStats,
     /// What costs more to find out, as of a few times a second.
     pub slow: Arc<Slow>,
@@ -441,6 +454,7 @@ fn stats_of(scene: &Scene, loader: &Loader, slow: &Arc<Slow>, eviction: Eviction
         holes: 0,
         work: Done::default(),
         throttled: false,
+        lag: 0.0,
         loader: LoaderStats::of(loader),
         slow: Arc::clone(slow),
         eviction,
@@ -582,6 +596,14 @@ struct Shared {
     /// a thread that holds work back for the budget goes on at once (see
     /// [`Engine::await_work`]), and does not sleep through the rest of the frame.
     taken: AtomicBool,
+    /// How many throttled waits (see [`Engine::await_work`]) the thread began, and how many of
+    /// them ended by the timeout and not by being woken: for the test that the frame thread's
+    /// take wakes it, which cannot tell a wake from the timeout by counting frames when the
+    /// machine is busy.
+    #[cfg(test)]
+    throttled_waits: AtomicU64,
+    #[cfg(test)]
+    throttled_timeouts: AtomicU64,
     /// The upload budget (see [`UPLOAD_BUDGET`]): bytes, and copies.
     budget_bytes: AtomicU64,
     budget_writes: AtomicU32,
@@ -702,6 +724,10 @@ impl SceneWorker {
             time_work: AtomicBool::new(false),
             spent: std::array::from_fn(|_| AtomicU64::new(0)),
             taken: AtomicBool::new(false),
+            #[cfg(test)]
+            throttled_waits: AtomicU64::new(0),
+            #[cfg(test)]
+            throttled_timeouts: AtomicU64::new(0),
             budget_bytes: AtomicU64::new(UPLOAD_BUDGET.bytes),
             budget_writes: AtomicU32::new(UPLOAD_BUDGET.writes),
             #[cfg(test)]
@@ -751,6 +777,8 @@ impl SceneWorker {
             pending: UploadCost::default(),
             batch_cost: UploadCost::default(),
             follow_rate: FollowRate::default(),
+            told: [0.0; 3],
+            lag_seen: 0.0,
             teleported: false,
             clock,
             #[cfg(test)]
@@ -800,6 +828,16 @@ impl SceneWorker {
     #[cfg(test)]
     pub fn forget_largest(&self) {
         self.shared.forget_largest.store(true, Ordering::Release);
+    }
+
+    /// How many waits for the frame thread to take what was published the scene thread began, and
+    /// how many of those ended by the timeout and not by a wake-up.
+    #[cfg(test)]
+    pub fn throttled_waits(&self) -> (u64, u64) {
+        (
+            self.shared.throttled_waits.load(Ordering::Relaxed),
+            self.shared.throttled_timeouts.load(Ordering::Relaxed),
+        )
     }
 
     /// One step of a stepped scene thread: the loader makes up to [`STEP_JOBS`] jobs, and the
@@ -1246,6 +1284,10 @@ struct Engine {
     /// What a Voxel of the camera's move has cost to pack, in bytes and in copies, as of the
     /// follow steps so far (see [`Engine::follow`]): how far the next step may go.
     follow_rate: FollowRate,
+    /// The camera the thread was last told, and the largest distance that the scene's centre was
+    /// from it at a publish since a [`Stats`] was published with it (see [`Stats::lag`]).
+    told: [f64; 3],
+    lag_seen: f64,
     /// The camera was put somewhere far, further than the scene follows by patching (a
     /// teleport), since the last follow: the scene is made again there, not walked to.
     teleported: bool,
@@ -1272,6 +1314,22 @@ struct Engine {
 struct FollowRate {
     bytes: f64,
     writes: f64,
+}
+
+impl FollowRate {
+    /// The rate after a step that cost `cost` over `distance` Voxels: what it cost, or half of the
+    /// rate before it (so that one quiet step does not make the next one long), and not under
+    /// [`FOLLOW_RATE_FLOOR`] (so that no run of quiet steps does).
+    fn after(self, cost: UploadCost, distance: f64) -> Self {
+        Self {
+            bytes: (cost.bytes as f64 / distance)
+                .max(self.bytes / 2.0)
+                .max(FOLLOW_RATE_FLOOR.0),
+            writes: (f64::from(cost.writes) / distance)
+                .max(self.writes / 2.0)
+                .max(FOLLOW_RATE_FLOOR.1),
+        }
+    }
 }
 
 impl Default for FollowRate {
@@ -1380,12 +1438,23 @@ impl Engine {
             && !inbox.shutdown
             && !self.shared.taken.load(Ordering::Acquire)
         {
-            inbox = self
+            let (woken, timeout) = self
                 .shared
                 .wake
                 .wait_timeout(inbox, THROTTLED_WAIT)
-                .expect("the frame thread panicked")
-                .0;
+                .expect("the frame thread panicked");
+            inbox = woken;
+            #[cfg(test)]
+            {
+                self.shared.throttled_waits.fetch_add(1, Ordering::Relaxed);
+                if timeout.timed_out() {
+                    self.shared
+                        .throttled_timeouts
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            #[cfg(not(test))]
+            let _ = timeout;
         }
         if self.idle
             && inbox.jobs.is_empty()
@@ -1454,6 +1523,7 @@ impl Engine {
             self.teleported = true;
         }
         self.shared.taken.store(false, Ordering::Release);
+        self.told = camera;
         self.look_ahead(camera, velocity);
         self.paused = self.shared.paused.load(Ordering::Acquire);
         self.scene
@@ -1755,7 +1825,20 @@ impl Engine {
             self.throttled = true;
             return Ok(false);
         }
-        let teleported = std::mem::take(&mut self.teleported);
+        // A teleport is jumped to (the scene is made again) only if the camera is past what
+        // `Scene::recentre` makes again for: one that ended within a jump of the scene would be
+        // patched in one operation of up to two `d0`, outside the budget, so it is walked to.
+        let teleported = std::mem::take(&mut self.teleported)
+            && match (self.scene.camera(), self.scene.bands()) {
+                (Some(from), Some(bands)) => {
+                    (0..3)
+                        .map(|a| (camera[a] - from[a]).powi(2))
+                        .sum::<f64>()
+                        .sqrt()
+                        > render::scene::JUMP * bands.d0()
+                }
+                _ => true,
+            };
         let started = self.clock.now();
         loop {
             let target = if teleported {
@@ -1784,12 +1867,7 @@ impl Engine {
                 .sum::<f64>()
                 .sqrt();
             if distance >= 1.0 {
-                // What a Voxel cost, or half of what it did, so that one quiet step does not
-                // make the next one long.
-                self.follow_rate = FollowRate {
-                    bytes: (cost.bytes as f64 / distance).max(self.follow_rate.bytes / 2.0),
-                    writes: (f64::from(cost.writes) / distance).max(self.follow_rate.writes / 2.0),
-                };
+                self.follow_rate = self.follow_rate.after(cost, distance);
             }
             self.note(update);
             if self.camera == Some(camera) {
@@ -2369,6 +2447,13 @@ impl Engine {
             stats.soft_misses_by_level = self.soft_misses_by_level;
             stats.holes = self.holes;
         }
+        if let Some(centre) = self.scene.camera() {
+            let lag = (0..3)
+                .map(|a| (self.told[a] - centre[a]).powi(2))
+                .sum::<f64>()
+                .sqrt();
+            self.lag_seen = self.lag_seen.max(lag);
+        }
         let changes = std::mem::replace(&mut self.changes, Changes::None);
         if matches!(changes, Changes::None)
             && stats.same_counts(&self.published, exactly)
@@ -2403,6 +2488,11 @@ impl Engine {
             }
             (Changes::None | Changes::Rebuilt, None) => {}
         }
+        // What waits in the outbox has not been taken: its lag was not seen, and stays in this one.
+        stats.lag = std::mem::take(&mut self.lag_seen);
+        if let Some(waiting) = &outbox.ready.stats {
+            stats.lag = stats.lag.max(waiting.lag);
+        }
         outbox.ready.stats = Some(stats.clone());
         if exactly {
             outbox.ready.published_at.get_or_insert(self.clock.now());
@@ -2421,6 +2511,32 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_rate_of_what_a_voxel_costs_does_not_fall_under_its_floor_whatever_the_steps_cost() {
+        // A run of steps that moved a Voxel and changed nothing, and of rebuilds (no patch's cost
+        // over a long distance): each halves the rate, and there was no end to it.
+        let mut rate = FollowRate::default();
+        for step in 0..200 {
+            let distance = if step % 2 == 0 { 1.0 } else { 512.0 };
+            rate = rate.after(UploadCost::default(), distance);
+        }
+        assert_eq!(rate.bytes, FOLLOW_RATE_FLOOR.0);
+        assert_eq!(rate.writes, FOLLOW_RATE_FLOOR.1);
+        // A step that cost more is followed at once, and one that cost less is followed down by
+        // halves, to the floor.
+        let costly = UploadCost {
+            bytes: 100_000,
+            writes: 10,
+        };
+        rate = rate.after(costly, 1.0);
+        assert_eq!((rate.bytes, rate.writes), (100_000.0, 10.0));
+        rate = rate.after(UploadCost::default(), 1.0);
+        assert_eq!((rate.bytes, rate.writes), (50_000.0, 5.0));
+        // The floor is half of what an unmeasured Voxel is taken to cost, so the first step of a
+        // walk is not longer than one at the floor.
+        assert!(FOLLOW_RATE_FLOOR.0 <= FOLLOW_RATE.0 && FOLLOW_RATE_FLOOR.1 <= FOLLOW_RATE.1);
+    }
 
     #[test]
     fn a_batch_is_expected_to_fit_in_what_is_left_of_the_slice() {
