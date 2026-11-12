@@ -334,7 +334,9 @@ is made there (below): the run's **Edit latency**. Its frames are not those of a
     frame-time limit (the gate's `frame_time_p99_ms`; the gate itself is unchanged and still on the
     p99), and `frames_over_limit_by_update` is those frames by what their update was: `none`,
     `patch` or `rebuild`, so that frames that were slow with no update to copy are counted apart
-    from those that had a large one. `slowest` is the five
+    from those that had a large one. The three add up to `frames_over_limit` in each run; in
+    `min` and `max` each is taken on its own across the runs, so there they need not. `slowest` is
+    the five
     longest frames of the path, worst first (a fixed list filled while the frames come: no
     allocation, and a path with fewer frames has fewer), each with:
     - `index` (the frame's place in the path, from 0) and `at_ms` (from the path's start to the
