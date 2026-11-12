@@ -270,10 +270,12 @@ fn run(args: &Args) -> Result<u8, Box<dyn Error>> {
     } else {
         None
     };
-    // The real-time mode runs after the stepped one, for the same reason: its own world and GPU.
+    // The real-time mode runs after the stepped one, for the same reason: its own world and GPU. If
+    // a run of it stops on an error, the report still has everything that was done before, and the
+    // error: tens of minutes of the 4090's time are not thrown away for the last run's.
     let streaming_real_time = match real_time_budgets {
         Some(budgets) if args.real_time => {
-            Some(realtime::run(!plan.patch, args.runs, resolution, &budgets)?)
+            Some(realtime::run(!plan.patch, args.runs, resolution, &budgets))
         }
         _ => None,
     };
@@ -363,6 +365,12 @@ fn run(args: &Args) -> Result<u8, Box<dyn Error>> {
         );
     }
     let code = code.max(streaming_code).max(real_time_code);
+    // An error of the real-time mode is exit status 1, not 2 (a gate that is over): nothing says
+    // whether its gates would have held.
+    let code = match &report.streaming_real_time {
+        Some(r) if r.error.is_some() => 1,
+        _ => code,
+    };
     if code != 0 {
         let (no_data, over) = failures(&report.modes);
         if !over.is_empty() {
@@ -782,15 +790,15 @@ fn print_real_time(r: &realtime::RealTimeReport) {
     for (n, run) in r.runs.iter().enumerate() {
         let c = &run.cold_start;
         eprintln!(
-            "  run {}: time to control {:.1} s (load {:.1} s), resident set complete after {:.1} s",
+            "  run {}: level 0 under the camera {:.1} s after the load began (load {:.1} s), resident set complete after {:.1} s",
             n + 1,
-            c.time_to_control_s,
+            c.time_to_level_0_under_camera_s,
             c.load_s,
             c.fill_s
         );
         for p in &run.paths {
             eprintln!(
-                "    {:<20} {:>5} frames: frame p99 {:>6.2} worst {:>7.2} ms, cpu p99 {:>6.2} worst {:>7.2} ms, soft misses {:.2} a frame, holes {} in {} looks{}",
+                "    {:<20} {:>5} frames: frame p99 {:>6.2} worst {:>7.2} ms, cpu p99 {:>6.2} worst {:>7.2} ms, soft misses {:.2} a frame, holes {} in {} looks ({:.0} ms, {:.0}% of the scene thread){}",
                 p.name,
                 p.frames,
                 p.frame_time.p99_ms,
@@ -799,7 +807,9 @@ fn print_real_time(r: &realtime::RealTimeReport) {
                 p.frame_cpu.worst_ms,
                 p.soft_misses_per_frame,
                 p.holes,
-                p.hole_scans,
+                p.hole_looks,
+                p.scene_thread.hole_scan_ms,
+                p.scene_thread.hole_scan_share * 100.0,
                 p.settle.map_or(String::new(), |s| format!(
                     ", settled after {:.1} s{}",
                     s.seconds,
@@ -813,19 +823,28 @@ fn print_real_time(r: &realtime::RealTimeReport) {
         }
         let t = &run.scene_thread;
         eprintln!(
-            "    scene thread: follow {:.0}, pack {:.0}, upload {:.0}, eviction {:.0}, coarse {:.0}, hole scans {:.0} ms; scene peak {:.0} MiB, store peak {} of {} bricks, process peak {} MiB",
+            "    scene thread: follow {:.0}, pack {:.0}, upload {:.0}, eviction {:.0}, coarse {:.0}, hole looks {:.0} ms; scene used peak {:.0} MiB (reserved {:.0} MiB), store peak {} of {} bricks, resident peak {} MiB (whole process {} MiB); {} looks, {} holes in the run; Edit taken in {} frames, {:.1} ms (its call {:.1} ms)",
             t.follow_ms,
             t.pack_ms,
             t.upload_ms,
             t.evict_ms,
             t.coarse_ms,
             t.hole_scan_ms,
-            run.memory.scene_peak_mib,
+            run.memory.scene_used_peak_mib,
+            run.memory.scene_reserved_mib,
             run.memory.store_peak_bricks,
             run.memory.store_limit_bricks,
             run.memory
-                .process_peak_mib
-                .map_or("n/a".to_string(), |m| format!("{m:.0}"))
+                .resident_peak_mib
+                .map_or("n/a".to_string(), |m| format!("{m:.0}")),
+            run.memory
+                .whole_process_peak_mib
+                .map_or("n/a".to_string(), |m| format!("{m:.0}")),
+            run.hole_looks,
+            run.holes,
+            run.edit_latency.frames,
+            run.edit_latency.ms,
+            run.edit_latency.call_ms
         );
         for c in &run.sizing.checks {
             eprintln!(
@@ -857,7 +876,12 @@ fn print_real_time(r: &realtime::RealTimeReport) {
             }
         );
     }
-    eprintln!("  edit latency: {}", r.edit_latency);
+    if let Some(e) = &r.error {
+        eprintln!(
+            "  STOPPED in run {} at `{}`: {} (the runs above are those that finished)",
+            e.run, e.step, e.message
+        );
+    }
 }
 
 /// The streaming mode's counts, in brief.

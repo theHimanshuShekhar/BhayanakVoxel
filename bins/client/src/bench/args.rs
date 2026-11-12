@@ -20,7 +20,7 @@ Options:
                    distance between levels of detail scales with it; 2 does a quarter of the
                    work for up to a pixel more of error
   --diag LIST      Switches for finding out where time goes, separated by commas; a report made
-                   with any of them is not a measurement. no-follow: the Planet does not follow
+                   with any of them is not a measurement (and does not go with --real-time). no-follow: the Planet does not follow
                    the camera. no-upload: it does, on the CPU, but the GPU is not told.
                    no-flush: writes to the GPU go with the next frame's commands. gap-ms=F:
                    sleep F milliseconds before each frame, as the CPU work of following would
@@ -132,6 +132,14 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Parsed, String> {
     if runs_given && !parsed.real_time {
         return Err("--runs is for --real-time".into());
     }
+    // `--diag` says that the budgets are not checked, and the real-time mode's gates are checked
+    // whatever it says (they are a failure of their own): the two do not go together.
+    if parsed.real_time && !parsed.diag.switches().is_empty() {
+        return Err(
+            "--diag does not go with --real-time: a diagnostic run is not held to the budgets,              and the real-time gates always are"
+                .into(),
+        );
+    }
     Ok(Parsed::Run(parsed))
 }
 
@@ -227,6 +235,8 @@ mod tests {
             &["--streaming", "--real-time", "--runs", "0"],
             &["--streaming", "--real-time", "--runs", "-1"],
             &["--streaming", "--real-time", "--runs", "many"],
+            // The diagnostic switches say the budgets are not checked, which the gates always are.
+            &["--streaming", "--real-time", "--diag", "no-flush"],
         ] {
             assert!(parse_all(bad).is_err(), "{bad:?}");
         }

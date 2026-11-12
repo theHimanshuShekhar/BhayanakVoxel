@@ -426,6 +426,25 @@ impl World {
         self.take_ready(true)
     }
 
+    /// Has the scene thread count the soft misses now, and look at every split brick for a hole if
+    /// `holes`, for the camera it was last told and what it has taken in, and takes what it published,
+    /// which the caller copies to the GPU. For the real-time bench: a look at the end of each
+    /// path, and a count of the soft misses that was made after the camera stopped (see
+    /// [`SceneWorker::look_now`]).
+    pub fn look_now(&mut self, holes: bool) -> Result<Option<SceneUpdate>, RingsFull> {
+        let Some(worker) = &self.worker else {
+            return Ok(None);
+        };
+        worker.look_now(holes)?;
+        self.take_ready(true)
+    }
+
+    /// Bytes the scene's buffers take, used or not: what the GPU copy reserves (see
+    /// [`Scene::reserved_bytes`]).
+    pub fn reserved_bytes(&self) -> u64 {
+        self.scene.reserved_bytes()
+    }
+
     /// Holds back (or lets go of) what the loader generates: while paused, nothing it generated
     /// is taken in, so the scene stays as it is and the reference image can accumulate. The
     /// loader's threads stop at [`crate::loader::MAX_AHEAD`] jobs ahead, so what waits is bounded.

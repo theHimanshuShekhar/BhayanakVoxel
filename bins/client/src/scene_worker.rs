@@ -406,6 +406,9 @@ enum Job {
     Edit(Vec<BrickCoord>),
     /// Other LOD bands (see [`Scene::set_bands`]).
     Bands(Bands),
+    /// A count of the soft misses, and a look at every split brick for a hole if `holes`, now and
+    /// not when the clock says (see [`SceneWorker::look_now`]).
+    Look { holes: bool },
     /// Nothing: for a test to know that what it sent before has been looked at.
     #[cfg(test)]
     Sync,
@@ -619,6 +622,8 @@ impl SceneWorker {
             holes: 0,
             soft_misses_at: clock.now(),
             holes_at: clock.now(),
+            recount_due: false,
+            look_due: false,
             work: Done::default(),
             ahead: [None; AHEAD],
             velocity: [0.0; 3],
@@ -721,6 +726,16 @@ impl SceneWorker {
             coarse: part(Part::Coarse),
             hole_scan: part(Part::HoleScan),
         }
+    }
+
+    /// Has the thread count the soft misses (if they are counted) **now**, and look at every split
+    /// brick for a hole if `holes` (and [`SceneWorker::count_holes`] is on), with the camera it
+    /// has been told and the bricks it has taken in, publish, and returns when that is published.
+    /// For the real-time bench, which wants a look at the end of each path and when the camera
+    /// has stood still, and a count of the soft misses that was made after the camera stopped, not
+    /// one from before it.
+    pub fn look_now(&self, holes: bool) -> Result<(), RingsFull> {
+        self.job(Job::Look { holes })
     }
 
     /// Has the thread count the soft misses (by level) and the holes at every publish, not a few
@@ -1018,6 +1033,10 @@ struct Engine {
     soft_misses_at: Instant,
     /// When every split brick was last looked at for a hole (see [`HOLES_EVERY`]).
     holes_at: Instant,
+    /// A [`Job::Look`] is waiting to be done in the next publish: the count of the soft misses, and
+    /// the look for holes if `look_due`, are due whatever the clock says.
+    recount_due: bool,
+    look_due: bool,
     /// What was done, by category (see [`Done`]).
     work: Done,
     /// The places the scene looks ahead to (see [`Engine::look_ahead`]), and the velocity of the
@@ -1182,6 +1201,12 @@ impl Engine {
         #[cfg_attr(not(test), allow(unused_mut))]
         let mut synced: Option<u64> = None;
         for (ticket, job) in jobs {
+            if let Job::Look { holes } = job {
+                self.recount_due = true;
+                self.look_due = holes;
+                self.publish(Some(ticket));
+                continue;
+            }
             #[cfg(test)]
             match job {
                 Job::Sync => {
@@ -1306,6 +1331,7 @@ impl Engine {
                 self.scene
                     .set_bands(&store, coarsened(bands, self.coarsening))?
             }
+            Job::Look { .. } => unreachable!("not run here"),
             #[cfg(test)]
             Job::Sync | Job::Panic | Job::Stall(_) | Job::SlowCoarse(_) => {
                 unreachable!("not run here")
@@ -1811,11 +1837,11 @@ impl Engine {
     }
 
     /// Looks at every split brick for a hole, if the bench asked for that and [`HOLES_EVERY`] has
-    /// gone by since the last look (`Scene::holes`).
+    /// gone by since the last look, or a [`Job::Look`] says to now (`Scene::holes`).
     fn scan_for_holes(&mut self) {
-        if !self.shared.count_holes.load(Ordering::Relaxed)
-            || self.clock.since(self.holes_at) < HOLES_EVERY
-        {
+        let forced = std::mem::take(&mut self.look_due);
+        let due = forced || self.clock.since(self.holes_at) >= HOLES_EVERY;
+        if !self.shared.count_holes.load(Ordering::Relaxed) || !due {
             return;
         }
         let began = self.began();
@@ -1853,6 +1879,9 @@ impl Engine {
         let mut stats = stats_of(&self.scene, &self.loader, &self.slow, self.eviction);
         stats.coarsening = self.coarsening;
         stats.work = self.work;
+        // The look that a job asked for is done by the scan before this (the holes) and here (the
+        // count), and is not due again.
+        let recount_due = std::mem::take(&mut self.recount_due);
         if self.shared.count_soft_misses.load(Ordering::Relaxed) {
             // Looking at every brick that waits takes milliseconds in a fill, so it is done a
             // few times a second, and the count is the last one in between, unless the counts are
@@ -1860,6 +1889,7 @@ impl Engine {
             // the count is made at once, so that a last count of misses is not left standing
             // while the thread sleeps (it looks at no brick then).
             if exactly
+                || recount_due
                 || self.clock.since(self.soft_misses_at) >= SOFT_MISSES_EVERY
                 || (self.soft_misses > 0 && stats.waiting == 0)
             {

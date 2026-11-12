@@ -21,9 +21,15 @@
 //! of the update to the GPU's buffers, and the encoding and submitting of the draw, without the wait.
 //!
 //! The scene thread cannot count holes for every frame at full size (every split brick is looked
-//! at, 0.3 s with the store's read lock held), so it does it every few seconds
-//! ([`crate::scene_worker::SceneWorker::count_holes`]) and the report says how many looks there
-//! were and what they found: **holes are sampled, not counted per frame**, as the stepped mode's are.
+//! at, 0.3 s with the store's read lock held), so it looks every few seconds
+//! ([`crate::scene_worker::SceneWorker::count_holes`]), and a look is **forced** at the end of every
+//! path, when the camera has stood still between paths (the loader's catching up), after the sizing
+//! and at the end of the run ([`crate::scene_worker::SceneWorker::look_now`]), so that every path
+//! has at least one. The report says how many looks there were, per path and per run, and what they
+//! found. The holes gate is on what the looks of the **whole run** found, from the moment the
+//! measuring began, and fails if a run or a path had no look at all. **Holes are sampled, not
+//! counted per frame** as the stepped mode's are: a hole that is made and filled between two looks is
+//! not seen.
 
 use std::error::Error;
 use std::time::{Duration, Instant};
@@ -42,9 +48,11 @@ use super::budget::{EXIT_OVER_BUDGET, StreamingBudgets};
 use super::process;
 use super::stream::{
     Constants, Series, Sizing, Start, TestPlanet, measure_sizes, over_the_ground, test_planet,
+    within_reach,
 };
 use crate::loader::{Loader, workers_for};
-use crate::scene_worker::Spent;
+use crate::scene_worker::{Done, Spent};
+use crate::tool::Tool;
 use crate::world::World;
 
 /// A frame at 60 a second.
@@ -55,8 +63,10 @@ const FLIGHT_METRES_PER_SECOND: f64 = 50.0;
 const STORE_EVERY: u64 = 6;
 /// Metres above the 2 m flight that the high one flies.
 const HIGH_METRES: f64 = 48.0;
-/// What the frame thread had to say of the edit latency, which no path measures.
-const EDIT_LATENCY: &str = "not measured: no path of the real-time mode makes an Edit (the versioned M1a path with a dig is #168)";
+/// How often the process's resident memory is looked at, in frames: twice a second.
+const RESIDENT_EVERY: u64 = 30;
+/// Frames that the Edit may take to show before it is said not to have: ten seconds.
+const EDIT_FRAMES_CAP: u64 = 600;
 
 /// How long each path goes on for, and how long the waits are held to.
 #[derive(Clone, Copy, Debug)]
@@ -188,19 +198,38 @@ pub struct SceneThread {
     pub evict_ms: f64,
     pub coarse_ms: f64,
     pub hole_scan_ms: f64,
+    /// The looks for holes' share of all the scene-thread time above (0 to 1). While a look runs
+    /// the thread publishes nothing, so the share is also how much of the time the frame thread's
+    /// updates were held back.
+    pub hole_scan_share: f64,
 }
 
 impl SceneThread {
     /// What was spent from `then` to `now`.
     fn between(then: Spent, now: Spent) -> Self {
         let ms = |now: Duration, then: Duration| now.saturating_sub(then).as_secs_f64() * 1e3;
-        Self {
+        let parts = Self {
             follow_ms: ms(now.follow, then.follow),
             pack_ms: ms(now.pack, then.pack),
             upload_ms: ms(now.publish, then.publish),
             evict_ms: ms(now.evict, then.evict),
             coarse_ms: ms(now.coarse, then.coarse),
             hole_scan_ms: ms(now.hole_scan, then.hole_scan),
+            hole_scan_share: 0.0,
+        };
+        let all = parts.follow_ms
+            + parts.pack_ms
+            + parts.upload_ms
+            + parts.evict_ms
+            + parts.coarse_ms
+            + parts.hole_scan_ms;
+        Self {
+            hole_scan_share: if all > 0.0 {
+                parts.hole_scan_ms / all
+            } else {
+                0.0
+            },
+            ..parts
         }
     }
 }
@@ -227,9 +256,9 @@ pub struct PathReport {
     /// reports the last count).
     pub soft_misses: Series,
     pub soft_misses_per_frame: f64,
-    /// Looks of the scene thread at every split brick (every few seconds), the holes they found in
-    /// all, and those per frame of the path.
-    pub hole_scans: u64,
+    /// Looks of the scene thread at every split brick (every few seconds, and one forced at the end
+    /// of the path), the holes they found in all, and those per frame of the path. Never 0 looks.
+    pub hole_looks: u64,
     pub holes: u64,
     pub holes_per_frame: f64,
     pub scene_thread: SceneThread,
@@ -245,10 +274,12 @@ pub struct ColdStart {
     pub world_map_s: Option<f64>,
     /// [`crate::load`]: the spawn ring, the Guard, and the first scene.
     pub load_s: f64,
-    /// **Time to control**: from the start of the load to the first frame with level 0 under the
-    /// camera, the ground the character stands on. The bench has no server, so the character is not
-    /// in it.
-    pub time_to_control_s: f64,
+    /// From the start of the load to the first frame with level 0 under the camera: one ray from
+    /// the camera straight down hits the ground at level 0. This is **not** the spec's time to
+    /// control (the ring of 20 m round the Spawn at full detail, and the character standing in it:
+    /// the bench has no server). The spawn ring is made inside [`crate::load`], so this is the
+    /// load time and about a frame.
+    pub time_to_level_0_under_camera_s: f64,
     /// From the start of the load to the resident set being complete.
     pub fill_s: f64,
 }
@@ -256,15 +287,43 @@ pub struct ColdStart {
 /// What the run held, at the most.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize)]
 pub struct Memory {
-    /// The process's peak resident memory since it began (it only grows over the runs), where the
-    /// system says.
-    pub process_peak_mib: Option<f64>,
-    /// The scene's buffers in use, at the most over the run's frames, as the scene thread said.
-    pub scene_peak_mib: f64,
+    /// The process's resident memory, at the most of the samples taken twice a second from the
+    /// moment this run's world was built to the end of the run (so not the peak inside the
+    /// generation of the world map and the load, and not the normal bench's before it, nor an
+    /// earlier run's), where the system says: the working set on Windows, `VmRSS` on Linux. This is
+    /// the run's own figure.
+    pub resident_peak_mib: Option<f64>,
+    /// The OS's own peak for the **whole process** since it began, which includes the normal
+    /// bench's generation of the Planet and every earlier run (the peak working set cannot be reset
+    /// on Windows): only an upper bound of this run's.
+    pub whole_process_peak_mib: Option<f64>,
+    /// The scene's buffers in use (`Scene::used_bytes`), at the most of what the scene thread said,
+    /// which it works out every 250 ms: not a value per frame. **The memory gate is on this**, not
+    /// on what the GPU reserves.
+    pub scene_used_peak_mib: f64,
+    /// The scene's buffers as the GPU reserves them, used or not (`Scene::reserved_bytes`): this
+    /// is the VRAM the scene takes, and it is allocated whole, so it does not change over the run
+    /// (the most of the frames' is given). Reported; not gated.
+    pub scene_reserved_mib: f64,
     /// The store's size as its budget counts it, looked at every few frames, and the most it may
     /// hold before eviction starts.
     pub store_peak_bricks: u64,
     pub store_limit_bricks: u64,
+}
+
+/// The Edit of the run: a dig of the default Tool at the Spawn after the stop, the one measure
+/// that the stepped mode cannot make (ADR 0006's bound, which needs the real scene thread). Reported,
+/// not gated.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+pub struct EditLatency {
+    /// Frames from the frame the Edit was made in (it is made before that frame's look at the
+    /// scene, where the game makes it) to the frame whose look took it in: 1 is the bound (an Edit
+    /// made in frame N shows in N+1), 0 the frame that made it.
+    pub frames: u64,
+    /// The same in milliseconds: from before the Edit's call to the end of the look that took it in.
+    pub ms: f64,
+    /// The Edit's own call on the frame thread: planning and writing the bricks.
+    pub call_ms: f64,
 }
 
 /// One run of the paths.
@@ -275,6 +334,12 @@ pub struct RunReport {
     pub paths: Vec<PathReport>,
     /// The scene thread's time over the whole run.
     pub scene_thread: SceneThread,
+    /// Looks for holes over the whole run, from the moment the measuring began (the paths, the
+    /// catching up between them, the sizing and the Edit), and what they found: **this is what the
+    /// holes gate is held to**, not the sum of the paths'.
+    pub hole_looks: u64,
+    pub holes: u64,
+    pub edit_latency: EditLatency,
     pub memory: Memory,
     /// The client's sizing constants against what was measured at full size, with the resident set
     /// complete. Reported; the check of it is not a gate.
@@ -301,9 +366,14 @@ pub struct Gates {
     /// The 99th percentile of frame time, of the worst path of the worst run.
     pub frame_time_p99_ms: Limit,
     pub frame_cpu_p99_ms: Limit,
-    /// Holes found by the scene thread's looks, summed over every path and run.
+    /// Holes found by the scene thread's looks over each whole run, summed over the runs.
     pub holes: Limit,
-    /// The memory gate has two measures: the scene's buffers and the store.
+    /// The fewest looks of any run, and of any path of any run. The holes gate fails on 0 of
+    /// either: a gate that looked at nothing has not passed.
+    pub hole_looks_fewest_in_a_run: u64,
+    pub hole_looks_fewest_in_a_path: u64,
+    /// The memory gate has two measures: the scene's buffers in use (not what the GPU reserves) and
+    /// the store.
     pub scene_mib: Limit,
     pub store_bricks: Limit,
     /// The gates that are over: `frame_time`, `frame_cpu`, `holes`, `memory`.
@@ -323,11 +393,16 @@ pub fn gates(runs: &[RunReport], budgets: &StreamingBudgets) -> Gates {
         limit: budgets.frame_cpu_p99_ms,
     };
     let holes = Limit {
-        worst: paths().map(|p| p.holes).sum::<u64>() as f64,
+        worst: runs.iter().map(|r| r.holes).sum::<u64>() as f64,
         limit: budgets.holes as f64,
     };
+    let hole_looks_fewest_in_a_run = runs.iter().map(|r| r.hole_looks).min().unwrap_or(0);
+    let hole_looks_fewest_in_a_path = paths().map(|p| p.hole_looks).min().unwrap_or(0);
+    // No run at all (the first failed) is an error of the report, not a pass or a failure of this.
+    let looked =
+        runs.is_empty() || (hole_looks_fewest_in_a_run > 0 && hole_looks_fewest_in_a_path > 0);
     let scene_mib = Limit {
-        worst: worst(&mut runs.iter().map(|r| r.memory.scene_peak_mib)),
+        worst: worst(&mut runs.iter().map(|r| r.memory.scene_used_peak_mib)),
         limit: budgets.scene_mib,
     };
     let store_bricks = Limit {
@@ -335,12 +410,13 @@ pub fn gates(runs: &[RunReport], budgets: &StreamingBudgets) -> Gates {
         limit: runs
             .iter()
             .map(|r| r.memory.store_limit_bricks as f64)
-            .fold(f64::INFINITY, f64::min),
+            .reduce(f64::min)
+            .unwrap_or(0.0),
     };
     let over = [
         ("frame_time", frame_time_p99_ms.over()),
         ("frame_cpu", frame_cpu_p99_ms.over()),
-        ("holes", holes.over()),
+        ("holes", holes.over() || !looked),
         ("memory", scene_mib.over() || store_bricks.over()),
     ]
     .into_iter()
@@ -350,10 +426,23 @@ pub fn gates(runs: &[RunReport], budgets: &StreamingBudgets) -> Gates {
         frame_time_p99_ms,
         frame_cpu_p99_ms,
         holes,
+        hole_looks_fewest_in_a_run,
+        hole_looks_fewest_in_a_path,
         scene_mib,
         store_bricks,
         over,
     }
+}
+
+/// Why the mode stopped before its last run was done.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct Failure {
+    /// The run (from 1) that was going.
+    pub run: u32,
+    /// What it was doing: building the world, a path, a catch-up between paths, the sizing, the
+    /// Edit.
+    pub step: String,
+    pub message: String,
 }
 
 /// The report of the real-time mode. Everything in it is made by that mode and is not
@@ -365,14 +454,17 @@ pub struct RealTimeReport {
     pub deterministic: bool,
     pub planet: String,
     pub d0: f64,
+    /// The runs that finished.
     pub runs: Vec<RunReport>,
     /// Every number of a run (the same shape as one of `runs`), at its least and its most over the
-    /// runs. What is not a number is the first run's.
+    /// runs. A boolean is the least (all) and the most (any) of the runs'; what is not a number
+    /// or a boolean is kept if the runs agree, and null if they do not. Null when no run finished.
     pub min: Value,
     pub max: Value,
     pub gates: Gates,
-    /// Whether the Edit latency is measured in this mode (see [`EDIT_LATENCY`]).
-    pub edit_latency: &'static str,
+    /// Set when a run did not finish: the runs above are those that did (and the gates are held to
+    /// those only), and the exit status is 1.
+    pub error: Option<Failure>,
 }
 
 impl RealTimeReport {
@@ -381,7 +473,11 @@ impl RealTimeReport {
             .iter()
             .map(|r| serde_json::to_value(r).expect("a run serializes"))
             .collect();
-        let (min, max) = envelope(&values.iter().collect::<Vec<_>>());
+        let (min, max) = if values.is_empty() {
+            (Value::Null, Value::Null)
+        } else {
+            envelope(&values.iter().collect::<Vec<_>>())
+        };
         Self {
             mode: "real-time",
             deterministic: false,
@@ -391,13 +487,21 @@ impl RealTimeReport {
             runs,
             min,
             max,
-            edit_latency: EDIT_LATENCY,
+            error: None,
         }
+    }
+
+    /// The report of a mode that stopped on `failure`.
+    pub fn failed(mut self, failure: Failure) -> Self {
+        self.error = Some(failure);
+        self
     }
 }
 
 /// Each number of `values`, which are of one shape, at its least and its most. Objects and arrays
-/// of one length are done member by member; anything else is the first value's.
+/// of one length are done member by member. A boolean is least when every run's is true and most
+/// when any is (false below true), so a flag that says "over" says it for the worst run. Anything
+/// else is kept if the runs agree and is null if they do not, so that nothing reads as one run's.
 fn envelope(values: &[&Value]) -> (Value, Value) {
     let first = values[0];
     match first {
@@ -405,8 +509,7 @@ fn envelope(values: &[&Value]) -> (Value, Value) {
             let (mut least, mut most) = (serde_json::Map::new(), serde_json::Map::new());
             for name in fields.keys() {
                 let members: Option<Vec<&Value>> = values.iter().map(|v| v.get(name)).collect();
-                let (low, high) =
-                    members.map_or((first[name].clone(), first[name].clone()), |m| envelope(&m));
+                let (low, high) = members.map_or((Value::Null, Value::Null), |m| envelope(&m));
                 least.insert(name.clone(), low);
                 most.insert(name.clone(), high);
             }
@@ -436,13 +539,24 @@ fn envelope(values: &[&Value]) -> (Value, Value) {
             let high = values.iter().max_by(by_value).expect("there is a value");
             ((**low).clone(), (**high).clone())
         }
-        _ => (first.clone(), first.clone()),
+        Value::Bool(_) if values.iter().all(|v| v.is_boolean()) => {
+            let flags = || values.iter().filter_map(|v| v.as_bool());
+            (
+                Value::Bool(flags().all(|f| f)),
+                Value::Bool(flags().any(|f| f)),
+            )
+        }
+        _ if values.iter().all(|v| *v == first) => (first.clone(), first.clone()),
+        _ => (Value::Null, Value::Null),
     }
 }
 
-/// The exit status of the mode: [`EXIT_OVER_BUDGET`] if a gate is over, unless `no_fail`.
+/// The exit status of the mode: 1 if it stopped on an error (whatever `no_fail` says),
+/// [`EXIT_OVER_BUDGET`] if a gate is over, unless `no_fail`.
 pub fn exit_code(report: &RealTimeReport, no_fail: bool) -> u8 {
-    if report.gates.over.is_empty() || no_fail {
+    if report.error.is_some() {
+        1
+    } else if report.gates.over.is_empty() || no_fail {
         0
     } else {
         EXIT_OVER_BUDGET
@@ -556,12 +670,18 @@ struct Frame {
     time_ms: f64,
     cpu_ms: f64,
     soft_misses: usize,
+    /// Whether the look at the scene in this frame took in the newest Edit, and when it was done.
+    edit_taken: bool,
+    taken_at: Instant,
 }
 
 /// What a path has seen so far.
 struct Capture {
     name: &'static str,
     began: Instant,
+    /// How long the path went on for, set when its frames are done (the forced look after them is
+    /// not in it).
+    seconds: Option<f64>,
     spent: Spent,
     scans: u64,
     holes: u64,
@@ -576,6 +696,7 @@ impl Capture {
         Self {
             name,
             began: Instant::now(),
+            seconds: None,
             spent: world.scene_thread_time(),
             scans: work.hole_scans,
             holes: work.holes_found,
@@ -599,12 +720,14 @@ impl Capture {
         PathReport {
             name: self.name,
             frames,
-            seconds: self.began.elapsed().as_secs_f64(),
+            seconds: self
+                .seconds
+                .unwrap_or_else(|| self.began.elapsed().as_secs_f64()),
             frame_time: Spread::of(&self.frame_ms),
             frame_cpu: Spread::of(&self.cpu_ms),
             soft_misses_per_frame: per_frame(self.soft_misses.total),
             soft_misses: self.soft_misses,
-            hole_scans: work.hole_scans - self.scans,
+            hole_looks: work.hole_scans - self.scans,
             holes,
             holes_per_frame: per_frame(holes),
             scene_thread: SceneThread::between(self.spent, world.scene_thread_time()),
@@ -663,12 +786,37 @@ fn level_0_under(scene: &Scene, camera: &Camera) -> bool {
 struct Session<'a> {
     world: World,
     gpu: &'a mut dyn Gpu,
-    scene_peak_bytes: u64,
+    /// What the run was doing when it last started on something: for the error of a run that stops.
+    step: String,
+    /// What the scene thread had done when the measuring began.
+    work_before: Done,
+    scene_used_peak_bytes: u64,
+    scene_reserved_bytes: u64,
+    resident_peak: Option<u64>,
+    whole_process_peak: Option<u64>,
     store_peak: usize,
     frames: u64,
 }
 
-impl Session<'_> {
+impl<'a> Session<'a> {
+    fn new(world: World, gpu: &'a mut dyn Gpu) -> Self {
+        let work_before = world.stats().work;
+        let mut session = Self {
+            world,
+            gpu,
+            step: "starting".to_string(),
+            work_before,
+            scene_used_peak_bytes: 0,
+            scene_reserved_bytes: 0,
+            resident_peak: None,
+            whole_process_peak: None,
+            store_peak: 0,
+            frames: 0,
+        };
+        session.look_at_resident_memory();
+        session
+    }
+
     /// One frame, paced to 60 a second: the camera is told (with its velocity measured, as the
     /// game's is, if `lead`), what the scene thread made is taken, copied to the GPU and drawn.
     fn frame(&mut self, camera: &Camera, lead: bool) -> Result<Frame, Box<dyn Error>> {
@@ -678,7 +826,9 @@ impl Session<'_> {
         } else {
             self.world.recentre_moving(camera.position, [0.0; 3])?
         };
-        let followed = began.elapsed();
+        let taken_at = Instant::now();
+        let edit_taken = self.world.edit_taken();
+        let followed = taken_at - began;
         let drawn = self
             .gpu
             .frame(camera, self.world.scene(), update.as_ref())?;
@@ -689,15 +839,50 @@ impl Session<'_> {
             time_ms: time.as_secs_f64() * 1e3,
             cpu_ms: (followed + drawn).as_secs_f64() * 1e3,
             soft_misses: self.world.stats().soft_misses,
+            edit_taken,
+            taken_at,
         })
     }
 
     fn look_at_memory(&mut self) {
-        self.scene_peak_bytes = self.scene_peak_bytes.max(self.world.used_bytes());
+        self.scene_used_peak_bytes = self.scene_used_peak_bytes.max(self.world.used_bytes());
+        self.scene_reserved_bytes = self.scene_reserved_bytes.max(self.world.reserved_bytes());
         self.frames += 1;
         if self.frames.is_multiple_of(STORE_EVERY) {
             self.store_peak = self.store_peak.max(self.world.store().streamed_len());
         }
+        if self.frames.is_multiple_of(RESIDENT_EVERY) {
+            self.look_at_resident_memory();
+        }
+    }
+
+    fn look_at_resident_memory(&mut self) {
+        if let Some(resident) = process::resident() {
+            self.resident_peak = self.resident_peak.max(Some(resident.now));
+            self.whole_process_peak = Some(resident.peak_since_start);
+        }
+    }
+
+    /// A look of the scene thread at every split brick for a hole now (if `holes`), and a count of
+    /// the soft misses now, with what the camera has told it, which is copied to the GPU like any
+    /// update (and drawn, but that is no frame of a path).
+    fn look(&mut self, camera: &Camera, holes: bool) -> Result<(), Box<dyn Error>> {
+        if let Some(update) = self.world.look_now(holes)? {
+            self.gpu.frame(camera, self.world.scene(), Some(&update))?;
+        }
+        Ok(())
+    }
+
+    /// Ends a path: a look at every split brick, so that no path has none, and its report.
+    fn end_path(
+        &mut self,
+        mut capture: Capture,
+        camera: &Camera,
+        settle: Option<Settle>,
+    ) -> Result<PathReport, Box<dyn Error>> {
+        capture.seconds = Some(capture.began.elapsed().as_secs_f64());
+        self.look(camera, true)?;
+        Ok(capture.finish(&self.world, settle))
     }
 
     /// Whether the resident set is complete: nothing waits, and the loader has nothing out.
@@ -705,9 +890,17 @@ impl Session<'_> {
         self.world.waiting() == 0 && self.world.loader().is_some_and(|l| l.pending == 0)
     }
 
-    /// Frames at `camera`, not recorded, until the loader has caught up. The camera's jump to it
-    /// is not a flight: the scene thread is told it is not moving.
-    fn settle(&mut self, camera: &Camera, cap: Duration) -> Result<(), Box<dyn Error>> {
+    /// Frames at `camera`, not recorded, until the loader has caught up, and then a look at every
+    /// split brick: whatever the scene thread found between paths is in the run's holes. The
+    /// camera's jump to it is not a flight: the scene thread is told it is not moving. `after`
+    /// names what came before, for an error.
+    fn settle(
+        &mut self,
+        camera: &Camera,
+        cap: Duration,
+        after: &str,
+    ) -> Result<(), Box<dyn Error>> {
+        self.step = format!("the loader's catch-up after {after}");
         let began = Instant::now();
         while !self.idle() {
             self.frame(camera, false)?;
@@ -720,7 +913,7 @@ impl Session<'_> {
                 .into());
             }
         }
-        Ok(())
+        self.look(camera, true)
     }
 
     /// The cold start: frames at the Spawn from the first until the resident set is complete.
@@ -729,6 +922,7 @@ impl Session<'_> {
         setup: &Setup,
         script: &Script,
     ) -> Result<(ColdStart, PathReport), Box<dyn Error>> {
+        self.step = "cold start".to_string();
         let began = Instant::now();
         let mut capture = Capture::start("cold start", &self.world);
         let mut control = None;
@@ -749,10 +943,12 @@ impl Session<'_> {
         let cold = ColdStart {
             world_map_s: setup.world_map_s,
             load_s: setup.load.as_secs_f64(),
-            time_to_control_s: control.expect("the loop ends with control").as_secs_f64(),
+            time_to_level_0_under_camera_s: control
+                .expect("the loop ends with control")
+                .as_secs_f64(),
             fill_s: (setup.load + began.elapsed()).as_secs_f64(),
         };
-        Ok((cold, capture.finish(&self.world, None)))
+        Ok((cold, self.end_path(capture, &setup.spawn, None)?))
     }
 
     /// The camera at `at(world, t)` for `seconds`, `t` the seconds since the path began.
@@ -762,26 +958,38 @@ impl Session<'_> {
         seconds: Duration,
         mut at: impl FnMut(&World, f64) -> Camera,
     ) -> Result<PathReport, Box<dyn Error>> {
+        self.step = name.to_string();
         let mut capture = Capture::start(name, &self.world);
         let began = Instant::now();
-        loop {
+        let camera = loop {
             let camera = at(&self.world, began.elapsed().as_secs_f64());
             let frame = self.frame(&camera, true)?;
             capture.add(&frame);
             if began.elapsed() >= seconds {
-                break;
+                break camera;
             }
-        }
-        Ok(capture.finish(&self.world, None))
+        };
+        self.end_path(capture, &camera, None)
     }
 
     /// A flight, and then the camera standing where it stopped until no brick is drawn coarser than
     /// the bands ask (the **settle time**), or the cap.
+    ///
+    /// The soft misses are counted by the scene thread a few times a second, and not at all while it
+    /// sleeps, so the count a frame sees can be from before the stop: a stale 0 would read as
+    /// settled at once. So the stop is followed by a count made **now** ([`Session::look`], without
+    /// the look for holes, which would be in the time), and the camera is settled when that count
+    /// or a later one is 0 and `waiting() == 0`. `waiting` (the bricks the scene still waits for the
+    /// loader's to split) is the right "nothing left to arrive" for a view: the loader's `pending`
+    /// also holds jobs ahead of the view, which the view does not wait for. A later count is not
+    /// stale: the thread counts again at once when nothing waits any more, and every 100 ms while
+    /// it works.
     fn stop_after_a_flight(
         &mut self,
         course: &Course,
         script: &Script,
     ) -> Result<PathReport, Box<dyn Error>> {
+        self.step = "stop after a flight".to_string();
         let mut capture = Capture::start("stop after a flight", &self.world);
         let began = Instant::now();
         let camera = loop {
@@ -794,10 +1002,11 @@ impl Session<'_> {
             }
         };
         let stopped = Instant::now();
+        self.look(&camera, false)?;
         let settle = loop {
             let frame = self.frame(&camera, true)?;
             capture.add(&frame);
-            if frame.soft_misses == 0 {
+            if frame.soft_misses == 0 && self.world.waiting() == 0 {
                 break Settle {
                     seconds: stopped.elapsed().as_secs_f64(),
                     settled: true,
@@ -810,96 +1019,173 @@ impl Session<'_> {
                 };
             }
         };
-        Ok(capture.finish(&self.world, Some(settle)))
+        self.end_path(capture, &camera, Some(settle))
+    }
+
+    /// One dig at the Spawn, made before the frame's look at the scene as the game makes it, and
+    /// the frames after it until one has taken it in (ADR 0006's bound, which a stepped scene
+    /// thread cannot show). The camera is at the Spawn and the loader has caught up. The frames are
+    /// not those of a path.
+    fn edit(&mut self, spawn: &Camera) -> Result<EditLatency, Box<dyn Error>> {
+        self.step = "edit latency".to_string();
+        let aim = within_reach(&self.world, spawn);
+        let began = Instant::now();
+        let update = self.world.edit(&aim, &Tool::default())?;
+        let call = began.elapsed();
+        if let Some(update) = update {
+            self.gpu.frame(spawn, self.world.scene(), Some(&update))?;
+        }
+        for frames in 0..EDIT_FRAMES_CAP {
+            let frame = self.frame(spawn, true)?;
+            if frame.edit_taken {
+                return Ok(EditLatency {
+                    frames,
+                    ms: (frame.taken_at - began).as_secs_f64() * 1e3,
+                    call_ms: call.as_secs_f64() * 1e3,
+                });
+            }
+        }
+        Err(format!("the Edit was not taken in after {EDIT_FRAMES_CAP} frames").into())
     }
 
     /// The client's sizing constants against what the complete resident set measures: the scene
     /// thread counts exactly once, here, and not in every publish (see
-    /// [`World::count_once_exactly`]).
+    /// [`World::count_once_exactly`]). A look for holes follows, so that what the exact count saw
+    /// is in the run's.
     fn sizing(&mut self, setup: &Setup) -> Result<Sizing, Box<dyn Error>> {
+        self.step = "sizing".to_string();
         let update = self.world.count_once_exactly()?;
         // What the count published is copied to the GPU like any update.
         self.gpu
             .frame(&setup.spawn, self.world.scene(), update.as_ref())?;
         let streamed = self.world.store().streamed_len();
         let measured = measure_sizes(&self.world, setup.start, setup.d0, streamed)?;
+        self.look(&setup.spawn, true)?;
         Ok(Sizing::check(measured, &setup.constants))
+    }
+
+    /// The paths, in order, and what they and the run cost.
+    fn paths(&mut self, setup: &Setup, script: &Script) -> Result<RunReport, Box<dyn Error>> {
+        let course = Course::of(&setup.spawn);
+        let (cold_start, cold) = self.cold_start(setup, script)?;
+        let mut paths = vec![cold];
+        let sizing = self.sizing(setup)?;
+        let flight = |height: f64, direction: [f64; 3]| {
+            let course = &course;
+            move |world: &World, t: f64| {
+                course.along(world, direction, FLIGHT_METRES_PER_SECOND * t, height)
+            }
+        };
+        let speed = FLIGHT_METRES_PER_SECOND * VOXELS_PER_METRE;
+        let spawn = setup.spawn;
+        let cap = script.between_cap;
+        self.settle(&spawn, cap, "the cold start")?;
+        paths.push(self.path("flight at 2 m", script.flight, flight(0.0, course.ahead))?);
+        self.settle(&spawn, cap, "the flight at 2 m")?;
+        paths.push(self.path(
+            "flight at 50 m",
+            script.flight,
+            flight(HIGH_METRES * VOXELS_PER_METRE, course.right),
+        )?);
+        self.settle(&spawn, cap, "the flight at 50 m")?;
+        paths.push(
+            self.path("vertical take-off", script.take_off, |_, t| Camera {
+                position: std::array::from_fn(|a| {
+                    spawn.position[a] + spawn.horizon_up[a] * speed * t
+                }),
+                ..spawn
+            })?,
+        );
+        self.settle(&spawn, cap, "the vertical take-off")?;
+        // A half turn in the first half of the path and the view still for the second.
+        let half = script.turn.as_secs_f64() / 2.0;
+        paths.push(self.path("180 degree turn", script.turn, |_, t| {
+            let mut turned = spawn;
+            turned.turn(std::f64::consts::PI * (t / half).min(1.0), 0.0);
+            turned
+        })?);
+        self.settle(&spawn, cap, "the 180 degree turn")?;
+        paths.push(self.stop_after_a_flight(&course, script)?);
+        self.settle(&spawn, cap, "the stop after a flight")?;
+        let edit_latency = self.edit(&spawn)?;
+        // The last look: what happened since the last path's, the Edit's, is in the run's holes.
+        self.step = "the last look".to_string();
+        self.look(&spawn, true)?;
+        self.look_at_resident_memory();
+
+        let work = self.world.stats().work;
+        let mib = |bytes: u64| bytes as f64 / MIB;
+        let memory = Memory {
+            resident_peak_mib: self.resident_peak.map(mib),
+            whole_process_peak_mib: self.whole_process_peak.map(mib),
+            scene_used_peak_mib: mib(self.scene_used_peak_bytes),
+            scene_reserved_mib: mib(self.scene_reserved_bytes),
+            store_peak_bricks: self.store_peak as u64,
+            store_limit_bricks: setup.store_limit as u64,
+        };
+        Ok(RunReport {
+            cold_start,
+            paths,
+            scene_thread: SceneThread::between(Spent::default(), self.world.scene_thread_time()),
+            hole_looks: work.hole_scans - self.work_before.hole_scans,
+            holes: work.holes_found - self.work_before.holes_found,
+            edit_latency,
+            memory,
+            sizing,
+        })
     }
 }
 
+/// A run that stopped: what it was doing, and why.
+struct Stopped {
+    step: String,
+    error: Box<dyn Error>,
+}
+
 /// One run of the paths on `built`, drawing with `gpu`.
-fn one_run(built: Built, gpu: &mut dyn Gpu, script: &Script) -> Result<RunReport, Box<dyn Error>> {
+fn one_run(built: Built, gpu: &mut dyn Gpu, script: &Script) -> Result<RunReport, Stopped> {
     let Built { world, setup, .. } = built;
     world.count_soft_misses();
     world.measure_scene_thread();
-    let mut session = Session {
-        world,
-        gpu,
-        scene_peak_bytes: 0,
-        store_peak: 0,
-        frames: 0,
-    };
-    let course = Course::of(&setup.spawn);
-    let (cold_start, cold) = session.cold_start(&setup, script)?;
-    let mut paths = vec![cold];
-    let sizing = session.sizing(&setup)?;
-    let flight = |height: f64, direction: [f64; 3]| {
-        let course = &course;
-        move |world: &World, t: f64| {
-            course.along(world, direction, FLIGHT_METRES_PER_SECOND * t, height)
-        }
-    };
-    let speed = FLIGHT_METRES_PER_SECOND * VOXELS_PER_METRE;
-    let spawn = setup.spawn;
-    session.settle(&spawn, script.between_cap)?;
-    paths.push(session.path("flight at 2 m", script.flight, flight(0.0, course.ahead))?);
-    session.settle(&spawn, script.between_cap)?;
-    paths.push(session.path(
-        "flight at 50 m",
-        script.flight,
-        flight(HIGH_METRES * VOXELS_PER_METRE, course.right),
-    )?);
-    session.settle(&spawn, script.between_cap)?;
-    paths.push(
-        session.path("vertical take-off", script.take_off, |_, t| Camera {
-            position: std::array::from_fn(|a| spawn.position[a] + spawn.horizon_up[a] * speed * t),
-            ..spawn
-        })?,
-    );
-    session.settle(&spawn, script.between_cap)?;
-    // A half turn in the first half of the path and the view still for the second.
-    let half = script.turn.as_secs_f64() / 2.0;
-    paths.push(session.path("180 degree turn", script.turn, |_, t| {
-        let mut turned = spawn;
-        turned.turn(std::f64::consts::PI * (t / half).min(1.0), 0.0);
-        turned
-    })?);
-    session.settle(&spawn, script.between_cap)?;
-    paths.push(session.stop_after_a_flight(&course, script)?);
-
-    let memory = Memory {
-        process_peak_mib: process::peak_bytes().map(|b| b as f64 / MIB),
-        scene_peak_mib: session.scene_peak_bytes as f64 / MIB,
-        store_peak_bricks: session.store_peak as u64,
-        store_limit_bricks: setup.store_limit as u64,
-    };
-    Ok(RunReport {
-        cold_start,
-        paths,
-        scene_thread: SceneThread::between(Spent::default(), session.world.scene_thread_time()),
-        memory,
-        sizing,
+    // The work the scene thread had done before it was told to measure is the run's baseline.
+    let mut session = Session::new(world, gpu);
+    session.paths(&setup, script).map_err(|error| Stopped {
+        step: session.step.clone(),
+        error,
     })
 }
 
+/// The `run`th run: its world, its GPU, and the paths. Also the Planet's `d0`.
+fn whole_run(
+    full: bool,
+    run: u32,
+    resolution: Resolution,
+    script: &Script,
+) -> Result<(RunReport, f64), Failure> {
+    let failed = |step: &str, error: Box<dyn Error>| Failure {
+        run,
+        step: step.to_string(),
+        message: error.to_string(),
+    };
+    let built = if full { build_full() } else { build_test() }
+        .map_err(|e| failed("building the world", e))?;
+    let d0 = built.setup.d0;
+    let mut gpu = Offscreen::with_resolution(resolution, built.world.scene())
+        .map_err(|e| failed("making the GPU context", e))?;
+    let report = one_run(built, &mut OffscreenGpu(&mut gpu), script)
+        .map_err(|stopped| failed(&stopped.step, stopped.error))?;
+    Ok((report, d0))
+}
+
 /// Runs the real-time mode: `runs` runs of the paths, each on a world of its own and a GPU of its
-/// own, at full size or (for `--short`) on the test Planet, and the report of them.
+/// own, at full size or (for `--short`) on the test Planet, and the report of them. A run that
+/// stops ends the mode, and the report has the runs that finished and the error.
 pub fn run(
     full: bool,
     runs: u32,
     resolution: Resolution,
     budgets: &StreamingBudgets,
-) -> Result<RealTimeReport, Box<dyn Error>> {
+) -> RealTimeReport {
     let script = if full {
         Script::full()
     } else {
@@ -907,22 +1193,38 @@ pub fn run(
     };
     let mut reports = Vec::new();
     let mut d0 = 0.0;
+    let mut failure = None;
     for run in 1..=runs {
         eprintln!("real time: run {run} of {runs}");
         let began = Instant::now();
-        let built = if full { build_full()? } else { build_test()? };
-        d0 = built.setup.d0;
-        let mut gpu = Offscreen::with_resolution(resolution, built.world.scene())?;
-        let report = one_run(built, &mut OffscreenGpu(&mut gpu), &script)?;
-        eprintln!("real time: run {run} took {:.0?}", began.elapsed());
-        reports.push(report);
+        match whole_run(full, run, resolution, &script) {
+            Ok((report, d)) => {
+                d0 = d;
+                eprintln!("real time: run {run} took {:.0?}", began.elapsed());
+                reports.push(report);
+            }
+            Err(f) => {
+                eprintln!(
+                    "real time: run {run} stopped at `{}` after {:.0?}: {}",
+                    f.step,
+                    began.elapsed(),
+                    f.message
+                );
+                failure = Some(f);
+                break;
+            }
+        }
     }
     let planet = if full {
         "full-size".to_string()
     } else {
         "test".to_string()
     };
-    Ok(RealTimeReport::new(planet, d0, reports, budgets))
+    let report = RealTimeReport::new(planet, d0, reports, budgets);
+    match failure {
+        Some(failure) => report.failed(failure),
+        None => report,
+    }
 }
 
 const MIB: f64 = 1024.0 * 1024.0;
@@ -958,7 +1260,7 @@ mod tests {
             },
             soft_misses: Series::default(),
             soft_misses_per_frame: 0.0,
-            hole_scans: 2,
+            hole_looks: 2,
             holes,
             holes_per_frame: 0.0,
             scene_thread: SceneThread::default(),
@@ -992,7 +1294,7 @@ mod tests {
             cold_start: ColdStart {
                 world_map_s: Some(25.0),
                 load_s: 60.0,
-                time_to_control_s: 61.0,
+                time_to_level_0_under_camera_s: 61.0,
                 fill_s: 200.0,
             },
             paths: vec![
@@ -1000,9 +1302,18 @@ mod tests {
                 path("flight at 2 m", 11.0, 6.0, 0),
             ],
             scene_thread: SceneThread::default(),
+            hole_looks: 12,
+            holes: 0,
+            edit_latency: EditLatency {
+                frames: 1,
+                ms: 21.0,
+                call_ms: 3.0,
+            },
             memory: Memory {
-                process_peak_mib: Some(9000.0),
-                scene_peak_mib: 474.0,
+                resident_peak_mib: Some(8000.0),
+                whole_process_peak_mib: Some(9000.0),
+                scene_used_peak_mib: 474.0,
+                scene_reserved_mib: 560.0,
                 store_peak_bricks: 20_000_000,
                 store_limit_bricks: 23_000_000,
             },
@@ -1045,9 +1356,17 @@ mod tests {
         assert_eq!(exit_code(&report, false), 2);
     }
 
+    /// A run with `holes` found by the looks of the whole run, `in_a_path` of them in the path.
+    fn holes_found(holes: u64, in_a_path: u64) -> RunReport {
+        run_with(|r| {
+            r.holes = holes;
+            r.paths[1].holes = in_a_path;
+        })
+    }
+
     #[test]
     fn the_holes_gate_fires_alone_on_one_hole_in_any_path_of_any_run() {
-        let hole = run_with(|r| r.paths[1].holes = 1);
+        let hole = holes_found(1, 1);
         assert_eq!(over(std::slice::from_ref(&hole)), ["holes"]);
         // Three runs, one hole in the last: the holes are summed, and one is too many.
         assert_eq!(
@@ -1056,11 +1375,50 @@ mod tests {
         );
         let report = RealTimeReport::new("test".into(), 64.0, vec![hole], &BUDGETS);
         assert_eq!(exit_code(&report, false), 2);
+        assert_eq!(exit_code(&report, true), 0, "--no-fail");
+    }
+
+    #[test]
+    fn holes_found_outside_any_path_fire_the_gate_too() {
+        // Between paths, while the loader catches up, at the sizing, or at the last look: the run's
+        // total has the hole, and no path does.
+        let outside = holes_found(1, 0);
+        assert_eq!(outside.paths.iter().map(|p| p.holes).sum::<u64>(), 0);
+        assert_eq!(over(std::slice::from_ref(&outside)), ["holes"]);
+        let report = RealTimeReport::new("test".into(), 64.0, vec![outside], &BUDGETS);
+        assert_eq!(report.gates.holes.worst, 1.0);
+        assert_eq!(exit_code(&report, false), 2);
+    }
+
+    #[test]
+    fn a_holes_gate_that_looked_at_nothing_has_not_passed() {
+        // A run, or a path of one, with no look at all: no evidence, so the gate is over, and the
+        // report says how few looks there were.
+        let none_in_a_run = run_with(|r| r.hole_looks = 0);
+        assert_eq!(over(std::slice::from_ref(&none_in_a_run)), ["holes"]);
+        let none_in_a_path = run_with(|r| r.paths[1].hole_looks = 0);
+        assert_eq!(over(std::slice::from_ref(&none_in_a_path)), ["holes"]);
+        let g = gates(std::slice::from_ref(&none_in_a_path), &BUDGETS);
+        assert_eq!(g.hole_looks_fewest_in_a_path, 0);
+        assert_eq!(g.hole_looks_fewest_in_a_run, 12);
+        assert_eq!(
+            g.holes.worst, 0.0,
+            "no hole was found, and the gate is over"
+        );
+        // One run of three that looked at nothing is enough.
+        assert_eq!(
+            over(&[run_with(|_| {}), none_in_a_run, run_with(|_| {})]),
+            ["holes"]
+        );
+        // With a look in each path and each run, and none found, it passes.
+        let passing = RealTimeReport::new("test".into(), 64.0, vec![run_with(|_| {})], &BUDGETS);
+        assert!(passing.gates.over.is_empty());
+        assert_eq!(passing.gates.hole_looks_fewest_in_a_path, 2);
     }
 
     #[test]
     fn the_memory_gate_fires_alone_for_the_scene_over_its_budget_or_the_store_over_its_limit() {
-        let scene = run_with(|r| r.memory.scene_peak_mib = 512.5);
+        let scene = run_with(|r| r.memory.scene_used_peak_mib = 512.5);
         assert_eq!(over(std::slice::from_ref(&scene)), ["memory"]);
         let store = run_with(|r| r.memory.store_peak_bricks = r.memory.store_limit_bricks + 1);
         assert_eq!(over(std::slice::from_ref(&store)), ["memory"]);
@@ -1071,7 +1429,10 @@ mod tests {
             )])
             .is_empty()
         );
-        assert!(over(&[run_with(|r| r.memory.process_peak_mib = Some(1e9))]).is_empty());
+        // What the GPU reserves, and the process's memory, are reported and not gated.
+        assert!(over(&[run_with(|r| r.memory.scene_reserved_mib = 1e6)]).is_empty());
+        assert!(over(&[run_with(|r| r.memory.resident_peak_mib = Some(1e9))]).is_empty());
+        assert!(over(&[run_with(|r| r.memory.whole_process_peak_mib = Some(1e9))]).is_empty());
         let report = RealTimeReport::new("test".into(), 64.0, vec![store], &BUDGETS);
         assert_eq!(exit_code(&report, false), 2);
     }
@@ -1089,7 +1450,7 @@ mod tests {
         // Soft misses, time to control and settle time are reported and not gated: a run with
         // many, and a long time to control, is still within.
         let slow_to_settle = run_with(|r| {
-            r.cold_start.time_to_control_s = 600.0;
+            r.cold_start.time_to_level_0_under_camera_s = 600.0;
             r.paths[1].soft_misses_per_frame = 5000.0;
             r.paths[1].settle = Some(Settle {
                 seconds: 120.0,
@@ -1105,25 +1466,25 @@ mod tests {
             run_with(|r| {
                 r.paths[1].frame_time.p99_ms = 9.0;
                 r.paths[1].holes = 0;
-                r.memory.scene_peak_mib = 470.0;
+                r.memory.scene_used_peak_mib = 470.0;
             }),
             run_with(|r| {
                 r.paths[1].frame_time.p99_ms = 12.5;
                 r.paths[1].holes = 0;
-                r.memory.scene_peak_mib = 480.0;
+                r.memory.scene_used_peak_mib = 480.0;
             }),
             run_with(|r| {
                 r.paths[1].frame_time.p99_ms = 7.0;
                 r.paths[1].holes = 0;
-                r.memory.scene_peak_mib = 475.0;
+                r.memory.scene_used_peak_mib = 475.0;
             }),
         ];
         let report = RealTimeReport::new("full-size".into(), 1028.2, runs, &BUDGETS);
         let p99 = |v: &Value| v["paths"][1]["frame_time"]["p99_ms"].as_f64().unwrap();
         assert_eq!((p99(&report.min), p99(&report.max)), (7.0, 12.5));
-        assert_eq!(report.min["memory"]["scene_peak_mib"], 470.0);
-        assert_eq!(report.max["memory"]["scene_peak_mib"], 480.0);
-        // Integers stay integers, and what is not a number is the first run's.
+        assert_eq!(report.min["memory"]["scene_used_peak_mib"], 470.0);
+        assert_eq!(report.max["memory"]["scene_used_peak_mib"], 480.0);
+        // Integers stay integers, and what the runs agree on is kept.
         assert_eq!(report.max["paths"][1]["frames"], 600);
         assert_eq!(report.min["paths"][1]["name"], "flight at 2 m");
         // The min and the max have the shape of a run, so a field added to a run is in them.
@@ -1131,6 +1492,93 @@ mod tests {
         let run = serde_json::to_value(&report.runs[0]).unwrap();
         assert_eq!(keys(&report.min), keys(&run));
         assert_eq!(keys(&report.max), keys(&run));
+    }
+
+    #[test]
+    fn a_flag_is_the_all_and_the_any_of_the_runs_and_a_word_is_kept_only_if_they_agree() {
+        use serde_json::json;
+        let one =
+            json!({"over": false, "settled": true, "name": "a", "note": "x", "n": 1, "gone": null});
+        let two =
+            json!({"over": true, "settled": false, "name": "a", "note": "y", "n": 3, "gone": null});
+        let (least, most) = envelope(&[&one, &two]);
+        // A flag that says "over" says it for the worst run, whichever run it was.
+        assert_eq!(
+            (&least["over"], &most["over"]),
+            (&json!(false), &json!(true))
+        );
+        assert_eq!(
+            (&least["settled"], &most["settled"]),
+            (&json!(false), &json!(true))
+        );
+        assert_eq!((&least["name"], &most["name"]), (&json!("a"), &json!("a")));
+        // Runs that disagree on a word do not make one of theirs the report's.
+        assert_eq!(
+            (&least["note"], &most["note"]),
+            (&json!(null), &json!(null))
+        );
+        assert_eq!((&least["n"], &most["n"]), (&json!(1), &json!(3)));
+        let (least, most) = envelope(&[&two, &two]);
+        assert_eq!(
+            (&least["over"], &most["over"]),
+            (&json!(true), &json!(true))
+        );
+        // The sizing's own checks are in the runs, and a check that one run is over is over in the max.
+        let over_in_run_2 = {
+            let mut run = serde_json::to_value(run_with(|_| {})).unwrap();
+            run["sizing"]["checks"][0]["over"] = json!(true);
+            run
+        };
+        let fine = serde_json::to_value(run_with(|_| {})).unwrap();
+        let (least, most) = envelope(&[&fine, &over_in_run_2]);
+        assert_eq!(least["sizing"]["checks"][0]["over"], false);
+        assert_eq!(most["sizing"]["checks"][0]["over"], true);
+    }
+
+    #[test]
+    fn a_report_of_a_run_that_stopped_has_the_runs_that_finished_and_the_error_and_exits_1() {
+        let stopped = Failure {
+            run: 3,
+            step: "flight at 50 m".into(),
+            message: "the loader has not caught up after 1200s".into(),
+        };
+        let report = RealTimeReport::new(
+            "full-size".into(),
+            1028.2,
+            vec![run_with(|_| {}), run_with(|_| {})],
+            &BUDGETS,
+        )
+        .failed(stopped.clone());
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["runs"].as_array().unwrap().len(), 2);
+        assert_eq!(json["error"]["run"], 3);
+        assert_eq!(json["error"]["step"], "flight at 50 m");
+        assert!(
+            json["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("caught up")
+        );
+        // The min and the max are of the runs that finished.
+        assert_eq!(json["min"]["paths"][0]["name"], "cold start");
+        // An error is status 1 whatever the gates say, and `--no-fail` does not hide it, and a
+        // gate that is over is status 2 and not an error.
+        assert_eq!(exit_code(&report, false), 1);
+        assert_eq!(exit_code(&report, true), 1);
+        let slow = run_with(|r| r.paths[1].frame_time.p99_ms = 20.0);
+        let over_only = RealTimeReport::new("test".into(), 64.0, vec![slow], &BUDGETS);
+        assert_eq!(exit_code(&over_only, false), 2);
+        assert!(serde_json::to_value(&over_only).unwrap()["error"].is_null());
+        // No run finished at all: still a report, with no min and max, and the same status.
+        let none =
+            RealTimeReport::new("full-size".into(), 0.0, Vec::new(), &BUDGETS).failed(stopped);
+        let json = serde_json::to_value(&none).unwrap();
+        assert!(json["min"].is_null() && json["max"].is_null());
+        assert_eq!(exit_code(&none, false), 1);
+        assert!(
+            none.gates.over.is_empty(),
+            "no run is not a run that failed a gate"
+        );
     }
 
     #[test]
@@ -1144,7 +1592,7 @@ mod tests {
             [
                 "d0",
                 "deterministic",
-                "edit_latency",
+                "error",
                 "gates",
                 "max",
                 "min",
@@ -1155,15 +1603,34 @@ mod tests {
         );
         assert_eq!(json["mode"], "real-time");
         assert_eq!(json["deterministic"], false);
-        assert!(
-            json["edit_latency"]
-                .as_str()
-                .unwrap()
-                .starts_with("not measured")
-        );
+        assert!(json["error"].is_null());
         assert_eq!(
             keys(&json["runs"][0]),
-            ["cold_start", "memory", "paths", "scene_thread", "sizing"]
+            [
+                "cold_start",
+                "edit_latency",
+                "hole_looks",
+                "holes",
+                "memory",
+                "paths",
+                "scene_thread",
+                "sizing"
+            ]
+        );
+        assert_eq!(
+            keys(&json["runs"][0]["edit_latency"]),
+            ["call_ms", "frames", "ms"]
+        );
+        assert_eq!(
+            keys(&json["runs"][0]["memory"]),
+            [
+                "resident_peak_mib",
+                "scene_reserved_mib",
+                "scene_used_peak_mib",
+                "store_limit_bricks",
+                "store_peak_bricks",
+                "whole_process_peak_mib"
+            ]
         );
         assert_eq!(
             keys(&json["runs"][0]["paths"][0]),
@@ -1171,7 +1638,7 @@ mod tests {
                 "frame_cpu",
                 "frame_time",
                 "frames",
-                "hole_scans",
+                "hole_looks",
                 "holes",
                 "holes_per_frame",
                 "name",
@@ -1189,19 +1656,27 @@ mod tests {
                 "evict_ms",
                 "follow_ms",
                 "hole_scan_ms",
+                "hole_scan_share",
                 "pack_ms",
                 "upload_ms"
             ]
         );
         assert_eq!(
             keys(&json["runs"][0]["cold_start"]),
-            ["fill_s", "load_s", "time_to_control_s", "world_map_s"]
+            [
+                "fill_s",
+                "load_s",
+                "time_to_level_0_under_camera_s",
+                "world_map_s"
+            ]
         );
         assert_eq!(
             keys(&json["gates"]),
             [
                 "frame_cpu_p99_ms",
                 "frame_time_p99_ms",
+                "hole_looks_fewest_in_a_path",
+                "hole_looks_fewest_in_a_run",
                 "holes",
                 "over",
                 "scene_mib",
@@ -1230,7 +1705,9 @@ mod tests {
     fn the_real_time_run_on_the_test_planet_completes_with_every_path_and_field() {
         let built = build_test().expect("the test Planet builds");
         let d0 = built.setup.d0;
-        let run = one_run(built, &mut NoGpu, &Script::short()).expect("the run completes");
+        let run = one_run(built, &mut NoGpu, &Script::short()).unwrap_or_else(|stopped| {
+            panic!("the run stopped at {}: {}", stopped.step, stopped.error)
+        });
         let names: Vec<_> = run.paths.iter().map(|p| p.name).collect();
         assert_eq!(
             names,
@@ -1248,14 +1725,34 @@ mod tests {
             assert_eq!(path.frame_time.samples, path.frames);
             assert_eq!(path.frame_cpu.samples, path.frames);
             assert_eq!(path.soft_misses.frames, path.frames);
+            // Every path has a look at the holes: one is forced at its end.
+            assert!(path.hole_looks >= 1, "{}", path.name);
         }
+        // The run's looks are all of the paths' and those between and after them.
+        assert!(run.hole_looks >= run.paths.iter().map(|p| p.hole_looks).sum::<u64>());
+        assert!(run.holes >= run.paths.iter().map(|p| p.holes).sum::<u64>());
+        // The Edit was taken in by a look at the scene: no later than the cap, with times.
+        assert!(run.edit_latency.frames < EDIT_FRAMES_CAP && run.edit_latency.ms > 0.0);
+        assert!(run.edit_latency.call_ms > 0.0);
         let stop = run.paths.last().unwrap();
         assert!(stop.settle.is_some() && run.paths[..5].iter().all(|p| p.settle.is_none()));
         let cold = &run.cold_start;
-        assert!(cold.time_to_control_s >= cold.load_s && cold.fill_s >= cold.time_to_control_s);
+        assert!(
+            cold.time_to_level_0_under_camera_s >= cold.load_s
+                && cold.fill_s >= cold.time_to_level_0_under_camera_s
+        );
         // The thread did the work of a fill, which is timed by category.
         assert!(run.scene_thread.pack_ms > 0.0 && run.scene_thread.follow_ms > 0.0);
-        assert!(run.memory.scene_peak_mib > 0.0 && run.memory.store_peak_bricks > 0);
+        assert!(run.memory.scene_used_peak_mib > 0.0 && run.memory.store_peak_bricks > 0);
+        // The GPU reserves the buffers whole, which is at least what is in use.
+        assert!(run.memory.scene_reserved_mib >= run.memory.scene_used_peak_mib);
+        // Where the system says, the run's resident peak is within the process's.
+        if let (Some(run_peak), Some(whole)) = (
+            run.memory.resident_peak_mib,
+            run.memory.whole_process_peak_mib,
+        ) {
+            assert!(run_peak > 0.0 && run_peak <= whole);
+        }
         assert!(run.memory.store_limit_bricks >= run.memory.store_peak_bricks);
         // The sizing is measured at the complete set, with the counts made once and exactly.
         assert!(run.sizing.measured.ring_bricks > 0 && run.sizing.measured.guard_bricks > 0);
@@ -1263,10 +1760,28 @@ mod tests {
             run.sizing.measured.ring_refs_words,
             run.sizing.measured.ring_bricks
         );
-        // The scene thread looked for holes at least in the cold start's few seconds, or not at all
-        // if it was quicker: what it found is the gate.
+        // What the looks found is the gate, and each had a look, so that the gate looked.
         let report = RealTimeReport::new("test".into(), d0, vec![run], &BUDGETS);
         assert_eq!(report.gates.holes.worst, 0.0, "{:?}", report.gates);
+        assert!(report.gates.hole_looks_fewest_in_a_path >= 1);
+        assert!(!report.gates.over.contains(&"holes"), "{:?}", report.gates);
         serde_json::to_string(&report).expect("the report serializes");
+    }
+
+    /// A run that cannot finish says at which step, and why: here the cold start, with no time to
+    /// fill. It is in `.github/real-thread-tests.txt` with the smoke test (it has threads).
+    #[test]
+    fn a_run_that_stops_names_the_step_it_was_at() {
+        let built = build_test().expect("the test Planet builds");
+        let script = Script {
+            fill_cap: Duration::ZERO,
+            ..Script::short()
+        };
+        let stopped = match one_run(built, &mut NoGpu, &script) {
+            Ok(_) => panic!("a cold start with no time cannot finish"),
+            Err(stopped) => stopped,
+        };
+        assert_eq!(stopped.step, "cold start");
+        assert!(stopped.error.to_string().contains("not complete"));
     }
 }

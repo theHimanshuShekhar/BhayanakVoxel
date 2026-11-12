@@ -21,7 +21,7 @@ not fail the workflow: the run still ends as a success. The job's own check show
 it fails, so look at it on a PR, but do not make it a required check.
 
 It runs the client tests that are about real threads or real time (see the next section), among them
-the smoke test of the bench's real-time mode on the test Planet (#162): CI never runs the
+the smoke test of the bench's real-time mode on the test Planet and its error case (#162): CI never runs the
 full-size mode, which is for the 4090 (`docs/agents/benchmarking.md`), and the tests of its gates
 need no threads and gate. Some of
 them wait on wall-clock time, and they fail now and then on a busy runner. Run them locally when

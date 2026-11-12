@@ -38,6 +38,8 @@ streaming_tests::a_job_that_is_done_is_always_there_to_be_taken_even_as_the_thre
 # thread and the machine's clock, with no GPU. It runs every path and checks that the report has its
 # fields, and no time. The tests of the gates and of the report are not here: they gate.
 bench::realtime::tests::the_real_time_run_on_the_test_planet_completes_with_every_path_and_field
+# A run that cannot finish (a cold start with no time) says at which step: on the same threads.
+bench::realtime::tests::a_run_that_stops_names_the_step_it_was_at
 
 # A loader worker that panics.
 loader::tests::a_worker_that_panics_panics_the_frame_thread_instead_of_loading_stopping_silently

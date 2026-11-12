@@ -23,7 +23,8 @@ dev's RTX 4090.
 - **Streaming gates** (decided 2026-11-10): on the full-size Planet the bench also gates frame
   time p99 (16.7 ms), frame-thread CPU p99 (8 ms), holes (none) and memory (#162, "The real-time
   mode" below); soft misses at the speed-scaled level (none, ADR 0009), time to control and
-  settle time are reported by that run and become gates in #168. The part of this that CI can do,
+  settle time are reported by that run and become gates in #168 (Edit latency is reported by it
+  too, ADR 0006's bound). The part of this that CI can do,
   with counts and no times, is the stepped streaming mode of #181 (`--streaming`, below); the
   full-size run in real time is `--streaming --real-time`, on the 4090.
 - **`needs-stream-bench`** goes on a CPU-only PR that touches **the loader, prefetch, eviction or
@@ -55,7 +56,7 @@ release: a debug build's CPU side is slow enough to distort the frame times.
 | `--budgets FILE` | Use this budgets file instead of the one built into the executable. |
 | `--size WxH` | Resolution of the traced (internal) image. Default `1280x720`, the internal resolution behind 1440p output that the budgets are for; primary mode upscales it to twice that in each direction (2560x1440). Do not change it for a report you paste. |
 | `--bias F` | LOD bias: output pixels one Voxel may cover, default 1. Every switch distance between levels of detail scales with it (see `CONTEXT.md`, LOD band); 2 does about a quarter of the work for up to a pixel more of error. The report records it. A report with another bias is not comparable with the budgets. |
-| `--diag LIST` | Switches for finding out where time goes, separated by commas: `no-follow` (the Planet does not follow the camera), `no-upload` (it does, on the CPU, but the GPU is not told), `no-flush` (writes to the GPU go with the next frame's commands, not at once) and `gap-ms=F` (sleep F ms before each frame, as the CPU work of following would). The report lists them in `config.diag`, the summary warns, and the budgets are not checked (`budgets.skipped` says why; the exit status is 0). See "Reading a regression" below. |
+| `--diag LIST` | Switches for finding out where time goes, separated by commas: `no-follow` (the Planet does not follow the camera), `no-upload` (it does, on the CPU, but the GPU is not told), `no-flush` (writes to the GPU go with the next frame's commands, not at once) and `gap-ms=F` (sleep F ms before each frame, as the CPU work of following would). The report lists them in `config.diag`, the summary warns, and the budgets are not checked (`budgets.skipped` says why; the exit status is 0). See "Reading a regression" below. **`--diag` is an error with `--real-time`**: the real-time gates are always checked, so a diagnostic run of it would contradict the first sentence. |
 | `--short` | A tiny run (160x90, a handful of frames, a patch of the Planet): the CI smoke test. |
 | `--streaming` | Also runs the streaming mode (below): the test Planet streamed in, stepped, on a fixed frame schedule, with counts that are the same on every run. The report's `streaming` is null without it. |
 | `--real-time` | With `--streaming`, also runs the real-time mode (below): the full-size Planet with the real loader workers and scene thread, on the machine's clock, along paths of 50 m/s flights, a take-off, a turn, a stop and a cold start. It takes tens of minutes and is not deterministic. With `--short` it runs on the test Planet, as a smoke test. The report's `streaming_real_time` is null without it. |
@@ -69,8 +70,10 @@ to stderr.
 **Exit status:** 0 if every budget is met, 2 if a pass is over its budget (or has a budget but
 could not be timed) or, with `--streaming`, if any frame had a hole, or, with `--real-time`, if a
 gate of the real-time mode is over (below); 1 if the bench could not run (no Vulkan device, an
-unreadable budgets file, a bad option, or `--real-time` with budgets that have no `[streaming]`
-table).
+unreadable budgets file, a bad option, `--real-time` with budgets that have no `[streaming]`
+table, or a run of the real-time mode that stopped on an error: that is 1 even with `--no-fail`,
+and `report.json` is still written, with everything done before it and the error, see "When a run
+stops").
 
 ### What it does
 
@@ -262,12 +265,16 @@ mean nothing.
 
 ### What the 4090 script must pass
 
-**Pass `--streaming --real-time` once, not once for each of the script's N runs.** The runs are in
+**The invocation is `client.exe bench --streaming --real-time`, once, with no `--no-fail`, so that
+the exit status shows the gates (nothing else is needed: `--runs` defaults to 3). Pass it once,
+not once for each of the script's N runs.** The runs are in
 the process: `--runs N` (default 3) makes N complete runs, each on a fresh world and a fresh GPU
 context, and the report keeps all of them in `streaming_real_time.runs`, and **the least and the
 most of every number over them in `min` and `max`** (the same shape as a run: the number at its
-least and its most, over the runs; what is not a number is the first run's). The gates use the
-worst, and the exit status is the gates' (2 if one is over). So the script has nothing to merge:
+least and its most, over the runs; a boolean is the all of the runs' in `min` and the any in `max`,
+so a flag that says `over` says it in `max` if any run was; a word the runs agree on is kept and
+one they do not is null). The gates use the worst, and the exit status is the gates' (2 if one is
+over; 1 if the mode stopped on an error). So the script has nothing to merge:
 one `report.json` has the three runs, the envelope and the verdict. A script that runs
 `client.exe bench <args>` N times to collect N reports should pass the real-time flags to one of
 them (or pass `--runs 1` to each and take the worst itself, which the envelope in a single process
@@ -281,22 +288,30 @@ camera back there and the loader caught up. The camera's speed and shape are tho
 
 | Path | The camera |
 | --- | --- |
-| `cold start` | At the Spawn from the first frame until the resident set is complete. Time to control is in it. |
+| `cold start` | At the Spawn from the first frame until the resident set is complete. The first frame with level 0 under the camera is in it. |
 | `flight at 2 m` | 50 m/s along the ground, 10 s, 2 m over it. |
 | `flight at 50 m` | 50 m/s sideways, 10 s, 50 m over the ground. |
 | `vertical take-off` | 50 m/s straight up, 6 s. |
 | `180 degree turn` | A half turn in a second, then the view still for a second. |
 | `stop after a flight` | 5 s of the flight at 2 m, then the camera stands where it was until the scene has no soft misses (up to 120 s). Settle time is in it. |
 
+After the last path the camera is back at the Spawn and the loader has caught up, and **one dig**
+is made there (below): the run's **Edit latency**. Its frames are not those of a path.
+
 ### The fields
 
 `streaming_real_time.runs[]` (and `min` and `max` of the same shape), each made by this mode:
 
 - `cold_start`: `world_map_s` (generating the map, which the client does before `load`), `load_s`
-  (`load`: the spawn ring, the Guard, the first scene), **`time_to_control_s`** (from the start of
-  the load to the first frame with level 0 under the camera, which is the ground the character
-  stands on: the bench has no server, so the character itself is not in it) and `fill_s` (from the
-  start of the load to the resident set being complete). Not gated.
+  (`load`: the spawn ring, the Guard, the first scene), **`time_to_level_0_under_camera_s`** (from
+  the start of the load to the first frame in which one ray from the camera straight down hits the
+  ground at level 0) and `fill_s` (from the start of the load to the resident set being complete).
+  Not gated. **This is not the spec's "time to control"** (the 20 m ring round the Spawn at full
+  detail, with the character standing in it: the bench has no server, so the character is not in
+  it). I kept the ray and named the field for it: the spawn ring is made inside `load`, so the
+  ring of 20 m is there before the first frame and the spec's condition would read the load time
+  too; the time that streaming adds to it is `fill_s` minus this. The ray is cheap, and a ring of
+  rays at 20 m could not be tried at full size without the 4090.
 - `paths[]`: `name`, `frames`, `seconds` and, for each path:
   - `frame_time`: `samples`, `mean_ms`, **`p99_ms`** (nearest rank) and **`worst_ms`**. A frame is
     the frame thread's work in the game's order: `World::recentre`, the copy of what the scene
@@ -308,24 +323,60 @@ camera back there and the loader caught up. The camera's speed and shape are tho
     `soft_misses_per_frame`. The scene thread counts them a few times a second, so a frame
     reports the last count, and the count stays within about 100 ms of the truth. Not gated yet
     (#168).
-  - `hole_scans`, `holes` and `holes_per_frame`: **holes are sampled, not counted for every
-    frame.** Looking at every split brick takes 0.3 s at full size with the store's read lock held,
-    so the scene thread does it every 5 s (`SceneWorker::count_holes`), and the report has how many
-    looks there were in the path and what they found. A hole that lasted less than the gap between
-    looks is not seen; the stepped mode counts every frame on the test Planet, and the
-    scene thread only splits a brick whose children are resident, so the look is a check of that.
+  - `hole_looks`, `holes` and `holes_per_frame`: **holes are sampled, not counted for every
+    frame** (see "What the holes gate can and cannot catch"). Looking at every split brick takes
+    0.3 s at full size with the store's read lock held, so the scene thread does it every 5 s
+    (`SceneWorker::count_holes`), and **one more look is forced at the end of every path**
+    (`SceneWorker::look_now`), so no path has 0 looks. The report has how many looks there were in
+    the path and what they found.
   - `scene_thread`: milliseconds the scene thread spent in the path on `follow` (selecting again
     for a new camera and packing what changed), `pack` (asking the loader, taking in what it made
     and packing it), `upload` (publishing: copying what changed out for the frame thread, which
     copies it to the GPU), `evict` (eviction), `coarse` (the coarse levels over an Edit) and
-    `hole_scan`. The same for the whole run is `scene_thread` of the run.
+    `hole_scan` (the looks for holes), and **`hole_scan_share`**, the looks' share of all of that
+    (0 to 1), beside the soft-miss figures. **While a look runs the scene thread publishes
+    nothing**, so the share is also how much of the time the frame thread's updates were held
+    back (a look at full size is 0.3 s with the store's read lock held). The same for the whole
+    run is `scene_thread` of the run. The looks' time includes the forced ones.
   - `settle`, for `stop after a flight` only (null for the others): `seconds` from the frame the
     camera stopped in to the first frame with no soft misses, or the cap, and `settled`. Not gated.
-- `memory`: `process_peak_mib` (the process's peak resident memory since it began, so it only grows
-  over the runs: Windows' peak working set, Linux's `VmHWM`; null where the system does not say),
-  `scene_peak_mib` (the scene's buffers in use, at the most over the frames), `store_peak_bricks`
-  (the store's size as its budget counts it, looked at every 6 frames) and `store_limit_bricks` (the
-  most it may hold before eviction starts: the budget with its overflow).
+    The scene thread's count of soft misses can be from before the stop (it counts a few times a
+    second, and not at all while it sleeps), so a stale 0 would read as settled at once. So the
+    stop is followed by **a count made after it** (`SceneWorker::look_now(false)`, the count and no
+    look for holes, whose 0.3 s would be in the time), and the camera is settled when that count
+    or a later one is 0 **and `waiting()` is 0**. I chose `waiting` (the bricks the scene still
+    waits for the loader's to split) over the loader's `pending` because pending also holds jobs
+    ahead of the view, which the view does not wait for; a count after the forced one is not
+    stale, since the scene thread counts again at once when nothing waits any more, and every
+    100 ms while it works. The time has the resolution of a frame, and of the count's 100 ms.
+- `hole_looks` and `holes` of the run: the looks for holes over the whole run, **from the moment the
+  measuring began** (the paths, the catching up between them, the sizing and the Edit), and what
+  they found. **The holes gate is held to this**, not to the sum of the paths'. A look is forced at
+  the end of each catch-up (once the loader has caught up, at the Spawn), after the sizing, and at
+  the end of the run.
+- `edit_latency`: the Edit that the run makes, **frames**, **ms** and `call_ms` (see below).
+- `memory`:
+  - `resident_peak_mib`: the process's resident memory (Windows' working set, Linux's `VmRSS`) at the
+    most of the samples taken twice a second from the moment the run's world was built to the end
+    of the run. **This is the run's own figure**: it does not include the normal bench's
+    generation of the Planet that runs first in the process, nor an earlier run's. It does not
+    include the peak inside the generation of this run's world map and its `load` either, which
+    come before the first sample.
+  - `whole_process_peak_mib`: the OS's own peak for the **whole process** (Windows' peak working
+    set, which cannot be reset; Linux's `VmHWM`) since it began. It includes the normal bench's
+    generation of the full Planet and every earlier run, so it is an upper bound of the run's, and
+    only grows over the runs. Null where the system does not say (as `resident_peak_mib`).
+  - `scene_used_peak_mib`: the scene's buffers **in use** (`Scene::used_bytes`), at the most of
+    what the scene thread said: it works the figure out every 250 ms (`TABLES_EVERY`), so this is
+    the most of those, not of every frame. **The memory gate is on this**, against the full-size
+    test's `SCENE_MIB_MOST` (512 MiB). It is **not VRAM**.
+  - `scene_reserved_mib`: what the GPU reserves for the scene, used or not
+    (`Scene::reserved_bytes`: the table, the regions, the brick references and the bricks, 4 bytes a
+    word). The buffers are allocated whole, so it does not change over the run. This is the VRAM
+    the scene takes (at full size the bricks buffer alone is about 587 MB). Reported, not gated.
+  - `store_peak_bricks` (the store's size as its budget counts it, looked at every 6 frames) and
+    `store_limit_bricks` (the most it may hold before eviction starts: the budget with its
+    overflow).
 - `sizing`: the client's sizing constants against what was measured **at full size** with the
   resident set complete, as `streaming.sizing` has them on the test Planet (same fields and the
   same checks, with `d0` of 1028.2, and no share of level 0 taken out of `STREAMED_PER_D0_SQUARED`:
@@ -336,12 +387,22 @@ camera back there and the loader caught up. The camera's speed and shape are tho
   `docs/measurements.md` are measured again.
 
 `gates` holds, for each measure, the `worst` over every run (and path) and the `limit`, and `over`
-lists the gates that are over: `frame_time`, `frame_cpu`, `holes`, `memory`.
+lists the gates that are over: `frame_time`, `frame_cpu`, `holes`, `memory`. For the holes it also
+has `hole_looks_fewest_in_a_run` and `hole_looks_fewest_in_a_path`.
 
-**Edit latency is not measured in this mode**: no path makes an Edit (the versioned M1a path with
-a dig and the Zoom is #168), and `edit_latency` in the report says so. The stepped mode's
-`residency.edit_latency_frames` is 0 by construction (see above), so ADR 0006's bound is held by
-the stepped and real-thread tests and not yet by a number from the 4090.
+**Edit latency is measured in this mode**, as ADR 0006's bound needs the real scene thread and the
+stepped mode cannot show it (its `residency.edit_latency_frames` is 0 by construction, see above).
+After the stop path the camera is back at the Spawn with the loader caught up, and one dig
+(`world.edit(&aim, &Tool::default())`, `aim` the Spawn's view pulled to 40 Voxels from the ground,
+as the stepped mode does it) is made **before the frame's look at the scene**, as the game does,
+and frames at the Spawn follow until one has taken it in (`World::edit_taken`). `edit_latency` of
+each run is **`frames`** (from the frame that made the Edit to the one whose look took it in: 1 is
+the bound, an Edit made in frame N shows in N+1, 0 the frame that made it), **`ms`** (from before the
+Edit's call to the end of that look) and `call_ms` (the Edit's own call on the frame thread:
+planning and writing the bricks). `min` and `max` have the least and the most over the runs.
+It is reported and not gated: the bound is held by the stepped and real-thread tests, and this
+gives the number from the 4090 (#168 may gate it). A run in which the Edit is not taken in within
+600 frames stops with an error.
 
 ### The gates
 
@@ -354,22 +415,64 @@ over exits with status 2 (0 with `--no-fail`).
 | --- | --- | --- | --- |
 | Frame time | `frame_time_p99_ms` | 16.7 | the p99 of `frame_time`, of every path |
 | Frame-thread CPU | `frame_cpu_p99_ms` | 8.0 | the p99 of `frame_cpu`, of every path |
-| Holes | `holes` | 0 | the holes the scene thread's looks found, summed over every path and run |
-| Memory | `scene_mib` | 512 | the scene's buffers in use (the full-size test's 474 MiB measured, #143) |
+| Holes | `holes` | 0 | the holes that the scene thread's looks found over each **whole run**, from the moment the measuring began, summed over the runs. It also fails if a run, or a path of a run, had **no look at all**: a gate that looked at nothing has not passed |
+| Memory | `scene_mib` | 512 | the scene's buffers **in use** (`scene_used_peak_mib`; the full-size test's 474 MiB measured, #143). **It is not VRAM**: what the GPU reserves is `scene_reserved_mib`, reported and not gated |
 | Memory | (the store's own budget) | | the store's size against its limit, `store_limit_bricks`, which the client sets from `STREAMED_PER_D0_SQUARED` and `BUDGET_OVERFLOW` |
 
-Soft misses, time to control and settle time are reported and not gated. The final stage budgets
-are not these: they are the stages of #10, per pass (#13's `[passes]`).
+**Frame time is the pessimistic figure.** Here a frame is the CPU's work and then the wait for the
+GPU, one after the other, with no presentation; in a window the CPU records the next frame while the
+GPU draws the last, so the two overlap. A run that meets 16.7 ms here meets it windowed, and one
+that does not may.
+
+Soft misses, the time to level 0 under the camera, settle time and Edit latency are reported and
+not gated. The final stage budgets are not these: they are the stages of #10, per pass (#13's
+`[passes]`).
+
+#### What the holes gate can and cannot catch
+
+It catches a brick that is split with the bricks under it not resident **at the moment of a look**:
+the scene thread looks every 5 s (`HOLES_EVERY`) while it works, a look is forced at the end of
+every path, of every catch-up, of the sizing and of the run, and the gate is on everything those
+looks found in the run, between the paths too. It fails when a run or a path had no look at all.
+
+It cannot catch a hole that is made and filled **between two looks**: one that lasted less than
+the interval between looks is not seen, and that includes a hole that is in one frame of a flight
+and gone by the next. A path's looks are at the interval and the end of the path, so the 2 s turn
+and the 6 s take-off have the one at their end and, at most, one more. The stepped mode on the
+test Planet counts holes in every frame, and so catches those on the test Planet, where the
+scene thread splits only a brick whose children are resident (so a hole is a bug in that rule). **An
+exact count at every publish at full size would be follow-up work in `render`**: `Scene::holes` is
+a pass over every split brick, which at full size is about 0.3 s, and what would make it exact is
+keeping the count of split bricks with a missing child as the scene changes (made and unmade by the
+selection and by eviction), so that a publish reads it and no pass is needed. Until then the gate
+is a sample.
 
 ### Reading it and tests
 
-The gates, the least and the most over runs, the shape of the report, and the budgets table are
-unit tests in `bench/realtime.rs` and `bench/budget.rs`, with no GPU and no Planet: one test per
-gate builds runs that are within every gate but one and checks that exactly that gate fires, with
-status 2 (the report is built from numbers, so they gate on Linux and on Windows).
+The gates, the least and the most over runs, the shape of the report, the report of a run that
+stopped, and the budgets table are unit tests in `bench/realtime.rs` and `bench/budget.rs`, with no
+GPU and no Planet: one test per gate builds runs that are within every gate but one and checks that
+exactly that gate fires, with status 2 (the report is built from numbers, so they gate on Linux and
+on Windows). For the holes there are three: a hole in a path, a hole **outside** any path (between
+them, at the sizing, at the last look) and a gate that looked at nothing. A stepped test of the
+scene thread (`streaming_tests`) checks that a look that is asked for counts the soft misses and
+looks for holes whatever the clock says.
 `the_real_time_run_on_the_test_planet_completes_with_every_path_and_field` runs the mode on the
-test Planet with real threads and no GPU, and asserts what was run, no time; it is in
-`.github/real-thread-tests.txt` and so does not gate. CI does not run the full-size mode.
+test Planet with real threads and no GPU, and asserts what was run, no time (a look for holes in
+every path, the Edit taken in); `a_run_that_stops_names_the_step_it_was_at` is its error case.
+Both are in `.github/real-thread-tests.txt` and so do not gate. CI does not run the full-size mode.
+
+#### When a run stops
+
+A run that stops (the loader that does not catch up within its cap, a GPU error, the Edit not
+taken in, a full scene) ends the mode, and the bench **still writes `report.json`**: the normal
+bench's results, `streaming_real_time.runs` with the runs that finished (the `min`, `max` and
+`gates` are of those; null `min` and `max` if none finished), and `streaming_real_time.error`:
+`{ "run", "step", "message" }`, the run that was going and what it was doing (`building the
+world`, `making the GPU context`, `cold start`, a path's name, `the loader's catch-up after ...`,
+`sizing`, `edit latency`, `the last look`). The exit status is **1**, even with `--no-fail`: an
+error says nothing about whether the gates would have held, and it is not 2. `error` is null when
+the mode ran to its end.
 
 ## Reading the report
 
@@ -400,7 +503,7 @@ test Planet with real threads and no GPU, and asserts what was run, no time; it 
                  "timing": { "deterministic": false, ... } } | null,  // --streaming only
   "streaming_real_time": { "mode": "real-time", "deterministic": false, "planet", "d0",
                            "runs": [RUN...], "min": RUN, "max": RUN, "gates",
-                           "edit_latency": "not measured: ..." } | null  // --real-time only
+                           "error": { "run", "step", "message" } | null } | null  // --real-time only
 }
 ```
 
