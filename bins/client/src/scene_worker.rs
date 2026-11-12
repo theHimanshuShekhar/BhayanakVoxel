@@ -553,6 +553,10 @@ struct Shared {
     /// The upload budget (see [`UPLOAD_BUDGET`]): bytes, and copies.
     budget_bytes: AtomicU64,
     budget_writes: AtomicU32,
+    /// A test asked for the largest-operation figures to start again (see
+    /// [`SceneWorker::forget_largest`]).
+    #[cfg(test)]
+    forget_largest: AtomicBool,
     /// The most words a buffer of the scene may have (see [`SceneWorker::set_buffer_limit`]).
     buffer_limit: AtomicUsize,
 }
@@ -666,6 +670,8 @@ impl SceneWorker {
             spent: std::array::from_fn(|_| AtomicU64::new(0)),
             budget_bytes: AtomicU64::new(UPLOAD_BUDGET.bytes),
             budget_writes: AtomicU32::new(UPLOAD_BUDGET.writes),
+            #[cfg(test)]
+            forget_largest: AtomicBool::new(false),
             buffer_limit: AtomicUsize::new(usize::MAX),
         });
         let (garbage, graveyard) = mpsc::channel();
@@ -750,6 +756,14 @@ impl SceneWorker {
         self.shared
             .budget_writes
             .store(budget.writes, Ordering::Relaxed);
+    }
+
+    /// Starts the largest-operation figures of [`Stats`] (`largest_op`, `largest_batch`,
+    /// `largest_follow`) again from the thread's next round, so that a test can read the sizes of a
+    /// stretch of the run and not the whole session's.
+    #[cfg(test)]
+    pub fn forget_largest(&self) {
+        self.shared.forget_largest.store(true, Ordering::Release);
     }
 
     /// One step of a stepped scene thread: the loader makes up to [`STEP_JOBS`] jobs, and the
@@ -1346,6 +1360,12 @@ impl Engine {
         self.scene
             .set_buffer_limit(self.shared.buffer_limit.load(Ordering::Relaxed));
         self.throttled = false;
+        #[cfg(test)]
+        if self.shared.forget_largest.swap(false, Ordering::AcqRel) {
+            self.largest_op = UploadCost::default();
+            self.largest_batch = UploadCost::default();
+            self.largest_follow = UploadCost::default();
+        }
         let mut worked = !jobs.is_empty();
         // A sync is done when the rest of what the thread does in this round is.
         #[cfg_attr(not(test), allow(unused_mut))]

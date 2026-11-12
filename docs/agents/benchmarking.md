@@ -564,9 +564,15 @@ frame took the newest Edit in), `growth` (a buffer grew in the frame), or `opera
 those: the operations that took the budget, and the gap words). The causes are exclusive and add
 up to `over_budget.frames`. The stepped tests measure the same on the test Planet: a fill with a
 still camera and a small budget, one with a budget well over the largest operation (the plain
-budget holds in every frame of it), and a flight with a budget a tenth over its largest follow
-step and batch, in which every update is within the bound above, worked out from the sizes the
-test measures (and the budget cuts 116 of its 120 frames).
+budget holds in every frame of it: this is the test that fails if the throttle does not hold
+work back, with a still camera), and a flight from the spawn over ground that is still loading
+(24 Voxels a frame, 120 frames), with a budget of one largest batch. The flight's control, with
+nothing held back, has frames of 866 324 bytes in 69 copies, over the bound above for this
+budget (613 536 bytes, 63 copies: budget 203 724 / 23, the largest follow step 210 860 / 18 or
+batch 198 952 / 20 as the crossing operation, and the first batch), and the test asserts that
+first. The throttled flight's every update is within the bound (at most 196 888 bytes in 24
+copies), worked out from the flight's own patch sizes. The test fails, as does the still-camera
+one, if the `break` in the arrivals loop and the early return in the follow are removed.
 
 ### The gates
 

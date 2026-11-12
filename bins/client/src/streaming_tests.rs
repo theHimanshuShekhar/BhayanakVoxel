@@ -2629,7 +2629,8 @@ struct Filled {
 /// whatever the throttle decides: it catches an operation that adds to a patch without going
 /// through `note()`, or a patch that is bigger than the operations that made it (merging adding
 /// words), and it does not say that the throttle holds back when it should. That is what the
-/// frames cut, the comfortable budget's test and the flight's independent bound are for.
+/// frames cut, `with_a_budget_well_over_one_operation…` (a still camera: the test that fails if the
+/// throttle holds nothing back) and the flight's bound from patch sizes are for.
 fn fill_checked(budget: render::UploadCost) -> Filled {
     let (mut world, _server, camera) = spawned_world(Run::Stepped);
     world.count_exactly();
@@ -2859,13 +2860,22 @@ struct Flown {
 /// The camera flown `frames` frames of `step` Voxels along the ground from the spawn, in a stepped
 /// world that has filled in, with `budget` for what the scene thread lets wait to be uploaded
 /// (the default one, if none is given), and then left still until nothing waits.
-fn fly_counting(budget: Option<render::UploadCost>, step: f64, frames: usize) -> Flown {
+fn fly_counting(
+    budget: Option<render::UploadCost>,
+    step: f64,
+    frames: usize,
+    filled: bool,
+) -> Flown {
     let (mut world, _server, camera) = spawned_world(Run::Stepped);
     world.count_exactly();
-    fill(&mut world, camera.position);
+    if filled {
+        fill(&mut world, camera.position);
+    }
     if let Some(budget) = budget {
         world.worker().set_upload_budget(budget);
     }
+    // The largest operations are those of the flight (and the drain after it), not of the fill.
+    world.worker().forget_largest();
     let before = world.stats().work;
     let (ahead, _) = tangents(camera.horizon_up);
     let mut flown = Flown::default();
@@ -2924,7 +2934,7 @@ fn flying_with_more_work_than_the_budget_drains_the_backlog_takes_in_arrivals_an
     // 8 Voxels a frame is 24 m/s, and a jump is 2 `d0`: 128 Voxels on these bands, 16 frames of
     // it. The flight is 240 frames, so a camera that was not followed for that long would jump.
     let (step, frames) = (8.0, 240);
-    let control = fly_counting(None, step, frames);
+    let control = fly_counting(None, step, frames, true);
     assert_eq!((control.cut, control.rebuilds), (0, 0), "{control:?}");
     for budget in [
         SMALL_BUDGET,
@@ -2933,7 +2943,7 @@ fn flying_with_more_work_than_the_budget_drains_the_backlog_takes_in_arrivals_an
             writes: 32,
         },
     ] {
-        let flown = fly_counting(Some(budget), step, frames);
+        let flown = fly_counting(Some(budget), step, frames, true);
         eprintln!("{budget:?}: {flown:?}\n  control {control:?}");
         // Work is held back for the whole flight: the budget is under what following costs.
         assert!(flown.cut > frames / 2, "{flown:?}");
@@ -2962,59 +2972,78 @@ fn flying_with_more_work_than_the_budget_drains_the_backlog_takes_in_arrivals_an
     }
 }
 
+/// The most that one update of a flight lists (bytes, once each) and copies.
+fn most_listed(flown: &Flown) -> (u64, u32) {
+    let bytes = flown.uploads.0.iter().map(|u| u.0).max().unwrap_or(0);
+    let writes = flown.uploads.0.iter().map(|u| u.1).max().unwrap_or(0);
+    (bytes, writes)
+}
+
 #[test]
-fn a_flight_with_a_budget_above_its_largest_operations_is_held_to_the_budget_the_crossing_operation_and_the_first_batch()
+fn a_flight_over_ground_that_is_still_loading_is_held_to_the_budget_the_crossing_operation_and_the_first_batch()
  {
-    // The sizes of the largest follow step and batch of arrivals, found out with nothing held
-    // back (patch costs, whatever the budget decides).
+    // A flight of 24 Voxels a frame from the spawn with the resident set not yet filled in, so
+    // that the loader has batches for every round and a follow step is not the whole of a
+    // frame, with nothing held back (the default budget): its frames pass any small budget by
+    // several operations.
     let (step, frames) = (24.0, 120);
-    let control = fly_counting(None, step, frames);
-    eprintln!("control {control:?}");
-    let largest = |a: render::UploadCost, b: render::UploadCost| render::UploadCost {
-        bytes: a.bytes.max(b.bytes),
-        writes: a.writes.max(b.writes),
-    };
-    let one = largest(control.largest_follow, control.largest_batch);
-    assert!(one.bytes > 0 && one.writes > 0, "{control:?}");
-    // Above any one operation (by a tenth), and under what a frame of the flight adds (a follow
-    // step and the batches of the round: the control's worst frame is more than that).
-    let budget = render::UploadCost {
-        bytes: one.bytes + one.bytes / 10,
-        writes: one.writes + one.writes / 10 + 1,
-    };
-    assert!(control.worst.bytes > budget.bytes, "{control:?}");
-    let flown = fly_counting(Some(budget), step, frames);
-    eprintln!("{budget:?}: {flown:?}");
-    assert!(flown.cut > 0, "the budget holds nothing back: {flown:?}");
+    let control = fly_counting(None, step, frames, false);
+    eprintln!(
+        "control {control:?}, most listed {:?}",
+        most_listed(&control)
+    );
+    assert_eq!((control.cut, control.rebuilds, control.holes), (0, 0, 0));
+    // The budget: what the largest batch of arrivals of the flight costs, so that one batch is
+    // what takes what waits to it.
+    let budget = control.largest_batch;
+    assert!(budget.bytes > 0 && budget.writes > 0, "{control:?}");
+    let flown = fly_counting(Some(budget), step, frames, false);
+    eprintln!(
+        "{budget:?}: {flown:?}, most listed {:?}",
+        most_listed(&flown)
+    );
     assert_eq!((flown.rebuilds, flown.holes), (0, 0), "{flown:?}");
-    // What a frame may take, from the sizes that this run measured: the budget, and the one
-    // operation (a follow step or a batch) that took what waits to it, and the first batch of the
-    // round, which is taken whatever following added. What the patch lists, once each, and the
-    // copies (joining ranges only ever makes fewer); the words between joined ranges are held to
-    // what a copy may hold.
-    let crossing = largest(flown.largest_follow, flown.largest_batch);
+    // What a frame may take, from the sizes of the flight itself (patch costs, kept from the
+    // flight's first round: not `excess_ops`, not the fill's): the budget, the one operation (a
+    // follow step or a batch) that took what waits to it, and the first batch of the round, which
+    // is taken whatever following added. What the patch lists, once each, and the copies (joining
+    // ranges only ever makes fewer); the words between joined ranges are held to what a copy may
+    // hold.
+    let crossing = render::UploadCost {
+        bytes: flown.largest_follow.bytes.max(flown.largest_batch.bytes),
+        writes: flown.largest_follow.writes.max(flown.largest_batch.writes),
+    };
     let first = flown.largest_batch;
-    let mut over_the_budget = 0;
+    let bound = (
+        budget.bytes + crossing.bytes + first.bytes,
+        budget.writes + crossing.writes + first.writes,
+    );
+    // The test has the power to fail: with nothing held back the flight's frames are well over
+    // that bound, in bytes and in copies.
+    let (control_bytes, control_writes) = most_listed(&control);
+    assert!(
+        control_bytes > bound.0 + bound.0 / 5 && control_writes > bound.1,
+        "the unthrottled flight is not over the bound {bound:?}: {control_bytes} bytes, \
+         {control_writes} copies"
+    );
+    // And the throttled flight is held to it, in every update.
+    assert!(flown.cut > frames / 2, "{flown:?}");
     for (frame, &(listed, writes, gaps)) in flown.uploads.0.iter().enumerate() {
         assert!(
-            listed <= budget.bytes + crossing.bytes + first.bytes,
-            "update {frame}: {listed} bytes, over {budget:?} and the operations {crossing:?}, {first:?}"
+            listed <= bound.0,
+            "update {frame}: {listed} bytes, over {bound:?} (the budget {budget:?}, and the \
+             operations {crossing:?}, {first:?})"
         );
         assert!(
-            u64::from(writes) <= u64::from(budget.writes + crossing.writes + first.writes),
-            "update {frame}: {writes} copies, over {budget:?} and the operations {crossing:?}, {first:?}"
+            writes <= bound.1,
+            "update {frame}: {writes} copies, over {bound:?} (the budget {budget:?}, and the \
+             operations {crossing:?}, {first:?})"
         );
         assert!(
             gaps <= u64::from(writes) * render::scene::COPY_GAP as u64 * 4,
             "update {frame}: {gaps} bytes between copies"
         );
-        over_the_budget +=
-            usize::from(listed > budget.bytes || u64::from(writes) > u64::from(budget.writes));
     }
-    eprintln!(
-        "{over_the_budget} of {} updates over the plain budget",
-        flown.uploads.0.len()
-    );
 }
 
 #[test]
