@@ -1,7 +1,7 @@
 //! Watching that the tables made roomy up front stay that size. A table that grows in the middle of
-//! a frame moves every entry (tens to hundreds of milliseconds, 0.9 s for the selection's nodes), and a scene that runs out of words is packed and
-//! uploaded again (`SceneUpdate::Rebuilt`), so either is a sign that `room_for` and
-//! `expected_words` in `main.rs` are too small. The client logs one to stderr, at most once in a
+//! a frame moves every entry (tens to hundreds of milliseconds, 0.9 s for the selection's nodes), and a scene that runs out of words grows
+//! that buffer (a new buffer on the GPU and a copy of the old, and the frame thread's copy made
+//! longer), so either is a sign that `room_for` and `expected_words` in `main.rs` are too small. The client logs one to stderr, at most once in a
 //! while for each kind; the full-size test asserts there is none.
 
 use std::collections::HashMap;
@@ -156,8 +156,8 @@ impl GrowthWatch {
             .collect()
     }
 
-    /// Logs that the scene was packed again and uploaded in full, and why if it is known. Only
-    /// running out of room is a sign that something was sized too small.
+    /// Logs that the scene was packed again and uploaded in full, and why if it is known. Both
+    /// reasons are expected: running out of room grows a buffer, and does not pack again.
     pub fn rebuilt(&mut self, why: Option<Rebuild>, now: Instant) {
         if let Some(message) = self.rebuilt_message(why, now) {
             eprintln!("{message}");
@@ -176,10 +176,6 @@ impl GrowthWatch {
             Some(Rebuild::Jump) => (
                 "rebuilt after jump",
                 "after the camera jumped further than the rings follow, as expected",
-            ),
-            Some(Rebuild::OutOfRoom) => (
-                "rebuilt out of room",
-                "because its buffers or regions ran out of room (the reservation is too small)",
             ),
             None => ("rebuilt", "for a reason that is not known"),
         };
@@ -254,14 +250,11 @@ mod tests {
     }
 
     #[test]
-    fn a_rebuild_says_why_and_only_running_out_of_room_is_a_sizing_problem() {
+    fn a_rebuild_says_why_and_both_are_expected() {
         let now = Instant::now();
         let mut watch = GrowthWatch::default();
         let message = |watch: &mut GrowthWatch, why| watch.rebuilt_message(why, now).unwrap();
         assert!(message(&mut watch, Some(Rebuild::Jump)).contains("jumped"));
-        let out_of_room = message(&mut watch, Some(Rebuild::OutOfRoom));
-        assert!(!out_of_room.contains("expected"), "{out_of_room}");
-        assert!(out_of_room.contains("too small"), "{out_of_room}");
         assert!(message(&mut watch, Some(Rebuild::Bands)).contains("new bias, as expected"));
         // After a change of bias the store's tables are expected to grow.
         watch.observe(vec![size("store", 5, 100)], now);

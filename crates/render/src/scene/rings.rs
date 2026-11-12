@@ -17,9 +17,9 @@
 //! them). Levels that have nothing, and the sky above and below the crust, then cost a clip and
 //! no steps.
 //!
-//! The buffers are allocated once, with room to spare ([`Room`] says how much when it is given;
+//! The buffers are allocated with room to spare ([`Room`] says how much when it is given;
 //! otherwise it is what the bricks selected need and half as much again), so they keep their
-//! size as the camera moves. [`Scene::recentre`] follows the camera: it asks the selection what
+//! size as the camera moves, unless one fills. [`Scene::recentre`] follows the camera: it asks the selection what
 //! changed and packs again only the regions that gained or lost a brick. [`Scene::update`] takes
 //! Edits in, from the bricks of level 0 that they changed, and rewrites only the bricks that
 //! differ.
@@ -30,11 +30,15 @@
 //! Bricks that are next to each other in space are then next to each other in memory, which the
 //! reference's incoherent bounce rays gain from. `crates/render/tests/layout.rs` measures it.
 //!
-//! The way this can fail is that the words run out ([`RingsFull`]). A scene that was sized by the
-//! bricks it needs packs itself again, bigger, when that happens, and says so
-//! ([`SceneUpdate::Rebuilt`]), which makes the GPU copy new buffers; one with a [`Room`] given
-//! fails, and is not to be used again: its selection and its pending patch no longer match what
-//! is on the GPU.
+//! The way this can fail is that the words run out ([`RingsFull`]), for a scene that was given its
+//! [`Room`]: it fails, and is not to be used again, since its selection and its pending patch no
+//! longer match what is on the GPU. A scene that was sized by the bricks it needs grows the one
+//! buffer that ran out, with room to spare (a quarter, and at least a mebiword; the table of one
+//! level, which is a hash table, is made again bigger at the end of `table` with its regions listed
+//! in it again), and says so in the next patch ([`RingPatch::sizes`]): the GPU copy makes that
+//! buffer bigger and copies what it had, and no other buffer is touched (A3 of
+//! `docs/research/scheduling-and-upload.md`). Only a jump of the camera or other bands pack all of
+//! the scene again ([`SceneUpdate::Rebuilt`]), which makes the GPU copy new buffers.
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -49,6 +53,7 @@ use super::{
     SOLID_FLAG, Scene, SceneUpdate, bit_of, encode_mixed, region_of,
 };
 use crate::lod::{AHEAD, Bands, LEVELS, Margins, Reach};
+use crate::tracer::SceneHeader;
 
 /// How many words the buffers of a scene of rings have, for each level, when the scene is given
 /// room instead of being sized by the bricks it holds. The levels share what they have, except
@@ -246,7 +251,7 @@ enum Sizing {
     Given(Room),
     /// By what the bricks selected need, and this many times as much, so that the camera can go
     /// on to where there are more, and at least this many words of `brick_refs` and of `bricks`.
-    /// A scene that does not fit is packed again, bigger.
+    /// A buffer that is full grows.
     Fitted(f64, (usize, usize)),
 }
 
@@ -277,6 +282,8 @@ pub(super) struct Rings {
     reserved: Option<Reserved>,
     /// Why the scene was last made again, if it was.
     rebuilt: Option<Rebuild>,
+    /// The lengths of the buffers that the last patch said (see [`RingPatch::sizes`]).
+    reported: Lengths,
 }
 
 /// The room [`Scene::reserve`] was asked to make in the selection, and the bands' `d0` it was for.
@@ -288,16 +295,13 @@ struct Reserved {
     d0: f64,
 }
 
-/// Why a scene of rings was packed again and uploaded in full ([`SceneUpdate::Rebuilt`]).
+/// Why a scene of rings was packed again and uploaded in full (a buffer that fills only grows) ([`SceneUpdate::Rebuilt`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Rebuild {
     /// Other LOD bands were asked for (a new bias): expected.
     Bands,
     /// The camera jumped further than the rings follow: expected.
     Jump,
-    /// The words of the buffers, or the regions of a level, ran out: the scene was sized too
-    /// small.
-    OutOfRoom,
 }
 
 /// A [`RingPatch`] in the making.
@@ -311,6 +315,28 @@ struct Patch {
     brick_refs: Vec<Range<usize>>,
     bricks: Vec<Range<usize>>,
     levels: bool,
+}
+
+/// The lengths of the four buffers of a scene of rings, in words. Each grows on its own, when it
+/// is the one that ran out of room (see [`Scene::grow_words`] and `grow_level`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Lengths {
+    pub table: usize,
+    pub regions: usize,
+    pub brick_refs: usize,
+    pub bricks: usize,
+}
+
+impl Lengths {
+    /// The lengths of the buffers of `scene`.
+    pub fn of(scene: &Scene) -> Self {
+        Self {
+            table: scene.table.len(),
+            regions: scene.regions.len(),
+            brick_refs: scene.brick_refs.len(),
+            bricks: scene.bricks.len(),
+        }
+    }
 }
 
 /// What changed in a scene of rings, for copying to a GPU copy of it. Everything else is as
@@ -328,6 +354,55 @@ pub struct RingPatch {
     /// Whether [`Scene::levels`] changed: the boxes walked, the holes, or the ball that rays are
     /// clipped to.
     pub levels: bool,
+    /// The lengths the buffers have now, if any of them grew (they never shrink): a copy of the
+    /// scene makes the buffers that are shorter this long, with what they had, before it writes
+    /// the words above. A buffer that is not named here has not changed in length.
+    pub sizes: Option<Lengths>,
+}
+
+/// The buffers of a scene of rings, for naming the part of one to write.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Part {
+    Table,
+    Regions,
+    BrickRefs,
+    Bricks,
+}
+
+/// What copying a [`RingPatch`] to the GPU costs: the bytes of the copies, and how many there are
+/// (each is a copy on the GPU with a barrier of its own), the header's included.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct UploadCost {
+    pub bytes: u64,
+    pub writes: u32,
+}
+
+impl UploadCost {
+    /// This and `other`, both.
+    pub fn plus(self, other: UploadCost) -> UploadCost {
+        UploadCost {
+            bytes: self.bytes + other.bytes,
+            writes: self.writes + other.writes,
+        }
+    }
+}
+
+/// Words that a gap between two words written may have, for one copy to write them both: the
+/// words in the gap are written again as they are. A copy costs a barrier and a command, a
+/// thousand words 4 KB at several GB/s, so it is cheaper to write a few thousand words twice
+/// than to make another copy. Measured on the stepped streaming bench (docs/measurements.md).
+pub const COPY_GAP: usize = 1024;
+
+/// The ranges of `ranges` (ascending) with those that are `gap` words apart or less made one.
+fn joined(ranges: impl IntoIterator<Item = Range<usize>>, gap: usize) -> Vec<Range<usize>> {
+    let mut out: Vec<Range<usize>> = Vec::new();
+    for range in ranges.into_iter().filter(|r| !r.is_empty()) {
+        match out.last_mut() {
+            Some(last) if range.start <= last.end + gap => last.end = last.end.max(range.end),
+            _ => out.push(range),
+        }
+    }
+    out
 }
 
 impl RingPatch {
@@ -338,6 +413,44 @@ impl RingPatch {
             + self.table.len() * 4
             + ranges(&self.brick_refs)
             + ranges(&self.bricks)
+    }
+
+    /// The copies that bring a GPU copy up to date with this patch, in the order to make them:
+    /// the words of bricks, then the lists of entries, the records, and the table, as ranges of
+    /// words of each buffer. Ranges that are [`COPY_GAP`] words apart or less are one copy, so a
+    /// patch of thousands of small writes is a few dozen copies; the words between are written as
+    /// the scene has them, which is what the GPU copy has too, since it is brought up to date by
+    /// every patch before this one.
+    pub fn copies(&self) -> Vec<(Part, Range<usize>)> {
+        let slots = self.table.iter().map(|&s| s * 4..s * 4 + 4);
+        let records = self
+            .regions
+            .iter()
+            .map(|&r| r * REGION_WORDS..(r + 1) * REGION_WORDS);
+        let mut out = Vec::new();
+        for (part, ranges) in [
+            (Part::Bricks, joined(self.bricks.iter().cloned(), COPY_GAP)),
+            (
+                Part::BrickRefs,
+                joined(self.brick_refs.iter().cloned(), COPY_GAP),
+            ),
+            (Part::Regions, joined(records, COPY_GAP)),
+            (Part::Table, joined(slots, COPY_GAP)),
+        ] {
+            out.extend(ranges.into_iter().map(|range| (part, range)));
+        }
+        out
+    }
+
+    /// What [`RingPatch::copies`] and the header cost to write.
+    pub fn cost(&self) -> UploadCost {
+        let copies = self.copies();
+        let header = u64::from(self.levels);
+        UploadCost {
+            bytes: copies.iter().map(|(_, r)| r.len() as u64 * 4).sum::<u64>()
+                + header * size_of::<SceneHeader>() as u64,
+            writes: copies.len() as u32 + header as u32,
+        }
     }
 }
 
@@ -365,6 +478,8 @@ impl RingPatch {
         self.brick_refs = both(std::mem::take(&mut self.brick_refs), later.brick_refs);
         self.bricks = both(std::mem::take(&mut self.bricks), later.bricks);
         self.levels |= later.levels;
+        // The buffers only grow, so the later lengths are the longer.
+        self.sizes = later.sizes.or(self.sizes);
     }
 }
 
@@ -427,6 +542,16 @@ fn group(keys: impl IntoIterator<Item = (usize, BrickCoord)>) -> ByRegion {
 /// 1000, 170 ms for 2000 on the test Planet), a new scene about 200 ms wherever it is, and less
 /// the further out the camera is, and they meet at about two `d0` (2056 Voxels).
 const JUMP: f64 = 2.0;
+
+/// The least a buffer that has run out of room grows by, in words (1 MiB).
+const GROW_LEAST: usize = 1 << 18;
+
+/// How many words to add to a buffer of `len` words that has no `needed` words in a row: a
+/// quarter of it, and at least [`GROW_LEAST`], so that a buffer that is filling grows a few times
+/// and not at every region, each time by what the allocation and the copy on the GPU are worth.
+fn grow_by(len: usize, needed: usize) -> usize {
+    needed.max(len / 4).max(GROW_LEAST)
+}
 
 /// Regions of bricks read on the threads before they are packed.
 const PREFETCH_REGIONS: usize = 256;
@@ -626,6 +751,7 @@ impl Scene {
                 coarsest: None,
                 reserved: None,
                 rebuilt: None,
+                reported: Lengths::default(),
             }),
             ..Scene::default()
         }
@@ -754,6 +880,19 @@ impl Scene {
     /// scene of rings had written, and the header is as it was.
     pub fn paste(&mut self, copy: &PatchCopy) {
         let patch = &copy.patch;
+        // A buffer that grew is longer before anything is written to it.
+        if let Some(sizes) = patch.sizes {
+            for (buffer, len) in [
+                (&mut self.table, sizes.table),
+                (&mut self.regions, sizes.regions),
+                (&mut self.brick_refs, sizes.brick_refs),
+                (&mut self.bricks, sizes.bricks),
+            ] {
+                if buffer.len() < len {
+                    buffer.resize(len, 0);
+                }
+            }
+        }
         for (&i, words) in patch.regions.iter().zip(copy.regions.chunks(REGION_WORDS)) {
             self.regions[i * REGION_WORDS..][..REGION_WORDS].copy_from_slice(words);
         }
@@ -853,8 +992,7 @@ impl Scene {
     /// The size of everything of a scene of rings that is made roomy up front: the selection's
     /// tables, the words of `brick_refs` and of `bricks` in use against what the buffers hold,
     /// and the regions each level lists against what it can (these are fitted again whenever the
-    /// scene is packed again, not reserved). A scene that is packed again (see
-    /// [`SceneUpdate::Rebuilt`]) makes the words and the regions larger. Empty for a scene that is
+    /// scene is packed again, not reserved, and grow, each on its own, when they fill). Empty for a scene that is
     /// not rings.
     pub fn table_sizes(&self) -> Vec<TableSize> {
         let Some(rings) = &self.rings else {
@@ -922,9 +1060,9 @@ impl Scene {
     /// change as it moves, and only the regions that lose or gain one are packed again. Returns
     /// what changed, or `None` if nothing did (and if this is not a scene of rings).
     ///
-    /// If the regions do not fit, the scene is packed again from scratch, which is reported as
-    /// [`SceneUpdate::Rebuilt`]. It is an error only if they do not fit even then, which a scene
-    /// that was given its room can be, and then the scene is half moved and not to be used again.
+    /// If the regions do not fit, the buffer that is full grows (see the module docs). It is an
+    /// error only for a scene that was given its room, which is then half moved and not to be
+    /// used again. A jump is reported as [`SceneUpdate::Rebuilt`].
     pub fn recentre(
         &mut self,
         store: &BrickStore,
@@ -951,7 +1089,7 @@ impl Scene {
     }
 
     /// Packs again the regions that `diff` (what the selection changed) touches. Returns what
-    /// changed, or `None` if nothing did; packs the scene again if the regions do not fit.
+    /// changed, or `None` if nothing did; the buffer that is full grows if the regions do not fit.
     fn show_diff(
         &mut self,
         store: &BrickStore,
@@ -967,10 +1105,7 @@ impl Scene {
                 let nothing = patch.words() == 0 && !patch.levels;
                 (!nothing).then_some(patch)
             });
-        match attempt {
-            Ok(patch) => Ok(patch.map(SceneUpdate::Rings)),
-            Err(RingsFull) => self.pack_again(store).map(Some),
-        }
+        attempt.map(|patch| patch.map(SceneUpdate::Rings))
     }
 
     /// The bricks that are drawn whole although the bands split them, because the bricks under
@@ -1089,8 +1224,8 @@ impl Scene {
     }
 
     /// Splits the bricks `parents`, whose children are resident, as the bands say. Returns
-    /// what changed, or `None` if nothing did; like [`Scene::recentre`] it packs the scene again
-    /// if the regions do not fit.
+    /// what changed, or `None` if nothing did; like [`Scene::recentre`] it grows the buffer that is
+    /// full if the regions do not fit.
     pub fn arrive(
         &mut self,
         store: &BrickStore,
@@ -1101,21 +1236,6 @@ impl Scene {
         };
         let diff = rings.selection.arrived(store, parents.iter().copied());
         self.show_diff(store, &diff)
-    }
-
-    /// Packs the scene again from scratch, bigger if it was sized by its bricks.
-    fn pack_again(&mut self, store: &BrickStore) -> Result<SceneUpdate, RingsFull> {
-        // Four times what is needed, not two: a flight from orbit to the ground overflows again and
-        // again as the bricks multiply, and each overflow is a new scene and a new upload.
-        let reserved = self.rings.as_ref().and_then(|r| r.reserved);
-        let changed = self.changed;
-        *self = self.repacked(store, Some(4.0))?;
-        self.changed = changed;
-        if let Some(rings) = &mut self.rings {
-            rings.reserved = reserved;
-            rings.rebuilt = Some(Rebuild::OutOfRoom);
-        }
-        Ok(SceneUpdate::Rebuilt)
     }
 
     /// Packs again the regions of `by_region`, in the bricks it lists, and brings the header up
@@ -1134,8 +1254,9 @@ impl Scene {
     /// they are; the store has remade them already (see [`BrickStore::refresh_lod`]). A brick
     /// whose words are what they were is not written again.
     ///
-    /// If the words run out the scene is packed again from scratch ([`SceneUpdate::Rebuilt`]),
-    /// which frees what the Edits left; it is an error only if they do not fit even then.
+    /// If the words run out the buffer that is full grows (a scene that was given its room is
+    /// [`RingsFull`]): the words that the Edits left free are used first, and a buffer that is in
+    /// pieces too small for a run grows, and is not packed again.
     pub(super) fn update_rings(
         &mut self,
         store: &BrickStore,
@@ -1172,10 +1293,7 @@ impl Scene {
                 }
             }
         }
-        match self.apply(store, touched) {
-            Ok(patch) => Ok(SceneUpdate::Rings(patch)),
-            Err(RingsFull) => self.pack_again(store),
-        }
+        self.apply(store, touched).map(SceneUpdate::Rings)
     }
 
     /// Brings the regions of `level` of `key` up to date with the bricks that are selected: the
@@ -1306,12 +1424,8 @@ impl Scene {
         if run.is_empty() {
             return Ok(());
         }
-        let rings = self.rings.as_mut().expect("a scene of rings");
-        let at = rings.data.take(run.len()).ok_or(RingsFull)?;
-        rings.patch.bricks.push(at..at + run.len());
-        if self.bricks.len() < at + run.len() {
-            self.bricks.resize(at + run.len(), 0);
-        }
+        let at = self.take_words(Part::Bricks, run.len())?;
+        self.patch().bricks.push(at..at + run.len());
         self.bricks[at..at + run.len()].copy_from_slice(&run);
         for (bit, from) in starts {
             new[bit] = Some((at + from) as u32);
@@ -1418,10 +1532,11 @@ impl Scene {
         let index = match found {
             Some(index) => index,
             None => {
-                let rings = self.rings.as_mut().expect("a scene of rings");
+                let rings = self.rings.as_ref().expect("a scene of rings");
                 if rings.listed[level] >= rings.capacity[level] {
-                    return Err(RingsFull);
+                    self.grow_level(level)?;
                 }
+                let rings = self.rings.as_mut().expect("a scene of rings");
                 rings.listed[level] += 1;
                 rings.free.pop().ok_or(RingsFull)?
             }
@@ -1477,15 +1592,10 @@ impl Scene {
     /// Writes the mask and the list of entries of the region record at `index`, for `bricks`
     /// (mask bit and entry, by mask bit). The list takes words from `brick_refs`.
     fn write_entries(&mut self, index: usize, bricks: &[(usize, u32)]) -> Result<(), RingsFull> {
-        let rings = self.rings.as_mut().expect("a scene of rings");
-        let first_ref = rings.refs.take(bricks.len()).ok_or(RingsFull)?;
-        rings
-            .patch
+        let first_ref = self.take_words(Part::BrickRefs, bricks.len())?;
+        self.patch()
             .brick_refs
             .push(first_ref..first_ref + bricks.len());
-        if self.brick_refs.len() < first_ref + bricks.len() {
-            self.brick_refs.resize(first_ref + bricks.len(), 0);
-        }
         let mut mask = [0u32; 16];
         for (i, &(bit, entry)) in bricks.iter().enumerate() {
             mask[bit / 32] |= 1 << (bit % 32);
@@ -1494,6 +1604,86 @@ impl Scene {
         let at = index * REGION_WORDS;
         self.regions[at..at + REGION_FIRST_REF].copy_from_slice(&mask);
         self.regions[at + REGION_FIRST_REF] = first_ref as u32;
+        Ok(())
+    }
+
+    /// The start of `len` words of `brick_refs` or of `bricks` (`part`) that are now taken. When
+    /// there is no room for them in one piece, a scene that was sized by its bricks grows that
+    /// buffer, and no other (see [`grow_by`]); one that was given its room is [`RingsFull`].
+    fn take_words(&mut self, part: Part, len: usize) -> Result<usize, RingsFull> {
+        let rings = self.rings.as_mut().expect("a scene of rings");
+        let (pool, buffer) = match part {
+            Part::Bricks => (&mut rings.data, &mut self.bricks),
+            Part::BrickRefs => (&mut rings.refs, &mut self.brick_refs),
+            Part::Table | Part::Regions => unreachable!("not handed out by a pool"),
+        };
+        let at = match pool.take(len) {
+            Some(at) => at,
+            None if matches!(rings.sizing, Sizing::Fitted(..)) => {
+                let old = buffer.len();
+                let by = grow_by(old, len);
+                buffer.resize(old + by, 0);
+                // The words it adds join the free ones at its end, so that there are `len` in a row.
+                pool.give(old, by);
+                pool.take(len).expect("the words just added")
+            }
+            None => return Err(RingsFull),
+        };
+        // A scene that is being packed from nothing takes words as if there were no end.
+        if buffer.len() < at + len {
+            buffer.resize(at + len, 0);
+        }
+        Ok(at)
+    }
+
+    /// Makes room for more regions in `level`, and for no other level: its part of `table` is
+    /// made a bigger one if it is full (the regions are listed in it again, at the end of the
+    /// buffer, and the part it had is left, unused), and `regions` has records for them. A scene
+    /// that was given its room is [`RingsFull`].
+    fn grow_level(&mut self, level: usize) -> Result<(), RingsFull> {
+        let rings = self.rings.as_mut().expect("a scene of rings");
+        if !matches!(rings.sizing, Sizing::Fitted(..)) {
+            return Err(RingsFull);
+        }
+        let capacity = rings.capacity[level];
+        let target = (capacity + capacity / 4 + 64).max(rings.listed[level] + 1);
+        let slots = (target * 2).next_power_of_two();
+        // The part is a power of two of slots, half full at most: all of that is room.
+        let new_capacity = slots / 2;
+        let first_new = self.regions.len() / REGION_WORDS;
+        let extra = new_capacity - capacity;
+        self.regions
+            .resize(self.regions.len() + extra * REGION_WORDS, 0);
+        // The records that were free are used before these.
+        rings
+            .free
+            .splice(0..0, (first_new..first_new + extra).rev());
+        rings.capacity[level] = new_capacity;
+        let was = self.levels[level];
+        if slots as u32 - 1 != was.table_mask {
+            let mut moved = Vec::with_capacity(rings.listed[level]);
+            for slot in was.table_base..=was.table_base + was.table_mask {
+                let at = slot as usize * 4;
+                let entry = &self.table[at..at + 4];
+                if entry[3] != 0 {
+                    moved.push((
+                        [entry[0], entry[1], entry[2]].map(|k| k as i32),
+                        entry[3] - 1,
+                    ));
+                }
+            }
+            let base = self.table.len() / 4;
+            self.table.resize(self.table.len() + slots * 4, 0);
+            self.levels[level].table_base = base as u32;
+            self.levels[level].table_mask = slots as u32 - 1;
+            let written: Vec<usize> = moved
+                .into_iter()
+                .map(|(key, index)| self.insert_region(level, key, index))
+                .collect();
+            let patch = self.patch();
+            patch.table.extend(written);
+            patch.levels = true;
+        }
         Ok(())
     }
 
@@ -1655,11 +1845,12 @@ impl Scene {
         &mut self.rings.as_mut().expect("a scene of rings").patch
     }
 
-    /// The level whose part of `table` has `slot`.
-    fn level_of_slot(&self, slot: usize) -> usize {
-        self.levels
-            .partition_point(|l| l.table_base as usize <= slot)
-            .saturating_sub(1)
+    /// The level whose part of `table` has `slot`, if one does: the slots of a part that a level
+    /// has left for a bigger one (see `grow_level`) are no level's.
+    fn level_of_slot(&self, slot: usize) -> Option<usize> {
+        self.levels.iter().position(|l| {
+            (l.table_base as usize..=(l.table_base + l.table_mask) as usize).contains(&slot)
+        })
     }
 
     /// Grows the occupied box of `level` to hold the regions in the table `slots`, which are
@@ -1739,11 +1930,10 @@ impl Scene {
                 }
             }
             for &slot in &patch.table {
-                if self.table[slot * 4 + 3] != 0 {
-                    grown
-                        .entry(self.level_of_slot(slot))
-                        .or_default()
-                        .push(slot);
+                if self.table[slot * 4 + 3] != 0
+                    && let Some(level) = self.level_of_slot(slot)
+                {
+                    grown.entry(level).or_default().push(slot);
                 }
             }
             for (level, slots) in grown {
@@ -1753,12 +1943,17 @@ impl Scene {
             }
             patch.levels |= self.occupy(&rescan);
         }
+        let now = Lengths::of(self);
+        let rings = self.rings.as_mut().expect("a scene of rings");
+        let sizes = (now != rings.reported).then_some(now);
+        rings.reported = now;
         RingPatch {
             regions: patch.regions.into_iter().collect(),
             table: patch.table.into_iter().collect(),
             brick_refs: merged(patch.brick_refs),
             bricks: merged(patch.bricks),
             levels: patch.levels,
+            sizes,
         }
     }
 }
@@ -1881,6 +2076,13 @@ mod tests {
 
         /// What a GPU copy holds after `patch` is written to it from `scene`, as the tracer does.
         fn patched(mut self, patch: &RingPatch, scene: &Scene) -> Self {
+            // A buffer that grew is made longer first, keeping what it had.
+            if let Some(sizes) = patch.sizes {
+                self.table.resize(sizes.table, 0);
+                self.regions.resize(sizes.regions, 0);
+                self.brick_refs.resize(sizes.brick_refs, 0);
+                self.bricks.resize(sizes.bricks, 0);
+            }
             for &slot in &patch.table {
                 self.table[slot * 4..][..4].copy_from_slice(&scene.table[slot * 4..][..4]);
             }
@@ -2065,16 +2267,19 @@ mod tests {
     }
 
     #[test]
-    fn a_scene_that_was_given_too_little_room_is_an_error_and_one_that_was_not_grows() {
+    fn a_scene_that_was_given_too_little_room_is_an_error_and_one_that_was_not_grows_the_buffer_that_filled()
+     {
         let scene = rings_at(ABOVE);
         let tiny = Room {
             words_per_ring: words_taken(&scene) / LEVELS / 2,
             ..Room::default()
         };
         assert!(Scene::rings_in(ground(), ABOVE, bands(), bound(), tiny).is_err());
-        // A fitted scene that has to hold more than it was sized for packs itself again.
+        // A fitted scene that has to hold more than it was sized for grows the buffer that is full.
         let mut store = ground().clone();
         let mut small = Scene::rings(&store, ABOVE, bands(), bound()).unwrap();
+        let before = Lengths::of(&small);
+        let copy = Copy::of(&small);
         let spare: usize = small
             .rings
             .as_ref()
@@ -2087,12 +2292,78 @@ mod tests {
         assert!(small.rings.as_mut().unwrap().data.take(spare).is_some());
         let changed = dig(&mut store, [20, 1510, -30], 14);
         store.refresh_lod(changed.iter().copied());
-        let update = small.update(&store, &changed).unwrap();
-        assert_eq!(update, SceneUpdate::Rebuilt);
+        let patch = patch_of(Some(small.update(&store, &changed).unwrap()));
+        let after = patch.sizes.expect("a buffer grew");
+        // Only `bricks` was full, and it grew by what growing says and not by a repack of all.
+        assert_eq!(
+            (after.table, after.regions, after.brick_refs),
+            (before.table, before.regions, before.brick_refs)
+        );
+        assert!(after.bricks >= before.bricks + GROW_LEAST, "{after:?}");
+        assert_eq!(after, Lengths::of(&small));
+        assert_eq!(copy.patched(&patch, &small), Copy::of(&small));
         assert_eq!(
             shown(&small),
             shown(&Scene::rings(&store, ABOVE, bands(), bound()).unwrap())
         );
+        // The next patch does not say it again.
+        let later = dig(&mut store, [20, 1510, -30], 3);
+        store.refresh_lod(later.iter().copied());
+        assert_eq!(
+            patch_of(Some(small.update(&store, &later).unwrap())).sizes,
+            None
+        );
+    }
+
+    #[test]
+    fn a_level_that_lists_more_regions_than_its_table_has_room_for_grows_its_table_alone() {
+        let mut scene = rings_at(ABOVE);
+        let level = 2;
+        let others = |scene: &Scene| -> Vec<(u32, u32)> {
+            scene
+                .levels
+                .iter()
+                .enumerate()
+                .filter(|&(l, _)| l != level)
+                .map(|(_, l)| (l.table_base, l.table_mask))
+                .collect()
+        };
+        let (shown_before, others_before) = (shown(&scene), others(&scene));
+        let before = Lengths::of(&scene);
+        let copy = Copy::of(&scene);
+        let capacity = scene.rings.as_ref().unwrap().capacity[level];
+        let slots = scene.levels[level].table_mask + 1;
+        // Grow until the table has to move.
+        while scene.levels[level].table_mask + 1 == slots {
+            scene.grow_level(level).unwrap();
+        }
+        assert!(scene.rings.as_ref().unwrap().capacity[level] > capacity);
+        let patch = scene.take_patch();
+        let after = patch.sizes.expect("buffers grew");
+        // The brick buffers are as they were, and every other level's table is where it was.
+        assert_eq!(
+            (after.brick_refs, after.bricks),
+            (before.brick_refs, before.bricks)
+        );
+        assert!(after.table > before.table && after.regions > before.regions);
+        assert_eq!(others(&scene), others_before);
+        assert!(patch.levels);
+        // The regions are found where they were, and the GPU copy has them in the new table.
+        assert_eq!(shown(&scene), shown_before);
+        assert_eq!(copy.patched(&patch, &scene), Copy::of(&scene));
+        // Every record is free or listed: the new ones are there for the level to use.
+        let rings = scene.rings.as_ref().unwrap();
+        assert_eq!(
+            rings.free.len() + rings.listed.iter().sum::<usize>(),
+            scene.regions.len() / REGION_WORDS
+        );
+    }
+
+    #[test]
+    fn a_scene_that_was_given_its_room_does_not_grow_a_table() {
+        let mut scene =
+            Scene::rings_in(ground(), ABOVE, bands(), bound(), Room::default()).unwrap();
+        assert_eq!(scene.grow_level(1), Err(RingsFull));
     }
 
     #[test]

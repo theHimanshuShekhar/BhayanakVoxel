@@ -430,6 +430,46 @@ fn a_flight_from_the_surface_to_orbit_and_back_keeps_the_gpu_memory_bounded() {
     assert!(peak < 512 << 20, "{peak} bytes of GPU memory");
 }
 
+/// A scene sized for orbit that the camera brings to the ground, where the bricks are many times as
+/// many, grows the buffers that fill, each on its own, and is not packed again (A3): what is
+/// copied on the GPU when one grows is less than all of the scene's buffers, and what is drawn is
+/// what the same selection packed from scratch draws.
+#[test]
+fn a_scene_that_outgrows_a_buffer_grows_it_and_not_the_rest() {
+    let (low, high) = ([0.0, 1548.0, 250.0], [0.0, 3600.0, 3000.0]);
+    let mut scene = rings_at(high);
+    let mut gpu = Offscreen::new(64, 36, &scene).unwrap();
+    let (mut grown, mut growths, mut rebuilt) = (0, 0, 0);
+    let steps = 60;
+    for step in 0..=steps {
+        let t = f64::from(step) / f64::from(steps);
+        let at: [f64; 3] = std::array::from_fn(|a| high[a] + (low[a] - high[a]) * t);
+        if let Some(update) = scene.recentre(planet(), at).unwrap() {
+            rebuilt += usize::from(update == SceneUpdate::Rebuilt);
+            gpu.update_scene(&scene, &update).unwrap();
+            if gpu.last_grown_bytes() > 0 {
+                growths += 1;
+                grown += gpu.last_grown_bytes();
+                assert!(
+                    gpu.last_grown_bytes() < gpu.scene_bytes(),
+                    "step {step}: {} bytes copied of {}",
+                    gpu.last_grown_bytes(),
+                    gpu.scene_bytes()
+                );
+            }
+        }
+        if step % 20 == 0 {
+            let camera = Camera::looking_at(at, [0.0; 3]);
+            let fresh = Offscreen::new(64, 36, &scene.rebuilt_rings(planet()).unwrap())
+                .unwrap()
+                .render(&camera);
+            assert_eq!(gpu.render(&camera), fresh, "step {step} at {at:?}");
+        }
+    }
+    eprintln!("{growths} growths copied {grown} bytes, {rebuilt} rebuilds");
+    assert!(growths > 0, "no buffer grew");
+}
+
 /// What the walk costs, in steps (see `reference::Steps`), averaged over a fan of primary rays
 /// from cameras along the bench's flight over the Planet (`planet-flyover-v1`), by what the rays
 /// do: miss, hit the ground face on, or graze it.

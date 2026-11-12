@@ -254,6 +254,12 @@ impl Offscreen {
         self.tracer.uploaded_bytes()
     }
 
+    /// Bytes that the last [`Offscreen::update_scene`] copied on the GPU into buffers that grew
+    /// (the host wrote none of them; they are not in [`Offscreen::uploaded_bytes`]).
+    pub fn last_grown_bytes(&self) -> u64 {
+        self.tracer.last_grown_bytes()
+    }
+
     /// The GPU that this renders on.
     pub fn gpu_info(&self) -> &GpuInfo {
         &self.info
