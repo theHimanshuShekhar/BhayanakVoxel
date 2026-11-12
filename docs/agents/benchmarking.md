@@ -567,12 +567,23 @@ still camera and a small budget, one with a budget well over the largest operati
 budget holds in every frame of it: this is the test that fails if the throttle does not hold
 work back, with a still camera), and a flight from the spawn over ground that is still loading
 (24 Voxels a frame, 120 frames), with a budget of one largest batch. The flight's control, with
-nothing held back, has frames of 866 324 bytes in 69 copies, over the bound above for this
-budget (613 536 bytes, 63 copies: budget 203 724 / 23, the largest follow step 210 860 / 18 or
-batch 198 952 / 20 as the crossing operation, and the first batch), and the test asserts that
-first. The throttled flight's every update is within the bound (at most 196 888 bytes in 24
-copies), worked out from the flight's own patch sizes. The test fails, as does the still-camera
-one, if the `break` in the arrivals loop and the early return in the follow are removed.
+nothing held back, has frames of 866 324 bytes in 69 copies. The throttled flight has no update
+over the plain budget in bytes (at most 196 888 of 203 724); its worst has 24 copies against the
+budget's 23, and it is held to under half of the control's copies. The flight does not exercise the
+bound's terms for the crossing operation and the round's first batch: built from the control's
+largest follow step (515 964 / 44) and batch (203 724 / 23) the bound is 923 412 bytes in 90
+copies, looser than the control's own worst, so it checks nothing there. (Those terms are what
+`with_a_small_budget…` exercises, against the scene thread's own count of them,
+`Stats::excess_ops`, which holds whatever the throttle decides.) The flight test fails, in a
+message that names the throttled flight, if the `break` between batches in `stream()` is removed;
+it does not notice the early return in `follow()`, which in the flight never has an outbox over
+the budget to hold back for. A partly broken throttle that keeps every update under the plain
+budget in bytes and under half the control's copies is not caught by it. The follow throttle is
+tested by `the_camera_is_not_followed_while_what_waits_is_over_the_budget_and_is_when_the_frame_thread_has_taken_it`:
+the frame thread does not take what two rounds publish, with a budget of one byte, so the outbox
+is over the budget when `follow` looks; the camera is followed in the first round and not in the
+next two, then in one step to where it is, with no hole in any frame and the scene that a run
+with that budget moved to just those places comes to.
 
 ### The gates
 
