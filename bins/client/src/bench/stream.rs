@@ -995,7 +995,7 @@ impl Streamer {
 
 /// The 99th percentile, nearest rank, of `values`: the smallest that at least 99% of them do not
 /// exceed; 0 for none.
-fn percentile_99(values: &[u64]) -> u64 {
+pub(super) fn percentile_99(values: &[u64]) -> u64 {
     let mut sorted = values.to_vec();
     sorted.sort_unstable();
     match (sorted.len() * 99).div_ceil(100) {

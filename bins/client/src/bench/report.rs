@@ -13,7 +13,10 @@ use super::stream::StreamReport;
 /// 9 added the slow-frame fields to its paths (`frames_over_limit`, `slowest`, `end_look_ms`) and
 /// made a run's `edit_latency` null when there was no Edit (`edit_not_made` says why).
 /// 10 added the GPU's own pass times of a slow frame and the frames over the limit by update kind.
-pub const SCHEMA_VERSION: u32 = 10;
+/// 11 added the upload budget's figures (#145): a frame's copies, the 99th percentile of its bytes
+/// and copies, the frames the budget cut and the longest backlog, in the stepped streaming mode's
+/// `upload` and in each path of the real-time mode (`upload`).
+pub const SCHEMA_VERSION: u32 = 11;
 
 /// One timed thing (a pass, or the GPU total of a profiler frame) in one mode, against its
 /// budget. In reference mode a profiler frame is one sample, so the entries of that mode have
@@ -504,7 +507,7 @@ mod tests {
                 "streaming_real_time"
             ]
         );
-        assert_eq!(json["schema_version"], 10);
+        assert_eq!(json["schema_version"], 11);
         assert_eq!(json["streaming"], serde_json::Value::Null);
         assert_eq!(json["streaming_real_time"], serde_json::Value::Null);
         assert_eq!(

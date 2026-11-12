@@ -53,8 +53,8 @@ use sim::Predictor;
 use super::budget::{EXIT_OVER_BUDGET, StreamingBudgets};
 use super::process;
 use super::stream::{
-    Constants, Series, Sizing, Start, TestPlanet, measure_sizes, over_the_ground, test_planet,
-    within_reach,
+    Constants, Series, Sizing, Start, TestPlanet, measure_sizes, over_the_ground, percentile_99,
+    test_planet, within_reach,
 };
 use crate::loader::{Loader, workers_for};
 use crate::scene_worker::{Done, Spent};
@@ -227,6 +227,31 @@ impl Spread {
             worst_ms: sorted[sorted.len() - 1],
         }
     }
+}
+
+/// What the uploads of a path's frames came to (#145): the frames that had an update, what each cost
+/// on the CPU, the bytes and the copies of each, and how often and for how long the scene thread
+/// held work back for the upload budget (`scene_worker::UPLOAD_BUDGET`). The gate on frame time is
+/// the one this is for; nothing here is gated.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize)]
+pub struct PathUpload {
+    /// Frames of the path that had an update.
+    pub updates: usize,
+    /// The CPU's time of the update's copy to the GPU (the copies made and sent), over those frames.
+    pub time: Spread,
+    /// The bytes and the copies (each a barrier of its own) of those frames: the 99th percentile
+    /// (nearest rank) and the largest. A rebuild makes new buffers and has no copies.
+    pub bytes_p99: u64,
+    pub bytes_max: u64,
+    pub writes_p99: u64,
+    pub writes_max: u64,
+    /// Frames in which the scene thread held work back for the budget, so that the frame's upload
+    /// was cut.
+    pub cut_frames: usize,
+    /// The longest run of frames in a row that did, in frames and in milliseconds: how long the
+    /// longest backlog lasted.
+    pub longest_backlog_frames: usize,
+    pub longest_backlog_ms: f64,
 }
 
 /// How long the scene thread spent on each part of its rounds, in milliseconds, over a path or a
@@ -418,6 +443,8 @@ pub struct PathReport {
     /// Those frames by what their update was: none, a patch or a rebuild.
     pub frames_over_limit_by_update: UpdateKinds,
     pub slowest: Vec<SlowFrame>,
+    /// What the frames' uploads came to, and how often the budget cut them.
+    pub upload: PathUpload,
     /// Soft misses a frame reported (counted by the scene thread a few times a second, so a frame
     /// reports the last count).
     pub soft_misses: Series,
@@ -858,6 +885,8 @@ struct Frame {
     /// The parts of the frame; its `index` and `at_ms` are set by the path that takes it in.
     parts: SlowFrame,
     soft_misses: usize,
+    /// Whether the scene thread held work back in this frame for the upload budget.
+    throttled: bool,
     /// Whether the look at the scene in this frame took in the newest Edit, and when it was done.
     edit_taken: bool,
     taken_at: Instant,
@@ -878,6 +907,15 @@ struct Capture {
     frame_ms: Vec<f64>,
     cpu_ms: Vec<f64>,
     soft_misses: Series,
+    /// The update of each frame that had one: its time, bytes and copies.
+    update_ms: Vec<f64>,
+    update_bytes: Vec<u64>,
+    update_writes: Vec<u64>,
+    /// Frames cut by the budget, the run of them that is going on (when it began, and how many),
+    /// and the longest so far.
+    cut_frames: usize,
+    backlog: Option<(Instant, usize)>,
+    longest_backlog: (usize, f64),
     /// Frames over the limit, and the slowest few.
     limit_ms: f64,
     over_limit: usize,
@@ -903,6 +941,12 @@ impl Capture {
             frame_ms: Vec::new(),
             cpu_ms: Vec::new(),
             soft_misses: Series::default(),
+            update_ms: Vec::new(),
+            update_bytes: Vec::new(),
+            update_writes: Vec::new(),
+            cut_frames: 0,
+            backlog: None,
+            longest_backlog: (0, 0.0),
         }
     }
 
@@ -923,6 +967,22 @@ impl Capture {
         self.frame_ms.push(frame.time_ms);
         self.cpu_ms.push(frame.cpu_ms);
         self.soft_misses.add(frame.soft_misses as u64);
+        if frame.parts.update != "none" {
+            self.update_ms.push(frame.parts.update_ms);
+            self.update_bytes.push(frame.parts.upload_bytes);
+            self.update_writes.push(u64::from(frame.parts.writes));
+        }
+        if frame.throttled {
+            self.cut_frames += 1;
+            let (began, frames) = self.backlog.get_or_insert((frame.began, 0));
+            *frames += 1;
+            let ms = frame.began.duration_since(*began).as_secs_f64() * 1e3 + frame.time_ms;
+            if *frames > self.longest_backlog.0 {
+                self.longest_backlog = (*frames, ms);
+            }
+        } else {
+            self.backlog = None;
+        }
     }
 
     /// The path's frames are done: what the scene thread has spent so far is the frames', and the
@@ -950,6 +1010,17 @@ impl Capture {
             frames_over_limit: self.over_limit,
             frames_over_limit_by_update: self.over_by_update,
             slowest: self.worst.sorted(),
+            upload: PathUpload {
+                updates: self.update_ms.len(),
+                time: Spread::of(&self.update_ms),
+                bytes_p99: percentile_99(&self.update_bytes),
+                bytes_max: self.update_bytes.iter().copied().max().unwrap_or(0),
+                writes_p99: percentile_99(&self.update_writes),
+                writes_max: self.update_writes.iter().copied().max().unwrap_or(0),
+                cut_frames: self.cut_frames,
+                longest_backlog_frames: self.longest_backlog.0,
+                longest_backlog_ms: self.longest_backlog.1,
+            },
             soft_misses_per_frame: per_frame(self.soft_misses.total),
             soft_misses: self.soft_misses,
             hole_looks: work.hole_scans - self.scans,
@@ -1126,6 +1197,7 @@ impl<'a> Session<'a> {
             cpu_ms: parts.cpu_ms,
             parts,
             soft_misses: self.world.stats().soft_misses,
+            throttled: self.world.stats().throttled,
             edit_taken,
             taken_at,
         })
@@ -1615,6 +1687,7 @@ mod tests {
             frames_over_limit: 0,
             frames_over_limit_by_update: UpdateKinds::default(),
             slowest: vec![slow_frame(0, frame_p99 * 2.0)],
+            upload: PathUpload::default(),
             soft_misses: Series::default(),
             soft_misses_per_frame: 0.0,
             hole_looks: 2,
@@ -2040,7 +2113,22 @@ mod tests {
                 "settle",
                 "slowest",
                 "soft_misses",
-                "soft_misses_per_frame"
+                "soft_misses_per_frame",
+                "upload"
+            ]
+        );
+        assert_eq!(
+            keys(&json["runs"][0]["paths"][0]["upload"]),
+            [
+                "bytes_max",
+                "bytes_p99",
+                "cut_frames",
+                "longest_backlog_frames",
+                "longest_backlog_ms",
+                "time",
+                "updates",
+                "writes_max",
+                "writes_p99"
             ]
         );
         assert_eq!(
