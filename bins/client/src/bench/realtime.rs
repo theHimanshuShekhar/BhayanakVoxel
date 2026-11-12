@@ -45,7 +45,7 @@ use net::{ServerEnd, loopback};
 use planet_gen::planet::tangents;
 use planet_gen::world_map::{WORLD_MAP_SIZE, WorldMap};
 use render::reference::{Ray, trace};
-use render::{Camera, Offscreen, Resolution, Scene, SceneUpdate, camera};
+use render::{Camera, GpuPasses, Offscreen, Resolution, Scene, SceneUpdate, camera};
 use serde::Serialize;
 use serde_json::Value;
 use sim::Predictor;
@@ -132,7 +132,7 @@ pub trait Gpu {
 }
 
 /// What a frame's copy to the GPU and draw took, by part.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct GpuFrame {
     /// Queuing the update's writes (`write_buffer`), or for a rebuild making the new buffers.
     pub write: Duration,
@@ -146,6 +146,9 @@ pub struct GpuFrame {
     /// Waiting for the GPU to be done: the update's copies and the draw, and whatever else the GPU
     /// was doing.
     pub wait: Duration,
+    /// The GPU's own time for this frame's passes, from its timestamps. None where the device has
+    /// no timers, or this frame's own times did not come in: never an earlier frame's.
+    pub passes: Option<GpuPasses>,
 }
 
 impl GpuFrame {
@@ -178,6 +181,7 @@ impl Gpu for OffscreenGpu<'_> {
         frame.encode = drawn.encode;
         frame.submit = drawn.submit;
         frame.wait = drawn.wait;
+        frame.passes = drawn.gpu;
         Ok(frame)
     }
 }
@@ -304,10 +308,27 @@ pub struct SlowFrame {
     pub update_flush_ms: f64,
     /// Calls of `write_buffer` (each a copy on the GPU with a barrier of its own).
     pub writes: u32,
+    /// Encoding the draw (the passes, the timer queries' resolving, and finishing the command
+    /// buffer), and `Queue::submit`.
     pub encode_ms: f64,
     pub submit_ms: f64,
-    /// Waiting for the GPU: after the CPU's clock has stopped.
+    /// Waiting for the GPU: after the CPU's clock has stopped. It holds the readback of the pass
+    /// times, the device poll and what wgpu frees inside it (a staging buffer for each
+    /// `write_buffer`) as well as the GPU's work.
     pub wait_ms: f64,
+    /// What the GPU says its passes of **this frame** took, from the timestamps the passes wrote
+    /// (the device's clock, not wall time): the primary pass, the upscale pass, and from the start
+    /// of the first to the end of the last (gaps included). Null where the device has no timers or
+    /// this frame's own times did not come in (never an earlier frame's: the profiler says which
+    /// frame a readback is of).
+    pub gpu_primary_ms: Option<f64>,
+    pub gpu_upscale_ms: Option<f64>,
+    pub gpu_total_ms: Option<f64>,
+    /// `wait_ms` less `gpu_total_ms`: what the wait was that was not the passes (the update's
+    /// copies, which are queued ahead of them, the driver, other GPU clients, our own cleanup in
+    /// the poll). Negative if the passes were already running while the CPU was still in the
+    /// submit. Null with `gpu_total_ms`.
+    pub wait_not_passes_ms: Option<f64>,
     pub other_ms: f64,
     /// The frame's look at the memory after its time was taken: the store's lock. Not in
     /// `time_ms`.
@@ -318,9 +339,29 @@ pub struct SlowFrame {
     pub update: &'static str,
     pub upload_bytes: u64,
     pub patch_bytes: u64,
-    /// Whether a look for holes was going on in the scene thread at the start or the end of the
-    /// frame (it holds the store's read lock and publishes nothing meanwhile).
+    /// Whether a look for holes **overlapped** the frame: the scene thread was in one at the start
+    /// or at the end of it (from before it takes the store's read lock to after it lets go). That
+    /// is not that it blocked the frame, and a look that began after the frame's start and was done
+    /// before its end is missed.
     pub hole_look: bool,
+}
+
+/// How many frames of a path were of each kind of update.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize)]
+pub struct UpdateKinds {
+    pub none: usize,
+    pub patch: usize,
+    pub rebuild: usize,
+}
+
+impl UpdateKinds {
+    fn add(&mut self, kind: &str) {
+        match kind {
+            "patch" => self.patch += 1,
+            "rebuild" => self.rebuild += 1,
+            _ => self.none += 1,
+        }
+    }
 }
 
 /// The slowest frames of a path, in a list of fixed size: no allocation while the frames come.
@@ -374,6 +415,8 @@ pub struct PathReport {
     /// their parts. In the min and the max the i-th slowest of each run is taken with the i-th of
     /// the others, member by member, and null if the runs did not all keep as many.
     pub frames_over_limit: usize,
+    /// Those frames by what their update was: none, a patch or a rebuild.
+    pub frames_over_limit_by_update: UpdateKinds,
     pub slowest: Vec<SlowFrame>,
     /// Soft misses a frame reported (counted by the scene thread a few times a second, so a frame
     /// reports the last count).
@@ -838,6 +881,7 @@ struct Capture {
     /// Frames over the limit, and the slowest few.
     limit_ms: f64,
     over_limit: usize,
+    over_by_update: UpdateKinds,
     worst: Worst,
 }
 
@@ -851,6 +895,7 @@ impl Capture {
             frames_done: None,
             limit_ms,
             over_limit: 0,
+            over_by_update: UpdateKinds::default(),
             worst: Worst::new(),
             spent: world.scene_thread_time(),
             scans: work.hole_scans,
@@ -864,6 +909,7 @@ impl Capture {
     fn add(&mut self, frame: &Frame) {
         if frame.time_ms > self.limit_ms {
             self.over_limit += 1;
+            self.over_by_update.add(frame.parts.update);
         }
         self.worst.offer(SlowFrame {
             index: self.frame_ms.len(),
@@ -902,6 +948,7 @@ impl Capture {
             frame_time: Spread::of(&self.frame_ms),
             frame_cpu: Spread::of(&self.cpu_ms),
             frames_over_limit: self.over_limit,
+            frames_over_limit_by_update: self.over_by_update,
             slowest: self.worst.sorted(),
             soft_misses_per_frame: per_frame(self.soft_misses.total),
             soft_misses: self.soft_misses,
@@ -1058,6 +1105,13 @@ impl<'a> Session<'a> {
             encode_ms: ms(gpu.encode),
             submit_ms: ms(gpu.submit),
             wait_ms: ms(gpu.wait),
+            gpu_primary_ms: gpu.passes.and_then(|p| p.primary_ms),
+            gpu_upscale_ms: gpu.passes.and_then(|p| p.upscale_ms),
+            gpu_total_ms: gpu.passes.and_then(|p| p.total_ms),
+            wait_not_passes_ms: gpu
+                .passes
+                .and_then(|p| p.total_ms)
+                .map(|t| ms(gpu.wait) - t),
             other_ms: ms(time.saturating_sub(followed + gpu.cpu() + gpu.wait)),
             after_ms: ms(after),
             update: kind,
@@ -1273,10 +1327,13 @@ impl<'a> Session<'a> {
         if self.world.aim(&aim, &tool).is_none() {
             return Ok(Edit::NotMade("nothing in reach"));
         }
+        let made_before = self.world.edits_made();
         let began = Instant::now();
         let update = self.world.edit(&aim, &tool)?;
         let call = began.elapsed();
-        if !self.world.edit_made() {
+        // With something aimed at, an Edit that is not made is one that the client knows the server
+        // would turn down.
+        if self.world.edits_made() == made_before {
             return Ok(Edit::NotMade("refused"));
         }
         if let Some(update) = update {
@@ -1446,7 +1503,7 @@ fn whole_run(
     .unwrap_or_else(|payload| {
         Err(Failure {
             run,
-            step: "building the world, making the GPU, or ending the run".to_string(),
+            step: "building the world, making the GPU context, or ending the run".to_string(),
             message: format!("panicked: {}", panic_message(&*payload)),
         })
     })
@@ -1556,6 +1613,7 @@ mod tests {
                 worst_ms: cpu_p99 * 2.0,
             },
             frames_over_limit: 0,
+            frames_over_limit_by_update: UpdateKinds::default(),
             slowest: vec![slow_frame(0, frame_p99 * 2.0)],
             soft_misses: Series::default(),
             soft_misses_per_frame: 0.0,
@@ -1585,6 +1643,10 @@ mod tests {
             encode_ms: 0.2,
             submit_ms: 0.1,
             wait_ms: time_ms - 1.8,
+            gpu_primary_ms: Some(1.0),
+            gpu_upscale_ms: Some(0.5),
+            gpu_total_ms: Some(1.6),
+            wait_not_passes_ms: Some(time_ms - 1.8 - 1.6),
             other_ms: 0.0,
             after_ms: 0.0,
             update: "patch",
@@ -1968,6 +2030,7 @@ mod tests {
                 "frame_time",
                 "frames",
                 "frames_over_limit",
+                "frames_over_limit_by_update",
                 "hole_looks",
                 "holes",
                 "holes_per_frame",
@@ -1988,6 +2051,9 @@ mod tests {
                 "camera_ms",
                 "cpu_ms",
                 "encode_ms",
+                "gpu_primary_ms",
+                "gpu_total_ms",
+                "gpu_upscale_ms",
                 "hole_look",
                 "index",
                 "other_ms",
@@ -2001,8 +2067,13 @@ mod tests {
                 "update_write_ms",
                 "upload_bytes",
                 "wait_ms",
+                "wait_not_passes_ms",
                 "writes"
             ]
+        );
+        assert_eq!(
+            keys(&json["runs"][0]["paths"][0]["frames_over_limit_by_update"]),
+            ["none", "patch", "rebuild"]
         );
         assert_eq!(
             keys(&json["runs"][0]["paths"][0]["scene_thread"]),
@@ -2083,6 +2154,7 @@ mod tests {
             encode: ms(4),
             submit: ms(8),
             wait: ms(100),
+            passes: None,
         };
         assert_eq!(frame.cpu(), ms(15));
         assert_eq!(GpuFrame::default().cpu(), Duration::ZERO);
@@ -2119,7 +2191,87 @@ mod tests {
             Edit::NotMade(why) => assert_eq!(why, "nothing in reach"),
             Edit::Taken(_) => panic!("there is nothing to dig in the sky"),
         }
-        assert!(!session.world.edit_made());
+        assert_eq!(session.world.edits_made(), 0);
+    }
+
+    /// A dig that the client knows the server would turn down is `refused`: the allowance is spent
+    /// by digging in the world itself, which has no scene thread (so no threads and no waits).
+    #[test]
+    fn a_dig_the_server_would_turn_down_is_no_edit_and_is_refused() {
+        let TestPlanet {
+            store,
+            scene,
+            spawn,
+            ..
+        } = test_planet();
+        let (client, _server) = loopback();
+        let world = World::new(scene, Predictor::new(store), client);
+        let mut gpu = NoGpu;
+        let mut session = Session::new(world, &mut gpu, BUDGETS.frame_time_p99_ms);
+        let aim = within_reach(&session.world, &spawn).expect("the Spawn looks at the ground");
+        let tool = Tool::default();
+        let mut made = 0;
+        loop {
+            let before = session.world.edits_made();
+            session.world.edit(&aim, &tool).expect("the link is up");
+            if session.world.edits_made() == before {
+                break;
+            }
+            made += 1;
+            assert!(made < 100_000, "the allowance never ran out");
+        }
+        assert!(made > 0, "the first Edit is within the allowance");
+        match session.edit(&spawn).expect("a refused dig is no error") {
+            Edit::NotMade(why) => assert_eq!(why, "refused"),
+            Edit::Taken(_) => panic!("the allowance is spent"),
+        }
+        assert_eq!(session.world.edits_made(), made);
+    }
+
+    #[test]
+    fn a_frame_with_no_gpu_pass_times_reports_them_null_and_never_zero() {
+        // A device with no timers, or a frame whose own times did not come in.
+        let mut frame = slow_frame(0, 30.0);
+        frame.gpu_primary_ms = None;
+        frame.gpu_upscale_ms = None;
+        frame.gpu_total_ms = None;
+        frame.wait_not_passes_ms = None;
+        let json = serde_json::to_value(frame).unwrap();
+        for key in [
+            "gpu_primary_ms",
+            "gpu_upscale_ms",
+            "gpu_total_ms",
+            "wait_not_passes_ms",
+        ] {
+            assert!(json[key].is_null(), "{key}: {}", json[key]);
+        }
+        // And in a run of them, the envelope has them null too.
+        let none = || {
+            run_with(|r| {
+                r.paths[1].slowest = vec![frame];
+            })
+        };
+        let report = RealTimeReport::new("test".into(), 64.0, vec![none(), none()], &BUDGETS);
+        let json = serde_json::to_value(&report).unwrap();
+        assert!(json["max"]["paths"][1]["slowest"][0]["gpu_total_ms"].is_null());
+        // The GPU frame of a run with no GPU has none either.
+        assert_eq!(GpuFrame::default().passes, None);
+    }
+
+    #[test]
+    fn the_frames_over_the_limit_are_counted_by_what_their_update_was() {
+        let mut kinds = UpdateKinds::default();
+        for kind in ["none", "patch", "none", "rebuild", "none", "patch"] {
+            kinds.add(kind);
+        }
+        assert_eq!(
+            kinds,
+            UpdateKinds {
+                none: 3,
+                patch: 2,
+                rebuild: 1
+            }
+        );
     }
 
     #[test]

@@ -100,11 +100,24 @@ pub struct UpdateTimes {
     pub writes: u32,
 }
 
+/// The GPU's own time for the passes of one frame, from the timestamps the passes wrote (the
+/// device's clock, not wall time).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct GpuPasses {
+    /// The primary pass and the upscale pass, in milliseconds each: None if the frame has no such
+    /// time.
+    pub primary_ms: Option<f64>,
+    pub upscale_ms: Option<f64>,
+    /// From the start of the frame's first pass to the end of its last, gaps between them included.
+    pub total_ms: Option<f64>,
+}
+
 /// What the last [`Offscreen::draw_upscaled_timed`] spent, by part. The frame is over when the GPU
 /// is done, which is `wait`; the CPU's share is `encode` and `submit`.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct DrawTimes {
-    /// Making the commands: the passes' encoding, the timer queries' resolving.
+    /// Making the commands: the passes' encoding, the timer queries' resolving, and finishing the
+    /// command buffer.
     pub encode: std::time::Duration,
     /// `Queue::submit` of them.
     pub submit: std::time::Duration,
@@ -112,6 +125,10 @@ pub struct DrawTimes {
     /// left to do. This is the GPU's time (the writes of the update before it, and the frame), and
     /// whatever else the GPU was doing.
     pub wait: std::time::Duration,
+    /// What the GPU says its passes of **this frame** took (see [`Profiler::times_of_this_frame`]):
+    /// None if the device has no timers, or this frame's own times did not come in; never an
+    /// earlier frame's.
+    pub gpu: Option<GpuPasses>,
 }
 
 /// The renderer with an image of its own instead of a window.
@@ -325,19 +342,37 @@ impl Offscreen {
             &self.target,
         );
         self.profiler.resolve(&mut encoder);
+        let commands = encoder.finish();
         let encoded = began.elapsed();
         // The uniforms of the next frame are written over these.
-        self.queue.submit([encoder.finish()]);
+        self.queue.submit([commands]);
         let submitted = began.elapsed();
         self.profiler.collect(&self.device, true);
         // Without timers `collect` does not wait, and the frame is not over until it has.
         self.device
             .poll(wgpu::PollType::wait_indefinitely())
             .expect("device poll failed");
+        let waited = began.elapsed() - submitted;
+        let gpu = self.profiler.times_of_this_frame().map(|frame| {
+            let timings = self.profiler.timings();
+            let named = |name: &str| {
+                frame
+                    .passes
+                    .iter()
+                    .find(|&&(pass, _)| timings.passes()[pass].name == name)
+                    .map(|&(_, ms)| ms)
+            };
+            GpuPasses {
+                primary_ms: named("primary"),
+                upscale_ms: named("upscale"),
+                total_ms: frame.total,
+            }
+        });
         self.last_draw = DrawTimes {
             encode: encoded,
             submit: submitted - encoded,
-            wait: began.elapsed() - submitted,
+            wait: waited,
+            gpu,
         };
         submitted
     }

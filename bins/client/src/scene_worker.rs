@@ -710,9 +710,9 @@ impl SceneWorker {
         self.shared.count_holes.store(on, Ordering::Relaxed);
     }
 
-    /// Whether the thread is in a look for holes at this moment (it holds the store's read lock
-    /// and publishes nothing meanwhile): for the real-time bench, which says if one was going on
-    /// in a slow frame.
+    /// Whether the thread is in a look for holes at this moment: from before it takes the store's
+    /// read lock (so waiting for the lock is in it) to after it has let go of it, and it publishes
+    /// nothing meanwhile. For the real-time bench, which says if one overlapped a slow frame.
     pub fn looking_for_holes(&self) -> bool {
         self.shared.looking.load(Ordering::Relaxed)
     }

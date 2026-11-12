@@ -173,6 +173,9 @@ pub struct World {
     /// [`World::edit_taken`]).
     edit_ticket: u64,
     taken_done: u64,
+    /// Edits made so far: those that the client did not know the server would turn down (see
+    /// [`World::edits_made`]).
+    edits_made: u64,
     /// The longest a result that the scene thread published waited, since it was last asked for,
     /// when the counts are exact (see [`World::take_outbox_wait`]).
     outbox_wait: std::time::Duration,
@@ -266,6 +269,7 @@ impl World {
             resim: std::time::Duration::ZERO,
             unshown_edit: None,
             edit_ticket: 0,
+            edits_made: 0,
             taken_done: 0,
             outbox_wait: std::time::Duration::ZERO,
             edit_wait: EDIT_WAIT,
@@ -316,10 +320,11 @@ impl World {
         self.clock.is_stepped()
     }
 
-    /// Whether an Edit has been made in this world with a scene thread ([`World::edit`] returns
-    /// without making one when nothing is aimed at or the server would turn it down).
-    pub fn edit_made(&self) -> bool {
-        self.edit_ticket > 0
+    /// Edits made in this world so far. [`World::edit`] makes none when nothing is aimed at or when
+    /// the client knows the server would turn it down, so a caller that needs to know which of the
+    /// two happened compares this before and after.
+    pub fn edits_made(&self) -> u64 {
+        self.edits_made
     }
 
     /// Whether the scene thread has packed the newest Edit made ([`World::edit`]) and this world has
@@ -846,6 +851,7 @@ impl World {
         let Ok((request, changed)) = self.predictor.edit_checked(op) else {
             return Ok(None);
         };
+        self.edits_made += 1;
         self.link.send(request)?;
         let Some(worker) = &self.worker else {
             return Ok(self.refresh(&changed)?);

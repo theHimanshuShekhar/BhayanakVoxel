@@ -156,7 +156,8 @@ The streaming bench (`client bench --streaming`, #181) measures the four on the 
 | Frame-thread CPU p99 (ms) | each path | to be filled from the 4090 baseline | to be filled from the 4090 baseline | 8.0 |
 | Frame-thread CPU worst (ms) | each path | to be filled from the 4090 baseline | to be filled from the 4090 baseline | |
 | Frames over the frame-time limit | each path | to be filled from the 4090 baseline | to be filled from the 4090 baseline | not gated |
-| The slowest frame of a path: where its time went (recentre, update with its writes and bytes, encode, submit, GPU wait; `slowest[0]`) | each path | to be filled from the 4090 baseline | to be filled from the 4090 baseline | not gated |
+| Frames over the limit by the update they had (none, patch, rebuild) | each path | to be filled from the 4090 baseline | to be filled from the 4090 baseline | not gated |
+| The slowest frame of a path: where its time went (recentre, update with its writes and bytes, encode, submit, GPU wait, the GPU's own pass times; `slowest[0]`) | each path | to be filled from the 4090 baseline | to be filled from the 4090 baseline | not gated |
 | Soft misses per frame | each path | to be filled from the 4090 baseline | to be filled from the 4090 baseline | not gated (#168) |
 | Holes found by the scene thread's looks (sampled, see "What the holes gate can and cannot catch") | whole run | to be filled from the 4090 baseline | to be filled from the 4090 baseline | 0 |
 | Looks for holes | whole run, fewest in a path | to be filled from the 4090 baseline | to be filled from the 4090 baseline | at least 1 |

@@ -320,7 +320,8 @@ is made there (below): the run's **Edit latency**. Its frames are not those of a
     the GPU's buffers (the writes queued and the submit that sends them), and the encoding and
     submitting of the draw, without the wait for the GPU (`Offscreen::draw_upscaled_timed`).
     **What each figure includes.** `frame_time` runs from the start of `World::recentre` to the GPU
-    being done: recentre, update (write and flush), encode, submit and the GPU wait, and anything
+    being done: recentre, update (write and flush), encode (with finishing the command buffer),
+    submit and the GPU wait, and anything
     else the frame thread does between (`other_ms` below, a few microseconds). `frame_cpu` is the
     same without the GPU wait. **Outside both**: working out the camera of a flight before the frame
     starts (it reads the store for the ground, and takes its read lock, so it can wait for a lock
@@ -328,9 +329,12 @@ is made there (below): the run's **Edit latency**. Its frames are not those of a
     and the frame's look at the memory after its time was taken (the store's lock again, every 6
     frames). Both are reported for a slow frame as `camera_ms` and `after_ms`. The pacing sleep is
     in neither.
-  - `frames_over_limit` and `slowest`: **where the time of a slow frame went**. `frames_over_limit`
-    is the number of frames of the path whose time was over the frame-time limit (the gate's
-    `frame_time_p99_ms`; the gate itself is unchanged and still on the p99). `slowest` is the five
+  - `frames_over_limit`, `frames_over_limit_by_update` and `slowest`: **where the time of a slow
+    frame went**. `frames_over_limit` is the number of frames of the path whose time was over the
+    frame-time limit (the gate's `frame_time_p99_ms`; the gate itself is unchanged and still on the
+    p99), and `frames_over_limit_by_update` is those frames by what their update was: `none`,
+    `patch` or `rebuild`, so that frames that were slow with no update to copy are counted apart
+    from those that had a large one. `slowest` is the five
     longest frames of the path, worst first (a fixed list filled while the frames come: no
     allocation, and a path with fewer frames has fewer), each with:
     - `index` (the frame's place in the path, from 0) and `at_ms` (from the path's start to the
@@ -340,15 +344,34 @@ is made there (below): the run's **Edit latency**. Its frames are not those of a
       the update to the GPU: `update_write_ms`, the `write_buffer` calls queued, and
       `update_flush_ms`, the submit with no commands that sends them; both zero with no update) and
       `writes` (the number of `write_buffer` calls: each is a copy on the GPU with a barrier of its
-      own), `encode_ms` and `submit_ms` (the draw), `wait_ms` (**the wait for the GPU, which comes
-      after the CPU's clock has stopped**: the update's copies, the draw, and whatever else the GPU
-      was doing), and `other_ms` (`time_ms` less all of those: what none of them says);
+      own), `encode_ms` (the draw's encoding, the timer queries' resolving and **finishing the
+      command buffer**) and `submit_ms` (`Queue::submit` alone), `wait_ms` (**the wait for the GPU,
+      which comes after the CPU's clock has stopped**: the readback of the pass times, the device
+      poll, what wgpu frees inside it (a staging buffer for each `write_buffer`), and the GPU's own
+      work: the update's copies, the draw, and whatever else the GPU was doing), and `other_ms`
+      (`time_ms` less all of those: what none of them says);
+    - **the GPU's own time for the frame's passes**, from the timestamps the passes wrote (the
+      device's clock, not wall time; they are GPU timestamps, not what the CPU waited):
+      `gpu_primary_ms`, `gpu_upscale_ms`, and `gpu_total_ms` (from the start of the frame's first
+      pass to the end of its last, gaps between them included), and `wait_not_passes_ms`, which is
+      `wait_ms` less `gpu_total_ms`: what the wait was that was not our passes (the update's copies,
+      which are queued ahead of them, driver work, other GPU clients, wgpu's cleanup in the poll).
+      It is negative if the passes were already running while the CPU was still in the submit. **Which
+      frame the times belong to**: the profiler reads the times back after each frame, and the
+      bench waits for them, so a frame's times are in when its draw returns; the profiler says
+      which readback was this frame's (`Profiler::times_of_this_frame`), and the fields are **null,
+      not zero and not an earlier frame's,** where the device has no timers, the frame was not timed
+      (the readback ring was full) or its readback failed. A time between the submit and the start
+      of the first pass (the copies' own time) is not reported: it needs a timestamp before the
+      copies, in the earlier submit that sends them, and there is none there;
     - `camera_ms` and `after_ms`, outside `time_ms` (see above);
     - what the update copied: `update` (`none`, `patch` or `rebuild`: a rebuild makes new buffers
       for the whole scene), `upload_bytes` (all the update writes, headers and tables included) and
       `patch_bytes` (the words that a patch lists);
-    - `hole_look`: whether the scene thread was in a look for holes at the start or the end of the
-      frame (it holds the store's read lock and publishes nothing meanwhile).
+    - `hole_look`: whether a look for holes **overlapped** the frame: the scene thread was in one at
+      the start or at the end of it, from before it takes the store's read lock to after it lets go
+      (so waiting for the lock is in it). It does not say that the look blocked the frame, and a
+      look that began after the frame's start and was done before its end is missed.
 
     The measuring costs a few clock reads a frame. In `min` and `max` the i-th slowest frame of each
     run is taken with the i-th of the others, member by member (a `slowest` of runs that did not
@@ -504,8 +527,10 @@ on Windows). For the holes there are three: a hole in a path, a hole **outside**
 them, at the sizing, at the last look) and a gate that looked at nothing. A stepped test of the
 scene thread (`streaming_tests`) checks that a look that is asked for counts the soft misses and
 looks for holes whatever the clock says.
-The slowest-frames list, a dig with nothing in reach (the report has `edit_latency` null with its
-reason, and the run goes on), the envelope of a run with no Edit, and the catching of a panic are
+The slowest-frames list, the frames over the limit by update kind, GPU pass times that are null and
+not zero, a dig with nothing in reach and a dig refused (spent by digging in a world with no scene
+thread; the report has `edit_latency` null with its reason, and the run goes on), the envelope of a
+run with no Edit, and the catching of a panic are
 synthetic tests of the same kind, with no threads, and gate.
 `the_real_time_run_on_the_test_planet_completes_with_every_path_and_field` runs the mode on the
 test Planet with real threads and no GPU, and asserts what was run, no time (a look for holes in
@@ -538,7 +563,7 @@ those cases the output on stderr is all there is.
 
 ```
 {
-  "schema_version": 9,
+  "schema_version": 10,
   "build":   { "version", "commit" },          // commit: CI builds only, else null; on a PR
                                                // build it is GitHub's merge commit, not the head
   "machine": { "gpu", "device_type", "driver", "driver_info", "backend", "os", "arch",
