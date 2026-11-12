@@ -26,9 +26,10 @@ use brick_store::{BrickStore, Budget, VOXELS_PER_METRE, VoxelCoord};
 use net::{ServerEnd, loopback};
 use planet_gen::planet::{Planet, tangents};
 use planet_gen::world_map::WorldMap;
+use render::UploadCost;
 use render::lod::{Bands, LEVELS, Margins};
 use render::scene::Bound;
-use render::tracer::upload_bytes;
+use render::tracer::upload_cost;
 use render::{Camera, Offscreen, Scene, SceneUpdate};
 use serde::Serialize;
 use sim::Predictor;
@@ -160,9 +161,14 @@ struct FrameCounts {
     /// Bytes the copy to the GPU writes (all of the buffers for a rebuild), and of them the bytes
     /// of the patch (none for a rebuild).
     upload_bytes: u64,
+    /// Copies the GPU makes for it (each a barrier of its own: see `render::RingPatch::cost`).
+    upload_writes: u64,
     patch_bytes: u64,
     rebuilt: bool,
     updated: bool,
+    /// The scene thread held work back in this frame for the upload budget (see
+    /// `scene_worker::UPLOAD_BUDGET`): the frame's upload was cut.
+    throttled: bool,
     soft_misses: [usize; LEVELS],
     holes: usize,
     /// The store's size as the budget counts it, the bricks drawn, those waiting, those generated.
@@ -275,10 +281,20 @@ pub struct Upload {
     /// Bytes the copies to the GPU write, a frame's, over the run, and of them the bytes of patches.
     pub bytes: Series,
     pub patch_bytes: u64,
+    /// The copies a frame made (a rebuild makes the buffers again and has none).
+    pub writes: Series,
+    /// The 99th percentile (nearest rank) of the bytes and of the copies of the frames that had an
+    /// update. The maximum is in the series.
+    pub bytes_p99: u64,
+    pub writes_p99: u64,
     /// Updates that made the buffers again.
     pub rebuilds: u64,
     /// Frames that had an update at all.
     pub updates: u64,
+    /// Frames in which the scene thread held work back for the upload budget, so that the frame's
+    /// upload was cut, and the most frames in a row it did: how long the longest backlog lasted.
+    pub cut_frames: u64,
+    pub longest_backlog_frames: u64,
 }
 
 /// Soft misses (bricks drawn whole although the bands split them) in the frames of a phase.
@@ -578,6 +594,11 @@ impl StreamReport {
 struct Tally {
     hash: Option<Fnv>,
     upload: Upload,
+    /// The bytes and the copies of each frame that had an update, for their percentiles.
+    update_bytes: Vec<u64>,
+    update_writes: Vec<u64>,
+    /// Frames in a row that work was held back.
+    backlog: u64,
     soft: SoftMisses,
     holes: Series,
     outbox: Series,
@@ -593,6 +614,18 @@ impl Tally {
             &serde_json::to_value(counts).expect("the counts serialize"),
         );
         self.upload.bytes.add(counts.upload_bytes);
+        self.upload.writes.add(counts.upload_writes);
+        if counts.updated {
+            self.update_bytes.push(counts.upload_bytes);
+            self.update_writes.push(counts.upload_writes);
+        }
+        self.upload.cut_frames += u64::from(counts.throttled);
+        self.backlog = if counts.throttled {
+            self.backlog + 1
+        } else {
+            0
+        };
+        self.upload.longest_backlog_frames = self.upload.longest_backlog_frames.max(self.backlog);
         self.upload.patch_bytes += counts.patch_bytes;
         self.upload.rebuilds += u64::from(counts.rebuilt);
         self.upload.updates += u64::from(counts.updated);
@@ -786,20 +819,22 @@ impl Streamer {
         let store = self.world.store();
         let (upload, patch) = match &update {
             Some(update) => (
-                upload_bytes(self.world.scene(), update),
+                upload_cost(self.world.scene(), update),
                 match update {
                     SceneUpdate::Rings(patch) => patch.words() as u64 * 4,
                     _ => 0,
                 },
             ),
-            None => (0, 0),
+            None => (UploadCost::default(), 0),
         };
         let counts = FrameCounts {
             phase,
-            upload_bytes: upload,
+            upload_bytes: upload.bytes,
+            upload_writes: u64::from(upload.writes),
             patch_bytes: patch,
             rebuilt: matches!(update, Some(SceneUpdate::Rebuilt)),
             updated: update.is_some(),
+            throttled: stats.throttled,
             soft_misses: stats.soft_misses_by_level,
             holes: stats.holes,
             streamed: store.streamed_len(),
@@ -912,7 +947,11 @@ impl Streamer {
                 edit_frame: EDIT_FRAME,
             },
             counts_hash: String::new(),
-            upload: counts.upload.clone(),
+            upload: Upload {
+                bytes_p99: percentile_99(&counts.update_bytes),
+                writes_p99: percentile_99(&counts.update_writes),
+                ..counts.upload.clone()
+            },
             soft_misses: counts.soft.clone(),
             rings: (0..LEVELS)
                 .map(|level| RingFill {
@@ -951,6 +990,17 @@ impl Streamer {
         };
         report.counts_hash = counts_hash(frames_hash, &report);
         Ok(report)
+    }
+}
+
+/// The 99th percentile, nearest rank, of `values`: the smallest that at least 99% of them do not
+/// exceed; 0 for none.
+fn percentile_99(values: &[u64]) -> u64 {
+    let mut sorted = values.to_vec();
+    sorted.sort_unstable();
+    match (sorted.len() * 99).div_ceil(100) {
+        0 => 0,
+        rank => sorted[rank - 1],
     }
 }
 
@@ -1088,9 +1138,11 @@ mod tests {
         let frame = FrameCounts {
             phase: Phase::Moving,
             upload_bytes: 0,
+            upload_writes: 0,
             patch_bytes: 0,
             rebuilt: false,
             updated: false,
+            throttled: false,
             soft_misses: [0; LEVELS],
             holes: 1,
             streamed: 0,
@@ -1213,9 +1265,11 @@ mod tests {
         let frame = FrameCounts {
             phase: Phase::Steady,
             upload_bytes: 1,
+            upload_writes: 11,
             patch_bytes: 2,
             rebuilt: false,
             updated: true,
+            throttled: true,
             soft_misses: [3; LEVELS],
             holes: 4,
             streamed: 5,

@@ -48,7 +48,9 @@ use brick_store::{Brick, BrickCoord, BrickStore, BrickView, Material};
 mod rings;
 pub mod select;
 
-pub use rings::{Lengths, Part, PatchCopy, Rebuild, RingPatch, RingsFull, Room, UploadCost};
+pub use rings::{
+    COPY_GAP, Lengths, Part, PatchCopy, Rebuild, RingPatch, RingsFull, Room, UploadCost,
+};
 
 /// Bricks along each edge of a region.
 pub const REGION_BRICKS: i32 = 8;

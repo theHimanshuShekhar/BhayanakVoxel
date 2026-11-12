@@ -2501,3 +2501,195 @@ fn wait_idle(world: &mut World, camera: [f64; 3], cap: Duration) {
         std::thread::sleep(Duration::from_millis(16));
     }
 }
+
+/// A budget small enough that the fill of the test world's shell takes many frames to upload.
+const SMALL_BUDGET: render::UploadCost = render::UploadCost {
+    bytes: 48 << 10,
+    writes: 12,
+};
+
+/// What a GPU copy of the scene holds, written to as the tracer writes (`Tracer::update_scene`):
+/// the buffers that grew are made longer with what they had, and then the copies of a patch are
+/// made from the frame thread's scene (words in the gaps between them as they are there), and the
+/// header (the levels) if it changed.
+struct GpuCopy {
+    levels: Vec<render::scene::Level>,
+    table: Vec<u32>,
+    regions: Vec<u32>,
+    brick_refs: Vec<u32>,
+    bricks: Vec<u32>,
+}
+
+impl GpuCopy {
+    fn of(scene: &Scene) -> Self {
+        Self {
+            levels: scene.levels.clone(),
+            table: scene.table.clone(),
+            regions: scene.regions.clone(),
+            brick_refs: scene.brick_refs.clone(),
+            bricks: scene.bricks.clone(),
+        }
+    }
+
+    fn write(&mut self, scene: &Scene, update: &SceneUpdate) {
+        match update {
+            SceneUpdate::Rebuilt => *self = Self::of(scene),
+            SceneUpdate::Rings(patch) => {
+                if let Some(sizes) = patch.sizes {
+                    self.table.resize(sizes.table, 0);
+                    self.regions.resize(sizes.regions, 0);
+                    self.brick_refs.resize(sizes.brick_refs, 0);
+                    self.bricks.resize(sizes.bricks, 0);
+                }
+                for (part, range) in patch.copies() {
+                    let (to, from) = match part {
+                        render::scene::Part::Table => (&mut self.table, &scene.table),
+                        render::scene::Part::Regions => (&mut self.regions, &scene.regions),
+                        render::scene::Part::BrickRefs => (&mut self.brick_refs, &scene.brick_refs),
+                        render::scene::Part::Bricks => (&mut self.bricks, &scene.bricks),
+                    };
+                    to[range.clone()].copy_from_slice(&from[range]);
+                }
+                if patch.levels {
+                    self.levels.clone_from(&scene.levels);
+                }
+            }
+            SceneUpdate::Patched { .. } => unreachable!("rings make rings"),
+        }
+    }
+
+    /// That the GPU has every word the scene that is drawn has: so every brick that scene draws
+    /// has its words (and the table, the records and the header that find them) in the GPU's
+    /// buffers, and none is drawn from words that have not been copied.
+    fn assert_is(&self, scene: &Scene, frame: usize) {
+        assert_eq!(self.levels, scene.levels, "frame {frame}: the header");
+        assert!(self.table == scene.table, "frame {frame}: the table");
+        assert!(self.regions == scene.regions, "frame {frame}: the regions");
+        assert!(
+            self.brick_refs == scene.brick_refs,
+            "frame {frame}: the brick refs"
+        );
+        assert!(self.bricks == scene.bricks, "frame {frame}: the bricks");
+    }
+}
+
+#[test]
+fn with_a_small_budget_no_frame_draws_a_brick_whose_words_have_not_been_copied_and_a_frames_upload_stays_in_it()
+ {
+    let (mut world, _server, camera) = spawned_world(Run::Stepped);
+    world.count_exactly();
+    world.worker().set_upload_budget(SMALL_BUDGET);
+    let mut gpu = GpuCopy::of(world.scene());
+    // The frame, whether it was cut by the budget, whether a buffer grew in it, and its upload.
+    let mut frames: Vec<(bool, bool)> = Vec::new();
+    let mut worst = render::UploadCost::default();
+    let mut patch_frames = 0;
+    let mut patience = Patience::new(Duration::from_secs(180));
+    loop {
+        let update = world.recentre(camera.position).unwrap();
+        let mut grew = false;
+        if let Some(update) = &update {
+            gpu.write(world.scene(), update);
+            patch_frames += 1;
+            grew = matches!(update, SceneUpdate::Rings(p) if p.sizes.is_some());
+            let cost = render::tracer::upload_cost(world.scene(), update);
+            worst.bytes = worst.bytes.max(cost.bytes);
+            worst.writes = worst.writes.max(cost.writes);
+        }
+        gpu.assert_is(world.scene(), frames.len());
+        assert_eq!(world.stats().holes, 0, "frame {}: a hole", frames.len());
+        frames.push((world.stats().throttled, grew));
+        if idle(&world) && !world.stats().throttled {
+            break;
+        }
+        patience.wait(&world, || "the resident set does not fill".into());
+    }
+    let cut = frames.iter().filter(|f| f.0).count();
+    let longest = frames
+        .split(|f| !f.0)
+        .map(<[_]>::len)
+        .max()
+        .unwrap_or_default();
+    // The upload spans many frames, and a buffer grew with the backlog standing: a frame that
+    // grew one has a frame before it and one after it that were cut.
+    let across = (1..frames.len().saturating_sub(1))
+        .filter(|&i| frames[i].1 && frames[i - 1].0 && frames[i + 1].0)
+        .count();
+    eprintln!(
+        "{} frames, {patch_frames} with an update, {cut} cut, backlog {longest}, {across} growths \
+         inside a backlog, worst frame {worst:?}",
+        frames.len()
+    );
+    assert!(
+        cut > 10 && longest > 3,
+        "{cut} cut, longest backlog {longest}"
+    );
+    assert!(across > 0, "no buffer grew in the middle of a backlog");
+    // A frame's upload is the budget and one operation, which is not split (the arrivals of a
+    // batch, or one step of following the camera, are one patch), and the words that joining
+    // copies puts between them: that is the bound.
+    let op = world.stats().largest_op;
+    let gaps = u64::from(SMALL_BUDGET.writes + op.writes) * render::scene::COPY_GAP as u64 * 4;
+    assert!(
+        worst.bytes <= SMALL_BUDGET.bytes + op.bytes + gaps,
+        "{} bytes in a frame, over {} and one operation of {} bytes",
+        worst.bytes,
+        SMALL_BUDGET.bytes,
+        op.bytes
+    );
+    assert!(
+        worst.writes <= SMALL_BUDGET.writes + op.writes,
+        "{} copies in a frame, over {} and one operation of {}",
+        worst.writes,
+        SMALL_BUDGET.writes,
+        op.writes
+    );
+}
+
+#[test]
+fn an_edit_made_while_a_backlog_waits_is_taken_as_soon_as_one_made_without_a_backlog_is() {
+    let (mut world, _server, camera) = spawned_world(Run::Stepped);
+    fill(&mut world, camera.position);
+    let aim = up_close(&mut world, &camera);
+    let depth = |world: &World| {
+        crate::world::centre_hit(world.scene(), &aim)
+            .expect("ground")
+            .t
+    };
+    let whole = depth(&world);
+    // The camera is on the move, with a budget so small that what the loader makes for the new
+    // places waits for frames: a backlog, which the Edit is made in the middle of.
+    world.worker().set_upload_budget(SMALL_BUDGET);
+    let (ahead, _) = tangents(camera.horizon_up);
+    let at = |n: i32| -> [f64; 3] {
+        std::array::from_fn(|a| aim.position[a] + 8.0 * f64::from(n) * ahead[a])
+    };
+    let mut n = 1;
+    while !world.stats().throttled {
+        world.recentre(at(n)).unwrap();
+        pace(&world, FRAME);
+        n = (n + 1).min(6);
+        assert!(n < 100 || world.stats().throttled, "no backlog stands");
+    }
+    let waiting_before = world.waiting();
+    world.edit(&aim, &crate::tool::Tool::default()).unwrap();
+    // The bound of ADR 0006: the frame of the click looks at the scene and does not have the Edit
+    // (the scene thread has not been looked at since); the next frame takes what has been
+    // published, which has it, whatever waits behind it.
+    assert!((depth(&world) - whole).abs() < 0.5);
+    pace(&world, FRAME);
+    world.recentre(at(n)).unwrap();
+    pace(&world, FRAME);
+    world.recentre(at(n)).unwrap();
+    assert!(
+        world.edit_taken(),
+        "the Edit was not taken in the frame after"
+    );
+    let dug = depth(&world);
+    assert!(dug > whole + 1.0, "the hole shows: {whole}, then {dug}");
+    // And the backlog was still standing then: the Edit did not wait for it to be gone.
+    assert!(
+        world.stats().throttled || world.waiting() > 0 || waiting_before > 0,
+        "there was no backlog to be behind"
+    );
+}

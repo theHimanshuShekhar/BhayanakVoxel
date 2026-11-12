@@ -36,7 +36,7 @@
 //! changes the Voxels (other players' Edits) is still waited for: [`SceneWorker::edit`].
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, TryLockError};
 use std::thread::JoinHandle;
@@ -44,7 +44,7 @@ use std::time::{Duration, Instant};
 
 use brick_store::{BrickCoord, BrickStore, Candidate, LodWork, TableSize, VOXELS_PER_METRE};
 use render::lod::{AHEAD, Bands, Class, LEVELS, brick_distance};
-use render::{PatchCopy, RingPatch, RingsFull, Scene, SceneUpdate};
+use render::{PatchCopy, RingPatch, RingsFull, Scene, SceneUpdate, UploadCost};
 use sim::SharedStore;
 
 use crate::clock::Clock;
@@ -53,6 +53,26 @@ use crate::loader::{Arrival, Loader};
 /// The time this thread spends taking in bricks before it looks at what the frame thread has
 /// asked of it (a new camera, an Edit) and publishes what it has done.
 const SLICE: Duration = Duration::from_millis(2);
+
+/// How much the scene thread lets wait for the frame thread to upload (#145): it stops following the
+/// camera and taking in what the loader made while what it has published and not had taken, and
+/// what it has packed since, comes to this much, and goes on when the frame thread has taken it.
+/// So a frame uploads about this much at the most, in this many copies (see
+/// [`render::RingPatch::cost`]), instead of whatever piled up: the baseline's worst frame
+/// copied 37 MB in 12 841 writes. The work is not dropped: the loader's arrivals wait in its queue
+/// and the camera is followed from where the scene is, so what is not packed yet is packed in
+/// the frames after, in the order the camera and the loader asked, which no frame draws a brick
+/// out of: every patch is whole, and the words of a brick are in the patch that lists it.
+///
+/// It is a limit on what is added, checked between operations: one batch of arrivals
+/// ([`BATCH`] bricks' children at the most) or one follow step can take it over, by what that
+/// costs, and an Edit is packed whatever the backlog is (it is never behind streamed bricks: it
+/// goes into the same patch, ahead of what is not yet packed). A jump or other bands pack the
+/// whole scene and are not limited either (`Rebuilt`).
+pub const UPLOAD_BUDGET: UploadCost = UploadCost {
+    bytes: 8 << 20,
+    writes: 128,
+};
 /// How long it sleeps when there was nothing to do but the loader has bricks on their way, before
 /// it looks again: the arrivals do not wake it. With nothing asked for it sleeps until it is told.
 const IDLE: Duration = Duration::from_millis(1);
@@ -226,6 +246,9 @@ pub struct Stats {
     pub holes: usize,
     /// What the thread has done, by category, since the start.
     pub work: Done,
+    /// The thread is holding work back, to keep what the frame thread uploads to its budget (see
+    /// [`UPLOAD_BUDGET`]): as of this publish.
+    pub throttled: bool,
     pub loader: LoaderStats,
     /// What costs more to find out, as of a few times a second.
     pub slow: Arc<Slow>,
@@ -234,6 +257,11 @@ pub struct Stats {
     /// Where the scene had been moved to.
     #[cfg(test)]
     pub camera: Option<[f64; 3]>,
+    /// The most that one operation (a follow step, a batch of arrivals, an Edit) added to what the
+    /// frame thread uploads: the most bytes, and the most copies, of any one, which is by how much
+    /// a frame's upload can pass the budget.
+    #[cfg(test)]
+    pub largest_op: UploadCost,
 }
 
 /// What the scene thread has done since the start, in steps and bricks, not milliseconds (#181):
@@ -258,6 +286,8 @@ pub struct Done {
     /// those looks found, summed.
     pub hole_scans: u64,
     pub holes_found: u64,
+    /// Rounds in which the thread held work back for the upload budget.
+    pub budget_cuts: u64,
 }
 
 /// The parts of a round that [`Spent`] times.
@@ -332,6 +362,7 @@ impl Stats {
         self.waiting == other.waiting
             && self.soft_misses == other.soft_misses
             && self.coarsening == other.coarsening
+            && self.throttled == other.throttled
             && self.loader == other.loader
             && self.level_bricks == other.level_bricks
             && self.work.hole_scans == other.work.hole_scans
@@ -357,11 +388,14 @@ fn stats_of(scene: &Scene, loader: &Loader, slow: &Arc<Slow>, eviction: Eviction
         soft_misses_by_level: [0; LEVELS],
         holes: 0,
         work: Done::default(),
+        throttled: false,
         loader: LoaderStats::of(loader),
         slow: Arc::clone(slow),
         eviction,
         #[cfg(test)]
         camera: scene.camera(),
+        #[cfg(test)]
+        largest_op: UploadCost::default(),
     }
 }
 
@@ -482,6 +516,9 @@ struct Shared {
     time_work: AtomicBool,
     /// Nanoseconds spent on each [`Part`], while timing is on.
     spent: [AtomicU64; PARTS],
+    /// The upload budget (see [`UPLOAD_BUDGET`]): bytes, and copies.
+    budget_bytes: AtomicU64,
+    budget_writes: AtomicU32,
 }
 
 /// What the frame thread has no more use for, which it hands back for the scene thread to use
@@ -591,6 +628,8 @@ impl SceneWorker {
             looking: AtomicBool::new(false),
             time_work: AtomicBool::new(false),
             spent: std::array::from_fn(|_| AtomicU64::new(0)),
+            budget_bytes: AtomicU64::new(UPLOAD_BUDGET.bytes),
+            budget_writes: AtomicU32::new(UPLOAD_BUDGET.writes),
         });
         let (garbage, graveyard) = mpsc::channel();
         let user_bands = scene.bands();
@@ -631,9 +670,13 @@ impl SceneWorker {
             ahead: [None; AHEAD],
             velocity: [0.0; 3],
             idle: false,
+            throttled: false,
+            pending: UploadCost::default(),
             clock,
             #[cfg(test)]
             coarse_sleep: Duration::ZERO,
+            #[cfg(test)]
+            largest_op: UploadCost::default(),
         };
         let worker = Self {
             shared,
@@ -643,6 +686,18 @@ impl SceneWorker {
             busy_until: Mutex::new(None),
         };
         (engine, worker, mirror, stats)
+    }
+
+    /// Changes the upload budget (see [`UPLOAD_BUDGET`]), for a test or the bench to see what a
+    /// smaller one does.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn set_upload_budget(&self, budget: UploadCost) {
+        self.shared
+            .budget_bytes
+            .store(budget.bytes, Ordering::Relaxed);
+        self.shared
+            .budget_writes
+            .store(budget.writes, Ordering::Relaxed);
     }
 
     /// One step of a stepped scene thread: the loader makes up to [`STEP_JOBS`] jobs, and the
@@ -1055,10 +1110,18 @@ struct Engine {
     velocity: [f64; 3],
     /// The last round did nothing, so a thread waits to be told (see [`Engine::await_work`]).
     idle: bool,
+    /// The last round held work back for the upload budget (see [`Engine::over_budget`]), so the
+    /// thread looks again soon, when the frame thread may have taken what it waits for.
+    throttled: bool,
+    /// What the patch that is in the outbox costs to upload, as of the last publish.
+    pending: UploadCost,
     /// The time that holds and slices are measured in: the machine's, or a test's.
     clock: Clock,
     #[cfg(test)]
     coarse_sleep: Duration,
+    /// See [`Stats::largest_op`].
+    #[cfg(test)]
+    largest_op: UploadCost,
 }
 
 /// What the thread was told: the camera, how it moves, and the jobs.
@@ -1149,6 +1212,16 @@ impl Engine {
     /// coarsening hold that is over. None when it is to stop.
     fn await_work(&mut self) -> Option<Work> {
         let mut inbox = lock(&self.shared.inbox);
+        // Holding work back for the frame thread to take what is waiting: look again in a
+        // millisecond, or when told (an Edit or a new camera wake it).
+        if self.throttled && inbox.jobs.is_empty() && !inbox.shutdown {
+            inbox = self
+                .shared
+                .wake
+                .wait_timeout(inbox, IDLE)
+                .expect("the frame thread panicked")
+                .0;
+        }
         if self.idle
             && inbox.jobs.is_empty()
             && Some(inbox.camera) == self.camera
@@ -1206,6 +1279,7 @@ impl Engine {
     fn round(&mut self, camera: [f64; 3], velocity: [f64; 3], jobs: VecDeque<(u64, Job)>) -> bool {
         self.look_ahead(camera, velocity);
         self.paused = self.shared.paused.load(Ordering::Acquire);
+        self.throttled = false;
         let mut worked = !jobs.is_empty();
         // A sync is done when the rest of what the thread does in this round is.
         #[cfg_attr(not(test), allow(unused_mut))]
@@ -1274,6 +1348,7 @@ impl Engine {
         worked |= evicting;
         self.coarsen_more();
         self.relax();
+        self.work.budget_cuts += u64::from(self.throttled);
         // A sync is done when the coarse levels over the Edits before it are made, too.
         let busy = !self.coarse.is_empty();
         let synced = if busy {
@@ -1283,8 +1358,34 @@ impl Engine {
             synced.or(self.sync_waiting.take())
         };
         self.publish(synced);
-        self.idle = !worked && !busy;
+        self.idle = !worked && !busy && !self.throttled;
         true
+    }
+
+    /// Whether what waits for the frame thread to upload, and what has been packed since it was
+    /// published, comes to the budget (see [`UPLOAD_BUDGET`]), so that no more is to be added
+    /// until the frame thread has taken it. A copy of all of the scene that waits is over any
+    /// budget.
+    fn over_budget(&mut self) -> bool {
+        let waiting = {
+            let outbox = lock(&self.shared.outbox);
+            if outbox.ready.mirror.is_some() {
+                return true;
+            }
+            outbox.ready.patch.is_some()
+        };
+        if !waiting {
+            self.pending = UploadCost::default();
+        }
+        let packed = match &self.changes {
+            Changes::None => UploadCost::default(),
+            Changes::Patch(patch) => patch.cost(),
+            Changes::Rebuilt => return true,
+        };
+        let all = self.pending.plus(packed);
+        let budget = &self.shared;
+        all.bytes >= budget.budget_bytes.load(Ordering::Relaxed)
+            || all.writes >= budget.budget_writes.load(Ordering::Relaxed)
     }
 
     /// The time a part of a round begins, if the parts are being timed.
@@ -1312,11 +1413,19 @@ impl Engine {
     fn note(&mut self, update: Option<SceneUpdate>) {
         match update {
             None => {}
-            Some(SceneUpdate::Rings(patch)) => match &mut self.changes {
-                Changes::None => self.changes = Changes::Patch(patch),
-                Changes::Patch(before) => before.merge(patch),
-                Changes::Rebuilt => {}
-            },
+            Some(SceneUpdate::Rings(patch)) => {
+                #[cfg(test)]
+                {
+                    let cost = patch.cost();
+                    self.largest_op.bytes = self.largest_op.bytes.max(cost.bytes);
+                    self.largest_op.writes = self.largest_op.writes.max(cost.writes);
+                }
+                match &mut self.changes {
+                    Changes::None => self.changes = Changes::Patch(patch),
+                    Changes::Patch(before) => before.merge(patch),
+                    Changes::Rebuilt => {}
+                }
+            }
             Some(SceneUpdate::Rebuilt) => self.changes = Changes::Rebuilt,
             Some(SceneUpdate::Patched { .. }) => unreachable!("a scene of rings makes rings"),
         }
@@ -1403,6 +1512,12 @@ impl Engine {
         if self.camera == Some(camera) && !self.scene.rewanted() {
             return Ok(false);
         }
+        // The camera is followed when the frame thread has taken what waits, from where the scene is:
+        // a move that is waited for is a longer one, which is the same work.
+        if self.over_budget() {
+            self.throttled = true;
+            return Ok(false);
+        }
         let store = self.store.read().expect("the store's lock is not poisoned");
         let before = self.scene.bricks_changed();
         let update = self.scene.recentre(&store, camera)?;
@@ -1444,6 +1559,12 @@ impl Engine {
         let mut worst = Duration::ZERO;
         let mut took = false;
         loop {
+            // What the loader made waits in its queue, in the order it made it, while the frame
+            // thread has more to upload than the budget.
+            if self.over_budget() {
+                self.throttled = true;
+                break;
+            }
             let left = SLICE.saturating_sub(self.clock.since(started));
             let Some(most) = batch_size(left, self.arrival_cost) else {
                 break;
@@ -1891,6 +2012,11 @@ impl Engine {
         let mut stats = stats_of(&self.scene, &self.loader, &self.slow, self.eviction);
         stats.coarsening = self.coarsening;
         stats.work = self.work;
+        stats.throttled = self.throttled;
+        #[cfg(test)]
+        {
+            stats.largest_op = self.largest_op;
+        }
         // The look that a job asked for is done by the scan before this (the holes) and here (the
         // count), and is not due again.
         let recount_due = std::mem::take(&mut self.recount_due);
@@ -1944,7 +2070,9 @@ impl Engine {
                         }
                         None => (patch, self.spare.pop().unwrap_or_default()),
                     };
-                    outbox.ready.patch = Some(self.scene.copy_patch_into(merged, buffers));
+                    let copy = self.scene.copy_patch_into(merged, buffers);
+                    self.pending = copy.patch.cost();
+                    outbox.ready.patch = Some(copy);
                 }
             }
             (Changes::None | Changes::Rebuilt, None) => {}
