@@ -204,7 +204,7 @@ has the working):
 | `STREAMED_PER_D0_SQUARED` 19.8 | 16.49 | 13.19: the constant less the spawn ring's 5.33 (`STREAMED_SPAWN_RING_PER_D0_SQUARED`) and level 0's 1.29 beyond the ring (`STREAMED_LEVEL_0_BEYOND_THE_RING_PER_D0_SQUARED`), which the measurement does not have | 1.25 | 13.09 |
 
 The streamed value is held to the part of the constant that the test Planet can show, not to the
-whole of it (whose limit, 24.75, would be 1.88 times what is measured). Level 0 is what is not
+whole of it (whose limit, 24.75, would be 1.89 times what is measured). Level 0 is what is not
 like for like: its band (128 Voxels, 160 with the radial margin) is the spawn ring (160) and no
 more, so no level-0 bricks are added to what is measured (the report has level 0 at the start and
 when complete: both 226 964, and a test holds them equal), while at full size level 0 held 1.36

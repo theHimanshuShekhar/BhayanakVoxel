@@ -278,7 +278,7 @@ const STREAMED_SPAWN_RING_PER_D0_SQUARED: f64 =
 /// Level 0's bricks beyond the ring, 1.29 per `d0` squared, the other share that is taken out. The
 /// measurement is held to [`STREAMED_PER_D0_SQUARED`] less both, 19.8 − 5.33 − 1.29 = 13.19, times
 /// [`HEADROOM`]: 16.49, against the 13.09 measured (99% of that part, 79% of the limit). Held to
-/// the whole constant the limit would be 24.75, 1.88 times what is measured and 1.71 times what
+/// the whole constant the limit would be 24.75, 1.89 times what is measured and 1.71 times what
 /// the measurement can show of the constant without the ring (14.47), and not 1.25.
 const STREAMED_LEVEL_0_BEYOND_THE_RING_PER_D0_SQUARED: f64 =
     LEVEL_0_BEYOND_THE_RING_AT_FULL_SIZE / (D0_OF_THE_MEASUREMENT * D0_OF_THE_MEASUREMENT);
