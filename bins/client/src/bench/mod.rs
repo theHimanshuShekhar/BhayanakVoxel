@@ -243,17 +243,20 @@ fn run(args: &Args) -> Result<u8, Box<dyn Error>> {
     // The cave stills are of another scene, and another GPU context: this one's is done with.
     drop(gpu);
     drop(flight);
-    let streaming = if args.streaming {
-        Some(run_streaming(&plan, resolution)?)
-    } else {
-        None
-    };
     let (caves, cave_shots) = if plan.patch {
         (Vec::new(), Vec::new())
     } else {
         cave_stills(&plan, &budgets, &args.out)?
     };
     screenshots.extend(cave_shots);
+    // The streaming mode runs last, so that `--streaming` cannot move the timings of anything else:
+    // it has a GPU context of its own, and what it leaves behind (memory, a warm driver) comes after
+    // every other measurement.
+    let streaming = if args.streaming {
+        Some(run_streaming(&plan, resolution)?)
+    } else {
+        None
+    };
 
     let report = Report {
         schema_version: SCHEMA_VERSION,

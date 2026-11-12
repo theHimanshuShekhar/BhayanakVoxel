@@ -93,8 +93,9 @@ file, a bad option).
    the view to seconds to make, and the numbers say what the cave costs, not the far ground. The
    flight and the sweep are left alone. `--short` has no stills.
 
-6. With `--streaming`, after all of that, the streaming mode (#181), on a GPU of its own. See
-   "The streaming mode" below.
+6. With `--streaming`, after everything else (the cave stills included, so that the flag cannot
+   move their timings), the streaming mode (#181), on a GPU of its own. See "The streaming mode"
+   below.
 
 The flight above does not stream: it draws a Planet that is generated whole, so the ring loader
 (#86) and its uploads are not in these numbers. The loader's own costs (the spawn ring, the Guard, how
@@ -125,8 +126,14 @@ except `timing`.
 
 `streaming` has `deterministic: true`, the `schedule`, and:
 
-- `counts_hash`: FNV-1a of every count of every frame and of the end state. It is the one number
-  to compare: `bins/client/src/bench/streaming-counts.golden` has the committed value, a unit
+- `counts_hash`: FNV-1a of the counts of every frame and of every integer, boolean and name in
+  the rest of `streaming` (all but `timing`, and itself): the report and each frame's counts are
+  hashed as they are serialized (`hash_json` in `bench/stream.rs`), so a field added to either is
+  in the hash without anyone listing it, and a test (`every_integer_of_the_report_and_of_a_frame_is_in_the_hash`)
+  changes each integer in turn and fails if the hash does not move. **Floats are left out** (a
+  platform's maths library may differ in the last bit); each is worked out from integers that are
+  hashed (the sizing values from the `sizing.measured` counts, `band_start` and `d0` from the
+  constants). It is the one number to compare: `bins/client/src/bench/streaming-counts.golden` has the committed value, a unit
   test (`the_counts_are_the_committed_ones`, which runs on Linux and on Windows, since it needs no
   GPU) and `tests/bench.rs` check it. When a change to the streaming code moves the counts on
   purpose, the test prints the new hash; put it in the file and say why in the PR.
@@ -144,9 +151,20 @@ except `timing`.
   again for a new camera), `pack` (taking in what the loader made), `upload` (frames with an
   update, and bytes: patches are words, not bricks) and eviction.
 - `residency`: the Diverged bricks (those an Edit changed), the store's size as its budget counts
-  it (at the start, when complete, the most, at the end) and the budget, and
-  `edit_latency_frames`: frames from the Edit to the frame that took it in from the scene thread (2,
-  the bound of ADR 0006: the Edit is looked at in the second frame after).
+  it (at the start, when complete, the most, at the end) and the budget, and two latencies, which
+  are not the same thing:
+  - `edit_latency_frames` (**Edit latency**): frames from the frame in which the Edit was made to
+    the frame that took it in from the scene thread (the first in which `World::edit_taken`
+    holds, which is not when the wait for it ended: a timeout ends that too). An Edit made in
+    frame N and taken in frame N+1 is **1**, ADR 0006's bound. The Edit is made after frame N's
+    look at the scene: a real scene thread has only just begun on it at that look, and a stepped
+    one does a whole round in it, so an Edit made before the look is taken by it, in the same
+    frame, which is 0 and says nothing of the bound.
+  - `outbox_latency_frames` (**Outbox latency**): frames that a result the scene thread published
+    waited in its outbox (ADR 0006) before the frame thread took it, for each frame that took one
+    (frames, total, max, frames with any). 0 in a stepped run, in which a frame takes what was
+    published in it, until #145's cap on uploads holds results back; it is there to show when that
+    changes.
 - `holes`: Split bricks whose children are not resident in the store, per frame. **The gate:** any
   hole fails the run with status 2 (unless `--no-fail`).
 - `sizing`: see below.
@@ -166,9 +184,25 @@ against.
 
 The constants are per `d0` squared, and the test Planet's `d0` is a sixteenth of the full-size
 bench's in length, so what does not scale with `d0` is left out of the measurement: the bricks of
-the Guard's levels (drawn, and their words, estimated at what a Guard brick weighed at the spawn),
-and the store as it was at the spawn (the spawn ring). The constants have those in, so the check
-is a little lenient, by 5% of the bricks at full size.
+the Guard's levels (drawn, and their words, which the scene counts exactly by level:
+`Scene::words_by_level`), and the store as it was at the spawn (the spawn ring). The constants had
+the Guard and the ring in, so the limits are not exactly 1.25 times what they scale with. Like for
+like, with real figures (the doc comment of each constant in `main.rs` has the working):
+
+| Constant | Limit | What it is a limit of | Limit ÷ that | Measured |
+|---|---|---|---|---|
+| `BRICKS_PER_D0_SQUARED` 3.25 | 4.06 | 3.09: the full-size Rings, without the Guard's 178 000 bricks | 1.32 | 3.51 |
+| `REFS_PER_BRICK` 1.0 | 1.25 | 1.0 (a Guard brick has one reference too) | 1.25 | 1.012 |
+| `WORDS_PER_BRICK` 34.2 | 42.75 | 33.1: the Rings, if the Guard weighs 53.8 words a brick at full size as on the test Planet (#162 measures it there) | 1.29 | 40.08 |
+| `STREAMED_PER_D0_SQUARED` 19.8 | 18.09 | 14.47: the constant less the spawn ring's 5.33 (`STREAMED_SPAWN_RING_PER_D0_SQUARED`), which the measurement takes out | 1.25 | 13.09 |
+
+The streamed value is held to the part that scales, not to the whole constant (whose limit,
+24.75, would be 1.71 times that part). Level 0 is not like for like on the test Planet: its band
+(128 Voxels) lies inside the spawn ring (160), so no level-0 bricks are added to what is measured,
+while at full size level 0 held 1.36 million bricks beyond the ring (1.29 per `d0` squared).
+Without them the part of the constant that the test Planet can show is 13.19, its limit 16.49,
+and the check still passes (13.09 is 99% of that part and 79% of that limit); the check as it is
+is not tuned to that.
 
 The camera is a function of the frame index only (keyframes, interpolated in a straight line at
 constant speed), never of the clock, so every run on every machine shows the GPU the same views.
@@ -304,8 +338,11 @@ its 3.0 ms (a sample, pass and total) catches a gross regression, set from the f
 
 The statistics, budget evaluation and exit status, camera path, argument parsing and report shape
 are unit tests in `bins/client/src/bench/`. So are the streaming mode's, in `bench/stream.rs`: two
-runs give identical counts, the counts have the committed hash, the holes gate gives status 2, and
-the sizing check passes and fails when a constant is lowered below its measured value. They are
+runs give identical counts, the counts have the committed hash, every integer of the report is in
+it, the Edit shows in the next frame, the holes gate gives status 2, and the sizing check passes
+and fails when a constant is lowered below its measured value. A client test
+(`a_round_that_changes_nothing_is_not_published_in_the_games_mode_but_is_when_counting_exactly`)
+fails if the scene thread publishes for its counts of work in the game's mode. They are
 stepped and need no GPU, so they gate on Linux and on Windows, which is how the two operating
 systems are compared. `bins/client/tests/bench.rs` runs the real
 `client bench --short` (and `--short --streaming`) and checks the report's schema, the

@@ -376,6 +376,11 @@ fn check_streaming(streaming: &Value) {
     ] {
         assert!(residency[key].is_u64(), "{key}");
     }
+    // An Edit made in a frame is taken in the next (ADR 0006); results are taken in the frame they
+    // are published in until #145 caps the uploads.
+    assert_eq!(residency["edit_latency_frames"], 1);
+    series(&residency["outbox_latency_frames"]);
+    assert_eq!(residency["outbox_latency_frames"]["total"], 0);
     assert!(residency["diverged_bricks"].as_u64().unwrap() > 0);
     // The gate: no frame has a hole.
     series(&streaming["holes"]);
@@ -395,8 +400,23 @@ fn check_streaming(streaming: &Value) {
     for check in checks {
         assert!(string(&check["field"]).starts_with("streaming.sizing.measured."));
         assert!(number(&check["measured"]) > 0.0);
-        assert!(number(&check["limit"]) >= number(&check["value"]));
+        assert!(number(&check["compared"]) <= number(&check["value"]));
+        assert!(number(&check["limit"]) >= number(&check["compared"]));
         assert_eq!(check["over"], false, "{check}");
+    }
+    // The words are counted exactly, by level, and the values are worked out from those integers.
+    let measured = &streaming["sizing"]["measured"];
+    for key in [
+        "ring_bricks",
+        "guard_bricks",
+        "ring_refs_words",
+        "ring_bricks_words",
+        "guard_refs_words",
+        "guard_bricks_words",
+        "streamed",
+        "streamed_at_start",
+    ] {
+        assert!(measured[key].as_u64().unwrap() > 0, "{key}");
     }
     // What the GPU wrote is what the CPU worked out that it would: the count that the Linux and
     // Windows runners compare is made without a GPU, and this is what ties it to one.

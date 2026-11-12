@@ -1589,6 +1589,32 @@ impl Scene {
         ))
     }
 
+    /// For each level, the words of `brick_refs` and of `bricks` that the bricks drawn at it take
+    /// (zero for a scene that is not rings): a brick that is air takes none, one in a region of a
+    /// single Material takes none of either, and a brick of one Material takes a reference and no
+    /// words. They add up to [`Scene::used_words`].
+    pub fn words_by_level(&self) -> [(usize, usize); LEVELS] {
+        let mut by_level = [(0, 0); LEVELS];
+        let Some(rings) = &self.rings else {
+            return by_level;
+        };
+        for (level, coord) in rings.selection.bricks() {
+            let Some(index) = self.find_region(level, region_of(coord)) else {
+                continue;
+            };
+            if self.regions[index * REGION_WORDS + 16] & SOLID_FLAG != 0 {
+                continue;
+            }
+            if let Some(entry) = self.entry(index, bit_of(coord))
+                && let Some(words) = by_level.get_mut(level)
+            {
+                words.0 += 1;
+                words.1 += self.mixed_words(entry);
+            }
+        }
+        by_level
+    }
+
     /// Bytes the scene's buffers take, used or not: what the GPU copy of a scene of rings
     /// reserves, and the host holds as well.
     pub fn reserved_bytes(&self) -> u64 {
@@ -1782,6 +1808,20 @@ mod tests {
 
     fn rings_at(camera: [f64; 3]) -> Scene {
         Scene::rings(ground(), camera, bands(), bound()).unwrap()
+    }
+
+    #[test]
+    fn the_words_of_the_levels_add_up_to_the_words_in_use() {
+        let mut scene = rings_at(ABOVE);
+        // After the camera has moved too, so that words were freed and taken again.
+        let far = [ABOVE[0] + 300.0, ABOVE[1], ABOVE[2] - 200.0];
+        scene.recentre(ground(), far).unwrap();
+        let by_level = scene.words_by_level();
+        let (refs, words) = by_level
+            .iter()
+            .fold((0, 0), |(r, w), &(lr, lw)| (r + lr, w + lw));
+        assert_eq!(Some((refs, words)), scene.used_words());
+        assert!(words > 0 && by_level.iter().filter(|&&(r, _)| r > 0).count() > 2);
     }
 
     /// What a scene shows of every region it lists, by level and region: its Material if it is

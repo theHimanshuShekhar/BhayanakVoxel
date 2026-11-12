@@ -168,6 +168,14 @@ pub struct World {
     resim: std::time::Duration,
     /// The Edits given to the scene thread that have not been waited for ([`World::edit`]).
     unshown_edit: Option<UnshownEdit>,
+    /// The scene thread's job of the newest Edit made, and the last job done that a take brought in:
+    /// the Edit is in the scene that is drawn once the second is at least the first (see
+    /// [`World::edit_taken`]).
+    edit_ticket: u64,
+    taken_done: u64,
+    /// The longest a result that the scene thread published waited, since it was last asked for,
+    /// when the counts are exact (see [`World::take_outbox_wait`]).
+    outbox_wait: std::time::Duration,
     /// How long [`World::edit_due`] waits: [`EDIT_WAIT`], or more in a test on a slow build.
     edit_wait: std::time::Duration,
     /// Whether [`World::recentre`] tells the scene thread how the camera is moving, for prefetch.
@@ -257,6 +265,9 @@ impl World {
             ghost_next: None,
             resim: std::time::Duration::ZERO,
             unshown_edit: None,
+            edit_ticket: 0,
+            taken_done: 0,
+            outbox_wait: std::time::Duration::ZERO,
             edit_wait: EDIT_WAIT,
             lead: true,
             motion: Motion::default(),
@@ -305,10 +316,18 @@ impl World {
         self.clock.is_stepped()
     }
 
-    /// Whether an Edit that was made has not been taken in from the scene thread yet (see
-    /// [`World::edit`]).
-    pub fn edit_pending(&self) -> bool {
-        self.unshown_edit.is_some()
+    /// Whether the scene thread has packed the newest Edit made ([`World::edit`]) and this world has
+    /// taken it in: the scene that is drawn shows it. Not the same as the wait for it being over,
+    /// which a timeout also ends. False before any Edit.
+    pub fn edit_taken(&self) -> bool {
+        self.edit_ticket > 0 && self.taken_done >= self.edit_ticket
+    }
+
+    /// The longest that what the scene thread published waited in the outbox before this world took
+    /// it, since this was last called (ADR 0006), if the counts are exact ([`World::count_exactly`]);
+    /// zero when it was taken in the frame it was published in, and always zero otherwise.
+    pub fn take_outbox_wait(&mut self) -> std::time::Duration {
+        std::mem::take(&mut self.outbox_wait)
     }
 
     /// Moves a stepped world's clock on by `time`.
@@ -604,6 +623,10 @@ impl World {
             return Ok(None);
         };
         let ready = worker.take(wait)?;
+        self.taken_done = self.taken_done.max(ready.done);
+        if let Some(published) = ready.published_at {
+            self.outbox_wait = self.outbox_wait.max(self.clock.since(published));
+        }
         let update = if let Some(mirror) = ready.mirror {
             // The old copy is freed by the thread that made the new one.
             worker.discard_scene(std::mem::replace(&mut self.scene, *mirror));
@@ -767,6 +790,7 @@ impl World {
         }
         // A second Edit before the first is waited for keeps the first one's frame.
         let newest = worker.edit_later(changed);
+        self.edit_ticket = newest;
         self.unshown_edit = Some(UnshownEdit {
             newest,
             looked_since_oldest: self.unshown_edit.is_some_and(|e| e.looked_since_oldest),

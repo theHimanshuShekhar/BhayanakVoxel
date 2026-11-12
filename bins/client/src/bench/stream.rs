@@ -8,7 +8,11 @@
 //! moves, a frame at a time, so the work of each frame does not depend on how long anything took.
 //! What the machine does differ in is the GPU's time, which is in [`Timing`] and is not
 //! deterministic; every other field of [`StreamReport`] is, and [`StreamReport::counts_hash`] is a
-//! hash of all of them, which the tests compare with a value that is committed.
+//! hash of every integer, boolean and name in them (see [`hash_json`]: the report and each frame's
+//! counts are hashed as they are serialized, so a field added to either is in the hash without
+//! anyone listing it), which the tests compare with a value that is committed. Floats are left
+//! out of the hash (a platform's maths library may differ in the last bit); each one in the report
+//! is worked out from integers that are in it.
 //!
 //! The frames, by index: the camera at the spawn until the resident set is complete (the **fill**);
 //! then a path that stands at the spawn for a quarter of its frames (**steady**) and walks the rest
@@ -149,8 +153,8 @@ enum Phase {
     Moving,
 }
 
-/// What one frame did, in counts.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// What one frame did, in counts. Every field is hashed, as it is serialized (see [`hash_json`]).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 struct FrameCounts {
     phase: Phase,
     /// Bytes the copy to the GPU writes (all of the buffers for a rebuild), and of them the bytes
@@ -167,6 +171,9 @@ struct FrameCounts {
     waiting: usize,
     generated: u64,
     diverged: usize,
+    /// Frames that the newest result taken waited in the outbox (see
+    /// [`Residency::outbox_latency_frames`]).
+    outbox_wait_frames: u64,
 }
 
 /// FNV-1a over 64-bit words: the same on every machine, which `DefaultHasher` does not promise.
@@ -178,10 +185,70 @@ impl Fnv {
     }
 
     fn word(&mut self, word: u64) {
-        for byte in word.to_le_bytes() {
+        self.bytes(&word.to_le_bytes());
+    }
+
+    fn bytes(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
             self.0 = (self.0 ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3);
         }
     }
+
+    /// A name, with its length so that two names in a row cannot run into each other.
+    fn text(&mut self, text: &str) {
+        self.word(text.len() as u64);
+        self.bytes(text.as_bytes());
+    }
+}
+
+/// Hashes everything deterministic in `value`: the integers, booleans and strings, with the names
+/// of the fields they are in (sorted) and the lengths of the lists. Floats are left out.
+fn hash_json(hash: &mut Fnv, value: &serde_json::Value) {
+    use serde_json::Value;
+    match value {
+        Value::Null => hash.word(0),
+        Value::Bool(b) => {
+            hash.word(1);
+            hash.word(u64::from(*b));
+        }
+        Value::Number(n) => {
+            if let Some(n) = n.as_u64() {
+                hash.word(2);
+                hash.word(n);
+            } else if let Some(n) = n.as_i64() {
+                hash.word(3);
+                hash.word(n as u64);
+            }
+        }
+        Value::String(text) => {
+            hash.word(4);
+            hash.text(text);
+        }
+        Value::Array(items) => {
+            hash.word(5);
+            hash.word(items.len() as u64);
+            for item in items {
+                hash_json(hash, item);
+            }
+        }
+        Value::Object(fields) => {
+            hash.word(6);
+            let mut names: Vec<_> = fields.keys().collect();
+            names.sort();
+            for name in names {
+                hash.text(name);
+                hash_json(hash, &fields[name]);
+            }
+        }
+    }
+}
+
+/// The hash of the report (with `counts_hash` empty and no timing) after that of the frames.
+fn counts_hash(frames: Fnv, report: &StreamReport) -> String {
+    let mut hash = frames;
+    let value = serde_json::to_value(report).expect("the report serializes");
+    hash_json(&mut hash, &value);
+    format!("{:016x}", hash.0)
 }
 
 /// What a series of counts came to.
@@ -273,22 +340,46 @@ pub struct Residency {
     pub store_max: usize,
     pub store_at_end: usize,
     pub budget: usize,
-    /// Frames from making the Edit to the frame that took it in from the scene thread (the Edit
-    /// goes out through the scene thread's inbox, and is looked at in the second frame after).
+    /// **Edit latency**: frames from the frame in which the Edit was made to the frame that took it
+    /// in from the scene thread (the one in which [`World::edit_taken`] first holds). An Edit made
+    /// in frame N and taken in frame N+1 is 1, which is ADR 0006's bound.
     pub edit_latency_frames: u32,
+    /// **Outbox latency**: frames that a result the scene thread published waited in its outbox
+    /// before the frame thread took it (ADR 0006; the cap on uploads of #145 is what makes it more
+    /// than 0), a count for each frame that took one. 0 in a stepped run, in which a frame takes
+    /// what was published in it, until #145.
+    pub outbox_latency_frames: Series,
 }
 
 /// The measured values that the client's sizing constants are checked against (see
-/// [`Sizing::check`]), taken when the resident set was complete.
+/// [`Sizing::check`]), taken when the resident set was complete: the integers they are worked out
+/// from, and then the values.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct Measured {
-    /// Bricks drawn per `d0` squared (`BRICKS_PER_D0_SQUARED`).
+    /// Bricks drawn at the levels below the Guard's (the Rings), and at the Guard's.
+    pub ring_bricks: u64,
+    pub guard_bricks: u64,
+    /// Words of `brick_refs` and of `bricks` in use by the bricks drawn at the Rings' levels and at
+    /// the Guard's, counted exactly (see `Scene::words_by_level`).
+    pub ring_refs_words: u64,
+    pub ring_bricks_words: u64,
+    pub guard_refs_words: u64,
+    pub guard_bricks_words: u64,
+    /// The store's size as its budget counts it, when the resident set was complete and at the
+    /// spawn.
+    pub streamed: u64,
+    pub streamed_at_start: u64,
+    /// Ring bricks drawn per `d0` squared (`BRICKS_PER_D0_SQUARED`).
     pub bricks_per_d0_squared: f64,
-    /// Words of `brick_refs` and of `bricks` in use per brick drawn (`REFS_PER_BRICK`,
-    /// `WORDS_PER_BRICK`).
+    /// Words of `brick_refs` and of `bricks` in use per Ring brick (`REFS_PER_BRICK`,
+    /// `WORDS_PER_BRICK`), and the words of `bricks` per Guard brick, for what the Guard's share of
+    /// the constant is.
     pub refs_per_brick: f64,
     pub words_per_brick: f64,
-    /// The store's size as its budget counts it, per `d0` squared (`STREAMED_PER_D0_SQUARED`).
+    pub words_per_guard_brick: f64,
+    /// What the store grew by from the spawn to the complete set, per `d0` squared, which is the
+    /// part of `STREAMED_PER_D0_SQUARED` that scales with `d0` (the spawn ring's share is held
+    /// at the start and does not).
     pub streamed_per_d0_squared: f64,
 }
 
@@ -298,8 +389,12 @@ pub struct Check {
     pub constant: &'static str,
     /// The report field it is checked against.
     pub field: &'static str,
+    /// The constant.
     pub value: f64,
-    /// The most that may be measured: the constant times `HEADROOM`.
+    /// The part of it that the measurement is held to: the whole of it, but for
+    /// `STREAMED_PER_D0_SQUARED`, whose spawn ring's share is not in what is measured.
+    pub compared: f64,
+    /// The most that may be measured: `compared` times `HEADROOM`.
     pub limit: f64,
     pub measured: f64,
     pub over: bool,
@@ -319,6 +414,8 @@ pub struct Constants {
     pub refs_per_brick: f64,
     pub words_per_brick: f64,
     pub streamed_per_d0_squared: f64,
+    /// The spawn ring's share of `streamed_per_d0_squared`, which is not what grows with `d0`.
+    pub streamed_spawn_ring_per_d0_squared: f64,
     pub headroom: f64,
 }
 
@@ -330,6 +427,7 @@ impl Constants {
             refs_per_brick: crate::REFS_PER_BRICK,
             words_per_brick: crate::WORDS_PER_BRICK,
             streamed_per_d0_squared: crate::STREAMED_PER_D0_SQUARED,
+            streamed_spawn_ring_per_d0_squared: crate::STREAMED_SPAWN_RING_PER_D0_SQUARED,
             headroom: crate::HEADROOM,
         }
     }
@@ -338,12 +436,14 @@ impl Constants {
 impl Sizing {
     /// Each measured value against its constant times the headroom.
     pub fn check(measured: Measured, constants: &Constants) -> Self {
-        let check = |constant, field, value: f64, measured: f64| {
-            let limit = value * constants.headroom;
+        let check = |constant, field, value: f64, taken_out: f64, measured: f64| {
+            let compared = value - taken_out;
+            let limit = compared * constants.headroom;
             Check {
                 constant,
                 field,
                 value,
+                compared,
                 limit,
                 measured,
                 over: measured > limit,
@@ -354,24 +454,28 @@ impl Sizing {
                 "BRICKS_PER_D0_SQUARED",
                 "streaming.sizing.measured.bricks_per_d0_squared",
                 constants.bricks_per_d0_squared,
+                0.0,
                 measured.bricks_per_d0_squared,
             ),
             check(
                 "REFS_PER_BRICK",
                 "streaming.sizing.measured.refs_per_brick",
                 constants.refs_per_brick,
+                0.0,
                 measured.refs_per_brick,
             ),
             check(
                 "WORDS_PER_BRICK",
                 "streaming.sizing.measured.words_per_brick",
                 constants.words_per_brick,
+                0.0,
                 measured.words_per_brick,
             ),
             check(
                 "STREAMED_PER_D0_SQUARED",
                 "streaming.sizing.measured.streamed_per_d0_squared",
                 constants.streamed_per_d0_squared,
+                constants.streamed_spawn_ring_per_d0_squared,
                 measured.streamed_per_d0_squared,
             ),
         ];
@@ -427,8 +531,9 @@ pub struct StreamReport {
     pub planet: String,
     pub d0: f64,
     pub schedule: Schedule,
-    /// FNV-1a of every count of every frame and of the end state, in hex: equal on every run and
-    /// on both operating systems, and compared with a committed value by the tests.
+    /// FNV-1a of the counts of every frame and of every integer, boolean and name of this report
+    /// (but this field and `timing`), in hex: equal on every run and on both operating systems,
+    /// and compared with a committed value by the tests. Floats are not in it (see the module).
     pub counts_hash: String,
     pub upload: Upload,
     pub soft_misses: SoftMisses,
@@ -456,6 +561,7 @@ struct Tally {
     upload: Upload,
     soft: SoftMisses,
     holes: Series,
+    outbox: Series,
     store_max: usize,
     first_drawn: Option<[usize; LEVELS]>,
 }
@@ -463,24 +569,10 @@ struct Tally {
 impl Tally {
     fn add(&mut self, counts: &FrameCounts) {
         let hash = self.hash.get_or_insert_with(Fnv::new);
-        for word in [
-            counts.phase as u64,
-            counts.upload_bytes,
-            counts.patch_bytes,
-            u64::from(counts.rebuilt),
-            u64::from(counts.updated),
-            counts.holes as u64,
-            counts.streamed as u64,
-            counts.drawn as u64,
-            counts.waiting as u64,
-            counts.generated,
-            counts.diverged as u64,
-        ]
-        .into_iter()
-        .chain(counts.soft_misses.iter().map(|&n| n as u64))
-        {
-            hash.word(word);
-        }
+        hash_json(
+            hash,
+            &serde_json::to_value(counts).expect("the counts serialize"),
+        );
         self.upload.bytes.add(counts.upload_bytes);
         self.upload.patch_bytes += counts.patch_bytes;
         self.upload.rebuilds += u64::from(counts.rebuilt);
@@ -497,22 +589,17 @@ impl Tally {
             *sum += n as u64;
         }
         self.holes.add(counts.holes as u64);
+        self.outbox.add(counts.outbox_wait_frames);
         self.store_max = self.store_max.max(counts.streamed);
     }
 }
 
-/// What the world was at the spawn, before any frame: the Guard, which is the same whatever `d0` is,
-/// and the spawn ring, which is held already and is not scaled either (see `room_for` in
-/// `main.rs`). The sizing constants are per `d0` squared, so these are taken out of what is
-/// measured.
+/// What the world was at the spawn, before any frame: the store's size as its budget counts it,
+/// which has the spawn ring in already, held and not scaled with `d0` (see `room_for` in
+/// `main.rs`). The sizing constants are per `d0` squared, so this is taken out of the store's.
 #[derive(Clone, Copy)]
 struct Start {
-    /// The store's size as its budget counts it.
     streamed: usize,
-    /// Words of `brick_refs` and `bricks` in use, and the bricks drawn.
-    refs: usize,
-    words: usize,
-    bricks: usize,
 }
 
 /// The test Planet, streamed in stepped.
@@ -604,12 +691,8 @@ impl Streamer {
             key(point(3.0 * SEGMENT_METRES)),
         ])
         .radial();
-        let (refs, words) = scene.used_words().expect("a scene of rings");
         let start = Start {
             streamed: store.streamed_len(),
-            refs,
-            words,
-            bricks: (0..LEVELS).map(|level| scene.level_bricks(level)).sum(),
         };
         let source = store.source().expect("the store has a source");
         let (client, server) = loopback();
@@ -642,6 +725,7 @@ impl Streamer {
         sink: &mut dyn Sink,
     ) -> Result<FrameCounts, Box<dyn Error>> {
         let update = self.world.recentre(camera.position)?;
+        let waited = self.world.take_outbox_wait();
         self.world.advance(FRAME);
         let stats = self.world.stats();
         let store = self.world.store();
@@ -668,6 +752,7 @@ impl Streamer {
             waiting: stats.waiting,
             generated: stats.loader.generated,
             diverged: store.diverged_len(),
+            outbox_wait_frames: (waited.as_nanos() / FRAME.as_nanos()) as u64,
         };
         drop(store);
         self.counts.add(&counts);
@@ -712,7 +797,7 @@ impl Streamer {
         self.world.set_budget(budget);
 
         let mut edited = None;
-        let mut latency = 0;
+        let mut latency = None;
         for frame in 0..PATH_FRAMES {
             // The camera stands for the first frames of the path, exactly where it was, and walks
             // for the rest.
@@ -724,19 +809,26 @@ impl Streamer {
                     Phase::Moving,
                 )
             };
+            self.step(phase, &camera, sink)?;
+            // The frame this one was (`step` counted it): the one that took the Edit in, if it did.
+            if let Some(since) = edited
+                && latency.is_none()
+                && self.world.edit_taken()
+            {
+                latency = Some(self.frame - 1 - since);
+            }
+            // The Edit is made after the frame's look at the scene, not before it: the real scene
+            // thread has only just begun on it at that look (ADR 0006), and a stepped one does a
+            // whole round in it, so an Edit made before the look would be taken by it, in the same
+            // frame (that is 0, and says nothing of the bound). After the look, it is taken by the
+            // next frame's, which is what the thread's time between the two is for.
             if frame == EDIT_FRAME {
                 let aim = within_reach(&self.world, &self.reach);
                 self.world.edit(&aim, &crate::tool::Tool::default())?;
-                edited = Some(self.frame);
-            }
-            self.step(phase, &camera, sink)?;
-            if let Some(since) = edited
-                && latency == 0
-                && !self.world.edit_pending()
-            {
-                latency = self.frame - since;
+                edited = Some(self.frame - 1);
             }
         }
+        let latency = latency.ok_or("the Edit was not taken in by the end of the path")?;
         // The scene thread's last word on what it did.
         self.world.advance(Duration::from_secs(1));
         let last = self.path.camera_at(WALK_FRAMES - 1, WALK_FRAMES);
@@ -749,27 +841,9 @@ impl Streamer {
         let (store_at_end, diverged) = (store.streamed_len(), store.diverged_len());
         drop(store);
         let mut counts = self.counts;
-        let mut hash = counts.hash.take().expect("there were frames");
-        for n in end.iter().chain(&when_complete) {
-            hash.word(*n as u64);
-        }
-        for word in [
-            done.follow_steps,
-            done.follow_bricks,
-            done.pack_steps,
-            done.pack_bricks,
-            done.arrived_bricks,
-            done.evict_steps,
-            done.evicted_units,
-            done.evicted_bricks,
-            store_at_end as u64,
-            diverged as u64,
-            u64::from(latency),
-        ] {
-            hash.word(word);
-        }
+        let frames_hash = counts.hash.take().expect("there were frames");
         let first_drawn = counts.first_drawn.unwrap_or([0; LEVELS]);
-        Ok(StreamReport {
+        let mut report = StreamReport {
             deterministic: true,
             planet: format!("world-map-{MAP_SIZE}"),
             d0: D0,
@@ -779,7 +853,7 @@ impl Streamer {
                 moving_frames: counts.soft.moving.bricks.frames as u32,
                 edit_frame: EDIT_FRAME,
             },
-            counts_hash: format!("{:016x}", hash.0),
+            counts_hash: String::new(),
             upload: counts.upload.clone(),
             soft_misses: counts.soft.clone(),
             rings: (0..LEVELS)
@@ -811,41 +885,52 @@ impl Streamer {
                 store_at_end,
                 budget: budget.bricks,
                 edit_latency_frames: latency,
+                outbox_latency_frames: counts.outbox.clone(),
             },
             holes: counts.holes.clone(),
             sizing: Sizing::check(measured, &Constants::of_the_client()),
             timing: None,
-        })
+        };
+        report.counts_hash = counts_hash(frames_hash, &report);
+        Ok(report)
     }
 
     /// The sizes that the constants are for, as the resident set is complete. The constants are
-    /// per `d0` squared, so what does not scale with it is left out (see [`Start`]): the Guard's
-    /// levels (from `GUARD_FIRST`) and the store as it was at the spawn. The words of the Guard's
-    /// bricks that are drawn are taken to be what the Guard's bricks weighed at the spawn, a brick
-    /// each on average. The constants have the Guard in, which is 5% of the bricks drawn at full
-    /// size and 30% here, so the check is a little easy on them, and not harder than the Planet
-    /// the constants were measured on.
+    /// per `d0` squared, so what does not scale with it is left out: the Guard's levels (from
+    /// `GUARD_FIRST`, which hold what they hold whatever `d0` is), whose bricks and words are
+    /// counted exactly and apart; and the store as it was at the spawn (see [`Start`]).
+    ///
+    /// The constants were measured with the Guard's bricks in (178 000 of the 3.44 million at full
+    /// size), so each of the Ring values is held to a constant that has the Guard in: the check is
+    /// lenient by what the Guard changes the constant by, which `words_per_guard_brick` and the
+    /// docs of the constants put in numbers.
     fn measure(&self, streamed: usize) -> Measured {
         let d0_squared = D0 * D0;
         let stats = self.world.stats();
         let (ring, guard) = stats.level_bricks.split_at(GUARD_FIRST);
-        let (ring, guard) = (
-            ring.iter().sum::<usize>() as f64,
-            guard.iter().sum::<usize>() as f64,
-        );
-        let used = |name: &str| {
-            self.world
-                .table_sizes()
+        let (ring, guard) = (ring.iter().sum::<usize>(), guard.iter().sum::<usize>());
+        let (ring_words, guard_words) = stats.slow.words_by_level.split_at(GUARD_FIRST);
+        let sum = |levels: &[(usize, usize)]| {
+            levels
                 .iter()
-                .find(|t| t.name == name)
-                .map_or(0.0, |t| t.len as f64)
+                .fold((0, 0), |(a, b), &(refs, words)| (a + refs, b + words))
         };
-        let per_guard_brick = |words: usize| words as f64 / self.start.bricks as f64;
-        let of_ring = |words: f64, at_start: usize| words - per_guard_brick(at_start) * guard;
+        let ((ring_refs, ring_bricks_words), (guard_refs, guard_bricks_words)) =
+            (sum(ring_words), sum(guard_words));
+        let per = |words: usize, bricks: usize| words as f64 / bricks.max(1) as f64;
         Measured {
-            bricks_per_d0_squared: ring / d0_squared,
-            refs_per_brick: of_ring(used("scene brick_refs words"), self.start.refs) / ring,
-            words_per_brick: of_ring(used("scene bricks words"), self.start.words) / ring,
+            ring_bricks: ring as u64,
+            guard_bricks: guard as u64,
+            ring_refs_words: ring_refs as u64,
+            ring_bricks_words: ring_bricks_words as u64,
+            guard_refs_words: guard_refs as u64,
+            guard_bricks_words: guard_bricks_words as u64,
+            streamed: streamed as u64,
+            streamed_at_start: self.start.streamed as u64,
+            bricks_per_d0_squared: ring as f64 / d0_squared,
+            refs_per_brick: per(ring_refs, ring),
+            words_per_brick: per(ring_bricks_words, ring),
+            words_per_guard_brick: per(guard_bricks_words, guard),
             streamed_per_d0_squared: (streamed - self.start.streamed) as f64 / d0_squared,
         }
     }
@@ -937,6 +1022,7 @@ mod tests {
             waiting: 0,
             generated: 0,
             diverged: 0,
+            outbox_wait_frames: 0,
         };
         tally.add(&FrameCounts {
             holes: 0,
@@ -982,7 +1068,7 @@ mod tests {
             ("REFS_PER_BRICK", |c, v| c.refs_per_brick = v),
             ("WORDS_PER_BRICK", |c, v| c.words_per_brick = v),
             ("STREAMED_PER_D0_SQUARED", |c, v| {
-                c.streamed_per_d0_squared = v
+                c.streamed_per_d0_squared = v + c.streamed_spawn_ring_per_d0_squared
             }),
         ];
         for (name, lower) in lowered {
@@ -1000,5 +1086,96 @@ mod tests {
             assert_eq!(sizing.over(), vec![name]);
         }
         assert!(Sizing::check(measured, &real).over().is_empty());
+    }
+
+    /// The JSON pointers of every integer in `value`.
+    fn integers(value: &serde_json::Value, at: String, into: &mut Vec<String>) {
+        use serde_json::Value;
+        match value {
+            Value::Number(n) if n.is_u64() || n.is_i64() => into.push(at),
+            Value::Array(items) => {
+                for (i, item) in items.iter().enumerate() {
+                    integers(item, format!("{at}/{i}"), into);
+                }
+            }
+            Value::Object(fields) => {
+                for (name, field) in fields {
+                    integers(field, format!("{at}/{name}"), into);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Whether changing any one integer of `value` changes its hash.
+    fn every_integer_is_hashed(value: &serde_json::Value) -> usize {
+        let hash = |value: &serde_json::Value| {
+            let mut hash = Fnv::new();
+            hash_json(&mut hash, value);
+            hash.0
+        };
+        let base = hash(value);
+        let mut pointers = Vec::new();
+        integers(value, String::new(), &mut pointers);
+        for pointer in &pointers {
+            let mut changed = value.clone();
+            let n = changed.pointer_mut(pointer).unwrap();
+            *n = serde_json::json!(n.as_u64().unwrap() + 1);
+            assert_ne!(hash(&changed), base, "{pointer} is not in the hash");
+        }
+        pointers.len()
+    }
+
+    #[test]
+    fn every_integer_of_the_report_and_of_a_frame_is_in_the_hash() {
+        // The report is hashed as it is serialized: a field added to it is in the hash with no list
+        // to keep. This is the test that would show the hash leaving something out.
+        let value = serde_json::to_value(report()).unwrap();
+        assert!(every_integer_is_hashed(&value) > 100);
+        let frame = FrameCounts {
+            phase: Phase::Steady,
+            upload_bytes: 1,
+            patch_bytes: 2,
+            rebuilt: false,
+            updated: true,
+            soft_misses: [3; LEVELS],
+            holes: 4,
+            streamed: 5,
+            drawn: 6,
+            waiting: 7,
+            generated: 8,
+            diverged: 9,
+            outbox_wait_frames: 10,
+        };
+        assert!(every_integer_is_hashed(&serde_json::to_value(frame).unwrap()) > LEVELS);
+    }
+
+    #[test]
+    fn the_hash_leaves_out_floats_and_the_timing_and_nothing_else() {
+        let mut changed = report().clone();
+        changed.d0 += 1.0;
+        changed.sizing.measured.words_per_brick += 1.0;
+        assert_eq!(
+            counts_hash(Fnv::new(), &changed),
+            counts_hash(Fnv::new(), report())
+        );
+        changed.upload.rebuilds += 1;
+        assert_ne!(
+            counts_hash(Fnv::new(), &changed),
+            counts_hash(Fnv::new(), report())
+        );
+    }
+
+    #[test]
+    fn an_edit_made_in_a_frame_is_taken_in_the_next_and_the_guard_is_counted_exactly() {
+        let report = report();
+        // ADR 0006: an Edit made in frame N is taken in frame N+1.
+        assert_eq!(report.residency.edit_latency_frames, 1);
+        // Results published in a frame are taken in it, until #145's cap on uploads.
+        assert_eq!(report.residency.outbox_latency_frames.total, 0);
+        // Words are counted by level, not guessed: the Rings' and the Guard's add up to those in use.
+        let m = &report.sizing.measured;
+        assert!(m.ring_bricks > 0 && m.guard_bricks > 0);
+        assert!(m.guard_bricks_words > 0 && m.ring_bricks_words > 0);
     }
 }
