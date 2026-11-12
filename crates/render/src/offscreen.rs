@@ -90,13 +90,14 @@ pub struct GpuInfo {
 /// frame's time went.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct UpdateTimes {
-    /// Queuing the writes to the scene's buffers (`Queue::write_buffer`: a copy into a staging
-    /// buffer each), or for a rebuild making the new buffers and filling them.
+    /// Queuing the writes to the scene's buffers (a copy into a staging belt's chunk each, recorded
+    /// in an encoder), the new buffers of one that grew and the copies into them (`grow` in the
+    /// bench's report), or for a rebuild making the new buffers and filling them.
     pub write: std::time::Duration,
     /// Sending them: the submit with no commands that follows (not made if flushing is off).
     pub flush: std::time::Duration,
-    /// Calls of `write_buffer`: each is a copy on the GPU with a barrier of its own. 0 for a
-    /// rebuild.
+    /// Copies written to the staging belt: each is a copy on the GPU with a barrier of its own. 0
+    /// for a rebuild.
     pub writes: u32,
 }
 
@@ -258,6 +259,36 @@ impl Offscreen {
     /// (the host wrote none of them; they are not in [`Offscreen::uploaded_bytes`]).
     pub fn last_grown_bytes(&self) -> u64 {
         self.tracer.last_grown_bytes()
+    }
+
+    /// Copies that the last [`Offscreen::update_scene`] wrote into the scene's buffers, counted as
+    /// they were made (see [`Offscreen::uploaded_bytes`]); 0 for a rebuild.
+    pub fn last_writes(&self) -> u32 {
+        self.tracer.last_writes()
+    }
+
+    /// How long the last [`Offscreen::update_scene`] took, on the host, to make the buffers that
+    /// grew and record the copies into them. Zero if none grew.
+    pub fn last_grow_time(&self) -> std::time::Duration {
+        self.tracer.last_grow_time()
+    }
+
+    /// How many times each of the scene's four buffers has been replaced by a bigger one (see
+    /// [`Tracer::buffer_generations`]).
+    pub fn buffer_generations(&self) -> [u32; 4] {
+        self.tracer.buffer_generations()
+    }
+
+    /// The most bytes of GPU memory the scene's buffers have taken at once, the old and the new
+    /// buffer of one that grew both counted ([`Tracer::peak_scene_bytes`]).
+    pub fn peak_scene_bytes(&self) -> u64 {
+        self.tracer.peak_scene_bytes()
+    }
+
+    /// The most words a buffer of the scene may have on this device (see
+    /// [`Scene::set_buffer_limit`]).
+    pub fn buffer_limit_words(&self) -> usize {
+        (self.device.limits().max_storage_buffer_binding_size / 4) as usize
     }
 
     /// The GPU that this renders on.

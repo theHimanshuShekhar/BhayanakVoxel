@@ -713,6 +713,9 @@ impl App {
                 ));
                 let mut world = World::new(loaded.scene, Predictor::new(loaded.store), client_end)
                     .with_loader(loaded.loader);
+                if let Some(renderer) = &self.renderer {
+                    world.set_buffer_limit(renderer.buffer_limit_words());
+                }
                 world.spawn(spawn_point)?;
                 self.spawn = Some(loaded.ground);
                 self.world = Some(world);

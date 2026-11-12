@@ -233,6 +233,18 @@ impl Renderer {
         self.tracer.uploaded_bytes()
     }
 
+    /// The most words a buffer of the scene may have on this device (see
+    /// [`Scene::set_buffer_limit`](crate::Scene::set_buffer_limit)).
+    pub fn buffer_limit_words(&self) -> usize {
+        (self.device.limits().max_storage_buffer_binding_size / 4) as usize
+    }
+
+    /// The most bytes of GPU memory the scene's buffers have taken at once, the old buffer and the
+    /// new one of a buffer that grew both counted.
+    pub fn peak_scene_bytes(&self) -> u64 {
+        self.tracer.peak_scene_bytes()
+    }
+
     /// How frames are presented, which says whether acquiring one waits for vertical sync.
     pub fn present_mode(&self) -> wgpu::PresentMode {
         self.config.present_mode

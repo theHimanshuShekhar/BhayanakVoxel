@@ -80,14 +80,38 @@ impl Default for Room {
     }
 }
 
-/// The rings do not fit in their buffers: the Planet is denser than they were sized for, or the
-/// words that are free are in pieces too small for a region.
+/// The rings do not fit in their buffers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct RingsFull;
+pub enum RingsFull {
+    /// The Planet is denser than the buffers were sized for, or the words that are free are in
+    /// pieces too small for a region, and the scene was given its room (a scene sized by its bricks
+    /// grows the buffer that is full instead).
+    Room,
+    /// A buffer would have to be longer than the device allows one to be
+    /// ([`Scene::set_buffer_limit`]), even with the growth cut down to what is needed.
+    BufferLimit {
+        part: Part,
+        /// The length, in words, that the buffer needs.
+        needed: usize,
+        /// The most words a buffer may have.
+        limit: usize,
+    },
+}
 
 impl fmt::Display for RingsFull {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "the rings do not fit in their buffers")
+        match self {
+            Self::Room => write!(f, "the rings do not fit in their buffers"),
+            Self::BufferLimit {
+                part,
+                needed,
+                limit,
+            } => write!(
+                f,
+                "the rings need {needed} words in the {part:?} buffer, more than the device's \
+                 limit of {limit} words a buffer"
+            ),
+        }
     }
 }
 
@@ -284,6 +308,8 @@ pub(super) struct Rings {
     rebuilt: Option<Rebuild>,
     /// The lengths of the buffers that the last patch said (see [`RingPatch::sizes`]).
     reported: Lengths,
+    /// The most words a buffer may have (see [`Scene::set_buffer_limit`]).
+    limit_words: usize,
 }
 
 /// The room [`Scene::reserve`] was asked to make in the selection, and the bands' `d0` it was for.
@@ -318,7 +344,7 @@ struct Patch {
 }
 
 /// The lengths of the four buffers of a scene of rings, in words. Each grows on its own, when it
-/// is the one that ran out of room (see [`Scene::grow_words`] and `grow_level`).
+/// is the one that ran out of room (see [`Scene::take_words`] and `grow_level`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Lengths {
     pub table: usize,
@@ -390,7 +416,10 @@ impl UploadCost {
 /// Words that a gap between two words written may have, for one copy to write them both: the
 /// words in the gap are written again as they are. A copy costs a barrier and a command, a
 /// thousand words 4 KB at several GB/s, so it is cheaper to write a few thousand words twice
-/// than to make another copy. Measured on the stepped streaming bench (docs/measurements.md).
+/// than to make another copy. A first value, set from that arithmetic and not from a measurement:
+/// the bench was not run with other values, so there is no figure of what joining saves or costs
+/// (docs/measurements.md has only the copies per frame that it gives, 43 at the most on the
+/// test Planet's walk).
 pub const COPY_GAP: usize = 1024;
 
 /// The ranges of `ranges` (ascending) with those that are `gap` words apart or less made one.
@@ -549,8 +578,11 @@ const GROW_LEAST: usize = 1 << 18;
 /// How many words to add to a buffer of `len` words that has no `needed` words in a row: a
 /// quarter of it, and at least [`GROW_LEAST`], so that a buffer that is filling grows a few times
 /// and not at every region, each time by what the allocation and the copy on the GPU are worth.
-fn grow_by(len: usize, needed: usize) -> usize {
-    needed.max(len / 4).max(GROW_LEAST)
+/// The buffer may not be longer than `limit`: the slack is cut down to what the limit leaves, and
+/// to nothing, if `needed` is all that it leaves or more. `None` if `needed` does not fit.
+fn grow_by(len: usize, needed: usize, limit: usize) -> Option<usize> {
+    let room = limit.saturating_sub(len);
+    (needed <= room).then(|| needed.max(len / 4).max(GROW_LEAST).min(room))
 }
 
 /// Regions of bricks read on the threads before they are packed.
@@ -752,6 +784,7 @@ impl Scene {
                 reserved: None,
                 rebuilt: None,
                 reported: Lengths::default(),
+                limit_words: usize::MAX,
             }),
             ..Scene::default()
         }
@@ -787,6 +820,7 @@ impl Scene {
         let bound = self.bound.is_some().then_some(rings.ball);
         let mut scene = Scene::pack_rings(store, rings.selection.clone(), rings.ball, sizing)?;
         scene.bound = bound;
+        scene.set_buffer_limit(rings.limit_words);
         Ok(scene)
     }
 
@@ -878,8 +912,13 @@ impl Scene {
     /// Writes `copy` into this scene, a [`Scene::mirror`] of the scene of rings that made it (or
     /// one that was brought up to date with every copy before it): what is written is what the
     /// scene of rings had written, and the header is as it was.
-    pub fn paste(&mut self, copy: &PatchCopy) {
+    ///
+    /// Returns the time it took to make the buffers that grew longer, which is what this copy
+    /// costs a growth beyond what writing the words costs: the new words are written as zero, and
+    /// that is a few milliseconds for each 100 MB.
+    pub fn paste(&mut self, copy: &PatchCopy) -> std::time::Duration {
         let patch = &copy.patch;
+        let lengthened = std::time::Instant::now();
         // A buffer that grew is longer before anything is written to it.
         if let Some(sizes) = patch.sizes {
             for (buffer, len) in [
@@ -893,6 +932,7 @@ impl Scene {
                 }
             }
         }
+        let lengthened = lengthened.elapsed();
         for (&i, words) in patch.regions.iter().zip(copy.regions.chunks(REGION_WORDS)) {
             self.regions[i * REGION_WORDS..][..REGION_WORDS].copy_from_slice(words);
         }
@@ -912,6 +952,17 @@ impl Scene {
         self.levels.clone_from(&copy.levels);
         self.bound = copy.bound;
         self.shown_coarsest = copy.coarsest;
+        lengthened
+    }
+
+    /// Sets the most words that a buffer of this scene of rings may have: the device's limit on a
+    /// storage buffer. A buffer that is full grows by no more than that leaves (and by less than
+    /// its slack, if need be), and a scene that needs more is [`RingsFull::BufferLimit`], not a
+    /// buffer that the GPU cannot make. A scene made again from this one has it too.
+    pub fn set_buffer_limit(&mut self, words: usize) {
+        if let Some(rings) = &mut self.rings {
+            rings.limit_words = words;
+        }
     }
 
     /// Whether this is a scene of rings (see [`Scene::rings`]).
@@ -1538,7 +1589,7 @@ impl Scene {
                 }
                 let rings = self.rings.as_mut().expect("a scene of rings");
                 rings.listed[level] += 1;
-                rings.free.pop().ok_or(RingsFull)?
+                rings.free.pop().ok_or(RingsFull::Room)?
             }
         };
         let first = bricks[0].1;
@@ -1621,13 +1672,18 @@ impl Scene {
             Some(at) => at,
             None if matches!(rings.sizing, Sizing::Fitted(..)) => {
                 let old = buffer.len();
-                let by = grow_by(old, len);
+                // The words free at the end of the buffer count towards the `len` in a row.
+                let by = grow_by(old, len, rings.limit_words).ok_or(RingsFull::BufferLimit {
+                    part,
+                    needed: old + len,
+                    limit: rings.limit_words,
+                })?;
                 buffer.resize(old + by, 0);
                 // The words it adds join the free ones at its end, so that there are `len` in a row.
                 pool.give(old, by);
                 pool.take(len).expect("the words just added")
             }
-            None => return Err(RingsFull),
+            None => return Err(RingsFull::Room),
         };
         // A scene that is being packed from nothing takes words as if there were no end.
         if buffer.len() < at + len {
@@ -1643,13 +1699,37 @@ impl Scene {
     fn grow_level(&mut self, level: usize) -> Result<(), RingsFull> {
         let rings = self.rings.as_mut().expect("a scene of rings");
         if !matches!(rings.sizing, Sizing::Fitted(..)) {
-            return Err(RingsFull);
+            return Err(RingsFull::Room);
         }
         let capacity = rings.capacity[level];
-        let target = (capacity + capacity / 4 + 64).max(rings.listed[level] + 1);
-        let slots = (target * 2).next_power_of_two();
-        // The part is a power of two of slots, half full at most: all of that is room.
-        let new_capacity = slots / 2;
+        // At least one record more than it has, and room for one more region listed.
+        let least = (rings.listed[level] + 1).max(capacity + 1);
+        let (table_len, regions_len) = (self.table.len(), self.regions.len());
+        let limit = rings.limit_words;
+        // Room for the slack, and, if the limit does not leave that, for no more than is needed.
+        let sized = |target: usize| {
+            let slots = (target * 2).next_power_of_two();
+            // The part is a power of two of slots, half full at most: all of that is room.
+            let new_capacity = slots / 2;
+            let moves = slots as u32 - 1 != self.levels[level].table_mask;
+            let table = table_len + if moves { slots * 4 } else { 0 };
+            let regions = regions_len + (new_capacity - capacity) * REGION_WORDS;
+            (slots, new_capacity, table, regions)
+        };
+        let mut chosen = sized((capacity + capacity / 4 + 64).max(least));
+        if chosen.2 > limit || chosen.3 > limit {
+            chosen = sized(least);
+        }
+        let (slots, new_capacity, table, regions) = chosen;
+        for (part, needed) in [(Part::Table, table), (Part::Regions, regions)] {
+            if needed > limit {
+                return Err(RingsFull::BufferLimit {
+                    part,
+                    needed,
+                    limit,
+                });
+            }
+        }
         let first_new = self.regions.len() / REGION_WORDS;
         let extra = new_capacity - capacity;
         self.regions
@@ -1685,6 +1765,18 @@ impl Scene {
             patch.levels = true;
         }
         Ok(())
+    }
+
+    /// Makes room for more regions in `level`, as a level that lists more than its table has room
+    /// for does, until the table has moved, and returns the update that says so. For a test of
+    /// what the GPU does with a table that grew, which a scene seldom needs to.
+    #[doc(hidden)]
+    pub fn grow_table_of(&mut self, level: usize) -> Result<SceneUpdate, RingsFull> {
+        let slots = self.levels[level].table_mask;
+        while self.levels[level].table_mask == slots {
+            self.grow_level(level)?;
+        }
+        Ok(SceneUpdate::Rings(self.take_patch()))
     }
 
     /// Gives back the words of `bricks` that the brick with `entry` has.
@@ -2363,7 +2455,62 @@ mod tests {
     fn a_scene_that_was_given_its_room_does_not_grow_a_table() {
         let mut scene =
             Scene::rings_in(ground(), ABOVE, bands(), bound(), Room::default()).unwrap();
-        assert_eq!(scene.grow_level(1), Err(RingsFull));
+        assert_eq!(scene.grow_level(1), Err(RingsFull::Room));
+    }
+
+    #[test]
+    fn a_growth_is_cut_to_the_devices_limit_when_what_is_needed_fits_and_is_a_named_error_when_not()
+    {
+        let mut scene = rings_at(ABOVE);
+        let spare: usize = scene
+            .rings
+            .as_ref()
+            .unwrap()
+            .data
+            .free()
+            .map(|r| r.len())
+            .sum();
+        // Take the spare words, so that the next that are asked for make the buffer grow.
+        assert!(scene.rings.as_mut().unwrap().data.take(spare).is_some());
+        let len = scene.bricks.len();
+        // A limit that leaves less than the least a buffer grows by (and than a quarter of it).
+        let limit = len + 1000;
+        const { assert!(1000 < GROW_LEAST) };
+        scene.set_buffer_limit(limit);
+        // What is needed fits, so the buffer grows, by what the limit leaves and no more.
+        scene.take_words(Part::Bricks, 500).unwrap();
+        assert_eq!(scene.bricks.len(), limit);
+        assert_eq!(patch_sizes_of(&mut scene).bricks, limit);
+        // What is needed does not: a named error, and the buffer is as it was.
+        assert_eq!(
+            scene.take_words(Part::Bricks, 2000),
+            Err(RingsFull::BufferLimit {
+                part: Part::Bricks,
+                needed: limit + 2000,
+                limit
+            })
+        );
+        assert_eq!(scene.bricks.len(), limit);
+        // A table that would have to be longer than the limit is the same error.
+        scene.set_buffer_limit(scene.table.len());
+        assert!(matches!(
+            scene.grow_level(2),
+            Err(RingsFull::BufferLimit { .. })
+        ));
+        assert!(
+            RingsFull::BufferLimit {
+                part: Part::Table,
+                needed: 2,
+                limit: 1
+            }
+            .to_string()
+            .contains("limit")
+        );
+    }
+
+    /// The lengths that the scene's next patch says, if it says any.
+    fn patch_sizes_of(scene: &mut Scene) -> Lengths {
+        scene.take_patch().sizes.expect("a buffer grew")
     }
 
     #[test]

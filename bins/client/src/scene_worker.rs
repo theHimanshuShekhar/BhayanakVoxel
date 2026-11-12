@@ -36,7 +36,7 @@
 //! changes the Voxels (other players' Edits) is still waited for: [`SceneWorker::edit`].
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, TryLockError};
 use std::thread::JoinHandle;
@@ -64,11 +64,20 @@ const SLICE: Duration = Duration::from_millis(2);
 /// the frames after, in the order the camera and the loader asked, which no frame draws a brick
 /// out of: every patch is whole, and the words of a brick are in the patch that lists it.
 ///
-/// It is a limit on what is added, checked between operations: one batch of arrivals
-/// ([`BATCH`] bricks' children at the most) or one follow step can take it over, by what that
-/// costs, and an Edit is packed whatever the backlog is (it is never behind streamed bricks: it
-/// goes into the same patch, ahead of what is not yet packed). A jump or other bands pack the
-/// whole scene and are not limited either (`Rebuilt`).
+/// It is a limit on what is added, checked between operations, and it is **reached** when the
+/// cost is at least the budget in bytes or in copies (`>=`): work is held back from then on. One
+/// batch of arrivals ([`BATCH`] bricks' children at the most) or one follow step can take it
+/// over, by what that costs. Two rules keep arrivals from starving behind the follow steps, which
+/// are checked first in a round (#145): the first batch of arrivals of a round is taken even over
+/// the budget, if the outbox is empty (so that a frame always carries some of the loader's work
+/// while the camera moves), and a further batch is taken only if the largest batch so far would
+/// still be under the budget after it (so that the batch that is taken does not take a frame over
+/// the budget by itself). An Edit is packed whatever the backlog is (it is never behind streamed
+/// bricks: it goes into the same patch, ahead of what is not yet packed). A jump or other bands
+/// pack the whole scene and are not limited either (`Rebuilt`), and nor is the copy of a growth.
+/// So a frame takes up to the budget, plus the one operation that crossed it, plus the words
+/// between joined ranges; whether that is "bounded by the budget" is the project owner's call
+/// (`docs/agents/benchmarking.md`).
 ///
 /// **How the value was chosen:** a first value, not one tuned on the 4090. 8 MiB is about a
 /// millisecond or two of copying at a few GB/s (arithmetic, not a measurement), well under a
@@ -263,9 +272,13 @@ pub struct Stats {
     /// Where the scene had been moved to.
     #[cfg(test)]
     pub camera: Option<[f64; 3]>,
-    /// The most that one operation (a follow step, a batch of arrivals, an Edit) added to what the
-    /// frame thread uploads: the most bytes, and the most copies, of any one, which is by how much
-    /// a frame's upload can pass the budget.
+    /// What the operations of the publish added that were not inside the budget: those (a follow
+    /// step, a batch of arrivals, an Edit) that began when what waits had reached the budget (the
+    /// batch of arrivals that a round is always given), and the one that took it there. A publish's
+    /// upload is at most the budget and this, and the words that joining copies puts between them.
+    #[cfg(test)]
+    pub excess_ops: UploadCost,
+    /// The most that one operation added, in bytes and in copies, since the start.
     #[cfg(test)]
     pub largest_op: UploadCost,
 }
@@ -401,6 +414,8 @@ fn stats_of(scene: &Scene, loader: &Loader, slow: &Arc<Slow>, eviction: Eviction
         #[cfg(test)]
         camera: scene.camera(),
         #[cfg(test)]
+        excess_ops: UploadCost::default(),
+        #[cfg(test)]
         largest_op: UploadCost::default(),
     }
 }
@@ -493,7 +508,7 @@ struct Outbox {
     /// Jobs finished, and published: the number of the last.
     done: u64,
     /// The scene ran out of room and is not to be used again.
-    failed: bool,
+    failed: Option<RingsFull>,
     /// The thread panicked: the frame thread panics too, rather than wait for it.
     died: bool,
 }
@@ -525,6 +540,8 @@ struct Shared {
     /// The upload budget (see [`UPLOAD_BUDGET`]): bytes, and copies.
     budget_bytes: AtomicU64,
     budget_writes: AtomicU32,
+    /// The most words a buffer of the scene may have (see [`SceneWorker::set_buffer_limit`]).
+    buffer_limit: AtomicUsize,
 }
 
 /// What the frame thread has no more use for, which it hands back for the scene thread to use
@@ -623,7 +640,7 @@ impl SceneWorker {
             outbox: Mutex::new(Outbox {
                 ready: Ready::default(),
                 done: 0,
-                failed: false,
+                failed: None,
                 died: false,
             }),
             finished: Condvar::new(),
@@ -636,6 +653,7 @@ impl SceneWorker {
             spent: std::array::from_fn(|_| AtomicU64::new(0)),
             budget_bytes: AtomicU64::new(UPLOAD_BUDGET.bytes),
             budget_writes: AtomicU32::new(UPLOAD_BUDGET.writes),
+            buffer_limit: AtomicUsize::new(usize::MAX),
         });
         let (garbage, graveyard) = mpsc::channel();
         let user_bands = scene.bands();
@@ -678,9 +696,12 @@ impl SceneWorker {
             idle: false,
             throttled: false,
             pending: UploadCost::default(),
+            batch_cost: UploadCost::default(),
             clock,
             #[cfg(test)]
             coarse_sleep: Duration::ZERO,
+            #[cfg(test)]
+            excess_ops: UploadCost::default(),
             #[cfg(test)]
             largest_op: UploadCost::default(),
         };
@@ -692,6 +713,14 @@ impl SceneWorker {
             busy_until: Mutex::new(None),
         };
         (engine, worker, mirror, stats)
+    }
+
+    /// Tells the thread the most words that a buffer of the scene may have, which is what the
+    /// device allows a storage buffer to be: a buffer that is full grows by no more than that
+    /// leaves, and a scene that needs more stops with [`RingsFull::BufferLimit`]. The thread has
+    /// it from its next round.
+    pub fn set_buffer_limit(&self, words: usize) {
+        self.shared.buffer_limit.store(words, Ordering::Relaxed);
     }
 
     /// Changes the upload budget (see [`UPLOAD_BUDGET`]), for a test or the bench to see what a
@@ -923,7 +952,7 @@ impl SceneWorker {
             for _ in 0..MOST_STEPS_FOR_A_JOB {
                 {
                     let outbox = lock(&self.shared.outbox);
-                    if outbox.done >= ticket || outbox.failed {
+                    if outbox.done >= ticket || outbox.failed.is_some() {
                         break;
                     }
                 }
@@ -943,18 +972,17 @@ impl SceneWorker {
             }
             let outbox = lock(&self.shared.outbox);
             assert!(
-                outbox.done >= ticket || outbox.failed,
+                outbox.done >= ticket || outbox.failed.is_some(),
                 "the job was never done"
             );
-            return if outbox.failed {
-                Err(RingsFull)
-            } else {
-                Ok(true)
+            return match outbox.failed {
+                Some(full) => Err(full),
+                None => Ok(true),
             };
         }
         let until = timeout.map(|t| Instant::now() + t);
         let mut outbox = lock(&self.shared.outbox);
-        while outbox.done < ticket && !outbox.failed && !outbox.died {
+        while outbox.done < ticket && outbox.failed.is_none() && !outbox.died {
             outbox = match until {
                 None => self
                     .shared
@@ -975,8 +1003,8 @@ impl SceneWorker {
             };
         }
         assert!(!outbox.died, "the scene thread panicked");
-        if outbox.failed {
-            return Err(RingsFull);
+        if let Some(full) = outbox.failed {
+            return Err(full);
         }
         Ok(true)
     }
@@ -997,8 +1025,8 @@ impl SceneWorker {
             }
         };
         assert!(!outbox.died, "the scene thread panicked");
-        if outbox.failed {
-            return Err(RingsFull);
+        if let Some(full) = outbox.failed {
+            return Err(full);
         }
         outbox.ready.done = outbox.done;
         Ok(std::mem::take(&mut outbox.ready))
@@ -1121,10 +1149,16 @@ struct Engine {
     throttled: bool,
     /// What the patch that is in the outbox costs to upload, as of the last publish.
     pending: UploadCost,
+    /// The most that one batch of arrivals has added to what is uploaded: the next batch is not
+    /// begun if it could take what waits over the budget.
+    batch_cost: UploadCost,
     /// The time that holds and slices are measured in: the machine's, or a test's.
     clock: Clock,
     #[cfg(test)]
     coarse_sleep: Duration,
+    /// See [`Stats::excess_ops`].
+    #[cfg(test)]
+    excess_ops: UploadCost,
     /// See [`Stats::largest_op`].
     #[cfg(test)]
     largest_op: UploadCost,
@@ -1285,6 +1319,8 @@ impl Engine {
     fn round(&mut self, camera: [f64; 3], velocity: [f64; 3], jobs: VecDeque<(u64, Job)>) -> bool {
         self.look_ahead(camera, velocity);
         self.paused = self.shared.paused.load(Ordering::Acquire);
+        self.scene
+            .set_buffer_limit(self.shared.buffer_limit.load(Ordering::Relaxed));
         self.throttled = false;
         let mut worked = !jobs.is_empty();
         // A sync is done when the rest of what the thread does in this round is.
@@ -1316,8 +1352,8 @@ impl Engine {
                 }
                 _ => {}
             }
-            if self.run_job(job).is_err() {
-                self.fail();
+            if let Err(full) = self.run_job(job) {
+                self.fail(full);
                 return false;
             }
             self.publish(Some(ticket));
@@ -1342,8 +1378,8 @@ impl Engine {
             });
         match outcome {
             Ok(took) => worked |= took,
-            Err(RingsFull) => {
-                self.fail();
+            Err(full) => {
+                self.fail(full);
                 return false;
             }
         }
@@ -1373,6 +1409,12 @@ impl Engine {
     /// until the frame thread has taken it. A copy of all of the scene that waits is over any
     /// budget.
     fn over_budget(&mut self) -> bool {
+        self.over_budget_with(UploadCost::default())
+    }
+
+    /// [`Engine::over_budget`] with `more` added to what waits: whether one more thing that costs
+    /// that would take it to the budget.
+    fn over_budget_with(&mut self, more: UploadCost) -> bool {
         let waiting = {
             let outbox = lock(&self.shared.outbox);
             if outbox.ready.mirror.is_some() {
@@ -1383,15 +1425,36 @@ impl Engine {
         if !waiting {
             self.pending = UploadCost::default();
         }
-        let packed = match &self.changes {
-            Changes::None => UploadCost::default(),
-            Changes::Patch(patch) => patch.cost(),
-            Changes::Rebuilt => return true,
-        };
-        let all = self.pending.plus(packed);
-        let budget = &self.shared;
-        all.bytes >= budget.budget_bytes.load(Ordering::Relaxed)
-            || all.writes >= budget.budget_writes.load(Ordering::Relaxed)
+        if matches!(self.changes, Changes::Rebuilt) {
+            return true;
+        }
+        self.reaches_budget(self.waiting_cost().plus(more))
+    }
+
+    /// What waits for the frame thread to upload: what the outbox has, and what has been packed
+    /// since it was published.
+    fn waiting_cost(&self) -> UploadCost {
+        match &self.changes {
+            Changes::None | Changes::Rebuilt => self.pending,
+            Changes::Patch(patch) => self.pending.plus(patch.cost()),
+        }
+    }
+
+    /// Whether `cost` is the budget, or more, in bytes or in copies.
+    fn reaches_budget(&self, cost: UploadCost) -> bool {
+        cost.bytes >= self.shared.budget_bytes.load(Ordering::Relaxed)
+            || cost.writes >= self.shared.budget_writes.load(Ordering::Relaxed)
+    }
+
+    /// Whether the frame thread has taken what the thread published: nothing waits in the outbox.
+    fn outbox_is_empty(&mut self) -> bool {
+        let outbox = lock(&self.shared.outbox);
+        let waits = outbox.ready.mirror.is_some() || outbox.ready.patch.is_some();
+        drop(outbox);
+        if !waits {
+            self.pending = UploadCost::default();
+        }
+        !waits
     }
 
     /// The time a part of a round begins, if the parts are being timed.
@@ -1411,8 +1474,8 @@ impl Engine {
     }
 
     /// The scene ran out of room: the frame thread is told, and waiting jobs end.
-    fn fail(&mut self) {
-        lock(&self.shared.outbox).failed = true;
+    fn fail(&mut self, full: RingsFull) {
+        lock(&self.shared.outbox).failed = Some(full);
         self.shared.finished.notify_all();
     }
 
@@ -1422,9 +1485,15 @@ impl Engine {
             Some(SceneUpdate::Rings(patch)) => {
                 #[cfg(test)]
                 {
-                    let cost = patch.cost();
-                    self.largest_op.bytes = self.largest_op.bytes.max(cost.bytes);
-                    self.largest_op.writes = self.largest_op.writes.max(cost.writes);
+                    // The operation is inside the budget unless what waited already reached it, or
+                    // it takes what waits there.
+                    let op = patch.cost();
+                    self.largest_op.bytes = self.largest_op.bytes.max(op.bytes);
+                    self.largest_op.writes = self.largest_op.writes.max(op.writes);
+                    let before = self.waiting_cost();
+                    if self.reaches_budget(before) || self.reaches_budget(before.plus(op)) {
+                        self.excess_ops = self.excess_ops.plus(op);
+                    }
                 }
                 match &mut self.changes {
                     Changes::None => self.changes = Changes::Patch(patch),
@@ -1564,10 +1633,15 @@ impl Engine {
         }
         let mut worst = Duration::ZERO;
         let mut took = false;
+        // The first batch of a round is taken whatever following the camera has added, if the frame
+        // thread has taken all that was published: it uploads that and the batch. Else a camera that
+        // moves so that following alone comes to the budget every round would be followed and no
+        // arrival would ever be taken in, with the bricks that are asked for waiting behind it.
+        let mut guaranteed = self.outbox_is_empty();
         loop {
             // What the loader made waits in its queue, in the order it made it, while the frame
             // thread has more to upload than the budget.
-            if self.over_budget() {
+            if !std::mem::take(&mut guaranteed) && self.over_budget_with(self.batch_cost) {
                 self.throttled = true;
                 break;
             }
@@ -1609,6 +1683,11 @@ impl Engine {
             let before = self.scene.bricks_changed();
             let update = self.scene.arrive(&store, &resident)?;
             drop(store);
+            if let Some(SceneUpdate::Rings(patch)) = &update {
+                let cost = patch.cost();
+                self.batch_cost.bytes = self.batch_cost.bytes.max(cost.bytes);
+                self.batch_cost.writes = self.batch_cost.writes.max(cost.writes);
+            }
             self.work.pack_steps += 1;
             self.work.pack_bricks += self.scene.bricks_changed() - before;
             self.note(update);
@@ -1758,7 +1837,7 @@ impl Engine {
             }
             // The scene is not to be used again, which the next job finds. It is not selected
             // again every round meanwhile.
-            Err(RingsFull) => {
+            Err(_) => {
                 self.coarsened_at = self.clock.now();
                 false
             }
@@ -2021,6 +2100,7 @@ impl Engine {
         stats.throttled = self.throttled;
         #[cfg(test)]
         {
+            stats.excess_ops = std::mem::take(&mut self.excess_ops);
             stats.largest_op = self.largest_op;
         }
         // The look that a job asked for is done by the scan before this (the holes) and here (the
@@ -2067,7 +2147,7 @@ impl Engine {
             (Changes::Patch(patch), None) => {
                 if let Some(mirror) = outbox.ready.mirror.as_mut() {
                     // A copy of all of the scene is waiting: the changes go into it.
-                    mirror.paste(&self.scene.copy_patch_into(patch, PatchCopy::default()));
+                    let _ = mirror.paste(&self.scene.copy_patch_into(patch, PatchCopy::default()));
                 } else {
                     let (merged, buffers) = match outbox.ready.patch.take() {
                         Some(mut copy) => {

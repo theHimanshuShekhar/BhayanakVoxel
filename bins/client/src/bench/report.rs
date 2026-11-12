@@ -16,7 +16,14 @@ use super::stream::StreamReport;
 /// 11 added the upload budget's figures (#145): a frame's copies, the 99th percentile of its bytes
 /// and copies, the frames the budget cut and the longest backlog, in the stepped streaming mode's
 /// `upload` and in each path of the real-time mode (`upload`).
-pub const SCHEMA_VERSION: u32 = 11;
+/// 12 added what the review of #145 asked to be able to judge: in each real-time path's `upload`
+/// the frames over the plain budget by cause (`over_budget`) and the growths (`growth_frames`,
+/// `grown_bytes`, `lengthen_ms_max`, `grow_ms_max`); in each slow frame the growth's cost
+/// (`lengthen_ms`, `grow_ms`, `grown_bytes`) and `over_budget`; in `memory` the peak during a
+/// growth (`scene_gpu_peak_growth_mib`, `scene_host_peak_growth_mib`); and in the stepped mode's
+/// `timing` the copies the GPU side counted (`gpu_uploaded_writes`) and the growth copies
+/// (`gpu_grown_bytes`). The stepped mode's counts, and so its hash, are not changed by these.
+pub const SCHEMA_VERSION: u32 = 12;
 
 /// One timed thing (a pass, or the GPU total of a profiler frame) in one mode, against its
 /// budget. In reference mode a profiler frame is one sample, so the entries of that mode have
@@ -507,7 +514,7 @@ mod tests {
                 "streaming_real_time"
             ]
         );
-        assert_eq!(json["schema_version"], 11);
+        assert_eq!(json["schema_version"], 12);
         assert_eq!(json["streaming"], serde_json::Value::Null);
         assert_eq!(json["streaming_real_time"], serde_json::Value::Null);
         assert_eq!(

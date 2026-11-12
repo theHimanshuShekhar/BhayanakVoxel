@@ -392,6 +392,7 @@ fn run_streaming(
     eprintln!("streaming: making the test Planet's world (this takes a while)...");
     let streamer = stream::Streamer::new();
     let mut gpu = Offscreen::with_resolution(resolution, streamer.scene())?;
+    streamer.set_buffer_limit(gpu.buffer_limit_words());
     // A frame is drawn every frame in a measurement, and every tenth in a smoke test, where a
     // software driver takes long to draw one.
     let mut sink = stream::GpuSink::new(&mut gpu, if plan.patch { 10 } else { 1 });

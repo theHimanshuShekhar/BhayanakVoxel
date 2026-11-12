@@ -16,7 +16,7 @@ use common::{Lcg, PRIMARY, assert_agree, check_golden, ray};
 use render::lod::Bands;
 use render::reference::{Hit, Ray, trace};
 use render::scene::{Bound, Core};
-use render::{Camera, Image, Offscreen, Scene, SceneUpdate};
+use render::{Camera, Image, Lengths, Offscreen, Scene, SceneUpdate};
 
 const SEED: u64 = 0xB4A7_A9AC;
 /// Levels of the Planet's pyramid: as many as the client draws (0 to 12).
@@ -430,23 +430,47 @@ fn a_flight_from_the_surface_to_orbit_and_back_keeps_the_gpu_memory_bounded() {
     assert!(peak < 512 << 20, "{peak} bytes of GPU memory");
 }
 
-/// A scene sized for orbit that the camera brings to the ground, where the bricks are many times as
-/// many, grows the buffers that fill, each on its own, and is not packed again (A3): what is
-/// copied on the GPU when one grows is less than all of the scene's buffers, and what is drawn is
-/// what the same selection packed from scratch draws.
+/// A scene that outgrows a buffer grows that buffer and no other: after each update, a buffer
+/// that is longer has been replaced by a bigger one (its generation is one more), each of the
+/// others is the buffer it was (the same generation), the bytes copied on the GPU when one grows
+/// are less than all of the scene's buffers, and what is drawn is what the same selection packed
+/// from scratch draws.
 #[test]
 fn a_scene_that_outgrows_a_buffer_grows_it_and_not_the_rest() {
     let (low, high) = ([0.0, 1548.0, 250.0], [0.0, 3600.0, 3000.0]);
     let mut scene = rings_at(high);
     let mut gpu = Offscreen::new(64, 36, &scene).unwrap();
+    let lengths = |scene: &Scene| {
+        let l = Lengths::of(scene);
+        [l.table, l.regions, l.brick_refs, l.bricks]
+    };
     let (mut grown, mut growths, mut rebuilt) = (0, 0, 0);
+    // How many times each of the table, regions, brick refs and bricks grew.
+    let mut kinds = [0u32; 4];
     let steps = 60;
     for step in 0..=steps {
         let t = f64::from(step) / f64::from(steps);
         let at: [f64; 3] = std::array::from_fn(|a| high[a] + (low[a] - high[a]) * t);
+        let (lengths_before, generations_before) = (lengths(&scene), gpu.buffer_generations());
         if let Some(update) = scene.recentre(planet(), at).unwrap() {
             rebuilt += usize::from(update == SceneUpdate::Rebuilt);
             gpu.update_scene(&scene, &update).unwrap();
+            if update != SceneUpdate::Rebuilt {
+                // Each buffer is replaced if it is longer, and is the same buffer if it is not.
+                let (lengths_now, generations_now) = (lengths(&scene), gpu.buffer_generations());
+                for i in 0..4 {
+                    let longer = lengths_now[i] > lengths_before[i];
+                    assert_eq!(
+                        generations_now[i],
+                        generations_before[i] + u32::from(longer),
+                        "step {step}: buffer {i} (table, regions, refs, bricks) was {} words and \
+                         is {}",
+                        lengths_before[i],
+                        lengths_now[i]
+                    );
+                    kinds[i] += u32::from(longer);
+                }
+            }
             if gpu.last_grown_bytes() > 0 {
                 growths += 1;
                 grown += gpu.last_grown_bytes();
@@ -456,6 +480,8 @@ fn a_scene_that_outgrows_a_buffer_grows_it_and_not_the_rest() {
                     gpu.last_grown_bytes(),
                     gpu.scene_bytes()
                 );
+                // The old and the new buffer were both there while the copy was made.
+                assert!(gpu.peak_scene_bytes() > gpu.scene_bytes() - gpu.last_grown_bytes());
             }
         }
         if step % 20 == 0 {
@@ -466,8 +492,37 @@ fn a_scene_that_outgrows_a_buffer_grows_it_and_not_the_rest() {
             assert_eq!(gpu.render(&camera), fresh, "step {step} at {at:?}");
         }
     }
-    eprintln!("{growths} growths copied {grown} bytes, {rebuilt} rebuilds");
+    eprintln!("{growths} growths copied {grown} bytes, {rebuilt} rebuilds, kinds {kinds:?}");
     assert!(growths > 0, "no buffer grew");
+    assert!(kinds[2] + kinds[3] > 0, "neither refs nor bricks grew");
+}
+
+/// A level's table that grows is the one buffer (with `regions`, which gains the records) that is
+/// replaced on the GPU: `brick_refs` and `bricks` are the buffers they were, and what is drawn is
+/// the same.
+#[test]
+fn a_level_whose_table_grows_replaces_that_table_and_the_regions_and_nothing_else() {
+    let at = [0.0, 1548.0, 250.0];
+    let mut scene = rings_at(at);
+    let mut gpu = Offscreen::new(64, 36, &scene).unwrap();
+    let camera = Camera::looking_at(at, [0.0; 3]);
+    let before = gpu.render(&camera);
+    let generations = gpu.buffer_generations();
+    let update = scene.grow_table_of(2).unwrap();
+    gpu.update_scene(&scene, &update).unwrap();
+    // [table, regions, brick refs, bricks]
+    let now = gpu.buffer_generations();
+    assert_eq!(
+        now,
+        [
+            generations[0] + 1,
+            generations[1] + 1,
+            generations[2],
+            generations[3]
+        ]
+    );
+    assert!(gpu.last_grown_bytes() > 0);
+    assert_eq!(gpu.render(&camera), before);
 }
 
 /// What the walk costs, in steps (see `reference::Steps`), averaged over a fan of primary rays

@@ -97,6 +97,9 @@ pub struct GpuSink<'a> {
     gpu: &'a mut Offscreen,
     draw_every: u32,
     uploaded_before: u64,
+    /// Copies and growth copies the tracer reported for each update, summed.
+    writes: u64,
+    grown_bytes: u64,
     upload_ms: Vec<f64>,
     draw_ms: Vec<f64>,
 }
@@ -107,6 +110,8 @@ impl<'a> GpuSink<'a> {
             uploaded_before: gpu.uploaded_bytes(),
             gpu,
             draw_every: draw_every.max(1),
+            writes: 0,
+            grown_bytes: 0,
             upload_ms: Vec::new(),
             draw_ms: Vec::new(),
         }
@@ -119,6 +124,8 @@ impl<'a> GpuSink<'a> {
             upload_ms: Stats::of(&self.upload_ms),
             draw_ms: Stats::of(&self.draw_ms),
             gpu_uploaded_bytes: self.gpu.uploaded_bytes() - self.uploaded_before,
+            gpu_uploaded_writes: self.writes,
+            gpu_grown_bytes: self.grown_bytes,
             drawn_frames: self.draw_ms.len(),
         }
     }
@@ -135,6 +142,8 @@ impl Sink for GpuSink<'_> {
         if let Some(update) = update {
             let began = Instant::now();
             self.gpu.update_scene(scene, update)?;
+            self.writes += u64::from(self.gpu.last_writes());
+            self.grown_bytes += self.gpu.last_grown_bytes();
             self.upload_ms.push(began.elapsed().as_secs_f64() * 1e3);
         }
         if index.is_multiple_of(self.draw_every) {
@@ -541,9 +550,17 @@ pub struct Timing {
     /// Per frame, in milliseconds on the CPU: the copy to the GPU, and the draw.
     pub upload_ms: Stats,
     pub draw_ms: Stats,
-    /// Bytes the GPU's copies wrote (what `render::tracer::upload_bytes` works out on the CPU, the
-    /// one in [`Upload`]), counted by the tracer.
+    /// What the GPU side wrote, counted by the tracer **where it writes to the staging belt** (the
+    /// header and each copy, the words between joined ranges included), as against what
+    /// `render::tracer::upload_bytes` and `upload_cost` work out beforehand from the patch (the
+    /// ones in [`Upload`], `bytes.total` and `writes.total`). Two counts, which agree if the patch's
+    /// cost is what the tracer writes. A rebuild is counted in bytes (its buffers) and has no
+    /// copies.
     pub gpu_uploaded_bytes: u64,
+    pub gpu_uploaded_writes: u64,
+    /// The bytes of old buffers that were copied on the GPU into bigger ones: the growth copies,
+    /// which are in neither of the counts above.
+    pub gpu_grown_bytes: u64,
     pub drawn_frames: usize,
 }
 
@@ -803,6 +820,12 @@ impl Streamer {
     /// The scene as the world has it, to make a GPU copy of before the run.
     pub fn scene(&self) -> &Scene {
         self.world.scene()
+    }
+
+    /// The most words a buffer of the scene may have on the GPU it is copied to: a growth is cut to
+    /// it (see `Scene::set_buffer_limit`). Takes effect with the scene thread's next step.
+    pub fn set_buffer_limit(&self, words: usize) {
+        self.world.set_buffer_limit(words);
     }
 
     /// One frame: the camera is told, the scene thread and the loader do a step, what was made is
