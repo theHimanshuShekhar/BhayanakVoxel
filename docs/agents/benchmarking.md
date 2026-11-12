@@ -410,6 +410,12 @@ is made there (below): the run's **Edit latency**. Its frames are not those of a
     The measuring costs a few clock reads a frame. In `min` and `max` the i-th slowest frame of each
     run is taken with the i-th of the others, member by member (a `slowest` of runs that did not
     keep the same number of frames is null there): read the runs for a frame's own parts.
+  - `largest_updates` and `over_limit_at` (schema 13): the five frames whose update copied the
+    most bytes, the most first, in the form of `slowest` (with `index`, `at_ms`, the frame's time,
+    its copies and its wait), and the places in the path of the first 200 frames over the limit.
+    They are for reading the slow frames against the big updates: whether a wait of 30 ms with
+    the GPU's passes at 1.5 ms is in the frame of a large update, or the frames after it (the 4090
+    run of `9539899` could not say: the largest update was not among its five slowest frames).
   - `upload` (#145): what the path's updates cost: `updates` (frames with one), `time` (the CPU's
     time of the copy: mean, p99 and worst, in milliseconds), `bytes_p99` and `bytes_max`,
     `writes_p99` and `writes_max` (the belt copies: a rebuild has none; **these are the largest
@@ -535,7 +541,7 @@ with an error.
 
 ### What the upload budget bounds
 
-The budget (`scene_worker::UPLOAD_BUDGET`: 8 MiB and 128 belt copies) limits what the scene thread
+The budget (`scene_worker::UPLOAD_BUDGET`: 8 MiB and 2 048 belt copies) limits what the scene thread
 **adds** to the outbox and the frame thread has not taken, not what a frame takes. This is the one
 place that says what a frame may take beyond it:
 
@@ -543,13 +549,21 @@ place that says what a frame may take beyond it:
   first batch of arrivals of the round, plus the gap words**. The check is between operations, and
   a patch is whole (a frame must not draw a brick whose words are not on the GPU), so the
   operation (a follow step or a batch of arrivals) that takes what waits to the budget is in the
-  frame. The first batch of arrivals of a round is taken whenever the outbox is empty, so that the
+  frame. **A follow step is itself cut** (#145, round 6): a camera further from the scene than a
+  quarter of the budget's worth of its move (by what a Voxel of it has cost so far, a Voxel at the
+  least, half a jump at the most) is walked to in steps of that size, each noted in its turn, so
+  that no follow step is much over a quarter of the budget, unless the least step (a bucket of the
+  camera's travel, 4 Voxels of it, at the selection's resolution) costs more. Before, a follow was
+  one operation to wherever the camera was: the 4090's flights followed in one step of 17 to
+  34 MB. The first batch of arrivals of a round is taken whenever the outbox is empty, so that the
   follow steps do not starve the arrivals: **if a follow step crossed the budget, the frame carries
   two operations beyond it**, the follow step and that batch. The gap words are those between
   ranges joined into one copy (`COPY_GAP`). The copies of a frame are at most the sum of its
   operations' (joining only makes fewer).
 - **Not budgeted at all:** an Edit and its coarse remakes (the Edit is packed ahead of the backlog,
-  so ADR 0006's bound holds); a jump and other bands, including the coarsening at the memory cap
+  so ADR 0006's bound holds); a **teleport** (the camera put further than a jump, 2 `d0`, in one
+  call of the frame thread: the scene is made again, as that is cheaper than walking; a scene that
+  merely fell behind by more than a jump is **walked to**, not jumped to: see below) and other bands, including the coarsening at the memory cap
   (the scene is packed again and uploaded whole: `Rebuilt`); and the copies of a growth, old buffer
   to new (they are on the GPU, not uploads, and are in no byte count).
 
@@ -567,23 +581,41 @@ still camera and a small budget, one with a budget well over the largest operati
 budget holds in every frame of it: this is the test that fails if the throttle does not hold
 work back, with a still camera), and a flight from the spawn over ground that is still loading
 (24 Voxels a frame, 120 frames), with a budget of one largest batch. The flight's control, with
-nothing held back, has frames of 866 324 bytes in 69 copies. The throttled flight has no update
-over the plain budget in bytes (at most 196 888 of 203 724); its worst has 24 copies against the
-budget's 23, and it is held to under half of the control's copies. The flight does not exercise the
-bound's terms for the crossing operation and the round's first batch: built from the control's
-largest follow step (515 964 / 44) and batch (203 724 / 23) the bound is 923 412 bytes in 90
-copies, looser than the control's own worst, so it checks nothing there. (Those terms are what
-`with_a_small_budget…` exercises, against the scene thread's own count of them,
-`Stats::excess_ops`, which holds whatever the throttle decides.) The flight test fails, in a
-message that names the throttled flight, if the `break` between batches in `stream()` is removed;
-it does not notice the early return in `follow()`, which in the flight never has an outbox over
-the budget to hold back for. A partly broken throttle that keeps every update under the plain
-budget in bytes and under half the control's copies is not caught by it. The follow throttle is
-tested by `the_camera_is_not_followed_while_what_waits_is_over_the_budget_and_is_when_the_frame_thread_has_taken_it`:
+nothing held back, has frames of 866 324 bytes in 69 copies and a largest follow step of 515 964
+bytes. The throttled flight's follow steps are held to the budget (the test asserts it), and its
+worst update (231 712 bytes, 23 copies, the budget being 203 724 / 23) is under a third of the
+control's in bytes and half in copies; it is a little over the plain budget, by part of an
+operation. The flight does not exercise the bound's terms for the crossing operation and the
+round's first batch: built from the control's largest batch (203 724 / 23, twice, as the follow
+steps are cut to the budget) the bound is 610 k bytes in 69 copies, looser than the control's own
+worst, so it checks nothing there. (Those terms are what `with_a_small_budget…` exercises, against
+the scene thread's own count of them, `Stats::excess_ops`, which holds whatever the throttle
+decides.) The flight test fails, in a message that names the throttled flight, if the `break`
+between batches in `stream()` is removed, and if the follow steps are not cut; it does not notice
+the early return in `follow()`, which in the flight never has an outbox over the budget to hold
+back for. A partly broken throttle that keeps every update under a third of the control's bytes
+and half its copies is not caught by it. The follow throttle is tested by
+`the_camera_is_not_followed_while_what_waits_is_over_the_budget_and_is_when_the_frame_thread_has_taken_it`:
 the frame thread does not take what two rounds publish, with a budget of one byte, so the outbox
-is over the budget when `follow` looks; the camera is followed in the first round and not in the
-next two, then in one step to where it is, with no hole in any frame and the scene that a run
-with that budget moved to just those places comes to.
+is over the budget when `follow` looks; one round follows (by a step) and the next two do not,
+then the next follows again, with no hole in any frame, and the scene walks on to the camera and
+draws what following in every round comes to (within 1% a level).
+
+**What the 4090's first run of the budget (`9539899`) showed, and the tests that now cover it**
+(`docs/measurements.md`, "The 4090's real-time run of 9539899"):
+
+- *An operation larger than the budget is split:* `a_camera_that_the_scene_fell_far_behind_is_walked_to_in_steps_within_the_budget_and_one_that_was_put_there_is_jumped_to`
+  (the camera four jumps away, the scene walked to it in 44 patches, the largest follow step within
+  the budget, no rebuild; a camera put there in one move is still jumped to).
+- *A flight and a stop do not end in a jump:* `a_scene_thread_that_is_busy_while_the_camera_flies_on_walks_to_it_after_and_does_not_end_in_a_rebuild`
+  (the scene thread busy for 1.5 s of a 2 s flight, the scene 2 240 Voxels behind, a jump being 128
+  here: 0 rebuilds).
+- *The fill is not slowed by the default budget:* `with_the_default_budget_a_fill_takes_about_as_many_frames_as_one_with_no_budget`
+  (stepped: within 20% of the frames of a fill with no budget; 43 against 43 on the test Planet).
+- *The thread goes on when the frame takes what waited:* `a_throttled_scene_thread_goes_on_when_the_frame_thread_takes_what_waited`
+  (real threads, in `.github/real-thread-tests.txt`: at least a quarter of the frames carry an
+  update while the loader works, with a budget of one byte: 270 of 287 alone, 122 of 262 with the
+  machine busy; a thread that slept out its wait would be near a tenth).
 
 ### The gates
 
@@ -674,7 +706,7 @@ those cases the output on stderr is all there is.
 
 ```
 {
-  "schema_version": 12,
+  "schema_version": 13,
   "build":   { "version", "commit" },          // commit: CI builds only, else null; on a PR
                                                // build it is GitHub's merge commit, not the head
   "machine": { "gpu", "device_type", "driver", "driver_info", "backend", "os", "arch",

@@ -24,7 +24,12 @@ use super::stream::StreamReport;
 /// while a rebuilt scene was made (`scene_gpu_peak_rebuild_mib`); and in the stepped mode's
 /// `timing` the copies the GPU side counted (`gpu_uploaded_writes`) and the growth copies
 /// (`gpu_grown_bytes`). The stepped mode's counts, and so its hash, are not changed by these.
-pub const SCHEMA_VERSION: u32 = 12;
+///
+/// 13 added what the 4090 run of #145 could not answer: in each real-time path `largest_updates`
+/// (the five frames whose update copied the most bytes, in the form of `slowest`) and
+/// `over_limit_at` (the places of the first frames over the limit), to read the slow frames against
+/// the big updates. The stepped mode's counts and hash are not changed by these.
+pub const SCHEMA_VERSION: u32 = 13;
 
 /// One timed thing (a pass, or the GPU total of a profiler frame) in one mode, against its
 /// budget. In reference mode a profiler frame is one sample, so the entries of that mode have
@@ -515,7 +520,7 @@ mod tests {
                 "streaming_real_time"
             ]
         );
-        assert_eq!(json["schema_version"], 12);
+        assert_eq!(json["schema_version"], 13);
         assert_eq!(json["streaming"], serde_json::Value::Null);
         assert_eq!(json["streaming_real_time"], serde_json::Value::Null);
         assert_eq!(

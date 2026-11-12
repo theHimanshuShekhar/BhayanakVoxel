@@ -49,7 +49,7 @@ mod rings;
 pub mod select;
 
 pub use rings::{
-    COPY_GAP, Lengths, Part, PatchCopy, Rebuild, RingPatch, RingsFull, Room, UploadCost,
+    COPY_GAP, JUMP, Lengths, Part, PatchCopy, Rebuild, RingPatch, RingsFull, Room, UploadCost,
 };
 
 /// Bricks along each edge of a region.

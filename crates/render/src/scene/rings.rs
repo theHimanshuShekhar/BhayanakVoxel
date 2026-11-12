@@ -570,7 +570,7 @@ fn group(keys: impl IntoIterator<Item = (usize, BrickCoord)>) -> ByRegion {
 /// patched. Patching costs about in proportion to the distance (8 ms for 100 Voxels, 90 ms for
 /// 1000, 170 ms for 2000 on the test Planet), a new scene about 200 ms wherever it is, and less
 /// the further out the camera is, and they meet at about two `d0` (2056 Voxels).
-const JUMP: f64 = 2.0;
+pub const JUMP: f64 = 2.0;
 
 /// The least a buffer that has run out of room grows by, in words (1 MiB).
 const GROW_LEAST: usize = 1 << 18;

@@ -68,7 +68,7 @@ fn check_entry(entry: &Value) {
 const GOLDEN_COUNTS: &str = include_str!("../src/bench/streaming-counts.golden");
 
 fn check_schema(report: &Value, out: &Path) {
-    assert_eq!(report["schema_version"], 12);
+    assert_eq!(report["schema_version"], 13);
     // The Edit stress is of the whole Planet, which the patch is not.
     assert!(report["edits"].is_null());
     // The streaming mode is asked for (see its own test); the other tests do not. The real-time

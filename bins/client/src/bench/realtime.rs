@@ -503,32 +503,50 @@ impl UpdateKinds {
 }
 
 /// The slowest frames of a path, in a list of fixed size: no allocation while the frames come.
-struct Worst([Option<SlowFrame>; SLOWEST]);
+struct Worst {
+    frames: [Option<SlowFrame>; SLOWEST],
+    /// What the list is of the most of.
+    key: fn(&SlowFrame) -> f64,
+}
 
 impl Worst {
+    /// The slowest frames.
     fn new() -> Self {
-        Self([None; SLOWEST])
+        Self::by(|f| f.time_ms)
+    }
+
+    /// The frames with the most of `key`.
+    fn by(key: fn(&SlowFrame) -> f64) -> Self {
+        Self {
+            frames: [None; SLOWEST],
+            key,
+        }
     }
 
     fn offer(&mut self, frame: SlowFrame) {
-        let time = |slot: &Option<SlowFrame>| slot.map_or(f64::NEG_INFINITY, |f| f.time_ms);
+        let key = self.key;
+        let value = |slot: &Option<SlowFrame>| slot.as_ref().map_or(f64::NEG_INFINITY, key);
         let least = self
-            .0
+            .frames
             .iter_mut()
-            .min_by(|a, b| time(a).total_cmp(&time(b)))
+            .min_by(|a, b| value(a).total_cmp(&value(b)))
             .expect("the list has room");
-        if frame.time_ms > time(least) {
+        if key(&frame) > value(least) {
             *least = Some(frame);
         }
     }
 
-    /// The slowest first.
+    /// The most first.
     fn sorted(&self) -> Vec<SlowFrame> {
-        let mut frames: Vec<SlowFrame> = self.0.iter().flatten().copied().collect();
-        frames.sort_by(|a, b| b.time_ms.total_cmp(&a.time_ms));
+        let key = self.key;
+        let mut frames: Vec<SlowFrame> = self.frames.iter().flatten().copied().collect();
+        frames.sort_by(|a, b| key(b).total_cmp(&key(a)));
         frames
     }
 }
+
+/// How many indexes of frames over the limit a path keeps.
+const OVER_LIMIT_INDEXES: usize = 200;
 
 /// How long the camera stood after a flight before the scene had no soft misses.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize)]
@@ -556,6 +574,14 @@ pub struct PathReport {
     /// Those frames by what their update was: none, a patch or a rebuild.
     pub frames_over_limit_by_update: UpdateKinds,
     pub slowest: Vec<SlowFrame>,
+    /// The places in the path (from 0) of the first frames over the limit, so that where the slow
+    /// frames are can be read against where the largest updates are (`largest_updates`): kept up
+    /// to a few hundred, `frames_over_limit` says how many there were.
+    pub over_limit_at: Vec<usize>,
+    /// The frames whose update copied the most bytes, the most first, in the same form as
+    /// `slowest`: with `index` and `at_ms` to read against the slow frames, and each one's time,
+    /// copies and wait.
+    pub largest_updates: Vec<SlowFrame>,
     /// What the frames' uploads came to, and how often the budget cut them.
     pub upload: PathUpload,
     /// Soft misses a frame reported (counted by the scene thread a few times a second, so a frame
@@ -1053,6 +1079,10 @@ struct Capture {
     lengthen_ms_max: f64,
     grow_ms_max: f64,
     worst: Worst,
+    /// The frames over the limit, by place, as far as the report keeps them.
+    over_limit_at: Vec<usize>,
+    /// The updates with the most bytes.
+    largest: Worst,
 }
 
 impl Capture {
@@ -1072,6 +1102,8 @@ impl Capture {
             lengthen_ms_max: 0.0,
             grow_ms_max: 0.0,
             worst: Worst::new(),
+            over_limit_at: Vec::new(),
+            largest: Worst::by(|f| f.upload_bytes as f64),
             spent: world.scene_thread_time(),
             scans: work.hole_scans,
             holes: work.holes_found,
@@ -1089,6 +1121,9 @@ impl Capture {
 
     fn add(&mut self, frame: &Frame) {
         if frame.time_ms > self.limit_ms {
+            if self.over_limit_at.len() < OVER_LIMIT_INDEXES {
+                self.over_limit_at.push(self.frame_ms.len());
+            }
             self.over_limit += 1;
             self.over_by_update.add(frame.parts.update);
         }
@@ -1099,7 +1134,7 @@ impl Capture {
         }
         self.lengthen_ms_max = self.lengthen_ms_max.max(frame.parts.lengthen_ms);
         self.grow_ms_max = self.grow_ms_max.max(frame.parts.grow_ms);
-        self.worst.offer(SlowFrame {
+        let slow = SlowFrame {
             index: self.frame_ms.len(),
             at_ms: frame
                 .began
@@ -1107,7 +1142,11 @@ impl Capture {
                 .as_secs_f64()
                 * 1e3,
             ..frame.parts
-        });
+        };
+        self.worst.offer(slow);
+        if frame.parts.update != "none" {
+            self.largest.offer(slow);
+        }
         self.frame_ms.push(frame.time_ms);
         self.cpu_ms.push(frame.cpu_ms);
         self.soft_misses.add(frame.soft_misses as u64);
@@ -1154,6 +1193,8 @@ impl Capture {
             frames_over_limit: self.over_limit,
             frames_over_limit_by_update: self.over_by_update,
             slowest: self.worst.sorted(),
+            over_limit_at: self.over_limit_at,
+            largest_updates: self.largest.sorted(),
             upload: PathUpload {
                 updates: self.update_ms.len(),
                 time: Spread::of(&self.update_ms),
@@ -1865,6 +1906,8 @@ mod tests {
             frames_over_limit: 0,
             frames_over_limit_by_update: UpdateKinds::default(),
             slowest: vec![slow_frame(0, frame_p99 * 2.0)],
+            over_limit_at: Vec::new(),
+            largest_updates: Vec::new(),
             upload: PathUpload::default(),
             soft_misses: Series::default(),
             soft_misses_per_frame: 0.0,
@@ -2295,7 +2338,9 @@ mod tests {
                 "hole_looks",
                 "holes",
                 "holes_per_frame",
+                "largest_updates",
                 "name",
+                "over_limit_at",
                 "scene_thread",
                 "seconds",
                 "settle",
@@ -2431,6 +2476,26 @@ mod tests {
             few.sorted().iter().map(|f| f.index).collect::<Vec<_>>(),
             [1, 0]
         );
+    }
+
+    #[test]
+    fn the_list_of_largest_updates_keeps_the_five_with_the_most_bytes_largest_first() {
+        let mut largest = Worst::by(|f| f.upload_bytes as f64);
+        for (index, bytes) in [10u64, 900, 30, 7, 500, 20, 1200, 40]
+            .into_iter()
+            .enumerate()
+        {
+            largest.offer(SlowFrame {
+                upload_bytes: bytes,
+                ..slow_frame(index, 1.0)
+            });
+        }
+        let kept: Vec<(usize, u64)> = largest
+            .sorted()
+            .iter()
+            .map(|f| (f.index, f.upload_bytes))
+            .collect();
+        assert_eq!(kept, [(6, 1200), (1, 900), (4, 500), (7, 40), (2, 30)]);
     }
 
     #[test]
