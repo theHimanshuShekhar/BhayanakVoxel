@@ -70,13 +70,16 @@ const SLICE: Duration = Duration::from_millis(2);
 /// over, by what that costs. Two rules keep arrivals from starving behind the follow steps, which
 /// are checked first in a round (#145): the first batch of arrivals of a round is taken even over
 /// the budget, if the outbox is empty (so that a frame always carries some of the loader's work
-/// while the camera moves), and a further batch is taken only if the largest batch so far would
-/// still be under the budget after it (so that the batch that is taken does not take a frame over
-/// the budget by itself). An Edit is packed whatever the backlog is (it is never behind streamed
+/// while the camera moves), and a further batch is taken only if a batch like the last (its
+/// cost, kept under the budget so that with nothing waiting a further batch is always tried) would
+/// still be under the budget after it. The last, not the largest: one big batch, such as one of
+/// the fill's, must not hold back every later one. An Edit is packed whatever the backlog is (it is never behind streamed
 /// bricks: it goes into the same patch, ahead of what is not yet packed). A jump or other bands
 /// pack the whole scene and are not limited either (`Rebuilt`), and nor is the copy of a growth.
-/// So a frame takes up to the budget, plus the one operation that crossed it, plus the words
-/// between joined ranges; whether that is "bounded by the budget" is the project owner's call
+/// So a frame takes up to **the budget, plus the one operation that took what waits to it, plus
+/// the round's first batch of arrivals** (taken whenever the outbox is empty, so after a follow
+/// step that crossed the budget a frame carries two operations beyond it), **plus the words
+/// between joined ranges**; whether that is "bounded by the budget" is the project owner's call
 /// (`docs/agents/benchmarking.md`).
 ///
 /// **How the value was chosen:** a first value, not one tuned on the 4090. 8 MiB is about a
@@ -281,6 +284,12 @@ pub struct Stats {
     /// The most that one operation added, in bytes and in copies, since the start.
     #[cfg(test)]
     pub largest_op: UploadCost,
+    /// The most that one batch of arrivals added, and the most that one follow step added, in
+    /// bytes and in copies, since the start: sizes of patches, whatever the budget decided.
+    #[cfg(test)]
+    pub largest_batch: UploadCost,
+    #[cfg(test)]
+    pub largest_follow: UploadCost,
 }
 
 /// What the scene thread has done since the start, in steps and bricks, not milliseconds (#181):
@@ -417,6 +426,10 @@ fn stats_of(scene: &Scene, loader: &Loader, slow: &Arc<Slow>, eviction: Eviction
         excess_ops: UploadCost::default(),
         #[cfg(test)]
         largest_op: UploadCost::default(),
+        #[cfg(test)]
+        largest_batch: UploadCost::default(),
+        #[cfg(test)]
+        largest_follow: UploadCost::default(),
     }
 }
 
@@ -704,6 +717,10 @@ impl SceneWorker {
             excess_ops: UploadCost::default(),
             #[cfg(test)]
             largest_op: UploadCost::default(),
+            #[cfg(test)]
+            largest_batch: UploadCost::default(),
+            #[cfg(test)]
+            largest_follow: UploadCost::default(),
         };
         let worker = Self {
             shared,
@@ -1149,8 +1166,9 @@ struct Engine {
     throttled: bool,
     /// What the patch that is in the outbox costs to upload, as of the last publish.
     pending: UploadCost,
-    /// The most that one batch of arrivals has added to what is uploaded: the next batch is not
-    /// begun if it could take what waits over the budget.
+    /// What the last batch of arrivals added to what is uploaded: the next batch is not begun if
+    /// one like it could take what waits to the budget (see [`Engine::batch_estimate`]). It is the
+    /// last, not the largest, so that one big batch is forgotten with the next.
     batch_cost: UploadCost,
     /// The time that holds and slices are measured in: the machine's, or a test's.
     clock: Clock,
@@ -1162,6 +1180,12 @@ struct Engine {
     /// See [`Stats::largest_op`].
     #[cfg(test)]
     largest_op: UploadCost,
+    /// See [`Stats::largest_batch`].
+    #[cfg(test)]
+    largest_batch: UploadCost,
+    /// See [`Stats::largest_follow`].
+    #[cfg(test)]
+    largest_follow: UploadCost,
 }
 
 /// What the thread was told: the camera, how it moves, and the jobs.
@@ -1446,6 +1470,19 @@ impl Engine {
             || cost.writes >= self.shared.budget_writes.load(Ordering::Relaxed)
     }
 
+    /// What a further batch of arrivals is expected to add: the last one's, less than the budget
+    /// in each of bytes and copies. So that with nothing waiting a further batch is always tried,
+    /// whatever one batch once cost: a batch that was itself over the budget does not hold every
+    /// later one back for the rest of the session.
+    fn batch_estimate(&self) -> UploadCost {
+        let budget_bytes = self.shared.budget_bytes.load(Ordering::Relaxed);
+        let budget_writes = self.shared.budget_writes.load(Ordering::Relaxed);
+        UploadCost {
+            bytes: self.batch_cost.bytes.min(budget_bytes.saturating_sub(1)),
+            writes: self.batch_cost.writes.min(budget_writes.saturating_sub(1)),
+        }
+    }
+
     /// Whether the frame thread has taken what the thread published: nothing waits in the outbox.
     fn outbox_is_empty(&mut self) -> bool {
         let outbox = lock(&self.shared.outbox);
@@ -1600,6 +1637,12 @@ impl Engine {
         self.work.follow_steps += 1;
         self.work.follow_bricks += self.scene.bricks_changed() - before;
         self.camera = Some(camera);
+        #[cfg(test)]
+        if let Some(SceneUpdate::Rings(patch)) = &update {
+            let cost = patch.cost();
+            self.largest_follow.bytes = self.largest_follow.bytes.max(cost.bytes);
+            self.largest_follow.writes = self.largest_follow.writes.max(cost.writes);
+        }
         self.note(update);
         Ok(true)
     }
@@ -1641,7 +1684,8 @@ impl Engine {
         loop {
             // What the loader made waits in its queue, in the order it made it, while the frame
             // thread has more to upload than the budget.
-            if !std::mem::take(&mut guaranteed) && self.over_budget_with(self.batch_cost) {
+            let estimate = self.batch_estimate();
+            if !std::mem::take(&mut guaranteed) && self.over_budget_with(estimate) {
                 self.throttled = true;
                 break;
             }
@@ -1685,8 +1729,12 @@ impl Engine {
             drop(store);
             if let Some(SceneUpdate::Rings(patch)) = &update {
                 let cost = patch.cost();
-                self.batch_cost.bytes = self.batch_cost.bytes.max(cost.bytes);
-                self.batch_cost.writes = self.batch_cost.writes.max(cost.writes);
+                self.batch_cost = cost;
+                #[cfg(test)]
+                {
+                    self.largest_batch.bytes = self.largest_batch.bytes.max(cost.bytes);
+                    self.largest_batch.writes = self.largest_batch.writes.max(cost.writes);
+                }
             }
             self.work.pack_steps += 1;
             self.work.pack_bricks += self.scene.bricks_changed() - before;
@@ -2102,6 +2150,8 @@ impl Engine {
         {
             stats.excess_ops = std::mem::take(&mut self.excess_ops);
             stats.largest_op = self.largest_op;
+            stats.largest_batch = self.largest_batch;
+            stats.largest_follow = self.largest_follow;
         }
         // The look that a job asked for is done by the scan before this (the holes) and here (the
         // count), and is not due again.

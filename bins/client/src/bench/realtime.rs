@@ -130,10 +130,15 @@ pub trait Gpu {
         update: Option<&SceneUpdate>,
     ) -> Result<GpuFrame, Box<dyn Error>>;
 
-    /// The most bytes of GPU memory the scene's buffers have taken at once, in all the updates so
-    /// far, the old and the new buffer of one that grew both counted (`Tracer::peak_scene_bytes`).
-    /// 0 with no GPU.
-    fn peak_scene_bytes(&self) -> u64 {
+    /// The most bytes of GPU memory the scene's buffers have taken at once while a buffer grew
+    /// (the old buffer and the new one both counted: `Tracer::peak_growth_bytes`), and while a
+    /// rebuilt scene was made (`Tracer::peak_rebuild_bytes`), in all the updates so far. 0 with no
+    /// GPU, and 0 for what has not happened.
+    fn peak_growth_bytes(&self) -> u64 {
+        0
+    }
+
+    fn peak_rebuild_bytes(&self) -> u64 {
         0
     }
 }
@@ -200,8 +205,12 @@ impl Gpu for OffscreenGpu<'_> {
         Ok(frame)
     }
 
-    fn peak_scene_bytes(&self) -> u64 {
-        self.0.peak_scene_bytes()
+    fn peak_growth_bytes(&self) -> u64 {
+        self.0.peak_growth_bytes()
+    }
+
+    fn peak_rebuild_bytes(&self) -> u64 {
+        self.0.peak_rebuild_bytes()
     }
 }
 
@@ -272,8 +281,9 @@ pub struct PathUpload {
     pub longest_backlog_frames: usize,
     pub longest_backlog_ms: f64,
     /// The frames whose upload was **over the plain budget** (more than `UPLOAD_BUDGET`'s bytes or
-    /// more than its copies), by cause. A frame can take up to the budget plus one unsplit
-    /// operation plus the gap words, and some work is not budgeted at all (see [`OverBudget`]).
+    /// more than its copies), by cause. A frame can take up to the budget plus the operation that
+    /// took what waits to it plus the round's first batch of arrivals plus the gap words, and some
+    /// work is not budgeted at all (see [`OverBudget`]).
     pub over_budget: OverBudget,
     /// Frames in which a buffer of the scene grew, the bytes of the old buffers those growths
     /// copied on the GPU, and the most that one frame spent on the host making a longer buffer: the
@@ -290,9 +300,11 @@ pub struct PathUpload {
 /// one cause, the first that applies, in this order: a **jump** or **bands** (the scene packed
 /// again and uploaded whole), an **edit** (the frame took the newest Edit: Edits and their coarse
 /// remakes are not budgeted), a **growth** (a buffer was made longer: the copy of its old words is
-/// not budgeted and is not in the bytes), or else an **operation** (the one batch of arrivals or
-/// follow step that took the scene thread's backlog across the budget, and the gap words of joined
-/// ranges). What is counted is the update's bytes and copies, not a frame time.
+/// not budgeted and is not in the bytes), or else an **operation** (the operation that took what
+/// waits to the budget, the round's first batch of arrivals that is taken after it, and the gap
+/// words of joined ranges). Only a frame whose bytes or copies are over the budget is counted
+/// (a rebuild of less is not), under exactly one cause, so the causes add up to `frames`. What
+/// is counted is the update's bytes and copies, not a frame time.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize)]
 pub struct OverBudget {
     pub frames: usize,
@@ -327,17 +339,16 @@ fn over_budget_cause(
     grown: bool,
 ) -> Option<&'static str> {
     let budget = UPLOAD_BUDGET;
-    if update == "rebuild" {
-        // A rebuild always writes the whole scene. (None is not expected: it is counted as a jump.)
-        return Some(match rebuilt {
-            Some(Rebuild::Bands) => "bands",
-            _ => "jump",
-        });
-    }
     if bytes <= budget.bytes && u64::from(writes) <= u64::from(budget.writes) {
         return None;
     }
-    Some(if took_edit {
+    Some(if update == "rebuild" {
+        // (None is not expected for a rebuild: it is counted as a jump.)
+        match rebuilt {
+            Some(Rebuild::Bands) => "bands",
+            _ => "jump",
+        }
+    } else if took_edit {
         "edit"
     } else if grown {
         "growth"
@@ -603,19 +614,22 @@ pub struct Memory {
     /// on what the GPU reserves.
     pub scene_used_peak_mib: f64,
     /// The scene's buffers as the GPU reserves them, used or not (`Scene::reserved_bytes`): this
-    /// is the VRAM the scene takes, and it is allocated whole, so it does not change over the run
-    /// (the most of the frames' is given). Reported; not gated.
+    /// is the VRAM the scene takes, after its growths (a buffer that fills grows, #145: the most
+    /// of the frames' is given). Reported; not gated.
     pub scene_reserved_mib: f64,
     /// The peak **during a growth** (ADR 0004's accounting is of the buffers after it): the GPU's
-    /// buffers at the most, the old buffer and the new one of one that grew both counted
-    /// (`Tracer::peak_scene_bytes`: what the buffers held before, plus the new ones); and the
-    /// frame thread's copy of the scene at the most, its reserved bytes after a growth plus the old
+    /// buffers at the most while a buffer grew, the old buffer and the new one both counted
+    /// (`Tracer::peak_growth_bytes`: what the buffers held before, plus the new ones; 0 if none
+    /// grew); and the frame thread's copy of the scene at the most, its reserved bytes after a growth plus the old
     /// words of the buffers that grew in that frame (a `Vec` that is lengthened may hold the old
     /// allocation and the new at once, which is what the platform's allocator does when it cannot
     /// extend in place: the upper bound; the scene thread's own copy, which grows the same way a
     /// round earlier, is not in it). Reported; not gated, and `scene_used_peak_mib` stays the gate.
     pub scene_gpu_peak_growth_mib: f64,
     pub scene_host_peak_growth_mib: f64,
+    /// The GPU's peak while a **rebuilt** scene was made (the old scene's buffers and the new
+    /// ones: a jump or other bands), apart from the growths'. 0 if there was none.
+    pub scene_gpu_peak_rebuild_mib: f64,
     /// The store's size as its budget counts it, looked at every few frames, and the most it may
     /// hold before eviction starts.
     pub store_peak_bricks: u64,
@@ -1658,7 +1672,8 @@ impl<'a> Session<'a> {
             whole_process_peak_mib: self.whole_process_peak.map(mib),
             scene_used_peak_mib: mib(self.scene_used_peak_bytes),
             scene_reserved_mib: mib(self.scene_reserved_bytes),
-            scene_gpu_peak_growth_mib: mib(self.gpu.peak_scene_bytes()),
+            scene_gpu_peak_growth_mib: mib(self.gpu.peak_growth_bytes()),
+            scene_gpu_peak_rebuild_mib: mib(self.gpu.peak_rebuild_bytes()),
             scene_host_peak_growth_mib: mib(self.scene_host_peak_bytes),
             store_peak_bricks: self.store_peak as u64,
             store_limit_bricks: setup.store_limit as u64,
@@ -1944,6 +1959,7 @@ mod tests {
                 scene_used_peak_mib: 474.0,
                 scene_reserved_mib: 560.0,
                 scene_gpu_peak_growth_mib: 600.0,
+                scene_gpu_peak_rebuild_mib: 0.0,
                 scene_host_peak_growth_mib: 600.0,
                 store_peak_bricks: 20_000_000,
                 store_limit_bricks: 23_000_000,
@@ -2258,6 +2274,7 @@ mod tests {
             [
                 "resident_peak_mib",
                 "scene_gpu_peak_growth_mib",
+                "scene_gpu_peak_rebuild_mib",
                 "scene_host_peak_growth_mib",
                 "scene_reserved_mib",
                 "scene_used_peak_mib",
@@ -2433,6 +2450,60 @@ mod tests {
         // The growth is inside the write: it is not another part of the CPU's time.
         assert_eq!(frame.cpu(), ms(15));
         assert_eq!(GpuFrame::default().cpu(), Duration::ZERO);
+    }
+
+    #[test]
+    fn a_frame_is_over_the_budget_only_by_its_bytes_or_copies_and_under_one_cause() {
+        let (bytes, writes) = (UPLOAD_BUDGET.bytes, UPLOAD_BUDGET.writes);
+        let cause = |update, bytes, writes, why, edit, grown| {
+            over_budget_cause(update, bytes, writes, why, edit, grown)
+        };
+        // Under the budget, whatever the update is: not counted (a small rebuild too).
+        assert_eq!(cause("patch", bytes, writes, None, true, true), None);
+        assert_eq!(
+            cause("rebuild", bytes - 1, 0, Some(Rebuild::Jump), false, false),
+            None
+        );
+        assert_eq!(cause("none", 0, 0, None, false, false), None);
+        // Over by bytes or by copies, the first cause that applies.
+        let over = (bytes + 1, writes);
+        assert_eq!(
+            cause("rebuild", over.0, 0, Some(Rebuild::Jump), true, true),
+            Some("jump")
+        );
+        assert_eq!(
+            cause("rebuild", over.0, 0, Some(Rebuild::Bands), true, true),
+            Some("bands")
+        );
+        assert_eq!(
+            cause("patch", over.0, over.1, None, true, true),
+            Some("edit")
+        );
+        assert_eq!(
+            cause("patch", over.0, over.1, None, false, true),
+            Some("growth")
+        );
+        assert_eq!(
+            cause("patch", 1, writes + 1, None, false, false),
+            Some("operation")
+        );
+        // The causes are exclusive and add up to the frames.
+        let mut counted = OverBudget::default();
+        for c in [
+            Some("jump"),
+            None,
+            Some("edit"),
+            Some("operation"),
+            Some("growth"),
+            Some("bands"),
+        ] {
+            counted.add(c);
+        }
+        assert_eq!(counted.frames, 5);
+        assert_eq!(
+            counted.operation + counted.edit + counted.jump + counted.bands + counted.growth,
+            counted.frames
+        );
     }
 
     #[test]

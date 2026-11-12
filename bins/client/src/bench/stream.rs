@@ -553,9 +553,11 @@ pub struct Timing {
     /// What the GPU side wrote, counted by the tracer **where it writes to the staging belt** (the
     /// header and each copy, the words between joined ranges included), as against what
     /// `render::tracer::upload_bytes` and `upload_cost` work out beforehand from the patch (the
-    /// ones in [`Upload`], `bytes.total` and `writes.total`). Two counts, which agree if the patch's
-    /// cost is what the tracer writes. A rebuild is counted in bytes (its buffers) and has no
-    /// copies.
+    /// ones in [`Upload`], `bytes.total` and `writes.total`). **Not independent of everything:**
+    /// both go over `RingPatch::copies()` and use the same header size, so their agreement shows
+    /// that the tracer writes each listed range and the header once, and that `cost()` adds them
+    /// as written; that the ranges cover the change is for `GpuCopy::assert_is` in the stepped
+    /// tests. A rebuild is counted in bytes (its buffers) and has no copies.
     pub gpu_uploaded_bytes: u64,
     pub gpu_uploaded_writes: u64,
     /// The bytes of old buffers that were copied on the GPU into bigger ones: the growth copies,

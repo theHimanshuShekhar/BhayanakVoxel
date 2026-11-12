@@ -20,7 +20,8 @@ use super::stream::StreamReport;
 /// the frames over the plain budget by cause (`over_budget`) and the growths (`growth_frames`,
 /// `grown_bytes`, `lengthen_ms_max`, `grow_ms_max`); in each slow frame the growth's cost
 /// (`lengthen_ms`, `grow_ms`, `grown_bytes`) and `over_budget`; in `memory` the peak during a
-/// growth (`scene_gpu_peak_growth_mib`, `scene_host_peak_growth_mib`); and in the stepped mode's
+/// growth (`scene_gpu_peak_growth_mib`, `scene_host_peak_growth_mib`) and, apart, the GPU's peak
+/// while a rebuilt scene was made (`scene_gpu_peak_rebuild_mib`); and in the stepped mode's
 /// `timing` the copies the GPU side counted (`gpu_uploaded_writes`) and the growth copies
 /// (`gpu_grown_bytes`). The stepped mode's counts, and so its hash, are not changed by these.
 pub const SCHEMA_VERSION: u32 = 12;

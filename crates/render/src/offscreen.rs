@@ -279,10 +279,15 @@ impl Offscreen {
         self.tracer.buffer_generations()
     }
 
-    /// The most bytes of GPU memory the scene's buffers have taken at once, the old and the new
-    /// buffer of one that grew both counted ([`Tracer::peak_scene_bytes`]).
-    pub fn peak_scene_bytes(&self) -> u64 {
-        self.tracer.peak_scene_bytes()
+    /// The most bytes of GPU memory the scene's buffers have taken at once while a buffer grew,
+    /// the old buffer and the new one both counted ([`Tracer::peak_growth_bytes`]), and while a
+    /// rebuilt scene was made ([`Tracer::peak_rebuild_bytes`]); each 0 if it has not happened.
+    pub fn peak_growth_bytes(&self) -> u64 {
+        self.tracer.peak_growth_bytes()
+    }
+
+    pub fn peak_rebuild_bytes(&self) -> u64 {
+        self.tracer.peak_rebuild_bytes()
     }
 
     /// The most words a buffer of the scene may have on this device (see

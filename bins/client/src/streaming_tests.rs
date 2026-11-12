@@ -2573,6 +2573,32 @@ impl GpuCopy {
     }
 }
 
+/// What an update costs to upload (`upload_cost`, which is the tracer's count: see
+/// `docs/agents/benchmarking.md`), and of it what the patch lists once each (the words and the
+/// header) and the words that joining ranges put between them.
+struct Uploaded {
+    cost: render::UploadCost,
+    listed: u64,
+    gaps: u64,
+}
+
+impl Uploaded {
+    fn of(scene: &Scene, update: &SceneUpdate) -> Self {
+        let SceneUpdate::Rings(patch) = update else {
+            panic!("a rebuild where a patch was expected");
+        };
+        let cost = render::tracer::upload_cost(scene, update);
+        let copied: u64 = patch.copies().iter().map(|(_, r)| r.len() as u64 * 4).sum();
+        let header = cost.bytes - copied;
+        let listed = patch.words() as u64 * 4 + header;
+        Self {
+            cost,
+            listed,
+            gaps: cost.bytes - listed,
+        }
+    }
+}
+
 /// What a fill with a budget came to (see [`fill_checked`]).
 #[derive(Debug, Default)]
 struct Filled {
@@ -2597,6 +2623,13 @@ struct Filled {
 /// drawn from words that were not copied, whatever waits and whatever grew; that no frame has a
 /// hole; and that the frame's upload is the budget and the operations that were not inside it
 /// (`Stats::excess_ops`), and the words that joining copies puts between them, and no more.
+///
+/// **What the bound on `excess_ops` can and cannot catch:** `excess_ops` is worked out by the
+/// scene thread (`Engine::note`) from what it saw when each operation began, so the bound holds
+/// whatever the throttle decides: it catches an operation that adds to a patch without going
+/// through `note()`, or a patch that is bigger than the operations that made it (merging adding
+/// words), and it does not say that the throttle holds back when it should. That is what the
+/// frames cut, the comfortable budget's test and the flight's independent bound are for.
 fn fill_checked(budget: render::UploadCost) -> Filled {
     let (mut world, _server, camera) = spawned_world(Run::Stepped);
     world.count_exactly();
@@ -2617,12 +2650,8 @@ fn fill_checked(budget: render::UploadCost) -> Filled {
                 panic!("frame {frame}: a rebuild in a fill");
             };
             grew = patch.sizes.is_some();
-            let cost = render::tracer::upload_cost(world.scene(), update);
-            let copied: u64 = patch.copies().iter().map(|(_, r)| r.len() as u64 * 4).sum();
-            let header = cost.bytes - copied;
             // What the patch lists, once each: the bytes before words are put between copies.
-            let listed = patch.words() as u64 * 4 + header;
-            let gaps = cost.bytes - listed;
+            let Uploaded { cost, listed, gaps } = Uploaded::of(world.scene(), update);
             let excess = world.stats().excess_ops;
             assert!(
                 listed <= budget.bytes + excess.bytes,
@@ -2787,6 +2816,17 @@ fn an_edit_made_while_a_backlog_waits_is_taken_as_soon_as_one_made_without_a_bac
     assert_eq!(with, without, "the Edit took longer behind a backlog");
 }
 
+/// What each update of a flight cost: what the patch lists (bytes), its copies, and the bytes
+/// between joined ranges. Printed as a count.
+#[derive(Default)]
+struct Uploads(Vec<(u64, u32, u64)>);
+
+impl std::fmt::Debug for Uploads {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} updates", self.0.len())
+    }
+}
+
 /// What a flight along the ground came to (see [`fly_counting`]).
 #[derive(Debug, Default)]
 struct Flown {
@@ -2809,6 +2849,11 @@ struct Flown {
     /// Frames, with the camera still at the end, until nothing waits.
     frames_to_drain: usize,
     holes: usize,
+    /// What each update of the flight (not a rebuild) cost, and the most that one follow step and
+    /// one batch of arrivals added over the run.
+    uploads: Uploads,
+    largest_follow: render::UploadCost,
+    largest_batch: render::UploadCost,
 }
 
 /// The camera flown `frames` frames of `step` Voxels along the ground from the spawn, in a stepped
@@ -2832,9 +2877,10 @@ fn fly_counting(budget: Option<render::UploadCost>, step: f64, frames: usize) ->
         match &update {
             Some(SceneUpdate::Rebuilt) => flown.rebuilds += 1,
             Some(update) => {
-                let cost = render::tracer::upload_cost(world.scene(), update);
+                let Uploaded { cost, listed, gaps } = Uploaded::of(world.scene(), update);
                 flown.worst.bytes = flown.worst.bytes.max(cost.bytes);
                 flown.worst.writes = flown.worst.writes.max(cost.writes);
+                flown.uploads.0.push((listed, cost.writes, gaps));
             }
             None => {}
         }
@@ -2868,6 +2914,8 @@ fn fly_counting(budget: Option<render::UploadCost>, step: f64, frames: usize) ->
         flown.frames_to_drain += 1;
         patience.wait(&world, || "the backlog does not drain".into());
     }
+    flown.largest_follow = world.stats().largest_follow;
+    flown.largest_batch = world.stats().largest_batch;
     flown
 }
 
@@ -2912,4 +2960,106 @@ fn flying_with_more_work_than_the_budget_drains_the_backlog_takes_in_arrivals_an
         );
         assert!(flown.frames_to_drain <= 4 * frames, "{flown:?}");
     }
+}
+
+#[test]
+fn a_flight_with_a_budget_above_its_largest_operations_is_held_to_the_budget_the_crossing_operation_and_the_first_batch()
+ {
+    // The sizes of the largest follow step and batch of arrivals, found out with nothing held
+    // back (patch costs, whatever the budget decides).
+    let (step, frames) = (24.0, 120);
+    let control = fly_counting(None, step, frames);
+    eprintln!("control {control:?}");
+    let largest = |a: render::UploadCost, b: render::UploadCost| render::UploadCost {
+        bytes: a.bytes.max(b.bytes),
+        writes: a.writes.max(b.writes),
+    };
+    let one = largest(control.largest_follow, control.largest_batch);
+    assert!(one.bytes > 0 && one.writes > 0, "{control:?}");
+    // Above any one operation (by a tenth), and under what a frame of the flight adds (a follow
+    // step and the batches of the round: the control's worst frame is more than that).
+    let budget = render::UploadCost {
+        bytes: one.bytes + one.bytes / 10,
+        writes: one.writes + one.writes / 10 + 1,
+    };
+    assert!(control.worst.bytes > budget.bytes, "{control:?}");
+    let flown = fly_counting(Some(budget), step, frames);
+    eprintln!("{budget:?}: {flown:?}");
+    assert!(flown.cut > 0, "the budget holds nothing back: {flown:?}");
+    assert_eq!((flown.rebuilds, flown.holes), (0, 0), "{flown:?}");
+    // What a frame may take, from the sizes that this run measured: the budget, and the one
+    // operation (a follow step or a batch) that took what waits to it, and the first batch of the
+    // round, which is taken whatever following added. What the patch lists, once each, and the
+    // copies (joining ranges only ever makes fewer); the words between joined ranges are held to
+    // what a copy may hold.
+    let crossing = largest(flown.largest_follow, flown.largest_batch);
+    let first = flown.largest_batch;
+    let mut over_the_budget = 0;
+    for (frame, &(listed, writes, gaps)) in flown.uploads.0.iter().enumerate() {
+        assert!(
+            listed <= budget.bytes + crossing.bytes + first.bytes,
+            "update {frame}: {listed} bytes, over {budget:?} and the operations {crossing:?}, {first:?}"
+        );
+        assert!(
+            u64::from(writes) <= u64::from(budget.writes + crossing.writes + first.writes),
+            "update {frame}: {writes} copies, over {budget:?} and the operations {crossing:?}, {first:?}"
+        );
+        assert!(
+            gaps <= u64::from(writes) * render::scene::COPY_GAP as u64 * 4,
+            "update {frame}: {gaps} bytes between copies"
+        );
+        over_the_budget +=
+            usize::from(listed > budget.bytes || u64::from(writes) > u64::from(budget.writes));
+    }
+    eprintln!(
+        "{over_the_budget} of {} updates over the plain budget",
+        flown.uploads.0.len()
+    );
+}
+
+#[test]
+fn after_one_batch_over_the_budget_further_batches_are_taken_again_once_the_backlog_has_drained() {
+    // A budget under what the fill's biggest batch costs, and over what a batch of a flight at a
+    // walking pace does: the fill goes over it once or more, and the flight after is no reason
+    // to take one batch a round. (The estimate that one more batch needs room for was the most a
+    // batch had ever cost, so after the fill it was over the budget with nothing waiting, and
+    // every round took the one batch that it is given and no more.)
+    let budget = render::UploadCost {
+        bytes: 100 << 10,
+        writes: 200,
+    };
+    let (mut world, _server, camera) = spawned_world(Run::Stepped);
+    world.count_exactly();
+    world.worker().set_upload_budget(budget);
+    let mut patience = Patience::new(Duration::from_secs(180));
+    loop {
+        world.recentre(camera.position).unwrap();
+        if idle(&world) && !world.stats().throttled {
+            break;
+        }
+        patience.wait(&world, || "the resident set does not fill".into());
+    }
+    let big = world.stats().largest_batch;
+    assert!(
+        big.bytes > budget.bytes,
+        "no batch was over the budget: {big:?}"
+    );
+    // The backlog is gone: nothing waits, and nothing is held back.
+    assert!(idle(&world) && !world.stats().throttled);
+    let (ahead, _) = tangents(camera.horizon_up);
+    let (mut moved, frames) = (camera.position, 120);
+    let before = world.stats().work;
+    for _ in 0..frames {
+        moved = std::array::from_fn(|a| moved[a] + ahead[a] * 2.0);
+        let position = over_the_ground(&world.store(), moved);
+        world.recentre(position).unwrap();
+        pace(&world, FRAME);
+    }
+    let batches = world.stats().work.pack_steps - before.pack_steps;
+    eprintln!("{batches} batches in {frames} frames, after a batch of {big:?}");
+    // More than the one a round is always given.
+    assert!(
+        batches as usize >= frames + frames / 4,
+        "{batches} batches in {frames} frames: one a round, as if the budget were still over"
+    );
 }

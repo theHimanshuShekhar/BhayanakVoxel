@@ -159,15 +159,21 @@ except `timing`.
   its own: neighbouring ranges of a patch are joined into one when they are within `COPY_GAP`
   words), `bytes_p99` and `writes_p99` (99th percentile, nearest rank, of the frames that had an
   update), `patch_bytes` (what patches wrote, a rebuild's all-buffers write excluded), `rebuilds`
-  and `updates`. **Two counts are compared, and they are independent.** One is worked out
-  from the patch before anything is written (`render::tracer::upload_cost`, which these fields
-  are made of: `RingPatch::cost`, bytes and copies of the ranges after joining, header included).
-  The other is counted by the tracer **where it writes to the staging belt**: the header's bytes
-  and one copy, then the bytes and one copy of each range, the words between joined ranges
-  included (`timing.gpu_uploaded_bytes` and `timing.gpu_uploaded_writes`, summed over the
-  updates). The smoke test checks that the two agree, in bytes and in copies; that is the check
-  that `cost()` is what the tracer writes, and it is not a count of what a GPU executed (the belt
-  and the driver are below it). A buffer that grew (#145) copies the old one on the GPU
+  and `updates`. **Two counts are compared, and they are not independent of
+  everything.** One is worked out from the patch before anything is written
+  (`render::tracer::upload_cost`, which these fields are made of: `RingPatch::cost` sums the
+  bytes and the copies of `RingPatch::copies()`, the ranges after joining, and the header). The
+  other is counted by the tracer **where it writes to the staging belt**: the header's bytes and
+  one copy, then the bytes and one copy of each range, the words between joined ranges included
+  (`timing.gpu_uploaded_bytes` and `timing.gpu_uploaded_writes`, summed over the updates). **Both
+  loop over the same `RingPatch::copies()` and use the same header size.** So the equality (the
+  smoke test checks bytes and copies) shows that the tracer writes every range that `copies()`
+  lists and the header, once each, and that `cost()`'s arithmetic matches the writes; if
+  `copies()` missed or mangled a range, both counts would agree and be wrong. That the ranges
+  cover the change, word for word, is checked by `GpuCopy::assert_is` in the stepped tests
+  (`streaming_tests.rs`): a copy of the buffers written from `copies()` as the tracer writes them,
+  compared with the frame thread's scene after every frame. None of it is a count of what a GPU
+  executed (the belt and the driver are below it). A buffer that grew (#145) copies the old one on the GPU
   (`copy_buffer_to_buffer`): that is not an upload, is in neither count, and is counted apart
   (`timing.gpu_grown_bytes`). The upload budget (`scene_worker::UPLOAD_BUDGET`) adds `cut_frames`, the frames in
   which the scene thread held work back for it, and `longest_backlog_frames`, the most such frames
@@ -479,17 +485,20 @@ is made there (below): the run's **Edit latency**. Its frames are not those of a
     word). The buffers are allocated whole and change only when one grows (#145), so this is the
     most over the run, after the growths. This is the VRAM the scene takes (at full size the
     bricks buffer alone is about 587 MB). Reported, not gated.
-  - `scene_gpu_peak_growth_mib` and `scene_host_peak_growth_mib`: **the peak during a growth**,
-    which `scene_reserved_mib` is not (it is the size after). While a buffer grows the old one and
-    the new one both exist: the GPU's is the buffers' bytes before the growth plus the new
-    buffers made (`Tracer::peak_scene_bytes`, the most over the run, and at least the size at the
-    end); the frame thread's is its copy's reserved bytes after the growth plus the old words of
+  - `scene_gpu_peak_growth_mib`, `scene_host_peak_growth_mib` and `scene_gpu_peak_rebuild_mib`:
+    **the peak during a growth**, which `scene_reserved_mib` is not (it is the size after). While
+    a buffer grows the old one and the new one both exist: the GPU's is the buffers' bytes before
+    the growth plus the new buffers made (`Tracer::peak_growth_bytes`, the most over the run's
+    growths; 0 if none grew). **A rebuild is apart**: while a rebuilt scene is made (a jump or
+    other bands) the old scene's buffers and the new ones both exist, which is
+    `scene_gpu_peak_rebuild_mib` (`Tracer::peak_rebuild_bytes`; 0 if there was none). The frame
+    thread's is its copy's reserved bytes after the growth plus the old words of
     the buffers that grew in that frame, at the most over the frames, which is what the process
     holds if the allocator cannot extend the `Vec` in place and copies (an upper bound; the
     scene thread's own copy, which grew a round before, and the outbox's copies are not in it).
     Both are **reported and not gated**: `scene_used_peak_mib` and its limit are what the memory
     gate is on, unchanged, and it counts the words in use, not the room a growth reserves. ADR
-    0004's accounting is of the sizes after a growth; these two are what it has to add during one.
+    0004's accounting is of the sizes after a growth; these are what it has to add during a growth and during a rebuild.
   - `store_peak_bricks` (the store's size as its budget counts it, looked at every 6 frames) and
     `store_limit_bricks` (the most it may hold before eviction starts: the budget with its
     overflow).
@@ -530,25 +539,34 @@ The budget (`scene_worker::UPLOAD_BUDGET`: 8 MiB and 128 belt copies) limits wha
 **adds** to the outbox and the frame thread has not taken, not what a frame takes. This is the one
 place that says what a frame may take beyond it:
 
-- A frame takes up to **the budget, plus one unsplit operation, plus the gap words**: the one
-  batch of arrivals or follow step that took the backlog across the budget (the check is between
-  operations, and a patch is whole, since a frame must not draw a brick whose words are not on the
-  GPU), and the words between ranges joined into one copy (`COPY_GAP`).
+- A frame takes up to **the budget, plus the one operation that took what waits to it, plus the
+  first batch of arrivals of the round, plus the gap words**. The check is between operations, and
+  a patch is whole (a frame must not draw a brick whose words are not on the GPU), so the
+  operation (a follow step or a batch of arrivals) that takes what waits to the budget is in the
+  frame. The first batch of arrivals of a round is taken whenever the outbox is empty, so that the
+  follow steps do not starve the arrivals: **if a follow step crossed the budget, the frame carries
+  two operations beyond it**, the follow step and that batch. The gap words are those between
+  ranges joined into one copy (`COPY_GAP`). The copies of a frame are at most the sum of its
+  operations' (joining only makes fewer).
 - **Not budgeted at all:** an Edit and its coarse remakes (the Edit is packed ahead of the backlog,
   so ADR 0006's bound holds); a jump and other bands, including the coarsening at the memory cap
   (the scene is packed again and uploaded whole: `Rebuilt`); and the copies of a growth, old buffer
   to new (they are on the GPU, not uploads, and are in no byte count).
 
-**Whether "the budget plus one operation" meets the issue's "a frame's upload is bounded by the
+**Whether "the budget plus the crossing operation plus the round's first batch" meets the issue's "a frame's upload is bounded by the
 budget" is not settled here; it is the project owner's decision.** What is needed to judge it is
 in the report, per path of the real-time mode: the largest frame's bytes and copies
 (`upload.bytes_max`, `upload.writes_max`), and `upload.over_budget`, the frames whose bytes were
-over `UPLOAD_BUDGET.bytes` or whose copies were over `UPLOAD_BUDGET.writes`, counted under the
-**first** cause that applies, in this order: `jump` or `bands` (a rebuild, by the scene's rebuild
-reason), `edit` (the frame took the newest Edit in), `growth` (a buffer grew in the frame), or
-`operation` (none of those: the operation that crossed it, and the gap words). The stepped tests
-measure the same on the test Planet with a small budget (`streaming_tests.rs`), and with one
-well over the largest operation the plain budget holds in every frame.
+over `UPLOAD_BUDGET.bytes` or whose copies were over `UPLOAD_BUDGET.writes` (a rebuild of less
+than the budget is not over it, whatever it is), each counted under one cause, the **first** that
+applies, in this order: `jump` or `bands` (a rebuild, by the scene's rebuild reason), `edit` (the
+frame took the newest Edit in), `growth` (a buffer grew in the frame), or `operation` (none of
+those: the operations that took the budget, and the gap words). The causes are exclusive and add
+up to `over_budget.frames`. The stepped tests measure the same on the test Planet: a fill with a
+still camera and a small budget, one with a budget well over the largest operation (the plain
+budget holds in every frame of it), and a flight with a budget a tenth over its largest follow
+step and batch, in which every update is within the bound above, worked out from the sizes the
+test measures (and the budget cuts 116 of its 120 frames).
 
 ### The gates
 

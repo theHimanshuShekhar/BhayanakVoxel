@@ -434,8 +434,11 @@ fn check_streaming(streaming: &Value) {
     // Two counts of what an update writes: the tracer's, made where it writes to the staging belt
     // (the header and each copy, the words between joined ranges included), and the one worked out
     // from the patch before it is written (`upload_cost`, what the Linux and Windows runners
-    // compare, made without a GPU). That they agree is what ties the second to a GPU. The copies of
-    // a growth, old buffer to new, are counted apart and are in neither.
+    // compare, made without a GPU). Both go over `RingPatch::copies()` and use the same header
+    // size, so that they agree shows that the tracer writes each listed range and the header once
+    // and that `cost()` adds them up as written, not that `copies()` is right (the stepped tests'
+    // `GpuCopy::assert_is` checks that). The copies of a growth, old buffer to new, are counted
+    // apart and are in neither.
     let timing = &streaming["timing"];
     assert_eq!(timing["deterministic"], false);
     assert_eq!(timing["gpu_uploaded_bytes"], upload["bytes"]["total"]);

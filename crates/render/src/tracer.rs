@@ -257,9 +257,13 @@ pub struct Tracer {
     /// How long the last [`Tracer::update_scene`] spent making the buffers that grew (making them
     /// and recording the copies), on the host.
     last_grow_time: std::time::Duration,
-    /// The most bytes of GPU memory the scene's buffers have taken, counting the old buffer and the
-    /// new one both while a buffer that grew is copied into its bigger one.
-    peak_scene_bytes: u64,
+    /// The most bytes of GPU memory the scene's buffers have taken while a buffer grew: what they
+    /// held before, and the new buffers made, with the old buffer and the new one both there while
+    /// the copy into the bigger one is made. 0 if none has grown.
+    peak_growth_bytes: u64,
+    /// The same for a rebuild (new buffers for all of the scene, made while the old scene still
+    /// exists): what the old held, and what the new does. 0 if there has been none.
+    peak_rebuild_bytes: u64,
     /// The staging memory that patches of rings are written through: a few big chunks, handed back
     /// by the GPU and used again, instead of a staging buffer for each write.
     belt: wgpu::util::StagingBelt,
@@ -426,7 +430,9 @@ struct SceneBuffers {
     /// Bytes of GPU memory in the five buffers.
     bytes: u64,
     /// How many times each of `table`, `regions`, `brick_refs` and `bricks` has been replaced by a
-    /// bigger buffer: a buffer that did not grow has the generation it had.
+    /// bigger buffer: a buffer that did not grow has the generation it had. **A full
+    /// [`SceneBuffers::new`] (a rebuild) makes all of them again and starts at 0**: a count of
+    /// growths is only meaningful between rebuilds.
     generation: [u32; 4],
     group: wgpu::BindGroup,
 }
@@ -672,7 +678,8 @@ impl Tracer {
             last_writes: 0,
             last_grown: 0,
             last_grow_time: std::time::Duration::ZERO,
-            peak_scene_bytes: 0,
+            peak_growth_bytes: 0,
+            peak_rebuild_bytes: 0,
             belt,
         })
     }
@@ -768,8 +775,9 @@ impl Tracer {
         update: &SceneUpdate,
     ) -> Result<()> {
         self.accumulator.reset();
-        // Counted where each write is made, not worked out from the patch: [`upload_cost`] is the
-        // other count, and the two are compared.
+        // Counted where each write is made, not summed from the patch's cost: [`upload_cost`] is
+        // the other count, and the two are compared. Both go over `RingPatch::copies()`, so the
+        // comparison does not check that list (the stepped tests' `GpuCopy::assert_is` does).
         let mut written = 0;
         let mut writes = 0;
         self.last_writes = 0;
@@ -779,7 +787,7 @@ impl Tracer {
             SceneUpdate::Rebuilt => {
                 let before = self.scene.bytes;
                 self.scene = SceneBuffers::new(device, &self.scene_layout, scene)?;
-                self.peak_scene_bytes = self.peak_scene_bytes.max(before + self.scene.bytes);
+                self.peak_rebuild_bytes = self.peak_rebuild_bytes.max(before + self.scene.bytes);
                 self.uploaded += self.scene.bytes;
                 return Ok(());
             }
@@ -796,7 +804,7 @@ impl Tracer {
                     self.scene
                         .grow(device, &self.scene_layout, &mut encoder, scene, &mut extra)?;
                 self.last_grow_time = grown_at.elapsed();
-                self.peak_scene_bytes = self.peak_scene_bytes.max(before + extra);
+                self.peak_growth_bytes = self.peak_growth_bytes.max(before + extra);
                 let buffers = &self.scene;
                 if patch.levels {
                     let header = SceneHeader::new(scene);
@@ -843,7 +851,8 @@ impl Tracer {
                 {
                     let before = self.scene.bytes;
                     self.scene = SceneBuffers::new(device, &self.scene_layout, scene)?;
-                    self.peak_scene_bytes = self.peak_scene_bytes.max(before + self.scene.bytes);
+                    self.peak_rebuild_bytes =
+                        self.peak_rebuild_bytes.max(before + self.scene.bytes);
                     self.uploaded += self.scene.bytes;
                     return Ok(());
                 }
@@ -900,12 +909,18 @@ impl Tracer {
         self.scene.generation
     }
 
-    /// The most bytes of GPU memory the scene's buffers have taken at once since the tracer was
-    /// made, counting the old buffer and the new one both while one that grew is copied into its
-    /// bigger one, and the old scene and the new while a rebuilt one is made. Never less than
-    /// [`Tracer::scene_bytes`].
-    pub fn peak_scene_bytes(&self) -> u64 {
-        self.peak_scene_bytes.max(self.scene.bytes)
+    /// The most bytes of GPU memory the scene's buffers have taken at once **while a buffer grew**
+    /// since the tracer was made: what they held before, and the new buffers, the old buffer and
+    /// the new one both there while the copy is made. 0 if none has grown. A rebuild is not in it
+    /// ([`Tracer::peak_rebuild_bytes`]).
+    pub fn peak_growth_bytes(&self) -> u64 {
+        self.peak_growth_bytes
+    }
+
+    /// The most bytes of GPU memory the scene's buffers have taken at once **while a rebuilt scene
+    /// was made** (the old scene and the new): 0 if there has been no rebuild.
+    pub fn peak_rebuild_bytes(&self) -> u64 {
+        self.peak_rebuild_bytes
     }
 
     /// Bytes of GPU memory that the Planet's bricks take: the five buffers of the scene.

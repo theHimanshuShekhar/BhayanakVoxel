@@ -481,7 +481,7 @@ fn a_scene_that_outgrows_a_buffer_grows_it_and_not_the_rest() {
                     gpu.scene_bytes()
                 );
                 // The old and the new buffer were both there while the copy was made.
-                assert!(gpu.peak_scene_bytes() > gpu.scene_bytes() - gpu.last_grown_bytes());
+                assert!(gpu.peak_growth_bytes() > gpu.scene_bytes() - gpu.last_grown_bytes());
             }
         }
         if step % 20 == 0 {
@@ -493,6 +493,9 @@ fn a_scene_that_outgrows_a_buffer_grows_it_and_not_the_rest() {
         }
     }
     eprintln!("{growths} growths copied {grown} bytes, {rebuilt} rebuilds, kinds {kinds:?}");
+    // No update was a rebuild (which makes all the buffers again, and would reset the counts the
+    // checks above are made against): what grew, grew alone.
+    assert_eq!(rebuilt, 0, "the scene was packed again {rebuilt} times");
     assert!(growths > 0, "no buffer grew");
     assert!(kinds[2] + kinds[3] > 0, "neither refs nor bricks grew");
 }
