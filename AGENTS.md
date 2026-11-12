@@ -18,4 +18,4 @@ Which CI jobs gate merges and which do not, and how to bump the pinned Rust and 
 
 ### Benchmarking
 
-PRs that can change GPU timings (shaders, passes, the tracer, GPU uploads) get the `needs-benchmark` label; the orchestrating agent runs `client bench` on the PR's Windows artifact on the 4090. CPU-only PRs merge on green CI; ones that touch streaming get `needs-stream-bench` once the streaming bench exists. See `docs/agents/benchmarking.md`.
+PRs that can change GPU timings (shaders, passes, the tracer, GPU uploads) get the `needs-benchmark` label; the orchestrating agent runs `client bench` on the PR's Windows artifact on the 4090. CPU-only PRs merge on green CI; ones that touch streaming (the loader, prefetch, eviction, generation) get `needs-stream-bench`, and the agent runs `client bench --streaming --real-time` on the 4090 (the full-size real-time run, gated, exit status 2). See `docs/agents/benchmarking.md`.

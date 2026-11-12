@@ -86,6 +86,51 @@ pub struct GpuInfo {
     pub backend: String,
 }
 
+/// What the CPU spent on the last [`Offscreen::update_scene`], by part: for finding out where a slow
+/// frame's time went.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct UpdateTimes {
+    /// Queuing the writes to the scene's buffers (`Queue::write_buffer`: a copy into a staging
+    /// buffer each), or for a rebuild making the new buffers and filling them.
+    pub write: std::time::Duration,
+    /// Sending them: the submit with no commands that follows (not made if flushing is off).
+    pub flush: std::time::Duration,
+    /// Calls of `write_buffer`: each is a copy on the GPU with a barrier of its own. 0 for a
+    /// rebuild.
+    pub writes: u32,
+}
+
+/// The GPU's own time for the passes of one frame, from the timestamps the passes wrote (the
+/// device's clock, not wall time).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct GpuPasses {
+    /// The primary pass and the upscale pass, in milliseconds each: None if the frame has no such
+    /// time.
+    pub primary_ms: Option<f64>,
+    pub upscale_ms: Option<f64>,
+    /// From the start of the frame's first pass to the end of its last, gaps between them included.
+    pub total_ms: Option<f64>,
+}
+
+/// What the last [`Offscreen::draw_upscaled_timed`] spent, by part. The frame is over when the GPU
+/// is done, which is `wait`; the CPU's share is `encode` and `submit`.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct DrawTimes {
+    /// Making the commands: the passes' encoding, the timer queries' resolving, and finishing the
+    /// command buffer.
+    pub encode: std::time::Duration,
+    /// `Queue::submit` of them.
+    pub submit: std::time::Duration,
+    /// Waiting for the GPU: the passes' times being read back, and then the device having nothing
+    /// left to do. This is the GPU's time (the writes of the update before it, and the frame), and
+    /// whatever else the GPU was doing.
+    pub wait: std::time::Duration,
+    /// What the GPU says its passes of **this frame** took (see [`Profiler::times_of_this_frame`]):
+    /// None if the device has no timers, or this frame's own times did not come in; never an
+    /// earlier frame's.
+    pub gpu: Option<GpuPasses>,
+}
+
 /// The renderer with an image of its own instead of a window.
 pub struct Offscreen {
     info: GpuInfo,
@@ -97,6 +142,8 @@ pub struct Offscreen {
     sun: Sun,
     /// Whether `update_scene` sends its writes at once; see `set_flush_scene_updates`.
     flush_scene_updates: bool,
+    last_update: UpdateTimes,
+    last_draw: DrawTimes,
 }
 
 impl Offscreen {
@@ -139,20 +186,39 @@ impl Offscreen {
             target,
             sun: Sun::default(),
             flush_scene_updates: true,
+            last_update: UpdateTimes::default(),
+            last_draw: DrawTimes::default(),
         })
     }
 
     /// Brings the GPU copy of the Planet up to date with `scene`, after `update` (the result of
     /// [`Scene::update`]) changed it. This starts the reference image over.
     pub fn update_scene(&mut self, scene: &Scene, update: &SceneUpdate) -> Result<()> {
+        let began = std::time::Instant::now();
         self.tracer
             .update_scene(&self.device, &self.queue, scene, update)?;
+        let written = began.elapsed();
         // The writes are queued until the next submit: send them now, so that their cost is the
         // update's and not that of the frame drawn next.
         if self.flush_scene_updates {
             self.queue.submit(std::iter::empty());
         }
+        self.last_update = UpdateTimes {
+            write: written,
+            flush: began.elapsed() - written,
+            writes: self.tracer.last_writes(),
+        };
         Ok(())
+    }
+
+    /// The parts of the CPU's time in the last [`Offscreen::update_scene`].
+    pub fn last_update_times(&self) -> UpdateTimes {
+        self.last_update
+    }
+
+    /// The parts of the last [`Offscreen::draw_upscaled_timed`].
+    pub fn last_draw_times(&self) -> DrawTimes {
+        self.last_draw
     }
 
     /// Whether [`Offscreen::update_scene`] sends the writes to the GPU at once (the default), or
@@ -254,6 +320,14 @@ impl Offscreen {
     /// pictures are not looked at (the bench), where reading back every output image (15 MB at
     /// 1440p) would be most of the CPU time of a frame and leave the GPU idle between frames.
     pub fn draw_upscaled(&mut self, camera: &Camera) {
+        self.draw_upscaled_timed(camera);
+    }
+
+    /// [`Offscreen::draw_upscaled`], and how long the CPU took to encode the frame and submit it,
+    /// before it waited for the GPU: what the frame thread of a window spends on drawing (the wait
+    /// is the GPU's time, which the window does not wait for on the CPU).
+    pub fn draw_upscaled_timed(&mut self, camera: &Camera) -> std::time::Duration {
+        let began = std::time::Instant::now();
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
@@ -268,13 +342,39 @@ impl Offscreen {
             &self.target,
         );
         self.profiler.resolve(&mut encoder);
+        let commands = encoder.finish();
+        let encoded = began.elapsed();
         // The uniforms of the next frame are written over these.
-        self.queue.submit([encoder.finish()]);
+        self.queue.submit([commands]);
+        let submitted = began.elapsed();
         self.profiler.collect(&self.device, true);
         // Without timers `collect` does not wait, and the frame is not over until it has.
         self.device
             .poll(wgpu::PollType::wait_indefinitely())
             .expect("device poll failed");
+        let waited = began.elapsed() - submitted;
+        let gpu = self.profiler.times_of_this_frame().map(|frame| {
+            let timings = self.profiler.timings();
+            let named = |name: &str| {
+                frame
+                    .passes
+                    .iter()
+                    .find(|&&(pass, _)| timings.passes()[pass].name == name)
+                    .map(|&(_, ms)| ms)
+            };
+            GpuPasses {
+                primary_ms: named("primary"),
+                upscale_ms: named("upscale"),
+                total_ms: frame.total,
+            }
+        });
+        self.last_draw = DrawTimes {
+            encode: encoded,
+            submit: submitted - encoded,
+            wait: waited,
+            gpu,
+        };
+        submitted
     }
 
     /// The G-buffer of the last frame of primary visibility ([`Offscreen::render`] or

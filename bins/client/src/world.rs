@@ -13,7 +13,7 @@ use sim::{Predictor, dig_seconds, target_hardness};
 use crate::clock::Clock;
 use crate::ghost::Ghost;
 use crate::loader::Loader;
-use crate::scene_worker::{LoaderStats, SceneWorker, Stats};
+use crate::scene_worker::{LoaderStats, SceneWorker, Spent, Stats};
 use crate::tool::{Tool, rotation_for};
 
 /// How many frames in a row the view must be unchanged before the reference image is taken to be
@@ -173,6 +173,9 @@ pub struct World {
     /// [`World::edit_taken`]).
     edit_ticket: u64,
     taken_done: u64,
+    /// Edits made so far: those that the client did not know the server would turn down (see
+    /// [`World::edits_made`]).
+    edits_made: u64,
     /// The longest a result that the scene thread published waited, since it was last asked for,
     /// when the counts are exact (see [`World::take_outbox_wait`]).
     outbox_wait: std::time::Duration,
@@ -266,6 +269,7 @@ impl World {
             resim: std::time::Duration::ZERO,
             unshown_edit: None,
             edit_ticket: 0,
+            edits_made: 0,
             taken_done: 0,
             outbox_wait: std::time::Duration::ZERO,
             edit_wait: EDIT_WAIT,
@@ -314,6 +318,13 @@ impl World {
     #[cfg(test)]
     pub fn is_stepped(&self) -> bool {
         self.clock.is_stepped()
+    }
+
+    /// Edits made in this world so far. [`World::edit`] makes none when nothing is aimed at or when
+    /// the client knows the server would turn it down, so a caller that needs to know which of the
+    /// two happened compares this before and after.
+    pub fn edits_made(&self) -> u64 {
+        self.edits_made
     }
 
     /// Whether the scene thread has packed the newest Edit made ([`World::edit`]) and this world has
@@ -376,10 +387,30 @@ impl World {
             .set_budget(budget);
     }
 
-    /// Has the scene thread count soft misses in [`Stats::soft_misses`] (a diagnostic).
-    #[cfg(test)]
+    /// Has the scene thread count soft misses in [`Stats::soft_misses`], a few times a second (a
+    /// diagnostic: the real-time bench's, #162).
     pub fn count_soft_misses(&self) {
-        self.worker().count_soft_misses(true);
+        if let Some(worker) = &self.worker {
+            worker.count_soft_misses(true);
+        }
+    }
+
+    /// Has the scene thread look at every split brick for a hole every few seconds, and the time of
+    /// the parts of its rounds be added up (see [`World::scene_thread_time`]): what the real-time
+    /// bench asks for (#162).
+    pub fn measure_scene_thread(&self) {
+        if let Some(worker) = &self.worker {
+            worker.count_holes(true);
+            worker.time_work(true);
+        }
+    }
+
+    /// How long the scene thread has spent on the parts of its rounds since
+    /// [`World::measure_scene_thread`].
+    pub fn scene_thread_time(&self) -> Spent {
+        self.worker
+            .as_ref()
+            .map_or_else(Spent::default, SceneWorker::spent)
     }
 
     /// Has the scene thread count the soft misses (by level) and the holes for every publish, so
@@ -388,6 +419,47 @@ impl World {
         if let Some(worker) = &self.worker {
             worker.count_exactly();
         }
+    }
+
+    /// Has the scene thread count everything exactly once, for the scene as it is: the soft misses
+    /// by level, the holes and the words by level (see [`World::count_exactly`]), and takes what it
+    /// published, which the caller copies to the GPU. For the real-time bench, at full size, where
+    /// counting at every publish is a pass over every brick each time.
+    pub fn count_once_exactly(&mut self) -> Result<Option<SceneUpdate>, RingsFull> {
+        let Some(worker) = &self.worker else {
+            return Ok(None);
+        };
+        worker.count_exactly();
+        // A job is published with the counts of its own round, which are exact now.
+        let counted = worker.edit(Vec::new());
+        worker.stop_counting_exactly();
+        counted?;
+        self.take_ready(true)
+    }
+
+    /// Has the scene thread count the soft misses now, and look at every split brick for a hole if
+    /// `holes`, for the camera it was last told and what it has taken in, and takes what it published,
+    /// which the caller copies to the GPU. For the real-time bench: a look at the end of each
+    /// path, and a count of the soft misses that was made after the camera stopped (see
+    /// [`SceneWorker::look_now`]).
+    pub fn look_now(&mut self, holes: bool) -> Result<Option<SceneUpdate>, RingsFull> {
+        let Some(worker) = &self.worker else {
+            return Ok(None);
+        };
+        worker.look_now(holes)?;
+        self.take_ready(true)
+    }
+
+    /// Whether the scene thread is looking for holes at this moment (see
+    /// [`SceneWorker::looking_for_holes`]); false with no scene thread.
+    pub fn looking_for_holes(&self) -> bool {
+        self.worker.as_ref().is_some_and(|w| w.looking_for_holes())
+    }
+
+    /// Bytes the scene's buffers take, used or not: what the GPU copy reserves (see
+    /// [`Scene::reserved_bytes`]).
+    pub fn reserved_bytes(&self) -> u64 {
+        self.scene.reserved_bytes()
     }
 
     /// Holds back (or lets go of) what the loader generates: while paused, nothing it generated
@@ -779,6 +851,7 @@ impl World {
         let Ok((request, changed)) = self.predictor.edit_checked(op) else {
             return Ok(None);
         };
+        self.edits_made += 1;
         self.link.send(request)?;
         let Some(worker) = &self.worker else {
             return Ok(self.refresh(&changed)?);

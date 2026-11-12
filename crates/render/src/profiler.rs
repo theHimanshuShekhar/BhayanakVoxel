@@ -17,7 +17,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Instant;
 
-use crate::timing::{Slot, Timings, frame_times};
+use crate::timing::{FrameTimes, Slot, Timings, frame_times};
 
 /// Timestamp queries are all this needs: they are written by the pass descriptors, not from
 /// inside passes or encoders.
@@ -98,6 +98,9 @@ pub struct Profiler {
     resolved_to: Option<usize>,
     sequence: u64,
     last_frame: Option<Instant>,
+    /// The times of the frame that the last [`collect`](Self::collect) was called for, if its own
+    /// readback was in by then (see [`Profiler::times_of_this_frame`]).
+    this_frame: Option<FrameTimes>,
 }
 
 impl Profiler {
@@ -114,6 +117,7 @@ impl Profiler {
             resolved_to: None,
             sequence: 0,
             last_frame: None,
+            this_frame: None,
         }
     }
 
@@ -125,6 +129,16 @@ impl Profiler {
     /// The times so far. They trail the frames being drawn by a frame or two.
     pub fn timings(&self) -> &Timings {
         &self.timings
+    }
+
+    /// The GPU times of the frame that the last [`collect`](Self::collect) was called for, **that
+    /// frame's own**: `Some` only if that call took in the readback of the frame it was made after
+    /// (a `wait` makes that so, unless the readback failed, or the frame was not timed because the
+    /// ring was full, or there are no timers). The latest of [`Profiler::timings`] is not this: it
+    /// can be an earlier frame's, which is what a caller that needs to know which frame a time
+    /// belongs to must not read.
+    pub fn times_of_this_frame(&self) -> Option<&FrameTimes> {
+        self.this_frame.as_ref()
     }
 
     /// Keeps every time from now on, for a report over a whole run (see
@@ -233,13 +247,17 @@ impl Profiler {
     /// takes in those of earlier frames that have arrived. With `wait`, this blocks until this
     /// frame's are in (for tests and tools that render one frame at a time).
     pub fn collect(&mut self, device: &wgpu::Device, wait: bool) {
+        self.this_frame = None;
         let Some(q) = &mut self.queries else { return };
+        // The sequence of the frame this call is for, to tell its times from those of earlier ones.
+        let mut mine = None;
         if let Some(index) = self.resolved_to.take() {
             let readback = &mut q.ring[index];
             let flight = readback
                 .in_flight
                 .as_mut()
                 .expect("resolve left a frame in flight");
+            mine = Some(flight.sequence);
             let state = Arc::clone(&flight.state);
             flight.mapping = true;
             readback
@@ -287,8 +305,11 @@ impl Profiler {
             let stamps: Vec<u64> = bytemuck::cast_slice(&range).to_vec();
             drop(range);
             readback.buffer.unmap();
-            self.timings
-                .record_frame(&frame_times(&stamps, &flight.slots, q.period_ns));
+            let times = frame_times(&stamps, &flight.slots, q.period_ns);
+            self.timings.record_frame(&times);
+            if mine == Some(flight.sequence) {
+                self.this_frame = Some(times);
+            }
         }
     }
 }

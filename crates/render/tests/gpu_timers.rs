@@ -117,3 +117,31 @@ fn a_device_without_timestamp_queries_renders_the_same_with_no_times() {
             .render(&overhead())
     );
 }
+
+#[test]
+fn a_drawn_frames_gpu_times_are_its_own_or_absent() {
+    let mut gpu = offscreen();
+    for frame in 1..=4u64 {
+        gpu.draw_upscaled_timed(&overhead());
+        let draw = gpu.last_draw_times();
+        if gpu.timers_supported() {
+            let times = draw
+                .gpu
+                .expect("this frame's own times are in once it has waited");
+            let (primary, upscale, total) = (
+                times.primary_ms.expect("the primary pass has a time"),
+                times.upscale_ms.expect("the upscale pass has a time"),
+                times.total_ms.expect("the frame has a span"),
+            );
+            // The span holds both passes, and they are the latest the timings have: one more time a
+            // frame, none skipped and none from another frame.
+            assert!(total >= primary && total >= upscale, "{times:?}");
+            let timings = gpu.timings();
+            assert_eq!(timings.pass("primary").unwrap().times.count(), frame);
+            assert_eq!(timings.pass("primary").unwrap().times.last(), Some(primary));
+            assert_eq!(timings.pass("upscale").unwrap().times.last(), Some(upscale));
+        } else {
+            assert_eq!(draw.gpu, None, "no timers, no times");
+        }
+    }
+}

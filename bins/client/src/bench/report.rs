@@ -5,10 +5,15 @@ use serde::Serialize;
 
 use super::budget::{Budgets, Status, status};
 use super::edits::EditsReport;
+use super::realtime::RealTimeReport;
 use super::stats::Stats;
 use super::stream::StreamReport;
 
-pub const SCHEMA_VERSION: u32 = 7;
+/// 8 added `streaming_real_time` (#162). Reports of the earlier versions are the same without it.
+/// 9 added the slow-frame fields to its paths (`frames_over_limit`, `slowest`, `end_look_ms`) and
+/// made a run's `edit_latency` null when there was no Edit (`edit_not_made` says why).
+/// 10 added the GPU's own pass times of a slow frame and the frames over the limit by update kind.
+pub const SCHEMA_VERSION: u32 = 10;
 
 /// One timed thing (a pass, or the GPU total of a profiler frame) in one mode, against its
 /// budget. In reference mode a profiler frame is one sample, so the entries of that mode have
@@ -293,6 +298,10 @@ pub struct Report {
     /// The streaming mode (`--streaming`): counts made by the stepped, deterministic mode on the
     /// test Planet, and the GPU's timing of it, which is not deterministic; null without the flag.
     pub streaming: Option<StreamReport>,
+    /// The real-time mode of the streaming bench (`--streaming --real-time`, #162): the full-size
+    /// Planet with real threads, the paths, the gates and the sizing at full size, over several
+    /// runs; not deterministic. Null without the flag.
+    pub streaming_real_time: Option<RealTimeReport>,
 }
 
 #[cfg(test)]
@@ -472,6 +481,7 @@ mod tests {
             budgets: summarize("embedded", &budgets(), &modes(0.5), &[], &[]),
             edits: None,
             streaming: None,
+            streaming_real_time: None,
         };
         let json = serde_json::to_value(&report).unwrap();
         let keys = |v: &serde_json::Value| -> Vec<String> {
@@ -490,11 +500,13 @@ mod tests {
                 "modes",
                 "schema_version",
                 "screenshots",
-                "streaming"
+                "streaming",
+                "streaming_real_time"
             ]
         );
-        assert_eq!(json["schema_version"], 7);
+        assert_eq!(json["schema_version"], 10);
         assert_eq!(json["streaming"], serde_json::Value::Null);
+        assert_eq!(json["streaming_real_time"], serde_json::Value::Null);
         assert_eq!(
             keys(&json["caves"][0]),
             ["bricks", "name", "primary", "reference", "upscale"]

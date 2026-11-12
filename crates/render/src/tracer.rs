@@ -248,6 +248,9 @@ pub struct Tracer {
     debug_view: DebugView,
     /// Bytes of the Planet that have been written to the GPU, creating its buffers included.
     uploaded: u64,
+    /// Calls of `write_buffer` that the last [`Tracer::update_scene`] made (each a copy on the GPU
+    /// with a barrier of its own); 0 for a rebuild, which makes new buffers.
+    last_writes: u32,
 }
 
 pub(crate) fn layout_entry(binding: u32, ty: wgpu::BindingType) -> wgpu::BindGroupLayoutEntry {
@@ -540,6 +543,7 @@ impl Tracer {
             accumulator: Accumulator::new(),
             debug_view: DebugView::default(),
             uploaded: scene_bytes,
+            last_writes: 0,
         })
     }
 
@@ -636,6 +640,8 @@ impl Tracer {
         self.accumulator.reset();
         let buffers = &self.scene;
         let mut written = 0;
+        let mut writes = 0;
+        self.last_writes = 0;
         match update {
             SceneUpdate::Rebuilt => {
                 self.scene = SceneBuffers::new(device, &self.scene_layout, scene)?;
@@ -648,11 +654,13 @@ impl Tracer {
                     let header = SceneHeader::new(scene);
                     queue.write_buffer(&buffers.header, 0, bytemuck::bytes_of(&header));
                     written += size_of::<SceneHeader>() as u64;
+                    writes += 1;
                 }
                 // Each write is a copy on the GPU with its own barrier, and a patch is mostly slots
                 // and records that are next to each other (they are handed out in order), so those
                 // go in as runs.
                 for run in runs(&patch.table) {
+                    writes += 1;
                     written += write_words(
                         queue,
                         &buffers.table,
@@ -662,6 +670,7 @@ impl Tracer {
                 }
                 for run in runs(&patch.regions) {
                     let (from, to) = (run.start * REGION_WORDS, run.end * REGION_WORDS);
+                    writes += 1;
                     written += write_words(queue, &buffers.regions, &scene.regions[from..to], from);
                 }
                 for (buffer, words, ranges) in [
@@ -669,6 +678,7 @@ impl Tracer {
                     (&buffers.bricks, &scene.bricks, &patch.bricks),
                 ] {
                     for range in ranges {
+                        writes += 1;
                         written += write_words(queue, buffer, &words[range.clone()], range.start);
                     }
                 }
@@ -687,6 +697,7 @@ impl Tracer {
                 }
                 for &region in regions {
                     let at = region * REGION_WORDS;
+                    writes += 1;
                     written += write_words(
                         queue,
                         &buffers.regions,
@@ -699,13 +710,21 @@ impl Tracer {
                     (&buffers.bricks, &scene.bricks, *bricks_from),
                 ] {
                     if from < words.len() {
+                        writes += 1;
                         written += write_words(queue, buffer, &words[from..], from);
                     }
                 }
             }
         }
         self.uploaded += written;
+        self.last_writes = writes;
         Ok(())
+    }
+
+    /// Calls of `write_buffer` that the last [`Tracer::update_scene`] made: each is a copy on the
+    /// GPU with a barrier of its own. 0 after a rebuild, which makes new buffers.
+    pub fn last_writes(&self) -> u32 {
+        self.last_writes
     }
 
     /// Bytes of GPU memory that the Planet's bricks take: the five buffers of the scene.

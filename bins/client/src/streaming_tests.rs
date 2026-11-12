@@ -2013,6 +2013,39 @@ fn flying_with_margins_evicts_the_trail_and_keeps_the_margin_the_camera_is_in() 
 }
 
 #[test]
+fn a_look_now_counts_the_soft_misses_and_looks_for_holes_whatever_the_clock_says() {
+    // The look for holes is due every 5 s of the world's clock, which steps do not move by that
+    // much: only a look that is asked for happens.
+    let (mut world, _server, camera) = spawned_world(Run::Stepped);
+    fill(&mut world, camera.position);
+    world.measure_scene_thread();
+    let looks = world.stats().work.hole_scans;
+    let (ahead, _) = tangents(camera.horizon_up);
+    let moved = over_the_ground(
+        &world.store(),
+        std::array::from_fn(|a| camera.position[a] + ahead[a] * 2.0 * D0),
+    );
+    stream(&mut world, moved);
+    // The soft misses are not counted yet, so what the scene thread said of them stands at its
+    // first value while bricks wait: a count that is not of this camera (a settle time read from it
+    // would be about 0).
+    assert!(world.waiting() > 0, "the camera moved to where bricks wait");
+    assert_eq!(world.stats().soft_misses, 0);
+    world.count_soft_misses();
+    assert_eq!(world.stats().work.hole_scans, looks, "no look is due");
+    // A look for the count alone does not look for holes.
+    world.look_now(false).unwrap();
+    assert!(world.stats().soft_misses > 0, "the count was made now");
+    assert_eq!(world.stats().work.hole_scans, looks);
+    // A look for holes does, once, and then it is not due again until the clock says so.
+    world.look_now(true).unwrap();
+    assert_eq!(world.stats().work.hole_scans, looks + 1);
+    stream(&mut world, moved);
+    assert_eq!(world.stats().work.hole_scans, looks + 1);
+    assert_eq!(world.stats().work.holes_found, 0);
+}
+
+#[test]
 fn a_prefetch_lead_makes_bricks_ahead_that_a_camera_without_one_does_not() {
     let (mut without, _s, camera) = spawned_world(Run::Stepped);
     fill(&mut without, camera.position);

@@ -51,6 +51,23 @@ edit_frame_thread = 4.0
 # post         = 0.5   # post-processing and UI (the window's blit and overlay passes are not
 #                      # run by the offscreen bench)
 
+# The gates of the real-time streaming mode (`--streaming --real-time`, #162): the full-size Planet
+# with the real loader workers and scene thread, on the 4090. Each is held to the worst of the runs
+# (three by default), and a run over any of them fails with exit status 2. Every key is needed.
+# Soft misses, time to control and settle time are reported, not gated (#168 turns them on).
+[streaming]
+# Frame time, p99 of the frames of each path: a 60 Hz frame (spec: "Generation and streaming").
+frame_time_p99_ms = 16.7
+# CPU time of the frame thread (recentring, the copy to the GPU, encoding the frame), p99 of each
+# path: half a frame.
+frame_cpu_p99_ms = 8.0
+# Holes, found by the scene thread's looks at every split brick, summed over the runs: none, ever.
+holes = 0
+# The scene's buffers in use, at the most: the full-size test's 512 MiB (474 MiB measured, #143).
+# The store's budget is not here: the store holds its own (`STREAMED_PER_D0_SQUARED`, with the
+# overflow), and the report's peak is held to that limit.
+scene_mib = 512.0
+
 # The GPU time of one profiler frame, by mode: from the start of its first pass to the end of
 # its last. In primary mode that is one frame of the path. In reference mode every sample is a
 # profiler frame of its own, so `gpu_total.reference` budgets one sample, not the frames' worth

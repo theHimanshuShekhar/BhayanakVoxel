@@ -68,11 +68,15 @@ fn check_entry(entry: &Value) {
 const GOLDEN_COUNTS: &str = include_str!("../src/bench/streaming-counts.golden");
 
 fn check_schema(report: &Value, out: &Path) {
-    assert_eq!(report["schema_version"], 7);
+    assert_eq!(report["schema_version"], 10);
     // The Edit stress is of the whole Planet, which the patch is not.
     assert!(report["edits"].is_null());
-    // The streaming mode is asked for (see its own test); the other tests do not.
+    // The streaming mode is asked for (see its own test); the other tests do not. The real-time
+    // mode takes minutes even on the test Planet, with real threads: it is not run here (a unit
+    // test of the client runs it, outside the gating jobs), so its section is null, and a report of
+    // the schemas before 8 is the same as this one without it.
     assert!(report["streaming"].is_null() || report["streaming"].is_object());
+    assert!(report["streaming_real_time"].is_null());
     assert!(!string(&report["build"]["version"]).is_empty());
     assert!(report["build"]["commit"].is_null() || report["build"]["commit"].is_string());
 
@@ -453,5 +457,37 @@ fn the_streaming_mode_reports_the_counts_of_a_stepped_run_that_has_the_committed
     let report = read_report(&out.join("run"));
     check_schema(&report, &out.join("run"));
     check_streaming(&report["streaming"]);
+    let _ = std::fs::remove_dir_all(&out);
+}
+
+#[test]
+fn the_real_time_mode_needs_streaming_and_budgets_with_a_streaming_table() {
+    // `--real-time` is a mode of the streaming bench, and `--runs` is for it.
+    for args in [&["--real-time"][..], &["--streaming", "--runs", "2"]] {
+        let run = bench(args);
+        assert_eq!(run.status.code(), Some(1), "{args:?}");
+        assert!(String::from_utf8_lossy(&run.stderr).contains("Usage: client bench"));
+    }
+    // Budgets with no gates for it are found out before the run, which takes minutes: with no
+    // `[streaming]` table a gate would be off, and nothing would say so.
+    let out = scratch("no-gates");
+    let budgets = out.join("no-gates.toml");
+    std::fs::write(&budgets, "[passes]\nprimary = 1.0\n").unwrap();
+    let run = bench(&[
+        "--short",
+        "--streaming",
+        "--real-time",
+        "--out",
+        out.join("run").to_str().unwrap(),
+        "--budgets",
+        budgets.to_str().unwrap(),
+    ]);
+    assert_eq!(run.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert!(
+        stderr.contains("[streaming]") && stderr.contains("no-gates.toml"),
+        "{stderr}"
+    );
+    assert!(!out.join("run").join("report.json").exists());
     let _ = std::fs::remove_dir_all(&out);
 }

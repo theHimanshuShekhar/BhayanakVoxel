@@ -36,7 +36,7 @@
 //! changes the Voxels (other players' Edits) is still waited for: [`SceneWorker::edit`].
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, TryLockError};
 use std::thread::JoinHandle;
@@ -126,6 +126,12 @@ const BARRED_FOR: f64 = 4.0;
 
 /// How often the soft misses are counted, when a diagnostic asks for them.
 const SOFT_MISSES_EVERY: Duration = Duration::from_millis(100);
+
+/// How often every split brick is looked at for a hole, when the real-time bench asks for it
+/// (#162). The look is one pass over every node of the selection with the store's read lock held:
+/// a third of a second at full size, so it is not done every frame, and the bench reports how much
+/// of the thread's time it took (`Spent::hole_scan`).
+const HOLES_EVERY: Duration = Duration::from_secs(5);
 
 /// The places that prefetch looks at, in seconds along the camera's velocity (ADR 0004: a lead of
 /// 1 to 2 s).
@@ -248,6 +254,41 @@ pub struct Done {
     pub evict_steps: u64,
     pub evicted_units: u64,
     pub evicted_bricks: u64,
+    /// Looks at every split brick for a hole (see [`SceneWorker::count_holes`]), and the holes
+    /// those looks found, summed.
+    pub hole_scans: u64,
+    pub holes_found: u64,
+}
+
+/// The parts of a round that [`Spent`] times.
+#[derive(Clone, Copy, Debug)]
+enum Part {
+    /// Moving the scene to a new camera: selecting again, and packing what changed.
+    Follow,
+    /// Asking the loader, taking in what it made, and packing it.
+    Pack,
+    /// Making the changes available to the frame thread: copying them out for it.
+    Publish,
+    /// Eviction.
+    Evict,
+    /// Remaking the coarse levels over an Edit.
+    Coarse,
+    /// Looking at every split brick for a hole (see [`HOLES_EVERY`]).
+    HoleScan,
+}
+
+const PARTS: usize = 6;
+
+/// How long the scene thread spent on each part of its rounds since timing was turned on
+/// ([`SceneWorker::time_work`]): the real-time bench's scene-thread time by category (#162).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Spent {
+    pub follow: Duration,
+    pub pack: Duration,
+    pub publish: Duration,
+    pub evict: Duration,
+    pub coarse: Duration,
+    pub hole_scan: Duration,
 }
 
 /// What eviction has done and what it cost the other threads, since the start.
@@ -293,6 +334,7 @@ impl Stats {
             && self.coarsening == other.coarsening
             && self.loader == other.loader
             && self.level_bricks == other.level_bricks
+            && self.work.hole_scans == other.work.hole_scans
             && (!exactly
                 || (self.holes == other.holes
                     && self.soft_misses_by_level == other.soft_misses_by_level
@@ -364,6 +406,9 @@ enum Job {
     Edit(Vec<BrickCoord>),
     /// Other LOD bands (see [`Scene::set_bands`]).
     Bands(Bands),
+    /// A count of the soft misses, and a look at every split brick for a hole if `holes`, now and
+    /// not when the clock says (see [`SceneWorker::look_now`]).
+    Look { holes: bool },
     /// Nothing: for a test to know that what it sent before has been looked at.
     #[cfg(test)]
     Sync,
@@ -428,6 +473,15 @@ struct Shared {
     /// Whether the soft misses and the holes are counted at every publish, not a few times a second
     /// (see [`SceneWorker::count_exactly`]).
     count_exactly: AtomicBool,
+    /// Whether every split brick is looked at for a hole every [`HOLES_EVERY`].
+    count_holes: AtomicBool,
+    /// Whether a look for holes is going on now (see [`SceneWorker::looking_for_holes`]).
+    looking: AtomicBool,
+    /// Whether the time of the parts of a round is added to `spent` (reading the clock is not free,
+    /// so the game does not).
+    time_work: AtomicBool,
+    /// Nanoseconds spent on each [`Part`], while timing is on.
+    spent: [AtomicU64; PARTS],
 }
 
 /// What the frame thread has no more use for, which it hands back for the scene thread to use
@@ -533,6 +587,10 @@ impl SceneWorker {
             paused: AtomicBool::new(false),
             count_soft_misses: AtomicBool::new(false),
             count_exactly: AtomicBool::new(false),
+            count_holes: AtomicBool::new(false),
+            looking: AtomicBool::new(false),
+            time_work: AtomicBool::new(false),
+            spent: std::array::from_fn(|_| AtomicU64::new(0)),
         });
         let (garbage, graveyard) = mpsc::channel();
         let user_bands = scene.bands();
@@ -566,6 +624,9 @@ impl SceneWorker {
             soft_misses_by_level: [0; LEVELS],
             holes: 0,
             soft_misses_at: clock.now(),
+            holes_at: clock.now(),
+            recount_due: false,
+            look_due: false,
             work: Done::default(),
             ahead: [None; AHEAD],
             velocity: [0.0; 3],
@@ -637,9 +698,54 @@ impl SceneWorker {
 
     /// Has the thread count the soft misses in each [`Stats`] it publishes (or not): a diagnostic,
     /// since it looks at every brick that waits.
-    #[cfg(test)]
     pub fn count_soft_misses(&self, on: bool) {
         self.shared.count_soft_misses.store(on, Ordering::Relaxed);
+    }
+
+    /// Has the thread look at every split brick for a hole every [`HOLES_EVERY`] (or not), and add
+    /// the holes found to [`Done::holes_found`]: for the real-time bench, which cannot count them at
+    /// every publish as [`SceneWorker::count_exactly`] does (that is a pass over every node each
+    /// time, and the thread would do nothing else).
+    pub fn count_holes(&self, on: bool) {
+        self.shared.count_holes.store(on, Ordering::Relaxed);
+    }
+
+    /// Whether the thread is in a look for holes at this moment: from before it takes the store's
+    /// read lock (so waiting for the lock is in it) to after it has let go of it, and it publishes
+    /// nothing meanwhile. For the real-time bench, which says if one overlapped a slow frame.
+    pub fn looking_for_holes(&self) -> bool {
+        self.shared.looking.load(Ordering::Relaxed)
+    }
+
+    /// Has the thread add the time of the parts of its rounds to what [`SceneWorker::spent`] says
+    /// (or not).
+    pub fn time_work(&self, on: bool) {
+        self.shared.time_work.store(on, Ordering::Relaxed);
+    }
+
+    /// How long the thread has spent on each part of its rounds while timing was on.
+    pub fn spent(&self) -> Spent {
+        let part = |part: Part| {
+            Duration::from_nanos(self.shared.spent[part as usize].load(Ordering::Relaxed))
+        };
+        Spent {
+            follow: part(Part::Follow),
+            pack: part(Part::Pack),
+            publish: part(Part::Publish),
+            evict: part(Part::Evict),
+            coarse: part(Part::Coarse),
+            hole_scan: part(Part::HoleScan),
+        }
+    }
+
+    /// Has the thread count the soft misses (if they are counted) **now**, and look at every split
+    /// brick for a hole if `holes` (and [`SceneWorker::count_holes`] is on), with the camera it
+    /// has been told and the bricks it has taken in, publish, and returns when that is published.
+    /// For the real-time bench, which wants a look at the end of each path and when the camera
+    /// has stood still, and a count of the soft misses that was made after the camera stopped, not
+    /// one from before it.
+    pub fn look_now(&self, holes: bool) -> Result<(), RingsFull> {
+        self.job(Job::Look { holes })
     }
 
     /// Has the thread count the soft misses (by level) and the holes at every publish, not a few
@@ -649,6 +755,13 @@ impl SceneWorker {
     pub fn count_exactly(&self) {
         self.shared.count_soft_misses.store(true, Ordering::Relaxed);
         self.shared.count_exactly.store(true, Ordering::Relaxed);
+    }
+
+    /// Has the thread stop counting exactly (see [`SceneWorker::count_exactly`]); the soft misses
+    /// are still counted, a few times a second. For the real-time bench, which needs the exact
+    /// counts once, at full size, where they cost a pass over every brick each.
+    pub fn stop_counting_exactly(&self) {
+        self.shared.count_exactly.store(false, Ordering::Relaxed);
     }
 
     /// Holds back (or lets go of) taking in what the loader generated (see
@@ -928,6 +1041,12 @@ struct Engine {
     soft_misses_by_level: [usize; LEVELS],
     holes: usize,
     soft_misses_at: Instant,
+    /// When every split brick was last looked at for a hole (see [`HOLES_EVERY`]).
+    holes_at: Instant,
+    /// A [`Job::Look`] is waiting to be done in the next publish: the count of the soft misses, and
+    /// the look for holes if `look_due`, are due whatever the clock says.
+    recount_due: bool,
+    look_due: bool,
     /// What was done, by category (see [`Done`]).
     work: Done,
     /// The places the scene looks ahead to (see [`Engine::look_ahead`]), and the velocity of the
@@ -1092,6 +1211,12 @@ impl Engine {
         #[cfg_attr(not(test), allow(unused_mut))]
         let mut synced: Option<u64> = None;
         for (ticket, job) in jobs {
+            if let Job::Look { holes } = job {
+                self.recount_due = true;
+                self.look_due = holes;
+                self.publish(Some(ticket));
+                continue;
+            }
             #[cfg(test)]
             match job {
                 Job::Sync => {
@@ -1117,15 +1242,23 @@ impl Engine {
             }
             self.publish(Some(ticket));
         }
-        let outcome = self
-            .remake_coarse()
+        let began = self.began();
+        let remade = self.remake_coarse();
+        self.spend(Part::Coarse, began);
+        let outcome = remade
             .and_then(|remade| {
                 worked |= remade;
-                self.follow(camera)
+                let began = self.began();
+                let moved = self.follow(camera);
+                self.spend(Part::Follow, began);
+                moved
             })
             .and_then(|moved| {
                 worked |= moved;
-                self.stream(camera)
+                let began = self.began();
+                let took = self.stream(camera);
+                self.spend(Part::Pack, began);
+                took
             });
         match outcome {
             Ok(took) => worked |= took,
@@ -1134,7 +1267,9 @@ impl Engine {
                 return false;
             }
         }
+        let began = self.began();
         let evicting = self.evict();
+        self.spend(Part::Evict, began);
         self.work.evict_steps += u64::from(evicting);
         worked |= evicting;
         self.coarsen_more();
@@ -1150,6 +1285,22 @@ impl Engine {
         self.publish(synced);
         self.idle = !worked && !busy;
         true
+    }
+
+    /// The time a part of a round begins, if the parts are being timed.
+    fn began(&self) -> Option<Instant> {
+        self.shared
+            .time_work
+            .load(Ordering::Relaxed)
+            .then(|| self.clock.now())
+    }
+
+    /// Adds the time since `began` to `part`'s.
+    fn spend(&self, part: Part, began: Option<Instant>) {
+        if let Some(began) = began {
+            let nanos = u64::try_from(self.clock.since(began).as_nanos()).unwrap_or(u64::MAX);
+            self.shared.spent[part as usize].fetch_add(nanos, Ordering::Relaxed);
+        }
     }
 
     /// The scene ran out of room: the frame thread is told, and waiting jobs end.
@@ -1190,6 +1341,7 @@ impl Engine {
                 self.scene
                     .set_bands(&store, coarsened(bands, self.coarsening))?
             }
+            Job::Look { .. } => unreachable!("not run here"),
             #[cfg(test)]
             Job::Sync | Job::Panic | Job::Stall(_) | Job::SlowCoarse(_) => {
                 unreachable!("not run here")
@@ -1688,6 +1840,33 @@ impl Engine {
     /// that it takes with, so that it never finds the outbox empty when a job is done; it takes
     /// with a try-lock, except after a job, so the copying costs it nothing.
     fn publish(&mut self, job: Option<u64>) {
+        self.scan_for_holes();
+        let began = self.began();
+        self.publish_changes(job);
+        self.spend(Part::Publish, began);
+    }
+
+    /// Looks at every split brick for a hole, if the bench asked for that and [`HOLES_EVERY`] has
+    /// gone by since the last look, or a [`Job::Look`] says to now (`Scene::holes`).
+    fn scan_for_holes(&mut self) {
+        let forced = std::mem::take(&mut self.look_due);
+        let due = forced || self.clock.since(self.holes_at) >= HOLES_EVERY;
+        if !self.shared.count_holes.load(Ordering::Relaxed) || !due {
+            return;
+        }
+        let began = self.began();
+        self.shared.looking.store(true, Ordering::Relaxed);
+        let store = self.store.read().expect("the store's lock is not poisoned");
+        let found = self.scene.holes(&store);
+        drop(store);
+        self.shared.looking.store(false, Ordering::Relaxed);
+        self.holes_at = self.clock.now();
+        self.work.hole_scans += 1;
+        self.work.holes_found += found as u64;
+        self.spend(Part::HoleScan, began);
+    }
+
+    fn publish_changes(&mut self, job: Option<u64>) {
         let exactly = self.shared.count_exactly.load(Ordering::Relaxed);
         if self.clock.since(self.slow_at) >= TABLES_EVERY {
             self.slow_at = self.clock.now();
@@ -1712,11 +1891,20 @@ impl Engine {
         let mut stats = stats_of(&self.scene, &self.loader, &self.slow, self.eviction);
         stats.coarsening = self.coarsening;
         stats.work = self.work;
+        // The look that a job asked for is done by the scan before this (the holes) and here (the
+        // count), and is not due again.
+        let recount_due = std::mem::take(&mut self.recount_due);
         if self.shared.count_soft_misses.load(Ordering::Relaxed) {
             // Looking at every brick that waits takes milliseconds in a fill, so it is done a
             // few times a second, and the count is the last one in between, unless the counts are
-            // asked for exactly (the bench's: one for each frame).
-            if exactly || self.clock.since(self.soft_misses_at) >= SOFT_MISSES_EVERY {
+            // asked for exactly (the bench's: one for each frame). When nothing waits any more
+            // the count is made at once, so that a last count of misses is not left standing
+            // while the thread sleeps (it looks at no brick then).
+            if exactly
+                || recount_due
+                || self.clock.since(self.soft_misses_at) >= SOFT_MISSES_EVERY
+                || (self.soft_misses > 0 && stats.waiting == 0)
+            {
                 self.soft_misses_at = self.clock.now();
                 self.soft_misses_by_level = self.scene.soft_misses_by_level();
                 self.soft_misses = self.soft_misses_by_level.iter().sum();

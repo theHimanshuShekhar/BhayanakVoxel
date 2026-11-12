@@ -262,7 +262,7 @@ pub struct Series {
 }
 
 impl Series {
-    fn add(&mut self, count: u64) {
+    pub(super) fn add(&mut self, count: u64) {
         self.frames += 1;
         self.total += count;
         self.max = self.max.max(count);
@@ -617,10 +617,20 @@ impl Tally {
 /// which has the spawn ring in already, held and not scaled with `d0` (see `room_for` in
 /// `main.rs`). The sizing constants are per `d0` squared, so this is taken out of the store's.
 #[derive(Clone, Copy)]
-struct Start {
-    streamed: usize,
+pub(super) struct Start {
+    pub(super) streamed: usize,
     /// The bricks of level 0 held (the spawn ring's: level 0 within the ring's reach).
-    level_0: usize,
+    pub(super) level_0: usize,
+}
+
+impl Start {
+    /// What `store` holds right after the spawn.
+    pub(super) fn of(store: &BrickStore) -> Self {
+        Self {
+            streamed: store.streamed_len(),
+            level_0: store.level(0).map_or(0, BrickStore::len),
+        }
+    }
 }
 
 /// The test Planet, streamed in stepped.
@@ -637,7 +647,7 @@ pub struct Streamer {
 }
 
 /// The point 4 m above the ground, along the radial through `point`, as `store` reads the Planet.
-fn over_the_ground(store: &BrickStore, point: [f64; 3]) -> [f64; 3] {
+pub(super) fn over_the_ground(store: &BrickStore, point: [f64; 3]) -> [f64; 3] {
     let length = point.iter().map(|c| c * c).sum::<f64>().sqrt();
     let up = point.map(|c| c / length);
     let at = |r: f64| -> [f64; 3] { up.map(|u| u * r) };
@@ -659,40 +669,67 @@ fn over_the_ground(store: &BrickStore, point: [f64; 3]) -> [f64; 3] {
 }
 
 /// `camera` pulled forward along its view to 40 Voxels from the ground it looks at: within reach
-/// of a dig.
-fn within_reach(world: &World, camera: &Camera) -> Camera {
+/// of a dig; None if it looks at nothing (the sky, or ground the scene has not got).
+pub(super) fn within_reach(world: &World, camera: &Camera) -> Option<Camera> {
     let forward = camera.forward();
-    let distance = crate::world::centre_hit(world.scene(), camera)
-        .expect("the camera looks at the ground")
-        .t;
-    Camera {
+    let distance = crate::world::centre_hit(world.scene(), camera)?.t;
+    Some(Camera {
         position: std::array::from_fn(|a| {
             camera.position[a] + forward[a] * f64::from(distance - 40.0)
         }),
         ..*camera
+    })
+}
+
+/// The test Planet right after the spawn: the ring and the Guard held and the rest waiting for the
+/// loader, the scene drawn from them, and where the camera is.
+pub(super) struct TestPlanet {
+    pub(super) store: BrickStore,
+    pub(super) scene: Scene,
+    pub(super) spawn: Camera,
+    pub(super) bands: Bands,
+    pub(super) start: Start,
+}
+
+/// The test Planet (see [`TestPlanet`]), which the stepped and the real-time modes both start from.
+pub(super) fn test_planet() -> TestPlanet {
+    let planet = Planet::new(WorldMap::generate(crate::SEED, MAP_SIZE));
+    let ground = planet.spawn(100);
+    let mut store = planet.crust_around(ground, RING, LEVELS - 1);
+    hold_guard(&mut store, &planet, GUARD_FIRST);
+    let spawn = crate::spawn_camera(ground);
+    let bands = Bands::with_d0(D0);
+    let mut scene = Scene::rings(
+        &store,
+        spawn.position,
+        bands,
+        Bound {
+            centre: [0; 3],
+            radius: planet_gen::planet::MAX_RADIUS,
+        },
+    )
+    .expect("the rings of the spawn fit");
+    scene.set_margins(&store, Margins::standard());
+    let start = Start::of(&store);
+    TestPlanet {
+        store,
+        scene,
+        spawn,
+        bands,
+        start,
     }
 }
 
 impl Streamer {
     /// The world right after the spawn, with the Guard held and the rest waiting for the loader.
     pub fn new() -> Self {
-        let planet = Planet::new(WorldMap::generate(crate::SEED, MAP_SIZE));
-        let ground = planet.spawn(100);
-        let mut store = planet.crust_around(ground, RING, LEVELS - 1);
-        hold_guard(&mut store, &planet, GUARD_FIRST);
-        let spawn = crate::spawn_camera(ground);
-        let bands = Bands::with_d0(D0);
-        let mut scene = Scene::rings(
-            &store,
-            spawn.position,
+        let TestPlanet {
+            store,
+            scene,
+            spawn,
             bands,
-            Bound {
-                centre: [0; 3],
-                radius: planet_gen::planet::MAX_RADIUS,
-            },
-        )
-        .expect("the rings of the spawn fit");
-        scene.set_margins(&store, Margins::standard());
+            start,
+        } = test_planet();
         let (ahead, _) = tangents(spawn.horizon_up);
         let point = |metres: f64| -> [f64; 3] {
             over_the_ground(
@@ -712,10 +749,6 @@ impl Streamer {
             key(point(3.0 * SEGMENT_METRES)),
         ])
         .radial();
-        let start = Start {
-            streamed: store.streamed_len(),
-            level_0: store.level(0).map_or(0, BrickStore::len),
-        };
         let source = store.source().expect("the store has a source");
         let (client, server) = loopback();
         let world = World::new(scene, Predictor::new(store), client)
@@ -810,7 +843,7 @@ impl Streamer {
         // goes by, and a frame later they are the ones of the complete set.
         self.world.advance(Duration::from_secs(1));
         self.step(Phase::Steady, &first, sink)?;
-        let measured = self.measure(store_when_complete)?;
+        let measured = measure_sizes(&self.world, self.start, D0, store_when_complete)?;
         // The walk is held to the complete set, so that it evicts what it leaves behind.
         let budget = Budget {
             bricks: store_when_complete * BUDGET_PERCENT / 100,
@@ -834,7 +867,8 @@ impl Streamer {
             // The Edit is made before the frame's look at the scene, where the game makes it (its
             // input is handled before `recentre`).
             if frame == EDIT_FRAME {
-                let aim = within_reach(&self.world, &self.reach);
+                let aim =
+                    within_reach(&self.world, &self.reach).expect("the camera looks at the ground");
                 let update = self.world.edit(&aim, &crate::tool::Tool::default())?;
                 // The call takes what the scene thread has published, which a stepped one has not
                 // done since the last frame took it. An update here would reach no GPU: say so.
@@ -918,58 +952,64 @@ impl Streamer {
         report.counts_hash = counts_hash(frames_hash, &report);
         Ok(report)
     }
+}
 
-    /// The sizes that the constants are for, as the resident set is complete. The constants are
-    /// per `d0` squared, so what does not scale with it is left out: the Guard's levels (from
-    /// `GUARD_FIRST`, which hold what they hold whatever `d0` is), whose bricks and words are
-    /// counted exactly and apart; and the store as it was at the spawn (see [`Start`]).
-    ///
-    /// The constants were measured with the Guard's bricks in (178 000 of the 3.44 million at full
-    /// size), so each of the Ring values is held to a constant that has the Guard in: the check is
-    /// lenient by what the Guard changes the constant by, which `words_per_guard_brick` and the
-    /// docs of the constants put in numbers.
-    fn measure(&self, streamed: usize) -> Result<Measured, Box<dyn Error>> {
-        let d0_squared = D0 * D0;
-        let stats = self.world.stats();
-        let (ring, guard) = stats.level_bricks.split_at(GUARD_FIRST);
-        let (ring, guard) = (ring.iter().sum::<usize>(), guard.iter().sum::<usize>());
-        let (ring_words, guard_words) = stats.slow.words_by_level.split_at(GUARD_FIRST);
-        let sum = |levels: &[(usize, usize)]| {
-            levels
-                .iter()
-                .fold((0, 0), |(a, b), &(refs, words)| (a + refs, b + words))
-        };
-        let ((ring_refs, ring_bricks_words), (guard_refs, guard_bricks_words)) =
-            (sum(ring_words), sum(guard_words));
-        // A brick drawn has one reference, so the references are the bricks: if they are not, the
-        // words are of another state of the scene than the bricks (a stale snapshot).
-        if (ring_refs, guard_refs) != (ring, guard) {
-            return Err(format!(
-                "the words by level are not of the scene the bricks are of: {ring_refs} references \
-                 for {ring} Ring bricks, {guard_refs} for {guard} of the Guard's"
-            )
-            .into());
-        }
-        let per = |words: usize, bricks: usize| words as f64 / bricks.max(1) as f64;
-        Ok(Measured {
-            ring_bricks: ring as u64,
-            guard_bricks: guard as u64,
-            ring_refs_words: ring_refs as u64,
-            ring_bricks_words: ring_bricks_words as u64,
-            guard_refs_words: guard_refs as u64,
-            guard_bricks_words: guard_bricks_words as u64,
-            streamed: streamed as u64,
-            streamed_at_start: self.start.streamed as u64,
-            level_0_bricks_at_start: self.start.level_0 as u64,
-            level_0_bricks_when_complete: self.world.store().level(0).map_or(0, BrickStore::len)
-                as u64,
-            bricks_per_d0_squared: ring as f64 / d0_squared,
-            refs_per_brick: per(ring_refs, ring),
-            words_per_brick: per(ring_bricks_words, ring),
-            words_per_guard_brick: per(guard_bricks_words, guard),
-            streamed_per_d0_squared: (streamed - self.start.streamed) as f64 / d0_squared,
-        })
+/// The sizes that the constants are for, as the resident set of `world` is complete, which `start`
+/// was the spawn of and `streamed` the store's size then. The constants are per `d0` squared, so
+/// what does not scale with it is left out: the Guard's levels (from `GUARD_FIRST`, which hold what
+/// they hold whatever `d0` is), whose bricks and words are counted exactly and apart; and the store
+/// as it was at the spawn (see [`Start`]). The world's stats must be exact (words by level, see
+/// `World::count_exactly` and `World::count_once_exactly`).
+///
+/// The constants were measured with the Guard's bricks in (178 000 of the 3.44 million at full
+/// size), so each of the Ring values is held to a constant that has the Guard in: the check is
+/// lenient by what the Guard changes the constant by, which `words_per_guard_brick` and the
+/// docs of the constants put in numbers.
+pub(super) fn measure_sizes(
+    world: &World,
+    start: Start,
+    d0: f64,
+    streamed: usize,
+) -> Result<Measured, Box<dyn Error>> {
+    let d0_squared = d0 * d0;
+    let stats = world.stats();
+    let (ring, guard) = stats.level_bricks.split_at(GUARD_FIRST);
+    let (ring, guard) = (ring.iter().sum::<usize>(), guard.iter().sum::<usize>());
+    let (ring_words, guard_words) = stats.slow.words_by_level.split_at(GUARD_FIRST);
+    let sum = |levels: &[(usize, usize)]| {
+        levels
+            .iter()
+            .fold((0, 0), |(a, b), &(refs, words)| (a + refs, b + words))
+    };
+    let ((ring_refs, ring_bricks_words), (guard_refs, guard_bricks_words)) =
+        (sum(ring_words), sum(guard_words));
+    // A brick drawn has one reference, so the references are the bricks: if they are not, the
+    // words are of another state of the scene than the bricks (a stale snapshot).
+    if (ring_refs, guard_refs) != (ring, guard) {
+        return Err(format!(
+            "the words by level are not of the scene the bricks are of: {ring_refs} references \
+             for {ring} Ring bricks, {guard_refs} for {guard} of the Guard's"
+        )
+        .into());
     }
+    let per = |words: usize, bricks: usize| words as f64 / bricks.max(1) as f64;
+    Ok(Measured {
+        ring_bricks: ring as u64,
+        guard_bricks: guard as u64,
+        ring_refs_words: ring_refs as u64,
+        ring_bricks_words: ring_bricks_words as u64,
+        guard_refs_words: guard_refs as u64,
+        guard_bricks_words: guard_bricks_words as u64,
+        streamed: streamed as u64,
+        streamed_at_start: start.streamed as u64,
+        level_0_bricks_at_start: start.level_0 as u64,
+        level_0_bricks_when_complete: world.store().level(0).map_or(0, BrickStore::len) as u64,
+        bricks_per_d0_squared: ring as f64 / d0_squared,
+        refs_per_brick: per(ring_refs, ring),
+        words_per_brick: per(ring_bricks_words, ring),
+        words_per_guard_brick: per(guard_bricks_words, guard),
+        streamed_per_d0_squared: (streamed - start.streamed) as f64 / d0_squared,
+    })
 }
 
 /// The exit status of the streaming mode: [`super::budget::EXIT_OVER_BUDGET`] if a frame had a

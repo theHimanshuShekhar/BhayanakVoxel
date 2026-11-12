@@ -14,6 +14,8 @@ mod budget;
 mod caves;
 mod edits;
 mod path;
+mod process;
+mod realtime;
 mod report;
 mod stats;
 mod stream;
@@ -148,6 +150,17 @@ fn run(args: &Args) -> Result<u8, Box<dyn Error>> {
             "embedded".to_string(),
         ),
     };
+    // The real-time mode takes tens of minutes: a budgets file that cannot gate it is found out now.
+    let real_time_budgets = match (args.real_time, budgets.streaming) {
+        (true, None) => {
+            return Err(format!(
+                "budgets {source}: --real-time needs the [streaming] table (frame_time_p99_ms, \
+                 frame_cpu_p99_ms, holes, scene_mib)"
+            )
+            .into());
+        }
+        (_, budgets) => budgets,
+    };
     let mut plan = if args.short {
         Plan::short()
     } else {
@@ -257,6 +270,15 @@ fn run(args: &Args) -> Result<u8, Box<dyn Error>> {
     } else {
         None
     };
+    // The real-time mode runs after the stepped one, for the same reason: its own world and GPU. If
+    // a run of it stops on an error, the report still has everything that was done before, and the
+    // error: tens of minutes of the 4090's time are not thrown away for the last run's.
+    let streaming_real_time = match real_time_budgets {
+        Some(budgets) if args.real_time => {
+            Some(realtime::run(!plan.patch, args.runs, resolution, &budgets))
+        }
+        _ => None,
+    };
 
     let report = Report {
         schema_version: SCHEMA_VERSION,
@@ -298,6 +320,7 @@ fn run(args: &Args) -> Result<u8, Box<dyn Error>> {
         edits,
         modes,
         streaming,
+        streaming_real_time,
     };
     let json = serde_json::to_string_pretty(&report)?;
     let file = args.out.join(REPORT_FILE);
@@ -328,7 +351,26 @@ fn run(args: &Args) -> Result<u8, Box<dyn Error>> {
             s.holes.total, s.holes.frames_with
         );
     }
-    let code = code.max(streaming_code);
+    // A gate of the real-time mode is a failure whatever `--diag` said of the floating one.
+    let real_time_code = report
+        .streaming_real_time
+        .as_ref()
+        .map_or(0, |r| realtime::exit_code(r, args.no_fail));
+    if real_time_code != 0
+        && let Some(r) = &report.streaming_real_time
+    {
+        eprintln!(
+            "streaming (real time): over its gates: {}",
+            r.gates.over.join(", ")
+        );
+    }
+    let code = code.max(streaming_code).max(real_time_code);
+    // An error of the real-time mode is exit status 1, not 2 (a gate that is over): nothing says
+    // whether its gates would have held.
+    let code = match &report.streaming_real_time {
+        Some(r) if r.error.is_some() => 1,
+        _ => code,
+    };
     if code != 0 {
         let (no_data, over) = failures(&report.modes);
         if !over.is_empty() {
@@ -644,6 +686,9 @@ fn print_summary(report: &Report) {
     if let Some(s) = &report.streaming {
         print_streaming(s);
     }
+    if let Some(r) = &report.streaming_real_time {
+        print_real_time(r);
+    }
     for a in &report.altitudes {
         eprintln!(
             "at {:>7.1} m: primary {} (p95 {}), upscale {}, reference {} (p95 {}) ms; bricks {:?}",
@@ -732,6 +777,144 @@ fn print_summary(report: &Report) {
         }
     }
     eprintln!();
+}
+
+/// The real-time mode's paths and gates, in brief: the worst of the runs.
+fn print_real_time(r: &realtime::RealTimeReport) {
+    eprintln!(
+        "streaming, real time ({} Planet, d0 {}; {} runs; not deterministic):",
+        r.planet,
+        r.d0,
+        r.runs.len()
+    );
+    for (n, run) in r.runs.iter().enumerate() {
+        let c = &run.cold_start;
+        eprintln!(
+            "  run {}: level 0 under the camera {:.1} s after the load began (load {:.1} s), resident set complete after {:.1} s",
+            n + 1,
+            c.time_to_level_0_under_camera_s,
+            c.load_s,
+            c.fill_s
+        );
+        for p in &run.paths {
+            eprintln!(
+                "    {:<20} {:>5} frames: frame p99 {:>6.2} worst {:>7.2} ms, cpu p99 {:>6.2} worst {:>7.2} ms, soft misses {:.2} a frame, holes {} in {} looks ({:.0} ms, {:.0}% of the scene thread's busy time; the end look {:.0} ms), {} frames over the limit{}",
+                p.name,
+                p.frames,
+                p.frame_time.p99_ms,
+                p.frame_time.worst_ms,
+                p.frame_cpu.p99_ms,
+                p.frame_cpu.worst_ms,
+                p.soft_misses_per_frame,
+                p.holes,
+                p.hole_looks,
+                p.scene_thread.hole_scan_ms,
+                p.scene_thread.hole_scan_share * 100.0,
+                p.end_look_ms,
+                p.frames_over_limit,
+                p.settle.map_or(String::new(), |s| format!(
+                    ", settled after {:.1} s{}",
+                    s.seconds,
+                    if s.settled {
+                        ""
+                    } else {
+                        " (not settled: the cap)"
+                    }
+                ))
+            );
+            // Where the time of the slowest frames went, when there were frames over the limit.
+            if p.frames_over_limit > 0 {
+                for f in p.slowest.iter().take(3) {
+                    eprintln!(
+                        "        frame {:>5} at {:>8.0} ms: {:>6.2} ms = recentre {:.2} + update {:.2} ({} writes, {} {} B) + encode {:.2} + submit {:.2} + GPU wait {:.2} + other {:.2}; camera before {:.2}, memory after {:.2}{}",
+                        f.index,
+                        f.at_ms,
+                        f.time_ms,
+                        f.recentre_ms,
+                        f.update_ms,
+                        f.writes,
+                        f.update,
+                        f.upload_bytes,
+                        f.encode_ms,
+                        f.submit_ms,
+                        f.wait_ms,
+                        f.other_ms,
+                        f.camera_ms,
+                        f.after_ms,
+                        if f.hole_look {
+                            ", hole look running"
+                        } else {
+                            ""
+                        }
+                    );
+                }
+            }
+        }
+        let t = &run.scene_thread;
+        eprintln!(
+            "    scene thread: follow {:.0}, pack {:.0}, upload {:.0}, eviction {:.0}, coarse {:.0}, hole looks {:.0} ms; scene used peak {:.0} MiB (reserved {:.0} MiB), store peak {} of {} bricks, resident peak {} MiB (whole process {} MiB); {} looks, {} holes in the run; {}",
+            t.follow_ms,
+            t.pack_ms,
+            t.upload_ms,
+            t.evict_ms,
+            t.coarse_ms,
+            t.hole_scan_ms,
+            run.memory.scene_used_peak_mib,
+            run.memory.scene_reserved_mib,
+            run.memory.store_peak_bricks,
+            run.memory.store_limit_bricks,
+            run.memory
+                .resident_peak_mib
+                .map_or("n/a".to_string(), |m| format!("{m:.0}")),
+            run.memory
+                .whole_process_peak_mib
+                .map_or("n/a".to_string(), |m| format!("{m:.0}")),
+            run.hole_looks,
+            run.holes,
+            run.edit_latency.map_or_else(
+                || format!("no Edit made ({})", run.edit_not_made.unwrap_or("?")),
+                |e| format!(
+                    "Edit taken in {} frames, {:.1} ms (its call {:.1} ms)",
+                    e.frames, e.ms, e.call_ms
+                )
+            )
+        );
+        for c in &run.sizing.checks {
+            eprintln!(
+                "    {:<24} constant {:>7.2} (limit {:>7.2}), measured {:>7.2}{}",
+                c.constant,
+                c.value,
+                c.limit,
+                c.measured,
+                if c.over { "  OVER" } else { "" }
+            );
+        }
+    }
+    let g = &r.gates;
+    for (name, limit) in [
+        ("frame time p99 (ms)", g.frame_time_p99_ms),
+        ("frame cpu p99 (ms)", g.frame_cpu_p99_ms),
+        ("holes", g.holes),
+        ("scene (MiB)", g.scene_mib),
+        ("store (bricks)", g.store_bricks),
+    ] {
+        eprintln!(
+            "  gate {name:<20} worst {:>12.2} limit {:>12.2}{}",
+            limit.worst,
+            limit.limit,
+            if limit.worst > limit.limit {
+                "  OVER"
+            } else {
+                ""
+            }
+        );
+    }
+    if let Some(e) = &r.error {
+        eprintln!(
+            "  STOPPED in run {} at `{}`: {} (the runs above are those that finished)",
+            e.run, e.step, e.message
+        );
+    }
 }
 
 /// The streaming mode's counts, in brief.
