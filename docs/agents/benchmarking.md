@@ -155,17 +155,25 @@ except `timing`.
   GPU) and `tests/bench.rs` check it. When a change to the streaming code moves the counts on
   purpose, the test prints the new hash; put it in the file and say why in the PR.
 - `upload`: bytes written to the GPU per frame (`bytes`: `total`, `max`, frames and frames with
-  any) and the `write_buffer` calls per frame (`writes`, the same, each a copy with a barrier of
+  any) and the belt copies per frame (`writes`, the same, each a copy with a barrier of
   its own: neighbouring ranges of a patch are joined into one when they are within `COPY_GAP`
   words), `bytes_p99` and `writes_p99` (99th percentile, nearest rank, of the frames that had an
   update), `patch_bytes` (what patches wrote, a rebuild's all-buffers write excluded), `rebuilds`
-  and `updates`. They are worked out on the CPU (`render::tracer::upload_cost`);
-  `timing.gpu_uploaded_bytes` is what the GPU counted, and the smoke test checks that they are
-  equal. A buffer that grew (#145) copies the old one on the GPU: that is not an upload and is not
-  counted. The upload budget (`scene_worker::UPLOAD_BUDGET`) adds `cut_frames`, the frames in
+  and `updates`. **Two counts are compared, and they are independent.** One is worked out
+  from the patch before anything is written (`render::tracer::upload_cost`, which these fields
+  are made of: `RingPatch::cost`, bytes and copies of the ranges after joining, header included).
+  The other is counted by the tracer **where it writes to the staging belt**: the header's bytes
+  and one copy, then the bytes and one copy of each range, the words between joined ranges
+  included (`timing.gpu_uploaded_bytes` and `timing.gpu_uploaded_writes`, summed over the
+  updates). The smoke test checks that the two agree, in bytes and in copies; that is the check
+  that `cost()` is what the tracer writes, and it is not a count of what a GPU executed (the belt
+  and the driver are below it). A buffer that grew (#145) copies the old one on the GPU
+  (`copy_buffer_to_buffer`): that is not an upload, is in neither count, and is counted apart
+  (`timing.gpu_grown_bytes`). The upload budget (`scene_worker::UPLOAD_BUDGET`) adds `cut_frames`, the frames in
   which the scene thread held work back for it, and `longest_backlog_frames`, the most such frames
   in a row. Both are counts and are in the hash. **The budget does not engage on the test Planet**
-  (the biggest frame is a fraction of it): the stepped tests run it with a small one.
+  (the biggest frame is a fraction of it): the stepped tests run it with a small one. What a
+  frame may take beyond the budget is in [What the upload budget bounds](#what-the-upload-budget-bounds).
 - `soft_misses`: bricks drawn whole although the bands split them, per frame, for `fill`, `steady`
   and `moving` (frames, total, max, frames with any), and the total by the level of the brick
   drawn whole. Counted for every frame, not a few times a second. The fill has them; with the
@@ -352,13 +360,13 @@ is made there (below): the run's **Edit latency**. Its frames are not those of a
       frame's start), `time_ms` and `cpu_ms`;
     - the parts, in milliseconds, in the order the frame does them: `recentre_ms` (`World::recentre`:
       telling the scene thread the camera and taking what it published), `update_ms` (the copy of
-      the update to the GPU: `update_write_ms`, the `write_buffer` calls queued, and
-      `update_flush_ms`, the submit with no commands that sends them; both zero with no update) and
-      `writes` (the number of `write_buffer` calls: each is a copy on the GPU with a barrier of its
-      own), `encode_ms` (the draw's encoding, the timer queries' resolving and **finishing the
+      the update to the GPU: `update_write_ms`, the copies written to the staging belt (and, if a
+      buffer grew, its new buffer and the copy into it), and `update_flush_ms`, the submit that
+      sends them; both zero with no update) and `writes` (the number of belt copies: each is a
+      copy on the GPU with a barrier of its own), `encode_ms` (the draw's encoding, the timer queries' resolving and **finishing the
       command buffer**) and `submit_ms` (`Queue::submit` alone), `wait_ms` (**the wait for the GPU,
       which comes after the CPU's clock has stopped**: the readback of the pass times, the device
-      poll, what wgpu frees inside it (a staging buffer for each `write_buffer`), and the GPU's own
+      poll, what wgpu frees inside it (the belt's chunks that were used), and the GPU's own
       work: the update's copies, the draw, and whatever else the GPU was doing), and `other_ms`
       (`time_ms` less all of those: what none of them says);
     - **the GPU's own time for the frame's passes**, from the timestamps the passes wrote (the
@@ -375,6 +383,15 @@ is made there (below): the run's **Edit latency**. Its frames are not those of a
       (the readback ring was full) or its readback failed. A time between the submit and the start
       of the first pass (the copies' own time) is not reported: it needs a timestamp before the
       copies, in the earlier submit that sends them, and there is none there;
+    - **what a growth cost** (#145), zero in a frame where no buffer grew: `lengthen_ms` (the frame
+      thread making its own copy of the scene longer, `Scene::paste`: the `Vec`s are lengthened
+      and the new words filled with zeros; it is **inside `recentre_ms`**), `grow_ms` (the GPU's
+      new buffers and the copies old to new, recorded; **inside `update_write_ms`**) and
+      `grown_bytes` (the old buffers' bytes that were copied). The frame-thread part is the one
+      that was probed at 13.9 / 26.5 / 52.4 ms for 128 / 256 / 512 MiB (`docs/measurements.md`)
+      and is not made smaller here: the 4090 run is what measures it at full size;
+    - `over_budget`: why this frame's upload was over the plain budget, if it was (`jump`,
+      `bands`, `edit`, `growth` or `operation`: see below); null if it was not;
     - `camera_ms` and `after_ms`, outside `time_ms` (see above);
     - what the update copied: `update` (`none`, `patch` or `rebuild`: a rebuild makes new buffers
       for the whole scene), `upload_bytes` (all the update writes, headers and tables included) and
@@ -389,13 +406,14 @@ is made there (below): the run's **Edit latency**. Its frames are not those of a
     keep the same number of frames is null there): read the runs for a frame's own parts.
   - `upload` (#145): what the path's updates cost: `updates` (frames with one), `time` (the CPU's
     time of the copy: mean, p99 and worst, in milliseconds), `bytes_p99` and `bytes_max`,
-    `writes_p99` and `writes_max` (the `write_buffer` calls: a rebuild has none), `cut_frames` (the
+    `writes_p99` and `writes_max` (the belt copies: a rebuild has none; **these are the largest
+    frame's bytes and the largest frame's copies**, which can be two frames), `cut_frames` (the
     frames in which the scene thread held work back for the upload budget) and
     `longest_backlog_frames` and `longest_backlog_ms` (the longest run of those frames in a row, in
-    frames and in time). Nothing here is gated. The budget bounds what the scene thread adds to a
-    frame's upload, not what a frame takes: a frame's upload stays within the budget plus one
-    operation and the words between ranges that were joined, and an Edit's patch is never held
-    back.
+    frames and in time), `over_budget` (the frames whose upload was over the plain budget, and by
+    cause: see below), and the growths: `growth_frames`, `grown_bytes`, `lengthen_ms_max` and
+    `grow_ms_max` (the most one frame spent on each part of a growth; the slowest frames have
+    the same per frame). Nothing here is gated.
   - `soft_misses` (a `Series` of what each frame reported: frames, total, max, frames with any) and
     `soft_misses_per_frame`. The scene thread counts them a few times a second, so a frame
     reports the last count, and the count stays within about 100 ms of the truth. Not gated yet
@@ -458,8 +476,20 @@ is made there (below): the run's **Edit latency**. Its frames are not those of a
     test's `SCENE_MIB_MOST` (512 MiB). It is **not VRAM**.
   - `scene_reserved_mib`: what the GPU reserves for the scene, used or not
     (`Scene::reserved_bytes`: the table, the regions, the brick references and the bricks, 4 bytes a
-    word). The buffers are allocated whole, so it does not change over the run. This is the VRAM
-    the scene takes (at full size the bricks buffer alone is about 587 MB). Reported, not gated.
+    word). The buffers are allocated whole and change only when one grows (#145), so this is the
+    most over the run, after the growths. This is the VRAM the scene takes (at full size the
+    bricks buffer alone is about 587 MB). Reported, not gated.
+  - `scene_gpu_peak_growth_mib` and `scene_host_peak_growth_mib`: **the peak during a growth**,
+    which `scene_reserved_mib` is not (it is the size after). While a buffer grows the old one and
+    the new one both exist: the GPU's is the buffers' bytes before the growth plus the new
+    buffers made (`Tracer::peak_scene_bytes`, the most over the run, and at least the size at the
+    end); the frame thread's is its copy's reserved bytes after the growth plus the old words of
+    the buffers that grew in that frame, at the most over the frames, which is what the process
+    holds if the allocator cannot extend the `Vec` in place and copies (an upper bound; the
+    scene thread's own copy, which grew a round before, and the outbox's copies are not in it).
+    Both are **reported and not gated**: `scene_used_peak_mib` and its limit are what the memory
+    gate is on, unchanged, and it counts the words in use, not the room a growth reserves. ADR
+    0004's accounting is of the sizes after a growth; these two are what it has to add during one.
   - `store_peak_bricks` (the store's size as its budget counts it, looked at every 6 frames) and
     `store_limit_bricks` (the most it may hold before eviction starts: the budget with its
     overflow).
@@ -493,6 +523,32 @@ show the ground there) `edit_latency` is null and `edit_not_made` is `nothing in
 knows the server would turn the Edit down (`Predictor::foresee`) it is `refused`. The run goes on and
 finishes. An Edit that was made and is not taken in within 600 frames is the one that stops the run
 with an error.
+
+### What the upload budget bounds
+
+The budget (`scene_worker::UPLOAD_BUDGET`: 8 MiB and 128 belt copies) limits what the scene thread
+**adds** to the outbox and the frame thread has not taken, not what a frame takes. This is the one
+place that says what a frame may take beyond it:
+
+- A frame takes up to **the budget, plus one unsplit operation, plus the gap words**: the one
+  batch of arrivals or follow step that took the backlog across the budget (the check is between
+  operations, and a patch is whole, since a frame must not draw a brick whose words are not on the
+  GPU), and the words between ranges joined into one copy (`COPY_GAP`).
+- **Not budgeted at all:** an Edit and its coarse remakes (the Edit is packed ahead of the backlog,
+  so ADR 0006's bound holds); a jump and other bands, including the coarsening at the memory cap
+  (the scene is packed again and uploaded whole: `Rebuilt`); and the copies of a growth, old buffer
+  to new (they are on the GPU, not uploads, and are in no byte count).
+
+**Whether "the budget plus one operation" meets the issue's "a frame's upload is bounded by the
+budget" is not settled here; it is the project owner's decision.** What is needed to judge it is
+in the report, per path of the real-time mode: the largest frame's bytes and copies
+(`upload.bytes_max`, `upload.writes_max`), and `upload.over_budget`, the frames whose bytes were
+over `UPLOAD_BUDGET.bytes` or whose copies were over `UPLOAD_BUDGET.writes`, counted under the
+**first** cause that applies, in this order: `jump` or `bands` (a rebuild, by the scene's rebuild
+reason), `edit` (the frame took the newest Edit in), `growth` (a buffer grew in the frame), or
+`operation` (none of those: the operation that crossed it, and the gap words). The stepped tests
+measure the same on the test Planet with a small budget (`streaming_tests.rs`), and with one
+well over the largest operation the plain budget holds in every frame.
 
 ### The gates
 
@@ -583,7 +639,7 @@ those cases the output on stderr is all there is.
 
 ```
 {
-  "schema_version": 11,
+  "schema_version": 12,
   "build":   { "version", "commit" },          // commit: CI builds only, else null; on a PR
                                                // build it is GitHub's merge commit, not the head
   "machine": { "gpu", "device_type", "driver", "driver_info", "backend", "os", "arch",
