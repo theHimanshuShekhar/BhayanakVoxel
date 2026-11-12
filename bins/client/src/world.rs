@@ -316,6 +316,12 @@ impl World {
         self.clock.is_stepped()
     }
 
+    /// Whether an Edit has been made in this world with a scene thread ([`World::edit`] returns
+    /// without making one when nothing is aimed at or the server would turn it down).
+    pub fn edit_made(&self) -> bool {
+        self.edit_ticket > 0
+    }
+
     /// Whether the scene thread has packed the newest Edit made ([`World::edit`]) and this world has
     /// taken it in: the scene that is drawn shows it. Not the same as the wait for it being over,
     /// which a timeout also ends. False before any Edit.
@@ -437,6 +443,12 @@ impl World {
         };
         worker.look_now(holes)?;
         self.take_ready(true)
+    }
+
+    /// Whether the scene thread is looking for holes at this moment (see
+    /// [`SceneWorker::looking_for_holes`]); false with no scene thread.
+    pub fn looking_for_holes(&self) -> bool {
+        self.worker.as_ref().is_some_and(|w| w.looking_for_holes())
     }
 
     /// Bytes the scene's buffers take, used or not: what the GPU copy reserves (see

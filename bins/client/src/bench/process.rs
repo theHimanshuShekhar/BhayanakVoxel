@@ -23,9 +23,12 @@ fn read() -> Option<Resident> {
         let line = status.lines().find_map(|l| l.strip_prefix(key))?;
         line.split_whitespace().next()?.parse::<u64>().ok()
     };
+    let now = kib("VmRSS:")? * 1024;
+    // The kernel batches the counters that `VmHWM` is made of, so it can read a little below `VmRSS`
+    // (seen on a 7.0 kernel): the peak is never below what is resident now.
     Some(Resident {
-        now: kib("VmRSS:")? * 1024,
-        peak_since_start: kib("VmHWM:")? * 1024,
+        now,
+        peak_since_start: (kib("VmHWM:")? * 1024).max(now),
     })
 }
 

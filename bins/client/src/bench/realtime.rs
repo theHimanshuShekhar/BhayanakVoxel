@@ -19,6 +19,10 @@
 //! the draw. **Frame time** is all of that, up to the GPU having finished (the offscreen draw
 //! waits for it). **Frame-thread CPU time** is the part that is the CPU's: the recentring, the copy
 //! of the update to the GPU's buffers, and the encoding and submitting of the draw, without the wait.
+//! Outside both: the camera's own computation before the frame starts (it reads the store, so it
+//! can wait for its lock; see [`SlowFrame::camera_ms`]), and the frame's look at the memory after
+//! its time is taken (the store's lock again; [`SlowFrame::after_ms`]). A frame over the limit is
+//! reported with its parts ([`SlowFrame`]), so that the time can be placed.
 //!
 //! The scene thread cannot count holes for every frame at full size (every split brick is looked
 //! at, 0.3 s with the store's read lock held), so it looks every few seconds
@@ -31,7 +35,9 @@
 //! counted per frame** as the stepped mode's are: a hole that is made and filled between two looks is
 //! not seen.
 
+use std::any::Any;
 use std::error::Error;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::time::{Duration, Instant};
 
 use brick_store::{Budget, VOXELS_PER_METRE};
@@ -63,7 +69,8 @@ const FLIGHT_METRES_PER_SECOND: f64 = 50.0;
 const STORE_EVERY: u64 = 6;
 /// Metres above the 2 m flight that the high one flies.
 const HIGH_METRES: f64 = 48.0;
-/// How often the process's resident memory is looked at, in frames: twice a second.
+/// How often the process's resident memory is looked at, in frames (every half second at 60 a
+/// second).
 const RESIDENT_EVERY: u64 = 30;
 /// Frames that the Edit may take to show before it is said not to have: ten seconds.
 const EDIT_FRAMES_CAP: u64 = 600;
@@ -115,13 +122,37 @@ impl Script {
 /// there, or nothing in a test with no GPU.
 pub trait Gpu {
     /// Copies `update` (how `scene` changed), if there is one, to the GPU and draws a frame from
-    /// `camera`. Returns the CPU time of that, without the wait for the GPU.
+    /// `camera`. Returns the parts of the time that took, the wait for the GPU last.
     fn frame(
         &mut self,
         camera: &Camera,
         scene: &Scene,
         update: Option<&SceneUpdate>,
-    ) -> Result<Duration, Box<dyn Error>>;
+    ) -> Result<GpuFrame, Box<dyn Error>>;
+}
+
+/// What a frame's copy to the GPU and draw took, by part.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GpuFrame {
+    /// Queuing the update's writes (`write_buffer`), or for a rebuild making the new buffers.
+    pub write: Duration,
+    /// The submit that sends them.
+    pub flush: Duration,
+    /// Calls of `write_buffer`: each is a copy on the GPU with a barrier of its own.
+    pub writes: u32,
+    /// Encoding the draw, and submitting it.
+    pub encode: Duration,
+    pub submit: Duration,
+    /// Waiting for the GPU to be done: the update's copies and the draw, and whatever else the GPU
+    /// was doing.
+    pub wait: Duration,
+}
+
+impl GpuFrame {
+    /// The CPU's part: all but the wait.
+    fn cpu(&self) -> Duration {
+        self.write + self.flush + self.encode + self.submit
+    }
 }
 
 /// The offscreen GPU of the bench.
@@ -133,13 +164,21 @@ impl Gpu for OffscreenGpu<'_> {
         camera: &Camera,
         scene: &Scene,
         update: Option<&SceneUpdate>,
-    ) -> Result<Duration, Box<dyn Error>> {
-        let began = Instant::now();
+    ) -> Result<GpuFrame, Box<dyn Error>> {
+        let mut frame = GpuFrame::default();
         if let Some(update) = update {
             self.0.update_scene(scene, update)?;
+            let times = self.0.last_update_times();
+            frame.write = times.write;
+            frame.flush = times.flush;
+            frame.writes = times.writes;
         }
-        let copied = began.elapsed();
-        Ok(copied + self.0.draw_upscaled_timed(camera))
+        self.0.draw_upscaled_timed(camera);
+        let drawn = self.0.last_draw_times();
+        frame.encode = drawn.encode;
+        frame.submit = drawn.submit;
+        frame.wait = drawn.wait;
+        Ok(frame)
     }
 }
 
@@ -154,8 +193,8 @@ impl Gpu for NoGpu {
         _: &Camera,
         _: &Scene,
         _: Option<&SceneUpdate>,
-    ) -> Result<Duration, Box<dyn Error>> {
-        Ok(Duration::ZERO)
+    ) -> Result<GpuFrame, Box<dyn Error>> {
+        Ok(GpuFrame::default())
     }
 }
 
@@ -198,9 +237,10 @@ pub struct SceneThread {
     pub evict_ms: f64,
     pub coarse_ms: f64,
     pub hole_scan_ms: f64,
-    /// The looks for holes' share of all the scene-thread time above (0 to 1). While a look runs
-    /// the thread publishes nothing, so the share is also how much of the time the frame thread's
-    /// updates were held back.
+    /// The looks for holes' share of the scene thread's **busy** time above (0 to 1): the sum of
+    /// the parts, not wall time, so a thread that is idle most of the time can still read high. A
+    /// path's figure is of its frames only: the look that is forced after them is not in it (see
+    /// [`PathReport::end_look_ms`]); a run's figure has every look of the run in it.
     pub hole_scan_share: f64,
 }
 
@@ -234,6 +274,83 @@ impl SceneThread {
     }
 }
 
+/// How many of the slowest frames of a path are kept.
+const SLOWEST: usize = 5;
+
+/// One frame over the limit, or among the slowest of its path, with where its time went. The parts
+/// are in milliseconds, in the order the frame does them: [`SlowFrame::recentre_ms`], then the
+/// update's copy to the GPU, then the draw's encoding and submitting, then the wait for the GPU;
+/// `other_ms` is what none of them says (`time_ms` less all five). `camera_ms` and `after_ms` are
+/// outside `time_ms`.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+pub struct SlowFrame {
+    /// The frame's place in its path (from 0), and the milliseconds from the path's start to the
+    /// frame's start.
+    pub index: usize,
+    pub at_ms: f64,
+    /// The frame's time, as the gate measures it, and its CPU part (the recentre, the update's
+    /// write and flush, the encode and the submit).
+    pub time_ms: f64,
+    pub cpu_ms: f64,
+    /// Working out the camera, before the frame started: the flights read the store for the
+    /// ground, and wait for its lock. Not in the frame's time, but it delays the frame's start.
+    pub camera_ms: f64,
+    /// `World::recentre`: telling the scene thread the camera and taking what it published.
+    pub recentre_ms: f64,
+    /// The update's copy to the GPU: the writes queued and the submit that sends them, in all and
+    /// each. Zero with no update.
+    pub update_ms: f64,
+    pub update_write_ms: f64,
+    pub update_flush_ms: f64,
+    /// Calls of `write_buffer` (each a copy on the GPU with a barrier of its own).
+    pub writes: u32,
+    pub encode_ms: f64,
+    pub submit_ms: f64,
+    /// Waiting for the GPU: after the CPU's clock has stopped.
+    pub wait_ms: f64,
+    pub other_ms: f64,
+    /// The frame's look at the memory after its time was taken: the store's lock. Not in
+    /// `time_ms`.
+    pub after_ms: f64,
+    /// What the update copied: `none`, `patch` (the words it lists) or `rebuild` (new buffers, all
+    /// of the scene written), the bytes in all (header and tables included) and those of a patch's
+    /// words.
+    pub update: &'static str,
+    pub upload_bytes: u64,
+    pub patch_bytes: u64,
+    /// Whether a look for holes was going on in the scene thread at the start or the end of the
+    /// frame (it holds the store's read lock and publishes nothing meanwhile).
+    pub hole_look: bool,
+}
+
+/// The slowest frames of a path, in a list of fixed size: no allocation while the frames come.
+struct Worst([Option<SlowFrame>; SLOWEST]);
+
+impl Worst {
+    fn new() -> Self {
+        Self([None; SLOWEST])
+    }
+
+    fn offer(&mut self, frame: SlowFrame) {
+        let time = |slot: &Option<SlowFrame>| slot.map_or(f64::NEG_INFINITY, |f| f.time_ms);
+        let least = self
+            .0
+            .iter_mut()
+            .min_by(|a, b| time(a).total_cmp(&time(b)))
+            .expect("the list has room");
+        if frame.time_ms > time(least) {
+            *least = Some(frame);
+        }
+    }
+
+    /// The slowest first.
+    fn sorted(&self) -> Vec<SlowFrame> {
+        let mut frames: Vec<SlowFrame> = self.0.iter().flatten().copied().collect();
+        frames.sort_by(|a, b| b.time_ms.total_cmp(&a.time_ms));
+        frames
+    }
+}
+
 /// How long the camera stood after a flight before the scene had no soft misses.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize)]
 pub struct Settle {
@@ -252,6 +369,12 @@ pub struct PathReport {
     /// Frame time, up to the GPU being done, and the frame thread's CPU time (see the module).
     pub frame_time: Spread,
     pub frame_cpu: Spread,
+    /// Frames whose time was over the frame-time limit (the gate's: the 99th percentile is held to
+    /// it, and this is how many frames there were above it), and the slowest few, worst first, with
+    /// their parts. In the min and the max the i-th slowest of each run is taken with the i-th of
+    /// the others, member by member, and null if the runs did not all keep as many.
+    pub frames_over_limit: usize,
+    pub slowest: Vec<SlowFrame>,
     /// Soft misses a frame reported (counted by the scene thread a few times a second, so a frame
     /// reports the last count).
     pub soft_misses: Series,
@@ -261,7 +384,12 @@ pub struct PathReport {
     pub hole_looks: u64,
     pub holes: u64,
     pub holes_per_frame: f64,
+    /// The scene thread's time in the frames of the path: without the look for holes that is forced
+    /// after them.
     pub scene_thread: SceneThread,
+    /// What the forced look at the end of the path took in the scene thread, in milliseconds (the
+    /// scan itself): a look after the frames, not in them.
+    pub end_look_ms: f64,
     /// For the stop after a flight only.
     pub settle: Option<Settle>,
 }
@@ -287,11 +415,12 @@ pub struct ColdStart {
 /// What the run held, at the most.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize)]
 pub struct Memory {
-    /// The process's resident memory, at the most of the samples taken twice a second from the
-    /// moment this run's world was built to the end of the run (so not the peak inside the
-    /// generation of the world map and the load, and not the normal bench's before it, nor an
-    /// earlier run's), where the system says: the working set on Windows, `VmRSS` on Linux. This is
-    /// the run's own figure.
+    /// The largest resident set of the samples taken during the run, where the system says: the
+    /// working set on Windows, `VmRSS` on Linux. A sample is taken every 30 frames of the paths and
+    /// the cold start, and at the start and the end of the run; not during the sizing, the looks
+    /// for holes or the waits between paths. The samples are of this process, so the allocator may
+    /// still hold memory from the normal bench and from earlier runs: the first run's figure is
+    /// the cleanest reading of what a run needs.
     pub resident_peak_mib: Option<f64>,
     /// The OS's own peak for the **whole process** since it began, which includes the normal
     /// bench's generation of the Planet and every earlier run (the peak working set cannot be reset
@@ -309,6 +438,13 @@ pub struct Memory {
     /// hold before eviction starts.
     pub store_peak_bricks: u64,
     pub store_limit_bricks: u64,
+}
+
+/// What the dig of a run came to.
+enum Edit {
+    Taken(EditLatency),
+    /// There was no Edit to time, and the reason.
+    NotMade(&'static str),
 }
 
 /// The Edit of the run: a dig of the default Tool at the Spawn after the stop, the one measure
@@ -339,7 +475,12 @@ pub struct RunReport {
     /// holes gate is held to**, not the sum of the paths'.
     pub hole_looks: u64,
     pub holes: u64,
-    pub edit_latency: EditLatency,
+    /// Null if the dig could not be made: see `edit_not_made`.
+    pub edit_latency: Option<EditLatency>,
+    /// Why there was no Edit to time: `nothing in reach` (the camera at the Spawn looks at no
+    /// Voxel within reach) or `refused` (the client knew the server would turn it down). Null when
+    /// the Edit was made. An Edit that was made and never taken in is an error of the run, not this.
+    pub edit_not_made: Option<&'static str>,
     pub memory: Memory,
     /// The client's sizing constants against what was measured at full size, with the resident set
     /// complete. Reported; the check of it is not a gate.
@@ -505,7 +646,7 @@ impl RealTimeReport {
 fn envelope(values: &[&Value]) -> (Value, Value) {
     let first = values[0];
     match first {
-        Value::Object(fields) => {
+        Value::Object(fields) if values.iter().all(|v| v.is_object()) => {
             let (mut least, mut most) = (serde_json::Map::new(), serde_json::Map::new());
             for name in fields.keys() {
                 let members: Option<Vec<&Value>> = values.iter().map(|v| v.get(name)).collect();
@@ -667,8 +808,12 @@ fn build_test() -> Result<Built, Box<dyn Error>> {
 
 /// What one frame cost, and the soft misses it reported.
 struct Frame {
+    /// When the frame started.
+    began: Instant,
     time_ms: f64,
     cpu_ms: f64,
+    /// The parts of the frame; its `index` and `at_ms` are set by the path that takes it in.
+    parts: SlowFrame,
     soft_misses: usize,
     /// Whether the look at the scene in this frame took in the newest Edit, and when it was done.
     edit_taken: bool,
@@ -685,18 +830,28 @@ struct Capture {
     spent: Spent,
     scans: u64,
     holes: u64,
+    /// What the scene thread had spent when the path's frames were done, before the forced look.
+    frames_done: Option<Spent>,
     frame_ms: Vec<f64>,
     cpu_ms: Vec<f64>,
     soft_misses: Series,
+    /// Frames over the limit, and the slowest few.
+    limit_ms: f64,
+    over_limit: usize,
+    worst: Worst,
 }
 
 impl Capture {
-    fn start(name: &'static str, world: &World) -> Self {
+    fn start(name: &'static str, world: &World, limit_ms: f64) -> Self {
         let work = world.stats().work;
         Self {
             name,
             began: Instant::now(),
             seconds: None,
+            frames_done: None,
+            limit_ms,
+            over_limit: 0,
+            worst: Worst::new(),
             spent: world.scene_thread_time(),
             scans: work.hole_scans,
             holes: work.holes_found,
@@ -707,13 +862,34 @@ impl Capture {
     }
 
     fn add(&mut self, frame: &Frame) {
+        if frame.time_ms > self.limit_ms {
+            self.over_limit += 1;
+        }
+        self.worst.offer(SlowFrame {
+            index: self.frame_ms.len(),
+            at_ms: frame
+                .began
+                .saturating_duration_since(self.began)
+                .as_secs_f64()
+                * 1e3,
+            ..frame.parts
+        });
         self.frame_ms.push(frame.time_ms);
         self.cpu_ms.push(frame.cpu_ms);
         self.soft_misses.add(frame.soft_misses as u64);
     }
 
+    /// The path's frames are done: what the scene thread has spent so far is the frames', and the
+    /// forced look that follows is not.
+    fn frames_done(&mut self, world: &World) {
+        self.seconds = Some(self.began.elapsed().as_secs_f64());
+        self.frames_done = Some(world.scene_thread_time());
+    }
+
     fn finish(self, world: &World, settle: Option<Settle>) -> PathReport {
         let work = world.stats().work;
+        let now = world.scene_thread_time();
+        let frames_end = self.frames_done.unwrap_or(now);
         let frames = self.frame_ms.len();
         let per_frame = |count: u64| count as f64 / frames.max(1) as f64;
         let holes = work.holes_found - self.holes;
@@ -725,12 +901,19 @@ impl Capture {
                 .unwrap_or_else(|| self.began.elapsed().as_secs_f64()),
             frame_time: Spread::of(&self.frame_ms),
             frame_cpu: Spread::of(&self.cpu_ms),
+            frames_over_limit: self.over_limit,
+            slowest: self.worst.sorted(),
             soft_misses_per_frame: per_frame(self.soft_misses.total),
             soft_misses: self.soft_misses,
             hole_looks: work.hole_scans - self.scans,
             holes,
             holes_per_frame: per_frame(holes),
-            scene_thread: SceneThread::between(self.spent, world.scene_thread_time()),
+            scene_thread: SceneThread::between(self.spent, frames_end),
+            end_look_ms: now
+                .hole_scan
+                .saturating_sub(frames_end.hole_scan)
+                .as_secs_f64()
+                * 1e3,
             settle,
         }
     }
@@ -796,14 +979,35 @@ struct Session<'a> {
     whole_process_peak: Option<u64>,
     store_peak: usize,
     frames: u64,
+    /// The frame-time limit, for counting the frames over it.
+    limit_ms: f64,
+    /// How long working out the camera of the next frame took (a flight reads the store).
+    camera_wait: Duration,
+}
+
+/// What an update copies to the GPU: its kind, the bytes in all and those of a patch's words.
+fn uploaded(scene: &Scene, update: Option<&SceneUpdate>) -> (&'static str, u64, u64) {
+    match update {
+        None => ("none", 0, 0),
+        Some(update) => {
+            let bytes = render::tracer::upload_bytes(scene, update);
+            match update {
+                SceneUpdate::Rebuilt => ("rebuild", bytes, 0),
+                SceneUpdate::Rings(patch) => ("patch", bytes, patch.words() as u64 * 4),
+                SceneUpdate::Patched { .. } => ("patch", bytes, bytes),
+            }
+        }
+    }
 }
 
 impl<'a> Session<'a> {
-    fn new(world: World, gpu: &'a mut dyn Gpu) -> Self {
+    fn new(world: World, gpu: &'a mut dyn Gpu, limit_ms: f64) -> Self {
         let work_before = world.stats().work;
         let mut session = Self {
             world,
             gpu,
+            limit_ms,
+            camera_wait: Duration::ZERO,
             step: "starting".to_string(),
             work_before,
             scene_used_peak_bytes: 0,
@@ -820,7 +1024,9 @@ impl<'a> Session<'a> {
     /// One frame, paced to 60 a second: the camera is told (with its velocity measured, as the
     /// game's is, if `lead`), what the scene thread made is taken, copied to the GPU and drawn.
     fn frame(&mut self, camera: &Camera, lead: bool) -> Result<Frame, Box<dyn Error>> {
+        let camera_wait = std::mem::take(&mut self.camera_wait);
         let began = Instant::now();
+        let looking = self.world.looking_for_holes();
         let update = if lead {
             self.world.recentre(camera.position)?
         } else {
@@ -829,15 +1035,42 @@ impl<'a> Session<'a> {
         let taken_at = Instant::now();
         let edit_taken = self.world.edit_taken();
         let followed = taken_at - began;
-        let drawn = self
+        let gpu = self
             .gpu
             .frame(camera, self.world.scene(), update.as_ref())?;
+        let looking = looking || self.world.looking_for_holes();
         let time = began.elapsed();
         self.look_at_memory();
+        let after = began.elapsed() - time;
+        let (kind, upload_bytes, patch_bytes) = uploaded(self.world.scene(), update.as_ref());
+        let ms = |d: Duration| d.as_secs_f64() * 1e3;
+        let parts = SlowFrame {
+            index: 0,
+            at_ms: 0.0,
+            time_ms: ms(time),
+            cpu_ms: ms(followed + gpu.cpu()),
+            camera_ms: ms(camera_wait),
+            recentre_ms: ms(followed),
+            update_ms: ms(gpu.write + gpu.flush),
+            update_write_ms: ms(gpu.write),
+            update_flush_ms: ms(gpu.flush),
+            writes: gpu.writes,
+            encode_ms: ms(gpu.encode),
+            submit_ms: ms(gpu.submit),
+            wait_ms: ms(gpu.wait),
+            other_ms: ms(time.saturating_sub(followed + gpu.cpu() + gpu.wait)),
+            after_ms: ms(after),
+            update: kind,
+            upload_bytes,
+            patch_bytes,
+            hole_look: looking,
+        };
         std::thread::sleep(FRAME.saturating_sub(began.elapsed()));
         Ok(Frame {
-            time_ms: time.as_secs_f64() * 1e3,
-            cpu_ms: (followed + drawn).as_secs_f64() * 1e3,
+            began,
+            time_ms: parts.time_ms,
+            cpu_ms: parts.cpu_ms,
+            parts,
             soft_misses: self.world.stats().soft_misses,
             edit_taken,
             taken_at,
@@ -859,7 +1092,8 @@ impl<'a> Session<'a> {
     fn look_at_resident_memory(&mut self) {
         if let Some(resident) = process::resident() {
             self.resident_peak = self.resident_peak.max(Some(resident.now));
-            self.whole_process_peak = Some(resident.peak_since_start);
+            // The OS's peak only rises, but the largest of what was read is kept in case a reading lags.
+            self.whole_process_peak = self.whole_process_peak.max(Some(resident.peak_since_start));
         }
     }
 
@@ -880,7 +1114,7 @@ impl<'a> Session<'a> {
         camera: &Camera,
         settle: Option<Settle>,
     ) -> Result<PathReport, Box<dyn Error>> {
-        capture.seconds = Some(capture.began.elapsed().as_secs_f64());
+        capture.frames_done(&self.world);
         self.look(camera, true)?;
         Ok(capture.finish(&self.world, settle))
     }
@@ -924,7 +1158,7 @@ impl<'a> Session<'a> {
     ) -> Result<(ColdStart, PathReport), Box<dyn Error>> {
         self.step = "cold start".to_string();
         let began = Instant::now();
-        let mut capture = Capture::start("cold start", &self.world);
+        let mut capture = Capture::start("cold start", &self.world, self.limit_ms);
         let mut control = None;
         while !self.idle() || control.is_none() {
             let frame = self.frame(&setup.spawn, true)?;
@@ -959,10 +1193,12 @@ impl<'a> Session<'a> {
         mut at: impl FnMut(&World, f64) -> Camera,
     ) -> Result<PathReport, Box<dyn Error>> {
         self.step = name.to_string();
-        let mut capture = Capture::start(name, &self.world);
+        let mut capture = Capture::start(name, &self.world, self.limit_ms);
         let began = Instant::now();
         let camera = loop {
-            let camera = at(&self.world, began.elapsed().as_secs_f64());
+            let t = began.elapsed().as_secs_f64();
+            let camera = at(&self.world, t);
+            self.camera_wait = began.elapsed() - Duration::from_secs_f64(t);
             let frame = self.frame(&camera, true)?;
             capture.add(&frame);
             if began.elapsed() >= seconds {
@@ -990,11 +1226,12 @@ impl<'a> Session<'a> {
         script: &Script,
     ) -> Result<PathReport, Box<dyn Error>> {
         self.step = "stop after a flight".to_string();
-        let mut capture = Capture::start("stop after a flight", &self.world);
+        let mut capture = Capture::start("stop after a flight", &self.world, self.limit_ms);
         let began = Instant::now();
         let camera = loop {
             let t = began.elapsed().as_secs_f64();
             let camera = course.along(&self.world, course.ahead, FLIGHT_METRES_PER_SECOND * t, 0.0);
+            self.camera_wait = began.elapsed() - Duration::from_secs_f64(t);
             let frame = self.frame(&camera, true)?;
             capture.add(&frame);
             if began.elapsed() >= script.flight_before_stop {
@@ -1026,23 +1263,33 @@ impl<'a> Session<'a> {
     /// the frames after it until one has taken it in (ADR 0006's bound, which a stepped scene
     /// thread cannot show). The camera is at the Spawn and the loader has caught up. The frames are
     /// not those of a path.
-    fn edit(&mut self, spawn: &Camera) -> Result<EditLatency, Box<dyn Error>> {
+    fn edit(&mut self, spawn: &Camera) -> Result<Edit, Box<dyn Error>> {
         self.step = "edit latency".to_string();
-        let aim = within_reach(&self.world, spawn);
+        // A dig that cannot happen is not an error of the run: there is nothing to time.
+        let tool = Tool::default();
+        let Some(aim) = within_reach(&self.world, spawn) else {
+            return Ok(Edit::NotMade("nothing in reach"));
+        };
+        if self.world.aim(&aim, &tool).is_none() {
+            return Ok(Edit::NotMade("nothing in reach"));
+        }
         let began = Instant::now();
-        let update = self.world.edit(&aim, &Tool::default())?;
+        let update = self.world.edit(&aim, &tool)?;
         let call = began.elapsed();
+        if !self.world.edit_made() {
+            return Ok(Edit::NotMade("refused"));
+        }
         if let Some(update) = update {
             self.gpu.frame(spawn, self.world.scene(), Some(&update))?;
         }
         for frames in 0..EDIT_FRAMES_CAP {
             let frame = self.frame(spawn, true)?;
             if frame.edit_taken {
-                return Ok(EditLatency {
+                return Ok(Edit::Taken(EditLatency {
                     frames,
                     ms: (frame.taken_at - began).as_secs_f64() * 1e3,
                     call_ms: call.as_secs_f64() * 1e3,
-                });
+                }));
             }
         }
         Err(format!("the Edit was not taken in after {EDIT_FRAMES_CAP} frames").into())
@@ -1107,7 +1354,10 @@ impl<'a> Session<'a> {
         self.settle(&spawn, cap, "the 180 degree turn")?;
         paths.push(self.stop_after_a_flight(&course, script)?);
         self.settle(&spawn, cap, "the stop after a flight")?;
-        let edit_latency = self.edit(&spawn)?;
+        let (edit_latency, edit_not_made) = match self.edit(&spawn)? {
+            Edit::Taken(latency) => (Some(latency), None),
+            Edit::NotMade(why) => (None, Some(why)),
+        };
         // The last look: what happened since the last path's, the Edit's, is in the run's holes.
         self.step = "the last look".to_string();
         self.look(&spawn, true)?;
@@ -1130,6 +1380,7 @@ impl<'a> Session<'a> {
             hole_looks: work.hole_scans - self.work_before.hole_scans,
             holes: work.holes_found - self.work_before.holes_found,
             edit_latency,
+            edit_not_made,
             memory,
             sizing,
         })
@@ -1143,16 +1394,40 @@ struct Stopped {
 }
 
 /// One run of the paths on `built`, drawing with `gpu`.
-fn one_run(built: Built, gpu: &mut dyn Gpu, script: &Script) -> Result<RunReport, Stopped> {
+fn one_run(
+    built: Built,
+    gpu: &mut dyn Gpu,
+    script: &Script,
+    limit_ms: f64,
+) -> Result<RunReport, Stopped> {
     let Built { world, setup, .. } = built;
     world.count_soft_misses();
     world.measure_scene_thread();
     // The work the scene thread had done before it was told to measure is the run's baseline.
-    let mut session = Session::new(world, gpu);
-    session.paths(&setup, script).map_err(|error| Stopped {
+    let mut session = Session::new(world, gpu, limit_ms);
+    // A panic in the paths is the run's error too, with the step it was at, and the report is kept.
+    catching(|| session.paths(&setup, script)).map_err(|error| Stopped {
         step: session.step.clone(),
         error,
     })
+}
+
+/// What a panic said.
+fn panic_message(payload: &(dyn Any + Send)) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|m| (*m).to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "no message".to_string())
+}
+
+/// `work`'s result, or if it panics an error that says so: a panic would end the process with status
+/// 101 and no report. The panic's own message is still printed by the hook.
+fn catching<T>(work: impl FnOnce() -> Result<T, Box<dyn Error>>) -> Result<T, Box<dyn Error>> {
+    match catch_unwind(AssertUnwindSafe(work)) {
+        Ok(result) => result,
+        Err(payload) => Err(format!("panicked: {}", panic_message(&*payload)).into()),
+    }
 }
 
 /// The `run`th run: its world, its GPU, and the paths. Also the Planet's `d0`.
@@ -1161,6 +1436,28 @@ fn whole_run(
     run: u32,
     resolution: Resolution,
     script: &Script,
+    limit_ms: f64,
+) -> Result<(RunReport, f64), Failure> {
+    // What the paths do is caught where the step is known; this catches the rest (making the
+    // world, the GPU, and ending the run, which drops them).
+    catch_unwind(AssertUnwindSafe(|| {
+        run_once(full, run, resolution, script, limit_ms)
+    }))
+    .unwrap_or_else(|payload| {
+        Err(Failure {
+            run,
+            step: "building the world, making the GPU, or ending the run".to_string(),
+            message: format!("panicked: {}", panic_message(&*payload)),
+        })
+    })
+}
+
+fn run_once(
+    full: bool,
+    run: u32,
+    resolution: Resolution,
+    script: &Script,
+    limit_ms: f64,
 ) -> Result<(RunReport, f64), Failure> {
     let failed = |step: &str, error: Box<dyn Error>| Failure {
         run,
@@ -1172,7 +1469,7 @@ fn whole_run(
     let d0 = built.setup.d0;
     let mut gpu = Offscreen::with_resolution(resolution, built.world.scene())
         .map_err(|e| failed("making the GPU context", e))?;
-    let report = one_run(built, &mut OffscreenGpu(&mut gpu), script)
+    let report = one_run(built, &mut OffscreenGpu(&mut gpu), script, limit_ms)
         .map_err(|stopped| failed(&stopped.step, stopped.error))?;
     Ok((report, d0))
 }
@@ -1197,7 +1494,7 @@ pub fn run(
     for run in 1..=runs {
         eprintln!("real time: run {run} of {runs}");
         let began = Instant::now();
-        match whole_run(full, run, resolution, &script) {
+        match whole_run(full, run, resolution, &script, budgets.frame_time_p99_ms) {
             Ok((report, d)) => {
                 d0 = d;
                 eprintln!("real time: run {run} took {:.0?}", began.elapsed());
@@ -1258,13 +1555,42 @@ mod tests {
                 p99_ms: cpu_p99,
                 worst_ms: cpu_p99 * 2.0,
             },
+            frames_over_limit: 0,
+            slowest: vec![slow_frame(0, frame_p99 * 2.0)],
             soft_misses: Series::default(),
             soft_misses_per_frame: 0.0,
             hole_looks: 2,
             holes,
             holes_per_frame: 0.0,
             scene_thread: SceneThread::default(),
+            end_look_ms: 0.0,
             settle: None,
+        }
+    }
+
+    /// A slow frame whose parts add up: 1 ms of recentre, 0.5 of update, 0.2 of encode, 0.1 of
+    /// submit, the rest the wait.
+    fn slow_frame(index: usize, time_ms: f64) -> SlowFrame {
+        SlowFrame {
+            index,
+            at_ms: index as f64 * 16.7,
+            time_ms,
+            cpu_ms: 1.8,
+            camera_ms: 0.0,
+            recentre_ms: 1.0,
+            update_ms: 0.5,
+            update_write_ms: 0.4,
+            update_flush_ms: 0.1,
+            writes: 12,
+            encode_ms: 0.2,
+            submit_ms: 0.1,
+            wait_ms: time_ms - 1.8,
+            other_ms: 0.0,
+            after_ms: 0.0,
+            update: "patch",
+            upload_bytes: 4096,
+            patch_bytes: 4000,
+            hole_look: false,
         }
     }
 
@@ -1304,11 +1630,12 @@ mod tests {
             scene_thread: SceneThread::default(),
             hole_looks: 12,
             holes: 0,
-            edit_latency: EditLatency {
+            edit_latency: Some(EditLatency {
                 frames: 1,
                 ms: 21.0,
                 call_ms: 3.0,
-            },
+            }),
+            edit_not_made: None,
             memory: Memory {
                 resident_peak_mib: Some(8000.0),
                 whole_process_peak_mib: Some(9000.0),
@@ -1609,6 +1936,7 @@ mod tests {
             [
                 "cold_start",
                 "edit_latency",
+                "edit_not_made",
                 "hole_looks",
                 "holes",
                 "memory",
@@ -1635,9 +1963,11 @@ mod tests {
         assert_eq!(
             keys(&json["runs"][0]["paths"][0]),
             [
+                "end_look_ms",
                 "frame_cpu",
                 "frame_time",
                 "frames",
+                "frames_over_limit",
                 "hole_looks",
                 "holes",
                 "holes_per_frame",
@@ -1645,8 +1975,33 @@ mod tests {
                 "scene_thread",
                 "seconds",
                 "settle",
+                "slowest",
                 "soft_misses",
                 "soft_misses_per_frame"
+            ]
+        );
+        assert_eq!(
+            keys(&json["runs"][0]["paths"][0]["slowest"][0]),
+            [
+                "after_ms",
+                "at_ms",
+                "camera_ms",
+                "cpu_ms",
+                "encode_ms",
+                "hole_look",
+                "index",
+                "other_ms",
+                "patch_bytes",
+                "recentre_ms",
+                "submit_ms",
+                "time_ms",
+                "update",
+                "update_flush_ms",
+                "update_ms",
+                "update_write_ms",
+                "upload_bytes",
+                "wait_ms",
+                "writes"
             ]
         );
         assert_eq!(
@@ -1686,6 +2041,132 @@ mod tests {
     }
 
     #[test]
+    fn the_list_of_slowest_frames_keeps_the_five_longest_worst_first_and_never_grows() {
+        let mut worst = Worst::new();
+        assert!(worst.sorted().is_empty());
+        for (index, time) in [4.0, 30.0, 9.0, 2.0, 17.0, 31.5, 8.0, 40.0, 1.0, 17.5]
+            .into_iter()
+            .enumerate()
+        {
+            worst.offer(slow_frame(index, time));
+        }
+        let kept: Vec<(usize, f64)> = worst
+            .sorted()
+            .iter()
+            .map(|f| (f.index, f.time_ms))
+            .collect();
+        assert_eq!(
+            kept,
+            [(7, 40.0), (5, 31.5), (1, 30.0), (9, 17.5), (4, 17.0)]
+        );
+        // A frame that is not slower than the fifth is not kept; a tie does not push one out.
+        worst.offer(slow_frame(10, 17.0));
+        assert_eq!(worst.sorted().len(), SLOWEST);
+        assert_eq!(worst.sorted()[4].index, 4);
+        // Fewer frames than the list holds are all there.
+        let mut few = Worst::new();
+        few.offer(slow_frame(0, 5.0));
+        few.offer(slow_frame(1, 6.0));
+        assert_eq!(
+            few.sorted().iter().map(|f| f.index).collect::<Vec<_>>(),
+            [1, 0]
+        );
+    }
+
+    #[test]
+    fn a_gpu_frames_cpu_part_is_all_but_the_wait() {
+        let ms = Duration::from_millis;
+        let frame = GpuFrame {
+            write: ms(1),
+            flush: ms(2),
+            writes: 7,
+            encode: ms(4),
+            submit: ms(8),
+            wait: ms(100),
+        };
+        assert_eq!(frame.cpu(), ms(15));
+        assert_eq!(GpuFrame::default().cpu(), Duration::ZERO);
+    }
+
+    #[test]
+    fn an_update_is_told_by_its_kind_and_bytes() {
+        let TestPlanet { scene, .. } = test_planet();
+        assert_eq!(uploaded(&scene, None), ("none", 0, 0));
+        let (kind, bytes, patch) = uploaded(&scene, Some(&SceneUpdate::Rebuilt));
+        assert_eq!((kind, patch), ("rebuild", 0));
+        assert!(bytes > 0);
+    }
+
+    #[test]
+    fn a_dig_with_nothing_in_reach_is_no_edit_and_not_an_error() {
+        // No loader and no threads: the world of the test Planet, with the camera at the sky.
+        let TestPlanet {
+            store,
+            scene,
+            spawn,
+            ..
+        } = test_planet();
+        let (client, _server) = loopback();
+        let world = World::new(scene, Predictor::new(store), client);
+        let mut gpu = NoGpu;
+        let mut session = Session::new(world, &mut gpu, BUDGETS.frame_time_p99_ms);
+        let mut sky = spawn;
+        sky.turn(0.0, 10.0);
+        match session
+            .edit(&sky)
+            .expect("a dig that cannot happen is no error")
+        {
+            Edit::NotMade(why) => assert_eq!(why, "nothing in reach"),
+            Edit::Taken(_) => panic!("there is nothing to dig in the sky"),
+        }
+        assert!(!session.world.edit_made());
+    }
+
+    #[test]
+    fn a_report_with_no_edit_says_why_and_the_min_and_max_keep_the_reason_the_runs_agree_on() {
+        let none = || {
+            run_with(|r| {
+                r.edit_latency = None;
+                r.edit_not_made = Some("nothing in reach");
+            })
+        };
+        let report = RealTimeReport::new(
+            "test".into(),
+            64.0,
+            vec![none(), none(), run_with(|_| {})],
+            &BUDGETS,
+        );
+        let json = serde_json::to_value(&report).unwrap();
+        assert!(json["runs"][0]["edit_latency"].is_null());
+        assert_eq!(json["runs"][0]["edit_not_made"], "nothing in reach");
+        // One run made the Edit and two did not: the envelope does not make one run's the report's.
+        assert!(json["min"]["edit_latency"].is_null() && json["max"]["edit_latency"].is_null());
+        assert!(json["min"]["edit_not_made"].is_null());
+        // All the runs agreeing keeps the reason, and no Edit is no failure of a gate.
+        let all = RealTimeReport::new("test".into(), 64.0, vec![none(), none()], &BUDGETS);
+        let json = serde_json::to_value(&all).unwrap();
+        assert_eq!(json["max"]["edit_not_made"], "nothing in reach");
+        assert!(json["max"]["edit_latency"].is_null());
+        assert!(all.gates.over.is_empty());
+        assert_eq!(exit_code(&all, false), 0);
+    }
+
+    #[test]
+    fn a_panic_in_a_run_is_an_error_with_its_message_and_not_a_dead_process() {
+        let caught: Result<(), _> = catching(|| panic!("the scene thread died: {}", 7));
+        let message = caught.unwrap_err().to_string();
+        assert_eq!(message, "panicked: the scene thread died: 7");
+        let caught: Result<(), _> = catching(|| panic!("a plain message"));
+        assert_eq!(caught.unwrap_err().to_string(), "panicked: a plain message");
+        // What does not panic comes through as it was.
+        assert_eq!(catching(|| Ok(3)).unwrap(), 3);
+        assert_eq!(
+            catching::<()>(|| Err("no".into())).unwrap_err().to_string(),
+            "no"
+        );
+    }
+
+    #[test]
     fn the_99th_percentile_is_the_nearest_rank_and_the_worst_is_the_longest() {
         let times: Vec<f64> = (1..=200).rev().map(f64::from).collect();
         let spread = Spread::of(&times);
@@ -1705,9 +2186,13 @@ mod tests {
     fn the_real_time_run_on_the_test_planet_completes_with_every_path_and_field() {
         let built = build_test().expect("the test Planet builds");
         let d0 = built.setup.d0;
-        let run = one_run(built, &mut NoGpu, &Script::short()).unwrap_or_else(|stopped| {
-            panic!("the run stopped at {}: {}", stopped.step, stopped.error)
-        });
+        let run = one_run(
+            built,
+            &mut NoGpu,
+            &Script::short(),
+            BUDGETS.frame_time_p99_ms,
+        )
+        .unwrap_or_else(|stopped| panic!("the run stopped at {}: {}", stopped.step, stopped.error));
         let names: Vec<_> = run.paths.iter().map(|p| p.name).collect();
         assert_eq!(
             names,
@@ -1732,8 +2217,10 @@ mod tests {
         assert!(run.hole_looks >= run.paths.iter().map(|p| p.hole_looks).sum::<u64>());
         assert!(run.holes >= run.paths.iter().map(|p| p.holes).sum::<u64>());
         // The Edit was taken in by a look at the scene: no later than the cap, with times.
-        assert!(run.edit_latency.frames < EDIT_FRAMES_CAP && run.edit_latency.ms > 0.0);
-        assert!(run.edit_latency.call_ms > 0.0);
+        let edit = run.edit_latency.expect("the Edit at the Spawn was made");
+        assert!(run.edit_not_made.is_none());
+        assert!(edit.frames < EDIT_FRAMES_CAP && edit.ms > 0.0);
+        assert!(edit.call_ms > 0.0);
         let stop = run.paths.last().unwrap();
         assert!(stop.settle.is_some() && run.paths[..5].iter().all(|p| p.settle.is_none()));
         let cold = &run.cold_start;
@@ -1777,7 +2264,7 @@ mod tests {
             fill_cap: Duration::ZERO,
             ..Script::short()
         };
-        let stopped = match one_run(built, &mut NoGpu, &script) {
+        let stopped = match one_run(built, &mut NoGpu, &script, BUDGETS.frame_time_p99_ms) {
             Ok(_) => panic!("a cold start with no time cannot finish"),
             Err(stopped) => stopped,
         };

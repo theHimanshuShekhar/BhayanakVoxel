@@ -475,6 +475,8 @@ struct Shared {
     count_exactly: AtomicBool,
     /// Whether every split brick is looked at for a hole every [`HOLES_EVERY`].
     count_holes: AtomicBool,
+    /// Whether a look for holes is going on now (see [`SceneWorker::looking_for_holes`]).
+    looking: AtomicBool,
     /// Whether the time of the parts of a round is added to `spent` (reading the clock is not free,
     /// so the game does not).
     time_work: AtomicBool,
@@ -586,6 +588,7 @@ impl SceneWorker {
             count_soft_misses: AtomicBool::new(false),
             count_exactly: AtomicBool::new(false),
             count_holes: AtomicBool::new(false),
+            looking: AtomicBool::new(false),
             time_work: AtomicBool::new(false),
             spent: std::array::from_fn(|_| AtomicU64::new(0)),
         });
@@ -705,6 +708,13 @@ impl SceneWorker {
     /// time, and the thread would do nothing else).
     pub fn count_holes(&self, on: bool) {
         self.shared.count_holes.store(on, Ordering::Relaxed);
+    }
+
+    /// Whether the thread is in a look for holes at this moment (it holds the store's read lock
+    /// and publishes nothing meanwhile): for the real-time bench, which says if one was going on
+    /// in a slow frame.
+    pub fn looking_for_holes(&self) -> bool {
+        self.shared.looking.load(Ordering::Relaxed)
     }
 
     /// Has the thread add the time of the parts of its rounds to what [`SceneWorker::spent`] says
@@ -1845,9 +1855,11 @@ impl Engine {
             return;
         }
         let began = self.began();
+        self.shared.looking.store(true, Ordering::Relaxed);
         let store = self.store.read().expect("the store's lock is not poisoned");
         let found = self.scene.holes(&store);
         drop(store);
+        self.shared.looking.store(false, Ordering::Relaxed);
         self.holes_at = self.clock.now();
         self.work.hole_scans += 1;
         self.work.holes_found += found as u64;

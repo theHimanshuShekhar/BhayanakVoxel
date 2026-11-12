@@ -308,7 +308,7 @@ is made there (below): the run's **Edit latency**. Its frames are not those of a
   ground at level 0) and `fill_s` (from the start of the load to the resident set being complete).
   Not gated. **This is not the spec's "time to control"** (the 20 m ring round the Spawn at full
   detail, with the character standing in it: the bench has no server, so the character is not in
-  it). I kept the ray and named the field for it: the spawn ring is made inside `load`, so the
+  it). The field is named for the ray that it uses: the spawn ring is made inside `load`, so the
   ring of 20 m is there before the first frame and the spec's condition would read the load time
   too; the time that streaming adds to it is `fill_s` minus this. The ray is cheap, and a ring of
   rays at 20 m could not be tried at full size without the 4090.
@@ -317,8 +317,42 @@ is made there (below): the run's **Edit latency**. Its frames are not those of a
     the frame thread's work in the game's order: `World::recentre`, the copy of what the scene
     thread made to the GPU, and the draw, until the GPU has finished (the offscreen draw waits).
   - `frame_cpu`: the same figures for the **frame thread's CPU time**: the recentring, the copy to
-    the GPU's buffers, and the encoding and submitting of the draw, without the wait for the GPU
-    (`Offscreen::draw_upscaled_timed`).
+    the GPU's buffers (the writes queued and the submit that sends them), and the encoding and
+    submitting of the draw, without the wait for the GPU (`Offscreen::draw_upscaled_timed`).
+    **What each figure includes.** `frame_time` runs from the start of `World::recentre` to the GPU
+    being done: recentre, update (write and flush), encode, submit and the GPU wait, and anything
+    else the frame thread does between (`other_ms` below, a few microseconds). `frame_cpu` is the
+    same without the GPU wait. **Outside both**: working out the camera of a flight before the frame
+    starts (it reads the store for the ground, and takes its read lock, so it can wait for a lock
+    that a look for holes or an eviction holds; it delays the frame's start and is not in its time),
+    and the frame's look at the memory after its time was taken (the store's lock again, every 6
+    frames). Both are reported for a slow frame as `camera_ms` and `after_ms`. The pacing sleep is
+    in neither.
+  - `frames_over_limit` and `slowest`: **where the time of a slow frame went**. `frames_over_limit`
+    is the number of frames of the path whose time was over the frame-time limit (the gate's
+    `frame_time_p99_ms`; the gate itself is unchanged and still on the p99). `slowest` is the five
+    longest frames of the path, worst first (a fixed list filled while the frames come: no
+    allocation, and a path with fewer frames has fewer), each with:
+    - `index` (the frame's place in the path, from 0) and `at_ms` (from the path's start to the
+      frame's start), `time_ms` and `cpu_ms`;
+    - the parts, in milliseconds, in the order the frame does them: `recentre_ms` (`World::recentre`:
+      telling the scene thread the camera and taking what it published), `update_ms` (the copy of
+      the update to the GPU: `update_write_ms`, the `write_buffer` calls queued, and
+      `update_flush_ms`, the submit with no commands that sends them; both zero with no update) and
+      `writes` (the number of `write_buffer` calls: each is a copy on the GPU with a barrier of its
+      own), `encode_ms` and `submit_ms` (the draw), `wait_ms` (**the wait for the GPU, which comes
+      after the CPU's clock has stopped**: the update's copies, the draw, and whatever else the GPU
+      was doing), and `other_ms` (`time_ms` less all of those: what none of them says);
+    - `camera_ms` and `after_ms`, outside `time_ms` (see above);
+    - what the update copied: `update` (`none`, `patch` or `rebuild`: a rebuild makes new buffers
+      for the whole scene), `upload_bytes` (all the update writes, headers and tables included) and
+      `patch_bytes` (the words that a patch lists);
+    - `hole_look`: whether the scene thread was in a look for holes at the start or the end of the
+      frame (it holds the store's read lock and publishes nothing meanwhile).
+
+    The measuring costs a few clock reads a frame. In `min` and `max` the i-th slowest frame of each
+    run is taken with the i-th of the others, member by member (a `slowest` of runs that did not
+    keep the same number of frames is null there): read the runs for a frame's own parts.
   - `soft_misses` (a `Series` of what each frame reported: frames, total, max, frames with any) and
     `soft_misses_per_frame`. The scene thread counts them a few times a second, so a frame
     reports the last count, and the count stays within about 100 ms of the truth. Not gated yet
@@ -333,35 +367,44 @@ is made there (below): the run's **Edit latency**. Its frames are not those of a
     for a new camera and packing what changed), `pack` (asking the loader, taking in what it made
     and packing it), `upload` (publishing: copying what changed out for the frame thread, which
     copies it to the GPU), `evict` (eviction), `coarse` (the coarse levels over an Edit) and
-    `hole_scan` (the looks for holes), and **`hole_scan_share`**, the looks' share of all of that
-    (0 to 1), beside the soft-miss figures. **While a look runs the scene thread publishes
-    nothing**, so the share is also how much of the time the frame thread's updates were held
-    back (a look at full size is 0.3 s with the store's read lock held). The same for the whole
-    run is `scene_thread` of the run. The looks' time includes the forced ones.
+    `hole_scan` (the looks for holes), and **`hole_scan_share`**: the looks' share of the scene
+    thread's **busy** time, which is the sum of the parts above and not wall time (a thread that is
+    idle most of the time can still read high). **A path's figures are those of its frames: the look
+    that is forced after the last frame is not in them**, so a path in which no look came due reads
+    0 and not 100%; its time is `end_look_ms`. **While a look runs the scene thread publishes
+    nothing**, so the looks of a path are time in which the frame thread's updates were held back
+    (a look at full size is 0.3 s with the store's read lock held), and a frame says whether one was
+    running in `hole_look`. The run's `scene_thread` is over the whole run and has every look in it,
+    the forced ones too.
+  - `end_look_ms`: what the look that is forced at the end of the path took in the scene thread
+    (the scan itself), in milliseconds. It is made after the frames, so it is in no frame's time.
   - `settle`, for `stop after a flight` only (null for the others): `seconds` from the frame the
     camera stopped in to the first frame with no soft misses, or the cap, and `settled`. Not gated.
     The scene thread's count of soft misses can be from before the stop (it counts a few times a
     second, and not at all while it sleeps), so a stale 0 would read as settled at once. So the
     stop is followed by **a count made after it** (`SceneWorker::look_now(false)`, the count and no
     look for holes, whose 0.3 s would be in the time), and the camera is settled when that count
-    or a later one is 0 **and `waiting()` is 0**. I chose `waiting` (the bricks the scene still
-    waits for the loader's to split) over the loader's `pending` because pending also holds jobs
-    ahead of the view, which the view does not wait for; a count after the forced one is not
-    stale, since the scene thread counts again at once when nothing waits any more, and every
+    or a later one is 0 **and `waiting()` is 0**. The check is on `waiting` (the bricks the scene
+    still waits for the loader's to split) and not on the loader's `pending`, because pending also
+    holds jobs ahead of the view, which the view does not wait for; a count after the forced one is
+    not stale, since the scene thread counts again at once when nothing waits any more, and every
     100 ms while it works. The time has the resolution of a frame, and of the count's 100 ms.
 - `hole_looks` and `holes` of the run: the looks for holes over the whole run, **from the moment the
   measuring began** (the paths, the catching up between them, the sizing and the Edit), and what
   they found. **The holes gate is held to this**, not to the sum of the paths'. A look is forced at
   the end of each catch-up (once the loader has caught up, at the Spawn), after the sizing, and at
   the end of the run.
-- `edit_latency`: the Edit that the run makes, **frames**, **ms** and `call_ms` (see below).
+- `edit_latency`: the Edit that the run makes, **frames**, **ms** and `call_ms` (see below); null
+  if there was no Edit to time, and then **`edit_not_made`** says why (`nothing in reach` or
+  `refused`; null when the Edit was made).
 - `memory`:
-  - `resident_peak_mib`: the process's resident memory (Windows' working set, Linux's `VmRSS`) at the
-    most of the samples taken twice a second from the moment the run's world was built to the end
-    of the run. **This is the run's own figure**: it does not include the normal bench's
-    generation of the Planet that runs first in the process, nor an earlier run's. It does not
-    include the peak inside the generation of this run's world map and its `load` either, which
-    come before the first sample.
+  - `resident_peak_mib`: **the largest resident set sampled during the run** (Windows' working set,
+    Linux's `VmRSS`). A sample is taken every 30 frames of the cold start and the paths (every half
+    second), and at the start and the end of the run; **not during the sizing, the looks for holes
+    or the waits between paths, and not inside the generation of this run's world map and its
+    `load`**, which come before the first sample. The samples are of the whole process, so **the
+    allocator may still hold memory from the normal bench that runs first and from earlier runs**,
+    and the figure can include it: the first run's is the cleanest reading of what a run needs.
   - `whole_process_peak_mib`: the OS's own peak for the **whole process** (Windows' peak working
     set, which cannot be reset; Linux's `VmHWM`) since it began. It includes the normal bench's
     generation of the full Planet and every earlier run, so it is an upper bound of the run's, and
@@ -401,8 +444,12 @@ the bound, an Edit made in frame N shows in N+1, 0 the frame that made it), **`m
 Edit's call to the end of that look) and `call_ms` (the Edit's own call on the frame thread:
 planning and writing the bricks). `min` and `max` have the least and the most over the runs.
 It is reported and not gated: the bound is held by the stepped and real-thread tests, and this
-gives the number from the 4090 (#168 may gate it). A run in which the Edit is not taken in within
-600 frames stops with an error.
+gives the number from the 4090 (#168 may gate it). **A dig that cannot be made is not an error:**
+if the Spawn's view has nothing in reach (no Voxel within `AIM_REACH` along it, or the scene does not
+show the ground there) `edit_latency` is null and `edit_not_made` is `nothing in reach`; if the client
+knows the server would turn the Edit down (`Predictor::foresee`) it is `refused`. The run goes on and
+finishes. An Edit that was made and is not taken in within 600 frames is the one that stops the run
+with an error.
 
 ### The gates
 
@@ -457,6 +504,9 @@ on Windows). For the holes there are three: a hole in a path, a hole **outside**
 them, at the sizing, at the last look) and a gate that looked at nothing. A stepped test of the
 scene thread (`streaming_tests`) checks that a look that is asked for counts the soft misses and
 looks for holes whatever the clock says.
+The slowest-frames list, a dig with nothing in reach (the report has `edit_latency` null with its
+reason, and the run goes on), the envelope of a run with no Edit, and the catching of a panic are
+synthetic tests of the same kind, with no threads, and gate.
 `the_real_time_run_on_the_test_planet_completes_with_every_path_and_field` runs the mode on the
 test Planet with real threads and no GPU, and asserts what was run, no time (a look for holes in
 every path, the Edit taken in); `a_run_that_stops_names_the_step_it_was_at` is its error case.
@@ -474,11 +524,21 @@ world`, `making the GPU context`, `cold start`, a path's name, `the loader's cat
 error says nothing about whether the gates would have held, and it is not 2. `error` is null when
 the mode ran to its end.
 
+**A panic** in the paths of a run is caught and reported as an error: the same errored report, with
+the step the run was at and the message `panicked: ...` (the panic's own message and backtrace still
+go to stderr). A panic in making the world or the GPU context, or in ending the run, is caught at
+the step `building the world, making the GPU context, or ending the run`. A panic on the loader's
+workers or the scene thread reaches the frame thread as one and is caught the same way. What is not
+caught is the rest of `client bench`: a panic in the normal bench before the real-time mode starts
+ends the process with **status 101 and no `report.json`**, as does any panic outside the run; and a
+process abort (an out-of-memory kill, a driver crash) ends it by signal, also with no report. In
+those cases the output on stderr is all there is.
+
 ## Reading the report
 
 ```
 {
-  "schema_version": 8,
+  "schema_version": 9,
   "build":   { "version", "commit" },          // commit: CI builds only, else null; on a PR
                                                // build it is GitHub's merge commit, not the head
   "machine": { "gpu", "device_type", "driver", "driver_info", "backend", "os", "arch",

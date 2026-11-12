@@ -136,7 +136,8 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Parsed, String> {
     // whatever it says (they are a failure of their own): the two do not go together.
     if parsed.real_time && !parsed.diag.switches().is_empty() {
         return Err(
-            "--diag does not go with --real-time: a diagnostic run is not held to the budgets,              and the real-time gates always are"
+            "--diag does not go with --real-time: a diagnostic run is not held to the budgets, \
+             and the real-time gates always are"
                 .into(),
         );
     }

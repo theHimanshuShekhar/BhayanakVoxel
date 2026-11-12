@@ -798,7 +798,7 @@ fn print_real_time(r: &realtime::RealTimeReport) {
         );
         for p in &run.paths {
             eprintln!(
-                "    {:<20} {:>5} frames: frame p99 {:>6.2} worst {:>7.2} ms, cpu p99 {:>6.2} worst {:>7.2} ms, soft misses {:.2} a frame, holes {} in {} looks ({:.0} ms, {:.0}% of the scene thread){}",
+                "    {:<20} {:>5} frames: frame p99 {:>6.2} worst {:>7.2} ms, cpu p99 {:>6.2} worst {:>7.2} ms, soft misses {:.2} a frame, holes {} in {} looks ({:.0} ms, {:.0}% of the scene thread's busy time; the end look {:.0} ms), {} frames over the limit{}",
                 p.name,
                 p.frames,
                 p.frame_time.p99_ms,
@@ -810,6 +810,8 @@ fn print_real_time(r: &realtime::RealTimeReport) {
                 p.hole_looks,
                 p.scene_thread.hole_scan_ms,
                 p.scene_thread.hole_scan_share * 100.0,
+                p.end_look_ms,
+                p.frames_over_limit,
                 p.settle.map_or(String::new(), |s| format!(
                     ", settled after {:.1} s{}",
                     s.seconds,
@@ -820,10 +822,37 @@ fn print_real_time(r: &realtime::RealTimeReport) {
                     }
                 ))
             );
+            // Where the time of the slowest frames went, when there were frames over the limit.
+            if p.frames_over_limit > 0 {
+                for f in p.slowest.iter().take(3) {
+                    eprintln!(
+                        "        frame {:>5} at {:>8.0} ms: {:>6.2} ms = recentre {:.2} + update {:.2} ({} writes, {} {} B) + encode {:.2} + submit {:.2} + GPU wait {:.2} + other {:.2}; camera before {:.2}, memory after {:.2}{}",
+                        f.index,
+                        f.at_ms,
+                        f.time_ms,
+                        f.recentre_ms,
+                        f.update_ms,
+                        f.writes,
+                        f.update,
+                        f.upload_bytes,
+                        f.encode_ms,
+                        f.submit_ms,
+                        f.wait_ms,
+                        f.other_ms,
+                        f.camera_ms,
+                        f.after_ms,
+                        if f.hole_look {
+                            ", hole look running"
+                        } else {
+                            ""
+                        }
+                    );
+                }
+            }
         }
         let t = &run.scene_thread;
         eprintln!(
-            "    scene thread: follow {:.0}, pack {:.0}, upload {:.0}, eviction {:.0}, coarse {:.0}, hole looks {:.0} ms; scene used peak {:.0} MiB (reserved {:.0} MiB), store peak {} of {} bricks, resident peak {} MiB (whole process {} MiB); {} looks, {} holes in the run; Edit taken in {} frames, {:.1} ms (its call {:.1} ms)",
+            "    scene thread: follow {:.0}, pack {:.0}, upload {:.0}, eviction {:.0}, coarse {:.0}, hole looks {:.0} ms; scene used peak {:.0} MiB (reserved {:.0} MiB), store peak {} of {} bricks, resident peak {} MiB (whole process {} MiB); {} looks, {} holes in the run; {}",
             t.follow_ms,
             t.pack_ms,
             t.upload_ms,
@@ -842,9 +871,13 @@ fn print_real_time(r: &realtime::RealTimeReport) {
                 .map_or("n/a".to_string(), |m| format!("{m:.0}")),
             run.hole_looks,
             run.holes,
-            run.edit_latency.frames,
-            run.edit_latency.ms,
-            run.edit_latency.call_ms
+            run.edit_latency.map_or_else(
+                || format!("no Edit made ({})", run.edit_not_made.unwrap_or("?")),
+                |e| format!(
+                    "Edit taken in {} frames, {:.1} ms (its call {:.1} ms)",
+                    e.frames, e.ms, e.call_ms
+                )
+            )
         );
         for c in &run.sizing.checks {
             eprintln!(

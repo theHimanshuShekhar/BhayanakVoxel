@@ -10,7 +10,9 @@ use super::stats::Stats;
 use super::stream::StreamReport;
 
 /// 8 added `streaming_real_time` (#162). Reports of the earlier versions are the same without it.
-pub const SCHEMA_VERSION: u32 = 8;
+/// 9 added the slow-frame fields to its paths (`frames_over_limit`, `slowest`, `end_look_ms`) and
+/// made a run's `edit_latency` null when there was no Edit (`edit_not_made` says why).
+pub const SCHEMA_VERSION: u32 = 9;
 
 /// One timed thing (a pass, or the GPU total of a profiler frame) in one mode, against its
 /// budget. In reference mode a profiler frame is one sample, so the entries of that mode have
@@ -501,7 +503,7 @@ mod tests {
                 "streaming_real_time"
             ]
         );
-        assert_eq!(json["schema_version"], 8);
+        assert_eq!(json["schema_version"], 9);
         assert_eq!(json["streaming"], serde_json::Value::Null);
         assert_eq!(json["streaming_real_time"], serde_json::Value::Null);
         assert_eq!(

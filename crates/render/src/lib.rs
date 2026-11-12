@@ -41,7 +41,7 @@ use std::error::Error;
 
 pub use camera::Camera;
 pub use debug_view::DebugView;
-pub use offscreen::{GpuInfo, Image, Offscreen};
+pub use offscreen::{DrawTimes, GpuInfo, Image, Offscreen, UpdateTimes};
 pub use profiler::Profiler;
 pub use scene::{PatchCopy, Rebuild, RingPatch, RingsFull, Room, Scene, SceneUpdate};
 pub use sun::Sun;

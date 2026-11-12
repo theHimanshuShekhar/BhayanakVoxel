@@ -155,10 +155,12 @@ The streaming bench (`client bench --streaming`, #181) measures the four on the 
 | Frame time worst (ms) | each path | to be filled from the 4090 baseline | to be filled from the 4090 baseline | |
 | Frame-thread CPU p99 (ms) | each path | to be filled from the 4090 baseline | to be filled from the 4090 baseline | 8.0 |
 | Frame-thread CPU worst (ms) | each path | to be filled from the 4090 baseline | to be filled from the 4090 baseline | |
+| Frames over the frame-time limit | each path | to be filled from the 4090 baseline | to be filled from the 4090 baseline | not gated |
+| The slowest frame of a path: where its time went (recentre, update with its writes and bytes, encode, submit, GPU wait; `slowest[0]`) | each path | to be filled from the 4090 baseline | to be filled from the 4090 baseline | not gated |
 | Soft misses per frame | each path | to be filled from the 4090 baseline | to be filled from the 4090 baseline | not gated (#168) |
 | Holes found by the scene thread's looks (sampled, see "What the holes gate can and cannot catch") | whole run | to be filled from the 4090 baseline | to be filled from the 4090 baseline | 0 |
 | Looks for holes | whole run, fewest in a path | to be filled from the 4090 baseline | to be filled from the 4090 baseline | at least 1 |
-| Hole looks' share of the scene thread's time | each path | to be filled from the 4090 baseline | to be filled from the 4090 baseline | |
+| Hole looks' share of the scene thread's busy time (the forced end look is not in a path's) | each path | to be filled from the 4090 baseline | to be filled from the 4090 baseline | |
 | Level 0 under the camera, from the start of the load (s; not the spec's time to control) | cold start | to be filled from the 4090 baseline | to be filled from the 4090 baseline | not gated |
 | Settle time after a flight (s) | stop after a flight | to be filled from the 4090 baseline | to be filled from the 4090 baseline | not gated (#168) |
 | Edit latency (frames; ADR 0006's bound is 1) | one dig at the Spawn | to be filled from the 4090 baseline | to be filled from the 4090 baseline | not gated |
@@ -167,7 +169,7 @@ The streaming bench (`client bench --streaming`, #181) measures the four on the 
 | Scene's buffers in use, peak (MiB; not VRAM) | whole run | to be filled from the 4090 baseline | to be filled from the 4090 baseline | 512 |
 | Scene's buffers as the GPU reserves them (MiB; the VRAM) | whole run | to be filled from the 4090 baseline | to be filled from the 4090 baseline | not gated |
 | Store peak (bricks) against its limit | whole run | to be filled from the 4090 baseline | to be filled from the 4090 baseline | the store's limit |
-| The run's resident memory, peak (MiB; sampled twice a second) | whole run | to be filled from the 4090 baseline | to be filled from the 4090 baseline | not gated |
+| The largest resident set sampled during the run (MiB; every 30 frames of the paths; run 1 is the cleanest reading) | whole run | to be filled from the 4090 baseline | to be filled from the 4090 baseline | not gated |
 | The whole process's peak (MiB; includes the normal bench and earlier runs) | whole run | to be filled from the 4090 baseline | to be filled from the 4090 baseline | not gated |
 
 The sizing constants at full size, measured with the resident set complete (`streaming_real_time.runs[].sizing`), which replace the hand measurements in the table above and settle what the test Planet could only bound (the Guard's words per brick at full size, `WORDS_PER_BRICK`):
@@ -180,7 +182,7 @@ The sizing constants at full size, measured with the resident set complete (`str
 | `STREAMED_PER_D0_SQUARED` | 19.8 | to be filled from the 4090 baseline | 24.75 (no share of level 0 taken out at full size) |
 | Words per Guard brick | | to be filled from the 4090 baseline | |
 
-Edit latency is measured in this mode, once a run: one dig at the Spawn after the stop path, made before the frame's look at the scene as the game does, in frames and in milliseconds (`runs[].edit_latency`, with `min` and `max`). It is reported, not gated; the table above has its place.
+Edit latency is measured in this mode, once a run: one dig at the Spawn after the stop path, made before the frame's look at the scene as the game does, in frames and in milliseconds (`runs[].edit_latency`, with `min` and `max`; null with `edit_not_made` saying why if the dig could not be made). It is reported, not gated; the table above has its place.
 
 ## The Reference view (ADR 0005)
 

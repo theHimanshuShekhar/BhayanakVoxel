@@ -669,18 +669,16 @@ pub(super) fn over_the_ground(store: &BrickStore, point: [f64; 3]) -> [f64; 3] {
 }
 
 /// `camera` pulled forward along its view to 40 Voxels from the ground it looks at: within reach
-/// of a dig.
-pub(super) fn within_reach(world: &World, camera: &Camera) -> Camera {
+/// of a dig; None if it looks at nothing (the sky, or ground the scene has not got).
+pub(super) fn within_reach(world: &World, camera: &Camera) -> Option<Camera> {
     let forward = camera.forward();
-    let distance = crate::world::centre_hit(world.scene(), camera)
-        .expect("the camera looks at the ground")
-        .t;
-    Camera {
+    let distance = crate::world::centre_hit(world.scene(), camera)?.t;
+    Some(Camera {
         position: std::array::from_fn(|a| {
             camera.position[a] + forward[a] * f64::from(distance - 40.0)
         }),
         ..*camera
-    }
+    })
 }
 
 /// The test Planet right after the spawn: the ring and the Guard held and the rest waiting for the
@@ -869,7 +867,8 @@ impl Streamer {
             // The Edit is made before the frame's look at the scene, where the game makes it (its
             // input is handled before `recentre`).
             if frame == EDIT_FRAME {
-                let aim = within_reach(&self.world, &self.reach);
+                let aim =
+                    within_reach(&self.world, &self.reach).expect("the camera looks at the ground");
                 let update = self.world.edit(&aim, &crate::tool::Tool::default())?;
                 // The call takes what the scene thread has published, which a stepped one has not
                 // done since the last frame took it. An update here would reach no GPU: say so.
