@@ -435,6 +435,40 @@ pub struct PathReport {
     pub end_look_ms: f64,
     /// For the stop after a flight only.
     pub settle: Option<Settle>,
+    /// MEASUREMENT ONLY (not merged): what the baseline's walk or jump looked like.
+    pub baseline_lag: BaselineLag,
+}
+
+/// MEASUREMENT ONLY: the drawn lag (the frame thread's camera against the centre of the scene it
+/// draws, each frame), the updates, rebuilds by reason, the largest update, and the scene thread's
+/// calls of `recentre` that overlapped the path (one that began before it, and one still running at
+/// its end, included).
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct BaselineLag {
+    pub lag_voxels_max: f64,
+    pub lag_d0_max: f64,
+    pub lag_voxels_p99: f64,
+    pub lag_d0_p99: f64,
+    pub updates: usize,
+    pub rebuilds_jump: usize,
+    pub rebuilds_bands: usize,
+    pub rebuilds_out_of_room: usize,
+    pub largest_update_bytes: u64,
+    pub follow_calls: Vec<FollowCallReport>,
+    pub follow_calls_began_in_path: usize,
+    pub follow_ms_in_path: f64,
+    /// A call still running at the path's end: how long it had run.
+    pub follow_running_at_end_ms: Option<f64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct FollowCallReport {
+    /// Milliseconds from the path's start (negative: it began before the path).
+    pub began_ms: f64,
+    pub ms: f64,
+    pub voxels: f64,
+    pub rebuilt: bool,
+    pub running_at_end: bool,
 }
 
 /// The cold start: the world made, and the frames at the Spawn until the resident set is complete.
@@ -861,6 +895,9 @@ struct Frame {
     /// Whether the look at the scene in this frame took in the newest Edit, and when it was done.
     edit_taken: bool,
     taken_at: Instant,
+    /// MEASUREMENT ONLY: the drawn lag, and the reason if the frame's update was a rebuild.
+    lag: f64,
+    rebuild: Option<render::Rebuild>,
 }
 
 /// What a path has seen so far.
@@ -883,6 +920,11 @@ struct Capture {
     over_limit: usize,
     over_by_update: UpdateKinds,
     worst: Worst,
+    /// MEASUREMENT ONLY.
+    lags: Vec<f64>,
+    updates: usize,
+    rebuilds: [usize; 3],
+    largest_update_bytes: u64,
 }
 
 impl Capture {
@@ -897,6 +939,10 @@ impl Capture {
             over_limit: 0,
             over_by_update: UpdateKinds::default(),
             worst: Worst::new(),
+            lags: Vec::new(),
+            updates: 0,
+            rebuilds: [0; 3],
+            largest_update_bytes: 0,
             spent: world.scene_thread_time(),
             scans: work.hole_scans,
             holes: work.holes_found,
@@ -923,6 +969,75 @@ impl Capture {
         self.frame_ms.push(frame.time_ms);
         self.cpu_ms.push(frame.cpu_ms);
         self.soft_misses.add(frame.soft_misses as u64);
+        self.lags.push(frame.lag);
+        self.updates += usize::from(frame.parts.update != "none");
+        self.largest_update_bytes = self.largest_update_bytes.max(frame.parts.upload_bytes);
+        match frame.rebuild {
+            Some(render::Rebuild::Jump) => self.rebuilds[0] += 1,
+            Some(render::Rebuild::Bands) => self.rebuilds[1] += 1,
+            Some(render::Rebuild::OutOfRoom) => self.rebuilds[2] += 1,
+            None => {}
+        }
+    }
+
+    /// MEASUREMENT ONLY.
+    fn baseline_lag(&self, world: &World) -> BaselineLag {
+        let mut sorted = self.lags.clone();
+        sorted.sort_by(f64::total_cmp);
+        let rank = (sorted.len() * 99).div_ceil(100);
+        let max = sorted.last().copied().unwrap_or(0.0);
+        let p99 = rank.checked_sub(1).map_or(0.0, |at| sorted[at]);
+        let d0 = world.stats().bands.map_or(f64::NAN, |bands| bands.d0());
+        let end = self.began + Duration::from_secs_f64(self.seconds.unwrap_or(0.0));
+        let now = Instant::now();
+        let ms = |d: Duration| d.as_secs_f64() * 1e3;
+        let signed = |at: Instant| {
+            if at >= self.began {
+                ms(at - self.began)
+            } else {
+                -ms(self.began - at)
+            }
+        };
+        let log = crate::scene_worker::FOLLOW_LOG.lock().unwrap().clone();
+        let mut calls = Vec::new();
+        let (mut began_in, mut in_path_ms) = (0, 0.0);
+        let mut running_at_end = None;
+        for call in log {
+            let call_end = call.ended.unwrap_or(now);
+            if call_end < self.began || call.began > end {
+                continue;
+            }
+            let ended_in_path = call.ended.is_some_and(|e| e <= end);
+            began_in += usize::from(call.began >= self.began);
+            in_path_ms += ms(call_end
+                .min(end)
+                .saturating_duration_since(call.began.max(self.began)));
+            if !ended_in_path {
+                running_at_end = Some(ms(end.saturating_duration_since(call.began)));
+            }
+            calls.push(FollowCallReport {
+                began_ms: signed(call.began),
+                ms: ms(call_end - call.began),
+                voxels: call.voxels,
+                rebuilt: call.rebuilt,
+                running_at_end: !ended_in_path,
+            });
+        }
+        BaselineLag {
+            lag_voxels_max: max,
+            lag_d0_max: max / d0,
+            lag_voxels_p99: p99,
+            lag_d0_p99: p99 / d0,
+            updates: self.updates,
+            rebuilds_jump: self.rebuilds[0],
+            rebuilds_bands: self.rebuilds[1],
+            rebuilds_out_of_room: self.rebuilds[2],
+            largest_update_bytes: self.largest_update_bytes,
+            follow_calls: calls,
+            follow_calls_began_in_path: began_in,
+            follow_ms_in_path: in_path_ms,
+            follow_running_at_end_ms: running_at_end,
+        }
     }
 
     /// The path's frames are done: what the scene thread has spent so far is the frames', and the
@@ -939,6 +1054,7 @@ impl Capture {
         let frames = self.frame_ms.len();
         let per_frame = |count: u64| count as f64 / frames.max(1) as f64;
         let holes = work.holes_found - self.holes;
+        let baseline_lag = self.baseline_lag(world);
         PathReport {
             name: self.name,
             frames,
@@ -962,6 +1078,7 @@ impl Capture {
                 .as_secs_f64()
                 * 1e3,
             settle,
+            baseline_lag,
         }
     }
 }
@@ -1128,6 +1245,10 @@ impl<'a> Session<'a> {
             soft_misses: self.world.stats().soft_misses,
             edit_taken,
             taken_at,
+            lag: self.world.lag(camera.position),
+            rebuild: (kind == "rebuild")
+                .then(|| self.world.scene().rebuild_reason())
+                .flatten(),
         })
     }
 
@@ -1623,6 +1744,21 @@ mod tests {
             scene_thread: SceneThread::default(),
             end_look_ms: 0.0,
             settle: None,
+            baseline_lag: BaselineLag {
+                lag_voxels_max: 0.0,
+                lag_d0_max: 0.0,
+                lag_voxels_p99: 0.0,
+                lag_d0_p99: 0.0,
+                updates: 0,
+                rebuilds_jump: 0,
+                rebuilds_bands: 0,
+                rebuilds_out_of_room: 0,
+                largest_update_bytes: 0,
+                follow_calls: Vec::new(),
+                follow_calls_began_in_path: 0,
+                follow_ms_in_path: 0.0,
+                follow_running_at_end_ms: None,
+            },
         }
     }
 
@@ -2025,6 +2161,7 @@ mod tests {
         assert_eq!(
             keys(&json["runs"][0]["paths"][0]),
             [
+                "baseline_lag",
                 "end_look_ms",
                 "frame_cpu",
                 "frame_time",

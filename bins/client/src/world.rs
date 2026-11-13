@@ -654,7 +654,6 @@ impl World {
 
     /// How far the scene as the world has it is behind `camera`, in Voxels: where the scene thread
     /// had moved the rings to, when it made what the world has taken.
-    #[cfg(test)]
     pub fn lag(&self, camera: [f64; 3]) -> f64 {
         let shown = self.stats.camera.unwrap_or(camera);
         (0..3)

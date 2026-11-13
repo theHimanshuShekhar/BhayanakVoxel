@@ -48,6 +48,21 @@ use render::{PatchCopy, RingPatch, RingsFull, Scene, SceneUpdate};
 use sim::SharedStore;
 
 use crate::clock::Clock;
+
+/// MEASUREMENT ONLY (never merged): when each call of `Scene::recentre` by the scene thread began,
+/// and when it ended (None while it runs).
+pub static FOLLOW_LOG: Mutex<Vec<FollowCall>> = Mutex::new(Vec::new());
+
+/// One call of `Scene::recentre` by the scene thread.
+#[derive(Clone, Copy, Debug)]
+pub struct FollowCall {
+    pub began: Instant,
+    /// None while it runs.
+    pub ended: Option<Instant>,
+    /// How far it moved the scene's centre, in Voxels.
+    pub voxels: f64,
+    pub rebuilt: bool,
+}
 use crate::loader::{Arrival, Loader};
 
 /// The time this thread spends taking in bricks before it looks at what the frame thread has
@@ -232,7 +247,6 @@ pub struct Stats {
     #[cfg_attr(not(test), allow(dead_code))]
     pub eviction: EvictionStats,
     /// Where the scene had been moved to.
-    #[cfg(test)]
     pub camera: Option<[f64; 3]>,
 }
 
@@ -360,7 +374,6 @@ fn stats_of(scene: &Scene, loader: &Loader, slow: &Arc<Slow>, eviction: Eviction
         loader: LoaderStats::of(loader),
         slow: Arc::clone(slow),
         eviction,
-        #[cfg(test)]
         camera: scene.camera(),
     }
 }
@@ -1405,7 +1418,27 @@ impl Engine {
         }
         let store = self.store.read().expect("the store's lock is not poisoned");
         let before = self.scene.bricks_changed();
+        // MEASUREMENT ONLY: logs when each call of `recentre` began and ended.
+        let from = self.scene.camera().unwrap_or(camera);
+        let logged = {
+            let mut log = FOLLOW_LOG.lock().unwrap();
+            log.push(FollowCall {
+                began: Instant::now(),
+                ended: None,
+                voxels: (0..3)
+                    .map(|a| (camera[a] - from[a]).powi(2))
+                    .sum::<f64>()
+                    .sqrt(),
+                rebuilt: false,
+            });
+            log.len() - 1
+        };
         let update = self.scene.recentre(&store, camera)?;
+        {
+            let mut log = FOLLOW_LOG.lock().unwrap();
+            log[logged].ended = Some(Instant::now());
+            log[logged].rebuilt = matches!(update, Some(SceneUpdate::Rebuilt));
+        }
         drop(store);
         self.work.follow_steps += 1;
         self.work.follow_bricks += self.scene.bricks_changed() - before;
