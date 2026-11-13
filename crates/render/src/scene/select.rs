@@ -100,6 +100,95 @@ struct Node {
     stamp: u64,
 }
 
+/// What looking at an entry that was due in the queue came to.
+enum Due {
+    /// The node is gone, or has been queued again since: the entry is stale.
+    Stale,
+    /// The node changes now.
+    Changes,
+    /// It does not, and is due again when the camera has gone `slack` more.
+    Later {
+        split: bool,
+        margin: bool,
+        slack: f64,
+    },
+}
+
+/// Entries due at once from which looking at them is shared among threads: below this the threads
+/// cost more than they save (a thread is about 50 microseconds, and an entry about 0.2).
+const PARALLEL_FROM: usize = 32_768;
+
+/// The most threads that look at due entries, and at most half of the machine's.
+const MOST_THREADS: usize = 4;
+
+/// Looks at each of the `due` entries (a stamp and a node): whether the node changes, or when it
+/// may. Each is looked at alone (the nodes are only read), so a long list is shared among threads,
+/// and the answers are in the order of the entries: what is done with them is the same whatever
+/// the threads, and the same on every run. At full size a call after the camera has moved some
+/// tens of Voxels has millions due, and looking at them was 80% of it (700 ms of 900 ms).
+fn look_at_due(
+    nodes: &HashMap<Key, Node>,
+    due: &[(u64, Key)],
+    camera: [f64; 3],
+    changes: &(impl Fn(Key, f64, bool, bool) -> bool + Sync),
+    slack: &(impl Fn(Key, f64, bool, bool) -> f64 + Sync),
+) -> Vec<Due> {
+    let look = |&(stamp, key): &(u64, Key)| {
+        // An entry for a node that has gone, or has been queued again since, is stale.
+        let Some(node) = nodes.get(&key) else {
+            return Due::Stale;
+        };
+        if node.stamp != stamp {
+            return Due::Stale;
+        }
+        let (split, margin) = (node.state == State::Split, node.margin);
+        let distance = brick_distance(camera, key.0, key.1);
+        if changes(key, distance, split, margin) {
+            Due::Changes
+        } else {
+            Due::Later {
+                split,
+                margin,
+                slack: slack(key, distance, split, margin),
+            }
+        }
+    };
+    let threads = std::thread::available_parallelism()
+        .map_or(1, |n| n.get() / 2)
+        .clamp(1, MOST_THREADS);
+    map_shared(
+        due,
+        if due.len() < PARALLEL_FROM {
+            1
+        } else {
+            threads
+        },
+        &look,
+    )
+}
+
+/// `look` of each of `items`, in their order, shared among `threads` (one: here and now).
+fn map_shared<T: Sync, R: Send>(
+    items: &[T],
+    threads: usize,
+    look: &(impl Fn(&T) -> R + Sync),
+) -> Vec<R> {
+    if threads <= 1 {
+        return items.iter().map(look).collect();
+    }
+    let share = items.len().div_ceil(threads).max(1);
+    std::thread::scope(|scope| {
+        let parts: Vec<_> = items
+            .chunks(share)
+            .map(|part| scope.spawn(|| part.iter().map(look).collect::<Vec<_>>()))
+            .collect();
+        parts
+            .into_iter()
+            .flat_map(|part| part.join().expect("a thread that looks at due entries"))
+            .collect()
+    })
+}
+
 /// A node that is close enough to the edge of its hysteresis to be looked at every frame.
 #[derive(Clone, Copy, Debug)]
 struct Hot {
@@ -586,6 +675,14 @@ impl Selection {
 
     pub fn camera(&self) -> [f64; 3] {
         self.camera
+    }
+
+    /// The camera's path since the selection began, and that of the places it looks ahead to, in
+    /// Voxels: what the selection is made to look at again for (a node is looked at when the
+    /// camera has gone as far as it was away from changing), so the cost of following a camera is
+    /// in proportion to it.
+    pub fn travelled(&self) -> f64 {
+        self.travelled
     }
 
     /// The coarsest level that is looked at.
@@ -1364,26 +1461,16 @@ impl Selection {
         for (entry, slack) in cooled {
             self.watch(entry.key, entry.stamp, entry.split, entry.margin, slack);
         }
-        for (stamp, key) in popped {
-            // An entry for a node that has gone, or has been queued again since, is stale.
-            let Some(node) = self.nodes.get(&key) else {
-                continue;
-            };
-            if node.stamp != stamp {
-                continue;
-            }
-            let (split, margin) = (node.state == State::Split, node.margin);
-            let distance = brick_distance(camera, key.0, key.1);
-            if changes(key, distance, split, margin) {
-                changing.push((stamp, key));
-            } else {
-                self.watch(
-                    key,
-                    stamp,
+        let looked = look_at_due(&self.nodes, &popped, camera, &changes, &slack);
+        for ((stamp, key), looked) in popped.into_iter().zip(looked) {
+            match looked {
+                Due::Stale => {}
+                Due::Changes => changing.push((stamp, key)),
+                Due::Later {
                     split,
                     margin,
-                    slack(key, distance, split, margin),
-                );
+                    slack,
+                } => self.watch(key, stamp, split, margin, slack),
             }
         }
         for (stamp, key) in changing {
@@ -1470,6 +1557,16 @@ impl Selection {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn what_threads_look_at_comes_back_in_the_order_of_the_entries_whatever_their_number() {
+        let items: Vec<u64> = (0..1000).collect();
+        let one = super::map_shared(&items, 1, &|n| n * n + 1);
+        for threads in [2, 3, 4, 7, 64, 5000] {
+            assert_eq!(super::map_shared(&items, threads, &|n| n * n + 1), one);
+        }
+        assert!(super::map_shared(&[] as &[u64], 4, &|n| *n).is_empty());
+    }
+
     use brick_store::{Interior, Material};
 
     use super::*;

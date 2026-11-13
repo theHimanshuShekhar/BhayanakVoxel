@@ -35,7 +35,14 @@ use super::stream::StreamReport;
 /// had been told and the scene's centre), and took `over_limit_at` out of `min` and `max`: a list
 /// of the places of frames is of one run, and stays under `runs` only. The stepped mode's counts
 /// and hash are not changed.
-pub const SCHEMA_VERSION: u32 = 14;
+///
+/// 15 measured that lag where it is seen: at each frame, the distance between the frame thread's
+/// camera and the centre of the scene it draws (14's was between the camera the scene thread had
+/// been told and the scene's centre at a publish, which a follow that ended at the camera it was
+/// told brought to 0 however far the camera had gone since), with the 99th percentile
+/// (`scene_lag_voxels_p99`, `scene_lag_d0_p99`) added to the most. The stepped mode's counts and
+/// hash are not changed.
+pub const SCHEMA_VERSION: u32 = 15;
 
 /// One timed thing (a pass, or the GPU total of a profiler frame) in one mode, against its
 /// budget. In reference mode a profiler frame is one sample, so the entries of that mode have
@@ -526,7 +533,7 @@ mod tests {
                 "streaming_real_time"
             ]
         );
-        assert_eq!(json["schema_version"], 14);
+        assert_eq!(json["schema_version"], 15);
         assert_eq!(json["streaming"], serde_json::Value::Null);
         assert_eq!(json["streaming_real_time"], serde_json::Value::Null);
         assert_eq!(

@@ -582,12 +582,17 @@ pub struct PathReport {
     /// `slowest`: with `index` and `at_ms` to read against the slow frames, and each one's time,
     /// copies and wait.
     pub largest_updates: Vec<SlowFrame>,
-    /// The most that the scene was behind the camera at a publish during the path: the distance
-    /// between the camera the scene thread had been told and the scene's centre, in Voxels and in
-    /// `d0` (the report's, so that it reads against the jump: 2 `d0`). A scene that is always
-    /// walked to, never made again, falls behind without limit above the speed it keeps up at.
+    /// How far behind the camera the scene that was drawn was, at each frame of the path: the
+    /// distance between the frame thread's camera and the centre of the scene it draws (the one the
+    /// scene thread had published, and the frame thread taken), in Voxels and in `d0` (the
+    /// report's, so that it reads against the jump: 2 `d0`), the most and the 99th percentile. A
+    /// scene that is always walked to, never made again, falls behind without limit above the
+    /// speed it keeps up at; a path that ends with the camera standing ends with the lag the
+    /// scene has then (0 if it has caught up).
     pub scene_lag_voxels_max: f64,
     pub scene_lag_d0_max: f64,
+    pub scene_lag_voxels_p99: f64,
+    pub scene_lag_d0_p99: f64,
     /// What the frames' uploads came to, and how often the budget cut them.
     pub upload: PathUpload,
     /// Soft misses a frame reported (counted by the scene thread a few times a second, so a frame
@@ -1042,6 +1047,17 @@ fn build_test() -> Result<Built, Box<dyn Error>> {
     })
 }
 
+/// The largest of the `lags` (Voxels) and the 99th percentile, nearest rank; 0 for none.
+fn lag_spread(lags: &[f64]) -> (f64, f64) {
+    let mut sorted = lags.to_vec();
+    sorted.sort_by(f64::total_cmp);
+    let rank = (sorted.len() * 99).div_ceil(100);
+    (
+        sorted.last().copied().unwrap_or(0.0),
+        rank.checked_sub(1).map_or(0.0, |at| sorted[at]),
+    )
+}
+
 /// What one frame cost, and the soft misses it reported.
 struct Frame {
     /// When the frame started.
@@ -1053,7 +1069,7 @@ struct Frame {
     soft_misses: usize,
     /// Whether the scene thread held work back in this frame for the upload budget.
     throttled: bool,
-    /// The scene's lag behind the camera in Voxels (see [`PathReport::scene_lag_voxels_max`]).
+    /// The drawn scene's lag behind the camera in Voxels (see [`PathReport::scene_lag_voxels_max`]).
     lag: f64,
     /// Whether the look at the scene in this frame has the newest Edit in it (from this frame or an
     /// earlier one), and when it was done.
@@ -1099,8 +1115,8 @@ struct Capture {
     over_limit_at: Vec<usize>,
     /// The updates with the most bytes.
     largest: Worst,
-    /// The largest lag of the scene behind the camera, in Voxels.
-    lag_max: f64,
+    /// The lag of the drawn scene behind the camera at each frame, in Voxels.
+    lags: Vec<f64>,
 }
 
 impl Capture {
@@ -1122,7 +1138,7 @@ impl Capture {
             worst: Worst::new(),
             over_limit_at: Vec::new(),
             largest: Worst::by(|f| f.upload_bytes as f64),
-            lag_max: 0.0,
+            lags: Vec::new(),
             spent: world.scene_thread_time(),
             scans: work.hole_scans,
             holes: work.holes_found,
@@ -1146,7 +1162,7 @@ impl Capture {
             self.over_limit += 1;
             self.over_by_update.add(frame.parts.update);
         }
-        self.lag_max = self.lag_max.max(frame.lag);
+        self.lags.push(frame.lag);
         self.over_budget.add(frame.parts.over_budget);
         if frame.parts.grown_bytes > 0 {
             self.growth_frames += 1;
@@ -1202,6 +1218,8 @@ impl Capture {
         let frames = self.frame_ms.len();
         let per_frame = |count: u64| count as f64 / frames.max(1) as f64;
         let holes = work.holes_found - self.holes;
+        let d0 = world.stats().bands.map(|bands| bands.d0());
+        let (lag_max, lag_p99) = lag_spread(&self.lags);
         PathReport {
             name: self.name,
             frames,
@@ -1215,11 +1233,10 @@ impl Capture {
             slowest: self.worst.sorted(),
             over_limit_at: self.over_limit_at,
             largest_updates: self.largest.sorted(),
-            scene_lag_voxels_max: self.lag_max,
-            scene_lag_d0_max: world
-                .stats()
-                .bands
-                .map_or(0.0, |bands| self.lag_max / bands.d0()),
+            scene_lag_voxels_max: lag_max,
+            scene_lag_d0_max: d0.map_or(0.0, |d0| lag_max / d0),
+            scene_lag_voxels_p99: lag_p99,
+            scene_lag_d0_p99: d0.map_or(0.0, |d0| lag_p99 / d0),
             upload: PathUpload {
                 updates: self.update_ms.len(),
                 time: Spread::of(&self.update_ms),
@@ -1435,7 +1452,7 @@ impl<'a> Session<'a> {
             parts,
             soft_misses: self.world.stats().soft_misses,
             throttled: self.world.stats().throttled,
-            lag: self.world.stats().lag,
+            lag: self.world.lag(camera.position),
             edit_taken,
             taken_at,
         })
@@ -1936,6 +1953,8 @@ mod tests {
             largest_updates: Vec::new(),
             scene_lag_voxels_max: 0.0,
             scene_lag_d0_max: 0.0,
+            scene_lag_voxels_p99: 0.0,
+            scene_lag_d0_p99: 0.0,
             upload: PathUpload::default(),
             soft_misses: Series::default(),
             soft_misses_per_frame: 0.0,
@@ -2370,7 +2389,9 @@ mod tests {
                 "name",
                 "over_limit_at",
                 "scene_lag_d0_max",
+                "scene_lag_d0_p99",
                 "scene_lag_voxels_max",
+                "scene_lag_voxels_p99",
                 "scene_thread",
                 "seconds",
                 "settle",
@@ -2750,6 +2771,15 @@ mod tests {
     }
 
     #[test]
+    fn the_lag_of_a_path_is_its_largest_and_its_99th_percentile_by_nearest_rank() {
+        assert_eq!(lag_spread(&[]), (0.0, 0.0));
+        assert_eq!(lag_spread(&[7.0]), (7.0, 7.0));
+        // 200 frames: the 99th is the 198th smallest, and the largest is not it.
+        let lags: Vec<f64> = (0..200).rev().map(f64::from).collect();
+        assert_eq!(lag_spread(&lags), (199.0, 197.0));
+    }
+
+    #[test]
     fn the_scene_lag_of_a_path_is_in_the_report_and_its_min_and_max_are_the_runs() {
         let report = RealTimeReport::new(
             "test".into(),
@@ -2758,10 +2788,12 @@ mod tests {
                 run_with(|r| {
                     r.paths[1].scene_lag_voxels_max = 640.0;
                     r.paths[1].scene_lag_d0_max = 10.0;
+                    r.paths[1].scene_lag_voxels_p99 = 600.0;
                 }),
                 run_with(|r| {
                     r.paths[1].scene_lag_voxels_max = 6400.0;
                     r.paths[1].scene_lag_d0_max = 100.0;
+                    r.paths[1].scene_lag_voxels_p99 = 6000.0;
                 }),
             ],
             &BUDGETS,
@@ -2770,6 +2802,8 @@ mod tests {
         assert_eq!(json["min"]["paths"][1]["scene_lag_voxels_max"], 640.0);
         assert_eq!(json["max"]["paths"][1]["scene_lag_voxels_max"], 6400.0);
         assert_eq!(json["max"]["paths"][1]["scene_lag_d0_max"], 100.0);
+        assert_eq!(json["min"]["paths"][1]["scene_lag_voxels_p99"], 600.0);
+        assert_eq!(json["max"]["paths"][1]["scene_lag_voxels_p99"], 6000.0);
     }
 
     #[test]

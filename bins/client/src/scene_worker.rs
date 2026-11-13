@@ -113,18 +113,27 @@ const THROTTLED_WAIT: Duration = Duration::from_millis(20);
 /// that was behind by more than a jump after them was made again, 871 MB).
 const FOLLOW_SHARE: (u64, u64) = (1, 4);
 
-/// What following the camera is assumed to cost a Voxel of its move before one is measured, a
-/// little over the 4090's flights (34 KB and 1.9 copies a Voxel at 2 m): so that the first step
-/// of a long walk is not the one that is too long.
-const FOLLOW_RATE: (f64, f64) = (64.0 * 1024.0, 4.0);
-/// The least that a Voxel of the camera's move is taken to cost, whatever the steps measured:
-/// half of [`FOLLOW_RATE`], a little under the 4090's 34 KB at 2 m. A step that moved the scene
-/// a Voxel and changed nothing costs nothing, and a rebuild is counted as costing nothing over a
-/// long distance, so without a floor a run of such steps halved the rate to nothing and the next
-/// step was as long as the cap (half a jump, 1 028 Voxels at full size, the 34 MB operation of
-/// the first 4090 run). With it a step is at most `FOLLOW_SHARE` of the budget over this, 64
-/// Voxels at the default budget, whatever came before.
-const FOLLOW_RATE_FLOOR: (f64, f64) = (32.0 * 1024.0, 2.0);
+/// The least that a Voxel of the camera's move is taken to cost, a little under the 4090's flights
+/// (34 KB and 1.9 copies a Voxel at 2 m): a step of following the camera is never longer than
+/// [`FOLLOW_SHARE`] of the budget over this, 64 Voxels at the default budget, whatever the steps
+/// before it cost. A step that moved the scene a Voxel and changed nothing costs nothing, and a
+/// rebuild is counted as costing nothing over a long distance, so what the steps cost cannot be
+/// all that sizes the next one (it was 1 028 Voxels at full size once, the 34 MB operation of the
+/// first 4090 run).
+const FOLLOW_MIN_COST: (f64, f64) = (32.0 * 1024.0, 2.0);
+
+/// How much a follow step's length changes by after one step, at the most, up and down: a step
+/// that cost half of what it may goes on twice as far, and one that cost over twice goes half.
+const FOLLOW_STEP_CHANGE: (f64, f64) = (0.5, 2.0);
+
+/// The shortest follow step, as a fraction of its limit (see [`Engine::follow_limit`]). A step's
+/// cost has a part that does not depend on its length: the regions that it rewrites are written
+/// whole, so on the 4090 a step of 64 Voxels cost 3.5 MB and one of 4 cost 2.2 MB. A length that
+/// is made to fit a share of the budget by the steps' cost therefore fell to 4 Voxels and stayed
+/// there (measured, 240 steps of 4 Voxels covered 1 200 Voxels in 7.4 s, 2 MB each: eight times
+/// the bytes of steps of 64 for the same walk, and a step costs the scene thread as long a Voxel
+/// at 4 as at 64).
+const FOLLOW_STEP_LEAST: f64 = 0.25;
 
 /// How many jobs of the loader are done in one step of a stepped scene thread (see
 /// [`SceneWorker::step`]): about what the real workers make between two frames of a test, so that a
@@ -299,19 +308,18 @@ pub struct Stats {
     /// The thread is holding work back, to keep what the frame thread uploads to its budget (see
     /// [`UPLOAD_BUDGET`]): as of this publish.
     pub throttled: bool,
-    /// The most, in Voxels, that the scene's centre was from the camera the thread was last told
-    /// at a publish since the frame thread last took one (a publish that merged into the one that
-    /// waited keeps the larger): how far behind the camera the scene was. 0 for a scene that is
-    /// where the camera is. See [`Engine::follow`].
-    pub lag: f64,
     pub loader: LoaderStats,
     /// What costs more to find out, as of a few times a second.
     pub slow: Arc<Slow>,
     #[cfg_attr(not(test), allow(dead_code))]
     pub eviction: EvictionStats,
-    /// Where the scene had been moved to.
-    #[cfg(test)]
+    /// Where the scene had been moved to: the centre of the scene that the frame thread draws once
+    /// it has taken this (see [`crate::world::World::lag`]).
     pub camera: Option<[f64; 3]>,
+    /// How far the camera and the places looked ahead to have gone as far as the selection is
+    /// concerned (see [`render::Scene::travelled`]): what it is made to look at again for.
+    #[cfg(test)]
+    pub travelled: f64,
     /// What the operations of the publish added that were not inside the budget: those (a follow
     /// step, a batch of arrivals, an Edit) that began when what waits had reached the budget (the
     /// batch of arrivals that a round is always given), and the one that took it there. A publish's
@@ -454,12 +462,12 @@ fn stats_of(scene: &Scene, loader: &Loader, slow: &Arc<Slow>, eviction: Eviction
         holes: 0,
         work: Done::default(),
         throttled: false,
-        lag: 0.0,
         loader: LoaderStats::of(loader),
         slow: Arc::clone(slow),
         eviction,
-        #[cfg(test)]
         camera: scene.camera(),
+        #[cfg(test)]
+        travelled: scene.travelled(),
         #[cfg(test)]
         excess_ops: UploadCost::default(),
         #[cfg(test)]
@@ -776,9 +784,7 @@ impl SceneWorker {
             throttled: false,
             pending: UploadCost::default(),
             batch_cost: UploadCost::default(),
-            follow_rate: FollowRate::default(),
-            told: [0.0; 3],
-            lag_seen: 0.0,
+            follow_step: None,
             teleported: false,
             clock,
             #[cfg(test)]
@@ -1281,13 +1287,9 @@ struct Engine {
     /// one like it could take what waits to the budget (see [`Engine::batch_estimate`]). It is the
     /// last, not the largest, so that one big batch is forgotten with the next.
     batch_cost: UploadCost,
-    /// What a Voxel of the camera's move has cost to pack, in bytes and in copies, as of the
-    /// follow steps so far (see [`Engine::follow`]): how far the next step may go.
-    follow_rate: FollowRate,
-    /// The camera the thread was last told, and the largest distance that the scene's centre was
-    /// from it at a publish since a [`Stats`] was published with it (see [`Stats::lag`]).
-    told: [f64; 3],
-    lag_seen: f64,
+    /// How long the next step of following the camera is (None before the first), from how the
+    /// steps so far cost (see [`Engine::follow`]).
+    follow_step: Option<FollowStep>,
     /// The camera was put somewhere far, further than the scene follows by patching (a
     /// teleport), since the last follow: the scene is made again there, not walked to.
     teleported: bool,
@@ -1309,35 +1311,29 @@ struct Engine {
     largest_follow: UploadCost,
 }
 
-/// What a Voxel of the camera's move costs to upload, as the steps of following it have shown.
+/// The length of the next step of following the camera, in Voxels, from how the last one went
+/// (see [`FollowStep::after`]).
 #[derive(Clone, Copy, Debug)]
-struct FollowRate {
-    bytes: f64,
-    writes: f64,
-}
+struct FollowStep(f64);
 
-impl FollowRate {
-    /// The rate after a step that cost `cost` over `distance` Voxels: what it cost, or half of the
-    /// rate before it (so that one quiet step does not make the next one long), and not under
-    /// [`FOLLOW_RATE_FLOOR`] (so that no run of quiet steps does).
-    fn after(self, cost: UploadCost, distance: f64) -> Self {
-        Self {
-            bytes: (cost.bytes as f64 / distance)
-                .max(self.bytes / 2.0)
-                .max(FOLLOW_RATE_FLOOR.0),
-            writes: (f64::from(cost.writes) / distance)
-                .max(self.writes / 2.0)
-                .max(FOLLOW_RATE_FLOOR.1),
-        }
-    }
-}
-
-impl Default for FollowRate {
-    fn default() -> Self {
-        Self {
-            bytes: FOLLOW_RATE.0,
-            writes: FOLLOW_RATE.1,
-        }
+impl FollowStep {
+    /// The length after a full step of `distance` Voxels that cost `cost`, to cost `target`: the
+    /// step scaled by how far under or over `target` the cost was (at most
+    /// [`FOLLOW_STEP_CHANGE`]), and within [`FOLLOW_STEP_LEAST`] of `limit` and `limit`. A cost
+    /// over a Voxel is not a rate (see [`FOLLOW_STEP_LEAST`]).
+    fn after(self, distance: f64, cost: UploadCost, target: UploadCost, limit: f64) -> Self {
+        let room = |target: f64, cost: f64| {
+            if cost <= 0.0 {
+                FOLLOW_STEP_CHANGE.1
+            } else {
+                target / cost
+            }
+        };
+        let scale = room(target.bytes as f64, cost.bytes as f64)
+            .min(room(f64::from(target.writes), f64::from(cost.writes)))
+            .clamp(FOLLOW_STEP_CHANGE.0, FOLLOW_STEP_CHANGE.1);
+        let limit = limit.max(1.0);
+        Self((distance * scale).clamp((limit * FOLLOW_STEP_LEAST).max(1.0), limit))
     }
 }
 
@@ -1523,8 +1519,17 @@ impl Engine {
             self.teleported = true;
         }
         self.shared.taken.store(false, Ordering::Release);
-        self.told = camera;
-        self.look_ahead(camera, velocity);
+        // The places looked ahead to are from where the scene is to be after this round's first
+        // step, which is the camera if it keeps up: not from the camera, which is as far as the
+        // scene is behind it ahead of where the scene's step goes, and a selection that counts
+        // the places' travel looks at what that travel made due (every round, for the camera's
+        // whole move since the last, however far the round walked the scene).
+        let place = if self.teleported {
+            camera
+        } else {
+            self.next_place(camera)
+        };
+        self.look_ahead(place, velocity);
         self.paused = self.shared.paused.load(Ordering::Acquire);
         self.scene
             .set_buffer_limit(self.shared.buffer_limit.load(Ordering::Relaxed));
@@ -1866,8 +1871,8 @@ impl Engine {
                 .map(|a| (target[a] - from[a]).powi(2))
                 .sum::<f64>()
                 .sqrt();
-            if distance >= 1.0 {
-                self.follow_rate = self.follow_rate.after(cost, distance);
+            if target != camera && !teleported {
+                self.resize_follow_step(distance, cost);
             }
             self.note(update);
             if self.camera == Some(camera) {
@@ -1885,9 +1890,28 @@ impl Engine {
         Ok(true)
     }
 
+    /// What one step of following the camera is to cost: [`FOLLOW_SHARE`] of the budget.
+    fn follow_target(&self) -> UploadCost {
+        let share = |n: u64| n * FOLLOW_SHARE.0 / FOLLOW_SHARE.1;
+        UploadCost {
+            bytes: share(self.shared.budget_bytes.load(Ordering::Relaxed)),
+            writes: share(u64::from(self.shared.budget_writes.load(Ordering::Relaxed))) as u32,
+        }
+    }
+
+    /// The longest that a step of following the camera is: a step that costs the least that a
+    /// Voxel does ([`FOLLOW_MIN_COST`]) at [`Engine::follow_target`], and no more than half a
+    /// jump.
+    fn follow_limit(&self, d0: f64) -> f64 {
+        let target = self.follow_target();
+        (target.bytes as f64 / FOLLOW_MIN_COST.0)
+            .min(f64::from(target.writes) / FOLLOW_MIN_COST.1)
+            .min(render::scene::JUMP * d0 / 2.0)
+            .max(1.0)
+    }
+
     /// Where the next step of following the camera to `camera` goes: the camera, or the point
-    /// along the way that costs a share of the budget (by what a Voxel has cost), no further than
-    /// half a jump, and at least a Voxel.
+    /// along the way that is the length of the step (half of its limit for the first one).
     fn next_place(&self, camera: [f64; 3]) -> [f64; 3] {
         let (Some(from), Some(bands)) = (self.scene.camera(), self.scene.bands()) else {
             return camera;
@@ -1896,23 +1920,25 @@ impl Engine {
             .map(|a| (camera[a] - from[a]).powi(2))
             .sum::<f64>()
             .sqrt();
-        let share = |budget: f64, rate: f64| {
-            budget * FOLLOW_SHARE.0 as f64 / FOLLOW_SHARE.1 as f64 / rate.max(1e-9)
-        };
-        let step = share(
-            self.shared.budget_bytes.load(Ordering::Relaxed) as f64,
-            self.follow_rate.bytes,
-        )
-        .min(share(
-            f64::from(self.shared.budget_writes.load(Ordering::Relaxed)),
-            self.follow_rate.writes,
-        ))
-        .min(render::scene::JUMP * bands.d0() / 2.0)
-        .max(1.0);
+        let limit = self.follow_limit(bands.d0());
+        let step = self
+            .follow_step
+            .map_or(limit / 2.0, |step| step.0)
+            .min(limit);
         if distance <= step {
             return camera;
         }
         std::array::from_fn(|a| from[a] + (camera[a] - from[a]) * step / distance)
+    }
+
+    /// Sizes the next step by a full step of `distance` Voxels that cost `cost`.
+    fn resize_follow_step(&mut self, distance: f64, cost: UploadCost) {
+        let Some(bands) = self.scene.bands() else {
+            return;
+        };
+        let limit = self.follow_limit(bands.d0());
+        let step = self.follow_step.unwrap_or(FollowStep(limit / 2.0));
+        self.follow_step = Some(step.after(distance, cost, self.follow_target(), limit));
     }
 
     /// Asks the loader for what the bands wait for, nearest `camera` first, and takes in what it
@@ -2447,13 +2473,6 @@ impl Engine {
             stats.soft_misses_by_level = self.soft_misses_by_level;
             stats.holes = self.holes;
         }
-        if let Some(centre) = self.scene.camera() {
-            let lag = (0..3)
-                .map(|a| (self.told[a] - centre[a]).powi(2))
-                .sum::<f64>()
-                .sqrt();
-            self.lag_seen = self.lag_seen.max(lag);
-        }
         let changes = std::mem::replace(&mut self.changes, Changes::None);
         if matches!(changes, Changes::None)
             && stats.same_counts(&self.published, exactly)
@@ -2488,11 +2507,6 @@ impl Engine {
             }
             (Changes::None | Changes::Rebuilt, None) => {}
         }
-        // What waits in the outbox has not been taken: its lag was not seen, and stays in this one.
-        stats.lag = std::mem::take(&mut self.lag_seen);
-        if let Some(waiting) = &outbox.ready.stats {
-            stats.lag = stats.lag.max(waiting.lag);
-        }
         outbox.ready.stats = Some(stats.clone());
         if exactly {
             outbox.ready.published_at.get_or_insert(self.clock.now());
@@ -2513,29 +2527,44 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_rate_of_what_a_voxel_costs_does_not_fall_under_its_floor_whatever_the_steps_cost() {
-        // A run of steps that moved a Voxel and changed nothing, and of rebuilds (no patch's cost
-        // over a long distance): each halves the rate, and there was no end to it.
-        let mut rate = FollowRate::default();
-        for step in 0..200 {
-            let distance = if step % 2 == 0 { 1.0 } else { 512.0 };
-            rate = rate.after(UploadCost::default(), distance);
-        }
-        assert_eq!(rate.bytes, FOLLOW_RATE_FLOOR.0);
-        assert_eq!(rate.writes, FOLLOW_RATE_FLOOR.1);
-        // A step that cost more is followed at once, and one that cost less is followed down by
-        // halves, to the floor.
-        let costly = UploadCost {
-            bytes: 100_000,
-            writes: 10,
+    fn a_follow_step_is_sized_by_how_its_cost_compared_to_its_share_and_is_never_over_the_limit() {
+        let target = UploadCost {
+            bytes: 2 << 20,
+            writes: 512,
         };
-        rate = rate.after(costly, 1.0);
-        assert_eq!((rate.bytes, rate.writes), (100_000.0, 10.0));
-        rate = rate.after(UploadCost::default(), 1.0);
-        assert_eq!((rate.bytes, rate.writes), (50_000.0, 5.0));
-        // The floor is half of what an unmeasured Voxel is taken to cost, so the first step of a
-        // walk is not longer than one at the floor.
-        assert!(FOLLOW_RATE_FLOOR.0 <= FOLLOW_RATE.0 && FOLLOW_RATE_FLOOR.1 <= FOLLOW_RATE.1);
+        let cost = |bytes, writes| UploadCost { bytes, writes };
+        let step = FollowStep(32.0);
+        // Half of what it may cost: twice as far. A tenth: still twice, and not over the limit.
+        assert_eq!(step.after(32.0, cost(1 << 20, 100), target, 64.0).0, 64.0);
+        assert_eq!(step.after(32.0, cost(200_000, 10), target, 100.0).0, 64.0);
+        assert_eq!(step.after(32.0, cost(200_000, 10), target, 40.0).0, 40.0);
+        // Over it by half: two thirds of the step; far over: half.
+        let over = step.after(32.0, cost(3 << 20, 100), target, 64.0).0;
+        assert!((over - 32.0 * 2.0 / 3.0).abs() < 1e-9, "{over}");
+        assert_eq!(step.after(32.0, cost(40 << 20, 100), target, 64.0).0, 16.0);
+        // The copies bound it as well as the bytes.
+        assert_eq!(step.after(32.0, cost(1 << 10, 2048), target, 64.0).0, 16.0);
+        // A step that cost nothing (the scene did not change) is twice as far, but not over the
+        // limit; and a run of costly ones halves it to a quarter of the limit, and no less.
+        assert_eq!(
+            step.after(32.0, UploadCost::default(), target, 64.0).0,
+            64.0
+        );
+        let mut step = FollowStep(64.0);
+        for _ in 0..40 {
+            step = step.after(step.0, cost(1 << 30, 100_000), target, 64.0);
+        }
+        assert_eq!(step.0, 16.0);
+        // The least is a Voxel for a limit of a few.
+        assert_eq!(step.after(1.0, cost(1 << 30, 9), target, 2.0).0, 1.0);
+    }
+
+    #[test]
+    fn the_least_a_voxel_costs_makes_a_step_at_most_64_voxels_at_the_default_budget() {
+        let share = UPLOAD_BUDGET.bytes * FOLLOW_SHARE.0 / FOLLOW_SHARE.1;
+        assert_eq!((share as f64 / FOLLOW_MIN_COST.0) as u64, 64);
+        let writes = u64::from(UPLOAD_BUDGET.writes) * FOLLOW_SHARE.0 / FOLLOW_SHARE.1;
+        assert_eq!((writes as f64 / FOLLOW_MIN_COST.1) as u64, 256);
     }
 
     #[test]

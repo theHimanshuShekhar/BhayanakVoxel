@@ -2366,6 +2366,9 @@ struct Misses {
     with_misses: usize,
     total: usize,
     peak: usize,
+    /// The distance of the scene that is drawn from the camera, at each frame (see
+    /// [`World::lag`]), in Voxels.
+    lag: Vec<f64>,
 }
 
 /// Runs the camera along `position_at(t)` (seconds) for `seconds` at 60 frames a second, with the
@@ -2384,6 +2387,7 @@ fn run_path(
         with_misses: 0,
         total: 0,
         peak: 0,
+        lag: Vec::new(),
     };
     while began.elapsed().as_secs_f64() < seconds {
         let tick = Instant::now();
@@ -2393,16 +2397,26 @@ fn run_path(
         misses.with_misses += usize::from(soft > 0);
         misses.total += soft;
         misses.peak = misses.peak.max(soft);
+        misses.lag.push(world.lag(position));
         std::thread::sleep(frame.saturating_sub(tick.elapsed()));
     }
+    let mut lags = misses.lag.clone();
+    lags.sort_by(f64::total_cmp);
+    let p99 = lags
+        .get((lags.len() * 99).div_ceil(100).saturating_sub(1))
+        .copied()
+        .unwrap_or(0.0);
     eprintln!(
         "  {name}: {} frames, {} with soft misses, {} bricks missed in all, {} at most at once; \
-         {} waiting at the end",
+         {} waiting at the end; the drawn scene was {:.0} Voxels behind the camera at most, {p99:.0} \
+         at the 99th percentile, {:.0} at the end",
         misses.frames,
         misses.with_misses,
         misses.total,
         misses.peak,
-        world.waiting()
+        world.waiting(),
+        lags.last().copied().unwrap_or(0.0),
+        misses.lag.last().copied().unwrap_or(0.0),
     );
     misses
 }
@@ -3253,7 +3267,7 @@ fn put_the_camera_far_away(
 }
 
 /// What the scene thread has been through before the camera is put far away (see
-/// [`put_the_camera_far_away_after`]), that its rate of what a Voxel of the move costs learns from.
+/// [`put_the_camera_far_away_after`]), that the length of its follow steps learns from.
 #[derive(Clone, Copy, Debug)]
 enum Before {
     Nothing,
@@ -3265,7 +3279,7 @@ enum Before {
 }
 
 /// [`put_the_camera_far_away`] after `before`, and the largest lag of the scene behind the camera
-/// that a frame saw ([`Stats::lag`]) as the last of the tuple.
+/// that a frame saw ([`World::lag`]) as the last of the tuple.
 fn put_the_camera_far_away_after(
     before: Before,
     budget: render::UploadCost,
@@ -3323,7 +3337,7 @@ fn put_the_camera_far_away_after(
     let mut patience = Patience::new(Duration::from_secs(180));
     loop {
         let update = world.recentre(target).unwrap();
-        lag = lag.max(world.stats().lag);
+        lag = lag.max(world.lag(target));
         match update {
             Some(SceneUpdate::Rebuilt) => {
                 rebuilds += 1;
@@ -3393,26 +3407,29 @@ fn a_camera_that_the_scene_fell_far_behind_is_walked_to_in_steps_within_the_budg
     assert_eq!(rebuilds, 1, "a teleport is not made again");
 }
 
-/// A budget at which the floor under the rate of a follow step's cost is what keeps a step in it,
-/// on this Planet: a step of the least size (a bucket of 4 Voxels of travel) costs 100 to 140 KB,
-/// and one of the cap, 64 Voxels, 200 to 260 KB. The stepped runs are the same every time, so the
-/// margins hold.
-const FLOOR_BUDGET: render::UploadCost = render::UploadCost {
+/// A small budget, so that the follow steps of a stepped scene thread are short (a Voxel or two:
+/// the step that a share of this budget over the least cost of a Voxel comes to), and a camera
+/// that goes at 24 Voxels a frame is not kept up with. A step costs 100 to 145 KB here, whatever its
+/// length (the regions that it rewrites are written whole), which is within the budget. The stepped
+/// runs are the same every time, so the margins hold. (On this Planet a step's cost does not depend
+/// on its length enough for the limit on it to be what keeps it in the budget: at full size it
+/// is, 34 KB a Voxel against 34 MB for half a jump; see
+/// `a_follow_step_is_sized_by_how_its_cost_compared_to_its_share_and_is_never_over_the_limit`.)
+const STEP_BUDGET: render::UploadCost = render::UploadCost {
     bytes: 192 << 10,
     writes: 32,
 };
 
-/// What a follow step costs when the measured cost of a Voxel is what limits it and not the cap of
-/// half a jump (64 Voxels here, 1 028 at full size). The rate that sizes a step learns from the
-/// steps before; one that moved and changed nothing, and a rebuild, cost nothing, and a rate that
-/// followed them down made the next step as long as the cap (the 34 MB operation of the first
-/// 4090 run). A floor under the rate stops that, and bounds a step whatever came before.
+/// What a follow step costs after steps that cost nothing (a run of quiet ones, and teleports,
+/// which are rebuilds and no patch's cost) and after none: it is within the budget whatever came
+/// before. The length of a step is limited by [`crate::scene_worker`]'s `FOLLOW_MIN_COST`, and was
+/// by a floor under a rate; the first 4090 run followed in one step of 17 to 34 MB.
 #[test]
 fn a_follow_step_is_within_the_budget_after_a_run_of_quiet_steps_and_after_teleports() {
     let far = 4.0 * render::scene::JUMP * D0;
     for before in [Before::Nothing, Before::QuietSteps, Before::Teleports] {
         let (rebuilds, patches, follow, _, frames, there, lag) =
-            put_the_camera_far_away_after(before, FLOOR_BUDGET, far, false);
+            put_the_camera_far_away_after(before, STEP_BUDGET, far, false);
         eprintln!(
             "{before:?}: {rebuilds} rebuilds, {patches} patches, {follow:?}, {frames} frames, lag {lag}"
         );
@@ -3421,17 +3438,68 @@ fn a_follow_step_is_within_the_budget_after_a_run_of_quiet_steps_and_after_telep
         // Every step costs what the budget lets it, though the cap would let it be 64 Voxels
         // (over the budget here): the budget sized it.
         assert!(
-            follow.bytes <= FLOOR_BUDGET.bytes && follow.writes <= FLOOR_BUDGET.writes,
-            "{before:?}: a follow step of {follow:?} is over the budget of {FLOOR_BUDGET:?}"
+            follow.bytes <= STEP_BUDGET.bytes && follow.writes <= STEP_BUDGET.writes,
+            "{before:?}: a follow step of {follow:?} is over the budget of {STEP_BUDGET:?}"
         );
         assert!(patches > 8, "{before:?}: {patches} patches");
-        // The scene was behind by about all of the way when it first published: what `Stats::lag`
+        // The scene was behind by about all of the way when it first published: what `World::lag`
         // is for, and it is a distance and not a count.
         assert!(
             lag > far * 0.5 && lag <= far + 1.0,
             "{before:?}: the scene was at most {lag} Voxels behind a camera {far} away"
         );
     }
+}
+
+/// What it costs the scene thread to follow a camera that it cannot keep up with is in
+/// proportion to how far it walked the scene, not to how far the camera went. The selection looks
+/// at the nodes that the camera's travel (and that of the places it looks ahead to) can have changed;
+/// the places were the camera's plus its lead, so each round that was told a camera that had gone 24
+/// Voxels counted 24 more travel, however far the round walked the scene: every call looked at what
+/// 1 300 Voxels at full size (about 3 million nodes, 0.75 s) had made due, for a step of 64.
+/// Now the places are the scene's own plus the lead. The test is the model of that: the selection's
+/// travel (see [`render::Scene::travelled`]) is at most 2.5 times what the scene walked (2.0
+/// times, against 3.5 with the places from the camera: the camera goes 2.4 times as far as the
+/// scene walks here, and about 8 times at full size, where the difference is the 3 million nodes
+/// of each call); it cannot show the time, since the stepped clock does not measure the work.
+#[test]
+fn the_selection_travels_as_far_as_the_scene_walks_when_the_camera_goes_faster() {
+    let (mut world, _server, camera) = spawned_world(Run::Stepped);
+    world.count_exactly();
+    fill(&mut world, camera.position);
+    world.worker().set_upload_budget(STEP_BUDGET);
+    let (ahead, _) = tangents(camera.horizon_up);
+    let along = |world: &World, voxels: f64| {
+        let moved = std::array::from_fn(|a| camera.position[a] + ahead[a] * voxels);
+        over_the_ground(&world.store(), moved)
+    };
+    // 40 Voxels a frame, 2 400 a second: the places looked ahead to are 2 400 and 4 800 Voxels on.
+    let velocity: [f64; 3] = std::array::from_fn(|a| ahead[a] * 40.0 * 60.0);
+    // The first look ahead counts the places' whole distance, once: it is not what is measured.
+    world
+        .recentre_moving(along(&world, 40.0), velocity)
+        .unwrap();
+    let (began_at, began) = (world.stats().camera.unwrap(), world.stats().travelled);
+    for frame in 2..=60 {
+        let there = along(&world, 40.0 * f64::from(frame));
+        world.recentre_moving(there, velocity).unwrap();
+    }
+    let now = world.stats().camera.unwrap();
+    let walked = (0..3)
+        .map(|a| (now[a] - began_at[a]).powi(2))
+        .sum::<f64>()
+        .sqrt();
+    let travelled = world.stats().travelled - began;
+    let went = 40.0 * 59.0;
+    eprintln!("walked {walked:.0} Voxels, travelled {travelled:.0}, the camera went {went}");
+    assert!(
+        walked > 60.0 && walked < went * 0.75,
+        "the scene walked {walked} Voxels: it is to be well behind a camera that went {went}"
+    );
+    assert!(
+        travelled <= 2.5 * walked,
+        "the selection travelled {travelled} Voxels for a scene that walked {walked}"
+    );
 }
 
 /// A camera that is put somewhere in one move (a teleport) but ends within a jump of where the
@@ -3443,7 +3511,7 @@ fn a_teleport_that_ends_within_a_jump_of_the_scene_is_walked_to_within_the_budge
     let (mut world, _server, camera) = spawned_world(Run::Stepped);
     world.count_exactly();
     fill(&mut world, camera.position);
-    world.worker().set_upload_budget(FLOOR_BUDGET);
+    world.worker().set_upload_budget(STEP_BUDGET);
     world.worker().forget_largest();
     let mut gpu = GpuCopy::of(world.scene());
     let (ahead, _) = tangents(camera.horizon_up);
@@ -3487,8 +3555,8 @@ fn a_teleport_that_ends_within_a_jump_of_the_scene_is_walked_to_within_the_budge
         "the scene was made again for a move within a jump"
     );
     assert!(
-        follow.bytes <= FLOOR_BUDGET.bytes && follow.writes <= FLOOR_BUDGET.writes,
-        "a follow step of {follow:?} is over the budget of {FLOOR_BUDGET:?}"
+        follow.bytes <= STEP_BUDGET.bytes && follow.writes <= STEP_BUDGET.writes,
+        "a follow step of {follow:?} is over the budget of {STEP_BUDGET:?}"
     );
     assert!(patches > 2, "{patches} patches: it was not walked");
 }

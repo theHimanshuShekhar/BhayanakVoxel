@@ -1107,6 +1107,12 @@ impl Scene {
         self.rings.as_ref().map(|r| r.selection.camera())
     }
 
+    /// How far the camera, and the places looked ahead to, have gone in all (see
+    /// [`Selection::travelled`]): 0 for a scene that is not of rings.
+    pub fn travelled(&self) -> f64 {
+        self.rings.as_ref().map_or(0.0, |r| r.selection.travelled())
+    }
+
     /// Follows the camera to `camera`, a position in Voxels: the bricks that the bands select
     /// change as it moves, and only the regions that lose or gain one are packed again. Returns
     /// what changed, or `None` if nothing did (and if this is not a scene of rings).

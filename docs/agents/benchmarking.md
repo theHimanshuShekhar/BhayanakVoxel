@@ -416,11 +416,15 @@ is made there (below): the run's **Edit latency**. Its frames are not those of a
     They are for reading the slow frames against the big updates: whether a wait of 30 ms with
     the GPU's passes at 1.5 ms is in the frame of a large update, or the frames after it (the 4090
     run of `9539899` could not say: the largest update was not among its five slowest frames).
-  - `scene_lag_voxels_max` and `scene_lag_d0_max` (schema 14): the most that the scene was behind
-    the camera at a publish during the path: the distance between the camera the scene thread had
-    been told and the scene's centre, in Voxels and in the report's `d0` (a jump is 2). A lag the
-    walk keeps up with stays near the distance a frame or two of the flight covers; one that grows
-    over a flight is the walk not keeping up (see "No ceiling on the lag").
+  - `scene_lag_voxels_max` and `scene_lag_d0_max`, with `scene_lag_voxels_p99` and
+    `scene_lag_d0_p99` (schema 15; 14 had the first two, measured at a publish, which understated
+    it): how far behind the camera the scene **that is drawn** was, at each frame of the path: the
+    distance between the frame thread's camera and the centre of the scene it draws, in Voxels and
+    in the report's `d0` (a jump is 2), the most and the 99th percentile (nearest rank) over the
+    path's frames. A lag the walk keeps up with stays near the distance a frame or two of the
+    flight covers (50 Voxels at 1 000 a second); one that grows over a flight is the walk not
+    keeping up (see "No ceiling on the lag"). A flight that ends with the camera 10 000 Voxels
+    from where it began and a scene 8 000 behind has a maximum a little under the end's.
   - `upload` (#145): what the path's updates cost: `updates` (frames with one), `time` (the CPU's
     time of the copy: mean, p99 and worst, in milliseconds), `bytes_p99` and `bytes_max`,
     `writes_p99` and `writes_max` (the belt copies: a rebuild has none; **these are the largest
@@ -556,23 +560,30 @@ place that says what a frame may take beyond it:
   operation (a follow step or a batch of arrivals) that takes what waits to the budget is in the
   frame. **A follow step is itself cut** (#145, round 6): a camera further from the scene than a
   quarter of the budget's worth of its move is walked to in steps of that size, each noted in its
-  turn. A step is `min(budget bytes / 4 / rate bytes, budget copies / 4 / rate copies)` Voxels,
-  where *rate* is what a Voxel of the move has cost (the larger of the last step's cost a Voxel and
-  half the rate before it) and **never under a floor of 32 KiB and 2 copies a Voxel** (round 7:
-  without it a run of steps that moved and changed nothing, or one rebuild, halved the rate towards
-  nothing, and the next step was as long as its cap, half a jump: 1 028 Voxels, the 34 MB operation
-  of the first 4090 run). A step is at least 1 Voxel and at most half a jump. **What that
-  guarantees at full size:** a step is at most 64 Voxels at the default budget (2 MiB / 32 KiB;
-  the copies come to 256 Voxels, so the bytes bind), and the first step of a walk, when nothing
-  has been measured, is 32 Voxels (the default 64 KiB a Voxel). A step then costs at most
-  `step * actual cost a Voxel`: with the 4090's 34 KB and 1.9 copies a Voxel at 2 m (flight,
-  `9539899`), **about 2.2 MB and 120 copies at the floor, about 1.1 MB for the first step**. That
-  is a bound by the rate, not by the budget: a Voxel of the move that costs more than the rate
-  (terrain denser than the flights', a rate that is behind by one step, for the rate follows a
-  dearer step at once and a cheaper one by halves) gives a step that much over a quarter of the
-  budget, and the least step (a bucket of the camera's travel, 4 Voxels of it, at the selection's
-  resolution) is the least that can be asked for. Before, a follow was one operation to wherever
-  the camera was: the 4090's flights followed in one step of 17 to 34 MB. The first batch of arrivals of a round is taken whenever the outbox is empty, so that the
+  turn. The length of a step is `FollowStep` (round 8; rounds 6 and 7 had a rate, below): it
+  begins at half of its **limit**, and after each step that did not reach the camera it is that step's
+  length scaled by `target / cost` (`target` a quarter of the budget, in bytes and copies, whichever
+  binds; scaled by at most 2 up and down; a step that cost nothing doubles), kept between a quarter
+  of the limit and the limit. The **limit** is a quarter of the budget over the least that a Voxel
+  of the move is taken to cost, `FOLLOW_MIN_COST` (32 KiB and 2 copies, a little under the 4090's
+  34 KB and 1.9 at 2 m), and at most half a jump: **64 Voxels at the default budget** (2 MiB /
+  32 KiB; the copies come to 256, so the bytes bind). It does not depend on what the steps before
+  it cost, so a run of steps that moved and changed nothing, or a rebuild (which has no patch's
+  cost), cannot make the next one long (the 34 MB operation of the first 4090 run). Rounds 6 and 7
+  sized a step by a *rate*, the cost a Voxel of the last step; that fell to steps of 4 Voxels
+  and stayed there, because **a step's cost has a part that does not depend on its length** (the
+  regions that it rewrites are written whole): in the local full-size flight a step of 64 Voxels
+  cost 2.9 to 3.8 MB and 380 to 510 copies and a step of 4 cost 2.0 to 2.3 MB and 310 to 360, so a
+  quarter of the budget (2 MiB) is under the cost of a step of any length there, and a length made
+  to fit it shrank, for 240 steps and eight times the bytes of steps of 64 for the same walk. The
+  least is a quarter of the limit (16 Voxels at the default budget) for that. **What that
+  guarantees at full size:** a step is at most 64 Voxels at the default budget, so it costs at most
+  `step * actual cost a Voxel` plus the part that is not in proportion: **the 4090's flights at
+  c537d09 had steps of 64 Voxels that cost at most 3.68 MB and 516 copies** (their `bytes_max` and
+  `writes_max`), and the first step of a walk is 32 Voxels. That is a bound by the limit and the
+  measured cost, not by the budget: terrain that costs more a Voxel than the flights' gives a step
+  that much over, down to the least, 16 Voxels. Before, a follow was one operation to wherever the
+  camera was: the 4090's flights followed in one step of 17 to 34 MB. The first batch of arrivals of a round is taken whenever the outbox is empty, so that the
   follow steps do not starve the arrivals: **if a follow step crossed the budget, the frame carries
   two operations beyond it**, the follow step and that batch. The gap words are those between
   ranges joined into one copy (`COPY_GAP`). The copies of a frame are at most the sum of its
@@ -586,20 +597,45 @@ place that says what a frame may take beyond it:
   behind by more than a jump is **walked to**, not jumped to, and so is a teleport that ends within
   a jump of the scene (round 7: it was one operation of up to two `d0`, outside the budget:
   `a_teleport_that_ends_within_a_jump_of_the_scene_is_walked_to_within_the_budget`).
-- **No ceiling on the lag.** A scene that is behind is always walked to, so a camera that moves
-  faster than the walk keeps up with falls behind without limit, and walking many jumps costs more
-  CPU than the one rebuild that the `JUMP` doc says it meets at about two `d0`. From the first 4090
-  report (3 458 ms of follow for 10 s of a flight at 1 000 Voxels a second) follow keeps up with
-  about 3 000 Voxels a second; **above that the scene falls behind by the difference, a second at
-  a time**, with the camera drawing the scene as it is (the bands it has, no hole: the scene is
-  consistent, only behind). Each real-time path reports the most it was behind at a publish
-  (`scene_lag_voxels_max` and `scene_lag_d0_max`, schema 14), so the 4090 shows it. **What I would
-  propose, not done here:** a fallback to the jump when the lag is over a number of `d0` (4, say:
-  at the first report's 0.35 ms of scene-thread time a Voxel, walking 4 `d0` is about 1.4 s
-  against a rebuild's 330 ms) and the camera is still moving faster than the walk, as a one-time
-  cost (a rebuild, 871 MB, 330 ms on the 4090) against a walk that does not end; before this PR
-  the follow jumped past two `d0`. It is the owner's to decide because it spends the
-  budget's bound once for a bounded lag.
+- **No ceiling on the lag, and the walk does not keep up with a flight (round 8).** A scene that
+  is behind is always walked to, so a camera that moves faster than the walk keeps up with falls
+  behind without limit, and walking many jumps costs more CPU than the one rebuild that the `JUMP`
+  doc says it meets at about two `d0`. **The walk does not keep up with 1 000 Voxels a second,
+  and neither did the baseline.** Measured (the 4090, c537d09; a scene that is behind is drawn as it
+  is: the bands it has, no hole): the scene was 8 415 Voxels (8.2 `d0`) behind at the end of a 10 s
+  flight at 2 m and 8 558 (8.3) at 50 m, with 12 and 10 updates and 9.0 s of the thread in
+  `follow`, about 0.75 s for each step of 64 Voxels. The baseline (3934846) does it with one
+  `recentre` to wherever the camera is when it is called, and a call takes as long as it takes
+  (measured on the dev box, the same flight: 207 Voxels 1.3 s, 1 341 Voxels 4.5 s, 4 672 Voxels
+  17.1 s, so 3.5 to 6 ms a Voxel); it ran two such calls in the 10 s, was 5 800 Voxels behind at 6 s
+  when the first of them ended and about 8 200 at 10 s (the drawn lag at each frame, printed by the
+  ignored full-size test), with its last call, of 4 672 Voxels, still running 13 s later. The
+  4090's baseline "2.7 to 4.0 s in `follow`" is the calls that ended within the path. So the
+  walk of the scene takes about 4 ms of scene-thread time a Voxel, here and in the baseline (the
+  selection looks at what the move made due, the nodes whose level changes are split or merged,
+  and the regions they are in are packed), which is 250 Voxels a second of a thread that is also
+  to take in the arrivals, against a flight's 1 000; **above that the scene falls behind by the
+  difference, a second at a time.** Round 7's "keeps up with about 3 000 Voxels a second" was a
+  guess from `follow`'s time over a flight, which counted the steps that ended and not what they
+  covered; it is refuted by the run above. **What round 8 changed** is how much of a step's time was
+  not the walk: each round told the selection the camera's move since the last round (about 1 300
+  Voxels at 1 000 a second and 0.75 s a round) as the distance of the places it looks ahead to,
+  and the selection looks at what that distance made due, so every call looked at 2 to 3 million
+  nodes (80% of its 0.9 s) whatever the step; now the places are from where the scene is to be
+  after the round's first step (`Engine::round`), so a call costs what it walks (a step of 64
+  Voxels 0.27 s, 4 ms a Voxel, on the dev box) and the look at what is due is shared among
+  threads (`look_at_due`, at most 4, only above 32 768 due). In the full-size flight on the dev box
+  the scene walked about 1 700 Voxels in 10 s against about 700 at c537d09, and the drawn lag at the
+  end was 8 300 and 8 600 at 2 m and 50 m: **about what the baseline's is (8 200), and not under 3
+  `d0`.** Each real-time path reports how far behind the drawn scene was, at each frame, the most
+  and the 99th percentile (schema 15). **What I would propose, not done here:** the walk is not
+  made to keep up by any step policy, since its cost a Voxel is the same for steps of 16 and of
+  200 (4 to 6 ms a Voxel, a little less for the long ones); to keep up it has to cost much less a
+  Voxel (what is looked at, and the splits and merges, are the cost: ADR 0004's selection) or to be
+  skipped: a fallback to the jump when the lag is over a number of `d0` (4, say) and the camera is
+  still moving faster than the walk, as a one-time cost (a rebuild, 871 MB, 330 ms on the 4090)
+  against a walk that does not end; before this PR the follow jumped past two `d0`. It is the
+  owner's to decide because it spends the budget's bound once for a bounded lag.
 
 **Whether "the budget plus the crossing operation plus the round's first batch" meets the issue's "a frame's upload is bounded by the
 budget" is not settled here; it is the project owner's decision.** What is needed to judge it is
@@ -651,10 +687,25 @@ draws what following in every round comes to (within 1% a level).
   (43 against 43 frames, within 20%) **does not cover that**: the stepped test Planet's frames are
   too small to reach 128 copies, so that test still passes with the cap at 128. The stepped test
   Planet cannot show the regression; only the constants test, and the 4090, can.
-- *The follow's rate cannot fall to nothing:* `a_follow_step_is_within_the_budget_after_a_run_of_quiet_steps_and_after_teleports`
-  (a budget that the measured cost, and not the cap of half a jump, limits on the test Planet:
-  after 40 quiet steps and after 20 teleports no follow step is over it; fails with the floor
-  removed) and `the_rate_of_what_a_voxel_costs_does_not_fall_under_its_floor_whatever_the_steps_cost`.
+- *A follow step is bounded whatever came before it:* `a_follow_step_is_sized_by_how_its_cost_compared_to_its_share_and_is_never_over_the_limit`
+  (unit test of `FollowStep::after`: doubles at most, halves at most, a quiet step doubles to the
+  limit and not over it, a run of costly ones stops at a quarter of the limit) and
+  `the_least_a_voxel_costs_makes_a_step_at_most_64_voxels_at_the_default_budget` (the constants).
+  `a_follow_step_is_within_the_budget_after_a_run_of_quiet_steps_and_after_teleports` (a 160 KiB
+  budget; after 40 quiet steps and 20 teleports no step is over it) **does not show the limit**:
+  it passes with the limit removed (checked), because a step's cost on the test Planet is the part
+  that does not depend on its length, not Voxels of it. It guards the controller (a step that
+  came to be over the budget after those). Round 7's claim that it "fails with the floor removed"
+  was only of its teleport case (the quiet-steps case passed without the floor), and the floor is
+  gone: the teleport case of round 7 is now `a_teleport_that_ends_within_a_jump_of_the_scene_is_walked_to_within_the_budget`.
+- *The selection is not made to look for the camera's move:* `the_selection_travels_as_far_as_the_scene_walks_when_the_camera_goes_faster`
+  (a camera that goes 40 Voxels a frame with a lead, the scene walks 960 of 2 360: the selection's
+  travel is 2.0 times the walk; **3.5 times, and the test fails, with the places looked ahead to
+  from the camera**, as at c537d09). On the test Planet the camera goes 2.4 times as far as the
+  scene walks; at full size 8 times, and the factor, the 3 million nodes a call, is time that
+  the stepped clock does not measure: the test is of the cause, not of the time (the time is the
+  ignored full-size test `soft_misses_on_the_flight_take_off_and_standing_paths`, which prints
+  the drawn lag of each path).
 - *The thread goes on when the frame takes what waited:* `a_throttled_scene_thread_goes_on_when_the_frame_thread_takes_what_waited`
   (real threads, in `.github/real-thread-tests.txt`: it counts how the scene thread's throttled
   waits ended (`SceneWorker::throttled_waits`, test-only) and asserts that at most half end by the
@@ -751,7 +802,7 @@ those cases the output on stderr is all there is.
 
 ```
 {
-  "schema_version": 14,
+  "schema_version": 15,
   "build":   { "version", "commit" },          // commit: CI builds only, else null; on a PR
                                                // build it is GitHub's merge commit, not the head
   "machine": { "gpu", "device_type", "driver", "driver_info", "backend", "os", "arch",
