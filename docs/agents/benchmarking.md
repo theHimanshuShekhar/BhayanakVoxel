@@ -607,9 +607,10 @@ place that says what a frame may take beyond it:
   `follow`, about 0.75 s for each step of 64 Voxels. The baseline (3934846) does it with one
   `recentre` to wherever the camera is when it is called, and a call takes as long as it takes
   (measured on the dev box, the same flight: 207 Voxels 1.3 s, 1 341 Voxels 4.5 s, 4 672 Voxels
-  17.1 s, so 3.5 to 6 ms a Voxel); it ran two such calls in the 10 s, was 5 800 Voxels behind at 6 s
-  when the first of them ended and about 8 200 at 10 s (the drawn lag at each frame, printed by the
-  ignored full-size test), with its last call, of 4 672 Voxels, still running 13 s later. The
+  17.1 s, so 3.5 to 6 ms a Voxel); it ended its calls of 207 and 1 341 Voxels at about 1.5 s and
+  6.7 s, was 6 300 Voxels behind just before the second ended and about 8 200 at 10 s (the drawn lag
+  at each frame, printed by the ignored full-size test), with its last call, of 4 672 Voxels, still
+  running 13 s later. The
   4090's baseline "2.7 to 4.0 s in `follow`" is the calls that ended within the path. So the
   walk of the scene takes about 4 ms of scene-thread time a Voxel, here and in the baseline (the
   selection looks at what the move made due, the nodes whose level changes are split or merged,
@@ -625,9 +626,10 @@ place that says what a frame may take beyond it:
   after the round's first step (`Engine::round`), so a call costs what it walks (a step of 64
   Voxels 0.27 s, 4 ms a Voxel, on the dev box) and the look at what is due is shared among
   threads (`look_at_due`, at most 4, only above 32 768 due). In the full-size flight on the dev box
-  the scene walked about 1 700 Voxels in 10 s against about 700 at c537d09, and the drawn lag at the
-  end was 8 300 and 8 600 at 2 m and 50 m: **about what the baseline's is (8 200), and not under 3
-  `d0`.** Each real-time path reports how far behind the drawn scene was, at each frame, the most
+  (a loaded box: 8 cores, load average above 10) the scene walked about 1 700 Voxels in 10 s against
+  about 250 at c537d09 and 1 800 for the baseline, and the drawn lag at the end was 8 300 and 8 600
+  at 2 m and 50 m (9 750 at c537d09, 8 200 for the baseline): **about what the baseline's is, and
+  not under 3 `d0`.** Each real-time path reports how far behind the drawn scene was, at each frame, the most
   and the 99th percentile (schema 15). **What I would propose, not done here:** the walk is not
   made to keep up by any step policy, since its cost a Voxel is the same for steps of 16 and of
   200 (4 to 6 ms a Voxel, a little less for the long ones); to keep up it has to cost much less a
