@@ -528,6 +528,41 @@ fn a_level_whose_table_grows_replaces_that_table_and_the_regions_and_nothing_els
     assert_eq!(gpu.render(&camera), before);
 }
 
+/// The GPU's peak during a growth is of growths: a patch that makes nothing longer leaves it 0, and
+/// one that grows a buffer sets it to what the buffers held plus the new buffers.
+#[test]
+fn the_growth_peak_is_0_without_a_growth_and_the_old_size_plus_the_new_buffers_with_one() {
+    let at = [0.0, 1548.0, 250.0];
+    let mut scene = rings_at(at);
+    let mut gpu = Offscreen::new(64, 36, &scene).unwrap();
+    assert_eq!(gpu.peak_growth_bytes(), 0);
+    // A patch with no growth: a small move of the camera.
+    let near = [at[0], at[1] + 20.0, at[2]];
+    let update = scene
+        .recentre(planet(), near)
+        .unwrap()
+        .expect("the move changes the scene");
+    assert_ne!(update, SceneUpdate::Rebuilt);
+    gpu.update_scene(&scene, &update).unwrap();
+    assert_eq!(gpu.last_grown_bytes(), 0);
+    assert_eq!(gpu.peak_growth_bytes(), 0, "a patch that grew nothing");
+    // A growth: the table of a level and the regions.
+    let before = gpu.scene_bytes();
+    let update = scene.grow_table_of(2).unwrap();
+    gpu.update_scene(&scene, &update).unwrap();
+    assert!(gpu.last_grown_bytes() > 0);
+    let new_buffers = gpu.scene_bytes() - before + gpu.last_grown_bytes();
+    assert_eq!(gpu.peak_growth_bytes(), before + new_buffers);
+    // A later patch with no growth does not change it.
+    let peak = gpu.peak_growth_bytes();
+    let update = scene.recentre(planet(), at).unwrap();
+    if let Some(update) = update {
+        gpu.update_scene(&scene, &update).unwrap();
+        assert_eq!(gpu.last_grown_bytes(), 0);
+    }
+    assert_eq!(gpu.peak_growth_bytes(), peak);
+}
+
 /// What the walk costs, in steps (see `reference::Steps`), averaged over a fan of primary rays
 /// from cameras along the bench's flight over the Planet (`planet-flyover-v1`), by what the rays
 /// do: miss, hit the ground face on, or graze it.

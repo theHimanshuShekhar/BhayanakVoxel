@@ -804,7 +804,10 @@ impl Tracer {
                     self.scene
                         .grow(device, &self.scene_layout, &mut encoder, scene, &mut extra)?;
                 self.last_grow_time = grown_at.elapsed();
-                self.peak_growth_bytes = self.peak_growth_bytes.max(before + extra);
+                // Only a growth has a peak: with none, `before` is just the scene's size.
+                if extra > 0 {
+                    self.peak_growth_bytes = self.peak_growth_bytes.max(before + extra);
+                }
                 let buffers = &self.scene;
                 if patch.levels {
                     let header = SceneHeader::new(scene);

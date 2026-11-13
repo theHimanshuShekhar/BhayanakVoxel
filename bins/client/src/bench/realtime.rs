@@ -1058,6 +1058,17 @@ fn lag_spread(lags: &[f64]) -> (f64, f64) {
     )
 }
 
+/// The frame thread's peak while a buffer grew: `peak`, or if `grown` bytes of old buffers were
+/// copied in this frame, the larger of it and what the copy reserves now (`reserved`) plus them.
+/// A frame with no growth is not a peak of one: 0 stays 0.
+fn host_growth_peak(peak: u64, reserved: u64, grown: u64) -> u64 {
+    if grown > 0 {
+        peak.max(reserved + grown)
+    } else {
+        peak
+    }
+}
+
 /// What one frame cost, and the soft misses it reported.
 struct Frame {
     /// When the frame started.
@@ -1400,9 +1411,11 @@ impl<'a> Session<'a> {
         self.look_at_memory();
         let after = began.elapsed() - time;
         let (kind, upload_bytes, patch_bytes) = uploaded(self.world.scene(), update.as_ref());
-        self.scene_host_peak_bytes = self
-            .scene_host_peak_bytes
-            .max(self.world.reserved_bytes() + gpu.grown_bytes);
+        self.scene_host_peak_bytes = host_growth_peak(
+            self.scene_host_peak_bytes,
+            self.world.reserved_bytes(),
+            gpu.grown_bytes,
+        );
         let over_budget = over_budget_cause(
             kind,
             upload_bytes,
@@ -2547,6 +2560,16 @@ mod tests {
             .map(|f| (f.index, f.upload_bytes))
             .collect();
         assert_eq!(kept, [(6, 1200), (1, 900), (4, 500), (7, 40), (2, 30)]);
+    }
+
+    #[test]
+    fn the_host_peak_of_a_growth_is_set_by_a_frame_that_grew_and_is_0_without_one() {
+        // No growth: the reserve is not a peak, whatever it is.
+        assert_eq!(host_growth_peak(0, 900, 0), 0);
+        assert_eq!(host_growth_peak(500, 900, 0), 500);
+        // A growth: the new reserve plus the old words copied, and it only rises.
+        assert_eq!(host_growth_peak(0, 900, 100), 1000);
+        assert_eq!(host_growth_peak(1200, 900, 100), 1200);
     }
 
     #[test]

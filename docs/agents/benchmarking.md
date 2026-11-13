@@ -504,7 +504,8 @@ is made there (below): the run's **Edit latency**. Its frames are not those of a
     **the peak during a growth**, which `scene_reserved_mib` is not (it is the size after). While
     a buffer grows the old one and the new one both exist: the GPU's is the buffers' bytes before
     the growth plus the new buffers made (`Tracer::peak_growth_bytes`, the most over the run's
-    growths; 0 if none grew). **A rebuild is apart**: while a rebuilt scene is made (a jump or
+    growths; 0 if none grew: before round 11 it was set by every patch and so equalled the scene's
+    size, e.g. the 4090's 1 000.3 MiB of `188ebe8`, which was not a growth). **A rebuild is apart**: while a rebuilt scene is made (a jump or
     other bands) the old scene's buffers and the new ones both exist, which is
     `scene_gpu_peak_rebuild_mib` (`Tracer::peak_rebuild_bytes`; 0 if there was none). The frame
     thread's is its copy's reserved bytes after the growth plus the old words of
