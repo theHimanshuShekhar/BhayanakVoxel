@@ -676,6 +676,12 @@ impl World {
     /// How far the scene as the world has it (the one that is drawn) is behind `camera`, in
     /// Voxels: the distance from `camera`, the frame thread's, to where the scene thread had moved
     /// the rings to when it made what the world has taken.
+    ///
+    /// The scene thread publishes a round that moved the scene and changed nothing, and no count,
+    /// only with the next publish (a stats-only publish would make the outbox look untaken, which
+    /// the budget reads), so after such steps this is more than it was by at most the Voxels they
+    /// moved it (a follow step is at most 64 at the default budget; a round that changed anything,
+    /// as every one of a flight's does, publishes).
     pub fn lag(&self, camera: [f64; 3]) -> f64 {
         let shown = self.stats.camera.unwrap_or(camera);
         (0..3)

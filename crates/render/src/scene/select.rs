@@ -101,6 +101,7 @@ struct Node {
 }
 
 /// What looking at an entry that was due in the queue came to.
+#[cfg_attr(test, derive(Debug, PartialEq))]
 enum Due {
     /// The node is gone, or has been queued again since: the entry is stale.
     Stale,
@@ -116,7 +117,12 @@ enum Due {
 
 /// Entries due at once from which looking at them is shared among threads: below this the threads
 /// cost more than they save (a thread is about 50 microseconds, and an entry about 0.2).
+#[cfg(not(test))]
 const PARALLEL_FROM: usize = 32_768;
+/// Under test the stepped runs and the unit tests reach it, so that the counts hash (the same with
+/// and without it) and the tests show the threads change nothing.
+#[cfg(test)]
+const PARALLEL_FROM: usize = 64;
 
 /// The most threads that look at due entries, and at most half of the machine's.
 const MOST_THREADS: usize = 4;
@@ -132,6 +138,32 @@ fn look_at_due(
     camera: [f64; 3],
     changes: &(impl Fn(Key, f64, bool, bool) -> bool + Sync),
     slack: &(impl Fn(Key, f64, bool, bool) -> f64 + Sync),
+) -> Vec<Due> {
+    let threads = std::thread::available_parallelism()
+        .map_or(1, |n| n.get() / 2)
+        .clamp(1, MOST_THREADS);
+    look_at_due_by(
+        nodes,
+        due,
+        camera,
+        changes,
+        slack,
+        if due.len() < PARALLEL_FROM {
+            1
+        } else {
+            threads
+        },
+    )
+}
+
+/// [`look_at_due`] shared among `threads` (one: here and now).
+fn look_at_due_by(
+    nodes: &HashMap<Key, Node>,
+    due: &[(u64, Key)],
+    camera: [f64; 3],
+    changes: &(impl Fn(Key, f64, bool, bool) -> bool + Sync),
+    slack: &(impl Fn(Key, f64, bool, bool) -> f64 + Sync),
+    threads: usize,
 ) -> Vec<Due> {
     let look = |&(stamp, key): &(u64, Key)| {
         // An entry for a node that has gone, or has been queued again since, is stale.
@@ -153,18 +185,7 @@ fn look_at_due(
             }
         }
     };
-    let threads = std::thread::available_parallelism()
-        .map_or(1, |n| n.get() / 2)
-        .clamp(1, MOST_THREADS);
-    map_shared(
-        due,
-        if due.len() < PARALLEL_FROM {
-            1
-        } else {
-            threads
-        },
-        &look,
-    )
+    map_shared(due, threads, &look)
 }
 
 /// `look` of each of `items`, in their order, shared among `threads` (one: here and now).
@@ -1557,6 +1578,54 @@ impl Selection {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn looking_at_more_entries_than_it_shares_among_threads_comes_to_what_one_thread_finds() {
+        use super::*;
+        // 5 000 nodes, whole and split, some stale, some missing; the camera moves them from
+        // changing to not, by distance.
+        let mut nodes = HashMap::default();
+        let mut due = Vec::new();
+        for n in 0..5000i32 {
+            let key: Key = (n as usize % 3, BrickCoord([n % 37, n % 11, n / 50]));
+            let node = Node {
+                state: if n % 4 == 0 {
+                    State::Split
+                } else {
+                    State::Whole
+                },
+                draws: true,
+                margin: n % 7 == 0,
+                stamp: u64::from(n as u32 % 5 + 1),
+            };
+            nodes.insert(key, node);
+            // A stamp that is the node's, or another (stale), and a key that is gone, in turn.
+            match n % 9 {
+                0 => due.push((node.stamp + 1, key)),
+                1 => due.push((node.stamp, (7, key.1))),
+                _ => due.push((node.stamp, key)),
+            }
+        }
+        assert!(due.len() > PARALLEL_FROM);
+        let camera = [100.0, 40.0, 3.0];
+        let changes = |key: Key, d: f64, split: bool, margin: bool| {
+            (d + key.0 as f64 + f64::from(u8::from(split)) * 3.0 + f64::from(u8::from(margin)))
+                % 5.0
+                < 1.0
+        };
+        let slack = |_: Key, d: f64, split: bool, _: bool| d * 0.25 + f64::from(u8::from(split));
+        let one = look_at_due_by(&nodes, &due, camera, &changes, &slack, 1);
+        assert!(one.iter().any(|d| matches!(d, Due::Stale)));
+        assert!(one.iter().any(|d| matches!(d, Due::Changes)));
+        assert!(one.iter().any(|d| matches!(d, Due::Later { .. })));
+        for threads in [2, 3, 4, 8] {
+            assert_eq!(
+                look_at_due_by(&nodes, &due, camera, &changes, &slack, threads),
+                one
+            );
+        }
+        assert_eq!(look_at_due(&nodes, &due, camera, &changes, &slack), one);
+    }
+
     #[test]
     fn what_threads_look_at_comes_back_in_the_order_of_the_entries_whatever_their_number() {
         let items: Vec<u64> = (0..1000).collect();

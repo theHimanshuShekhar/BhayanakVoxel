@@ -1317,6 +1317,13 @@ struct Engine {
 struct FollowStep(f64);
 
 impl FollowStep {
+    /// The first step of a walk, before any is measured: half of `limit`, and not under a Voxel
+    /// (with a budget under 256 KiB the limit is a few Voxels, and half of it is under one).
+    fn first(limit: f64) -> Self {
+        let limit = limit.max(1.0);
+        Self((limit / 2.0).max(1.0))
+    }
+
     /// The length after a full step of `distance` Voxels that cost `cost`, to cost `target`: the
     /// step scaled by how far under or over `target` the cost was (at most
     /// [`FOLLOW_STEP_CHANGE`]), and within [`FOLLOW_STEP_LEAST`] of `limit` and `limit`. A cost
@@ -1524,6 +1531,16 @@ impl Engine {
         // scene is behind it ahead of where the scene's step goes, and a selection that counts
         // the places' travel looks at what that travel made due (every round, for the camera's
         // whole move since the last, however far the round walked the scene).
+        //
+        // They are along the camera's velocity from there, though a scene that lags walks along
+        // the line to the camera, which on a turn is not the velocity's way. Taking the way from
+        // the line was tried and made things worse: the places are a second and two seconds of
+        // speed on (2 400 and 4 800 Voxels in the test), so a camera whose line to the scene
+        // turns a little moves them by hundreds of Voxels every round, and the selection's travel
+        // was 6.7 times the scene's walk against 2.0 (the test below). The velocity is steady.
+        // The effect of the other is on prefetch only (the places make the children of bricks
+        // near them wanted, lowest priority; the scene's own selection is of the scene's place),
+        // and ends when the scene is at the camera.
         let place = if self.teleported {
             camera
         } else {
@@ -1923,7 +1940,8 @@ impl Engine {
         let limit = self.follow_limit(bands.d0());
         let step = self
             .follow_step
-            .map_or(limit / 2.0, |step| step.0)
+            .unwrap_or(FollowStep::first(limit))
+            .0
             .min(limit);
         if distance <= step {
             return camera;
@@ -1937,7 +1955,7 @@ impl Engine {
             return;
         };
         let limit = self.follow_limit(bands.d0());
-        let step = self.follow_step.unwrap_or(FollowStep(limit / 2.0));
+        let step = self.follow_step.unwrap_or(FollowStep::first(limit));
         self.follow_step = Some(step.after(distance, cost, self.follow_target(), limit));
     }
 
@@ -2557,6 +2575,18 @@ mod tests {
         assert_eq!(step.0, 16.0);
         // The least is a Voxel for a limit of a few.
         assert_eq!(step.after(1.0, cost(1 << 30, 9), target, 2.0).0, 1.0);
+    }
+
+    #[test]
+    fn the_first_follow_step_is_half_the_limit_and_at_least_a_voxel() {
+        assert_eq!(FollowStep::first(64.0).0, 32.0);
+        assert_eq!(FollowStep::first(3.0).0, 1.5);
+        // A budget of 192 KiB gives a limit of 1.5 Voxels, and half of it was 0.75.
+        let limit = (192.0 * 1024.0 / 4.0) / FOLLOW_MIN_COST.0;
+        assert_eq!(limit, 1.5);
+        assert_eq!(FollowStep::first(limit).0, 1.0);
+        assert_eq!(FollowStep::first(1.0).0, 1.0);
+        assert_eq!(FollowStep::first(0.2).0, 1.0);
     }
 
     #[test]
