@@ -623,27 +623,63 @@ place that says what a frame may take beyond it:
   250 Voxels a second against a flight's 1 000. The walk does not keep up, and no step policy
   changes that: its cost a Voxel is the same for steps of 16 and of 200.** Round 7's "keeps up with
   about 3 000 Voxels a second" was a guess from `follow`'s time over a flight, which counted the
-  steps that ended and not what they covered; it is refuted. **What the baseline (main) does is
-  being measured, and no conclusion is drawn here about a regression or none.** What is known:
-  main follows with one `recentre` to wherever the camera is when it is called, and the dev-box
-  figures of two such calls that were walks (under a jump) are 207 Voxels in 1.3 s and 1 341 in
-  4.5 s (the same flight, `3934846`, the full-size ignored test). The third call, of 4 672 Voxels,
-  took 17.1 s there, and it was more than a jump, so on main it was a rebuild and not a walk: it
-  is not a cost a Voxel of walking, and earlier text that took 3.5 to 6 ms a Voxel from the three
-  calls, and an "8 200 Voxels behind at 10 s" from the dev box, mixed a walk with a rebuild (on the
-  dev box a rebuild call takes seconds, and the drawn scene stayed behind while it ran; on the
-  4090 the rebuild's frame was 330 ms, and its time on the scene thread is not in a report). The
-  4090 report of the baseline's drawn lag is being measured with `measure-145-baseline-lag`
-  (PR #197, `baseline_lag` in each real-time path: the drawn lag, updates, rebuilds by reason,
-  the largest update, and the scene thread's calls of `recentre` including one still running at
-  the path's end):
+  steps that ended and not what they covered; it is refuted. **What the baseline (main) does, measured on the 4090** by PR #197 (main `7706578` plus
+  measurement only, never merged; one run, GPU at 0% before it): over the bench's 10 s flights
+  **the drawn lag is comparable with main's, not smaller everywhere**: better at 2 m (7.73 against
+  8.84 `d0`), worse at 50 m (8.05 against 7.41), and take-off (3.55 against 3.59) and stop (4.03
+  against 3.84) within 0.2, so within about 0.7 `d0` either way. Both are far behind, and neither keeps
+  up.
 
-  | Baseline (main `7706578`), 4090, 10 s flight | 2 m | 50 m |
+  | 10 s flight at 1 000 Voxels a second | main `7706578` (#197) | `188ebe8` (this head) |
   | --- | --- | --- |
-  | drawn lag at the most, Voxels (`d0`) | *to be filled* | *to be filled* |
-  | drawn lag p99 | *to be filled* | *to be filled* |
-  | updates; rebuilds by reason; largest update | *to be filled* | *to be filled* |
-  | `recentre` calls overlapping the path (Voxels, ms; running at the end) | *to be filled* | *to be filled* |
+  | drawn lag at the most, 2 m | 9 088 Voxels (8.84 `d0`) | 7 945 (7.73) |
+  | drawn lag p99, 2 m | 9 003 (8.76) | 7 876 (7.66) |
+  | drawn lag at the most, 50 m | 7 622 (7.41) | 8 275 (8.05) |
+  | drawn lag p99, 50 m | 7 537 (7.33) | 8 222 (8.00) |
+  | take-off, lag at the most | 3.59 `d0` | 3.55 |
+  | stop after the flight, lag at the most | 3.84 `d0` | 4.03 |
+  | updates, 2 m / 50 m | 3 / 3 | 119 / 96 |
+  | largest update, 2 m / 50 m | 24.7 MB / 36.9 MB (patches) | 4.6 MB, 689 copies / 4.0 MB, 548 |
+  | frame time p99, 2 m / 50 m | 30.4 / 32.1 ms (gate fails) | 3.8 / 3.5 ms |
+  | `recentre` calls that began in the path, 2 m / 50 m | 5 / 4 | (a step of at most 64 Voxels each) |
+
+  The baseline's calls in the 2 m flight (Voxels, ms): 40 in 12, 17 in 146, 140 in 758, 804 in
+  2 046, then 2 094 in 10 745, flagged `rebuilt` and still running when the path ended; at 50 m: 920
+  in 552, 562 in 1 805, 1 862 in 3 773, then 4 231 in 10 133, `rebuilt`, running at the end. The
+  larger walks main makes under a jump run at 300 to 500 Voxels a second (562 in 1.8 s, 804 in 2.0 s,
+  1 862 in 3.8 s; the first 920 at 50 m, 1 700), against this head's 170 to 200; what main cannot do is walk past a jump: the call over
+  2 058 Voxels is a repack that takes about 10 s at full size and during which the drawn scene does
+  not move (the 4090's frame time p99 of 30 ms on main is the GPU waiting in frames with no update,
+  as in the #162 section, not the repack). **What a `rebuilt` call is, and what the report's rebuild
+  fields are.** A call's `rebuilt` flag says that `Scene::recentre` on the scene thread returned
+  `SceneUpdate::Rebuilt`: the scene was made again at the camera the call was given (the camera when
+  the call began: after the 2 094 Voxel call the scene was where the camera had been 3 s into the
+  flight; in the stop path the next call found it 955 Voxels from the camera, which stopped 0.9 s
+  after the call began). The next publish copies the whole scene (`Scene::mirror`) and the frame
+  thread takes it as a `Rebuilt` update, one upload of the whole scene. The path fields
+  `rebuilds_jump`, `rebuilds_bands`, `rebuilds_out_of_room` and `largest_update_bytes` count only
+  the updates that reach a **frame of the path**, and they are 0 and a patch (34 MB) in every path
+  for a reason that is the measurement's, not "no rebuild": the bench's `look` at the end of a path
+  (and at the stop) waits for the scene thread to publish, so in the stop path (a flight of 5 s,
+  then `look`, 64.2 s in all against a settle of 59.2 s) it waited about 10 s for the call that began
+  at 4 083 ms and ended at 15 058 ms and copied its `Rebuilt` to the GPU **outside any frame**
+  (`Session::look`), and in the flights the call was still running when the path's frames ended. So
+  "a jump's rebuild" is a call and an update that no path's frames contain, and what main's rebuild
+  costs the frame on the 4090 (about 330 ms for 871 MB) is not in these reports. It also means main's
+  stop-path settle (59.2 s) has about 10 s of that wait in it and is not like for like with this
+  head's (54.4 s).
+
+  **What differs beyond 10 s (inferred from the figures above, not measured).** This head walks
+  about 170 to 200 Voxels a second, so in a longer flight at 1 000 its lag grows by about 800 a second
+  and has no ceiling, and after the camera stops the walk back takes about 5 s for every 1 000
+  Voxels of lag. Main's scene stays where it was for the roughly 10 s a far `recentre` takes and
+  lands where the camera was when the call began (checked in the stop path, above), so its lag has a
+  ceiling of roughly the call's flight time, about 10 `d0` at this speed, and a camera that stops
+  gets a scene that is at most that far off and walks the rest at a few hundred Voxels a second.
+  By that reading this head's lag passes main's after about 12 s of a flight at 1 000 Voxels a second.
+  **Neither keeps up with 50 m/s; keeping up is #168 (the speed-scaled LOD), which must gate the drawn
+  lag** (`scene_lag_d0_max` and its p99), and the fallback below is the other way to give the lag a
+  ceiling.
 
   **What round 8 changed** is how much of a step's time was not the walk: each round told the
   selection the camera's move since the last round (about 1 300 Voxels at 1 000 a second and 0.75 s
@@ -652,7 +688,7 @@ place that says what a frame may take beyond it:
   whatever the step; now the places are from where the scene is to be after the round's first step
   (`Engine::round`), so a call costs what it walks, and the look at what is due is shared among
   threads (`look_at_due`: at most 4 and at most half the machine's, scoped to the call, order-preserving,
-  only above 32 768 entries). **Round 9 measured it** after the look-ahead fix (dev box, full-size
+  only above 32 768 entries). **Round 9 measured it** after the look-ahead fix (loaded 8-core dev box, full-size
   flight at 2 m, two runs each): 53 and 58 calls, 52 and 57 of them over 32 768 due entries (about
   300 000 to 400 000 on average), the look at them 108 and 92 ms each serially and 24 ms with the
   threads, and the scene walked about 940 and 1 020 Voxels serially against 1 690 and 1 710 with them
@@ -660,10 +696,12 @@ place that says what a frame may take beyond it:
   gate on the 4090 (frame CPU p99 2.0 ms), so it did not make the frames wait there. The unit test
   `looking_at_more_entries_than_it_shares_among_threads_comes_to_what_one_thread_finds` compares 1, 2,
   3, 4 and 8 threads on 5 000 entries (stale, changing and later), and under test the threshold is 64
-  so that the render library's tests reach the threads (558 calls) on a machine with 4 or more cores.
+  so that the render library's own unit tests reach the threads (559 calls in `cargo test -p render --lib`
+  on a machine with 4 or more cores; `cfg(test)` is not set for the client's stepped runs, which made 0
+  threaded calls, or for `render/tests`: they use the 32 768).
   Each real-time path reports how far behind the
   drawn scene was, at each frame, the most and the 99th percentile (schema 15). **What a fallback
-  would be, not done here** (the owner's to decide, and it waits for the baseline's numbers): the
+  would be, not done here** (the owner's to decide; the baseline's numbers are above): the
   walk-instead-of-jump decision of round 6 is `Engine::follow`: a camera that was put further than
   a jump (`Engine::teleported`) and ends further than a jump from the scene is jumped to, and any
   other is walked to by `next_place`. Restoring main's jump for a scene that has fallen more than
@@ -692,7 +730,7 @@ place that says what a frame may take beyond it:
   the scene is at the camera, so it is documented (`Engine::round`) and left.
 
 **Whether "the budget plus the crossing operation plus the round's first batch" meets the issue's "a frame's upload is bounded by the
-budget" is not settled here; it is the project owner's decision.** What is needed to judge it is
+budget" was accepted by the project owner on 2026-11-13 (the last comment on #145).** What is needed to judge it is
 in the report, per path of the real-time mode: the largest frame's bytes and copies
 (`upload.bytes_max`, `upload.writes_max`), and `upload.over_budget`, the frames whose bytes were
 over `UPLOAD_BUDGET.bytes` or whose copies were over `UPLOAD_BUDGET.writes` (a rebuild of less

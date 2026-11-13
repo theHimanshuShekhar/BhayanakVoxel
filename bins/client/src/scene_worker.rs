@@ -83,7 +83,7 @@ const SLICE: Duration = Duration::from_millis(2);
 /// one). So a frame takes up to **the budget, plus the one operation that took what waits to it,
 /// plus the round's first batch of arrivals** (taken whenever the outbox is empty, so after a
 /// follow step that crossed the budget a frame carries two operations beyond it), **plus the words
-/// between joined ranges**; whether that is "bounded by the budget" is the project owner's call
+/// between joined ranges**; the project owner accepted that as "bounded by the budget" on 2026-11-13 (the last comment on #145)
 /// (`docs/agents/benchmarking.md`).
 ///
 /// **How the value was chosen:** from the 4090's real-time bench, not the stepped one. A frame's

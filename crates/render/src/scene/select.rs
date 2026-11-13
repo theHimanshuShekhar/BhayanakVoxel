@@ -119,8 +119,10 @@ enum Due {
 /// cost more than they save (a thread is about 50 microseconds, and an entry about 0.2).
 #[cfg(not(test))]
 const PARALLEL_FROM: usize = 32_768;
-/// Under test the stepped runs and the unit tests reach it, so that the counts hash (the same with
-/// and without it) and the tests show the threads change nothing.
+/// Under test, in the render library's own unit tests (`cargo test -p render --lib`), it is low
+/// enough for them to reach the threads, so that the thread-comparison test shows they change
+/// nothing. `cfg(test)` is not set for the client's stepped runs or for the tests in `render/tests`,
+/// which are built against the library without it and use the 32 768 above.
 #[cfg(test)]
 const PARALLEL_FROM: usize = 64;
 
