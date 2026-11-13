@@ -83,8 +83,8 @@ const DEFAULT_BIAS: f32 = 1.0;
 /// A Planet's bricks, packed for the GPU as the bricks the LOD `bands` select from `camera`. The
 /// store must have its pyramid ([`RING_LEVELS`] of it); its source gives the bricks it does not
 /// hold. Nothing of the Planet is further from the centre than `radius`, the Planet's maximum
-/// radius (the full-size Planet's is [`planet_gen::planet::MAX_RADIUS`], the test one's
-/// [`planet_gen::MAX_RADIUS`]), so no ray need be walked beyond it.
+/// radius (`Planet::max_radius`; the root of `planet_gen` has another, fixed one,
+/// [`planet_gen::MAX_RADIUS`], for its test sphere), so no ray need be walked beyond it.
 fn planet_scene(
     store: &BrickStore,
     camera: [f64; 3],
@@ -158,8 +158,14 @@ const BRICKS_PER_D0_SQUARED: f64 = 3.25;
 /// the references' limit is 1.25 times 1.0. The test Planet measures 1.000 and 39.78 words, 2.97
 /// words (6.9% of the limit) under it, and its Rings take 20% more words a brick than the full-size
 /// Planet's did.
+///
+/// #166 (the ground has its detail added at generation, so more of a Ring's bricks are mixed):
+/// the test Planet measures 43.28 words a brick, 8.8% over the 39.78 it measured before, which was
+/// over the limit of 42.75. The constant is raised by that ratio, 34.2 to 37.3 (limit 46.6), as an
+/// estimate for the 320 km Planet until the full-size run measures it there (#162, on the 4090,
+/// `needs-stream-bench`; #167 sizes the scene for 320 km).
 const REFS_PER_BRICK: f64 = 1.0;
-const WORDS_PER_BRICK: f64 = 34.2;
+const WORDS_PER_BRICK: f64 = 37.3;
 
 /// What the tables that hold the Planet are made roomy for at the start, for the full bands at a
 /// bias of 1: the most each held in the measurement of [`BRICKS_PER_D0_SQUARED`], with
@@ -428,19 +434,15 @@ fn load(map: WorldMap, reach: i32) -> Result<Loaded, RingsFull> {
     store.reserve_resident(room.resident);
     store.set_budget(budget_for(bands));
     let guarded = Instant::now();
-    let held = loader::hold_guard(&mut store, &planet, GUARD_FIRST);
+    let guard_first = loader::guard_first(&planet);
+    let held = loader::hold_guard(&mut store, &planet, guard_first);
     eprintln!(
-        "Guard (levels {GUARD_FIRST} to {}, the whole Planet): {held} bricks in {:.2?}",
+        "Guard (levels {guard_first} to {}, the whole Planet): {held} bricks in {:.2?}",
         RING_LEVELS - 1,
         guarded.elapsed()
     );
     let selected = Instant::now();
-    let mut scene = planet_scene(
-        &store,
-        camera.position,
-        bands,
-        planet_gen::planet::MAX_RADIUS,
-    )?;
+    let mut scene = planet_scene(&store, camera.position, bands, planet.max_radius())?;
     let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
     scene.reserve(room.nodes, room.waiting, room.stuck);
     // The margins of ADR 0004, on from the start: the selection is only the Guard and the spawn
@@ -1429,7 +1431,7 @@ mod tests {
     #[test]
     fn the_client_generates_a_planet_it_stands_on_land_in_with_the_ground_around_it() {
         // Ring packing is the renderer's and is tested there; one level is the ground alone.
-        let loaded = generate_ground(WorldMap::generate(SEED, 512), 100, 1);
+        let loaded = generate_ground(WorldMap::for_tests(SEED), 100, 1);
         let [x, y, z] = loaded.camera.position;
         let up = loaded.camera.horizon_up;
         let feet = |down: f64| {
@@ -1453,7 +1455,7 @@ mod tests {
 
     #[test]
     fn the_server_holds_the_ground_without_a_pyramid_so_an_edit_there_remakes_no_coarse_brick() {
-        let loaded = generate_ground(WorldMap::generate(SEED, 512), 100, 3);
+        let loaded = generate_ground(WorldMap::for_tests(SEED), 100, 3);
         assert_eq!(loaded.store.level_count(), 3);
         assert_eq!(loaded.server_store.level_count(), 1);
         assert_eq!(
@@ -1467,7 +1469,7 @@ mod tests {
         // The full-size Planet reaches far beyond the test Planet's radius, so the sphere the
         // client clips rays to must be the full-size Planet's. With the test Planet's, every ray
         // from the spawn misses and there is only sky.
-        let loaded = generate_ground(WorldMap::generate(SEED, 512), 100, 1);
+        let loaded = generate_ground(WorldMap::for_tests(SEED), 100, 1);
         let (cell, origin) = render::camera::split(loaded.camera.position);
         let ray = render::reference::Ray {
             cell,
@@ -1479,7 +1481,7 @@ mod tests {
             &loaded.store,
             loaded.camera.position,
             Bands::standard(1.0),
-            planet_gen::planet::MAX_RADIUS,
+            loaded.planet.max_radius(),
         )
         .expect("a patch of the Planet fits the rings");
         assert!(

@@ -12,8 +12,8 @@
 use std::time::{Duration, Instant};
 
 use brick_store::{BRICK_SIZE, Brick, BrickCoord};
-use planet_gen::planet::{INTERIOR_RADIUS, Planet};
-use planet_gen::world_map::{WORLD_RADIUS, WorldMap};
+use planet_gen::planet::Planet;
+use planet_gen::world_map::WorldMap;
 
 #[derive(Default)]
 struct Tally {
@@ -37,7 +37,7 @@ fn main() {
     let length = spawn.iter().map(|c| c * c).sum::<f64>().sqrt();
     println!(
         "spawn at {spawn:?}, {:.0} Voxels out",
-        length - f64::from(WORLD_RADIUS)
+        length - f64::from(planet.radius())
     );
 
     // A block of bricks around the spawn, aligned to the axes: 64 across, 72 high along the axis
@@ -66,7 +66,7 @@ fn main() {
         }
     }
     // Along a line from the centre out through the interior, to the ground.
-    let line = (0..INTERIOR_RADIUS / BRICK_SIZE).step_by(7);
+    let line = (0..planet.interior_radius() / BRICK_SIZE).step_by(7);
     let mut interior = Tally::default();
     for r in line {
         let coord = BrickCoord(up.map(|u| (u * f64::from(r)).floor() as i32));

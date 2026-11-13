@@ -2,9 +2,16 @@
 //! generation (#45) samples instead of working out continents and climate itself.
 //!
 //! It is a cube-sphere: six faces of `size` x `size` texels (2048 for the real Planet, about
-//! 12 m a texel at the 16 km radius). Each texel holds its elevation, how much erosion changed
-//! it, its biome and its fantasy-region masks. Sea level is the constant [`SEA_LEVEL`], and
-//! rivers and lakes are not here yet (M1b).
+//! 240 m a texel at the 320 km radius of ADR 0008). Each texel holds its elevation, how much
+//! erosion changed it, its biome and its fantasy-region masks. Sea level is the constant
+//! [`SEA_LEVEL`], and rivers and lakes are not here yet (M1b). It keeps what is large:
+//! continents, climate and biomes. What is finer than a texel is made per brick, from the map's
+//! height (`crate::detail`).
+//!
+//! The Planet's radius is a value, not a constant read from inside: [`WorldMap::with_radius`]
+//! makes the map of a Planet of any radius, and everything that depends on the radius is derived
+//! from the map's. [`WORLD_RADIUS`] is the default, that of the one Planet of the Vertical
+//! slice, and the only radius constant in this crate.
 //!
 //! The map is the same whatever the size of a Voxel (ADR 0007): sizes are in metres, and the
 //! noise is sampled on a lattice of fixed 10 cm spacing ([`ELEVATION_UNITS_PER_METRE`]), not on
@@ -44,8 +51,21 @@ pub(crate) const fn units(metres: f64) -> i32 {
 /// Texels along one face's edge for the real Planet.
 pub const WORLD_MAP_SIZE: u32 = 2048;
 
-/// Distance of sea level from the Planet's centre, in Voxels: 16 km.
-pub const WORLD_RADIUS: i32 = voxels(16_000.0);
+/// Distance of sea level from the Planet's centre, in Voxels: 320 km (ADR 0008). The default
+/// radius of a [`WorldMap`], and the only radius constant in this crate: everything else derives
+/// from it, or from the radius a map is made with.
+pub const WORLD_RADIUS: i32 = voxels(320_000.0);
+
+/// The radius of a test Planet: an eighth of [`WORLD_RADIUS`] (40 km, a sixty-fourth of its area),
+/// which is a value derived from it and not a second radius. Tests of this and the other crates
+/// that need a Planet's ground but not its size use it with a world map of [`TEST_MAP_SIZE`]
+/// texels a face (an eighth of the real map's), so that a texel is the same 245 m as the real
+/// Planet's: the same detail at the same sizes in metres, the same erosion limit, and a map made
+/// in a fraction of a second. At 320 km the Guard alone (levels 9 to 13) is millions of bricks.
+pub const TEST_RADIUS: i32 = WORLD_RADIUS / 8;
+
+/// Texels along a face of a test Planet's world map: an eighth of [`WORLD_MAP_SIZE`].
+pub const TEST_MAP_SIZE: u32 = WORLD_MAP_SIZE / 8;
 
 /// Elevation of the sea surface. Texel elevations are in units of 10 cm above or below it.
 pub const SEA_LEVEL: i16 = 0;
@@ -60,10 +80,14 @@ pub const TRENCH: i32 = voxels(1_000.0);
 const PEAK_UNITS: i32 = units(2_000.0);
 const TRENCH_UNITS: i32 = units(1_000.0);
 
-/// Radius of the sphere that the noise is sampled on, in lattice points: 16 km at the lattice's
-/// 10 cm spacing. Its cells are powers of two of that spacing, so the map does not change with
-/// the size of a Voxel.
-const NOISE_RADIUS: i32 = units(16_000.0);
+/// Radius of the sphere that the noise is sampled on, in lattice points, for a Planet of
+/// `radius` Voxels: the radius in the lattice's 10 cm spacing. The cells of the noise are powers
+/// of two of that spacing, so the map does not change with the size of a Voxel, and they are a
+/// fixed size in metres, not a share of the radius: a bigger Planet has more continents, not
+/// bigger ones.
+const fn lattice_radius(radius: i32) -> i32 {
+    (radius as f64 / VOXELS_PER_UNIT + 0.5) as i32
+}
 
 /// Faces as (normal, u axis, v axis), each a signed unit vector along one of x, y and z. A face
 /// is the set of cube points `normal + a * u + b * v` for `a` and `b` in `[-1, 1]`. The order
@@ -171,30 +195,54 @@ impl ElevationCell {
 pub struct WorldMap {
     seed: u64,
     size: u32,
+    /// Distance of sea level from the Planet's centre, in Voxels.
+    radius: i32,
     /// Face by face, each row by row (`i` fastest).
     texels: Vec<Texel>,
 }
 
 impl WorldMap {
-    /// Computes the map of `seed` with `size` x `size` texels a face, on all available cores.
-    /// The Planet uses [`WORLD_MAP_SIZE`]; tests use a coarser map. Panics if `size` is 0.
+    /// Computes the map of `seed` with `size` x `size` texels a face, on all available cores, for
+    /// a Planet of [`WORLD_RADIUS`]. The Planet uses [`WORLD_MAP_SIZE`]; tests use a coarser map.
+    /// Panics if `size` is 0.
     pub fn generate(seed: u64, size: u32) -> WorldMap {
-        let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
-        Self::generate_on(seed, size, threads)
+        Self::with_radius(seed, size, WORLD_RADIUS)
     }
 
-    fn generate_on(seed: u64, size: u32, threads: usize) -> WorldMap {
+    /// The map of the test Planet of `seed`: [`TEST_MAP_SIZE`] texels a face, [`TEST_RADIUS`]
+    /// Voxels from the centre to sea level.
+    pub fn for_tests(seed: u64) -> WorldMap {
+        Self::with_radius(seed, TEST_MAP_SIZE, TEST_RADIUS)
+    }
+
+    /// [`WorldMap::generate`] for a Planet of `radius` Voxels from the centre to sea level, which
+    /// is a value passed to the generator, so that there can be Planets of different radii in one
+    /// process. The size in metres of continents, peaks and everything else is the same
+    /// whatever the radius; the climate's latitude bands and the erosion's slope limit are what
+    /// scale with it. Panics if `size` is 0 or `radius` is too small to hold the 2 km peak or too
+    /// big for the coordinates (`i32` Voxels, and 10 cm lattice points).
+    pub fn with_radius(seed: u64, size: u32, radius: i32) -> WorldMap {
+        let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+        Self::generate_on(seed, size, radius, threads)
+    }
+
+    fn generate_on(seed: u64, size: u32, radius: i32, threads: usize) -> WorldMap {
         assert!(size > 0, "a world map needs at least one texel");
+        assert!(
+            radius > PEAK + TRENCH && i64::from(radius) < i64::from(i32::MAX) / 2,
+            "a Planet of {radius} Voxels does not fit its relief or the coordinates"
+        );
+        let noise = lattice_radius(radius);
         let count = 6 * (size as usize).pow(2);
         let mut raw = vec![0; count];
         par_fill(&mut raw, threads, |index| {
             let (face, i, j) = split(size, index);
-            raw_elevation(seed, centre(size, face, i, j))
+            raw_elevation(seed, noise, centre(size, face, i, j))
         });
         let base = normalise(&raw, size);
         drop(raw);
         let mut eroded = base.clone();
-        erode(&mut eroded, size, threads);
+        erode(&mut eroded, size, noise, threads);
         let blank = Texel {
             elevation: 0,
             erosion: 0,
@@ -209,11 +257,16 @@ impl WorldMap {
             Texel {
                 elevation,
                 erosion: (i32::from(base[index]) - i32::from(elevation)) as i16,
-                biome: biome(seed, direction, elevation),
-                regions: regions(seed, direction),
+                biome: biome(seed, noise, direction, elevation),
+                regions: regions(seed, noise, direction),
             }
         });
-        WorldMap { seed, size, texels }
+        WorldMap {
+            seed,
+            size,
+            radius,
+            texels,
+        }
     }
 
     /// The seed the map was made from, which per-brick generation draws its own randomness from
@@ -225,6 +278,11 @@ impl WorldMap {
     /// Texels along one face's edge.
     pub fn size(&self) -> u32 {
         self.size
+    }
+
+    /// The distance of sea level from the Planet's centre, in Voxels.
+    pub fn radius(&self) -> i32 {
+        self.radius
     }
 
     /// The texel `(i, j)` of `face`: 0 to 5 in the order +x, -x, +y, -y, +z, -z, with `i`
@@ -496,9 +554,10 @@ fn step(size: u32, face: usize, i: u32, j: u32, side: usize) -> (usize, u32, u32
 
 /// Value noise summed over `octaves` octaves, from cells `1 << first` lattice points wide down,
 /// each half the weight of the one before; in `[-1, 1)`. The noise is sampled at the lattice
-/// point of the sphere of [`NOISE_RADIUS`] in `direction`.
-fn fractal(seed: u64, direction: [f64; 3], first: u32, octaves: u32) -> f64 {
-    let point = direction.map(|d| (d * f64::from(NOISE_RADIUS)).round() as i32);
+/// point of the sphere of `noise` lattice points in radius (see [`lattice_radius`]) in
+/// `direction`.
+fn fractal(seed: u64, noise: i32, direction: [f64; 3], first: u32, octaves: u32) -> f64 {
+    let point = direction.map(|d| (d * f64::from(noise)).round() as i32);
     let (mut total, mut weight, mut sum) = (0.0, 1.0, 0.0);
     for octave in 0..octaves {
         let salt = u64::from(octave).wrapping_mul(0x9e37_79b9_7f4a_7c15);
@@ -520,9 +579,27 @@ const REGION: [u64; 4] = [
     0x8eb4_4a87_6858_1511,
 ];
 
+/// Where the noise's cells start, as the power of two of lattice points (10 cm) of the widest:
+/// the sizes of what the map shows, fixed in kilometres whatever the radius.
+///
+/// Elevation: 2^18 points, 26 km, so that the land and the sea are in continents of 30 to 60 km,
+/// down to 2^11 points (205 m, about a texel of the real map) in 8 octaves. Climate and biomes:
+/// 13 km patches. Volcanic hot spots and the fantasy regions: 6.5 km patches.
+const ELEVATION_CELL: u32 = 18;
+const ELEVATION_OCTAVES: u32 = 8;
+const CLIMATE_CELL: u32 = 17;
+const PATCH_CELL: u32 = 16;
+
 /// The elevation noise at a point, in `[-2^20, 2^20)`, before it is scaled to elevation units.
-fn raw_elevation(seed: u64, direction: [f64; 3]) -> i32 {
-    (fractal(seed ^ ELEVATION, direction, 16, 9) * 1_048_576.0) as i32
+fn raw_elevation(seed: u64, noise: i32, direction: [f64; 3]) -> i32 {
+    let noise = fractal(
+        seed ^ ELEVATION,
+        noise,
+        direction,
+        ELEVATION_CELL,
+        ELEVATION_OCTAVES,
+    );
+    (noise * 1_048_576.0) as i32
 }
 
 /// The weight of each texel of a face, proportional to the area of sphere it covers.
@@ -580,12 +657,12 @@ fn normalise(raw: &[i32], size: u32) -> Vec<i16> {
 /// the last step's heights and writes new ones, so the order of texels does not matter. The
 /// number of steps and the talus scale with the texel size, so the slope limit is the same at
 /// every size, but a coarse map is not a small copy of a fine one: material spreads about
-/// `sqrt(size / 16)` texels, and the amounts moved differ (on the test seed the largest change
-/// is about 1,250 units at 256 texels and 580 at 2048).
-fn erode(heights: &mut Vec<i16>, size: u32, threads: usize) {
-    // A slope of 0.2 (11 degrees) across one texel, which is 251,327 units / `size` wide: a
-    // quarter of the circumference of sea level, 25.1 km.
-    let talus = (251_327 / size as i32) / 5;
+/// `sqrt(size / 16)` texels, and the amounts moved differ.
+fn erode(heights: &mut Vec<i16>, size: u32, noise: i32, threads: usize) {
+    // A slope of 0.2 (11 degrees) across one texel, which is a quarter of the circumference of
+    // sea level (pi / 2 of the radius, 251,327 units at 16 km), divided by `size`, wide.
+    let quarter = i64::from(noise) * 1_570_796 / 1_000_000;
+    let talus = (quarter / i64::from(size)) as i32 / 5;
     let mut next = vec![0i16; heights.len()];
     for _ in 0..size / 16 {
         par_fill(&mut next, threads, |index| {
@@ -606,14 +683,16 @@ fn erode(heights: &mut Vec<i16>, size: u32, threads: usize) {
 
 /// The biome at a texel: cold at the poles and on high ground, dry in a band of subtropical
 /// latitudes, volcanic in rare hot spots.
-fn biome(seed: u64, direction: [f64; 3], elevation: i16) -> Biome {
+fn biome(seed: u64, noise: i32, direction: [f64; 3], elevation: i16) -> Biome {
     let latitude = direction[1].abs();
     let land = elevation >= SEA_LEVEL;
     let height = f64::from(elevation.max(SEA_LEVEL)) / f64::from(PEAK_UNITS);
-    let warmth = 1.0 - latitude - 0.8 * height + 0.1 * fractal(seed ^ WARMTH, direction, 15, 3);
+    let patch =
+        |tag: u64, first: u32, octaves: u32| fractal(seed ^ tag, noise, direction, first, octaves);
+    let warmth = 1.0 - latitude - 0.8 * height + 0.1 * patch(WARMTH, CLIMATE_CELL, 3);
     let subtropics = (1.0 - (latitude - 0.35).abs() / 0.35).max(0.0);
-    let aridity = fractal(seed ^ ARIDITY, direction, 15, 3) + 0.7 * subtropics;
-    if land && fractal(seed ^ VOLCANISM, direction, 15, 4) > 0.4 {
+    let aridity = patch(ARIDITY, CLIMATE_CELL, 3) + 0.7 * subtropics;
+    if land && patch(VOLCANISM, PATCH_CELL, 4) > 0.4 {
         Biome::Volcanic
     } else if warmth < 0.2 {
         Biome::Snow
@@ -625,12 +704,12 @@ fn biome(seed: u64, direction: [f64; 3], elevation: i16) -> Biome {
 }
 
 /// The fantasy regions at a texel: each a rare patch of its own noise.
-fn regions(seed: u64, direction: [f64; 3]) -> Regions {
+fn regions(seed: u64, noise: i32, direction: [f64; 3]) -> Regions {
     Regions(
         REGION
             .iter()
             .enumerate()
-            .filter(|&(_, &tag)| fractal(seed ^ tag, direction, 15, 3) > 0.35)
+            .filter(|&(_, &tag)| fractal(seed ^ tag, noise, direction, PATCH_CELL, 3) > 0.35)
             .fold(0, |bits, (k, _)| bits | 1 << k),
     )
 }
@@ -646,7 +725,7 @@ mod tests {
 
     fn map() -> &'static WorldMap {
         static MAP: OnceLock<WorldMap> = OnceLock::new();
-        MAP.get_or_init(|| WorldMap::generate(SEED, SIZE))
+        MAP.get_or_init(|| WorldMap::with_radius(SEED, SIZE, TEST_RADIUS))
     }
 
     fn all_texels(map: &WorldMap) -> impl Iterator<Item = (usize, u32, u32, Texel)> + '_ {
@@ -670,9 +749,10 @@ mod tests {
 
     #[test]
     fn the_map_does_not_depend_on_the_thread_count() {
-        let one = WorldMap::generate_on(SEED, 64, 1).content_hash();
+        let one = WorldMap::generate_on(SEED, 64, TEST_RADIUS, 1).content_hash();
         for threads in [2, 3, 8] {
-            assert_eq!(one, WorldMap::generate_on(SEED, 64, threads).content_hash());
+            let many = WorldMap::generate_on(SEED, 64, TEST_RADIUS, threads);
+            assert_eq!(one, many.content_hash());
         }
     }
 

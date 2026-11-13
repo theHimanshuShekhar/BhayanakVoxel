@@ -100,8 +100,8 @@ jobs:
       - uses: ./.github/actions/setup-rust
       - name: Tests of the crates that need no GPU
         run: cargo test -p brick-store -p materials -p net -p planet-gen -p sim -p prefetch-sim -p server
-      # The client's unit tests, minus the real-thread tests and the two that make an Offscreen
-      # renderer (a Vulkan device): the cave stills and the Edit stress of the bench.
+      # The client's unit tests, minus the real-thread tests and the three that make an Offscreen
+      # renderer (a Vulkan device): the cave stills, the landscape golden and the Edit stress of the bench.
       - name: Client tests that need no GPU, without the real-thread tests
         shell: bash
         run: |
@@ -109,6 +109,7 @@ jobs:
           mapfile -t filters < <(tr -d '\r' < .github/real-thread-tests.txt | grep -vE '^\s*(#|$)')
           skips=(
             --skip bench::caves::tests::the_stills_are_timed_and_photographed
+            --skip bench::landscape::the_landscape_from_the_ground_500_m_and_20_km_matches_the_approved_images
             --skip bench::edits::tests::the_largest_brush_is_dug_and_placed_in_turn_at_no_more_than_the_metric_rate
           )
           for f in "${filters[@]}"; do skips+=(--skip "$f"); done

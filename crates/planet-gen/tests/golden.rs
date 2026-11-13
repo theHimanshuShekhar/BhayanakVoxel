@@ -56,7 +56,7 @@ const GOLDEN: &[([i32; 3], Kind, u64)] = &[
 #[test]
 fn golden_generator_version() {
     // Changing this means the hashes below were regenerated on purpose.
-    assert_eq!(GENERATOR_VERSION, 4);
+    assert_eq!(GENERATOR_VERSION, 5);
 }
 
 #[test]
@@ -77,7 +77,7 @@ fn golden_brick_hashes() {
 /// map's algorithm is the same at every size.
 const WORLD_MAP_SIZE: u32 = 128;
 
-const WORLD_MAP_HASH: u64 = 0xcd2f00519adae333;
+const WORLD_MAP_HASH: u64 = 0xa8b3355aa886d5b2;
 
 #[test]
 fn golden_world_map_hash() {
@@ -85,88 +85,121 @@ fn golden_world_map_hash() {
     assert_eq!(actual, WORLD_MAP_HASH, "actual {actual:#018x}");
 }
 
-/// Bricks of the real Planet on the coarse world map above, with a sample of every layer of it.
+/// Bricks of the real Planet (320 km, `WORLD_RADIUS`) on the coarse world map above, with a sample
+/// of every layer of it.
 #[rustfmt::skip]
 const PLANET_GOLDEN: &[([i32; 3], Kind, u64)] = &[
     // The core, its edge, deep rock, and the interior's outer edge.
     ([0, 0, 0], Solid, 0x02c5150a75e71525),
-    ([8000, 0, 0], Mixed, 0x9c31dfda9ca31e8a),
-    ([8002, 0, 0], Solid, 0xd97e511494bfdb25),
-    ([0, 37380, 0], Solid, 0xd97e511494bfdb25),
+    ([160000, 0, 0], Mixed, 0x9c31dfda9ca31e8a),
+    ([160002, 0, 0], Solid, 0xd97e511494bfdb25),
+    ([0, 300000, 0], Solid, 0xd97e511494bfdb25),
+    ([797329, 0, 0], Solid, 0xd97e511494bfdb25),
     // Temperate land, from the sky down: air, the ground, the strata and the boundaries between
     // them, and deep rock.
-    ([23924, -23676, 22690], Air, 0x6ab05ef9aa8b9b25),
-    ([23920, -23674, 22686], Mixed, 0xa6bd8a214eafa0e9),
-    ([23920, -23672, 22686], Mixed, 0xc94a1d256b3090f3),
-    ([23918, -23670, 22684], Solid, 0xb3c594f58463b525),
-    ([23908, -23662, 22676], Solid, 0x6fa64afc62031525),
-    ([23890, -23644, 22658], Solid, 0xe0e4f56507851525),
-    ([23862, -23614, 22630], Solid, 0x4d3463ca4f10d325),
-    ([23850, -23604, 22620], Mixed, 0xcbc917f5ecbd4ccd),
-    ([23832, -23586, 22602], Solid, 0xd97e511494bfdb25),
+    ([533743, -517162, 296419], Air, 0x6ab05ef9aa8b9b25),
+    ([533735, -517154, 296414], Air, 0x6ab05ef9aa8b9b25),
+    ([533733, -517152, 296413], Mixed, 0x7ea1273154058e0c),
+    ([533730, -517150, 296412], Solid, 0xb3c594f58463b525),
+    ([533722, -517141, 296407], Solid, 0x6fa64afc62031525),
+    ([533708, -517129, 296399], Solid, 0xe0e4f56507851525),
+    ([533675, -517096, 296381], Solid, 0x4d3463ca4f10d325),
+    ([533652, -517074, 296368], Solid, 0xd97e511494bfdb25),
     // The other biomes: sand over sandstone, snow over ice over gravel over granite, basalt
     // and obsidian.
-    ([25858, -21938, 21432], Mixed, 0x2ddb1d3b984ae27b),
-    ([25852, -21932, 21426], Solid, 0x0dc0fd820e036725),
-    ([27460, -23837, -19636], Mixed, 0x2fe666e7950d0492),
-    ([27456, -23834, -19634], Solid, 0xfeb0233604966725),
-    ([27446, -23826, -19626], Solid, 0x4a6835539d1e5b25),
-    ([27394, -23780, -19588], Solid, 0x40312cd046acb525),
-    ([23744, -23500, 23498], Mixed, 0xf9e0c112940ee2dd),
-    ([23742, -23496, 23494], Solid, 0xfc11e2d7244c1525),
-    ([23732, -23488, 23486], Solid, 0x3725155588c5a725),
-    // The ocean: water, the sea's surface, the sea floor and its layers, and a coast.
-    ([27650, -27364, 4648], Solid, 0xb812ab782d86a725),
-    ([28230, -27938, 4746], Mixed, 0x548df38cfb57afc9),
-    ([27646, -27360, 4648], Mixed, 0x73a80fb2cb7dddc3),
-    ([27642, -27356, 4648], Solid, 0x6fa64afc62031525),
-    ([27576, -27290, 4636], Solid, 0x4d3463ca4f10d325),
-    ([28388, -28096, 1376], Mixed, 0xfa0ff2af7a930aa3),
+    ([504902, -458400, -418462], Solid, 0x8be0c40c241ab525),
+    ([504895, -458394, -418456], Solid, 0x0dc0fd820e036725),
+    ([-15725, 592256, 537708], Mixed, 0x21af38d1d5f1499a),
+    ([-15725, 592253, 537705], Solid, 0xfeb0233604966725),
+    ([-15725, 592238, 537692], Mixed, 0x53af882b1adee525),
+    ([-15724, 592208, 537665], Solid, 0x4d3463ca4f10d325),
+    ([579250, -525901, 167828], Mixed, 0xa30d7e286015d7b1),
+    ([579247, -525898, 167827], Solid, 0xfc11e2d7244c1525),
+    ([579232, -525884, 167823], Solid, 0x3725155588c5a725),
+    // The ocean: water, the sea's surface and the sea floor, and a coast.
+    ([463954, -459131, 459131], Solid, 0xe0e4f56507851525),
+    ([463976, -459153, 459152], Mixed, 0x6226f4947a643083),
+    ([463978, -459155, 459154], Solid, 0xb812ab782d86a725),
+    ([465098, -460263, 460262], Mixed, 0x3303cd46092608ed),
+    ([465099, -460264, 460263], Air, 0x6ab05ef9aa8b9b25),
+    ([522061, -453161, 402602], Mixed, 0xf87202c3998cdda4),
+    ([522059, -453159, 402601], Solid, 0x6fa64afc62031525),
     // A polar sea, from the water below to the air above: the water, the ice and the water under
     // it, and the ice and the air over it.
-    ([-24316, 31528, 3730], Solid, 0xb812ab782d86a725),
-    ([-24320, 31535, 3732], Mixed, 0x8b1693591b57bf59),
-    ([-24320, 31536, 3732], Mixed, 0xdcabd3ed56e92a39),
-    ([-24322, 31536, 3732], Mixed, 0x2262629570ceb499),
-    ([-24322, 31538, 3732], Air, 0x6ab05ef9aa8b9b25),
+    ([-49868, 602968, 523389], Solid, 0xb812ab782d86a725),
+    ([-49868, 602970, 523391], Solid, 0xfeb0233604966725),
+    ([-49868, 602971, 523391], Mixed, 0xa600681c28adecc5),
+    ([-49868, 602971, 523392], Mixed, 0x3afd700576df75c5),
+    ([-49868, 602972, 523392], Air, 0x6ab05ef9aa8b9b25),
     // Caves (#46), at a few of the mouths on this map and under it: the sky above a mouth, the
     // brick that the mouth is in, bricks that are mostly cave, one wholly cave under the ground
     // (air, where the strata would be), and the strata below, which the caves did not change.
-    ([804, -8832, -41326], Air, 0x6ab05ef9aa8b9b25),
-    ([802, -8828, -41313], Mixed, 0x2ad7abaf510facd3),
-    ([802, -8828, -41308], Mixed, 0x6a23f321f5e34641),
-    ([802, -8826, -41298], Solid, 0x6fa64afc62031525),
-    ([-3648, -3980, -41480], Air, 0x6ab05ef9aa8b9b25),
-    ([-3648, -3978, -41476], Mixed, 0x1d55487e6a069a0d),
-    ([-4476, -3122, -41640], Mixed, 0x49a2a5120efcce75),
-    ([-4474, -3120, -41626], Solid, 0x0dc0fd820e036725),
-    // Chambers, which are wide enough to be seen from further away: the brick at the end of a
-    // tube, and at the end of another, both wholly cave.
-    ([-10866, -3762, -39382], Air, 0x6ab05ef9aa8b9b25),
-    ([-10964, -1636, -39520], Air, 0x6ab05ef9aa8b9b25),
+    ([509730, -475221, 393241], Air, 0x6ab05ef9aa8b9b25),
+    ([509714, -475223, 393218], Mixed, 0x9383d22ddbdefea6),
+    ([509715, -475223, 393218], Mixed, 0x53b61b2c5558fb39),
+    ([509703, -475221, 393218], Mixed, 0x26f0d08316654baf),
+    ([509703, -475219, 393218], Mixed, 0x59fe2c63e00e70f1),
+    ([510182, -474707, 393150], Solid, 0xb3c594f58463b525),
+    ([510179, -474704, 393147], Solid, 0x6fa64afc62031525),
+    // Chambers, which are wide enough to be seen from further away: bricks wholly cave.
+    ([509705, -475204, 393222], Air, 0x6ab05ef9aa8b9b25),
+    ([650925, -319280, 338531], Air, 0x6ab05ef9aa8b9b25),
+    ([650936, -319278, 338519], Air, 0x6ab05ef9aa8b9b25),
 ];
 
-/// The hash of the tubes of the caves that the walk makes on this map: the table itself, so that
-/// a change to the walk, or to the floats under it, shows here before it shows in the bricks.
-const CAVES_HASH: u64 = 0xd9e77605f137ec18;
+/// Boxes of Voxels from the centre, a few caves' cubes each, that [`CAVES_GOLDEN`] hashes the
+/// tubes of: around the mouths and chambers of the bricks above.
+const CAVES_BOXES: [([f64; 3], [f64; 3]); 2] = [
+    (
+        [4_075_000.0, -3_805_000.0, 3_143_000.0],
+        [4_085_000.0, -3_795_000.0, 3_149_000.0],
+    ),
+    (
+        [5_200_000.0, -2_560_000.0, 2_705_000.0],
+        [5_210_000.0, -2_550_000.0, 2_711_000.0],
+    ),
+];
+
+/// The hash of the tubes of the caves that the walk makes in each of the boxes above: the tubes
+/// themselves, so that a change to the walk, or to the floats under it, shows here before it
+/// shows in the bricks.
+const CAVES_GOLDEN: [u64; 2] = [0x18bf7a329aead62f, 0xb5e4e9da53fa1dbe];
 
 #[test]
 fn golden_caves_hash() {
-    let actual = planet().caves_hash();
-    assert_eq!(actual, CAVES_HASH, "actual {actual:#018x}");
+    let actual: Vec<u64> = CAVES_BOXES
+        .iter()
+        .map(|(low, high)| planet().caves_hash(*low, *high))
+        .collect();
+    let hex: Vec<String> = actual.iter().map(|h| format!("{h:#018x}")).collect();
+    assert_eq!(actual, CAVES_GOLDEN, "actual {hex:?}");
 }
 
 /// Voxels around the ground that the region golden covers, and the ground: the temperate land
 /// above, at the corner of its brick (which is within a brick of the ground).
 const REGION_REACH: i32 = 80;
-const REGION_GROUND: [f64; 3] = [191360.0, -189392.0, 181488.0];
+const REGION_GROUND: [f64; 3] = [4269870.0, -4137219.0, 2371310.0];
 
 /// The hash of the store that `region_around` makes there.
-const REGION_HASH: u64 = 0x49cda98d13a643b4;
+const REGION_HASH: u64 = 0x9a1bca7e0602d6bc;
 
 fn planet() -> &'static Planet {
     static PLANET: OnceLock<Planet> = OnceLock::new();
     PLANET.get_or_init(|| Planet::new(WorldMap::generate(SEED, WORLD_MAP_SIZE)))
+}
+
+/// The Spawn of this seed, to the bit (`f64::to_bits`): the same on every machine.
+const SPAWN_BITS: [u64; 3] = [
+    4706891993883463654,
+    4706316363597622642,
+    4688651980890690691,
+];
+
+#[test]
+fn golden_spawn() {
+    let spawn = planet().spawn(100);
+    let actual = spawn.map(f64::to_bits);
+    assert_eq!(actual, SPAWN_BITS, "actual {actual:?}, {spawn:?}");
 }
 
 #[test]
@@ -203,42 +236,45 @@ fn golden_region_hash() {
 /// in them, the sea, the sky and the interior did not.
 #[rustfmt::skip]
 const COARSE_GOLDEN: &[(usize, [i32; 3], Kind, u64)] = &[
-    // Temperate land, from 10 cm Voxels up to orbit: a brick is 1.6 km across at level 12, 13 km at
-    // level 15, and at level 20 a Voxel is 52 km, which is wider than the Planet, so it is air.
-    (2, [23920, -23674, 22686], Mixed, 0xfa9cbec5e56075d4),
-    (4, [23920, -23674, 22686], Mixed, 0x3788f7b911e25b6d),
-    (6, [23920, -23674, 22686], Mixed, 0xf6c851598a6c1446),
-    (9, [23920, -23674, 22686], Mixed, 0x59fdfa374196f730),
-    (12, [23920, -23674, 22686], Mixed, 0x0cb55abb80f2d189),
-    (15, [23920, -23674, 22686], Mixed, 0x36301fd372a2ec18),
-    (20, [23920, -23674, 22686], Air, 0x6ab05ef9aa8b9b25),
+    // Temperate land, from 5 cm Voxels up to orbit: a brick is 1.6 km across at level 12, 13 km at
+    // level 15, 410 km at level 20, and at level 24 a Voxel is 840 km, which is wider than the
+    // Planet, so it is air.
+    (2, [533733, -517152, 296413], Mixed, 0x472aa43cf21f35ab),
+    (4, [533733, -517152, 296413], Mixed, 0xe9a3f3c992c66b1d),
+    (6, [533733, -517152, 296413], Mixed, 0xb242c9011ace0e96),
+    (9, [533733, -517152, 296413], Mixed, 0x1cf1cb2cde93b4d9),
+    (12, [533733, -517152, 296413], Mixed, 0x29edbd2e9b8213b1),
+    (15, [533733, -517152, 296413], Mixed, 0x1a98d219a6282471),
+    (20, [533733, -517152, 296413], Mixed, 0xccdcc342ee803ddd),
+    (24, [533733, -517152, 296413], Air, 0x6ab05ef9aa8b9b25),
     // The other biomes, the sky above the land, the ocean, a coast and a polar sea.
-    (3, [25858, -21938, 21432], Mixed, 0x07787a6cc86d9a29),
-    (7, [25858, -21938, 21432], Mixed, 0xb1ff2acf10b58d64),
-    (3, [27460, -23838, -19636], Mixed, 0x6cbb319bc51480fb),
-    (7, [27460, -23838, -19636], Mixed, 0x1b18ebde98244c62),
-    (4, [23744, -23500, 23498], Mixed, 0x24310e2636cd844b),
-    (3, [23924, -23676, 22690], Mixed, 0xd2c3afe20c4d1595),
-    (5, [28230, -27938, 4746], Mixed, 0xce83b6cef716c779),
-    (10, [28230, -27938, 4746], Mixed, 0xa89a1db55bc431f5),
-    (5, [28388, -28096, 1376], Mixed, 0xee30ab707837aefe),
-    (2, [-24320, 31534, 3732], Mixed, 0x00fd7221bbbca7c5),
-    (4, [-24320, 31534, 3732], Solid, 0xb812ab782d86a725),
-    (8, [-24320, 31534, 3732], Mixed, 0x702836b6574c4521),
+    (3, [-15725, 592256, 537708], Mixed, 0x4e715bf6ee9cf093),
+    (7, [-15725, 592256, 537708], Mixed, 0xb591457469283fdb),
+    (3, [579250, -525901, 167828], Mixed, 0x4cec4e0a0a2dc35c),
+    (7, [579250, -525901, 167828], Mixed, 0xe05d879e7e113f39),
+    (4, [504902, -458400, -418462], Mixed, 0x6e94aa2edac3e693),
+    (3, [533735, -517154, 296414], Mixed, 0x231ce71f6114cdb7),
+    (5, [463976, -459153, 459152], Mixed, 0xf4dad3ac5e4cae24),
+    (10, [463976, -459153, 459152], Mixed, 0xba9198728649c91b),
+    (5, [522061, -453161, 402602], Mixed, 0x396741cda01f1773),
+    (2, [-49837, 602601, 523071], Mixed, 0xf51317df10f72146),
+    (4, [-49837, 602601, 523071], Mixed, 0x6f7bb5f13e964ffe),
+    (8, [-49837, 602601, 523071], Mixed, 0x7f590850aa0e3014),
     // Under the caves: a Voxel is a cave at the levels where a tube holds most of it, and not
     // from level 8, so these differ from what the ground makes at levels 1 to 4 and not at 8.
-    (2, [-10866, -3762, -39382], Air, 0x6ab05ef9aa8b9b25),
-    (3, [-10866, -3762, -39382], Mixed, 0xc71222b94a24693f),
-    (4, [-10866, -3762, -39382], Mixed, 0x8eb86d9caeca02b7),
-    (3, [-10964, -1636, -39520], Mixed, 0xe7fe83c79afea461),
-    (3, [802, -8828, -41314], Mixed, 0xda23bcebf1a92ad1),
-    (8, [-10866, -3762, -39382], Solid, 0xd97e511494bfdb25),
+    (2, [509705, -475204, 393222], Mixed, 0x021d36e137dc65ee),
+    (3, [509705, -475204, 393222], Mixed, 0x08cc4b694e40f223),
+    (4, [509705, -475204, 393222], Mixed, 0x00fe3da5b839d270),
+    (3, [509717, -475209, 393231], Mixed, 0xc08dc1d99875a171),
+    (3, [650925, -319280, 338531], Mixed, 0xa86d5e5a0c20e966),
+    (8, [509705, -475204, 393222], Mixed, 0xacbe0533239052bc),
     // The core's edge, the interior's, and the interior far from either.
-    (2, [4618, 4618, 4618], Mixed, 0x471f08b899b435a9),
-    (6, [4618, 4618, 4618], Mixed, 0xe2c5cca2e703b85f),
-    (11, [4618, 4618, 4618], Mixed, 0xee14a7ee217ce91c),
-    (7, [21580, 21580, 21580], Solid, 0xd97e511494bfdb25),
-    (5, [18000, 18000, 18000], Solid, 0xd97e511494bfdb25),
+    (2, [92376, 92376, 92376], Solid, 0xd97e511494bfdb25),
+    (6, [92376, 92376, 92376], Mixed, 0x99eba5730a5ffae1),
+    (11, [92376, 92376, 92376], Mixed, 0xd7e1d9ad7b8617ef),
+    (6, [460334, 460334, 460334], Solid, 0xd97e511494bfdb25),
+    (7, [300000, 300000, 300000], Solid, 0xd97e511494bfdb25),
+    (5, [200000, 200000, 200000], Solid, 0xd97e511494bfdb25),
 ];
 
 #[test]

@@ -19,10 +19,18 @@ pub const CRUST: f64 = 0.4;
 /// The eye's height above the ground when walking or flying low: 2 m.
 pub const EYE: f64 = 2.0 * VOXELS_PER_METRE;
 
+/// The radius of the Planet that the simulator models, in Voxels: 16 km, the client's Planet when
+/// the simulator was calibrated against it (`DRAWN_PER_D0_SQUARED`, the tests of `report`). The
+/// real Planet is 320 km now (ADR 0008, #166), whose keys do not fit a [`crate::key::Key`] and
+/// whose fill the client has not measured yet: recalibrating is #167's, with the renderer's
+/// levels. The bricks that the band rule picks near a camera do not depend on the radius but
+/// through the horizon, which is what is calibrated.
+pub const SIM_RADIUS: i32 = 16_000 * VOXELS_PER_METRE as i32;
+
 /// What is resident, what is required, and by which rules.
 #[derive(Clone, Debug)]
 pub struct Model {
-    /// Radius of the ground: sea level, [`planet_gen::world_map::WORLD_RADIUS`] for the real Planet.
+    /// Radius of the ground: sea level, [`SIM_RADIUS`] for the real Planet.
     pub planet_radius: f64,
     /// How far the ground's relief reaches either side of the sphere. A brick is a surface brick
     /// if it meets the shell of this half-thickness: more is rougher terrain (the research's
@@ -55,12 +63,12 @@ pub struct Model {
 }
 
 impl Model {
-    /// The real Planet, with the ADR 0004 margins, the Guard at levels 9 to the top, the
+    /// The real Planet (as [`SIM_RADIUS`] has it), with the ADR 0004 margins, the Guard at levels 9 to the top, the
     /// renderer's strict band rule at 1440p, and a 1 to 2 s prefetch lead.
     pub fn real() -> Self {
         let tan_v = (render::lod::VFOV / 2.0).tan();
         Self {
-            planet_radius: f64::from(planet_gen::world_map::WORLD_RADIUS),
+            planet_radius: f64::from(SIM_RADIUS),
             relief: 0.0,
             crust: CRUST,
             bands: Bands::standard(1.0),

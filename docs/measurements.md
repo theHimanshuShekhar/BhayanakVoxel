@@ -258,6 +258,23 @@ Before and after, full size, on the RTX 4090 (`client bench --streaming --real-t
 
 On the test Planet (stepped, measured here): the largest frame is 451 KB in 43 calls, down from 12.9 MB, and the counts hash moved from `b37e0fb7cd3a2c78` to `e621feef18ef1801`: the rebuild that the scene running out of room used to make is gone (one rebuild and 0.8 MB less over the run, and the 12.9 MB frame), and the report has the writes and the budget's counts, which are hashed.
 
+## The 320 km generator (ADR 0008, #166, 2026-11-14)
+
+Measured on the 8-core dev box (release), whose load was not quiet: other agents' builds ran beside it (load average 2 to 10), so the timings below swing by about 15% from run to run. The baseline is main at `48c4361` (the 16 km generator), run the same way.
+
+- **The world map** of the real Planet (6 × 2048² texels, 320 km, 245 m a texel): 18.6 to 24.6 s on 8 cores in `gen_rate` (the last run: 18.8 s); the baseline's (16 km, same 2048 map) was 21.6 s. The acceptance is at most about a minute.
+- **Per-brick cost** (`cargo run --release -p prefetch-sim --example gen_rate`, µs a generated brick; baseline → #166):
+  - level 0, the sampled jobs: 28.39 → 47.83 (**+68%**; #143's figure was 62);
+  - levels 1 to 7: 59.09, 67.51, 88.48, 89.10, 86.85, 77.90, 61.23 → 109.9, 110.7, 102.4, 104.2, 107.2, 100.6, 93.9;
+  - the contiguous jobs within 150 m of the Spawn: 53.51 → 50.27 (−6%);
+  - blended over the drawn bricks of levels 0 to 7: 68.15 → 95.10 (**+40%**).
+  - `brick_throughput` on one core (the bricks of a block under the Spawn): air 2.2 → 11.5 µs, uniform 3.7 to 4.0 → 10.7, mixed 24 to 27 → 48.
+- **The walking tick** (`sim` test `a_character_runs_a_kilometre_from_the_spawn_without_stopping_while_the_ground_keeps_up`, release, the server's and the client's): mean 2.26 ms → 5.99 ms and p99 8.5 → 21.3 ms (the tick is 16.7 ms), and the character waited 2 ticks for the ground in the kilometre where it waited none. The test fails on both (its assertions on the wait and on the p99); nothing was changed to make it pass, as the cost is the regression above.
+- **Where the cost went.** A brick of ground is now `ground_height` = the map's elevation + the detail (seven octaves of value noise), per Voxel column, and `bounds` for the shortcuts that say a brick is all air or all solid: the detail is an extra 20 m of relief that those bounds have to allow for, so more bricks near the ground are mixed (evaluated Voxel by Voxel) and fewer are proved air or solid. The bounds are a Lipschitz bound at the box's middle (`detail::Detail::sum_bounds`), the tightest cheap one found; the detail is the same in every profile.
+- **N continents.** The map has 20 land masses of at least 1,000 km² on the 2048 map of the test seed (the largest 412,135 km², then 148,739 and 16,222; 638,359 km² of land, 49.8% ocean), and 17 to 29 on the 256-texel map of each of 12 other seeds; `landscape.rs` holds at least 15. The map is dominated by one large continent (about 65% of the land), which the dev should judge against ADR 0008's "continents 30 to 60 km across".
+- **The test Planet** is `WORLD_RADIUS / 8` (40 km) on a map of `WORLD_MAP_SIZE / 8` (256) texels: its texel is the real Planet's 245 m, so it has the same detail at the same scale, in 1/64 of the area. The fixed-Voxel sphere of the root of `planet-gen` (`generate_brick`, 1,500 Voxels) is a different fixture and was not changed.
+- **Sizing constants.** The prefetch simulator's `Key` is 20 bits and does not hold 320 km, so `Model::real()` keeps the 16 km sphere (`SIM_RADIUS`) until #167 recalibrates it. The Guard is from level 12 at 320 km (`loader::guard_first`: the first level of at most a million ground bricks); the figures of the sections above are of the 16 km Planet and have not been taken again.
+
 ## The Reference view (ADR 0005)
 
 Measured on the RTX 4090 on 2026-11-01 ([#99](https://github.com/theHimanshuShekhar/bhayanakvoxel/issues/99) has every checkpoint), at 2560×1440 output, with the estimator as it was then (white noise, 4 bounces, flat colours). FLIP is LDR-FLIP at ppd 67.02 on the 8-bit image; each truth is 8192 samples. #187 and #188 measure these again.

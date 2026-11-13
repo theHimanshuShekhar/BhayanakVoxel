@@ -4,9 +4,12 @@
 //! from one end's to the other's, so a chain of them makes a winding passage with chambers where
 //! the radius swells. A *system* is a chain of tubes grown by a random walk from an anchor under
 //! the ground, with a few side branches. Everything is made from the seed and the world map
-//! alone, once, when the [`Planet`](crate::planet::Planet) is made, into the table [`Caves`]. A
-//! Voxel is then a cave if it is inside a tube, which a brick finds out by asking the table for
-//! the few tubes near it: most bricks have none near, and cost a lookup.
+//! alone, a cube of the world at a time and as it is asked for (ADR 0008: at 320 km the Planet has
+//! millions of cubes of ground, which are too many to make or hold, and a cube is a pure function
+//! of the seed and the cube, so it costs a few microseconds whenever it is made again): [`Caves`]
+//! hands out the tubes of a cube, and keeps the last few that a thread asked for. A Voxel is then
+//! a cave if it is inside a tube, which a brick finds out by asking for the few tubes near it:
+//! most bricks have none near, and cost a lookup.
 //!
 //! The limits of a cave hold by construction, not by luck:
 //! - **Depth.** Only a Voxel less than [`MAX_DEPTH`] (300 m) below the ground is carved, and only
@@ -26,7 +29,11 @@
 //! rest of the generator does (ADR 0003): no `sin` or `cos`, which differ between platforms.
 //! Directions come from random vectors that are normalised, not from random angles.
 
-use crate::planet::{SEA_RADIUS, tangents};
+use std::cell::RefCell;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use crate::planet::tangents;
 use crate::world_map::{PEAK, SEA_LEVEL, WorldMap, voxels};
 use crate::{Corners, distance, hash, value_noise};
 
@@ -37,11 +44,9 @@ const fn v(metres: f64) -> f64 {
 
 /// Voxels along the edge of the cubes that the world is cut into: 1.024 km.
 pub const CELL: i32 = voxels(1_024.0);
-/// Cubes along each axis: enough to hold the Planet, which is within 18 km of the centre
-/// ([`crate::planet::MAX_RADIUS`]).
-const CELLS: usize = 36;
-/// The coordinate of the cube at index 0, in cubes.
-const FIRST: i32 = -(CELLS as i32 / 2);
+
+/// How many cubes a thread keeps: a walk and its bricks stay within a few.
+const KEPT: usize = 48;
 
 /// How far below the ground caves go, in Voxels: 300 m.
 pub const MAX_DEPTH: f64 = v(300.0);
@@ -153,29 +158,31 @@ impl Tube {
     }
 }
 
-/// One cube of the table: its tubes are `tubes[start..start + len]`, in a box that holds all of
-/// them, grown by their radii.
-#[derive(Clone, Copy)]
-struct Cell {
-    start: u32,
-    len: u32,
+/// One cube's tubes, in a box that holds all of them, grown by their radii.
+struct Cube {
+    tubes: Vec<Tube>,
     low: [f64; 3],
     high: [f64; 3],
 }
 
-const EMPTY: Cell = Cell {
-    start: 0,
-    len: 0,
-    low: [0.0; 3],
-    high: [0.0; 3],
-};
-
-/// Every tube of the Planet, by the cube it is in. See the module documentation.
+/// The caves of one Planet. See the module documentation.
 pub struct Caves {
-    seed: u64,
-    cells: Vec<Cell>,
-    tubes: Vec<Tube>,
+    /// Tells this Planet's cubes from another's in a thread's cache.
+    id: u64,
+    map: Arc<WorldMap>,
 }
+
+/// A thread's kept cubes: where to put the next, and each as (the Planet's id, the cube, its tubes).
+type Kept = (usize, Vec<(u64, [i32; 3], Arc<Cube>)>);
+
+thread_local! {
+    /// The cubes this thread asked for last, as (the Planet's id, the cube, its tubes), the oldest
+    /// replaced first. It only saves work: a cube is the same however it is got.
+    static KEPT_CUBES: RefCell<Kept> =
+        const { RefCell::new((0, Vec::new())) };
+}
+
+static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
 fn dot(a: [f64; 3], b: [f64; 3]) -> f64 {
     a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
@@ -302,6 +309,7 @@ fn grow(
     map: &WorldMap,
     (cube, centre): ([i32; 3], [f64; 3]),
     attempt: u64,
+    sea: f64,
     tubes: &mut Vec<Tube>,
 ) {
     let mut dice = Dice {
@@ -320,7 +328,7 @@ fn grow(
     let radius = distance(anchor);
     let up = anchor.map(|c| c / radius);
     let elevation = map.elevation_at(up);
-    let depth = SEA_RADIUS + elevation - radius;
+    let depth = sea + elevation - radius;
     if elevation < f64::from(SEA_LEVEL) || !ANCHOR_DEPTH.contains(&depth) {
         return;
     }
@@ -353,64 +361,112 @@ fn grow(
 }
 
 impl Caves {
-    /// The caves of the Planet of `map`, from its seed: every tube of every cube that the ground
-    /// goes near. Takes a few milliseconds.
-    pub fn new(map: &WorldMap) -> Caves {
-        let seed = map.seed();
-        let mut cells = vec![EMPTY; CELLS * CELLS * CELLS];
+    /// The caves of the Planet of `map`, from its seed and radius: nothing is made until it is
+    /// asked for.
+    pub fn new(map: Arc<WorldMap>) -> Caves {
+        Caves {
+            id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
+            map,
+        }
+    }
+
+    fn seed(&self) -> u64 {
+        self.map.seed()
+    }
+
+    /// The cube `index` (in cubes of [`CELL`] Voxels): every tube of the systems grown in it, or
+    /// none if it is too far from the ground for any anchor to be under land in it.
+    fn cube(&self, index: [i32; 3]) -> Arc<Cube> {
+        let kept = KEPT_CUBES.with(|kept| {
+            let kept = kept.borrow();
+            kept.1
+                .iter()
+                .find(|(id, cube, _)| *id == self.id && *cube == index)
+                .map(|(.., made)| made.clone())
+        });
+        if let Some(cube) = kept {
+            return cube;
+        }
+        let made = Arc::new(self.make_cube(index));
+        KEPT_CUBES.with(|kept| {
+            let mut kept = kept.borrow_mut();
+            let (next, entries) = &mut *kept;
+            if entries.len() < KEPT {
+                entries.push((self.id, index, made.clone()));
+            } else {
+                entries[*next] = (self.id, index, made.clone());
+                *next = (*next + 1) % KEPT;
+            }
+        });
+        made
+    }
+
+    fn make_cube(&self, cube: [i32; 3]) -> Cube {
+        let map = &*self.map;
+        let sea = f64::from(map.radius()) + f64::from(SEA_LEVEL);
+        let lowest = sea - ANCHOR_DEPTH.end();
+        let highest = sea + f64::from(PEAK) - ANCHOR_DEPTH.start();
+        let centre = cube.map(|c| f64::from(c) * f64::from(CELL) + f64::from(CELL / 2));
+        let none = Cube {
+            tubes: Vec::new(),
+            low: [0.0; 3],
+            high: [0.0; 3],
+        };
+        // A cube too far from the ground for any anchor to be under land in it has none.
+        let middle = distance(centre);
+        if middle + HEART < lowest || middle - HEART > highest {
+            return none;
+        }
         let mut tubes = Vec::new();
-        let lowest = SEA_RADIUS - ANCHOR_DEPTH.end();
-        let highest = SEA_RADIUS + f64::from(PEAK) - ANCHOR_DEPTH.start();
-        for (index, cell) in cells.iter_mut().enumerate() {
-            let cube = [
-                (index % CELLS) as i32 + FIRST,
-                (index / CELLS % CELLS) as i32 + FIRST,
-                (index / (CELLS * CELLS)) as i32 + FIRST,
-            ];
-            let centre = cube.map(|c| f64::from(c * CELL + CELL / 2));
-            // A cube too far from the ground for any anchor to be under land in it has none.
-            let middle = distance(centre);
-            if middle + HEART < lowest || middle - HEART > highest {
-                continue;
+        for attempt in 0..ATTEMPTS {
+            grow(self.seed(), map, (cube, centre), attempt, sea, &mut tubes);
+        }
+        if tubes.is_empty() {
+            return none;
+        }
+        let (mut low, mut high) = ([f64::INFINITY; 3], [f64::NEG_INFINITY; 3]);
+        for tube in &tubes {
+            let grow = tube.ra.max(tube.rb) + ROUGHNESS;
+            for k in 0..3 {
+                low[k] = low[k].min(tube.a[k].min(tube.b[k]) - grow);
+                high[k] = high[k].max(tube.a[k].max(tube.b[k]) + grow);
             }
-            let start = tubes.len();
-            for attempt in 0..ATTEMPTS {
-                grow(seed, map, (cube, centre), attempt, &mut tubes);
-            }
-            let made = &tubes[start..];
-            if made.is_empty() {
-                continue;
-            }
-            let (mut low, mut high) = ([f64::INFINITY; 3], [f64::NEG_INFINITY; 3]);
-            for tube in made {
-                let grow = tube.ra.max(tube.rb) + ROUGHNESS;
-                for k in 0..3 {
-                    low[k] = low[k].min(tube.a[k].min(tube.b[k]) - grow);
-                    high[k] = high[k].max(tube.a[k].max(tube.b[k]) + grow);
+        }
+        Cube { tubes, low, high }
+    }
+
+    /// The tubes of the cubes that the box from `low` to `high` touches, in the order of the cubes
+    /// (x fastest, then y, then z): see [`crate::planet::Planet::cave_mouths`].
+    pub fn tubes_in(&self, low: [f64; 3], high: [f64; 3]) -> Vec<Tube> {
+        let mut tubes = Vec::new();
+        self.each_cube(low, high, 0.0, |cube| {
+            tubes.extend_from_slice(&cube.tubes);
+            false
+        });
+        tubes
+    }
+
+    /// Calls `visit` for each cube from the one with `low` to the one with `high`, until it says
+    /// `true`; whether it did.
+    fn each_cube(
+        &self,
+        low: [f64; 3],
+        high: [f64; 3],
+        margin: f64,
+        mut visit: impl FnMut(&Cube) -> bool,
+    ) -> bool {
+        let first = low.map(|c| cube_index(c - margin));
+        let last = high.map(|c| cube_index(c + margin));
+        for z in first[2]..=last[2] {
+            for y in first[1]..=last[1] {
+                for x in first[0]..=last[0] {
+                    if visit(&self.cube([x, y, z])) {
+                        return true;
+                    }
                 }
             }
-            *cell = Cell {
-                start: start as u32,
-                len: made.len() as u32,
-                low,
-                high,
-            };
         }
-        Caves { seed, cells, tubes }
-    }
-
-    /// Every tube, in the order of the table.
-    pub fn tubes(&self) -> &[Tube] {
-        &self.tubes
-    }
-
-    fn cell(&self, [x, y, z]: [usize; 3]) -> Option<&Cell> {
-        let cell = &self.cells[x + CELLS * (y + CELLS * z)];
-        (cell.len > 0).then_some(cell)
-    }
-
-    fn cell_tubes(&self, cell: &Cell) -> &[Tube] {
-        &self.tubes[cell.start as usize..(cell.start + cell.len) as usize]
+        false
     }
 
     /// Calls `visit` for every tube that may carve a Voxel in the box from `low` to `high`, or
@@ -423,30 +479,16 @@ impl Caves {
         mut visit: impl FnMut(&Tube) -> bool,
     ) -> bool {
         // A tube is inside its cube, and so is the Voxels it carves.
-        let first = low.map(|c| cube_index(c - margin));
-        let last = high.map(|c| cube_index(c + margin));
-        for z in first[2]..=last[2] {
-            for y in first[1]..=last[1] {
-                for x in first[0]..=last[0] {
-                    let Some(cell) = self.cell([x, y, z]) else {
-                        continue;
-                    };
-                    if (0..3)
-                        .any(|k| low[k] - margin > cell.high[k] || high[k] + margin < cell.low[k])
-                    {
-                        continue;
-                    }
-                    if self
-                        .cell_tubes(cell)
-                        .iter()
-                        .any(|t| t.reaches(low, high, margin) && visit(t))
-                    {
-                        return true;
-                    }
-                }
+        self.each_cube(low, high, margin, |cube| {
+            if cube.tubes.is_empty()
+                || (0..3).any(|k| low[k] - margin > cube.high[k] || high[k] + margin < cube.low[k])
+            {
+                return false;
             }
-        }
-        false
+            cube.tubes
+                .iter()
+                .any(|t| t.reaches(low, high, margin) && visit(t))
+        })
     }
 
     /// The tubes that may carve a Voxel in the box from `low` to `high`, a Voxel of which is
@@ -503,7 +545,7 @@ impl Caves {
             }
             let rough = *rough.get_or_insert_with(|| {
                 value_noise(
-                    self.seed ^ ROUGH_SALT,
+                    self.seed() ^ ROUGH_SALT,
                     point.map(|c| c.floor() as i32),
                     ROUGH_CELL,
                     cache,
@@ -514,13 +556,14 @@ impl Caves {
         })
     }
 
-    /// FNV-1a hash of the table: the tubes' ends and radii, bit for bit, cube by cube. It is
-    /// what the golden test (`tests/golden.rs`) holds the generator's walk to.
-    pub fn content_hash(&self) -> u64 {
+    /// FNV-1a hash of the tubes of the cubes that the box from `low` to `high` touches: the
+    /// tubes' ends and radii, bit for bit, cube by cube. It is what the golden test
+    /// (`tests/golden.rs`) holds the generator's walk to.
+    pub fn content_hash(&self, low: [f64; 3], high: [f64; 3]) -> u64 {
         let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
         let mut feed =
             |byte: u8| hash = (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3);
-        for tube in &self.tubes {
+        for tube in self.tubes_in(low, high) {
             for value in tube.a.into_iter().chain(tube.b).chain([tube.ra, tube.rb]) {
                 value.to_le_bytes().into_iter().for_each(&mut feed);
             }
@@ -529,9 +572,9 @@ impl Caves {
     }
 }
 
-/// The index along an axis of the cube that holds the coordinate `c`, held to the table.
-fn cube_index(c: f64) -> usize {
-    ((c / f64::from(CELL)).floor() as i32 - FIRST).clamp(0, CELLS as i32 - 1) as usize
+/// The index along an axis of the cube that holds the coordinate `c`.
+fn cube_index(c: f64) -> i32 {
+    (c / f64::from(CELL)).floor() as i32
 }
 
 /// The square of the least distance between the segments `(p1, q1)` and `(p2, q2)`.
@@ -574,6 +617,7 @@ fn segments_distance2((p1, q1): ([f64; 3], [f64; 3]), (p2, q2): ([f64; 3], [f64;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::world_map::TEST_RADIUS;
 
     fn dice(seed: u64) -> Dice {
         Dice {
@@ -666,11 +710,7 @@ mod tests {
     #[test]
     fn the_walls_are_rough_but_never_further_than_the_roughness_from_the_radius() {
         let planet_seed = 5;
-        let caves = Caves {
-            seed: planet_seed,
-            cells: Vec::new(),
-            tubes: Vec::new(),
-        };
+        let caves = Caves::new(Arc::new(WorldMap::with_radius(planet_seed, 4, TEST_RADIUS)));
         let tube = Tube {
             a: [0.0; 3],
             b: [400.0, 0.0, 0.0],

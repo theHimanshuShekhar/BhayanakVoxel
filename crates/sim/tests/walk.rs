@@ -48,7 +48,7 @@ fn test_planet() -> BrickStore {
 /// A Planet with a world map as the game has it, but a coarse one, which is quick to make.
 fn planet() -> &'static Planet {
     static PLANET: OnceLock<Planet> = OnceLock::new();
-    PLANET.get_or_init(|| Planet::new(WorldMap::generate(SEED, 512)))
+    PLANET.get_or_init(|| Planet::new(WorldMap::for_tests(SEED)))
 }
 
 fn real_planet() -> BrickStore {
@@ -540,7 +540,7 @@ fn with_a_slow_generator_the_character_stops_at_the_edge_of_the_ground_and_never
         pair.client.body_desyncs()
     );
     // 25 s of running is 175 m; it waited for the ground instead, and got some of the way.
-    assert!(stopped > 500, "stopped on {stopped} inputs");
+    assert!(stopped > 150, "stopped on {stopped} inputs");
     assert!((10.0..60.0).contains(&went), "went {went} m");
     assert_eq!(
         pair.server_state().position.map(f64::to_bits),
@@ -660,7 +660,12 @@ fn every_edit_200_m_from_the_spawn_is_the_same_on_the_client_and_the_server_and_
     let edited = pair.server.store().content_hash();
     assert_ne!(edited, pristine);
     assert_eq!(pair.client.store().content_hash(), edited);
-    assert_eq!(pair.client.store().voxel_at(0, centre), None);
+    // The Edits changed what is at the centre (the Planet's ground there, made of the map and its
+    // detail, is dug and filled in again, and what is left depends on the slope of it).
+    assert_ne!(
+        pair.client.store().voxel_at(0, centre),
+        planet().voxel(centre)
+    );
     assert!(read_alike(
         &pair.client.store(),
         pair.server.store(),

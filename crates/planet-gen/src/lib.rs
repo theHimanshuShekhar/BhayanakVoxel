@@ -22,11 +22,14 @@ use std::sync::atomic::{AtomicI32, Ordering};
 use brick_store::{BRICK_SIZE, Brick, BrickCoord, BrickStore, Interior, Material, VoxelCoord};
 
 mod caves;
+mod detail;
 pub mod planet;
 pub mod world_map;
 
-/// Identifies the generation algorithm. Bump it whenever generated bricks change.
-pub const GENERATOR_VERSION: u32 = 4;
+/// Identifies the generation algorithm. Bump it whenever generated bricks change. 5 is the 320 km
+/// Planet of ADR 0008: a different world map, detail made per brick, caves made on demand, and
+/// the Planet's radius a value passed to the generator.
+pub const GENERATOR_VERSION: u32 = 5;
 
 /// Mean radius of the test Planet in Voxels: 75 m at 5 cm Voxels, so 150 m across.
 pub const PLANET_RADIUS: i32 = 1500;
@@ -86,21 +89,31 @@ struct Corners {
 #[derive(Default)]
 struct ReliefCache([Option<Corners>; OCTAVES.len()]);
 
+/// The value at a lattice point of the noise of `seed`: in `[0, 1)`.
+fn corner_value(seed: u64, lattice: [i32; 3]) -> f64 {
+    // The top 53 bits scaled by 2^-53 is exact.
+    (hash(seed, lattice) >> 11) as f64 * (1.0 / 9_007_199_254_740_992.0)
+}
+
 /// Smooth value noise in `[-1, 1)` at an integer point.
 fn value_noise(seed: u64, point: [i32; 3], cell: i32, cache: &mut Option<Corners>) -> f64 {
     // `div_euclid` and `rem_euclid` floor, so negative points work. `cell` is a power of two,
     // so `frac` is exact.
-    let lattice = point.map(|p| p.div_euclid(cell));
-    let frac = point.map(|p| f64::from(p.rem_euclid(cell)) / f64::from(cell));
+    // As `div_euclid` and `rem_euclid` by `cell`, which is a power of two: a shift floors and a
+    // mask is the remainder that is not negative, in two's complement. And dividing by a power of
+    // two is multiplying by its inverse, exactly.
+    debug_assert!(cell > 0 && cell & (cell - 1) == 0);
+    let shift = cell.trailing_zeros();
+    let lattice = point.map(|p| p >> shift);
+    let inverse = 1.0 / f64::from(cell);
+    let frac = point.map(|p| f64::from(p & (cell - 1)) * inverse);
     let fade = frac.map(|t| t * t * (3.0 - 2.0 * t));
     let corners = match cache {
         Some(corners) if corners.lattice == lattice => *corners,
         _ => {
             let values = std::array::from_fn(|i| {
                 let [dx, dy, dz] = [i & 1, i >> 1 & 1, i >> 2].map(|d| d as i32);
-                let h = hash(seed, [lattice[0] + dx, lattice[1] + dy, lattice[2] + dz]);
-                // The top 53 bits scaled by 2^-53 is exact: a value in [0, 1).
-                (h >> 11) as f64 * (1.0 / 9_007_199_254_740_992.0)
+                corner_value(seed, [lattice[0] + dx, lattice[1] + dy, lattice[2] + dz])
             });
             *cache.insert(Corners { lattice, values })
         }

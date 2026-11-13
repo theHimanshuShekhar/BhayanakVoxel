@@ -32,7 +32,7 @@ struct World {
 fn world() -> &'static World {
     static WORLD: OnceLock<World> = OnceLock::new();
     WORLD.get_or_init(|| {
-        let planet = Planet::new(WorldMap::generate(SEED, 512));
+        let planet = Planet::new(WorldMap::for_tests(SEED));
         let ground = planet.spawn(100);
         World { planet, ground }
     })
@@ -45,7 +45,7 @@ fn bands() -> Bands {
 fn bound() -> Bound {
     Bound {
         centre: [0; 3],
-        radius: planet_gen::planet::MAX_RADIUS,
+        radius: world().planet.max_radius(),
     }
 }
 
@@ -314,7 +314,9 @@ fn walking_at_5_m_per_s_while_the_loader_keeps_up_a_little_at_a_time_leaves_no_h
         }
     }
     assert!(checks == 12 && hits > 1000, "{checks} checks, {hits} hits");
-    assert!(compared > 400, "{compared} rays compared with the Planet");
+    // (381 of the 480 frames' 12 checks on the 40 km Planet's ground, which has its detail: fewer
+    // of the rays meet the ground than on the smooth one.)
+    assert!(compared > 300, "{compared} rays compared with the Planet");
     // The loader is slow enough that some of the rays are on a stand-in, and fast enough that
     // not all of them are.
     assert!(coarser > 0 && coarser < hits, "{coarser} of {hits}");
@@ -463,5 +465,6 @@ fn flying_at_20_m_per_s_leaves_no_hole_in_the_ground_ahead_of_the_camera() {
             checked += not_deeper_than_the_planet(&scene, &rays, &format!("frame {frame}"));
         }
     }
-    assert!(checked > 1500, "{checked} rays compared with the Planet");
+    // (1 376 on the 40 km Planet, whose ground is rougher than the smooth one it had.)
+    assert!(checked > 1000, "{checked} rays compared with the Planet");
 }

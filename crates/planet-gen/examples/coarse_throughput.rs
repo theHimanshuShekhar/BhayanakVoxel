@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use brick_store::{BRICK_SIZE, BrickCoord};
 use planet_gen::planet::Planet;
-use planet_gen::world_map::{PEAK, WORLD_RADIUS, WorldMap};
+use planet_gen::world_map::WorldMap;
 
 /// The coarsest level worth generating: one Voxel there is wider than the Planet.
 const TOP: usize = 19;
@@ -38,7 +38,7 @@ fn main() {
     for level in (lowest..=TOP).rev() {
         // Bricks from -extent to extent - 1 along each axis hold every Voxel within the Planet.
         let width = i64::from(BRICK_SIZE) << level;
-        let extent = i32::try_from((i64::from(WORLD_RADIUS + PEAK) + width - 1) / width).unwrap();
+        let extent = i32::try_from((i64::from(planet.max_radius()) + width - 1) / width).unwrap();
         let (not_air, mixed) = (AtomicU64::new(0), AtomicU64::new(0));
         let next_x = AtomicI32::new(-extent);
         let started = Instant::now();

@@ -13,9 +13,9 @@ use std::time::Instant;
 
 use brick_store::{BrickCoord, children_with_solid};
 use planet_gen::planet::{Planet, PlanetSource};
-use planet_gen::world_map::{WORLD_RADIUS, WorldMap};
+use planet_gen::world_map::WorldMap;
 use prefetch_sim::demand::{Point, traverse};
-use prefetch_sim::model::{EYE, Model, scale, unit};
+use prefetch_sim::model::{EYE, Model, SIM_RADIUS, scale, unit};
 
 const SAMPLE: usize = 1500;
 
@@ -54,13 +54,15 @@ fn main() {
         let jobs: Vec<BrickCoord> = picks[level]
             .iter()
             .map(|coord| {
-                // The model's Planet is a smooth sphere at sea level: move the brick radially to
-                // the real ground there, so that the jobs are over ground and not open sea.
+                // The model's Planet is a smooth sphere of 16 km at sea level: move the brick
+                // radially to the real Planet's ground there (320 km, `GENERATOR_VERSION` 5: the
+                // ground the detail is on too), so that the jobs are over ground and not open
+                // sea.
                 let size = (8u64 << level) as f64;
                 let centre = coord.0.map(|c| (f64::from(c) + 0.5) * size);
                 let r = centre.iter().map(|c| c * c).sum::<f64>().sqrt();
                 let direction = centre.map(|c| c / r);
-                let ground = f64::from(WORLD_RADIUS) + planet.map().elevation_at(direction);
+                let ground = planet.sea_radius() + planet.ground_height(direction);
                 BrickCoord(direction.map(|d| (d * ground / size).floor() as i32)).parent()
             })
             .collect();
@@ -91,16 +93,25 @@ fn main() {
 fn contiguous(planet: &Planet, source: &PlanetSource) {
     let spawn = planet.spawn(100);
     let radius = spawn.iter().map(|c| c * c).sum::<f64>().sqrt();
-    let mut model = Model::real();
-    model.planet_radius = radius - EYE;
+    // The model's sphere is 16 km, so its keys fit: the jobs are found over it, at the spawn's
+    // direction, and moved as a whole, a level's bricks by the same number of bricks, to the
+    // spawn's ground (the ground is flat to 14 Voxels in 150 m, which is under two bricks).
+    let model = Model::real();
+    let up = unit(spawn);
     let point = Point {
-        pos: spawn,
+        pos: scale(up, f64::from(SIM_RADIUS) + EYE),
         reach: 1500.0,
     };
+    let shift = std::array::from_fn::<f64, 3, _>(|a| spawn[a] - point.pos[a]);
+    let _ = radius;
     let mut jobs = Vec::new();
     traverse(&model, &[point], |level, coord, _| {
         if level < 8 {
-            jobs.push((level + 1, coord.parent()));
+            let size = (8u64 << (level + 1)) as f64;
+            let moved = BrickCoord(std::array::from_fn(|a| {
+                coord.parent().0[a] + (shift[a] / size).round() as i32
+            }));
+            jobs.push((level + 1, moved));
         }
     });
     jobs.sort();

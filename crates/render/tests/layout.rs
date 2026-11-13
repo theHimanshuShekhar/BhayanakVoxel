@@ -34,7 +34,7 @@ struct World {
 fn world() -> &'static World {
     static WORLD: OnceLock<World> = OnceLock::new();
     WORLD.get_or_init(|| {
-        let planet = Planet::new(WorldMap::generate(SEED, 512));
+        let planet = Planet::new(WorldMap::for_tests(SEED));
         let ground = planet.spawn(100);
         World { planet, ground }
     })
@@ -146,7 +146,7 @@ fn flown(steps: usize, step: f64) -> Flight {
     };
     let bound = Bound {
         centre: [0; 3],
-        radius: planet_gen::planet::MAX_RADIUS,
+        radius: world().planet.max_radius(),
     };
     let scene = Scene::rings(&store, at(0.0, 0.0), Bands::with_d0(D0), bound).unwrap();
     let mut flight = Flight::new(store, scene);

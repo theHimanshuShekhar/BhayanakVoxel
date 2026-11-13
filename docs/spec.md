@@ -111,7 +111,7 @@ Every Milestone is **done** only when all of the following hold:
 2. #180, a stepped mode for the client's tests: the scene thread and the loader are driven a step at a time on one thread, so the tests that gate do not depend on the clock.
 3. The streaming bench, in two parts (with #64's measurement part): #181, the streaming mode on the test Planet in CI with residency and soft-miss counts and the measured sizing constants; then #162, the full-size run in real time on the 4090 with its four gates.
 4. #145 uploads: per-buffer growth and a per-frame budget, before the buffers grow.
-5. #166 the 320 km generator, then the look-dev flythrough (#148) on it.
+5. #166 the 320 km generator (#166: radius and seed are a value passed to the generator, the world map is 2048² a face, the ground has its detail added at generation, caves are made on demand per cube, the Spawn is seeded; measured in `measurements.md`), then the look-dev flythrough (#148) on it.
 6. #167 the renderer's levels, Guard and sizes, #146 the horizon cap, then #168 speed-scaled LOD and the 20 m spawn. #166 and #168 measure the sizing constants again.
 7. **A playtest on the 4090**: walk, fly, orbit and edit at 320 km. What it finds becomes tickets before saves start.
 8. #182, the wire codec (every message encoded, with a protocol version, the Planet's id in an Edit, golden bytes, and seeded delay, loss and reordering on the loopback), then #183, a throwaway prototype that recovers a Piece's frame from its stamped Voxels. The prototype's result decides whether a stamped Piece also keeps a record, before saves are designed.

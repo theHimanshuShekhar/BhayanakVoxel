@@ -13,7 +13,7 @@ use std::path::Path;
 
 use brick_store::{BrickCoord, BrickStore, VOXELS_PER_METRE, VoxelCoord, children_from};
 use planet_gen::planet::{Planet, tangents};
-use planet_gen::world_map::{WORLD_RADIUS, WorldMap};
+use planet_gen::world_map::{TEST_MAP_SIZE, TEST_RADIUS, WorldMap};
 use render::lod::{Bands, brick_distance};
 use render::{Mode, Offscreen, Resolution, Scene};
 
@@ -23,7 +23,7 @@ use super::report::CaveStill;
 use super::{Flight, ModePlan, draw, pass_stats, run_mode, write_png};
 
 /// Texels along a face of the world map the stills use.
-const MAP_SIZE: u32 = 512;
+const MAP_SIZE: u32 = TEST_MAP_SIZE;
 /// Voxels round the cave that the level 0 ring holds: 30 m.
 const RING: i32 = (30.0 * VOXELS_PER_METRE) as i32;
 /// Where the Guard begins: two levels above the real Guard's, so that the stills are made in
@@ -64,11 +64,8 @@ pub struct Site {
 fn slope(planet: &Planet, point: [f64; 3]) -> f64 {
     let (ahead, aside) = tangents(unit(point));
     let rise = |way: [f64; 3]| {
-        let at = |side: f64| {
-            planet
-                .map()
-                .elevation_at(std::array::from_fn(|a| point[a] + way[a] * side))
-        };
+        let at =
+            |side: f64| planet.ground_height(std::array::from_fn(|a| point[a] + way[a] * side));
         (at(3.0 * VOXELS_PER_METRE) - at(-3.0 * VOXELS_PER_METRE)).abs()
     };
     rise(ahead).max(rise(aside)) / (6.0 * VOXELS_PER_METRE)
@@ -91,7 +88,7 @@ fn air_under_the_ground(planet: &Planet, point: [f64; 3]) -> Vec<[f64; 3]> {
                         + up[a] * f64::from(k - 1) * step
                 });
                 let voxel = at.map(f64::round);
-                let ground = f64::from(WORLD_RADIUS) + planet.map().elevation_at(voxel);
+                let ground = planet.sea_radius() + planet.ground_height(voxel);
                 if planet.voxel(VoxelCoord(voxel.map(|c| c as i32))).is_none()
                     && length(voxel) < ground - 0.4 * VOXELS_PER_METRE
                 {
@@ -108,8 +105,12 @@ fn air_under_the_ground(planet: &Planet, point: [f64; 3]) -> Vec<[f64; 3]> {
 /// (the cave goes into the hill), 9 m off and 2 m up, looking at the mouth; the one inside is in
 /// the air nearest the middle of the cave, looking away from the mouth, down the tunnel.
 pub fn find_site(planet: &Planet) -> Site {
+    // Within 5 km of the Spawn: the caves are made as they are asked for (a few milliseconds a
+    // kilometre of ground), and the test Planet is 40 km across its radius.
+    let spawn = planet.spawn(100);
+    let reach = 100_000.0;
     let mut mouths: Vec<([f64; 3], f64)> = planet
-        .cave_mouths()
+        .cave_mouths(spawn.map(|c| c - reach), spawn.map(|c| c + reach))
         .into_iter()
         .map(|m| (m, slope(planet, m)))
         .collect();
@@ -140,7 +141,7 @@ pub fn find_site(planet: &Planet) -> Site {
         unit(level)
     };
     let outside: [f64; 3] = std::array::from_fn(|a| mouth[a] - inward[a] * 9.0 * VOXELS_PER_METRE);
-    let ground = f64::from(WORLD_RADIUS) + planet.map().elevation_at(outside);
+    let ground = planet.sea_radius() + planet.ground_height(outside);
     let eye = unit(outside).map(|c| c * (ground + 2.0 * VOXELS_PER_METRE));
     Site {
         mouth,
@@ -165,7 +166,7 @@ pub fn find_site(planet: &Planet) -> Site {
 
 /// Loads what `scene` asks for, nearest `position` first, until it asks for nothing: what the
 /// client's loader does, with this thread.
-fn fill(
+pub(super) fn fill(
     scene: &mut Scene,
     store: &mut BrickStore,
     position: [f64; 3],
@@ -225,12 +226,7 @@ pub fn run(
                 scene.recentre(&store, still.key.position)?;
                 scene
             }
-            None => crate::planet_scene(
-                &store,
-                still.key.position,
-                bands,
-                planet_gen::planet::MAX_RADIUS,
-            )?,
+            None => crate::planet_scene(&store, still.key.position, bands, planet.max_radius())?,
         };
         fill(&mut current, &mut store, still.key.position)?;
         let mut gpu = Offscreen::with_resolution(resolution, &current)?;
@@ -291,7 +287,7 @@ pub fn run(
 
 /// The Planet and cave that the stills of a run are of.
 pub fn site() -> (Planet, Site) {
-    let planet = Planet::new(WorldMap::generate(crate::SEED, MAP_SIZE));
+    let planet = Planet::new(WorldMap::with_radius(crate::SEED, MAP_SIZE, TEST_RADIUS));
     let site = find_site(&planet);
     (planet, site)
 }
@@ -325,7 +321,7 @@ mod tests {
             );
         }
         // The camera at the mouth is above ground, the other under it, near the mouth.
-        let ground = |p: [f64; 3]| f64::from(WORLD_RADIUS) + planet.map().elevation_at(p);
+        let ground = |p: [f64; 3]| planet.sea_radius() + planet.ground_height(p);
         let [mouth, tunnel] = &site.stills;
         assert!(length(mouth.key.position) > ground(mouth.key.position));
         assert!(length(tunnel.key.position) < ground(tunnel.key.position) - 0.4 * VOXELS_PER_METRE);
