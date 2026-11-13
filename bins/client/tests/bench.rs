@@ -68,7 +68,7 @@ fn check_entry(entry: &Value) {
 const GOLDEN_COUNTS: &str = include_str!("../src/bench/streaming-counts.golden");
 
 fn check_schema(report: &Value, out: &Path) {
-    assert_eq!(report["schema_version"], 10);
+    assert_eq!(report["schema_version"], 15);
     // The Edit stress is of the whole Planet, which the patch is not.
     assert!(report["edits"].is_null());
     // The streaming mode is asked for (see its own test); the other tests do not. The real-time
@@ -338,7 +338,10 @@ fn check_streaming(streaming: &Value) {
     let upload = &streaming["upload"];
     series(&upload["bytes"]);
     assert!(upload["bytes"]["total"].as_u64().unwrap() > 0);
-    assert!(upload["patch_bytes"].is_u64() && upload["rebuilds"].as_u64().unwrap() >= 1);
+    // A buffer that fills grows alone (#145): no update is a repack of the scene, and the stepped
+    // bench's walk and Edit make none of the others (a jump, other bands) either.
+    assert!(upload["patch_bytes"].is_u64());
+    assert_eq!(upload["rebuilds"], 0, "{upload}");
     for phase in ["fill", "steady", "moving"] {
         let misses = &streaming["soft_misses"][phase];
         series(&misses["bricks"]);
@@ -428,11 +431,19 @@ fn check_streaming(streaming: &Value) {
     // A brick drawn has one reference: the words are of the scene the bricks are of.
     assert_eq!(measured["ring_refs_words"], measured["ring_bricks"]);
     assert_eq!(measured["guard_refs_words"], measured["guard_bricks"]);
-    // What the GPU wrote is what the CPU worked out that it would: the count that the Linux and
-    // Windows runners compare is made without a GPU, and this is what ties it to one.
+    // Two counts of what an update writes: the tracer's, made where it writes to the staging belt
+    // (the header and each copy, the words between joined ranges included), and the one worked out
+    // from the patch before it is written (`upload_cost`, what the Linux and Windows runners
+    // compare, made without a GPU). Both go over `RingPatch::copies()` and use the same header
+    // size, so that they agree shows that the tracer writes each listed range and the header once
+    // and that `cost()` adds them up as written, not that `copies()` is right (the stepped tests'
+    // `GpuCopy::assert_is` checks that). The copies of a growth, old buffer to new, are counted
+    // apart and are in neither.
     let timing = &streaming["timing"];
     assert_eq!(timing["deterministic"], false);
     assert_eq!(timing["gpu_uploaded_bytes"], upload["bytes"]["total"]);
+    assert_eq!(timing["gpu_uploaded_writes"], upload["writes"]["total"]);
+    assert!(timing["gpu_grown_bytes"].is_u64());
     check_stats(&timing["upload_ms"]);
     check_stats(&timing["draw_ms"]);
     assert!(timing["drawn_frames"].as_u64().unwrap() > 0);

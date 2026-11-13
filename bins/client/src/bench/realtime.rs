@@ -45,7 +45,7 @@ use net::{ServerEnd, loopback};
 use planet_gen::planet::tangents;
 use planet_gen::world_map::{WORLD_MAP_SIZE, WorldMap};
 use render::reference::{Ray, trace};
-use render::{Camera, GpuPasses, Offscreen, Resolution, Scene, SceneUpdate, camera};
+use render::{Camera, GpuPasses, Offscreen, Rebuild, Resolution, Scene, SceneUpdate, camera};
 use serde::Serialize;
 use serde_json::Value;
 use sim::Predictor;
@@ -53,11 +53,11 @@ use sim::Predictor;
 use super::budget::{EXIT_OVER_BUDGET, StreamingBudgets};
 use super::process;
 use super::stream::{
-    Constants, Series, Sizing, Start, TestPlanet, measure_sizes, over_the_ground, test_planet,
-    within_reach,
+    Constants, Series, Sizing, Start, TestPlanet, measure_sizes, over_the_ground, percentile_99,
+    test_planet, within_reach,
 };
 use crate::loader::{Loader, workers_for};
-use crate::scene_worker::{Done, Spent};
+use crate::scene_worker::{Done, Spent, UPLOAD_BUDGET};
 use crate::tool::Tool;
 use crate::world::World;
 
@@ -129,16 +129,29 @@ pub trait Gpu {
         scene: &Scene,
         update: Option<&SceneUpdate>,
     ) -> Result<GpuFrame, Box<dyn Error>>;
+
+    /// The most bytes of GPU memory the scene's buffers have taken at once while a buffer grew
+    /// (the old buffer and the new one both counted: `Tracer::peak_growth_bytes`), and while a
+    /// rebuilt scene was made (`Tracer::peak_rebuild_bytes`), in all the updates so far. 0 with no
+    /// GPU, and 0 for what has not happened.
+    fn peak_growth_bytes(&self) -> u64 {
+        0
+    }
+
+    fn peak_rebuild_bytes(&self) -> u64 {
+        0
+    }
 }
 
 /// What a frame's copy to the GPU and draw took, by part.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct GpuFrame {
-    /// Queuing the update's writes (`write_buffer`), or for a rebuild making the new buffers.
+    /// Queuing the update's copies to the staging belt (and the new buffers of one that grew), or
+    /// for a rebuild making the new buffers.
     pub write: Duration,
     /// The submit that sends them.
     pub flush: Duration,
-    /// Calls of `write_buffer`: each is a copy on the GPU with a barrier of its own.
+    /// Copies written to the belt: each is a copy on the GPU with a barrier of its own.
     pub writes: u32,
     /// Encoding the draw, and submitting it.
     pub encode: Duration,
@@ -149,6 +162,11 @@ pub struct GpuFrame {
     /// The GPU's own time for this frame's passes, from its timestamps. None where the device has
     /// no timers, or this frame's own times did not come in: never an earlier frame's.
     pub passes: Option<GpuPasses>,
+    /// What making the buffers that grew in this frame's update took on the host (new buffers and
+    /// the copies into them, recorded; it is inside `write`), and the bytes of the old buffers
+    /// that were copied. Zero if no buffer grew.
+    pub grow: Duration,
+    pub grown_bytes: u64,
 }
 
 impl GpuFrame {
@@ -175,6 +193,8 @@ impl Gpu for OffscreenGpu<'_> {
             frame.write = times.write;
             frame.flush = times.flush;
             frame.writes = times.writes;
+            frame.grow = self.0.last_grow_time();
+            frame.grown_bytes = self.0.last_grown_bytes();
         }
         self.0.draw_upscaled_timed(camera);
         let drawn = self.0.last_draw_times();
@@ -183,6 +203,14 @@ impl Gpu for OffscreenGpu<'_> {
         frame.wait = drawn.wait;
         frame.passes = drawn.gpu;
         Ok(frame)
+    }
+
+    fn peak_growth_bytes(&self) -> u64 {
+        self.0.peak_growth_bytes()
+    }
+
+    fn peak_rebuild_bytes(&self) -> u64 {
+        self.0.peak_rebuild_bytes()
     }
 }
 
@@ -227,6 +255,106 @@ impl Spread {
             worst_ms: sorted[sorted.len() - 1],
         }
     }
+}
+
+/// What the uploads of a path's frames came to (#145): the frames that had an update, what each cost
+/// on the CPU, the bytes and the copies of each, and how often and for how long the scene thread
+/// held work back for the upload budget (`scene_worker::UPLOAD_BUDGET`). The gate on frame time is
+/// the one this is for; nothing here is gated.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize)]
+pub struct PathUpload {
+    /// Frames of the path that had an update.
+    pub updates: usize,
+    /// The CPU's time of the update's copy to the GPU (the copies made and sent), over those frames.
+    pub time: Spread,
+    /// The bytes and the copies (each a barrier of its own) of those frames: the 99th percentile
+    /// (nearest rank) and the largest. A rebuild makes new buffers and has no copies.
+    pub bytes_p99: u64,
+    pub bytes_max: u64,
+    pub writes_p99: u64,
+    pub writes_max: u64,
+    /// Frames in which the scene thread held work back for the budget, so that the frame's upload
+    /// was cut.
+    pub cut_frames: usize,
+    /// The longest run of frames in a row that did, in frames and in milliseconds: how long the
+    /// longest backlog lasted.
+    pub longest_backlog_frames: usize,
+    pub longest_backlog_ms: f64,
+    /// The frames whose upload was **over the plain budget** (more than `UPLOAD_BUDGET`'s bytes or
+    /// more than its copies), by cause. A frame can take up to the budget plus the operation that
+    /// took what waits to it plus the round's first batch of arrivals plus the gap words, and some
+    /// work is not budgeted at all (see [`OverBudget`]).
+    pub over_budget: OverBudget,
+    /// Frames in which a buffer of the scene grew, the bytes of the old buffers those growths
+    /// copied on the GPU, and the most that one frame spent on the host making a longer buffer: the
+    /// frame thread's own copy (`lengthen_ms_max`, inside the recentre) and the GPU buffers and
+    /// their copies (`grow_ms_max`, inside the update's write). The slowest frames carry the same
+    /// per frame.
+    pub growth_frames: usize,
+    pub grown_bytes: u64,
+    pub lengthen_ms_max: f64,
+    pub grow_ms_max: f64,
+}
+
+/// The frames of a path whose upload was over the plain budget, and why. A frame is counted under
+/// one cause, the first that applies, in this order: a **jump** or **bands** (the scene packed
+/// again and uploaded whole), an **edit** (the frame took the newest Edit: Edits and their coarse
+/// remakes are not budgeted), a **growth** (a buffer was made longer: the copy of its old words is
+/// not budgeted and is not in the bytes), or else an **operation** (the operation that took what
+/// waits to the budget, the round's first batch of arrivals that is taken after it, and the gap
+/// words of joined ranges). Only a frame whose bytes or copies are over the budget is counted
+/// (a rebuild of less is not), under exactly one cause, so the causes add up to `frames`. What
+/// is counted is the update's bytes and copies, not a frame time.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize)]
+pub struct OverBudget {
+    pub frames: usize,
+    pub operation: usize,
+    pub edit: usize,
+    pub jump: usize,
+    pub bands: usize,
+    pub growth: usize,
+}
+
+impl OverBudget {
+    fn add(&mut self, cause: Option<&str>) {
+        let Some(cause) = cause else { return };
+        self.frames += 1;
+        match cause {
+            "jump" => self.jump += 1,
+            "bands" => self.bands += 1,
+            "edit" => self.edit += 1,
+            "growth" => self.growth += 1,
+            _ => self.operation += 1,
+        }
+    }
+}
+
+/// Why a frame's upload was over the plain budget (see [`OverBudget`]), if it was.
+fn over_budget_cause(
+    update: &str,
+    bytes: u64,
+    writes: u32,
+    rebuilt: Option<Rebuild>,
+    took_edit: bool,
+    grown: bool,
+) -> Option<&'static str> {
+    let budget = UPLOAD_BUDGET;
+    if bytes <= budget.bytes && u64::from(writes) <= u64::from(budget.writes) {
+        return None;
+    }
+    Some(if update == "rebuild" {
+        // (None is not expected for a rebuild: it is counted as a jump.)
+        match rebuilt {
+            Some(Rebuild::Bands) => "bands",
+            _ => "jump",
+        }
+    } else if took_edit {
+        "edit"
+    } else if grown {
+        "growth"
+    } else {
+        "operation"
+    })
 }
 
 /// How long the scene thread spent on each part of its rounds, in milliseconds, over a path or a
@@ -306,15 +434,15 @@ pub struct SlowFrame {
     pub update_ms: f64,
     pub update_write_ms: f64,
     pub update_flush_ms: f64,
-    /// Calls of `write_buffer` (each a copy on the GPU with a barrier of its own).
+    /// Copies written to the staging belt (each a copy on the GPU with a barrier of its own).
     pub writes: u32,
     /// Encoding the draw (the passes, the timer queries' resolving, and finishing the command
     /// buffer), and `Queue::submit`.
     pub encode_ms: f64,
     pub submit_ms: f64,
     /// Waiting for the GPU: after the CPU's clock has stopped. It holds the readback of the pass
-    /// times, the device poll and what wgpu frees inside it (a staging buffer for each
-    /// `write_buffer`) as well as the GPU's work.
+    /// times, the device poll and what wgpu frees inside it (the belt's chunks that were used) as
+    /// well as the GPU's work.
     pub wait_ms: f64,
     /// What the GPU says its passes of **this frame** took, from the timestamps the passes wrote
     /// (the device's clock, not wall time): the primary pass, the upscale pass, and from the start
@@ -339,6 +467,16 @@ pub struct SlowFrame {
     pub update: &'static str,
     pub upload_bytes: u64,
     pub patch_bytes: u64,
+    /// What making a buffer longer cost in this frame, in milliseconds, in the two places it is
+    /// paid, and the bytes of the old buffers copied on the GPU: the frame thread's own copy of the
+    /// scene (inside `recentre_ms`; its `Vec` is lengthened and filled with zeros), and the GPU's
+    /// new buffers and their copies (inside `update_write_ms`). All zero if no buffer grew.
+    pub lengthen_ms: f64,
+    pub grow_ms: f64,
+    pub grown_bytes: u64,
+    /// Why this frame's upload was over the plain budget (`jump`, `bands`, `edit`, `growth` or
+    /// `operation`, see [`OverBudget`]); null if it was not.
+    pub over_budget: Option<&'static str>,
     /// Whether a look for holes **overlapped** the frame: the scene thread was in one at the start
     /// or at the end of it (from before it takes the store's read lock to after it lets go). That
     /// is not that it blocked the frame, and a look that began after the frame's start and was done
@@ -365,32 +503,50 @@ impl UpdateKinds {
 }
 
 /// The slowest frames of a path, in a list of fixed size: no allocation while the frames come.
-struct Worst([Option<SlowFrame>; SLOWEST]);
+struct Worst {
+    frames: [Option<SlowFrame>; SLOWEST],
+    /// What the list is of the most of.
+    key: fn(&SlowFrame) -> f64,
+}
 
 impl Worst {
+    /// The slowest frames.
     fn new() -> Self {
-        Self([None; SLOWEST])
+        Self::by(|f| f.time_ms)
+    }
+
+    /// The frames with the most of `key`.
+    fn by(key: fn(&SlowFrame) -> f64) -> Self {
+        Self {
+            frames: [None; SLOWEST],
+            key,
+        }
     }
 
     fn offer(&mut self, frame: SlowFrame) {
-        let time = |slot: &Option<SlowFrame>| slot.map_or(f64::NEG_INFINITY, |f| f.time_ms);
+        let key = self.key;
+        let value = |slot: &Option<SlowFrame>| slot.as_ref().map_or(f64::NEG_INFINITY, key);
         let least = self
-            .0
+            .frames
             .iter_mut()
-            .min_by(|a, b| time(a).total_cmp(&time(b)))
+            .min_by(|a, b| value(a).total_cmp(&value(b)))
             .expect("the list has room");
-        if frame.time_ms > time(least) {
+        if key(&frame) > value(least) {
             *least = Some(frame);
         }
     }
 
-    /// The slowest first.
+    /// The most first.
     fn sorted(&self) -> Vec<SlowFrame> {
-        let mut frames: Vec<SlowFrame> = self.0.iter().flatten().copied().collect();
-        frames.sort_by(|a, b| b.time_ms.total_cmp(&a.time_ms));
+        let key = self.key;
+        let mut frames: Vec<SlowFrame> = self.frames.iter().flatten().copied().collect();
+        frames.sort_by(|a, b| key(b).total_cmp(&key(a)));
         frames
     }
 }
+
+/// How many indexes of frames over the limit a path keeps.
+const OVER_LIMIT_INDEXES: usize = 200;
 
 /// How long the camera stood after a flight before the scene had no soft misses.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize)]
@@ -418,6 +574,27 @@ pub struct PathReport {
     /// Those frames by what their update was: none, a patch or a rebuild.
     pub frames_over_limit_by_update: UpdateKinds,
     pub slowest: Vec<SlowFrame>,
+    /// The places in the path (from 0) of the first frames over the limit, so that where the slow
+    /// frames are can be read against where the largest updates are (`largest_updates`): kept up
+    /// to a few hundred, `frames_over_limit` says how many there were.
+    pub over_limit_at: Vec<usize>,
+    /// The frames whose update copied the most bytes, the most first, in the same form as
+    /// `slowest`: with `index` and `at_ms` to read against the slow frames, and each one's time,
+    /// copies and wait.
+    pub largest_updates: Vec<SlowFrame>,
+    /// How far behind the camera the scene that was drawn was, at each frame of the path: the
+    /// distance between the frame thread's camera and the centre of the scene it draws (the one the
+    /// scene thread had published, and the frame thread taken), in Voxels and in `d0` (the
+    /// report's, so that it reads against the jump: 2 `d0`), the most and the 99th percentile. A
+    /// scene that is always walked to, never made again, falls behind without limit above the
+    /// speed it keeps up at; a path that ends with the camera standing ends with the lag the
+    /// scene has then (0 if it has caught up).
+    pub scene_lag_voxels_max: f64,
+    pub scene_lag_d0_max: f64,
+    pub scene_lag_voxels_p99: f64,
+    pub scene_lag_d0_p99: f64,
+    /// What the frames' uploads came to, and how often the budget cut them.
+    pub upload: PathUpload,
     /// Soft misses a frame reported (counted by the scene thread a few times a second, so a frame
     /// reports the last count).
     pub soft_misses: Series,
@@ -474,9 +651,22 @@ pub struct Memory {
     /// on what the GPU reserves.
     pub scene_used_peak_mib: f64,
     /// The scene's buffers as the GPU reserves them, used or not (`Scene::reserved_bytes`): this
-    /// is the VRAM the scene takes, and it is allocated whole, so it does not change over the run
-    /// (the most of the frames' is given). Reported; not gated.
+    /// is the VRAM the scene takes, after its growths (a buffer that fills grows, #145: the most
+    /// of the frames' is given). Reported; not gated.
     pub scene_reserved_mib: f64,
+    /// The peak **during a growth** (ADR 0004's accounting is of the buffers after it): the GPU's
+    /// buffers at the most while a buffer grew, the old buffer and the new one both counted
+    /// (`Tracer::peak_growth_bytes`: what the buffers held before, plus the new ones; 0 if none
+    /// grew); and the frame thread's copy of the scene at the most, its reserved bytes after a growth plus the old
+    /// words of the buffers that grew in that frame (a `Vec` that is lengthened may hold the old
+    /// allocation and the new at once, which is what the platform's allocator does when it cannot
+    /// extend in place: the upper bound; the scene thread's own copy, which grows the same way a
+    /// round earlier, is not in it). Reported; not gated, and `scene_used_peak_mib` stays the gate.
+    pub scene_gpu_peak_growth_mib: f64,
+    pub scene_host_peak_growth_mib: f64,
+    /// The GPU's peak while a **rebuilt** scene was made (the old scene's buffers and the new
+    /// ones: a jump or other bands), apart from the growths'. 0 if there was none.
+    pub scene_gpu_peak_rebuild_mib: f64,
     /// The store's size as its budget counts it, looked at every few frames, and the most it may
     /// hold before eviction starts.
     pub store_peak_bricks: u64,
@@ -682,6 +872,11 @@ impl RealTimeReport {
     }
 }
 
+/// The members that have no least and most over the runs, and are in the runs only: a list of the
+/// places of frames (`over_limit_at`) is a different list in each run, and the i-th place of one
+/// run is not comparable with the i-th of another.
+const NOT_IN_THE_ENVELOPE: &[&str] = &["over_limit_at"];
+
 /// Each number of `values`, which are of one shape, at its least and its most. Objects and arrays
 /// of one length are done member by member. A boolean is least when every run's is true and most
 /// when any is (false below true), so a flag that says "over" says it for the worst run. Anything
@@ -692,6 +887,9 @@ fn envelope(values: &[&Value]) -> (Value, Value) {
         Value::Object(fields) if values.iter().all(|v| v.is_object()) => {
             let (mut least, mut most) = (serde_json::Map::new(), serde_json::Map::new());
             for name in fields.keys() {
+                if NOT_IN_THE_ENVELOPE.contains(&name.as_str()) {
+                    continue;
+                }
                 let members: Option<Vec<&Value>> = values.iter().map(|v| v.get(name)).collect();
                 let (low, high) = members.map_or((Value::Null, Value::Null), |m| envelope(&m));
                 least.insert(name.clone(), low);
@@ -849,6 +1047,28 @@ fn build_test() -> Result<Built, Box<dyn Error>> {
     })
 }
 
+/// The largest of the `lags` (Voxels) and the 99th percentile, nearest rank; 0 for none.
+fn lag_spread(lags: &[f64]) -> (f64, f64) {
+    let mut sorted = lags.to_vec();
+    sorted.sort_by(f64::total_cmp);
+    let rank = (sorted.len() * 99).div_ceil(100);
+    (
+        sorted.last().copied().unwrap_or(0.0),
+        rank.checked_sub(1).map_or(0.0, |at| sorted[at]),
+    )
+}
+
+/// The frame thread's peak while a buffer grew: `peak`, or if `grown` bytes of old buffers were
+/// copied in this frame, the larger of it and what the copy reserves now (`reserved`) plus them.
+/// A frame with no growth is not a peak of one: 0 stays 0.
+fn host_growth_peak(peak: u64, reserved: u64, grown: u64) -> u64 {
+    if grown > 0 {
+        peak.max(reserved + grown)
+    } else {
+        peak
+    }
+}
+
 /// What one frame cost, and the soft misses it reported.
 struct Frame {
     /// When the frame started.
@@ -858,7 +1078,12 @@ struct Frame {
     /// The parts of the frame; its `index` and `at_ms` are set by the path that takes it in.
     parts: SlowFrame,
     soft_misses: usize,
-    /// Whether the look at the scene in this frame took in the newest Edit, and when it was done.
+    /// Whether the scene thread held work back in this frame for the upload budget.
+    throttled: bool,
+    /// The drawn scene's lag behind the camera in Voxels (see [`PathReport::scene_lag_voxels_max`]).
+    lag: f64,
+    /// Whether the look at the scene in this frame has the newest Edit in it (from this frame or an
+    /// earlier one), and when it was done.
     edit_taken: bool,
     taken_at: Instant,
 }
@@ -878,11 +1103,31 @@ struct Capture {
     frame_ms: Vec<f64>,
     cpu_ms: Vec<f64>,
     soft_misses: Series,
+    /// The update of each frame that had one: its time, bytes and copies.
+    update_ms: Vec<f64>,
+    update_bytes: Vec<u64>,
+    update_writes: Vec<u64>,
+    /// Frames cut by the budget, the run of them that is going on (when it began, and how many),
+    /// and the longest so far.
+    cut_frames: usize,
+    backlog: Option<(Instant, usize)>,
+    longest_backlog: (usize, f64),
     /// Frames over the limit, and the slowest few.
     limit_ms: f64,
     over_limit: usize,
     over_by_update: UpdateKinds,
+    over_budget: OverBudget,
+    growth_frames: usize,
+    grown_bytes: u64,
+    lengthen_ms_max: f64,
+    grow_ms_max: f64,
     worst: Worst,
+    /// The frames over the limit, by place, as far as the report keeps them.
+    over_limit_at: Vec<usize>,
+    /// The updates with the most bytes.
+    largest: Worst,
+    /// The lag of the drawn scene behind the camera at each frame, in Voxels.
+    lags: Vec<f64>,
 }
 
 impl Capture {
@@ -896,22 +1141,47 @@ impl Capture {
             limit_ms,
             over_limit: 0,
             over_by_update: UpdateKinds::default(),
+            over_budget: OverBudget::default(),
+            growth_frames: 0,
+            grown_bytes: 0,
+            lengthen_ms_max: 0.0,
+            grow_ms_max: 0.0,
             worst: Worst::new(),
+            over_limit_at: Vec::new(),
+            largest: Worst::by(|f| f.upload_bytes as f64),
+            lags: Vec::new(),
             spent: world.scene_thread_time(),
             scans: work.hole_scans,
             holes: work.holes_found,
             frame_ms: Vec::new(),
             cpu_ms: Vec::new(),
             soft_misses: Series::default(),
+            update_ms: Vec::new(),
+            update_bytes: Vec::new(),
+            update_writes: Vec::new(),
+            cut_frames: 0,
+            backlog: None,
+            longest_backlog: (0, 0.0),
         }
     }
 
     fn add(&mut self, frame: &Frame) {
         if frame.time_ms > self.limit_ms {
+            if self.over_limit_at.len() < OVER_LIMIT_INDEXES {
+                self.over_limit_at.push(self.frame_ms.len());
+            }
             self.over_limit += 1;
             self.over_by_update.add(frame.parts.update);
         }
-        self.worst.offer(SlowFrame {
+        self.lags.push(frame.lag);
+        self.over_budget.add(frame.parts.over_budget);
+        if frame.parts.grown_bytes > 0 {
+            self.growth_frames += 1;
+            self.grown_bytes += frame.parts.grown_bytes;
+        }
+        self.lengthen_ms_max = self.lengthen_ms_max.max(frame.parts.lengthen_ms);
+        self.grow_ms_max = self.grow_ms_max.max(frame.parts.grow_ms);
+        let slow = SlowFrame {
             index: self.frame_ms.len(),
             at_ms: frame
                 .began
@@ -919,10 +1189,30 @@ impl Capture {
                 .as_secs_f64()
                 * 1e3,
             ..frame.parts
-        });
+        };
+        self.worst.offer(slow);
+        if frame.parts.update != "none" {
+            self.largest.offer(slow);
+        }
         self.frame_ms.push(frame.time_ms);
         self.cpu_ms.push(frame.cpu_ms);
         self.soft_misses.add(frame.soft_misses as u64);
+        if frame.parts.update != "none" {
+            self.update_ms.push(frame.parts.update_ms);
+            self.update_bytes.push(frame.parts.upload_bytes);
+            self.update_writes.push(u64::from(frame.parts.writes));
+        }
+        if frame.throttled {
+            self.cut_frames += 1;
+            let (began, frames) = self.backlog.get_or_insert((frame.began, 0));
+            *frames += 1;
+            let ms = frame.began.duration_since(*began).as_secs_f64() * 1e3 + frame.time_ms;
+            if *frames > self.longest_backlog.0 {
+                self.longest_backlog = (*frames, ms);
+            }
+        } else {
+            self.backlog = None;
+        }
     }
 
     /// The path's frames are done: what the scene thread has spent so far is the frames', and the
@@ -939,6 +1229,8 @@ impl Capture {
         let frames = self.frame_ms.len();
         let per_frame = |count: u64| count as f64 / frames.max(1) as f64;
         let holes = work.holes_found - self.holes;
+        let d0 = world.stats().bands.map(|bands| bands.d0());
+        let (lag_max, lag_p99) = lag_spread(&self.lags);
         PathReport {
             name: self.name,
             frames,
@@ -950,6 +1242,28 @@ impl Capture {
             frames_over_limit: self.over_limit,
             frames_over_limit_by_update: self.over_by_update,
             slowest: self.worst.sorted(),
+            over_limit_at: self.over_limit_at,
+            largest_updates: self.largest.sorted(),
+            scene_lag_voxels_max: lag_max,
+            scene_lag_d0_max: d0.map_or(0.0, |d0| lag_max / d0),
+            scene_lag_voxels_p99: lag_p99,
+            scene_lag_d0_p99: d0.map_or(0.0, |d0| lag_p99 / d0),
+            upload: PathUpload {
+                updates: self.update_ms.len(),
+                time: Spread::of(&self.update_ms),
+                bytes_p99: percentile_99(&self.update_bytes),
+                bytes_max: self.update_bytes.iter().copied().max().unwrap_or(0),
+                writes_p99: percentile_99(&self.update_writes),
+                writes_max: self.update_writes.iter().copied().max().unwrap_or(0),
+                cut_frames: self.cut_frames,
+                longest_backlog_frames: self.longest_backlog.0,
+                longest_backlog_ms: self.longest_backlog.1,
+                over_budget: self.over_budget,
+                growth_frames: self.growth_frames,
+                grown_bytes: self.grown_bytes,
+                lengthen_ms_max: self.lengthen_ms_max,
+                grow_ms_max: self.grow_ms_max,
+            },
             soft_misses_per_frame: per_frame(self.soft_misses.total),
             soft_misses: self.soft_misses,
             hole_looks: work.hole_scans - self.scans,
@@ -1022,6 +1336,9 @@ struct Session<'a> {
     work_before: Done,
     scene_used_peak_bytes: u64,
     scene_reserved_bytes: u64,
+    /// The most the frame thread's copy of the scene reserved, with the old words of a buffer
+    /// that grew in that frame added (see [`Memory::scene_host_peak_growth_mib`]).
+    scene_host_peak_bytes: u64,
     resident_peak: Option<u64>,
     whole_process_peak: Option<u64>,
     store_peak: usize,
@@ -1059,6 +1376,7 @@ impl<'a> Session<'a> {
             work_before,
             scene_used_peak_bytes: 0,
             scene_reserved_bytes: 0,
+            scene_host_peak_bytes: 0,
             resident_peak: None,
             whole_process_peak: None,
             store_peak: 0,
@@ -1074,6 +1392,7 @@ impl<'a> Session<'a> {
         let camera_wait = std::mem::take(&mut self.camera_wait);
         let began = Instant::now();
         let looking = self.world.looking_for_holes();
+        let edit_before = self.world.edit_taken();
         let update = if lead {
             self.world.recentre(camera.position)?
         } else {
@@ -1081,6 +1400,8 @@ impl<'a> Session<'a> {
         };
         let taken_at = Instant::now();
         let edit_taken = self.world.edit_taken();
+        let took_edit = edit_taken && !edit_before;
+        let lengthened = self.world.take_lengthened();
         let followed = taken_at - began;
         let gpu = self
             .gpu
@@ -1090,6 +1411,19 @@ impl<'a> Session<'a> {
         self.look_at_memory();
         let after = began.elapsed() - time;
         let (kind, upload_bytes, patch_bytes) = uploaded(self.world.scene(), update.as_ref());
+        self.scene_host_peak_bytes = host_growth_peak(
+            self.scene_host_peak_bytes,
+            self.world.reserved_bytes(),
+            gpu.grown_bytes,
+        );
+        let over_budget = over_budget_cause(
+            kind,
+            upload_bytes,
+            gpu.writes,
+            self.world.scene().rebuild_reason(),
+            took_edit,
+            gpu.grown_bytes > 0,
+        );
         let ms = |d: Duration| d.as_secs_f64() * 1e3;
         let parts = SlowFrame {
             index: 0,
@@ -1117,6 +1451,10 @@ impl<'a> Session<'a> {
             update: kind,
             upload_bytes,
             patch_bytes,
+            lengthen_ms: ms(lengthened),
+            grow_ms: ms(gpu.grow),
+            grown_bytes: gpu.grown_bytes,
+            over_budget,
             hole_look: looking,
         };
         std::thread::sleep(FRAME.saturating_sub(began.elapsed()));
@@ -1126,6 +1464,8 @@ impl<'a> Session<'a> {
             cpu_ms: parts.cpu_ms,
             parts,
             soft_misses: self.world.stats().soft_misses,
+            throttled: self.world.stats().throttled,
+            lag: self.world.lag(camera.position),
             edit_taken,
             taken_at,
         })
@@ -1158,6 +1498,8 @@ impl<'a> Session<'a> {
         if let Some(update) = self.world.look_now(holes)? {
             self.gpu.frame(camera, self.world.scene(), Some(&update))?;
         }
+        // Not a frame of a path: what it took to lengthen the copy is not any frame's.
+        self.world.take_lengthened();
         Ok(())
     }
 
@@ -1427,6 +1769,9 @@ impl<'a> Session<'a> {
             whole_process_peak_mib: self.whole_process_peak.map(mib),
             scene_used_peak_mib: mib(self.scene_used_peak_bytes),
             scene_reserved_mib: mib(self.scene_reserved_bytes),
+            scene_gpu_peak_growth_mib: mib(self.gpu.peak_growth_bytes()),
+            scene_gpu_peak_rebuild_mib: mib(self.gpu.peak_rebuild_bytes()),
+            scene_host_peak_growth_mib: mib(self.scene_host_peak_bytes),
             store_peak_bricks: self.store_peak as u64,
             store_limit_bricks: setup.store_limit as u64,
         };
@@ -1526,6 +1871,8 @@ fn run_once(
     let d0 = built.setup.d0;
     let mut gpu = Offscreen::with_resolution(resolution, built.world.scene())
         .map_err(|e| failed("making the GPU context", e))?;
+    // A growth is cut to what a buffer of this GPU may hold (see `Scene::set_buffer_limit`).
+    built.world.set_buffer_limit(gpu.buffer_limit_words());
     let report = one_run(built, &mut OffscreenGpu(&mut gpu), script, limit_ms)
         .map_err(|stopped| failed(&stopped.step, stopped.error))?;
     Ok((report, d0))
@@ -1615,6 +1962,13 @@ mod tests {
             frames_over_limit: 0,
             frames_over_limit_by_update: UpdateKinds::default(),
             slowest: vec![slow_frame(0, frame_p99 * 2.0)],
+            over_limit_at: Vec::new(),
+            largest_updates: Vec::new(),
+            scene_lag_voxels_max: 0.0,
+            scene_lag_d0_max: 0.0,
+            scene_lag_voxels_p99: 0.0,
+            scene_lag_d0_p99: 0.0,
+            upload: PathUpload::default(),
             soft_misses: Series::default(),
             soft_misses_per_frame: 0.0,
             hole_looks: 2,
@@ -1652,6 +2006,10 @@ mod tests {
             update: "patch",
             upload_bytes: 4096,
             patch_bytes: 4000,
+            lengthen_ms: 0.0,
+            grow_ms: 0.0,
+            grown_bytes: 0,
+            over_budget: None,
             hole_look: false,
         }
     }
@@ -1703,6 +2061,9 @@ mod tests {
                 whole_process_peak_mib: Some(9000.0),
                 scene_used_peak_mib: 474.0,
                 scene_reserved_mib: 560.0,
+                scene_gpu_peak_growth_mib: 600.0,
+                scene_gpu_peak_rebuild_mib: 0.0,
+                scene_host_peak_growth_mib: 600.0,
                 store_peak_bricks: 20_000_000,
                 store_limit_bricks: 23_000_000,
             },
@@ -2015,6 +2376,9 @@ mod tests {
             keys(&json["runs"][0]["memory"]),
             [
                 "resident_peak_mib",
+                "scene_gpu_peak_growth_mib",
+                "scene_gpu_peak_rebuild_mib",
+                "scene_host_peak_growth_mib",
                 "scene_reserved_mib",
                 "scene_used_peak_mib",
                 "store_limit_bricks",
@@ -2034,13 +2398,39 @@ mod tests {
                 "hole_looks",
                 "holes",
                 "holes_per_frame",
+                "largest_updates",
                 "name",
+                "over_limit_at",
+                "scene_lag_d0_max",
+                "scene_lag_d0_p99",
+                "scene_lag_voxels_max",
+                "scene_lag_voxels_p99",
                 "scene_thread",
                 "seconds",
                 "settle",
                 "slowest",
                 "soft_misses",
-                "soft_misses_per_frame"
+                "soft_misses_per_frame",
+                "upload"
+            ]
+        );
+        assert_eq!(
+            keys(&json["runs"][0]["paths"][0]["upload"]),
+            [
+                "bytes_max",
+                "bytes_p99",
+                "cut_frames",
+                "grow_ms_max",
+                "grown_bytes",
+                "growth_frames",
+                "lengthen_ms_max",
+                "longest_backlog_frames",
+                "longest_backlog_ms",
+                "over_budget",
+                "time",
+                "updates",
+                "writes_max",
+                "writes_p99"
             ]
         );
         assert_eq!(
@@ -2054,9 +2444,13 @@ mod tests {
                 "gpu_primary_ms",
                 "gpu_total_ms",
                 "gpu_upscale_ms",
+                "grow_ms",
+                "grown_bytes",
                 "hole_look",
                 "index",
+                "lengthen_ms",
                 "other_ms",
+                "over_budget",
                 "patch_bytes",
                 "recentre_ms",
                 "submit_ms",
@@ -2074,6 +2468,10 @@ mod tests {
         assert_eq!(
             keys(&json["runs"][0]["paths"][0]["frames_over_limit_by_update"]),
             ["none", "patch", "rebuild"]
+        );
+        assert_eq!(
+            keys(&json["runs"][0]["paths"][0]["upload"]["over_budget"]),
+            ["bands", "edit", "frames", "growth", "jump", "operation"]
         );
         assert_eq!(
             keys(&json["runs"][0]["paths"][0]["scene_thread"]),
@@ -2145,6 +2543,36 @@ mod tests {
     }
 
     #[test]
+    fn the_list_of_largest_updates_keeps_the_five_with_the_most_bytes_largest_first() {
+        let mut largest = Worst::by(|f| f.upload_bytes as f64);
+        for (index, bytes) in [10u64, 900, 30, 7, 500, 20, 1200, 40]
+            .into_iter()
+            .enumerate()
+        {
+            largest.offer(SlowFrame {
+                upload_bytes: bytes,
+                ..slow_frame(index, 1.0)
+            });
+        }
+        let kept: Vec<(usize, u64)> = largest
+            .sorted()
+            .iter()
+            .map(|f| (f.index, f.upload_bytes))
+            .collect();
+        assert_eq!(kept, [(6, 1200), (1, 900), (4, 500), (7, 40), (2, 30)]);
+    }
+
+    #[test]
+    fn the_host_peak_of_a_growth_is_set_by_a_frame_that_grew_and_is_0_without_one() {
+        // No growth: the reserve is not a peak, whatever it is.
+        assert_eq!(host_growth_peak(0, 900, 0), 0);
+        assert_eq!(host_growth_peak(500, 900, 0), 500);
+        // A growth: the new reserve plus the old words copied, and it only rises.
+        assert_eq!(host_growth_peak(0, 900, 100), 1000);
+        assert_eq!(host_growth_peak(1200, 900, 100), 1200);
+    }
+
+    #[test]
     fn a_gpu_frames_cpu_part_is_all_but_the_wait() {
         let ms = Duration::from_millis;
         let frame = GpuFrame {
@@ -2155,9 +2583,66 @@ mod tests {
             submit: ms(8),
             wait: ms(100),
             passes: None,
+            grow: ms(50),
+            grown_bytes: 1 << 20,
         };
+        // The growth is inside the write: it is not another part of the CPU's time.
         assert_eq!(frame.cpu(), ms(15));
         assert_eq!(GpuFrame::default().cpu(), Duration::ZERO);
+    }
+
+    #[test]
+    fn a_frame_is_over_the_budget_only_by_its_bytes_or_copies_and_under_one_cause() {
+        let (bytes, writes) = (UPLOAD_BUDGET.bytes, UPLOAD_BUDGET.writes);
+        let cause = |update, bytes, writes, why, edit, grown| {
+            over_budget_cause(update, bytes, writes, why, edit, grown)
+        };
+        // Under the budget, whatever the update is: not counted (a small rebuild too).
+        assert_eq!(cause("patch", bytes, writes, None, true, true), None);
+        assert_eq!(
+            cause("rebuild", bytes - 1, 0, Some(Rebuild::Jump), false, false),
+            None
+        );
+        assert_eq!(cause("none", 0, 0, None, false, false), None);
+        // Over by bytes or by copies, the first cause that applies.
+        let over = (bytes + 1, writes);
+        assert_eq!(
+            cause("rebuild", over.0, 0, Some(Rebuild::Jump), true, true),
+            Some("jump")
+        );
+        assert_eq!(
+            cause("rebuild", over.0, 0, Some(Rebuild::Bands), true, true),
+            Some("bands")
+        );
+        assert_eq!(
+            cause("patch", over.0, over.1, None, true, true),
+            Some("edit")
+        );
+        assert_eq!(
+            cause("patch", over.0, over.1, None, false, true),
+            Some("growth")
+        );
+        assert_eq!(
+            cause("patch", 1, writes + 1, None, false, false),
+            Some("operation")
+        );
+        // The causes are exclusive and add up to the frames.
+        let mut counted = OverBudget::default();
+        for c in [
+            Some("jump"),
+            None,
+            Some("edit"),
+            Some("operation"),
+            Some("growth"),
+            Some("bands"),
+        ] {
+            counted.add(c);
+        }
+        assert_eq!(counted.frames, 5);
+        assert_eq!(
+            counted.operation + counted.edit + counted.jump + counted.bands + counted.growth,
+            counted.frames
+        );
     }
 
     #[test]
@@ -2272,6 +2757,76 @@ mod tests {
                 rebuild: 1
             }
         );
+    }
+
+    #[test]
+    fn the_places_of_the_frames_over_the_limit_are_in_each_run_and_not_in_the_min_and_max() {
+        use serde_json::json;
+        // Two runs with lists of the same length, which the envelope used to take place by place
+        // (the least and most of the i-th frame's index, which means nothing), and one more.
+        let report = RealTimeReport::new(
+            "test".into(),
+            64.0,
+            vec![
+                run_with(|r| r.paths[1].over_limit_at = vec![10, 50, 90]),
+                run_with(|r| r.paths[1].over_limit_at = vec![300, 310, 700]),
+            ],
+            &BUDGETS,
+        );
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(
+            json["runs"][0]["paths"][1]["over_limit_at"],
+            json!([10, 50, 90])
+        );
+        assert_eq!(
+            json["runs"][1]["paths"][1]["over_limit_at"],
+            json!([300, 310, 700])
+        );
+        for edge in ["min", "max"] {
+            let path = json[edge]["paths"][1].as_object().unwrap();
+            assert!(
+                !path.contains_key("over_limit_at"),
+                "{edge} has the places of one run's frames"
+            );
+            // The rest of the path is still in it.
+            assert!(path.contains_key("largest_updates") && path.contains_key("upload"));
+        }
+    }
+
+    #[test]
+    fn the_lag_of_a_path_is_its_largest_and_its_99th_percentile_by_nearest_rank() {
+        assert_eq!(lag_spread(&[]), (0.0, 0.0));
+        assert_eq!(lag_spread(&[7.0]), (7.0, 7.0));
+        // 200 frames: the 99th is the 198th smallest, and the largest is not it.
+        let lags: Vec<f64> = (0..200).rev().map(f64::from).collect();
+        assert_eq!(lag_spread(&lags), (199.0, 197.0));
+    }
+
+    #[test]
+    fn the_scene_lag_of_a_path_is_in_the_report_and_its_min_and_max_are_the_runs() {
+        let report = RealTimeReport::new(
+            "test".into(),
+            64.0,
+            vec![
+                run_with(|r| {
+                    r.paths[1].scene_lag_voxels_max = 640.0;
+                    r.paths[1].scene_lag_d0_max = 10.0;
+                    r.paths[1].scene_lag_voxels_p99 = 600.0;
+                }),
+                run_with(|r| {
+                    r.paths[1].scene_lag_voxels_max = 6400.0;
+                    r.paths[1].scene_lag_d0_max = 100.0;
+                    r.paths[1].scene_lag_voxels_p99 = 6000.0;
+                }),
+            ],
+            &BUDGETS,
+        );
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["min"]["paths"][1]["scene_lag_voxels_max"], 640.0);
+        assert_eq!(json["max"]["paths"][1]["scene_lag_voxels_max"], 6400.0);
+        assert_eq!(json["max"]["paths"][1]["scene_lag_d0_max"], 100.0);
+        assert_eq!(json["min"]["paths"][1]["scene_lag_voxels_p99"], 600.0);
+        assert_eq!(json["max"]["paths"][1]["scene_lag_voxels_p99"], 6000.0);
     }
 
     #[test]

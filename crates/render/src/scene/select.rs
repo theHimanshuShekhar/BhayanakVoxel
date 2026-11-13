@@ -100,6 +100,118 @@ struct Node {
     stamp: u64,
 }
 
+/// What looking at an entry that was due in the queue came to.
+#[cfg_attr(test, derive(Debug, PartialEq))]
+enum Due {
+    /// The node is gone, or has been queued again since: the entry is stale.
+    Stale,
+    /// The node changes now.
+    Changes,
+    /// It does not, and is due again when the camera has gone `slack` more.
+    Later {
+        split: bool,
+        margin: bool,
+        slack: f64,
+    },
+}
+
+/// Entries due at once from which looking at them is shared among threads: below this the threads
+/// cost more than they save (a thread is about 50 microseconds, and an entry about 0.2).
+#[cfg(not(test))]
+const PARALLEL_FROM: usize = 32_768;
+/// Under test, in the render library's own unit tests (`cargo test -p render --lib`), it is low
+/// enough for them to reach the threads, so that the thread-comparison test shows they change
+/// nothing. `cfg(test)` is not set for the client's stepped runs or for the tests in `render/tests`,
+/// which are built against the library without it and use the 32 768 above.
+#[cfg(test)]
+const PARALLEL_FROM: usize = 64;
+
+/// The most threads that look at due entries, and at most half of the machine's.
+const MOST_THREADS: usize = 4;
+
+/// Looks at each of the `due` entries (a stamp and a node): whether the node changes, or when it
+/// may. Each is looked at alone (the nodes are only read), so a long list is shared among threads,
+/// and the answers are in the order of the entries: what is done with them is the same whatever
+/// the threads, and the same on every run. At full size a call after the camera has moved some
+/// tens of Voxels has millions due, and looking at them was 80% of it (700 ms of 900 ms).
+fn look_at_due(
+    nodes: &HashMap<Key, Node>,
+    due: &[(u64, Key)],
+    camera: [f64; 3],
+    changes: &(impl Fn(Key, f64, bool, bool) -> bool + Sync),
+    slack: &(impl Fn(Key, f64, bool, bool) -> f64 + Sync),
+) -> Vec<Due> {
+    let threads = std::thread::available_parallelism()
+        .map_or(1, |n| n.get() / 2)
+        .clamp(1, MOST_THREADS);
+    look_at_due_by(
+        nodes,
+        due,
+        camera,
+        changes,
+        slack,
+        if due.len() < PARALLEL_FROM {
+            1
+        } else {
+            threads
+        },
+    )
+}
+
+/// [`look_at_due`] shared among `threads` (one: here and now).
+fn look_at_due_by(
+    nodes: &HashMap<Key, Node>,
+    due: &[(u64, Key)],
+    camera: [f64; 3],
+    changes: &(impl Fn(Key, f64, bool, bool) -> bool + Sync),
+    slack: &(impl Fn(Key, f64, bool, bool) -> f64 + Sync),
+    threads: usize,
+) -> Vec<Due> {
+    let look = |&(stamp, key): &(u64, Key)| {
+        // An entry for a node that has gone, or has been queued again since, is stale.
+        let Some(node) = nodes.get(&key) else {
+            return Due::Stale;
+        };
+        if node.stamp != stamp {
+            return Due::Stale;
+        }
+        let (split, margin) = (node.state == State::Split, node.margin);
+        let distance = brick_distance(camera, key.0, key.1);
+        if changes(key, distance, split, margin) {
+            Due::Changes
+        } else {
+            Due::Later {
+                split,
+                margin,
+                slack: slack(key, distance, split, margin),
+            }
+        }
+    };
+    map_shared(due, threads, &look)
+}
+
+/// `look` of each of `items`, in their order, shared among `threads` (one: here and now).
+fn map_shared<T: Sync, R: Send>(
+    items: &[T],
+    threads: usize,
+    look: &(impl Fn(&T) -> R + Sync),
+) -> Vec<R> {
+    if threads <= 1 {
+        return items.iter().map(look).collect();
+    }
+    let share = items.len().div_ceil(threads).max(1);
+    std::thread::scope(|scope| {
+        let parts: Vec<_> = items
+            .chunks(share)
+            .map(|part| scope.spawn(|| part.iter().map(look).collect::<Vec<_>>()))
+            .collect();
+        parts
+            .into_iter()
+            .flat_map(|part| part.join().expect("a thread that looks at due entries"))
+            .collect()
+    })
+}
+
 /// A node that is close enough to the edge of its hysteresis to be looked at every frame.
 #[derive(Clone, Copy, Debug)]
 struct Hot {
@@ -586,6 +698,14 @@ impl Selection {
 
     pub fn camera(&self) -> [f64; 3] {
         self.camera
+    }
+
+    /// The camera's path since the selection began, and that of the places it looks ahead to, in
+    /// Voxels: what the selection is made to look at again for (a node is looked at when the
+    /// camera has gone as far as it was away from changing), so the cost of following a camera is
+    /// in proportion to it.
+    pub fn travelled(&self) -> f64 {
+        self.travelled
     }
 
     /// The coarsest level that is looked at.
@@ -1364,26 +1484,16 @@ impl Selection {
         for (entry, slack) in cooled {
             self.watch(entry.key, entry.stamp, entry.split, entry.margin, slack);
         }
-        for (stamp, key) in popped {
-            // An entry for a node that has gone, or has been queued again since, is stale.
-            let Some(node) = self.nodes.get(&key) else {
-                continue;
-            };
-            if node.stamp != stamp {
-                continue;
-            }
-            let (split, margin) = (node.state == State::Split, node.margin);
-            let distance = brick_distance(camera, key.0, key.1);
-            if changes(key, distance, split, margin) {
-                changing.push((stamp, key));
-            } else {
-                self.watch(
-                    key,
-                    stamp,
+        let looked = look_at_due(&self.nodes, &popped, camera, &changes, &slack);
+        for ((stamp, key), looked) in popped.into_iter().zip(looked) {
+            match looked {
+                Due::Stale => {}
+                Due::Changes => changing.push((stamp, key)),
+                Due::Later {
                     split,
                     margin,
-                    slack(key, distance, split, margin),
-                );
+                    slack,
+                } => self.watch(key, stamp, split, margin, slack),
             }
         }
         for (stamp, key) in changing {
@@ -1470,6 +1580,64 @@ impl Selection {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn looking_at_more_entries_than_it_shares_among_threads_comes_to_what_one_thread_finds() {
+        use super::*;
+        // 5 000 nodes, whole and split, some stale, some missing; the camera moves them from
+        // changing to not, by distance.
+        let mut nodes = HashMap::default();
+        let mut due = Vec::new();
+        for n in 0..5000i32 {
+            let key: Key = (n as usize % 3, BrickCoord([n % 37, n % 11, n / 50]));
+            let node = Node {
+                state: if n % 4 == 0 {
+                    State::Split
+                } else {
+                    State::Whole
+                },
+                draws: true,
+                margin: n % 7 == 0,
+                stamp: u64::from(n as u32 % 5 + 1),
+            };
+            nodes.insert(key, node);
+            // A stamp that is the node's, or another (stale), and a key that is gone, in turn.
+            match n % 9 {
+                0 => due.push((node.stamp + 1, key)),
+                1 => due.push((node.stamp, (7, key.1))),
+                _ => due.push((node.stamp, key)),
+            }
+        }
+        assert!(due.len() > PARALLEL_FROM);
+        let camera = [100.0, 40.0, 3.0];
+        let changes = |key: Key, d: f64, split: bool, margin: bool| {
+            (d + key.0 as f64 + f64::from(u8::from(split)) * 3.0 + f64::from(u8::from(margin)))
+                % 5.0
+                < 1.0
+        };
+        let slack = |_: Key, d: f64, split: bool, _: bool| d * 0.25 + f64::from(u8::from(split));
+        let one = look_at_due_by(&nodes, &due, camera, &changes, &slack, 1);
+        assert!(one.iter().any(|d| matches!(d, Due::Stale)));
+        assert!(one.iter().any(|d| matches!(d, Due::Changes)));
+        assert!(one.iter().any(|d| matches!(d, Due::Later { .. })));
+        for threads in [2, 3, 4, 8] {
+            assert_eq!(
+                look_at_due_by(&nodes, &due, camera, &changes, &slack, threads),
+                one
+            );
+        }
+        assert_eq!(look_at_due(&nodes, &due, camera, &changes, &slack), one);
+    }
+
+    #[test]
+    fn what_threads_look_at_comes_back_in_the_order_of_the_entries_whatever_their_number() {
+        let items: Vec<u64> = (0..1000).collect();
+        let one = super::map_shared(&items, 1, &|n| n * n + 1);
+        for threads in [2, 3, 4, 7, 64, 5000] {
+            assert_eq!(super::map_shared(&items, threads, &|n| n * n + 1), one);
+        }
+        assert!(super::map_shared(&[] as &[u64], 4, &|n| *n).is_empty());
+    }
+
     use brick_store::{Interior, Material};
 
     use super::*;

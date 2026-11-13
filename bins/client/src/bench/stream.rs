@@ -26,9 +26,10 @@ use brick_store::{BrickStore, Budget, VOXELS_PER_METRE, VoxelCoord};
 use net::{ServerEnd, loopback};
 use planet_gen::planet::{Planet, tangents};
 use planet_gen::world_map::WorldMap;
+use render::UploadCost;
 use render::lod::{Bands, LEVELS, Margins};
 use render::scene::Bound;
-use render::tracer::upload_bytes;
+use render::tracer::upload_cost;
 use render::{Camera, Offscreen, Scene, SceneUpdate};
 use serde::Serialize;
 use sim::Predictor;
@@ -96,6 +97,9 @@ pub struct GpuSink<'a> {
     gpu: &'a mut Offscreen,
     draw_every: u32,
     uploaded_before: u64,
+    /// Copies and growth copies the tracer reported for each update, summed.
+    writes: u64,
+    grown_bytes: u64,
     upload_ms: Vec<f64>,
     draw_ms: Vec<f64>,
 }
@@ -106,6 +110,8 @@ impl<'a> GpuSink<'a> {
             uploaded_before: gpu.uploaded_bytes(),
             gpu,
             draw_every: draw_every.max(1),
+            writes: 0,
+            grown_bytes: 0,
             upload_ms: Vec::new(),
             draw_ms: Vec::new(),
         }
@@ -118,6 +124,8 @@ impl<'a> GpuSink<'a> {
             upload_ms: Stats::of(&self.upload_ms),
             draw_ms: Stats::of(&self.draw_ms),
             gpu_uploaded_bytes: self.gpu.uploaded_bytes() - self.uploaded_before,
+            gpu_uploaded_writes: self.writes,
+            gpu_grown_bytes: self.grown_bytes,
             drawn_frames: self.draw_ms.len(),
         }
     }
@@ -134,6 +142,8 @@ impl Sink for GpuSink<'_> {
         if let Some(update) = update {
             let began = Instant::now();
             self.gpu.update_scene(scene, update)?;
+            self.writes += u64::from(self.gpu.last_writes());
+            self.grown_bytes += self.gpu.last_grown_bytes();
             self.upload_ms.push(began.elapsed().as_secs_f64() * 1e3);
         }
         if index.is_multiple_of(self.draw_every) {
@@ -160,9 +170,14 @@ struct FrameCounts {
     /// Bytes the copy to the GPU writes (all of the buffers for a rebuild), and of them the bytes
     /// of the patch (none for a rebuild).
     upload_bytes: u64,
+    /// Copies the GPU makes for it (each a barrier of its own: see `render::RingPatch::cost`).
+    upload_writes: u64,
     patch_bytes: u64,
     rebuilt: bool,
     updated: bool,
+    /// The scene thread held work back in this frame for the upload budget (see
+    /// `scene_worker::UPLOAD_BUDGET`): the frame's upload was cut.
+    throttled: bool,
     soft_misses: [usize; LEVELS],
     holes: usize,
     /// The store's size as the budget counts it, the bricks drawn, those waiting, those generated.
@@ -275,10 +290,20 @@ pub struct Upload {
     /// Bytes the copies to the GPU write, a frame's, over the run, and of them the bytes of patches.
     pub bytes: Series,
     pub patch_bytes: u64,
+    /// The copies a frame made (a rebuild makes the buffers again and has none).
+    pub writes: Series,
+    /// The 99th percentile (nearest rank) of the bytes and of the copies of the frames that had an
+    /// update. The maximum is in the series.
+    pub bytes_p99: u64,
+    pub writes_p99: u64,
     /// Updates that made the buffers again.
     pub rebuilds: u64,
     /// Frames that had an update at all.
     pub updates: u64,
+    /// Frames in which the scene thread held work back for the upload budget, so that the frame's
+    /// upload was cut, and the most frames in a row it did: how long the longest backlog lasted.
+    pub cut_frames: u64,
+    pub longest_backlog_frames: u64,
 }
 
 /// Soft misses (bricks drawn whole although the bands split them) in the frames of a phase.
@@ -350,9 +375,10 @@ pub struct Residency {
     /// when a change makes an Edit later than the look that made it.
     pub edit_latency_frames: u32,
     /// **Outbox latency**: frames that a result the scene thread published waited in its outbox
-    /// before the frame thread took it (ADR 0006; the cap on uploads of #145 is what makes it more
-    /// than 0), a count for each frame that took one. 0 in a stepped run, in which a frame takes
-    /// what was published in it, until #145.
+    /// before the frame thread took it (ADR 0006), a count for each frame that took one. 0 in a
+    /// stepped run, in which a frame takes what was published in it. The upload budget of #145
+    /// holds work back in the scene thread, before it is published, so it does not make this more
+    /// than 0.
     pub outbox_latency_frames: Series,
 }
 
@@ -524,9 +550,19 @@ pub struct Timing {
     /// Per frame, in milliseconds on the CPU: the copy to the GPU, and the draw.
     pub upload_ms: Stats,
     pub draw_ms: Stats,
-    /// Bytes the GPU's copies wrote (what `render::tracer::upload_bytes` works out on the CPU, the
-    /// one in [`Upload`]), counted by the tracer.
+    /// What the GPU side wrote, counted by the tracer **where it writes to the staging belt** (the
+    /// header and each copy, the words between joined ranges included), as against what
+    /// `render::tracer::upload_bytes` and `upload_cost` work out beforehand from the patch (the
+    /// ones in [`Upload`], `bytes.total` and `writes.total`). **Not independent of everything:**
+    /// both go over `RingPatch::copies()` and use the same header size, so their agreement shows
+    /// that the tracer writes each listed range and the header once, and that `cost()` adds them
+    /// as written; that the ranges cover the change is for `GpuCopy::assert_is` in the stepped
+    /// tests. A rebuild is counted in bytes (its buffers) and has no copies.
     pub gpu_uploaded_bytes: u64,
+    pub gpu_uploaded_writes: u64,
+    /// The bytes of old buffers that were copied on the GPU into bigger ones: the growth copies,
+    /// which are in neither of the counts above.
+    pub gpu_grown_bytes: u64,
     pub drawn_frames: usize,
 }
 
@@ -578,6 +614,11 @@ impl StreamReport {
 struct Tally {
     hash: Option<Fnv>,
     upload: Upload,
+    /// The bytes and the copies of each frame that had an update, for their percentiles.
+    update_bytes: Vec<u64>,
+    update_writes: Vec<u64>,
+    /// Frames in a row that work was held back.
+    backlog: u64,
     soft: SoftMisses,
     holes: Series,
     outbox: Series,
@@ -593,6 +634,18 @@ impl Tally {
             &serde_json::to_value(counts).expect("the counts serialize"),
         );
         self.upload.bytes.add(counts.upload_bytes);
+        self.upload.writes.add(counts.upload_writes);
+        if counts.updated {
+            self.update_bytes.push(counts.upload_bytes);
+            self.update_writes.push(counts.upload_writes);
+        }
+        self.upload.cut_frames += u64::from(counts.throttled);
+        self.backlog = if counts.throttled {
+            self.backlog + 1
+        } else {
+            0
+        };
+        self.upload.longest_backlog_frames = self.upload.longest_backlog_frames.max(self.backlog);
         self.upload.patch_bytes += counts.patch_bytes;
         self.upload.rebuilds += u64::from(counts.rebuilt);
         self.upload.updates += u64::from(counts.updated);
@@ -771,6 +824,12 @@ impl Streamer {
         self.world.scene()
     }
 
+    /// The most words a buffer of the scene may have on the GPU it is copied to: a growth is cut to
+    /// it (see `Scene::set_buffer_limit`). Takes effect with the scene thread's next step.
+    pub fn set_buffer_limit(&self, words: usize) {
+        self.world.set_buffer_limit(words);
+    }
+
     /// One frame: the camera is told, the scene thread and the loader do a step, what was made is
     /// taken, and the clock moves on by a frame.
     fn step(
@@ -786,20 +845,22 @@ impl Streamer {
         let store = self.world.store();
         let (upload, patch) = match &update {
             Some(update) => (
-                upload_bytes(self.world.scene(), update),
+                upload_cost(self.world.scene(), update),
                 match update {
                     SceneUpdate::Rings(patch) => patch.words() as u64 * 4,
                     _ => 0,
                 },
             ),
-            None => (0, 0),
+            None => (UploadCost::default(), 0),
         };
         let counts = FrameCounts {
             phase,
-            upload_bytes: upload,
+            upload_bytes: upload.bytes,
+            upload_writes: u64::from(upload.writes),
             patch_bytes: patch,
             rebuilt: matches!(update, Some(SceneUpdate::Rebuilt)),
             updated: update.is_some(),
+            throttled: stats.throttled,
             soft_misses: stats.soft_misses_by_level,
             holes: stats.holes,
             streamed: store.streamed_len(),
@@ -912,7 +973,11 @@ impl Streamer {
                 edit_frame: EDIT_FRAME,
             },
             counts_hash: String::new(),
-            upload: counts.upload.clone(),
+            upload: Upload {
+                bytes_p99: percentile_99(&counts.update_bytes),
+                writes_p99: percentile_99(&counts.update_writes),
+                ..counts.upload.clone()
+            },
             soft_misses: counts.soft.clone(),
             rings: (0..LEVELS)
                 .map(|level| RingFill {
@@ -951,6 +1016,17 @@ impl Streamer {
         };
         report.counts_hash = counts_hash(frames_hash, &report);
         Ok(report)
+    }
+}
+
+/// The 99th percentile, nearest rank, of `values`: the smallest that at least 99% of them do not
+/// exceed; 0 for none.
+pub(super) fn percentile_99(values: &[u64]) -> u64 {
+    let mut sorted = values.to_vec();
+    sorted.sort_unstable();
+    match (sorted.len() * 99).div_ceil(100) {
+        0 => 0,
+        rank => sorted[rank - 1],
     }
 }
 
@@ -1088,9 +1164,11 @@ mod tests {
         let frame = FrameCounts {
             phase: Phase::Moving,
             upload_bytes: 0,
+            upload_writes: 0,
             patch_bytes: 0,
             rebuilt: false,
             updated: false,
+            throttled: false,
             soft_misses: [0; LEVELS],
             holes: 1,
             streamed: 0,
@@ -1213,9 +1291,11 @@ mod tests {
         let frame = FrameCounts {
             phase: Phase::Steady,
             upload_bytes: 1,
+            upload_writes: 11,
             patch_bytes: 2,
             rebuilt: false,
             updated: true,
+            throttled: true,
             soft_misses: [3; LEVELS],
             holes: 4,
             streamed: 5,
@@ -1252,7 +1332,8 @@ mod tests {
         // finishes its round in that look: the frame that made the Edit takes it. This is not ADR
         // 0006's bound, which a stepped run cannot show (see `Residency::edit_latency_frames`).
         assert_eq!(report.residency.edit_latency_frames, 0);
-        // Results published in a frame are taken in it, until #145's cap on uploads.
+        // Results published in a frame are taken in it (the upload budget of #145 holds work back
+        // before it is published).
         assert_eq!(report.residency.outbox_latency_frames.total, 0);
         // Words are counted by level, not guessed: the Rings' and the Guard's add up to those in use.
         let m = &report.sizing.measured;

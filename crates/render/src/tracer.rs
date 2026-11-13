@@ -12,7 +12,7 @@ use crate::debug_view::DebugView;
 use crate::gpu_materials;
 use crate::profiler::Profiler;
 use crate::reference::{Hit, Ray};
-use crate::scene::{MAX_LEVELS, REGION_WORDS, Scene, SceneUpdate, spare_words};
+use crate::scene::{MAX_LEVELS, Part, REGION_WORDS, Scene, SceneUpdate, UploadCost, spare_words};
 use crate::sun::{Sun, SunUniform};
 use crate::upscale::{History, Resolution, UpscalePass};
 use crate::{Result, shaders};
@@ -48,7 +48,7 @@ struct LevelHeader {
 /// levels.
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
-struct SceneHeader {
+pub(crate) struct SceneHeader {
     level_count: u32,
     bound_radius: f32,
     pad0: [u32; 2],
@@ -248,10 +248,29 @@ pub struct Tracer {
     debug_view: DebugView,
     /// Bytes of the Planet that have been written to the GPU, creating its buffers included.
     uploaded: u64,
-    /// Calls of `write_buffer` that the last [`Tracer::update_scene`] made (each a copy on the GPU
-    /// with a barrier of its own); 0 for a rebuild, which makes new buffers.
+    /// Copies that the last [`Tracer::update_scene`] made into the scene's buffers (each a copy on
+    /// the GPU with a barrier of its own); 0 for a rebuild, which makes new buffers.
     last_writes: u32,
+    /// Bytes of the buffers that the last [`Tracer::update_scene`] copied on the GPU into bigger
+    /// ones (a buffer that grew), which the host wrote none of.
+    last_grown: u64,
+    /// How long the last [`Tracer::update_scene`] spent making the buffers that grew (making them
+    /// and recording the copies), on the host.
+    last_grow_time: std::time::Duration,
+    /// The most bytes of GPU memory the scene's buffers have taken while a buffer grew: what they
+    /// held before, and the new buffers made, with the old buffer and the new one both there while
+    /// the copy into the bigger one is made. 0 if none has grown.
+    peak_growth_bytes: u64,
+    /// The same for a rebuild (new buffers for all of the scene, made while the old scene still
+    /// exists): what the old held, and what the new does. 0 if there has been none.
+    peak_rebuild_bytes: u64,
+    /// The staging memory that patches of rings are written through: a few big chunks, handed back
+    /// by the GPU and used again, instead of a staging buffer for each write.
+    belt: wgpu::util::StagingBelt,
 }
+
+/// The size of a chunk of the staging belt, in bytes: a patch is written to a few of them.
+const BELT_CHUNK: u64 = 4 << 20;
 
 pub(crate) fn layout_entry(binding: u32, ty: wgpu::BindingType) -> wgpu::BindGroupLayoutEntry {
     wgpu::BindGroupLayoutEntry {
@@ -300,6 +319,12 @@ fn compute_pipeline(
     })
 }
 
+/// What the scene's storage buffers are for: read by the walk, written to, and copied from when
+/// one grows into a bigger buffer.
+const STORAGE_USAGE: wgpu::BufferUsages = wgpu::BufferUsages::STORAGE
+    .union(wgpu::BufferUsages::COPY_DST)
+    .union(wgpu::BufferUsages::COPY_SRC);
+
 /// A storage buffer holding `words`, with room for `spare` more words (as far as the device's
 /// limit allows), padded to a non-empty size as bindings must be. Returns it and its size in
 /// words. It can be written to with `COPY_DST`.
@@ -321,7 +346,7 @@ fn storage_buffer(
     let buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some(label),
         size: capacity as u64 * 4,
-        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        usage: STORAGE_USAGE,
         mapped_at_creation: true,
     });
     {
@@ -341,24 +366,21 @@ fn write_words(queue: &wgpu::Queue, buffer: &wgpu::Buffer, words: &[u32], at: us
     words.len() as u64 * 4
 }
 
-/// The runs of consecutive numbers in `sorted` (ascending, no repeats), each as a range.
-fn runs(sorted: &[usize]) -> Vec<std::ops::Range<usize>> {
-    let mut out: Vec<std::ops::Range<usize>> = Vec::new();
-    for &n in sorted {
-        match out.last_mut() {
-            Some(last) if last.end == n => last.end += 1,
-            _ => out.push(n..n + 1),
-        }
-    }
-    out
-}
-
 /// The bytes that copying `update` to the GPU copy of `scene` writes, worked out on the CPU: what
 /// [`Tracer::update_scene`] adds to [`Tracer::uploaded_bytes`], the same on every machine. A
 /// rebuild writes all five buffers (the Planet's buffers have no room to spare for rings), and a
 /// patch of rings the header, if the levels changed, and the words it lists. A `Patched` update is
 /// counted as if it fits the buffers; it is not made for rings, which the bench streams.
 pub fn upload_bytes(scene: &Scene, update: &SceneUpdate) -> u64 {
+    upload_cost(scene, update).bytes
+}
+
+/// What copying `update` to the GPU copy of `scene` costs, worked out on the CPU: the bytes
+/// ([`upload_bytes`]) and the copies, each a barrier of its own (0 for a rebuild, which makes new
+/// buffers). A buffer that grew is not counted: the GPU copies what it had, and the host writes
+/// none of it.
+pub fn upload_cost(scene: &Scene, update: &SceneUpdate) -> UploadCost {
+    let bytes_only = |bytes| UploadCost { bytes, writes: 0 };
     match update {
         SceneUpdate::Rebuilt => {
             let spare = |len: usize| {
@@ -369,46 +391,49 @@ pub fn upload_bytes(scene: &Scene, update: &SceneUpdate) -> u64 {
                 }
             };
             let words = |len: usize, spare: usize| (len + spare).max(4) as u64 * 4;
-            size_of::<SceneHeader>() as u64
-                + words(scene.table.len(), 0)
-                + words(scene.regions.len(), 0)
-                + words(scene.brick_refs.len(), spare(scene.brick_refs.len()))
-                + words(scene.bricks.len(), spare(scene.bricks.len()))
-        }
-        SceneUpdate::Rings(patch) => {
-            let header = if patch.levels {
+            bytes_only(
                 size_of::<SceneHeader>() as u64
-            } else {
-                0
-            };
-            header + patch.words() as u64 * 4
+                    + words(scene.table.len(), 0)
+                    + words(scene.regions.len(), 0)
+                    + words(scene.brick_refs.len(), spare(scene.brick_refs.len()))
+                    + words(scene.bricks.len(), spare(scene.bricks.len())),
+            )
         }
+        SceneUpdate::Rings(patch) => patch.cost(),
         SceneUpdate::Patched {
             regions,
             brick_refs_from,
             bricks_from,
         } => {
             let tail = |words: &[u32], from: usize| words.len().saturating_sub(from) as u64 * 4;
-            regions.len() as u64 * REGION_WORDS as u64 * 4
-                + tail(&scene.brick_refs, *brick_refs_from)
-                + tail(&scene.bricks, *bricks_from)
+            bytes_only(
+                regions.len() as u64 * REGION_WORDS as u64 * 4
+                    + tail(&scene.brick_refs, *brick_refs_from)
+                    + tail(&scene.bricks, *bricks_from),
+            )
         }
     }
 }
 
 /// The Planet's packed bricks on the GPU. The buffers of an ordinary scene have room to grow,
 /// since an Edit appends to `brick_refs` and `bricks` (see [`Scene::update`]); those of rings
-/// are as big as the scene's, which has all its room already.
+/// are as big as the scene's, and one that the scene makes longer is made bigger on its own
+/// ([`SceneBuffers::grow`]).
 struct SceneBuffers {
     header: wgpu::Buffer,
     table: wgpu::Buffer,
     regions: wgpu::Buffer,
     brick_refs: wgpu::Buffer,
     bricks: wgpu::Buffer,
-    /// Sizes of `brick_refs` and `bricks`, in words.
-    capacity: [usize; 2],
+    /// Sizes of `table`, `regions`, `brick_refs` and `bricks`, in words.
+    capacity: [usize; 4],
     /// Bytes of GPU memory in the five buffers.
     bytes: u64,
+    /// How many times each of `table`, `regions`, `brick_refs` and `bricks` has been replaced by a
+    /// bigger buffer: a buffer that did not grow has the generation it had. **A full
+    /// [`SceneBuffers::new`] (a rebuild) makes all of them again and starts at 0**: a count of
+    /// growths is only meaningful between rebuilds.
+    generation: [u32; 4],
     group: wgpu::BindGroup,
 }
 
@@ -426,8 +451,8 @@ impl SceneBuffers {
                 spare_words(len)
             }
         };
-        let (table, _) = storage_buffer(device, "region table", &scene.table, 0)?;
-        let (regions, _) = storage_buffer(device, "regions", &scene.regions, 0)?;
+        let (table, table_capacity) = storage_buffer(device, "region table", &scene.table, 0)?;
+        let (regions, regions_capacity) = storage_buffer(device, "regions", &scene.regions, 0)?;
         let (brick_refs, refs_capacity) = storage_buffer(
             device,
             "brick refs",
@@ -436,11 +461,44 @@ impl SceneBuffers {
         )?;
         let (bricks, bricks_capacity) =
             storage_buffer(device, "bricks", &scene.bricks, spare(scene.bricks.len()))?;
-        let bytes = [&header, &table, &regions, &brick_refs, &bricks]
-            .iter()
-            .map(|buffer| buffer.size())
-            .sum();
-        let entries: Vec<_> = [&header, &table, &regions, &brick_refs, &bricks]
+        let mut buffers = Self {
+            group: Self::bind(
+                device,
+                layout,
+                &header,
+                &table,
+                &regions,
+                &brick_refs,
+                &bricks,
+            ),
+            header,
+            table,
+            regions,
+            brick_refs,
+            bricks,
+            capacity: [
+                table_capacity,
+                regions_capacity,
+                refs_capacity,
+                bricks_capacity,
+            ],
+            bytes: 0,
+            generation: [0; 4],
+        };
+        buffers.bytes = buffers.measure();
+        Ok(buffers)
+    }
+
+    fn bind(
+        device: &wgpu::Device,
+        layout: &wgpu::BindGroupLayout,
+        header: &wgpu::Buffer,
+        table: &wgpu::Buffer,
+        regions: &wgpu::Buffer,
+        brick_refs: &wgpu::Buffer,
+        bricks: &wgpu::Buffer,
+    ) -> wgpu::BindGroup {
+        let entries: Vec<_> = [header, table, regions, brick_refs, bricks]
             .into_iter()
             .enumerate()
             .map(|(binding, buffer)| wgpu::BindGroupEntry {
@@ -448,21 +506,94 @@ impl SceneBuffers {
                 resource: buffer.as_entire_binding(),
             })
             .collect();
-        let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("scene"),
             layout,
             entries: &entries,
-        });
-        Ok(Self {
-            header,
-            table,
-            regions,
-            brick_refs,
-            bricks,
-            capacity: [refs_capacity, bricks_capacity],
-            bytes,
-            group,
         })
+    }
+
+    fn measure(&self) -> u64 {
+        [
+            &self.header,
+            &self.table,
+            &self.regions,
+            &self.brick_refs,
+            &self.bricks,
+        ]
+        .iter()
+        .map(|buffer| buffer.size())
+        .sum()
+    }
+
+    /// Makes each buffer that is shorter than the scene's (it grew, see [`RingPatch::sizes`]) a
+    /// new one of the scene's length, and copies what it had into it with `encoder`: on the GPU,
+    /// the host writes none of it. The buffers that did not grow are the same buffers. Returns the
+    /// bytes copied; the bind group is made again if any buffer was replaced. `peak_extra` is
+    /// added the bytes of the new buffers, which exist along with the old ones until the copy is
+    /// done.
+    fn grow(
+        &mut self,
+        device: &wgpu::Device,
+        layout: &wgpu::BindGroupLayout,
+        encoder: &mut wgpu::CommandEncoder,
+        scene: &Scene,
+        peak_extra: &mut u64,
+    ) -> Result<u64> {
+        let limit = device.limits().max_storage_buffer_binding_size;
+        let mut copied = 0;
+        for (i, (label, len)) in [
+            ("region table", scene.table.len()),
+            ("regions", scene.regions.len()),
+            ("brick refs", scene.brick_refs.len()),
+            ("bricks", scene.bricks.len()),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            if len <= self.capacity[i] {
+                continue;
+            }
+            if len as u64 * 4 > limit {
+                return Err(format!(
+                    "{label} needs {} bytes, more than the device's {limit} limit",
+                    len * 4
+                )
+                .into());
+            }
+            let bigger = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size: len as u64 * 4,
+                usage: STORAGE_USAGE,
+                mapped_at_creation: false,
+            });
+            let old = match i {
+                0 => &mut self.table,
+                1 => &mut self.regions,
+                2 => &mut self.brick_refs,
+                _ => &mut self.bricks,
+            };
+            encoder.copy_buffer_to_buffer(old, 0, &bigger, 0, old.size());
+            copied += old.size();
+            // Until the copy is done, which the GPU does after this is submitted, both exist.
+            *peak_extra += bigger.size();
+            *old = bigger;
+            self.capacity[i] = len;
+            self.generation[i] += 1;
+        }
+        if copied > 0 {
+            self.group = Self::bind(
+                device,
+                layout,
+                &self.header,
+                &self.table,
+                &self.regions,
+                &self.brick_refs,
+                &self.bricks,
+            );
+            self.bytes = self.measure();
+        }
+        Ok(copied)
     }
 }
 
@@ -481,6 +612,7 @@ impl Tracer {
         });
         let scene_buffers = SceneBuffers::new(device, &scene_layout, scene)?;
         let scene_bytes = scene_buffers.bytes;
+        let belt = wgpu::util::StagingBelt::new(device.clone(), BELT_CHUNK);
 
         let camera_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("camera, image, accumulation, materials and G-buffer"),
@@ -544,6 +676,11 @@ impl Tracer {
             debug_view: DebugView::default(),
             uploaded: scene_bytes,
             last_writes: 0,
+            last_grown: 0,
+            last_grow_time: std::time::Duration::ZERO,
+            peak_growth_bytes: 0,
+            peak_rebuild_bytes: 0,
+            belt,
         })
     }
 
@@ -638,60 +775,87 @@ impl Tracer {
         update: &SceneUpdate,
     ) -> Result<()> {
         self.accumulator.reset();
-        let buffers = &self.scene;
+        // Counted where each write is made, not summed from the patch's cost: [`upload_cost`] is
+        // the other count, and the two are compared. Both go over `RingPatch::copies()`, so the
+        // comparison does not check that list (the stepped tests' `GpuCopy::assert_is` does).
         let mut written = 0;
         let mut writes = 0;
         self.last_writes = 0;
+        self.last_grown = 0;
+        self.last_grow_time = std::time::Duration::ZERO;
         match update {
             SceneUpdate::Rebuilt => {
+                let before = self.scene.bytes;
                 self.scene = SceneBuffers::new(device, &self.scene_layout, scene)?;
+                self.peak_rebuild_bytes = self.peak_rebuild_bytes.max(before + self.scene.bytes);
                 self.uploaded += self.scene.bytes;
                 return Ok(());
             }
             SceneUpdate::Rings(patch) => {
-                // The scene has all its room, so what changed is written where it is.
+                // What is written goes through the belt into one command buffer, which is sent at
+                // once: after the buffers that grew are made, before the frame that draws.
+                let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("scene upload"),
+                });
+                let grown_at = std::time::Instant::now();
+                let mut extra = 0;
+                let before = self.scene.bytes;
+                self.last_grown =
+                    self.scene
+                        .grow(device, &self.scene_layout, &mut encoder, scene, &mut extra)?;
+                self.last_grow_time = grown_at.elapsed();
+                // Only a growth has a peak: with none, `before` is just the scene's size.
+                if extra > 0 {
+                    self.peak_growth_bytes = self.peak_growth_bytes.max(before + extra);
+                }
+                let buffers = &self.scene;
                 if patch.levels {
                     let header = SceneHeader::new(scene);
-                    queue.write_buffer(&buffers.header, 0, bytemuck::bytes_of(&header));
-                    written += size_of::<SceneHeader>() as u64;
+                    let bytes = bytemuck::bytes_of(&header);
+                    let size = wgpu::BufferSize::new(bytes.len() as u64).expect("a header");
+                    self.belt
+                        .write_buffer(&mut encoder, &buffers.header, 0, size)
+                        .slice(..)
+                        .copy_from_slice(bytes);
+                    written += bytes.len() as u64;
                     writes += 1;
                 }
-                // Each write is a copy on the GPU with its own barrier, and a patch is mostly slots
-                // and records that are next to each other (they are handed out in order), so those
-                // go in as runs.
-                for run in runs(&patch.table) {
+                // Each copy is a barrier on the GPU, and a patch is mostly small writes that are
+                // near each other, so they are made as a few long ones (see
+                // `RingPatch::copies`).
+                for (part, range) in patch.copies() {
+                    let (buffer, words) = match part {
+                        Part::Table => (&buffers.table, &scene.table),
+                        Part::Regions => (&buffers.regions, &scene.regions),
+                        Part::BrickRefs => (&buffers.brick_refs, &scene.brick_refs),
+                        Part::Bricks => (&buffers.bricks, &scene.bricks),
+                    };
+                    let bytes: &[u8] = bytemuck::cast_slice(&words[range.clone()]);
+                    let size = wgpu::BufferSize::new(bytes.len() as u64).expect("a range");
+                    self.belt
+                        .write_buffer(&mut encoder, buffer, range.start as u64 * 4, size)
+                        .slice(..)
+                        .copy_from_slice(bytes);
+                    written += bytes.len() as u64;
                     writes += 1;
-                    written += write_words(
-                        queue,
-                        &buffers.table,
-                        &scene.table[run.start * 4..run.end * 4],
-                        run.start * 4,
-                    );
                 }
-                for run in runs(&patch.regions) {
-                    let (from, to) = (run.start * REGION_WORDS, run.end * REGION_WORDS);
-                    writes += 1;
-                    written += write_words(queue, &buffers.regions, &scene.regions[from..to], from);
-                }
-                for (buffer, words, ranges) in [
-                    (&buffers.brick_refs, &scene.brick_refs, &patch.brick_refs),
-                    (&buffers.bricks, &scene.bricks, &patch.bricks),
-                ] {
-                    for range in ranges {
-                        writes += 1;
-                        written += write_words(queue, buffer, &words[range.clone()], range.start);
-                    }
-                }
+                self.belt.finish();
+                queue.submit(std::iter::once(encoder.finish()));
+                self.belt.recall();
             }
             SceneUpdate::Patched {
                 regions,
                 brick_refs_from,
                 bricks_from,
             } => {
-                if scene.brick_refs.len() > buffers.capacity[0]
-                    || scene.bricks.len() > buffers.capacity[1]
+                let buffers = &self.scene;
+                if scene.brick_refs.len() > buffers.capacity[2]
+                    || scene.bricks.len() > buffers.capacity[3]
                 {
+                    let before = self.scene.bytes;
                     self.scene = SceneBuffers::new(device, &self.scene_layout, scene)?;
+                    self.peak_rebuild_bytes =
+                        self.peak_rebuild_bytes.max(before + self.scene.bytes);
                     self.uploaded += self.scene.bytes;
                     return Ok(());
                 }
@@ -721,10 +885,45 @@ impl Tracer {
         Ok(())
     }
 
-    /// Calls of `write_buffer` that the last [`Tracer::update_scene`] made: each is a copy on the
-    /// GPU with a barrier of its own. 0 after a rebuild, which makes new buffers.
+    /// Copies that the last [`Tracer::update_scene`] wrote to the staging belt (the header, and each
+    /// range of words), counted as they were written: each is a copy on the GPU with a barrier of
+    /// its own. The copies of a growth, old buffer to new, are not in it. 0 after a rebuild, which
+    /// makes new buffers.
     pub fn last_writes(&self) -> u32 {
         self.last_writes
+    }
+
+    /// Bytes that the last [`Tracer::update_scene`] copied on the GPU from buffers into bigger
+    /// ones that grew: not written by the host, and not in [`Tracer::uploaded_bytes`].
+    pub fn last_grown_bytes(&self) -> u64 {
+        self.last_grown
+    }
+
+    /// How long the last [`Tracer::update_scene`] took to make the buffers that grew and to record
+    /// the copies into them, on the host (the GPU's copy is not in it). Zero if nothing grew.
+    pub fn last_grow_time(&self) -> std::time::Duration {
+        self.last_grow_time
+    }
+
+    /// How many times each of the scene's table, regions, brick refs and bricks buffers has been
+    /// replaced by a bigger one. A buffer that did not grow is the same buffer, and its number
+    /// does not change.
+    pub fn buffer_generations(&self) -> [u32; 4] {
+        self.scene.generation
+    }
+
+    /// The most bytes of GPU memory the scene's buffers have taken at once **while a buffer grew**
+    /// since the tracer was made: what they held before, and the new buffers, the old buffer and
+    /// the new one both there while the copy is made. 0 if none has grown. A rebuild is not in it
+    /// ([`Tracer::peak_rebuild_bytes`]).
+    pub fn peak_growth_bytes(&self) -> u64 {
+        self.peak_growth_bytes
+    }
+
+    /// The most bytes of GPU memory the scene's buffers have taken at once **while a rebuilt scene
+    /// was made** (the old scene and the new): 0 if there has been no rebuild.
+    pub fn peak_rebuild_bytes(&self) -> u64 {
+        self.peak_rebuild_bytes
     }
 
     /// Bytes of GPU memory that the Planet's bricks take: the five buffers of the scene.

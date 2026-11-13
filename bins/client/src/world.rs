@@ -74,15 +74,16 @@ pub(crate) const AIM_REACH: f64 = sim::EDIT_REACH - 0.5 * brick_store::VOXELS_PE
 pub enum Stopped {
     /// The server is gone.
     Disconnected,
-    /// The Planet no longer fits the rings' buffers; the scene is not to be used again.
-    RingsFull,
+    /// The Planet no longer fits the rings' buffers (a scene that was given its room, or a buffer
+    /// that would be longer than the device allows); the scene is not to be used again.
+    RingsFull(RingsFull),
 }
 
 impl std::fmt::Display for Stopped {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Disconnected => write!(f, "the server stopped"),
-            Self::RingsFull => write!(f, "{RingsFull}"),
+            Self::RingsFull(full) => write!(f, "{full}"),
         }
     }
 }
@@ -96,8 +97,8 @@ impl From<Disconnected> for Stopped {
 }
 
 impl From<RingsFull> for Stopped {
-    fn from(_: RingsFull) -> Self {
-        Self::RingsFull
+    fn from(full: RingsFull) -> Self {
+        Self::RingsFull(full)
     }
 }
 
@@ -179,6 +180,9 @@ pub struct World {
     /// The longest a result that the scene thread published waited, since it was last asked for,
     /// when the counts are exact (see [`World::take_outbox_wait`]).
     outbox_wait: std::time::Duration,
+    /// How long making the buffers of the copy of the scene longer took, for the buffers that grew
+    /// in what was taken since [`World::take_lengthened`] was last called.
+    lengthened: std::time::Duration,
     /// How long [`World::edit_due`] waits: [`EDIT_WAIT`], or more in a test on a slow build.
     edit_wait: std::time::Duration,
     /// Whether [`World::recentre`] tells the scene thread how the camera is moving, for prefetch.
@@ -272,6 +276,7 @@ impl World {
             edits_made: 0,
             taken_done: 0,
             outbox_wait: std::time::Duration::ZERO,
+            lengthened: std::time::Duration::ZERO,
             edit_wait: EDIT_WAIT,
             lead: true,
             motion: Motion::default(),
@@ -339,6 +344,14 @@ impl World {
     /// zero when it was taken in the frame it was published in, and always zero otherwise.
     pub fn take_outbox_wait(&mut self) -> std::time::Duration {
         std::mem::take(&mut self.outbox_wait)
+    }
+
+    /// How long the frame thread spent, since this was last called, making the buffers of its copy
+    /// of the scene longer for the buffers that grew (a `Vec` that is longer: a reallocation, and
+    /// the new words written as zero), which is what a growth costs the frame thread besides
+    /// pasting the words and copying them to the GPU. Zero if none grew.
+    pub fn take_lengthened(&mut self) -> std::time::Duration {
+        std::mem::take(&mut self.lengthened)
     }
 
     /// Moves a stepped world's clock on by `time`.
@@ -411,6 +424,14 @@ impl World {
         self.worker
             .as_ref()
             .map_or_else(Spent::default, SceneWorker::spent)
+    }
+
+    /// Tells the scene thread the most words that a buffer of the scene may have, which is what
+    /// the device allows a storage buffer to be (`Renderer::buffer_limit_words`).
+    pub fn set_buffer_limit(&self, words: usize) {
+        if let Some(worker) = &self.worker {
+            worker.set_buffer_limit(words);
+        }
     }
 
     /// Has the scene thread count the soft misses (by level) and the holes for every publish, so
@@ -652,9 +673,15 @@ impl World {
         self.take_ready(true)
     }
 
-    /// How far the scene as the world has it is behind `camera`, in Voxels: where the scene thread
-    /// had moved the rings to, when it made what the world has taken.
-    #[cfg(test)]
+    /// How far the scene as the world has it (the one that is drawn) is behind `camera`, in
+    /// Voxels: the distance from `camera`, the frame thread's, to where the scene thread had moved
+    /// the rings to when it made what the world has taken.
+    ///
+    /// The scene thread publishes a round that moved the scene and changed nothing, and no count,
+    /// only with the next publish (a stats-only publish would make the outbox look untaken, which
+    /// the budget reads), so after such steps this is more than it was by at most the Voxels they
+    /// moved it (a follow step is at most 64 at the default budget; a round that changed anything,
+    /// as every one of a flight's does, publishes).
     pub fn lag(&self, camera: [f64; 3]) -> f64 {
         let shown = self.stats.camera.unwrap_or(camera);
         (0..3)
@@ -704,7 +731,7 @@ impl World {
             worker.discard_scene(std::mem::replace(&mut self.scene, *mirror));
             Some(SceneUpdate::Rebuilt)
         } else if let Some(copy) = ready.patch {
-            self.scene.paste(&copy);
+            self.lengthened += self.scene.paste(&copy);
             // The update is a copy of the patch: what the scene thread allocated goes back to it.
             let update = Some(SceneUpdate::Rings(copy.patch.clone()));
             worker.recycle(copy);

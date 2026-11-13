@@ -33,6 +33,9 @@ streaming_tests::an_edit_the_scene_thread_is_too_busy_to_pack_shows_when_it_has_
 streaming_tests::a_parked_scene_thread_takes_the_coarsening_steps_back_when_the_hold_is_over
 streaming_tests::a_panic_on_the_scene_thread_is_a_panic_on_the_frame_thread_not_a_wait
 streaming_tests::a_job_that_is_done_is_always_there_to_be_taken_even_as_the_thread_goes_on_publishing
+# A scene thread that holds work back for the upload budget wakes when the frame thread takes what
+# waited (a sleep that is a clock tick long on Windows cut a fill to every second frame).
+streaming_tests::a_throttled_scene_thread_goes_on_when_the_frame_thread_takes_what_waited
 
 # The real-time mode of the streaming bench (#162) on the test Planet: real workers, a real scene
 # thread and the machine's clock, with no GPU. It runs every path and checks that the report has its

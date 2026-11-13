@@ -2366,6 +2366,9 @@ struct Misses {
     with_misses: usize,
     total: usize,
     peak: usize,
+    /// The distance of the scene that is drawn from the camera, at each frame (see
+    /// [`World::lag`]), in Voxels.
+    lag: Vec<f64>,
 }
 
 /// Runs the camera along `position_at(t)` (seconds) for `seconds` at 60 frames a second, with the
@@ -2384,6 +2387,7 @@ fn run_path(
         with_misses: 0,
         total: 0,
         peak: 0,
+        lag: Vec::new(),
     };
     while began.elapsed().as_secs_f64() < seconds {
         let tick = Instant::now();
@@ -2393,16 +2397,26 @@ fn run_path(
         misses.with_misses += usize::from(soft > 0);
         misses.total += soft;
         misses.peak = misses.peak.max(soft);
+        misses.lag.push(world.lag(position));
         std::thread::sleep(frame.saturating_sub(tick.elapsed()));
     }
+    let mut lags = misses.lag.clone();
+    lags.sort_by(f64::total_cmp);
+    let p99 = lags
+        .get((lags.len() * 99).div_ceil(100).saturating_sub(1))
+        .copied()
+        .unwrap_or(0.0);
     eprintln!(
         "  {name}: {} frames, {} with soft misses, {} bricks missed in all, {} at most at once; \
-         {} waiting at the end",
+         {} waiting at the end; the drawn scene was {:.0} Voxels behind the camera at most, {p99:.0} \
+         at the 99th percentile, {:.0} at the end",
         misses.frames,
         misses.with_misses,
         misses.total,
         misses.peak,
-        world.waiting()
+        world.waiting(),
+        lags.last().copied().unwrap_or(0.0),
+        misses.lag.last().copied().unwrap_or(0.0),
     );
     misses
 }
@@ -2500,4 +2514,1199 @@ fn wait_idle(world: &mut World, camera: [f64; 3], cap: Duration) {
         assert!(began.elapsed() < cap, "does not fill");
         std::thread::sleep(Duration::from_millis(16));
     }
+}
+
+/// A budget small enough that the fill of the test world's shell takes many frames to upload.
+const SMALL_BUDGET: render::UploadCost = render::UploadCost {
+    bytes: 48 << 10,
+    writes: 12,
+};
+
+/// What a GPU copy of the scene holds, written to as the tracer writes (`Tracer::update_scene`):
+/// the buffers that grew are made longer with what they had, and then the copies of a patch are
+/// made from the frame thread's scene (words in the gaps between them as they are there), and the
+/// header (the levels) if it changed.
+struct GpuCopy {
+    levels: Vec<render::scene::Level>,
+    table: Vec<u32>,
+    regions: Vec<u32>,
+    brick_refs: Vec<u32>,
+    bricks: Vec<u32>,
+}
+
+impl GpuCopy {
+    fn of(scene: &Scene) -> Self {
+        Self {
+            levels: scene.levels.clone(),
+            table: scene.table.clone(),
+            regions: scene.regions.clone(),
+            brick_refs: scene.brick_refs.clone(),
+            bricks: scene.bricks.clone(),
+        }
+    }
+
+    fn write(&mut self, scene: &Scene, update: &SceneUpdate) {
+        match update {
+            SceneUpdate::Rebuilt => *self = Self::of(scene),
+            SceneUpdate::Rings(patch) => {
+                if let Some(sizes) = patch.sizes {
+                    self.table.resize(sizes.table, 0);
+                    self.regions.resize(sizes.regions, 0);
+                    self.brick_refs.resize(sizes.brick_refs, 0);
+                    self.bricks.resize(sizes.bricks, 0);
+                }
+                for (part, range) in patch.copies() {
+                    let (to, from) = match part {
+                        render::scene::Part::Table => (&mut self.table, &scene.table),
+                        render::scene::Part::Regions => (&mut self.regions, &scene.regions),
+                        render::scene::Part::BrickRefs => (&mut self.brick_refs, &scene.brick_refs),
+                        render::scene::Part::Bricks => (&mut self.bricks, &scene.bricks),
+                    };
+                    to[range.clone()].copy_from_slice(&from[range]);
+                }
+                if patch.levels {
+                    self.levels.clone_from(&scene.levels);
+                }
+            }
+            SceneUpdate::Patched { .. } => unreachable!("rings make rings"),
+        }
+    }
+
+    /// That the GPU has every word the scene that is drawn has: so every brick that scene draws
+    /// has its words (and the table, the records and the header that find them) in the GPU's
+    /// buffers, and none is drawn from words that have not been copied.
+    fn assert_is(&self, scene: &Scene, frame: usize) {
+        assert_eq!(self.levels, scene.levels, "frame {frame}: the header");
+        assert!(self.table == scene.table, "frame {frame}: the table");
+        assert!(self.regions == scene.regions, "frame {frame}: the regions");
+        assert!(
+            self.brick_refs == scene.brick_refs,
+            "frame {frame}: the brick refs"
+        );
+        assert!(self.bricks == scene.bricks, "frame {frame}: the bricks");
+    }
+}
+
+/// What an update costs to upload (`upload_cost`, which is the tracer's count: see
+/// `docs/agents/benchmarking.md`), and of it what the patch lists once each (the words and the
+/// header) and the words that joining ranges put between them.
+struct Uploaded {
+    cost: render::UploadCost,
+    listed: u64,
+    gaps: u64,
+}
+
+impl Uploaded {
+    fn of(scene: &Scene, update: &SceneUpdate) -> Self {
+        let SceneUpdate::Rings(patch) = update else {
+            panic!("a rebuild where a patch was expected");
+        };
+        let cost = render::tracer::upload_cost(scene, update);
+        let copied: u64 = patch.copies().iter().map(|(_, r)| r.len() as u64 * 4).sum();
+        let header = cost.bytes - copied;
+        let listed = patch.words() as u64 * 4 + header;
+        Self {
+            cost,
+            listed,
+            gaps: cost.bytes - listed,
+        }
+    }
+}
+
+/// What a fill with a budget came to (see [`fill_checked`]).
+#[derive(Debug, Default)]
+struct Filled {
+    frames: usize,
+    patch_frames: usize,
+    /// Frames in which work was held back, and the most in a row.
+    cut: usize,
+    longest_backlog: usize,
+    /// Frames in which a buffer grew with a frame before it and one after it that were cut.
+    growths_in_a_backlog: usize,
+    /// The most that one frame's upload passed the budget by, in bytes and in copies (the words
+    /// that joining copies put between them not counted), and the frames that passed it.
+    over: render::UploadCost,
+    frames_over: usize,
+    /// The most that one operation added.
+    largest_op: render::UploadCost,
+}
+
+/// Streams a world with the camera still until the resident set is complete, with `budget` for
+/// what is uploaded, and on every frame checks that a GPU copy that is written as the tracer
+/// writes it (see [`GpuCopy`]) is what the frame thread's scene is, so that no brick drawn is
+/// drawn from words that were not copied, whatever waits and whatever grew; that no frame has a
+/// hole; and that the frame's upload is the budget and the operations that were not inside it
+/// (`Stats::excess_ops`), and the words that joining copies puts between them, and no more.
+///
+/// **What the bound on `excess_ops` can and cannot catch:** `excess_ops` is worked out by the
+/// scene thread (`Engine::note`) from what it saw when each operation began, so the bound holds
+/// whatever the throttle decides: it catches an operation that adds to a patch without going
+/// through `note()`, or a patch that is bigger than the operations that made it (merging adding
+/// words), and it does not say that the throttle holds back when it should. That is what the
+/// frames cut, `with_a_budget_well_over_one_operation…` (a still camera: the test that fails if the
+/// throttle holds nothing back) and the flight's bound from patch sizes are for.
+fn fill_checked(budget: render::UploadCost) -> Filled {
+    let (mut world, _server, camera) = spawned_world(Run::Stepped);
+    world.count_exactly();
+    world.worker().set_upload_budget(budget);
+    let mut gpu = GpuCopy::of(world.scene());
+    let mut filled = Filled::default();
+    // Whether each frame was cut, and whether a buffer grew in it.
+    let mut frames: Vec<(bool, bool)> = Vec::new();
+    let mut patience = Patience::new(Duration::from_secs(180));
+    loop {
+        let update = world.recentre(camera.position).unwrap();
+        let frame = frames.len();
+        let mut grew = false;
+        if let Some(update) = &update {
+            gpu.write(world.scene(), update);
+            filled.patch_frames += 1;
+            let SceneUpdate::Rings(patch) = update else {
+                panic!("frame {frame}: a rebuild in a fill");
+            };
+            grew = patch.sizes.is_some();
+            // What the patch lists, once each: the bytes before words are put between copies.
+            let Uploaded { cost, listed, gaps } = Uploaded::of(world.scene(), update);
+            let excess = world.stats().excess_ops;
+            assert!(
+                listed <= budget.bytes + excess.bytes,
+                "frame {frame}: {listed} bytes listed, over the budget of {} and the {} bytes of \
+                 the operations that were not inside it",
+                budget.bytes,
+                excess.bytes
+            );
+            assert!(
+                cost.writes <= budget.writes + excess.writes,
+                "frame {frame}: {} copies, over the budget of {} and the {} copies of the \
+                 operations that were not inside it",
+                cost.writes,
+                budget.writes,
+                excess.writes
+            );
+            assert!(
+                gaps <= u64::from(cost.writes) * render::scene::COPY_GAP as u64 * 4,
+                "frame {frame}: {gaps} bytes between copies"
+            );
+            if cost.bytes > budget.bytes || cost.writes > budget.writes {
+                filled.frames_over += 1;
+                filled.over.bytes = filled
+                    .over
+                    .bytes
+                    .max(cost.bytes.saturating_sub(budget.bytes));
+                filled.over.writes = filled
+                    .over
+                    .writes
+                    .max(cost.writes.saturating_sub(budget.writes));
+            }
+        }
+        gpu.assert_is(world.scene(), frame);
+        assert_eq!(world.stats().holes, 0, "frame {frame}: a hole");
+        frames.push((world.stats().throttled, grew));
+        if idle(&world) && !world.stats().throttled {
+            break;
+        }
+        patience.wait(&world, || "the resident set does not fill".into());
+    }
+    filled.frames = frames.len();
+    filled.cut = frames.iter().filter(|f| f.0).count();
+    filled.longest_backlog = frames
+        .split(|f| !f.0)
+        .map(<[_]>::len)
+        .max()
+        .unwrap_or_default();
+    filled.growths_in_a_backlog = (1..frames.len().saturating_sub(1))
+        .filter(|&i| frames[i].1 && frames[i - 1].0 && frames[i + 1].0)
+        .count();
+    filled.largest_op = world.stats().largest_op;
+    filled
+}
+
+#[test]
+fn with_a_small_budget_no_frame_draws_a_brick_whose_words_have_not_been_copied_and_a_frame_passes_the_budget_by_the_operations_that_were_not_inside_it()
+ {
+    let filled = fill_checked(SMALL_BUDGET);
+    eprintln!("{filled:?}");
+    // The upload spans many frames, and a buffer grew with the backlog standing.
+    assert!(filled.cut > 10 && filled.longest_backlog > 3, "{filled:?}");
+    assert!(
+        filled.growths_in_a_backlog > 0,
+        "no buffer grew in the middle of a backlog: {filled:?}"
+    );
+    // The budget is so small that one operation is over it: the frames pass it, by what the
+    // operations that were not inside it add, which `fill_checked` holds each of them to.
+    assert!(filled.frames_over > 0, "{filled:?}");
+    assert!(filled.largest_op.bytes > SMALL_BUDGET.bytes, "{filled:?}");
+}
+
+#[test]
+fn with_a_budget_well_over_one_operation_the_budget_holds_in_every_frame_and_still_holds_work_back()
+{
+    // Twice the most that one operation added, found out with a budget that holds nothing back.
+    let one = fill_checked(render::UploadCost {
+        bytes: 64 << 20,
+        writes: 100_000,
+    })
+    .largest_op;
+    assert!(one.bytes > 0 && one.writes > 0);
+    let budget = render::UploadCost {
+        bytes: one.bytes * 2,
+        writes: one.writes * 2,
+    };
+    let filled = fill_checked(budget);
+    eprintln!("one operation {one:?}, budget {budget:?}: {filled:?}");
+    // It holds work back, but no frame is over it: what is added is checked against it before
+    // each batch, with the most that a batch has added, so it is not taken over the budget.
+    assert!(filled.cut > 0, "the budget holds nothing back: {filled:?}");
+    assert_eq!(filled.frames_over, 0, "{filled:?}");
+}
+
+/// A stepped world with a camera still at the spawn that has filled in, an Edit in view, and the
+/// frames that the Edit takes to be taken: made when there is a backlog (`budget`: a small one) or
+/// when there is none (`None`). Returns the frames from the click to the frame that had it, whether
+/// there was a backlog in the frame of the click, and whether work was still held back, and bricks
+/// were still waiting, in the frame that had it.
+fn edit_with_backlog(budget: Option<render::UploadCost>) -> (i32, bool, bool, bool) {
+    let (mut world, _server, camera) = spawned_world(Run::Stepped);
+    fill(&mut world, camera.position);
+    let aim = up_close(&mut world, &camera);
+    let depth = |world: &World| {
+        crate::world::centre_hit(world.scene(), &aim)
+            .expect("ground")
+            .t
+    };
+    let whole = depth(&world);
+    let (ahead, _) = tangents(camera.horizon_up);
+    let at = |n: i32| -> [f64; 3] {
+        std::array::from_fn(|a| aim.position[a] + 8.0 * f64::from(n.min(6)) * ahead[a])
+    };
+    let mut frame = 0i32;
+    if let Some(budget) = budget {
+        // The camera is on the move, with a budget so small that what the loader makes for the
+        // new places waits for frames: a backlog, which the Edit is made in the middle of.
+        world.worker().set_upload_budget(budget);
+        while !(world.stats().throttled && world.waiting() > 0) {
+            frame += 1;
+            assert!(frame <= 200, "no backlog formed in 200 frames");
+            world.recentre(at(frame)).unwrap();
+            pace(&world, FRAME);
+        }
+    }
+    let backlog = world.stats().throttled && world.waiting() > 0;
+    world.edit(&aim, &crate::tool::Tool::default()).unwrap();
+    // The frame of the click looks at the scene and does not have the Edit.
+    assert!((depth(&world) - whole).abs() < 0.5);
+    let mut taken_in = 0;
+    while !world.edit_taken() {
+        taken_in += 1;
+        assert!(taken_in <= 3, "the Edit was not taken in 3 frames");
+        pace(&world, FRAME);
+        world.recentre(at(frame + taken_in)).unwrap();
+    }
+    assert!(depth(&world) > whole + 1.0, "the hole shows");
+    (
+        taken_in,
+        backlog,
+        world.stats().throttled,
+        world.waiting() > 0,
+    )
+}
+
+#[test]
+fn an_edit_made_while_a_backlog_waits_is_taken_as_soon_as_one_made_without_a_backlog_is() {
+    let (without, had_backlog, ..) = edit_with_backlog(None);
+    assert!(!had_backlog, "the control had a backlog");
+    let (with, had_backlog, still_held, still_waiting) = edit_with_backlog(Some(SMALL_BUDGET));
+    // A backlog stood when the Edit was made, and when it was taken: work was held back for the
+    // budget and bricks were waiting, so the Edit did not wait for the backlog to be gone.
+    assert!(had_backlog, "no backlog stood when the Edit was made");
+    assert!(
+        still_held && still_waiting,
+        "the backlog was gone by the frame that took the Edit"
+    );
+    // ADR 0006's bound: the frame after the click, as without a backlog.
+    assert_eq!(
+        without, 1,
+        "the control takes the Edit in the frame after the click"
+    );
+    assert_eq!(with, without, "the Edit took longer behind a backlog");
+}
+
+/// What each update of a flight cost: what the patch lists (bytes), its copies, and the bytes
+/// between joined ranges. Printed as a count.
+#[derive(Default)]
+struct Uploads(Vec<(u64, u32, u64)>);
+
+impl std::fmt::Debug for Uploads {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} updates", self.0.len())
+    }
+}
+
+/// What a flight along the ground came to (see [`fly_counting`]).
+#[derive(Debug, Default)]
+struct Flown {
+    frames: usize,
+    /// Updates that were a whole new scene (a jump).
+    rebuilds: usize,
+    /// Frames in which work was held back, and the longest run of them in a row.
+    cut: usize,
+    longest_backlog: usize,
+    /// What the scene thread did over the flight.
+    follow_steps: u64,
+    pack_steps: u64,
+    arrived_bricks: u64,
+    /// The most bricks that waited for the bricks under them, and the most that the loader had on
+    /// its way, in a frame of the flight.
+    waiting_peak: usize,
+    pending_peak: usize,
+    /// The largest upload of a frame that was not a rebuild.
+    worst: render::UploadCost,
+    /// Frames, with the camera still at the end, until nothing waits.
+    frames_to_drain: usize,
+    holes: usize,
+    /// What each update of the flight (not a rebuild) cost, and the most that one follow step and
+    /// one batch of arrivals added over the run.
+    uploads: Uploads,
+    largest_follow: render::UploadCost,
+    largest_batch: render::UploadCost,
+    /// The most that the scene (as of the last update taken) was from the camera, in Voxels, in a
+    /// frame of the flight.
+    max_lag: f64,
+}
+
+/// The camera flown `frames` frames of `step` Voxels along the ground from the spawn, in a stepped
+/// world that has filled in, with `budget` for what the scene thread lets wait to be uploaded
+/// (the default one, if none is given), and then left still until nothing waits.
+fn fly_counting(
+    budget: Option<render::UploadCost>,
+    step: f64,
+    frames: usize,
+    filled: bool,
+) -> Flown {
+    fly_counting_busy(budget, step, frames, filled, Duration::ZERO)
+}
+
+/// [`fly_counting`] with the scene thread busy for `busy` of the flight (inside one long
+/// operation, as the 4090's was for most of a second at a time), so that the camera is far ahead
+/// of the scene when it looks again.
+fn fly_counting_busy(
+    budget: Option<render::UploadCost>,
+    step: f64,
+    frames: usize,
+    filled: bool,
+    busy: Duration,
+) -> Flown {
+    let (mut world, _server, camera) = spawned_world(Run::Stepped);
+    world.count_exactly();
+    if filled {
+        fill(&mut world, camera.position);
+    }
+    if let Some(budget) = budget {
+        world.worker().set_upload_budget(budget);
+    }
+    // The largest operations are those of the flight (and the drain after it), not of the fill.
+    world.worker().forget_largest();
+    if !busy.is_zero() {
+        world.worker().busy_for(busy);
+    }
+    let before = world.stats().work;
+    let (ahead, _) = tangents(camera.horizon_up);
+    let mut flown = Flown::default();
+    let mut run = 0;
+    let mut moved = camera.position;
+    let mut position = camera.position;
+    let take = |world: &mut World, position: [f64; 3], flown: &mut Flown| {
+        let update = world.recentre(position).unwrap();
+        match &update {
+            Some(SceneUpdate::Rebuilt) => flown.rebuilds += 1,
+            Some(update) => {
+                let Uploaded { cost, listed, gaps } = Uploaded::of(world.scene(), update);
+                flown.worst.bytes = flown.worst.bytes.max(cost.bytes);
+                flown.worst.writes = flown.worst.writes.max(cost.writes);
+                flown.uploads.0.push((listed, cost.writes, gaps));
+            }
+            None => {}
+        }
+        flown.holes += world.stats().holes;
+        if let Some(at) = world.stats().camera {
+            let lag = (0..3)
+                .map(|a| (at[a] - position[a]).powi(2))
+                .sum::<f64>()
+                .sqrt();
+            flown.max_lag = flown.max_lag.max(lag);
+        }
+        flown.waiting_peak = flown.waiting_peak.max(world.waiting());
+        flown.pending_peak = flown
+            .pending_peak
+            .max(world.loader().map_or(0, |l| l.pending));
+        world.stats().throttled
+    };
+    for _ in 0..frames {
+        moved = std::array::from_fn(|a| moved[a] + ahead[a] * step);
+        position = over_the_ground(&world.store(), moved);
+        let cut = take(&mut world, position, &mut flown);
+        run = if cut { run + 1 } else { 0 };
+        flown.cut += usize::from(cut);
+        flown.longest_backlog = flown.longest_backlog.max(run);
+        pace(&world, FRAME);
+        flown.frames += 1;
+    }
+    let after = world.stats().work;
+    flown.follow_steps = after.follow_steps - before.follow_steps;
+    flown.pack_steps = after.pack_steps - before.pack_steps;
+    flown.arrived_bricks = after.arrived_bricks - before.arrived_bricks;
+    let mut patience = Patience::new(Duration::from_secs(180));
+    loop {
+        let cut = take(&mut world, position, &mut flown);
+        if idle(&world) && !cut {
+            break;
+        }
+        flown.frames_to_drain += 1;
+        patience.wait(&world, || "the backlog does not drain".into());
+    }
+    flown.largest_follow = world.stats().largest_follow;
+    flown.largest_batch = world.stats().largest_batch;
+    flown
+}
+
+#[test]
+fn flying_with_more_work_than_the_budget_drains_the_backlog_takes_in_arrivals_and_does_not_jump() {
+    // 8 Voxels a frame is 24 m/s, and a jump is 2 `d0`: 128 Voxels on these bands, 16 frames of
+    // it. The flight is 240 frames, so a camera that was not followed for that long would jump.
+    let (step, frames) = (8.0, 240);
+    let control = fly_counting(None, step, frames, true);
+    assert_eq!((control.cut, control.rebuilds), (0, 0), "{control:?}");
+    for budget in [
+        SMALL_BUDGET,
+        render::UploadCost {
+            bytes: 256 << 10,
+            writes: 32,
+        },
+    ] {
+        let flown = fly_counting(Some(budget), step, frames, true);
+        eprintln!("{budget:?}: {flown:?}\n  control {control:?}");
+        // Work is held back for the whole flight: the budget is under what following costs.
+        assert!(flown.cut > frames / 2, "{flown:?}");
+        // The camera is followed every frame, and no throttle makes it jump.
+        assert_eq!(flown.rebuilds, 0, "{flown:?}");
+        assert_eq!(flown.follow_steps, control.follow_steps, "{flown:?}");
+        assert_eq!(flown.holes, 0, "{flown:?}");
+        // Arrivals are taken in every frame that the loader has some (a batch each, at least), not
+        // starved by following the camera, which comes first.
+        assert!(
+            flown.pack_steps as usize >= frames / 2,
+            "{} batches of arrivals in {frames} frames: {flown:?}",
+            flown.pack_steps
+        );
+        // And the backlog is bounded and drains: what waits in the flight is no more than a
+        // few times what waits when nothing is held back, and is gone soon after it ends.
+        assert!(
+            flown.waiting_peak <= control.waiting_peak * 4 + 1000,
+            "{flown:?} against {control:?}"
+        );
+        assert!(
+            flown.pending_peak <= control.pending_peak * 4 + 1000,
+            "{flown:?} against {control:?}"
+        );
+        assert!(flown.frames_to_drain <= 4 * frames, "{flown:?}");
+    }
+}
+
+/// The most that one update of a flight lists (bytes, once each) and copies.
+fn most_listed(flown: &Flown) -> (u64, u32) {
+    let bytes = flown.uploads.0.iter().map(|u| u.0).max().unwrap_or(0);
+    let writes = flown.uploads.0.iter().map(|u| u.1).max().unwrap_or(0);
+    (bytes, writes)
+}
+
+/// A flight over ground that is still loading, held to a budget of one batch of arrivals.
+///
+/// **What it can catch:** the throttle in `stream()` (between batches) taken out or loosened, and
+/// the follow steps not being cut to the budget (`Engine::next_place`). The unthrottled flight's
+/// worst update is 866 324 bytes in 69 copies and its largest follow step 515 964 bytes; the
+/// throttled flight's follow steps are held to the budget, and its worst update to under a third
+/// of the unthrottled worst in bytes and under half in copies, in messages that name the
+/// throttled flight. A partly broken throttle that lets through fewer and smaller operations than
+/// the unthrottled flight, and stays under both margins, is not caught by this test, and then
+/// nothing in it says it is wrong.
+///
+/// **What it cannot catch:** the throttle in `follow()` (the flight's numbers are the same without
+/// it: `stream` stops before the outbox is over the budget when `follow` looks; see
+/// `the_camera_is_not_followed_while_what_waits_is_over_the_budget_and_is_when_the_frame_thread_has_taken_it`),
+/// and the bound's terms for the crossing operation and the round's first batch: the update
+/// bound below (the budget and two batches, from the *unthrottled* flight's batch, so that a
+/// broken throttle cannot widen it) is looser than the unthrottled flight's own worst update, so it
+/// states the design's bound and has no power here. The terms are exercised by
+/// `with_a_small_budget…`, where a budget under one operation puts every frame over it by the
+/// operations that were not inside it, checked against `Stats::excess_ops` (the scene thread's own
+/// count, which holds whatever the throttle decides).
+#[test]
+fn a_flight_over_ground_that_is_still_loading_has_follow_steps_within_the_budget_and_updates_far_under_the_unthrottled_flights()
+ {
+    // A flight of 24 Voxels a frame from the spawn with the resident set not yet filled in, so
+    // that the loader has batches for every round, with nothing held back (the default budget).
+    let (step, frames) = (24.0, 120);
+    let control = fly_counting(None, step, frames, false);
+    eprintln!(
+        "control {control:?}, most listed {:?}",
+        most_listed(&control)
+    );
+    assert_eq!(
+        (control.cut, control.rebuilds, control.holes),
+        (0, 0, 0),
+        "the unthrottled flight held work back, jumped, or had a hole: {control:?}"
+    );
+    // The budget: what the largest batch of arrivals of the unthrottled flight costs.
+    let budget = control.largest_batch;
+    assert!(budget.bytes > 0 && budget.writes > 0, "{control:?}");
+    let flown = fly_counting(Some(budget), step, frames, false);
+    let (bytes, writes) = most_listed(&flown);
+    let (control_bytes, control_writes) = most_listed(&control);
+    eprintln!("{budget:?}: {flown:?}, most listed {:?}", (bytes, writes));
+    assert_eq!(
+        (flown.rebuilds, flown.holes),
+        (0, 0),
+        "the throttled flight jumped or had a hole: {flown:?}"
+    );
+    assert!(
+        flown.cut > frames / 2,
+        "the throttled flight held work back in {} of {frames} frames: {flown:?}",
+        flown.cut
+    );
+    // The follow steps are cut to the budget: none costs more than it (the unthrottled flight's
+    // largest is several times that), where the steps are the scene thread's, not the budget's.
+    assert!(
+        flown.largest_follow.bytes <= budget.bytes && flown.largest_follow.writes <= budget.writes,
+        "the throttled flight has a follow step of {:?}, over the budget of {budget:?} (the \
+         unthrottled flight's is {:?}): {flown:?}",
+        flown.largest_follow,
+        control.largest_follow
+    );
+    // And well under the unthrottled flight's worst update, in bytes and in copies.
+    assert!(
+        bytes * 3 < control_bytes && writes * 2 < control_writes,
+        "the throttled flight's worst update ({bytes} bytes, {writes} copies) is not well under \
+         the unthrottled flight's ({control_bytes} bytes, {control_writes} copies)"
+    );
+    // The design's bound on an update: the budget, the one operation (a follow step, cut to the
+    // budget, or a batch) that took what waits to it, and the first batch of the round, from the
+    // largest batch of the unthrottled flight. It is looser than that flight's own worst update, so
+    // it does not say the throttle works; it says nothing is more than the design allows.
+    let crossing = control.largest_batch;
+    let first = control.largest_batch;
+    let bound = (
+        budget.bytes + crossing.bytes + first.bytes,
+        budget.writes + crossing.writes + first.writes,
+    );
+    for (frame, &(listed, writes, gaps)) in flown.uploads.0.iter().enumerate() {
+        assert!(
+            listed <= bound.0 && writes <= bound.1,
+            "the throttled flight's update {frame}: {listed} bytes, {writes} copies, over {bound:?} \
+             (the budget {budget:?}, and the operations {crossing:?}, {first:?})"
+        );
+        assert!(
+            gaps <= u64::from(writes) * render::scene::COPY_GAP as u64 * 4,
+            "the throttled flight's update {frame}: {gaps} bytes between copies"
+        );
+    }
+}
+
+/// What `follow_with_an_outbox_that_is_not_taken` saw.
+#[derive(Debug)]
+struct Unseen {
+    /// The five places the camera was put at, in order.
+    path: [[f64; 3]; 5],
+    /// Follow steps the scene thread took, and where it had moved the scene to, as of the frame
+    /// after two rounds that the frame thread did not take what they published, and as of the
+    /// frame after that. Follow steps are counted from the frame before the rounds.
+    held: (u64, Option<[f64; 3]>),
+    resumed: (u64, Option<[f64; 3]>),
+    /// Where the scene was once nothing waited.
+    end: Option<[f64; 3]>,
+    /// The bricks drawn at each level at the end, as the table lists them, once nothing waits.
+    listed: Vec<usize>,
+}
+
+/// A stepped world that has filled in, with the camera moved along a path in five places: the first
+/// as a frame (the scene thread follows, the frame thread takes what it publishes), then two
+/// rounds in which the scene thread is given the next places and the frame thread does not take
+/// (a slow frame: what the scene thread published waits in the outbox), then two frames. Each frame
+/// checks, as the tracer writes, that the GPU copy is the scene and that there is no hole. With
+/// `budget`, a budget under any one patch, what waits in the outbox is over it from the first of
+/// those rounds on, until a frame takes it; with `None`, the default one, it is not.
+fn follow_with_an_outbox_that_is_not_taken(budget: Option<render::UploadCost>) -> Unseen {
+    let (mut world, _server, camera) = spawned_world(Run::Stepped);
+    world.count_exactly();
+    fill(&mut world, camera.position);
+    if let Some(budget) = budget {
+        world.worker().set_upload_budget(budget);
+    }
+    let mut gpu = GpuCopy::of(world.scene());
+    let (ahead, _) = tangents(camera.horizon_up);
+    let path: [[f64; 3]; 5] = std::array::from_fn(|n| {
+        let moved = std::array::from_fn(|a| camera.position[a] + ahead[a] * 8.0 * (n + 1) as f64);
+        over_the_ground(&world.store(), moved)
+    });
+    let mut frames = 0;
+    let mut frame = |world: &mut World, position: [f64; 3]| {
+        if let Some(update) = world.recentre(position).unwrap() {
+            gpu.write(world.scene(), &update);
+        }
+        gpu.assert_is(world.scene(), frames);
+        assert_eq!(world.stats().holes, 0, "frame {frames}: a hole");
+        frames += 1;
+    };
+    frame(&mut world, path[0]);
+    let before = world.stats().work.follow_steps;
+    // The scene thread is given the next place twice, and publishes what following to the first
+    // costs: that waits in the outbox, with nothing to take it.
+    for place in &path[1..3] {
+        world.worker().follow_moving(*place, [0.0; 3]);
+        world.worker().step();
+    }
+    // Its round in this frame has the outbox as the two left it, then the frame takes it.
+    frame(&mut world, path[3]);
+    let stats = world.stats();
+    let held = (stats.work.follow_steps - before, stats.camera);
+    frame(&mut world, path[4]);
+    let stats = world.stats();
+    let resumed = (stats.work.follow_steps - before, stats.camera);
+    let mut patience = Patience::new(Duration::from_secs(180));
+    loop {
+        frame(&mut world, path[4]);
+        if idle(&world) && !world.stats().throttled {
+            break;
+        }
+        patience.wait(&world, || "the backlog does not drain".into());
+    }
+    Unseen {
+        path,
+        held,
+        resumed,
+        end: world.stats().camera,
+        listed: listed(world.scene()),
+    }
+}
+
+/// The throttle in `follow()`: while what the scene thread has published (or packed since) is over
+/// the budget, the camera is not followed, and it is when the frame thread has taken it, from where
+/// the scene is, by a step each round, with no hole and the scene that following in every round
+/// comes to.
+///
+/// Nothing else tests it: in the flights `stream` stops before the outbox is over the budget, so it
+/// never is when `follow` looks, and the flight's numbers are the same without the early return.
+/// Here the frame thread is slow on purpose, so the outbox is over the budget (any patch is over
+/// one byte) when the next round's `follow` looks: removing only `return Ok(false)` from it makes
+/// the held frame's counts those of the control and fails the first assertion on the throttled
+/// run.
+#[test]
+fn the_camera_is_not_followed_while_what_waits_is_over_the_budget_and_is_when_the_frame_thread_has_taken_it()
+ {
+    let control = follow_with_an_outbox_that_is_not_taken(None);
+    // The control follows in every round: the two that were not taken, and the frame after them.
+    assert_eq!(
+        (control.held.0, control.held.1),
+        (3, Some(control.path[3])),
+        "the unthrottled run did not follow in every round: {control:?}"
+    );
+    assert_eq!(
+        (control.resumed.0, control.resumed.1),
+        (4, Some(control.path[4])),
+        "{control:?}"
+    );
+    // A budget of one byte: a round follows by one step of the least size (a Voxel, see
+    // `Engine::next_place`) and is over the budget after it.
+    let budget = render::UploadCost {
+        bytes: 1,
+        writes: 1,
+    };
+    let held = follow_with_an_outbox_that_is_not_taken(Some(budget));
+    assert_eq!(held.path, control.path, "the runs' paths differ");
+    // The first round followed (nothing waited), as far as a step that makes a change; the
+    // second, and the frame's, found the outbox over the budget and did not: one follow step, and
+    // the scene short of the camera. (The unthrottled run follows to the camera in all three.)
+    assert_eq!(
+        held.held.0, 1,
+        "the camera was followed while what waited was over the budget and the frame thread had \
+         not taken it: {held:?}"
+    );
+    assert_ne!(held.held.1, Some(held.path[3]), "{held:?}");
+    // The frame after the one that took it follows again, and is not yet at the camera.
+    assert_eq!(
+        held.resumed.0, 2,
+        "the camera was not followed once the frame thread had taken what waited: {held:?}"
+    );
+    assert_ne!(held.resumed.1, Some(held.path[4]), "{held:?}");
+    // Nothing was lost to the hold: the scene walks on to the camera, with no hole in any frame
+    // (`follow_with_an_outbox_that_is_not_taken` checks each), and draws what following in every
+    // round comes to, within the hysteresis of the selection: no level has a percent more or
+    // fewer bricks drawn.
+    assert_eq!(held.end, Some(held.path[4]), "{held:?}");
+    for (level, (&held, &control)) in held.listed.iter().zip(&control.listed).enumerate() {
+        assert!(
+            held.abs_diff(control) * 100 <= control,
+            "level {level}: {held} bricks drawn against the unthrottled run's {control}"
+        );
+    }
+}
+
+/// A stepped world that has filled in, with `budget`, whose camera is put `far` Voxels along the
+/// ground in one move (a teleport), or gets there in moves of 16 Voxels that the scene thread does
+/// not look at until the last (it fell behind). Returns the rebuilds and the patches, the largest
+/// follow step, the most that one update listed, the frames until nothing waits, and whether the
+/// scene ended at the camera. Every frame checks the GPU copy against the scene and that there is
+/// no hole.
+fn put_the_camera_far_away(
+    budget: render::UploadCost,
+    far: f64,
+    teleport: bool,
+) -> (usize, usize, render::UploadCost, u64, usize, bool) {
+    let (rebuilds, patches, follow, listed, frames, there, _) =
+        put_the_camera_far_away_after(Before::Nothing, budget, far, teleport);
+    (rebuilds, patches, follow, listed, frames, there)
+}
+
+/// What the scene thread has been through before the camera is put far away (see
+/// [`put_the_camera_far_away_after`]), that the length of its follow steps learns from.
+#[derive(Clone, Copy, Debug)]
+enum Before {
+    Nothing,
+    /// 40 rounds in which the camera moves a Voxel (to and fro within one bucket of the
+    /// selection) and nothing changes: each is a step that moved and cost nothing.
+    QuietSteps,
+    /// 20 teleports (to the far place and back), each a rebuild, which no patch's cost is of.
+    Teleports,
+}
+
+/// [`put_the_camera_far_away`] after `before`, and the largest lag of the scene behind the camera
+/// that a frame saw ([`World::lag`]) as the last of the tuple.
+fn put_the_camera_far_away_after(
+    before: Before,
+    budget: render::UploadCost,
+    far: f64,
+    teleport: bool,
+) -> (usize, usize, render::UploadCost, u64, usize, bool, f64) {
+    let (mut world, _server, camera) = spawned_world(Run::Stepped);
+    world.count_exactly();
+    fill(&mut world, camera.position);
+    {
+        let (ahead, _) = tangents(camera.horizon_up);
+        let at = |metres: f64| -> [f64; 3] {
+            std::array::from_fn(|a| camera.position[a] + ahead[a] * metres)
+        };
+        match before {
+            Before::Nothing => {}
+            Before::QuietSteps => {
+                let patches_before = world.stats().work.follow_bricks;
+                for n in 0..40 {
+                    world.recentre(at((n % 2) as f64)).unwrap();
+                }
+                let changed = world.stats().work.follow_bricks - patches_before;
+                // The steps were quiet: the bricks that changed are those of the first (the
+                // selection settling on a camera that is a Voxel off the one it was filled at).
+                assert!(changed < 200, "{changed} bricks changed in the quiet steps");
+            }
+            Before::Teleports => {
+                let there = over_the_ground(&world.store(), at(far));
+                for _ in 0..20 {
+                    world.recentre(there).unwrap();
+                    world.recentre(camera.position).unwrap();
+                }
+            }
+        }
+        world.recentre(camera.position).unwrap();
+        fill(&mut world, camera.position);
+    }
+    world.worker().set_upload_budget(budget);
+    world.worker().forget_largest();
+    let mut gpu = GpuCopy::of(world.scene());
+    let (ahead, _) = tangents(camera.horizon_up);
+    let along = |world: &World, metres: f64| {
+        let moved = std::array::from_fn(|a| camera.position[a] + ahead[a] * metres);
+        over_the_ground(&world.store(), moved)
+    };
+    let target = along(&world, far);
+    if !teleport {
+        for n in 1..=(far / 16.0) as usize {
+            let at = along(&world, 16.0 * n as f64);
+            world.worker().follow_moving(at, [0.0; 3]);
+        }
+    }
+    let (mut rebuilds, mut patches, mut listed_most) = (0, 0, 0);
+    let (mut frames, mut lag) = (0, 0.0f64);
+    let mut patience = Patience::new(Duration::from_secs(180));
+    loop {
+        let update = world.recentre(target).unwrap();
+        lag = lag.max(world.lag(target));
+        match update {
+            Some(SceneUpdate::Rebuilt) => {
+                rebuilds += 1;
+                gpu.write(world.scene(), &SceneUpdate::Rebuilt);
+            }
+            Some(update) => {
+                patches += 1;
+                listed_most = listed_most.max(Uploaded::of(world.scene(), &update).listed);
+                gpu.write(world.scene(), &update);
+            }
+            None => {}
+        }
+        gpu.assert_is(world.scene(), frames);
+        assert_eq!(world.stats().holes, 0, "frame {frames}: a hole");
+        frames += 1;
+        if idle(&world) && !world.stats().throttled && world.stats().camera == Some(target) {
+            break;
+        }
+        patience.wait(&world, || "the backlog does not drain".into());
+    }
+    (
+        rebuilds,
+        patches,
+        world.stats().largest_follow,
+        listed_most,
+        frames,
+        world.stats().camera == Some(target),
+        lag,
+    )
+}
+
+/// A budget over what a follow step of the least size costs here (a bucket of 4 Voxels of the
+/// camera's travel: about 100 KB), and under what a walk of hundreds of Voxels does.
+const WALKING_BUDGET: render::UploadCost = render::UploadCost {
+    bytes: 256 << 10,
+    writes: 32,
+};
+
+#[test]
+fn a_camera_that_the_scene_fell_far_behind_is_walked_to_in_steps_within_the_budget_and_one_that_was_put_there_is_jumped_to()
+ {
+    // Four jumps (a jump is 2 `d0`: 128 Voxels on these bands) away.
+    let far = 4.0 * render::scene::JUMP * D0;
+    let (rebuilds, patches, follow, listed, frames, there) =
+        put_the_camera_far_away(WALKING_BUDGET, far, false);
+    eprintln!("walked: {rebuilds} rebuilds, {patches} patches, {follow:?}, {listed}, {frames}");
+    assert!(there, "the scene did not reach the camera");
+    // Never made again (which would upload the whole scene: 871 MB at full size), though it was
+    // more than a jump behind.
+    assert_eq!(
+        rebuilds, 0,
+        "the scene was made again: it fell behind by more than a jump"
+    );
+    // In many patches, each step of the follow within the budget: not in one operation of many
+    // times it (the walk of 512 Voxels costs several MB here).
+    assert!(
+        patches > 8 && frames > 8,
+        "{patches} patches in {frames} frames"
+    );
+    assert!(
+        follow.bytes <= WALKING_BUDGET.bytes && follow.writes <= WALKING_BUDGET.writes,
+        "a follow step of {follow:?} is over the budget of {WALKING_BUDGET:?}"
+    );
+    // A camera that was put there in one move is still jumped to: the scene is made again, as that
+    // is cheaper than walking.
+    let (rebuilds, ..) = put_the_camera_far_away(WALKING_BUDGET, far, true);
+    assert_eq!(rebuilds, 1, "a teleport is not made again");
+}
+
+/// A small budget, so that the follow steps of a stepped scene thread are short (a Voxel or two:
+/// the step that a share of this budget over the least cost of a Voxel comes to), and a camera
+/// that goes at 24 Voxels a frame is not kept up with. A step costs 100 to 145 KB here, whatever its
+/// length (the regions that it rewrites are written whole), which is within the budget. The stepped
+/// runs are the same every time, so the margins hold. (On this Planet a step's cost does not depend
+/// on its length enough for the limit on it to be what keeps it in the budget: at full size it
+/// is, 34 KB a Voxel against 34 MB for half a jump; see
+/// `a_follow_step_is_sized_by_how_its_cost_compared_to_its_share_and_is_never_over_the_limit`.)
+const STEP_BUDGET: render::UploadCost = render::UploadCost {
+    bytes: 192 << 10,
+    writes: 32,
+};
+
+/// What a follow step costs after steps that cost nothing (a run of quiet ones, and teleports,
+/// which are rebuilds and no patch's cost) and after none: it is within the budget whatever came
+/// before. The length of a step is limited by [`crate::scene_worker`]'s `FOLLOW_MIN_COST`, and was
+/// by a floor under a rate; the first 4090 run followed in one step of 17 to 34 MB.
+#[test]
+fn a_follow_step_is_within_the_budget_after_a_run_of_quiet_steps_and_after_teleports() {
+    let far = 4.0 * render::scene::JUMP * D0;
+    for before in [Before::Nothing, Before::QuietSteps, Before::Teleports] {
+        let (rebuilds, patches, follow, _, frames, there, lag) =
+            put_the_camera_far_away_after(before, STEP_BUDGET, far, false);
+        eprintln!(
+            "{before:?}: {rebuilds} rebuilds, {patches} patches, {follow:?}, {frames} frames, lag {lag}"
+        );
+        assert!(there, "{before:?}: the scene did not reach the camera");
+        assert_eq!(rebuilds, 0, "{before:?}: the scene was made again");
+        // Every step costs what the budget lets it, though the cap would let it be 64 Voxels
+        // (over the budget here): the budget sized it.
+        assert!(
+            follow.bytes <= STEP_BUDGET.bytes && follow.writes <= STEP_BUDGET.writes,
+            "{before:?}: a follow step of {follow:?} is over the budget of {STEP_BUDGET:?}"
+        );
+        assert!(patches > 8, "{before:?}: {patches} patches");
+        // The scene was behind by about all of the way when it first published: what `World::lag`
+        // is for, and it is a distance and not a count.
+        assert!(
+            lag > far * 0.5 && lag <= far + 1.0,
+            "{before:?}: the scene was at most {lag} Voxels behind a camera {far} away"
+        );
+    }
+}
+
+/// What it costs the scene thread to follow a camera that it cannot keep up with is in
+/// proportion to how far it walked the scene, not to how far the camera went. The selection looks
+/// at the nodes that the camera's travel (and that of the places it looks ahead to) can have changed;
+/// the places were the camera's plus its lead, so each round that was told a camera that had gone 24
+/// Voxels counted 24 more travel, however far the round walked the scene: every call looked at what
+/// 1 300 Voxels at full size (about 3 million nodes, 0.75 s) had made due, for a step of 64.
+/// Now the places are the scene's own plus the lead. The test is the model of that: the selection's
+/// travel (see [`render::Scene::travelled`]) is at most 2.5 times what the scene walked (2.0
+/// times, against 3.5 with the places from the camera: the camera goes 2.4 times as far as the
+/// scene walks here, and about 8 times at full size, where the difference is the 3 million nodes
+/// of each call); it cannot show the time, since the stepped clock does not measure the work.
+#[test]
+fn the_selection_travels_as_far_as_the_scene_walks_when_the_camera_goes_faster() {
+    let (mut world, _server, camera) = spawned_world(Run::Stepped);
+    world.count_exactly();
+    fill(&mut world, camera.position);
+    world.worker().set_upload_budget(STEP_BUDGET);
+    let (ahead, _) = tangents(camera.horizon_up);
+    let along = |world: &World, voxels: f64| {
+        let moved = std::array::from_fn(|a| camera.position[a] + ahead[a] * voxels);
+        over_the_ground(&world.store(), moved)
+    };
+    // 40 Voxels a frame, 2 400 a second: the places looked ahead to are 2 400 and 4 800 Voxels on.
+    let velocity: [f64; 3] = std::array::from_fn(|a| ahead[a] * 40.0 * 60.0);
+    // The first look ahead counts the places' whole distance, once: it is not what is measured.
+    world
+        .recentre_moving(along(&world, 40.0), velocity)
+        .unwrap();
+    let (began_at, began) = (world.stats().camera.unwrap(), world.stats().travelled);
+    for frame in 2..=60 {
+        let there = along(&world, 40.0 * f64::from(frame));
+        world.recentre_moving(there, velocity).unwrap();
+    }
+    let now = world.stats().camera.unwrap();
+    let walked = (0..3)
+        .map(|a| (now[a] - began_at[a]).powi(2))
+        .sum::<f64>()
+        .sqrt();
+    let travelled = world.stats().travelled - began;
+    let went = 40.0 * 59.0;
+    eprintln!("walked {walked:.0} Voxels, travelled {travelled:.0}, the camera went {went}");
+    assert!(
+        walked > 60.0 && walked < went * 0.75,
+        "the scene walked {walked} Voxels: it is to be well behind a camera that went {went}"
+    );
+    assert!(
+        travelled <= 2.5 * walked,
+        "the selection travelled {travelled} Voxels for a scene that walked {walked}"
+    );
+}
+
+/// A camera that is put somewhere in one move (a teleport) but ends within a jump of where the
+/// scene is (the scene was behind it, and it was put back toward it) is walked to, in steps
+/// within the budget: it is not patched in one operation of up to two `d0`, outside the budget
+/// (here 250 KB in one, against steps of 100 to 130 KB, and a budget of 192 KB between).
+#[test]
+fn a_teleport_that_ends_within_a_jump_of_the_scene_is_walked_to_within_the_budget() {
+    let (mut world, _server, camera) = spawned_world(Run::Stepped);
+    world.count_exactly();
+    fill(&mut world, camera.position);
+    world.worker().set_upload_budget(STEP_BUDGET);
+    world.worker().forget_largest();
+    let mut gpu = GpuCopy::of(world.scene());
+    let (ahead, _) = tangents(camera.horizon_up);
+    let jump = render::scene::JUMP * D0;
+    let along = |world: &World, voxels: f64| {
+        let moved = std::array::from_fn(|a| camera.position[a] + ahead[a] * voxels);
+        over_the_ground(&world.store(), moved)
+    };
+    // The camera is told of a place a jump behind the scene, then put 0.9 of a jump ahead of it:
+    // a move of 1.9 jumps, ending 0.9 jump from the scene, which has not looked.
+    let behind = along(&world, -jump * 0.9);
+    let target = along(&world, jump * 0.9);
+    world.worker().follow_moving(behind, [0.0; 3]);
+    world.worker().follow_moving(target, [0.0; 3]);
+    let (mut rebuilds, mut patches, mut frames) = (0, 0, 0);
+    let mut patience = Patience::new(Duration::from_secs(180));
+    loop {
+        match world.recentre(target).unwrap() {
+            Some(SceneUpdate::Rebuilt) => {
+                rebuilds += 1;
+                gpu.write(world.scene(), &SceneUpdate::Rebuilt);
+            }
+            Some(update) => {
+                patches += 1;
+                gpu.write(world.scene(), &update);
+            }
+            None => {}
+        }
+        gpu.assert_is(world.scene(), frames);
+        assert_eq!(world.stats().holes, 0, "frame {frames}: a hole");
+        frames += 1;
+        if idle(&world) && !world.stats().throttled && world.stats().camera == Some(target) {
+            break;
+        }
+        patience.wait(&world, || "the backlog does not drain".into());
+    }
+    let follow = world.stats().largest_follow;
+    eprintln!("{rebuilds} rebuilds, {patches} patches, {follow:?}");
+    assert_eq!(
+        rebuilds, 0,
+        "the scene was made again for a move within a jump"
+    );
+    assert!(
+        follow.bytes <= STEP_BUDGET.bytes && follow.writes <= STEP_BUDGET.writes,
+        "a follow step of {follow:?} is over the budget of {STEP_BUDGET:?}"
+    );
+    assert!(patches > 2, "{patches} patches: it was not walked");
+}
+
+#[test]
+fn a_scene_thread_that_is_busy_while_the_camera_flies_on_walks_to_it_after_and_does_not_end_in_a_rebuild()
+ {
+    // 24 Voxels a frame for 120 frames (2 s), with the scene thread inside one operation for the
+    // first 1.5 s, as the 4090's were: the camera is 2 000 Voxels ahead of the scene when it
+    // looks again (a jump is 128 here), and the scene is walked to it, not made again.
+    let flown = fly_counting_busy(None, 24.0, 120, true, Duration::from_millis(1500));
+    eprintln!("{flown:?}");
+    assert!(
+        flown.max_lag > render::scene::JUMP * D0,
+        "the scene was only {} Voxels behind at the most, which is no more than a jump: {flown:?}",
+        flown.max_lag
+    );
+    assert_eq!(
+        flown.rebuilds, 0,
+        "a flight that the scene fell {} Voxels behind in ended in a rebuild: {flown:?}",
+        flown.max_lag
+    );
+    assert_eq!(flown.holes, 0, "{flown:?}");
+}
+
+#[test]
+fn the_default_budget_is_over_what_a_baseline_fill_frame_uploaded_so_it_is_not_what_bounds_a_fill()
+{
+    // The #162 baseline's fill frames did about 2 MB in about 1 400 copies on the 4090 (frame time
+    // p99 4.9 ms). A budget under that bounds the fill, which the first one (128 copies) did: the
+    // 4090's fill took 1 035 s against 254 to 265 s. The stepped test planet cannot show it (its
+    // frames are a few dozen copies), so the constants are held to the measurement.
+    let budget = crate::scene_worker::UPLOAD_BUDGET;
+    assert!(budget.writes >= 1_400, "{budget:?}");
+    assert!(budget.bytes >= 2 << 20, "{budget:?}");
+}
+
+#[test]
+fn with_the_default_budget_a_fill_takes_about_as_many_frames_as_one_with_no_budget() {
+    let unbudgeted = fill_checked(render::UploadCost {
+        bytes: u64::MAX,
+        writes: u32::MAX,
+    });
+    let default = fill_checked(crate::scene_worker::UPLOAD_BUDGET);
+    eprintln!("unbudgeted {unbudgeted:?}\ndefault {default:?}");
+    assert!(
+        default.frames * 5 <= unbudgeted.frames * 6,
+        "a fill with the default budget takes {} frames, against {} with none",
+        default.frames,
+        unbudgeted.frames
+    );
+}
+
+/// A scene thread that holds work back for the budget goes on as soon as the frame thread has
+/// taken what waited, not when its own sleep ends. With a budget of one byte every round ends with
+/// the thread holding work back and waiting for the frame thread, and a frame every 2 ms takes what
+/// it published: the camera is still, so nothing but the take can wake it. The measure is how the
+/// thread's waits ended (`SceneWorker::throttled_waits`): by the wake or by the timeout
+/// (`THROTTLED_WAIT`, 20 ms). The share of frames that had an update, which this test counted
+/// before, depends on how much CPU the scene thread gets (5 of 250 in the real-thread job, where
+/// the other tests are running, and 270 of 287 alone), and a thread that is woken late looks like
+/// one that slept out its wait. A wait that ends by the timeout is one that nothing woke in 20 ms,
+/// which a frame every 2 ms does not allow unless the frame thread itself was stalled, so a loaded
+/// machine adds few; the allowance is half. The loop goes on until the thread has waited 40 times
+/// (or 8 s), as a starved thread waits few times in a short run. With the `notify_one` of
+/// `SceneWorker::take` removed every wait ends by the timeout (10 of 10, 22 of 22 in scratch
+/// runs). Real threads, so it is in `.github/real-thread-tests.txt`.
+#[test]
+fn a_throttled_scene_thread_goes_on_when_the_frame_thread_takes_what_waited() {
+    let (mut world, _server, camera) = spawned_world(Run::Threads(2));
+    world.worker().set_upload_budget(render::UploadCost {
+        bytes: 1,
+        writes: 1,
+    });
+    let (mut frames, mut with_update) = (0, 0);
+    let began = Instant::now();
+    while began.elapsed() < Duration::from_secs(8)
+        && world.worker().throttled_waits().0 < 40
+        && !idle(&world)
+    {
+        // Updates counted only while the loader still has work: a world that has filled in
+        // publishes nothing, whatever wakes the thread.
+        let loading = world.loader().is_some_and(|l| l.pending > 0);
+        let updated = world.recentre(camera.position).unwrap().is_some();
+        if loading {
+            frames += 1;
+            with_update += usize::from(updated);
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    let (waits, timeouts) = world.worker().throttled_waits();
+    eprintln!(
+        "{with_update} of {frames} frames had an update; {timeouts} of {waits} waits timed out"
+    );
+    assert!(frames >= 50, "only {frames} frames while the loader worked");
+    assert!(
+        waits >= 10,
+        "the thread waited {waits} times in {:?}: it did not hold work back, or was starved",
+        began.elapsed()
+    );
+    assert!(
+        timeouts * 2 <= waits,
+        "{timeouts} of {waits} waits of the scene thread ended by the timeout: it slept on after \
+         the frame thread took what waited"
+    );
+}
+
+#[test]
+fn after_one_batch_over_the_budget_further_batches_are_taken_again_once_the_backlog_has_drained() {
+    // A budget under what the fill's biggest batch costs, and over what a batch of a flight at a
+    // walking pace does: the fill goes over it once or more, and the flight after is no reason
+    // to take one batch a round. (The estimate that one more batch needs room for was the most a
+    // batch had ever cost, so after the fill it was over the budget with nothing waiting, and
+    // every round took the one batch that it is given and no more.)
+    let budget = render::UploadCost {
+        bytes: 100 << 10,
+        writes: 200,
+    };
+    let (mut world, _server, camera) = spawned_world(Run::Stepped);
+    world.count_exactly();
+    world.worker().set_upload_budget(budget);
+    let mut patience = Patience::new(Duration::from_secs(180));
+    loop {
+        world.recentre(camera.position).unwrap();
+        if idle(&world) && !world.stats().throttled {
+            break;
+        }
+        patience.wait(&world, || "the resident set does not fill".into());
+    }
+    let big = world.stats().largest_batch;
+    assert!(
+        big.bytes > budget.bytes,
+        "no batch was over the budget: {big:?}"
+    );
+    // The backlog is gone: nothing waits, and nothing is held back.
+    assert!(idle(&world) && !world.stats().throttled);
+    let (ahead, _) = tangents(camera.horizon_up);
+    let (mut moved, frames) = (camera.position, 120);
+    let before = world.stats().work;
+    for _ in 0..frames {
+        moved = std::array::from_fn(|a| moved[a] + ahead[a] * 2.0);
+        let position = over_the_ground(&world.store(), moved);
+        world.recentre(position).unwrap();
+        pace(&world, FRAME);
+    }
+    let batches = world.stats().work.pack_steps - before.pack_steps;
+    eprintln!("{batches} batches in {frames} frames, after a batch of {big:?}");
+    // More than the one a round is always given.
+    assert!(
+        batches as usize >= frames + frames / 4,
+        "{batches} batches in {frames} frames: one a round, as if the budget were still over"
+    );
 }

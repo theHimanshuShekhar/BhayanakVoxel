@@ -13,7 +13,36 @@ use super::stream::StreamReport;
 /// 9 added the slow-frame fields to its paths (`frames_over_limit`, `slowest`, `end_look_ms`) and
 /// made a run's `edit_latency` null when there was no Edit (`edit_not_made` says why).
 /// 10 added the GPU's own pass times of a slow frame and the frames over the limit by update kind.
-pub const SCHEMA_VERSION: u32 = 10;
+/// 11 added the upload budget's figures (#145): a frame's copies, the 99th percentile of its bytes
+/// and copies, the frames the budget cut and the longest backlog, in the stepped streaming mode's
+/// `upload` and in each path of the real-time mode (`upload`).
+/// 12 added what the review of #145 asked to be able to judge: in each real-time path's `upload`
+/// the frames over the plain budget by cause (`over_budget`) and the growths (`growth_frames`,
+/// `grown_bytes`, `lengthen_ms_max`, `grow_ms_max`); in each slow frame the growth's cost
+/// (`lengthen_ms`, `grow_ms`, `grown_bytes`) and `over_budget`; in `memory` the peak during a
+/// growth (`scene_gpu_peak_growth_mib`, `scene_host_peak_growth_mib`) and, apart, the GPU's peak
+/// while a rebuilt scene was made (`scene_gpu_peak_rebuild_mib`); and in the stepped mode's
+/// `timing` the copies the GPU side counted (`gpu_uploaded_writes`) and the growth copies
+/// (`gpu_grown_bytes`). The stepped mode's counts, and so its hash, are not changed by these.
+///
+/// 13 added what the 4090 run of #145 could not answer: in each real-time path `largest_updates`
+/// (the five frames whose update copied the most bytes, in the form of `slowest`) and
+/// `over_limit_at` (the places of the first frames over the limit), to read the slow frames against
+/// the big updates. The stepped mode's counts and hash are not changed by these.
+///
+/// 14 added in each real-time path how far the scene was behind the camera (`scene_lag_voxels_max`
+/// and `scene_lag_d0_max`: the largest distance, at a publish, between the camera the scene thread
+/// had been told and the scene's centre), and took `over_limit_at` out of `min` and `max`: a list
+/// of the places of frames is of one run, and stays under `runs` only. The stepped mode's counts
+/// and hash are not changed.
+///
+/// 15 measured that lag where it is seen: at each frame, the distance between the frame thread's
+/// camera and the centre of the scene it draws (14's was between the camera the scene thread had
+/// been told and the scene's centre at a publish, which a follow that ended at the camera it was
+/// told brought to 0 however far the camera had gone since), with the 99th percentile
+/// (`scene_lag_voxels_p99`, `scene_lag_d0_p99`) added to the most. The stepped mode's counts and
+/// hash are not changed.
+pub const SCHEMA_VERSION: u32 = 15;
 
 /// One timed thing (a pass, or the GPU total of a profiler frame) in one mode, against its
 /// budget. In reference mode a profiler frame is one sample, so the entries of that mode have
@@ -504,7 +533,7 @@ mod tests {
                 "streaming_real_time"
             ]
         );
-        assert_eq!(json["schema_version"], 10);
+        assert_eq!(json["schema_version"], 15);
         assert_eq!(json["streaming"], serde_json::Value::Null);
         assert_eq!(json["streaming_real_time"], serde_json::Value::Null);
         assert_eq!(
