@@ -18,9 +18,6 @@
 //! a shot names the [`Place`]s for hand-placed stamps: what kind, and the empty Voxel that touches
 //! a surface and the way that surface faces. What a stamp is made of is for whoever places one.
 
-// Nothing but the tests reads the shot list until the look-dev prototype and M1b do, and the
-// hues are the whole palette of #135 although the shot list uses some.
-#![allow(dead_code, unused_imports)]
 // PROTOTYPE (#148) code, thrown away: AgX's published constants, and a plain save().
 #![allow(clippy::excessive_precision, clippy::too_many_arguments)]
 
@@ -31,14 +28,19 @@ mod finder;
 mod post;
 mod run;
 mod shading;
+// The record's checks are the only readers of its generator, seed and radius outside the tests.
+#[cfg_attr(not(test), allow(dead_code))]
 mod shots;
 mod stamps;
 
 pub use run::main;
 
-pub use shots::{RECORDED_FOR, SHOTS};
+#[cfg_attr(not(test), allow(unused_imports))]
+pub use shots::{RECORDED_FOR, RECORDED_RADIUS, RECORDED_SEED, SHOTS};
 
-/// The crystal Materials' hues (#135): six to eight opaque, glossy, emissive crystals.
+/// The crystal Materials' hues (#135): six to eight opaque, glossy, emissive crystals. All eight
+/// are here, although the shot list uses some of them.
+#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Hue {
     Blue,
@@ -52,6 +54,7 @@ pub enum Hue {
 }
 
 /// What a hand-placed stamp is, where the generators of M1b do not make it yet.
+#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Stamp {
     /// A cluster of opaque emissive crystal growing out of the surface, of one hue.
@@ -68,6 +71,7 @@ pub enum Stamp {
 
 /// A place for a stamp: the empty Voxel that touches a surface, and the way that surface faces
 /// (the axis the stamp grows along: `[0, 1, 0]` is a floor where +y is up).
+#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Place {
     pub stamp: Stamp,
@@ -77,6 +81,7 @@ pub struct Place {
 
 /// The hues of a crystal cave: the dominant one, the accents, and the floor beds in a second
 /// hue (#135).
+#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CavePalette {
     pub dominant: Hue,
@@ -86,6 +91,7 @@ pub struct CavePalette {
 
 /// One camera keyframe of a shot, in Voxels from the Planet's centre, with the roll of the debug
 /// free camera there (radians, `render::Camera::roll`).
+#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Key {
     pub position: [f64; 3],
@@ -94,6 +100,7 @@ pub struct Key {
 }
 
 /// One shot of the flythrough.
+#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug)]
 pub struct Shot {
     pub name: &'static str,
@@ -108,6 +115,7 @@ pub struct Shot {
     pub cave: Option<CavePalette>,
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 impl Shot {
     /// The shot as a bench camera path: horizon levelled to the Planet's up where the camera is,
     /// rolled as recorded.
@@ -164,6 +172,13 @@ mod tests {
                 "pull-out to the Planet",
             ]
         );
+    }
+
+    #[test]
+    fn the_places_are_those_of_the_seed_and_radius_the_client_has() {
+        // The generator version alone would not notice a new seed or a new radius.
+        assert_eq!(RECORDED_SEED, crate::SEED);
+        assert_eq!(RECORDED_RADIUS, WORLD_RADIUS);
     }
 
     #[test]
