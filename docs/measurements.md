@@ -313,3 +313,11 @@ Measured on the RTX 4090 on 2026-11-01 ([#99](https://github.com/theHimanshuShek
 - **One sample by part**, open view at 1440p (2.59 ms): the primary ray 0.52 ms, the sun's shadow ray 0.34 ms, bounces 1 to 4 1.04, 0.37, 0.21 and 0.12 ms. In the pit the bounces are 85 % of 6.1 ms.
 - **Stopping tiles early** would save 3.7 times the work at the 0.02 line on the open view and 1.5 times in the pit; 8 to 13 times at the 0.05 line. About 41 % of the open view's tiles, the sky, pass at 1 sample.
 
+
+### The bench's convergence phase (#187, 2026-11-14)
+
+`client bench` now draws these curves itself (`docs/agents/benchmarking.md`, "The convergence phase"), so the table above is the baseline that a run of the phase is compared with, and #188's estimator and #189's still-frame policy are measured against. The views are #99's, on the patch of the *test* Planet: `golden` is the reference golden's view, `pit` is #99's `interreflect` view (the same hillside, box, depth below the rim, camera and sun, in Voxels; at 5 cm Voxels it is 2 m by 3 m and 2 m deep, where #99's was 4 m by 6 m and 4 m deep). The seeds, FLIP (LDR, ppd 67.02, `flip-rs` 0.1.2), the checkpoints and the truths' seeds are #99's.
+
+- **The 4090 baseline of the phase is not here yet.** The owner runs `client.exe bench --truth-spp 8192 --out bench-out` on the 4090 and posts it on #187; the numbers go into the table above beside #99's when they have.
+- **What can differ from #99 without the code being wrong:** the encoding FLIP is given (the image the player sees, a gamma of 2.2, where ADR 0005 says sRGB), the pit's dimensions in metres (the pictures are the same), the driver, and the clocks (the bench does not lock them). Differences larger than the run-to-run noise of #99's own table should be looked into before they are taken as a change.
+- **On lavapipe (this box)**, at 96 by 54 with FLIP, the phase gives sensible curves and a floor under them; the numbers are of no use as timings. FLIP at 2560x1440 took 0.25 s an image (0.47 s with its statistics) on this box's CPU.

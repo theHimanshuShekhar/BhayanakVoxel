@@ -72,8 +72,14 @@ fn variance_of_one_sample() -> [f64; 3] {
 /// and `want`, and the per-channel mean variance the answer predicts for one sample.
 fn mse_against(accumulation: &[f32], want: [f64; 3]) -> f64 {
     let squares: f64 = accumulation
-        .chunks_exact(3)
-        .map(|p| (0..3).map(|c| (f64::from(p[c]) - want[c]).powi(2)).sum::<f64>())
+        .as_chunks::<3>()
+        .0
+        .iter()
+        .map(|p| {
+            (0..3)
+                .map(|c| (f64::from(p[c]) - want[c]).powi(2))
+                .sum::<f64>()
+        })
         .sum();
     squares / accumulation.len() as f64
 }
@@ -108,7 +114,9 @@ fn the_squared_error_against_a_known_answer_falls_as_one_over_n() {
     let predicted = variance_of_one_sample().iter().sum::<f64>() / 3.0;
     for (&n, &error) in COUNTS.iter().zip(&errors) {
         let per_sample = error * f64::from(n);
-        eprintln!("N = {n:>3}: MSE {error:.3e}, N * MSE {per_sample:.3e} (predicted {predicted:.3e})");
+        eprintln!(
+            "N = {n:>3}: MSE {error:.3e}, N * MSE {per_sample:.3e} (predicted {predicted:.3e})"
+        );
         assert!(
             (per_sample / predicted - 1.0).abs() < 0.25,
             "N = {n}: N * MSE = {per_sample:.3e}, the answer predicts {predicted:.3e}"
@@ -126,7 +134,11 @@ fn the_squared_error_against_a_known_answer_falls_as_one_over_n() {
         xs.iter().sum::<f64>() / xs.len() as f64,
         ys.iter().sum::<f64>() / ys.len() as f64,
     );
-    let slope = xs.iter().zip(&ys).map(|(x, y)| (x - mx) * (y - my)).sum::<f64>()
+    let slope = xs
+        .iter()
+        .zip(&ys)
+        .map(|(x, y)| (x - mx) * (y - my))
+        .sum::<f64>()
         / xs.iter().map(|x| (x - mx).powi(2)).sum::<f64>();
     assert!(
         (slope + 1.0).abs() < 0.1,
@@ -179,7 +191,13 @@ fn the_image_that_is_read_back_is_the_accumulation_encoded() {
     let mut offscreen = offscreen();
     let accumulation = accumulate(&mut offscreen, SEED, 16);
     let image = offscreen.render_reference(&overhead(), 0);
-    for (pixel, linear) in image.rgba.chunks_exact(4).zip(accumulation.chunks_exact(3)) {
+    for (pixel, linear) in image
+        .rgba
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(accumulation.as_chunks::<3>().0)
+    {
         for c in 0..3 {
             let shown = f64::from(linear[c]).clamp(0.0, 1.0).powf(1.0 / 2.2) * 255.0;
             assert!(

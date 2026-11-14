@@ -57,7 +57,9 @@ pub fn mse(a: &[f32], b: &[f32]) -> f64 {
 
 /// RGB bytes of an RGBA image, which is what FLIP reads.
 pub fn rgb_of_rgba(rgba: &[u8]) -> Vec<u8> {
-    rgba.chunks_exact(4)
+    rgba.as_chunks::<4>()
+        .0
+        .iter()
         .flat_map(|p| [p[0], p[1], p[2]])
         .collect()
 }
@@ -206,11 +208,20 @@ mod tests {
         let mut brighter = grey.clone();
         brighter.iter_mut().for_each(|v| *v = 200);
         let same = flip(&grey, &grey, size).unwrap();
-        assert_eq!(same, Flip { mean: 0.0, p99: 0.0 });
+        assert_eq!(
+            same,
+            Flip {
+                mean: 0.0,
+                p99: 0.0
+            }
+        );
         let different = flip(&grey, &brighter, size).unwrap();
         // A flat difference has one value everywhere: the mean and the percentile agree.
         assert!((different.mean - 0.578).abs() < 0.01, "{different:?}");
-        assert!((different.p99 - different.mean).abs() < 0.001, "{different:?}");
+        assert!(
+            (different.p99 - different.mean).abs() < 0.001,
+            "{different:?}"
+        );
         assert!(flip(&grey, &grey[..10], size).is_err());
     }
 }

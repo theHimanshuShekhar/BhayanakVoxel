@@ -152,7 +152,9 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Parsed, String> {
         return Err("--runs is for --real-time".into());
     }
     if parsed.truth_spp.is_some() && !parsed.convergence {
-        return Err("--truth-spp is for the convergence phase, which --no-convergence leaves out".into());
+        return Err(
+            "--truth-spp is for the convergence phase, which --no-convergence leaves out".into(),
+        );
     }
     // `--diag` says that the budgets are not checked, and the real-time mode's gates are checked
     // whatever it says (they are a failure of their own): the two do not go together.

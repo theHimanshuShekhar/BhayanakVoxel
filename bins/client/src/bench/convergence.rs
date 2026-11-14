@@ -263,8 +263,7 @@ pub fn run(settings: &Settings, out: &Path) -> Result<ConvergenceReport, Box<dyn
         views,
     };
     let csv = out.join(CSV_FILE);
-    fs::write(&csv, csv_of(&report))
-        .map_err(|e| format!("cannot write {}: {e}", csv.display()))?;
+    fs::write(&csv, csv_of(&report)).map_err(|e| format!("cannot write {}: {e}", csv.display()))?;
     Ok(report)
 }
 
@@ -297,24 +296,37 @@ fn run_view(view: View, settings: &Settings, out: &Path) -> Result<ViewReport, B
     gpu.set_keep_history(true);
     let info = gpu.gpu_info().clone();
     let folder = out.join(FOLDER).join(name);
-    fs::create_dir_all(&folder)
-        .map_err(|e| format!("cannot create {}: {e}", folder.display()))?;
+    fs::create_dir_all(&folder).map_err(|e| format!("cannot create {}: {e}", folder.display()))?;
     let last = settings.checkpoints.last().copied().unwrap_or(0);
 
     // The truths first: they warm the GPU's clocks and caches, and they are not timed.
     let truth = |gpu: &mut Offscreen, seed| {
-        draw(gpu, &view.camera, seed, &[settings.truth_spp], settings.truth_spp)
-            .pop()
-            .expect("a truth has samples")
+        draw(
+            gpu,
+            &view.camera,
+            seed,
+            &[settings.truth_spp],
+            settings.truth_spp,
+        )
+        .pop()
+        .expect("a truth has samples")
     };
     let truth_a = truth(&mut gpu, TRUTH_SEEDS[0]);
     let truth_b = truth(&mut gpu, TRUTH_SEEDS[1]);
 
     // The run, timed. What the scores take is done after it, with the GPU idle.
     let passes = gpu.timings();
-    let reference_from = passes.pass("reference").map_or(0, |p| p.times.history().len());
+    let reference_from = passes
+        .pass("reference")
+        .map_or(0, |p| p.times.history().len());
     let total_from = passes.total().history().len();
-    let checkpoints = draw(&mut gpu, &view.camera, RUN_SEED, &settings.checkpoints, last);
+    let checkpoints = draw(
+        &mut gpu,
+        &view.camera,
+        RUN_SEED,
+        &settings.checkpoints,
+        last,
+    );
     let timings = gpu.timings();
     let reference_times: Vec<f64> = timings
         .pass("reference")
@@ -341,7 +353,11 @@ fn run_view(view: View, settings: &Settings, out: &Path) -> Result<ViewReport, B
         eprintln!("convergence: {name}: FLIP of {what}...");
         score::flip(against, &rgb(test), pixels).map(Some)
     };
-    let floor_flip = flip("truth B against truth A (the floor)", &truth_b, &truth_a_rgb)?;
+    let floor_flip = flip(
+        "truth B against truth A (the floor)",
+        &truth_b,
+        &truth_a_rgb,
+    )?;
     let floor = Floor {
         flip_mean: floor_flip.map(|f| f.mean),
         flip_p99: floor_flip.map(|f| f.p99),
@@ -381,14 +397,28 @@ fn run_view(view: View, settings: &Settings, out: &Path) -> Result<ViewReport, B
                 flip: line,
                 samples: reach.samples,
                 how: reach.how,
-                gpu_s: reach.samples.zip(reference.mean_ms).map(|(n, ms)| n * ms / 1e3),
-                gpu_s_p95: reach.samples.zip(reference.p95_ms).map(|(n, ms)| n * ms / 1e3),
+                gpu_s: reach
+                    .samples
+                    .zip(reference.mean_ms)
+                    .map(|(n, ms)| n * ms / 1e3),
+                gpu_s_p95: reach
+                    .samples
+                    .zip(reference.p95_ms)
+                    .map(|(n, ms)| n * ms / 1e3),
                 counts: line >= MIN_LINE_OVER_FLOOR * floor_mean,
             });
         }
     }
 
-    let mut files = write_files(&folder, &view, &info, settings, &truth_a, &truth_b, &checkpoints)?;
+    let mut files = write_files(
+        &folder,
+        &view,
+        &info,
+        settings,
+        &truth_a,
+        &truth_b,
+        &checkpoints,
+    )?;
     files.sort();
     let megapixels = f64::from(settings.size.0) * f64::from(settings.size.1) / 1e6;
     Ok(ViewReport {
@@ -428,6 +458,9 @@ struct TruthInputs<'a> {
     note: &'static str,
 }
 
+/// Writes one file at the path it is given.
+type Writer<'a> = dyn Fn(&Path) -> Result<(), Box<dyn Error>> + 'a;
+
 /// Writes the pictures, and the truths with their inputs, to `folder`; returns the names.
 fn write_files(
     folder: &Path,
@@ -439,7 +472,7 @@ fn write_files(
     checkpoints: &[Capture],
 ) -> Result<Vec<String>, Box<dyn Error>> {
     let mut names = Vec::new();
-    let mut put = |name: String, write: &dyn Fn(&Path) -> Result<(), Box<dyn Error>>| {
+    let mut put = |name: String, write: &Writer<'_>| {
         let path = folder.join(&name);
         write(&path)?;
         names.push(name);
@@ -449,7 +482,9 @@ fn write_files(
         ("truth-a", TRUTH_SEEDS[0], truth_a),
         ("truth-b", TRUTH_SEEDS[1], truth_b),
     ] {
-        put(format!("{label}.png"), &|path| write_png(path, &truth.image))?;
+        put(format!("{label}.png"), &|path| {
+            write_png(path, &truth.image)
+        })?;
         put(format!("{label}.f32"), &|path| {
             let bytes: Vec<u8> = truth.linear.iter().flat_map(|v| v.to_le_bytes()).collect();
             fs::write(path, bytes).map_err(|e| format!("cannot write {}: {e}", path.display()))?;
@@ -521,7 +556,8 @@ pub fn csv_of(report: &ConvergenceReport) -> String {
 
 /// The phase in brief, for whoever is watching the run.
 pub fn print_summary(report: &ConvergenceReport) {
-    let num = |v: Option<f64>, digits: usize| v.map_or("n/a".to_string(), |v| format!("{v:.digits$}"));
+    let num =
+        |v: Option<f64>, digits: usize| v.map_or("n/a".to_string(), |v| format!("{v:.digits$}"));
     for view in &report.views {
         eprintln!(
             "convergence, {} ({}x{}): one sample {} ms (p95 {}), {} ms per megapixel; floor FLIP {} (mse {:.3e})",
@@ -724,9 +760,17 @@ mod tests {
         for view in &report.views {
             // The curve falls: more samples are closer to the truth, by every score.
             let flips: Vec<f64> = view.curve.iter().map(|p| p.flip_mean.unwrap()).collect();
-            assert!(flips.windows(2).all(|w| w[1] < w[0]), "{} {flips:?}", view.name);
+            assert!(
+                flips.windows(2).all(|w| w[1] < w[0]),
+                "{} {flips:?}",
+                view.name
+            );
             let mses: Vec<f64> = view.curve.iter().map(|p| p.mse_linear).collect();
-            assert!(mses.windows(2).all(|w| w[1] < w[0]), "{} {mses:?}", view.name);
+            assert!(
+                mses.windows(2).all(|w| w[1] < w[0]),
+                "{} {mses:?}",
+                view.name
+            );
             // The floor is under what the first sample scores.
             assert!(view.floor.flip_mean.unwrap() < flips[0]);
             assert!(view.floor.flip_p99.unwrap() >= view.floor.flip_mean.unwrap());
@@ -741,7 +785,11 @@ mod tests {
             }
         }
         let csv = fs::read_to_string(out.join(CSV_FILE)).unwrap();
-        assert!(csv.lines().skip(1).all(|r| r.split(',').nth(3).is_some_and(|c| !c.is_empty())));
+        assert!(
+            csv.lines()
+                .skip(1)
+                .all(|r| r.split(',').nth(3).is_some_and(|c| !c.is_empty()))
+        );
         let _ = fs::remove_dir_all(&out);
     }
 }

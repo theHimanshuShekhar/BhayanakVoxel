@@ -167,11 +167,7 @@ pub fn pit() -> View {
             f64::from(pit.rim_high_y) + 20.0,
             f64::from(PIT_Z.1) + 14.0,
         ],
-        [
-            cx,
-            f64::from(pit.floor_y) + 8.0,
-            f64::from(PIT_Z.0) + 25.0,
-        ],
+        [cx, f64::from(pit.floor_y) + 8.0, f64::from(PIT_Z.0) + 25.0],
     );
     let camera = Camera::looking_at(from, to);
     let sun_angles = (std::f32::consts::PI + 0.26, 0.8, 0.04);

@@ -70,7 +70,10 @@ const GOLDEN_COUNTS: &str = include_str!("../src/bench/streaming-counts.golden")
 /// The convergence phase of a `--short` run (#187): a tiny ladder on both views, with no FLIP, which
 /// CI never runs (ADR 0005); what is checked is the shape of the block and the files.
 fn check_convergence(convergence: &Value, out: &Path) {
-    assert!(convergence.is_object(), "the phase runs unless it is left out");
+    assert!(
+        convergence.is_object(),
+        "the phase runs unless it is left out"
+    );
     assert_eq!(string(&convergence["scene"]), "patch");
     assert!(convergence["flip"].is_null(), "--short runs no FLIP");
     assert_eq!(convergence["checkpoints"], serde_json::json!([1, 4, 16]));
@@ -98,7 +101,10 @@ fn check_convergence(convergence: &Value, out: &Path) {
         assert!(number(&view["floor"]["mse_linear"]) >= 0.0);
         assert_eq!(view["lines"], serde_json::json!([]));
         let curve = view["curve"].as_array().expect("curve");
-        let samples: Vec<u64> = curve.iter().map(|p| p["samples"].as_u64().unwrap()).collect();
+        let samples: Vec<u64> = curve
+            .iter()
+            .map(|p| p["samples"].as_u64().unwrap())
+            .collect();
         assert_eq!(samples, [1, 4, 16]);
         for point in curve {
             assert!(point["flip_mean"].is_null() && point["flip_p99"].is_null());
@@ -127,10 +133,9 @@ fn check_convergence(convergence: &Value, out: &Path) {
         }
         let f32s = std::fs::metadata(folder.join("truth-a.f32")).unwrap().len();
         assert_eq!(f32s, width * height * 3 * 4);
-        let inputs: Value = serde_json::from_str(
-            &std::fs::read_to_string(folder.join("truth-a.json")).unwrap(),
-        )
-        .unwrap();
+        let inputs: Value =
+            serde_json::from_str(&std::fs::read_to_string(folder.join("truth-a.json")).unwrap())
+                .unwrap();
         assert_eq!(inputs["seed"], 1);
         assert_eq!(inputs["samples"], convergence["truth_spp"]);
         assert!(string(&inputs["note"]).contains("never compare"));
