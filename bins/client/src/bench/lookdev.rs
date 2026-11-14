@@ -21,12 +21,20 @@
 // Nothing but the tests reads the shot list until the look-dev prototype and M1b do, and the
 // hues are the whole palette of #135 although the shot list uses some.
 #![allow(dead_code, unused_imports)]
+// PROTOTYPE (#148) code, thrown away: AgX's published constants, and a plain save().
+#![allow(clippy::excessive_precision, clippy::too_many_arguments)]
 
 use super::path::{CameraPath, Keyframe};
 
 #[cfg(test)]
 mod finder;
+mod post;
+mod run;
+mod shading;
 mod shots;
+mod stamps;
+
+pub use run::main;
 
 pub use shots::{RECORDED_FOR, SHOTS};
 

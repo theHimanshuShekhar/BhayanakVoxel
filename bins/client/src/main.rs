@@ -1358,8 +1358,11 @@ impl ApplicationHandler for App {
 
 fn main() -> Result<ExitCode, Box<dyn Error>> {
     let mut args = std::env::args().skip(1);
-    if args.next().as_deref() == Some("bench") {
-        return Ok(bench::main(args));
+    match args.next().as_deref() {
+        Some("bench") => return Ok(bench::main(args)),
+        // PROTOTYPE (#148): the look-dev contact sheet.
+        Some("lookdev") => return Ok(bench::lookdev::main(args)),
+        _ => {}
     }
     let event_loop = EventLoop::new()?;
     event_loop.set_control_flow(ControlFlow::Poll);
