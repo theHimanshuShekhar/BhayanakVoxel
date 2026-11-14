@@ -79,6 +79,50 @@ fn the_sea_is_at_sea_level_and_the_ground_is_where_the_height_says() {
     assert!(oceans >= 3 && lands >= 3, "{oceans} oceans, {lands} lands");
 }
 
+/// The part of ADR 0007's claim that still can be held: the ground is where the generator's height
+/// in metres says it is, to a Voxel. The claim itself, that 10 cm and 5 cm Voxels make the same
+/// landscape, cannot be: there is one Voxel size (`VOXELS_PER_METRE`, one definition, held by a
+/// test) and the 10 cm heights it was held to came from another generator (#166), so no number
+/// recorded then applies. This catches a Voxel conversion in the generator that is off (a height
+/// taken in Voxels where metres are meant), and not a change of the landscape.
+#[test]
+fn the_ground_is_at_the_same_height_in_metres_as_the_generator_says_to_a_voxel() {
+    let sea = planet().sea_radius();
+    let (mut checked, mut worst) = (0, 0.0_f64);
+    for place in PLACES {
+        let d = direction(place);
+        let height = planet().ground_height(d);
+        // Down from 10 m over the ground, a Voxel at a time, to the first that is solid and
+        // neither water nor sea ice: the ground itself.
+        let mut found = None;
+        let mut at = height + 10.0 * VOXELS_PER_METRE;
+        while at > height - 10.0 * VOXELS_PER_METRE {
+            if planet()
+                .voxel(along(d, sea + at))
+                .is_some_and(|m| m != WATER && m != ICE)
+            {
+                found = Some(at);
+                break;
+            }
+            at -= 1.0;
+        }
+        let Some(found) = found else {
+            panic!("{place:?}: no ground within 10 m of {height} Voxels");
+        };
+        checked += 1;
+        worst = worst.max((found - height).abs());
+        // Within two Voxels: one that the point is rounded to a Voxel, and one that the ground
+        // slopes across it (the steepest is about 27 degrees, 0.5 Voxel a Voxel).
+        assert!(
+            (found - height).abs() <= 2.0,
+            "{place:?}: the generator says {} m, the Voxels have {} m",
+            height / VOXELS_PER_METRE,
+            found / VOXELS_PER_METRE
+        );
+    }
+    eprintln!("{checked} places, the most off {worst} Voxels");
+}
+
 #[test]
 fn nothing_is_higher_than_about_two_kilometres_or_lower_than_about_a_kilometre_down() {
     let map = planet().map();

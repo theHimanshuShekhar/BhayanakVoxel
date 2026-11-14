@@ -279,7 +279,15 @@ const COARSE_GOLDEN: &[(usize, [i32; 3], Kind, u64)] = &[
     (3, [-525024, -40092, -602795], Mixed, 0x2d04929c47734155),
     (3, [-525520, -36417, -602551], Mixed, 0x1b8d337d68897977),
     (8, [-525027, -40093, -602799], Mixed, 0x5b5c8f7e71601a08),
-    // The core's edge, the interior's, and the interior far from either.
+    // The core's edge. The molten core is 64 km, 1 280 000 Voxels, from the centre, which is
+    // brick 92 376 along each axis of a diagonal (`under` is a brick of level 0). The level 2
+    // brick over brick 92 364 is wholly inside it (molten core), the one over 92 368 is across
+    // it (1 279 962 to 1 280 016 Voxels from the centre: core and deep rock in one brick, and
+    // the level 3 one over it too), and the one over 92 376 is wholly outside it, by 0.4
+    // Voxels, so it is deep rock and not at the edge. The level 6 and 11 bricks hold it.
+    (2, [92364, 92376, 92376], Solid, 0x02c5150a75e71525),
+    (2, [92368, 92376, 92376], Mixed, 0x471f08b899b435a9),
+    (3, [92368, 92376, 92376], Mixed, 0x32ba41878a5672e9),
     (2, [92376, 92376, 92376], Solid, 0xd97e511494bfdb25),
     (6, [92376, 92376, 92376], Mixed, 0x99eba5730a5ffae1),
     (11, [92376, 92376, 92376], Mixed, 0xd7e1d9ad7b8617ef),

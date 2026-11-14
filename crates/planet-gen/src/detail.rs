@@ -252,19 +252,18 @@ impl Detail {
         )
     }
 
-    /// Bounds on the sum of the octaves, before it is scaled.
-    fn sum_bounds(&self, corners: &[[f64; 3]], size: f64) -> (f64, f64) {
+    /// The box of lattice points that holds the sphere of sea level's points under the box that
+    /// has `corners` among its corners; `None` near the centre, where there is none to give.
+    fn lattice_box(&self, corners: &[[f64; 3]]) -> Option<([i32; 3], [i32; 3])> {
         // Where the box's points are on the sphere of sea level, in lattice points: the box that
         // holds the corners', and room for the sphere's curve between them and the rounding.
         let mut low = [i32::MAX; 3];
         let mut high = [i32::MIN; 3];
-        let mut near = f64::INFINITY;
         for &corner in corners {
             let radius = crate::distance(corner);
-            near = near.min(radius);
             // Near the centre the directions of the box's points are not those of its corners.
             if radius < self.sea * VOXELS_PER_POINT / 2.0 {
-                return self.whole(size);
+                return None;
             }
             let at = self.lattice(corner, radius);
             for a in 0..3 {
@@ -276,10 +275,18 @@ impl Detail {
             .map(|a| f64::from(high[a] - low[a]))
             .fold(0.0, f64::max);
         // The rounding of a point to its lattice point is monotone, so a point of the box is
-        // within the corners' lattice points but for the sphere's curve between them.
-        let margin = 1 + (span * span / (8.0 * self.sea)).ceil() as i32;
-        let low = low.map(|l| l - margin);
-        let high = high.map(|h| h + margin);
+        // within the corners' lattice points but for the sphere's curve between them. A box that
+        // straddles two coordinate planes at a face's centre bulges across both: the cap over a
+        // box `span` wide is `span^2 / (4 sea)` deep, twice what one axis's bulge is.
+        let margin = 1 + (span * span / (4.0 * self.sea)).ceil() as i32;
+        Some((low.map(|l| l - margin), high.map(|h| h + margin)))
+    }
+
+    /// Bounds on the sum of the octaves, before it is scaled.
+    fn sum_bounds(&self, corners: &[[f64; 3]], size: f64) -> (f64, f64) {
+        let Some((low, high)) = self.lattice_box(corners) else {
+            return self.whole(size);
+        };
         let (mut lo, mut hi) = (0.0, 0.0);
         for (k, o) in OCTAVES.into_iter().enumerate() {
             if !has(o, size) {
@@ -456,7 +463,13 @@ mod tests {
     fn the_height_is_within_its_bounds_everywhere_in_a_box() {
         let detail = Detail::new(9, SEA);
         for (n, centre) in points().enumerate() {
-            for (width, size) in [(7.0, 1.0), (63.0, 8.0), (1000.0, 1.0), (60_000.0, 1.0)] {
+            for (width, size) in [
+                (7.0, 1.0),
+                (63.0, 8.0),
+                (1000.0, 1.0),
+                (3_500.0, 1.0),
+                (60_000.0, 1.0),
+            ] {
                 let corners: [[f64; 3]; 8] = std::array::from_fn(|i| {
                     std::array::from_fn(|a| centre[a] + if i >> a & 1 == 0 { 0.0 } else { width })
                 });
@@ -495,6 +508,49 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The box of lattice points holds every point of a box across a face's centre, 3 000 to
+    /// 4 000 Voxels wide at the test Planet's radius (the bulge there is across two axes: with
+    /// the margin of one axis, `span^2 / (8 sea)`, a point of the box falls outside it).
+    #[test]
+    fn the_lattice_box_holds_every_point_of_a_box_across_the_centre_of_a_face() {
+        let detail = Detail::new(0, SEA);
+        let sea = f64::from(SEA);
+        let mut worst = 0;
+        for width in [3_000.0, 3_500.0, 4_000.0, 8_192.0] {
+            for lift in [0.0, 0.5, 1.0] {
+                for face in 0..3 {
+                    let at = |u: f64, v: f64, w: f64| {
+                        let mut p = [0.0; 3];
+                        p[face] = sea - width * lift + w;
+                        p[(face + 1) % 3] = u - width / 2.0;
+                        p[(face + 2) % 3] = v - width / 2.0;
+                        p
+                    };
+                    let corners: Vec<[f64; 3]> = (0..8)
+                        .map(|i| {
+                            let c = |bit: i32| width * f64::from(i >> bit & 1);
+                            at(c(0), c(1), c(2))
+                        })
+                        .collect();
+                    let (low, high) = detail.lattice_box(&corners).unwrap();
+                    for i in 0..=32 {
+                        for j in 0..=32 {
+                            for w in [0.0, width] {
+                                let p =
+                                    at(width * f64::from(i) / 32.0, width * f64::from(j) / 32.0, w);
+                                let held = detail.lattice(p, crate::distance(p));
+                                for a in 0..3 {
+                                    worst = worst.max(low[a] - held[a]).max(held[a] - high[a]);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(worst <= 0, "{worst} lattice points outside the box");
     }
 
     #[test]
