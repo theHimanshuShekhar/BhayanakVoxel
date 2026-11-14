@@ -812,12 +812,13 @@ const HELD_FLIGHT: Held = HELD;
 /// with the scene thread).
 const HELD_FILL_SECS: f64 = 300.0;
 /// The most the drawn scene may use per copy (the words of the bricks it draws, in MiB), near the
-/// ground at the full bands: measured 474 MiB for 3.44 million drawn bricks at about 144 bytes
-/// each (the words of the bricks and their regions). The prefetch simulator's shell at rest, 227 to
-/// 259 MB (#49), is about half of that because it stops at the horizon, which the client does not
-/// yet: it draws the whole Planet (#143 re-checked it, `prefetch-sim`'s `built_size`). The bands
-/// bound the scene whatever the store holds, and the margins are not drawn, so this is a ceiling
-/// on the client, with some room over what was measured.
+/// ground at the full bands of the 320 km Planet. With the horizon cap (#146) it is 498 to 510 MiB
+/// for 3.18 million bricks, and 512 MiB with the camera 50 m up; without it, 792 MiB for 4.65
+/// million (at about 178 bytes each: the words of the bricks and their regions), and 474 MiB for
+/// 3.44 million on the 16 km Planet that this was first set for. The prefetch simulator's shell
+/// at rest is 391 MB (`prefetch-sim`'s `shell_size`). The bands bound the scene whatever the
+/// store holds, and the margins are not drawn, so this is a ceiling on the client, with little
+/// room over what was measured.
 const SCENE_MIB_MOST: f64 = 512.0;
 
 impl Held {
@@ -1051,8 +1052,7 @@ fn the_full_size_planet_streams_in_and_walking_over_it_does_not_stall() {
     );
     eprintln!(
         "the scene: {:.0} MiB used after the fill, at most {:.0} MiB in the flight (the prefetch \
-         simulator's horizon-capped shell at rest near the ground is 227 to 259 MB; the client \
-         draws the whole Planet)",
+         simulator's horizon-capped shell at rest near the ground is 391 MB at 320 km)",
         mib(scene_after_fill),
         mib(fly_updates.scene_peak)
     );
@@ -1078,9 +1078,14 @@ fn the_full_size_planet_streams_in_and_walking_over_it_does_not_stall() {
             fly_updates.held_peak,
             budget.limit()
         );
+        // Eviction runs once the store holds more than its limit, and the budget is sized from the
+        // shell of the whole Planet (#167 sizes it again): with the horizon cap (#146) the 5 km
+        // flight does not reach it, and then there is nothing to evict.
         assert!(
-            store.evicted_len() > 0,
-            "the flight was long enough to evict"
+            store.evicted_len() > 0 || fly_updates.held_peak <= budget.bricks,
+            "the flight held {} against a budget of {} and evicted nothing",
+            fly_updates.held_peak,
+            budget.bricks
         );
     }
     drop(store);
@@ -1925,12 +1930,24 @@ fn flying_away_and_back_keeps_the_store_within_its_budget_and_leaves_no_hole_or_
 
 /// A world like [`spawned_world`] with the residency margins of ADR 0004 and a `budget` if given.
 fn margined_world(run: Run, budget: Option<brick_store::Budget>) -> (World, ServerEnd, Camera) {
+    margined_world_under(run, budget, true)
+}
+
+/// [`margined_world`] with the horizon cap (#146) if `capped`, or without it.
+fn margined_world_under(
+    run: Run,
+    budget: Option<brick_store::Budget>,
+    capped: bool,
+) -> (World, ServerEnd, Camera) {
     let mut store = spawned_store();
     if let Some(budget) = budget {
         store.set_budget(budget);
     }
     let camera = crate::spawn_camera(ground());
     let mut scene = Scene::rings(&store, camera.position, bands(), bound()).unwrap();
+    if capped {
+        scene.set_horizon(&store, crate::horizon(planet())).unwrap();
+    }
     scene.set_margins(&store, render::lod::Margins::standard());
     let (world, server) = streamed(store, scene, camera.position, run);
     (world, server, camera)
@@ -1941,7 +1958,7 @@ fn margins_make_more_of_the_store_resident_and_draw_no_more() {
     let (mut plain, _s, camera) = spawned_world(Run::Stepped);
     fill(&mut plain, camera.position);
     plain.sync().unwrap();
-    let (mut margined, _s2, camera) = margined_world(Run::Stepped, None);
+    let (mut margined, _s2, camera) = margined_world_under(Run::Stepped, None, false);
     margined.count_soft_misses();
     // The count is live: with the Guard standing in for what the bands split, bricks are drawn
     // coarser than they ask until the fill is done.
@@ -2491,16 +2508,68 @@ fn soft_misses_on_the_flight_take_off_and_standing_paths() {
     eprintln!("coarsening steps: {}", world.stats().coarsening);
 }
 
+/// #146, in the real client at full size: what is drawn and held with the camera still at 2 m,
+/// 50 m, 500 m and 5 km over the spawn, each with the loader's work done (the camera is put there,
+/// and the scene follows it). Per height it prints the bricks drawn and the scene's MiB, the bricks
+/// the store counts and holds, and the process's size. With the horizon cap the drawn scene is
+/// the horizon's, and without it (`FULLSIZE_HORIZON=0`) it is the whole Planet's. A few minutes at
+/// each height at full size:
+/// `[FULLSIZE_HORIZON=0] cargo test --release -p client -- --ignored --nocapture resident_set_at`.
+#[test]
+#[ignore = "generates the full-size world map"]
+fn the_resident_set_at_2_m_50_m_500_m_and_5_km_over_the_spawn() {
+    let loaded = crate::load_planet();
+    let (client, _server) = loopback();
+    let mut world =
+        World::new(loaded.scene, Predictor::new(loaded.store), client).with_loader(loaded.loader);
+    let spawn = loaded.camera;
+    let began = Instant::now();
+    wait_idle(&mut world, spawn.position, Duration::from_secs(5400));
+    eprintln!("filled after {:.0?}", began.elapsed());
+    let up = spawn.horizon_up;
+    for metres in [2.0_f64, 50.0, 500.0, 5000.0] {
+        // 2 m is the spawn; the others are that much higher over it.
+        let camera: [f64; 3] = std::array::from_fn(|a| {
+            spawn.position[a] + up[a] * (metres - 2.0).max(0.0) * VOXELS_PER_METRE
+        });
+        let from = Instant::now();
+        wait_idle(&mut world, camera, Duration::from_secs(5400));
+        let by_level: Vec<usize> = (0..LEVELS).map(|l| world.level_bricks(l)).collect();
+        let store = world.store();
+        let held: usize = (0..store.level_count())
+            .map(|l| store.level(l).map_or(0, |l| l.len()))
+            .sum();
+        eprintln!(
+            "AT {metres} m: drawn {} bricks (per level {by_level:?}), scene {:.1} MiB used; store \
+             counts {} streamed and holds {held}; {} waiting; reached in {:.0?}; {}",
+            by_level.iter().sum::<usize>(),
+            world.used_bytes() as f64 / (1024.0 * 1024.0),
+            store.streamed_len(),
+            world.waiting(),
+            from.elapsed(),
+            memory(&world, "then"),
+        );
+    }
+}
+
 /// Streams with the camera at `camera` until the loader has nothing left (or `cap` is over). A
 /// jump back to a camera that no path counts, when it is not already there.
 fn wait_idle(world: &mut World, camera: [f64; 3], cap: Duration) {
     let began = Instant::now();
     let mut last = Instant::now();
+    // A camera that has only just moved is not seen by the scene thread yet, and what it asks for
+    // is not in the loader yet: idle is only believed once the scene is at the camera and it has held
+    // for a few seconds.
+    let mut idle_since: Option<Instant> = None;
     loop {
         world.recentre_moving(camera, [0.0; 3]).unwrap();
         world.stream::<RingsFull>(camera, |_, _| Ok(())).unwrap();
-        if idle(world) {
-            return;
+        if idle(world) && world.lag(camera) < 1.0 {
+            if idle_since.get_or_insert_with(Instant::now).elapsed() > Duration::from_secs(3) {
+                return;
+            }
+        } else {
+            idle_since = None;
         }
         if last.elapsed() > Duration::from_secs(30) {
             last = Instant::now();
