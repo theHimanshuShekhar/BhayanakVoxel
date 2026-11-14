@@ -19,7 +19,6 @@ const MAX_BOUNCES = 4u;
 // The sun's light on a surface facing it head on, as a multiple of albedo (its irradiance
 // divided by pi): a Lambertian surface at angle theta to the sun reflects albedo * cos(theta)
 // times this.
-const SUN_RADIANCE = vec3<f32>(1.6, 1.5, 1.35);
 // How far a ray starts inside the empty Voxel in front of the face it leaves, in Voxels. It
 // only has to beat the rounding of the hit position, so a ray cannot hit its own face.
 const NUDGE = 1e-3;
@@ -44,8 +43,12 @@ fn radiance(first: Ray, rng: ptr<function, u32>) -> vec3<f32> {
     var ray = first;
     var throughput = vec3<f32>(1.0);
     var light = vec3<f32>(0.0);
+    var first_t = -1.0;
     for (var bounce = 0u; bounce <= MAX_BOUNCES; bounce++) {
         let hit = trace(ray);
+        if bounce == 0u && hit.hit {
+            first_t = hit.t;
+        }
         if !hit.hit {
             light += throughput * sky(ray.dir);
             break;
@@ -58,12 +61,16 @@ fn radiance(first: Ray, rng: ptr<function, u32>) -> vec3<f32> {
         let to_sun = sample_cone(frame.sun.xyz, frame.sun.w, vec2<f32>(next_f32(rng), next_f32(rng)));
         let facing = dot(hit.normal, to_sun);
         if facing > 0.0 && !trace(leave(ray, hit, to_sun)).hit {
-            light += throughput * colour * SUN_RADIANCE * facing;
+            light += throughput * colour * frame.sun_rgb.xyz * facing;
         }
 
         throughput *= colour;
         let bounce_dir = cosine_hemisphere(hit.normal, vec2<f32>(next_f32(rng), next_f32(rng)));
         ray = leave(ray, hit, bounce_dir);
+    }
+    // Haze: what the camera ray crossed before its first hit, in the horizon's colour.
+    if first_t >= 0.0 && frame.horizon.w > 0.0 {
+        light = mix(frame.horizon.xyz, light, exp(-frame.horizon.w * first_t));
     }
     return light;
 }

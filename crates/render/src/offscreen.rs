@@ -491,6 +491,42 @@ impl Offscreen {
         self.read_image(encoder, &texture, size)
     }
 
+    /// PROTOTYPE (#148): sets the look-dev light of the reference path tracer.
+    pub fn set_look(&mut self, look: crate::tracer::Look) {
+        self.tracer.set_look(look);
+    }
+
+    /// PROTOTYPE (#148): [`Offscreen::render_reference`], read back as the linear HDR mean
+    /// (RGBA f32, rows from the top) rather than the encoded image.
+    pub fn render_reference_hdr(
+        &mut self,
+        camera: &Camera,
+        samples: u32,
+    ) -> (u32, u32, Vec<[f32; 4]>) {
+        let _ = self.render_reference(camera, samples);
+        let (width, height) = self.target.resolution().internal;
+        let size = u64::from(width) * u64::from(height) * 16;
+        let encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        let bytes = crate::read_buffer(
+            &self.device,
+            &self.queue,
+            encoder,
+            self.target.accum(),
+            size,
+        );
+        let pixels = bytes
+            .as_chunks::<16>()
+            .0
+            .iter()
+            .map(|p| {
+                std::array::from_fn(|i| f32::from_le_bytes(p[i * 4..i * 4 + 4].try_into().unwrap()))
+            })
+            .collect();
+        (width, height, pixels)
+    }
+
     /// Reads back `texture`, an image `(width, height)` big, after the work recorded in `encoder`,
     /// which ends the frame the profiler is timing (if any).
     fn read_image(

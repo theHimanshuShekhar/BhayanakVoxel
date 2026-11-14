@@ -21,6 +21,12 @@ struct Frame {
     params: vec4<u32>,
     // Where in its pixel primary visibility traces its ray, (0, 0) to (1, 1), then two unused.
     jitter: vec4<f32>,
+    // PROTOTYPE (#148), the look-dev light: the local up (zero: the world's +y), the sun's
+    // radiance, the sky at the zenith, and at the horizon with, in w, the haze per Voxel.
+    look_up: vec4<f32>,
+    sun_rgb: vec4<f32>,
+    zenith: vec4<f32>,
+    horizon: vec4<f32>,
 }
 
 @group(1) @binding(0) var<uniform> camera: Camera;
@@ -91,7 +97,8 @@ fn varied_albedo(material: u32, voxel: vec3<i32>) -> vec3<f32> {
 // A simple gradient from the horizon to the zenith, until the atmosphere replaces it. It uses
 // the world's y axis as up, which is right near the +y pole and nowhere else.
 fn sky(dir: vec3<f32>) -> vec3<f32> {
-    return mix(vec3<f32>(0.75, 0.82, 0.92), vec3<f32>(0.25, 0.45, 0.85), clamp(dir.y, 0.0, 1.0));
+    let up = select(vec3<f32>(0.0, 1.0, 0.0), frame.look_up.xyz, dot(frame.look_up.xyz, frame.look_up.xyz) > 0.5);
+    return mix(frame.horizon.xyz, frame.zenith.xyz, clamp(dot(dir, up), 0.0, 1.0));
 }
 
 // The ray from the camera through `pixel` of an image `size` pixels across. `offset` says where

@@ -95,6 +95,38 @@ struct FrameUniform {
     params: [u32; 4],
     /// Where in its pixel primary visibility traces, then two unused.
     jitter: [f32; 4],
+    /// PROTOTYPE (#148): see [`Look`].
+    look_up: [f32; 4],
+    sun_rgb: [f32; 4],
+    zenith: [f32; 4],
+    horizon: [f32; 4],
+}
+
+/// PROTOTYPE (#148): the light of the look-dev run, which the reference path tracer reads: the
+/// local up of the sky, the sun's radiance, the sky's two colours and haze. The default is what
+/// the renderer has always had.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Look {
+    /// The local up; the sky is a gradient along it.
+    pub up: [f32; 3],
+    /// The radiance of the sun on a surface facing it head on, as a multiple of albedo.
+    pub sun: [f32; 3],
+    pub zenith: [f32; 3],
+    pub horizon: [f32; 3],
+    /// Haze per Voxel, in the horizon's colour; 0 for none.
+    pub haze: f32,
+}
+
+impl Default for Look {
+    fn default() -> Self {
+        Self {
+            up: [0.0, 1.0, 0.0],
+            sun: [1.6, 1.5, 1.35],
+            zenith: [0.25, 0.45, 0.85],
+            horizon: [0.75, 0.82, 0.92],
+            haze: 0.0,
+        }
+    }
 }
 
 /// Where primary visibility traces when nothing moves it: the centre of the pixel.
@@ -171,7 +203,7 @@ impl Target {
         let accum = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("accumulation"),
             size: u64::from(internal.0) * u64::from(internal.1) * 16,
-            usage: wgpu::BufferUsages::STORAGE,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
         Self {
@@ -206,6 +238,11 @@ impl Target {
         &self.gbuffer
     }
 
+    /// The reference path tracer's running mean, one `vec4<f32>` per pixel (PROTOTYPE #148).
+    pub(crate) fn accum(&self) -> &wgpu::Buffer {
+        &self.accum
+    }
+
     /// The upscaler's history image `which` (0 or 1).
     pub(crate) fn history(&self, which: usize) -> &Plane {
         &self.history[which]
@@ -219,6 +256,7 @@ pub struct View {
     camera: Camera,
     sun: Sun,
     size: (u32, u32),
+    look: Look,
 }
 
 impl View {
@@ -228,6 +266,7 @@ impl View {
             camera: *camera,
             sun: *sun,
             size: target.resolution.internal,
+            look: Look::default(),
         }
     }
 }
@@ -237,6 +276,7 @@ pub struct Tracer {
     scene_layout: wgpu::BindGroupLayout,
     camera_buffer: wgpu::Buffer,
     frame_buffer: wgpu::Buffer,
+    look: Look,
     /// The Material table (see [`gpu_materials`]), which nothing changes after the upload.
     materials: wgpu::Buffer,
     camera_layout: wgpu::BindGroupLayout,
@@ -666,6 +706,7 @@ impl Tracer {
             scene_layout,
             camera_buffer,
             frame_buffer,
+            look: Look::default(),
             materials,
             camera_layout,
             primary,
@@ -751,7 +792,8 @@ impl Tracer {
         sun: &Sun,
         target: &Target,
     ) {
-        let view = View::new(camera, sun, target);
+        let mut view = View::new(camera, sun, target);
+        view.look = self.look;
         let sample_index = self.accumulator.begin_sample(&view);
         self.write_uniforms(queue, camera, sun, sample_index, CENTRE);
         self.dispatch(
@@ -762,6 +804,11 @@ impl Tracer {
             &self.reference,
             target,
         );
+    }
+
+    /// PROTOTYPE (#148): sets the look-dev light; the reference image starts over if it changes.
+    pub fn set_look(&mut self, look: Look) {
+        self.look = look;
     }
 
     /// Brings the GPU copy of the Planet up to date with `scene`, which `update` describes the
@@ -976,6 +1023,20 @@ impl Tracer {
             sun: sun.uniform(),
             params: [sample_index, RNG_SEED, self.debug_view.index(), 0],
             jitter: [jitter[0], jitter[1], 0.0, 0.0],
+            look_up: [self.look.up[0], self.look.up[1], self.look.up[2], 0.0],
+            sun_rgb: [self.look.sun[0], self.look.sun[1], self.look.sun[2], 0.0],
+            zenith: [
+                self.look.zenith[0],
+                self.look.zenith[1],
+                self.look.zenith[2],
+                0.0,
+            ],
+            horizon: [
+                self.look.horizon[0],
+                self.look.horizon[1],
+                self.look.horizon[2],
+                self.look.haze,
+            ],
         };
         queue.write_buffer(&self.frame_buffer, 0, bytemuck::bytes_of(&frame));
     }

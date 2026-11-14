@@ -329,7 +329,7 @@ fluid = "none"
 
     /// Every id and name of the shipped table. Saved Planets and Edits store ids, so an id keeps
     /// its meaning for good: this list only ever grows. Materials added to the file need no entry.
-    const IDS: [(u16, &str); 55] = [
+    const IDS: [(u16, &str); 63] = [
         (1, "rock"),
         (2, "soil"),
         (3, "grassy soil"),
@@ -385,6 +385,14 @@ fluid = "none"
         (53, "green light"),
         (54, "blue light"),
         (55, "purple light"),
+        (56, "crystal blue"),
+        (57, "crystal cyan"),
+        (58, "crystal green"),
+        (59, "crystal magenta"),
+        (60, "crystal red"),
+        (61, "crystal amber"),
+        (62, "crystal white"),
+        (63, "crystal violet"),
     ];
 
     #[test]
@@ -410,7 +418,7 @@ fluid = "none"
                 .filter(|d| d.category == category)
                 .count()
         };
-        assert!((28..=34).contains(&count(Category::Natural)));
+        assert!((28..=42).contains(&count(Category::Natural)));
         assert!((14..=18).contains(&count(Category::Building)));
         assert!((5..=7).contains(&count(Category::Light)));
     }
