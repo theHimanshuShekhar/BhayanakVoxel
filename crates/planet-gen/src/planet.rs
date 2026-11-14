@@ -1,22 +1,26 @@
-//! The real Planet: 16 km in radius, made brick by brick from the [`WorldMap`].
+//! The real Planet: 320 km in radius, made brick by brick from the [`WorldMap`] (the radius is the
+//! map's, a value, and [`WORLD_RADIUS`] its default).
 //!
 //! The world map gives the surface (an elevation and a biome per texel); this module gives what
-//! lies above and below it. From the sky down, a Voxel is:
+//! lies above and below it, and the detail of the surface itself, which is finer than a texel
+//! (`crate::detail`: the ground is the map's elevation plus the detail, up to 20 m). From the
+//! sky down, a Voxel is:
 //! - **air**, or **water** if it is below sea level (static until Fluids), frozen to a thin
 //!   sea ice at the top in polar seas;
 //! - one of the biome's **strata** for [`STRATA_DEPTH`] Voxels below the ground, the topmost
 //!   being the biome's surface Material (the sea floor has strata of its own);
 //! - **deep rock**, below the strata, and
-//! - the glowing **molten core**, within [`MOLTEN_RADIUS`] of the centre.
+//! - the glowing **molten core**, within a fifth of the radius of the centre.
 //!
 //! **Caves** (see `crate::caves`) are carved out of the strata and the deep rock under land,
 //! less than 300 m below the ground: tunnels and chambers at most 8 m across, in systems that
-//! reach 1 km, some of which open to the surface. They are the one thing that makes a Voxel air
+//! reach 1 km, some of which open to the surface. They are made on demand from the seed, cube by
+//! cube. They are the one thing that makes a Voxel air
 //! that the ground does not, so the ground's bounds on a brick (below) decide a brick only
 //! where the caves have no tube near it.
 //!
-//! The lowest the ground gets is [`TRENCH`] below sea level, so everything within
-//! [`INTERIOR_RADIUS`] of the centre is core or deep rock whatever the world map says. That is
+//! The lowest the ground gets is [`TRENCH`] and the detail below sea level, so everything within
+//! [`Planet::interior_radius`] of the centre is core or deep rock whatever the world map says. That is
 //! most of the Planet, and its bricks are uniform: one flag each, not memory. Only the bricks
 //! near the ground need their Voxels evaluated, and most of those are decided by bounds on the
 //! ground's height under them (see [`Planet::brick`]).
@@ -32,8 +36,10 @@ use brick_store::{BRICK_SIZE, Brick, BrickCoord, BrickSource, BrickStore, Materi
 
 pub use crate::SOIL;
 use crate::caves::{self, Caves, Tube};
+use crate::detail::{self, Detail};
 use crate::world_map::{
-    Biome, ElevationCell, PEAK, SEA_LEVEL, TRENCH, Texel, WORLD_RADIUS, WorldMap, units, voxels,
+    Biome, ElevationCell, Fields, PEAK, SEA_LEVEL, TRENCH, Texel, WORLD_RADIUS, WorldMap, units,
+    voxels,
 };
 use crate::{Corners, distance, par_bricks};
 
@@ -54,21 +60,74 @@ pub const ICE: Material = Material(15);
 pub const MOLTEN_CORE: Material = Material(16);
 pub const WATER: Material = Material(27);
 
-/// Radius of the molten core, in Voxels: 3.2 km.
-pub const MOLTEN_RADIUS: i32 = voxels(3_200.0);
+/// The molten core's share of the radius: a fifth (3.2 km of 16 km, 64 km of 320 km). It scales
+/// with the Planet, as the core of a bigger one would.
+const MOLTEN_SHARE: i32 = 5;
 /// Thickness of the strata, in Voxels: 48 m. Deep rock lies below.
 pub const STRATA_DEPTH: i32 = voxels(48.0);
-/// Radius inside which a Voxel is core or deep rock whatever the world map says: below even the
-/// lowest ground's strata.
-pub const INTERIOR_RADIUS: i32 = WORLD_RADIUS - TRENCH - STRATA_DEPTH;
 
-/// Every Voxel of the Planet is within this many Voxels of its centre: sea level's radius plus
-/// the highest its relief goes. Nothing is generated beyond it, so a ray need not be walked
-/// further.
-pub const MAX_RADIUS: i32 = WORLD_RADIUS + PEAK;
+/// The detail's reach, in Voxels, rounded up: how far it moves the ground from the map's.
+const DETAIL_REACH: i32 = detail::REACH as i32 + 1;
 
-/// The interior's layers, innermost first, as (outer radius in Voxels, Material).
-const INTERIOR: [(i32, Material); 2] = [(MOLTEN_RADIUS, MOLTEN_CORE), (INTERIOR_RADIUS, DEEP_ROCK)];
+/// Radius of the molten core of a Planet of `radius` Voxels, in Voxels.
+pub const fn molten_radius(radius: i32) -> i32 {
+    radius / MOLTEN_SHARE
+}
+
+/// Radius inside which a Voxel of a Planet of `radius` Voxels is core or deep rock whatever the
+/// world map says: below even the lowest ground's strata.
+pub const fn interior_radius(radius: i32) -> i32 {
+    radius - TRENCH - DETAIL_REACH - STRATA_DEPTH
+}
+
+/// Every Voxel of a Planet of `radius` Voxels is within this many Voxels of its centre: sea
+/// level's radius plus the highest its ground goes. Nothing is generated beyond it, so a ray need
+/// not be walked further.
+pub const fn max_radius(radius: i32) -> i32 {
+    radius + PEAK + DETAIL_REACH
+}
+
+/// The default Planet's [`max_radius`].
+pub const MAX_RADIUS: i32 = max_radius(WORLD_RADIUS);
+
+/// What a Planet's radius says of it, in Voxels from the centre.
+#[derive(Clone, Copy, Debug)]
+struct Shape {
+    /// Sea level.
+    sea: f64,
+    molten: i32,
+    interior: i32,
+    max: i32,
+}
+
+impl Shape {
+    fn new(radius: i32) -> Shape {
+        Shape {
+            sea: f64::from(radius) + f64::from(SEA_LEVEL),
+            molten: molten_radius(radius),
+            interior: interior_radius(radius),
+            max: max_radius(radius),
+        }
+    }
+
+    /// The interior's layers, innermost first, as (outer radius in Voxels, Material).
+    fn layers(&self) -> [(i32, Material); 2] {
+        [(self.molten, MOLTEN_CORE), (self.interior, DEEP_ROCK)]
+    }
+
+    /// The interior's Material at `radius` Voxels from the centre, if it is within the interior.
+    fn interior(&self, radius: f64) -> Option<Material> {
+        (self.layers().iter())
+            .find(|&&(outer, _)| radius <= f64::from(outer))
+            .map(|&(_, material)| material)
+    }
+
+    /// Whether the brick at `coord` of mip `level` is wholly in the interior, which is solid all
+    /// the way down.
+    fn inside_interior(&self, level: usize, coord: BrickCoord) -> bool {
+        coord.within_ball_at(level, self.interior)
+    }
+}
 
 /// What the ground is made of, topmost first, as (depth at which the layer ends in Voxels,
 /// Material), the depths written in metres. The last ends at [`STRATA_DEPTH`].
@@ -134,17 +193,6 @@ fn one_layer(strata: &Strata, shallow: f64, deep: f64) -> Option<Material> {
     .then_some(material)
 }
 
-/// The interior's Material at `radius` Voxels from the centre, if it is within the interior.
-fn interior(radius: f64) -> Option<Material> {
-    INTERIOR
-        .iter()
-        .find(|&&(outer, _)| radius <= f64::from(outer))
-        .map(|&(_, material)| material)
-}
-
-/// The sea's surface, as a distance in Voxels from the centre.
-pub(crate) const SEA_RADIUS: f64 = (WORLD_RADIUS + SEA_LEVEL as i32) as f64;
-
 /// Thickness of the ice on the top of polar seas, those the world map marks as snow, in Voxels:
 /// 60 cm.
 const ICE_THICKNESS: f64 = voxels(0.6) as f64;
@@ -161,6 +209,13 @@ const SLACK: f64 = 1e-6;
 /// 100 m.
 const SPAWN_ELEVATIONS: std::ops::RangeInclusive<i16> =
     (units(20.0) as i16)..=(units(100.0) as i16);
+
+/// How many places of the world map, chosen from the seed, the Spawn tries before it goes through
+/// the map's lattice.
+const SPAWN_TRIES: u64 = 4096;
+
+/// Salt of the Spawn's tries, so that they are not the world map's own randomness.
+const SPAWN_SALT: u64 = 0x510e_527f_ade6_82d1;
 
 /// Most the ground may rise or fall across a spawn's region, in Voxels: 40 m. More would make
 /// the region a lot of bricks.
@@ -256,9 +311,10 @@ fn radii_of_box(low: [f64; 3], high: [f64; 3]) -> (f64, f64) {
 }
 
 /// What is known of the ground under a brick's Voxels, from the corners of the box that holds
-/// the points sampled (see [`Planet::generate`]): the ground there is between `low` and `high`
-/// above sea level and in one biome, so that most of the Voxels are told from these, and the
-/// rest from the one interpolation cell that the elevation is read from, if it is in one.
+/// the points sampled (see [`Planet::generate`]): the ground there, with its detail, is between
+/// `low` and `high` above sea level and in one biome, so that most of the Voxels are told from
+/// these, and the rest from the one interpolation cell that the map's elevation is read from, if
+/// it is in one.
 struct GroundBounds {
     low: f64,
     high: f64,
@@ -269,18 +325,25 @@ struct GroundBounds {
 }
 
 impl GroundBounds {
-    /// What [`Planet::ground_at`] says of `point`, one of the points sampled, with what is
-    /// known: in the interior, in the air above the ground, or below the ground in one layer of
-    /// its strata from the shallowest it can be to the deepest, without working out the height
-    /// under it. Only the Voxels near the ground or a boundary between layers need that.
-    fn ground_at(&self, map: &WorldMap, point: [f64; 3]) -> Option<Material> {
+    /// What [`Planet::ground_at`] says of `point`, one of the points sampled `size` apart, with
+    /// what is known: in the interior, in the air above the ground, or below the ground in one
+    /// layer of its strata from the shallowest it can be to the deepest, without working out the
+    /// height under it. Only the Voxels near the ground or a boundary between layers need that.
+    fn ground_at(
+        &self,
+        planet: &Planet,
+        point: [f64; 3],
+        size: f64,
+        cache: &mut detail::Cache,
+    ) -> Option<Material> {
         let radius = distance(point);
-        if let Some(material) = interior(radius) {
+        let sea = planet.shape.sea;
+        if let Some(material) = planet.shape.interior(radius) {
             return Some(material);
         }
-        let shallow = SEA_RADIUS + self.low - radius - SLACK;
-        let deep = SEA_RADIUS + self.high - radius + SLACK;
-        if deep <= 0.0 && radius >= SEA_RADIUS {
+        let shallow = sea + self.low - radius - SLACK;
+        let deep = sea + self.high - radius + SLACK;
+        if deep <= 0.0 && radius >= sea {
             return None;
         }
         if shallow > 0.0
@@ -289,19 +352,11 @@ impl GroundBounds {
         {
             return Some(material);
         }
-        let elevation = self
+        let fields = self
             .cell
-            .and_then(|cell| cell.elevation_at(point))
-            .unwrap_or_else(|| map.elevation_at(point));
-        let depth = SEA_RADIUS + elevation - radius;
-        if depth <= 0.0 {
-            if radius >= SEA_RADIUS {
-                return None;
-            }
-            let frozen = radius >= SEA_RADIUS - ICE_THICKNESS && self.biome == Biome::Snow;
-            return Some(if frozen { ICE } else { WATER });
-        }
-        Some(at_depth(strata(self.biome, elevation < 0.0), depth))
+            .and_then(|cell| cell.fields_at(point))
+            .unwrap_or_else(|| planet.map.fields_at(point));
+        planet.ground_below(point, radius, fields, size, cache, Some(self.biome))
     }
 }
 
@@ -311,32 +366,107 @@ impl GroundBounds {
 pub struct Planet {
     map: Arc<WorldMap>,
     caves: Arc<Caves>,
+    shape: Shape,
+    detail: Detail,
 }
 
 impl fmt::Debug for Planet {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "Planet ({0}x{0} world map)", self.map.size())
+        write!(
+            f,
+            "Planet (radius {}, {1}x{1} world map)",
+            self.shape.sea,
+            self.map.size()
+        )
     }
 }
 
 impl Planet {
-    /// The Planet of `map`, with the caves its seed grows under it (a few milliseconds).
+    /// The Planet of `map`, whose seed and radius are the Planet's: the radius is the map's, a
+    /// value, so Planets of different radii can be made in one process. The caves its seed grows
+    /// under it are made as they are asked for.
     pub fn new(map: WorldMap) -> Planet {
-        let caves = Arc::new(Caves::new(&map));
+        let map = Arc::new(map);
         Planet {
-            map: Arc::new(map),
-            caves,
+            shape: Shape::new(map.radius()),
+            detail: Detail::new(map.seed(), map.radius()),
+            caves: Arc::new(Caves::new(map.clone())),
+            map,
         }
     }
 
-    /// FNV-1a hash of the caves' tubes, bit for bit: what the golden test holds the walk that
-    /// grows them to, on every platform.
-    pub fn caves_hash(&self) -> u64 {
-        self.caves.content_hash()
+    /// FNV-1a hash of the tubes of the caves of the cubes in the box from `low` to `high`, bit for
+    /// bit, in the order of the cubes: what the golden test holds the walk that grows them to,
+    /// on every platform.
+    pub fn caves_hash(&self, low: [f64; 3], high: [f64; 3]) -> u64 {
+        self.caves.content_hash(low, high)
     }
 
     pub fn map(&self) -> &WorldMap {
         &self.map
+    }
+
+    /// Distance of sea level from the centre, in Voxels: the radius the Planet was made with.
+    pub fn radius(&self) -> i32 {
+        self.map.radius()
+    }
+
+    /// Distance of sea level from the centre, in Voxels, as a float.
+    pub fn sea_radius(&self) -> f64 {
+        self.shape.sea
+    }
+
+    /// The radius of the molten core, in Voxels.
+    pub fn molten_radius(&self) -> i32 {
+        self.shape.molten
+    }
+
+    /// The radius inside which a Voxel is core or deep rock whatever the world map says.
+    pub fn interior_radius(&self) -> i32 {
+        self.shape.interior
+    }
+
+    /// Every Voxel of the Planet is within this many Voxels of its centre.
+    pub fn max_radius(&self) -> i32 {
+        self.shape.max
+    }
+
+    /// The height of the ground above sea level at `point` (which is not the centre), in Voxels
+    /// and as a float: the map's elevation there, bilinear between texel centres, and the detail
+    /// that the generator adds to it. The Voxels it makes solid are those below it.
+    pub fn ground_height(&self, point: [f64; 3]) -> f64 {
+        let fields = self.map.fields_at(point);
+        fields.elevation
+            + self.detail_at(
+                point,
+                distance(point),
+                fields,
+                1.0,
+                &mut detail::Cache::default(),
+            )
+    }
+
+    /// The detail at `point`, `radius` from the centre, where the map's fields are `fields`, in a
+    /// brick sampled `size` Voxels apart.
+    fn detail_at(
+        &self,
+        point: [f64; 3],
+        radius: f64,
+        fields: Fields,
+        size: f64,
+        cache: &mut detail::Cache,
+    ) -> f64 {
+        self.detail.height(point, radius, fields, size, cache)
+    }
+
+    /// Bounds `(lowest, highest)` on [`Planet::ground_height`] over every point in the hull of
+    /// `corners`, for a brick sampled `size` Voxels apart: the map's bounds (see
+    /// [`WorldMap::elevation_range`]) and the detail's.
+    fn ground_range(&self, corners: &[[f64; 3]], size: f64) -> (f64, f64) {
+        let fields = self.map.field_range(corners);
+        let (low, high) = fields.elevation;
+        let (below, above) = self.detail.bounds(corners, size, fields);
+        (low + below, high + above)
     }
 
     /// The Voxel at `coord`: `None` for air.
@@ -346,12 +476,19 @@ impl Planet {
 
     /// The Material at `point`, in Voxels from the centre, caves and all: `None` for air.
     fn material_at(&self, point: [f64; 3]) -> Option<Material> {
-        let ground = self.ground_at(point);
+        self.material_sized(point, 1.0)
+    }
+
+    /// [`Planet::material_at`] for a Voxel `size` Voxels wide (see [`Samples`]): the Material that
+    /// a brick sampled so far apart has at `point`, with the detail and the caves that it has.
+    fn material_sized(&self, point: [f64; 3], size: f64) -> Option<Material> {
+        let ground = self.ground_at(point, size, &mut detail::Cache::default());
         if ground.is_none() {
             return ground;
         }
+        let half = (size - 1.0) / 2.0;
         let tubes = self.caves.near(point, point, 1.0);
-        if !tubes.is_empty() && self.carved(point, 0.0, &tubes, &mut None) {
+        if !tubes.is_empty() && self.carved(point, half, &tubes, &mut None) {
             return None;
         }
         ground
@@ -371,9 +508,13 @@ impl Planet {
         if !self.caves.carves(tubes, point, half, cache) {
             return false;
         }
-        let elevation = self.map.elevation_at(point);
-        let depth = SEA_RADIUS + elevation - distance(point);
-        elevation >= f64::from(SEA_LEVEL) && depth > 0.0 && depth < caves::MAX_DEPTH
+        let radius = distance(point);
+        let size = 2.0 * half + 1.0;
+        let fields = self.map.fields_at(point);
+        let height = fields.elevation
+            + self.detail_at(point, radius, fields, size, &mut detail::Cache::default());
+        let depth = self.shape.sea + height - radius;
+        height >= f64::from(SEA_LEVEL) && depth > 0.0 && depth < caves::MAX_DEPTH
     }
 
     /// The tubes that may carve a Voxel of the brick sampled at `samples`, given bounds on the
@@ -398,25 +539,41 @@ impl Planet {
     }
 
     /// The Material of the ground at `point`, in Voxels from the centre, which is the Planet's
-    /// without its caves: `None` for air.
-    fn ground_at(&self, point: [f64; 3]) -> Option<Material> {
+    /// without its caves: `None` for air. `size` is how far apart the points of the brick sampled
+    /// are (see [`Samples`]), which says which octaves of the detail it has.
+    fn ground_at(&self, point: [f64; 3], size: f64, cache: &mut detail::Cache) -> Option<Material> {
         let radius = distance(point);
-        if let Some(material) = interior(radius) {
+        if let Some(material) = self.shape.interior(radius) {
             return Some(material);
         }
-        let elevation = self.map.elevation_at(point);
-        let depth = SEA_RADIUS + elevation - radius;
+        let fields = self.map.fields_at(point);
+        self.ground_below(point, radius, fields, size, cache, None)
+    }
+
+    /// [`Planet::ground_at`] outside the interior, where the map's elevation is `elevation`, and
+    /// the biome is `biome` if it is known.
+    fn ground_below(
+        &self,
+        point: [f64; 3],
+        radius: f64,
+        fields: Fields,
+        size: f64,
+        cache: &mut detail::Cache,
+        biome: Option<Biome>,
+    ) -> Option<Material> {
+        let sea = self.shape.sea;
+        let height = fields.elevation + self.detail_at(point, radius, fields, size, cache);
+        let depth = sea + height - radius;
+        let biome = || biome.unwrap_or_else(|| self.map.sample(point).biome);
         if depth <= 0.0 {
             // Above the ground: water below sea level, else air, and ice on a polar sea.
-            if radius >= SEA_RADIUS {
+            if radius >= sea {
                 return None;
             }
-            let frozen =
-                radius >= SEA_RADIUS - ICE_THICKNESS && self.map.sample(point).biome == Biome::Snow;
+            let frozen = radius >= sea - ICE_THICKNESS && biome() == Biome::Snow;
             return Some(if frozen { ICE } else { WATER });
         }
-        let strata = strata(self.map.sample(point).biome, elevation < 0.0);
-        Some(at_depth(strata, depth))
+        Some(at_depth(strata(biome(), height < 0.0), depth))
     }
 
     /// Generates the brick at `coord`, from nothing but the world map and the coordinate.
@@ -464,7 +621,9 @@ impl Planet {
         BRICKS_MADE.with(|made| made.set(made.get() + 1));
         let samples = Samples::new(level, coord);
         let (near, far) = samples.radii();
-        if near >= f64::from(MAX_RADIUS) {
+        let shape = self.shape;
+        let sea = shape.sea;
+        if near >= f64::from(shape.max) {
             return Brick::AIR;
         }
         // A Voxel of a coarse brick with air beside it takes the Material at the ground's surface
@@ -472,7 +631,7 @@ impl Planet {
         // one layer knows. Those hold where no Voxel has air beside it. The sky and the sea
         // below are no layer, and have nothing to expose.
         let sealed = || level == 0 || self.sealed(&samples);
-        if far <= f64::from(INTERIOR_RADIUS)
+        if far <= f64::from(shape.interior)
             && sealed()
             && let Some(brick) = self.interior_brick(&samples)
         {
@@ -481,10 +640,10 @@ impl Planet {
         let corners: [[f64; 3]; 8] =
             std::array::from_fn(|i| samples.corner([i & 1, i >> 1 & 1, i >> 2]));
         // Every Voxel is in the hull of the corners, so the ground under it is within these.
-        let (low, high) = self.map.elevation_range(&corners);
+        let (low, high) = self.ground_range(&corners, samples.size);
         // The brick's Voxels are between these many Voxels below the ground.
-        let shallowest = SEA_RADIUS + low - far - SLACK;
-        let deepest = SEA_RADIUS + high - near + SLACK;
+        let shallowest = sea + low - far - SLACK;
+        let deepest = sea + high - near + SLACK;
         // The caves are what the bounds on the ground know nothing of: where a tube is near, the
         // brick is not what they say, so the shortcuts below are not for it.
         let tubes = if deepest > 0.0 {
@@ -494,12 +653,12 @@ impl Planet {
         };
         if deepest <= 0.0 {
             // All above the ground: sky, or sea if it is below sea level.
-            if low >= 0.0 || near >= SEA_RADIUS {
+            if low >= 0.0 || near >= sea {
                 return Brick::AIR;
             }
             // All water, unless it reaches the ice on a polar sea.
-            if far < SEA_RADIUS
-                && (far < SEA_RADIUS - ICE_THICKNESS
+            if far < sea
+                && (far < sea - ICE_THICKNESS
                     || self
                         .single_texel(&corners)
                         .is_some_and(|texel| texel.biome != Biome::Snow))
@@ -532,17 +691,17 @@ impl Planet {
 
     /// The least distance from the centre that air beside a Voxel of the brick sampled at
     /// `samples` can be at, or `None` if there is none because the brick is too far in. Air is at
-    /// least [`SEA_RADIUS`] from the centre, and above the ground, which is at least the lowest
+    /// least the sea's radius from the centre, and above the ground, which is at least the lowest
     /// of it under the box that holds the brick and the points one Voxel's width beyond it. So
     /// there is none beside a Voxel if every one of those points is nearer than that.
     fn air_floor(&self, samples: &Samples) -> Option<f64> {
         // A point beside a Voxel is a Voxel's width from it.
         let far = samples.radii().1 + samples.size;
-        if far + SLACK < SEA_RADIUS {
+        if far + SLACK < self.shape.sea {
             return None;
         }
-        let (lowest, _) = self.map.elevation_range(&samples.corners_with_neighbours());
-        let floor = SEA_RADIUS + lowest.max(0.0);
+        let (lowest, _) = self.ground_range(&samples.corners_with_neighbours(), samples.size);
+        let floor = self.shape.sea + lowest.max(0.0);
         (far + SLACK >= floor).then_some(floor)
     }
 
@@ -550,11 +709,11 @@ impl Planet {
     /// its distance from the centre to say what it is (and 512 of them at the edge of the core).
     fn interior_brick(&self, samples: &Samples) -> Option<Brick> {
         let (near, far) = samples.radii();
-        if far > f64::from(INTERIOR_RADIUS) {
+        if far > f64::from(self.shape.interior) {
             return None;
         }
         let mut inner = f64::NEG_INFINITY;
-        for &(outer, material) in &INTERIOR {
+        for (outer, material) in self.shape.layers() {
             if near > inner && far <= f64::from(outer) {
                 return Some(Brick::solid(material));
             }
@@ -586,8 +745,8 @@ impl Planet {
     fn evaluate(&self, samples: &Samples) -> Brick {
         let corners: [[f64; 3]; 8] =
             std::array::from_fn(|i| samples.corner([i & 1, i >> 1 & 1, i >> 2]));
-        let (low, high) = self.map.elevation_range(&corners);
-        let shallowest = SEA_RADIUS + low - samples.radii().1 - SLACK;
+        let (low, high) = self.ground_range(&corners, samples.size);
+        let shallowest = self.shape.sea + low - samples.radii().1 - SLACK;
         let tubes = self.tubes_near(samples, shallowest, high);
         self.evaluate_with(samples, &tubes)
     }
@@ -598,14 +757,15 @@ impl Planet {
         EVALUATED.with(|made| made.set(made.get() + 1));
         let bounds = self.ground_bounds(samples);
         let mut voxels = [None; 512];
+        let mut cache = detail::Cache::for_brick(samples.size);
         for z in 0..8 {
             for y in 0..8 {
                 for x in 0..8 {
                     let point = samples.at([x, y, z]);
                     voxels[usize::from(x) | usize::from(y) << 3 | usize::from(z) << 6] =
                         match &bounds {
-                            Some(bounds) => bounds.ground_at(&self.map, point),
-                            None => self.ground_at(point),
+                            Some(bounds) => bounds.ground_at(self, point, samples.size, &mut cache),
+                            None => self.ground_at(point, samples.size, &mut cache),
                         };
                 }
             }
@@ -639,7 +799,7 @@ impl Planet {
         let corners: [[f64; 3]; 8] =
             std::array::from_fn(|i| samples.corner([i & 1, i >> 1 & 1, i >> 2]));
         let texel = self.single_texel(&corners)?;
-        let (low, high) = self.map.elevation_range(&corners);
+        let (low, high) = self.ground_range(&corners, samples.size);
         Some(GroundBounds {
             low,
             high,
@@ -671,6 +831,7 @@ impl Planet {
     /// ground's surface within them (see [`Planet::evaluate`]). `floor` is the [`Planet::air_floor`].
     fn expose(&self, samples: &Samples, floor: f64, brick: &mut Brick) {
         let size = samples.size;
+        let mut cache = detail::Cache::for_brick(size);
         // Solidity as sampled, which the Materials set below leave as it is.
         let solid = brick.clone();
         for z in 0..8 {
@@ -696,11 +857,11 @@ impl Planet {
                             _ => {
                                 let mut beside = point;
                                 beside[face / 2] += f64::from(step) * size;
-                                self.ground_at(beside).is_none()
+                                self.ground_at(beside, size, &mut cache).is_none()
                             }
                         }
                     });
-                    if exposed && let Some(surface) = self.top_within(point, size) {
+                    if exposed && let Some(surface) = self.top_within(point, size, &mut cache) {
                         brick.set(local, Some(surface));
                     }
                 }
@@ -714,11 +875,20 @@ impl Planet {
     /// half its width only if it faces along an axis, and up to sqrt(3) times more across the
     /// corner of a cube. If it reaches into the air, the top is the surface: the ground's, or the
     /// sea's if the ground is under it. `None` if the middle is not below the ground.
-    fn top_within(&self, point: [f64; 3], size: f64) -> Option<Material> {
+    fn top_within(
+        &self,
+        point: [f64; 3],
+        size: f64,
+        cache: &mut detail::Cache,
+    ) -> Option<Material> {
         let radius = distance(point);
-        let elevation = self.map.elevation_at(point);
-        let ground = SEA_RADIUS + elevation;
-        if ground <= radius || radius == 0.0 {
+        if radius == 0.0 {
+            return None;
+        }
+        let fields = self.map.fields_at(point);
+        let sea = self.shape.sea;
+        let ground = sea + fields.elevation + self.detail_at(point, radius, fields, size, cache);
+        if ground <= radius {
             return None;
         }
         let lean = (point[0].abs() + point[1].abs() + point[2].abs()) / radius;
@@ -726,13 +896,13 @@ impl Planet {
         let on_axis = |r: f64| point.map(|c| c * r / radius);
         let top = on_axis(radius + size / 2.0 * lean);
         // In the air, a little below the highest ground or sea there.
-        self.ground_at(top)
-            .or_else(|| self.ground_at(on_axis(ground.max(SEA_RADIUS) - 0.5)))
+        self.ground_at(top, size, cache)
+            .or_else(|| self.ground_at(on_axis(ground.max(sea) - 0.5), size, cache))
     }
 
     /// Bounds `(lowest, highest)` on the ground's height above sea level within `reach` Voxels
-    /// of the line from the centre through `point`, which is near the ground. The whole Planet's
-    /// bounds if that is not over one face of the world map.
+    /// of the line from the centre through `point`, which is near the ground, detail and all. The
+    /// whole Planet's bounds if that is not over one face of the world map.
     fn heights_near(&self, point: [f64; 3], reach: i32) -> (f64, f64) {
         let up = point.map(|c| c / distance(point));
         let (ahead, aside) = tangents(up);
@@ -743,14 +913,21 @@ impl Planet {
         let half = f64::from(reach + 2 * BRICK_SIZE) * 1.1;
         let corners = [(-half, -half), (half, -half), (-half, half), (half, half)]
             .map(|(s, t)| std::array::from_fn(|a| point[a] + ahead[a] * s + aside[a] * t));
-        self.map.elevation_range(&corners)
+        self.ground_range(&corners, 1.0)
     }
 
-    /// A point on the ground to spawn on: gentle, temperate land if there is any, else gentle land
-    /// of any kind, else the land that varies least, else the highest ground, so that every
-    /// world map has one. Gentle, temperate land is the first, going through the world map's
-    /// texels on a lattice, where the ground is 20 to 100 m above the sea and varies by 40 m at
-    /// most within `reach` Voxels (see [`Planet::region_around`]). The same for the same map.
+    /// The Spawn (`CONTEXT.md`): the one place on this Planet where every character starts, chosen
+    /// from the seed, on land, the same on every machine. It is a point on the ground, gentle,
+    /// temperate land if there is any, else gentle land of any kind, else the land that varies
+    /// least, else the highest ground, so that every world map has one.
+    ///
+    /// Gentle, temperate land is the first of a seeded sequence of places on the world map (a
+    /// hash of the seed and the number of the try: see [`SPAWN_TRIES`]) where the ground is 20 to
+    /// 100 m above the sea and varies by 40 m at most, detail and all, within `reach` Voxels (see
+    /// [`Planet::region_around`]). The tries are the same for the same seed, and not the first
+    /// such place of a scan, so that the Spawn is anywhere on a Planet this size and not at its
+    /// first face. The other choices go through a lattice of the map's texels, as the last one
+    /// always did.
     ///
     /// Except for the last two, every choice is clear of the caves: no tube of them is within
     /// `reach` and a brick or two of the line from the centre through the spawn, at any depth.
@@ -765,7 +942,9 @@ impl Planet {
     fn spawn_where(&self, reach: i32, clear: impl Fn(&[f64; 3]) -> bool) -> [f64; 3] {
         let size = self.map.size();
         let stride = (size / 32).max(1) as usize;
-        let spots = || {
+        let seed = self.map.seed() ^ SPAWN_SALT;
+        let area = u64::from(size) * u64::from(size) * 6;
+        let lattice = move || {
             (0..6).flat_map(move |face| {
                 (stride / 2..size as usize)
                     .step_by(stride)
@@ -776,19 +955,34 @@ impl Planet {
                     })
             })
         };
+        // A texel of the whole map for each try: its index is the hash modulo the number of texels.
+        let seeded = move || {
+            (0..SPAWN_TRIES).map(move |k| {
+                let at = crate::hash(seed, [k as i32, 0, 0]) % area;
+                let (face, rest) = (
+                    at / (u64::from(size) * u64::from(size)),
+                    at % u64::from(size).pow(2),
+                );
+                (
+                    face as usize,
+                    (rest % u64::from(size)) as u32,
+                    (rest / u64::from(size)) as u32,
+                )
+            })
+        };
+        let spots = move || seeded().chain(lattice());
         let ground = |&(face, i, j): &(usize, u32, u32)| {
             let texel = self.map.texel(face, i, j);
             let direction = self.map.texel_direction(face, i, j);
-            (
-                texel,
-                direction.map(|d| d * (SEA_RADIUS + texel.elevation_voxels())),
-            )
+            (texel, self.ground_point(direction))
         };
         let relief = |point: [f64; 3]| {
             let (low, high) = self.heights_near(point, reach);
             high - low
         };
-        let land = |texel: &Texel| texel.elevation >= SEA_LEVEL;
+        let land = |texel: &Texel, point: &[f64; 3]| {
+            texel.elevation >= SEA_LEVEL && self.ground_height(*point) >= f64::from(SEA_LEVEL)
+        };
         spots()
             .map(|spot| ground(&spot))
             .find(|(texel, point)| {
@@ -798,37 +992,45 @@ impl Planet {
                     && clear(point)
             })
             .or_else(|| {
-                (spots().map(|spot| ground(&spot)))
-                    .find(|(texel, point)| land(texel) && relief(*point) <= GENTLE && clear(point))
+                (spots().map(|spot| ground(&spot))).find(|(texel, point)| {
+                    land(texel, point) && relief(*point) <= GENTLE && clear(point)
+                })
             })
             .or_else(|| {
-                (spots()
-                    .map(|spot| ground(&spot))
-                    .filter(|(texel, point)| land(texel) && clear(point)))
-                .min_by(|a, b| relief(a.1).total_cmp(&relief(b.1)))
+                (lattice().map(|spot| ground(&spot)))
+                    .filter(|(texel, point)| land(texel, point) && clear(point))
+                    .min_by(|a, b| relief(a.1).total_cmp(&relief(b.1)))
             })
             .or_else(|| {
                 // Land with the least relief, caves or not: a cave is a better reason to go
                 // elsewhere than to go to a peak.
-                (spots()
-                    .map(|spot| ground(&spot))
-                    .filter(|(texel, _)| land(texel)))
-                .min_by(|a, b| relief(a.1).total_cmp(&relief(b.1)))
+                (lattice().map(|spot| ground(&spot)))
+                    .filter(|(texel, point)| land(texel, point))
+                    .min_by(|a, b| relief(a.1).total_cmp(&relief(b.1)))
             })
             .or_else(|| {
-                (spots().map(|spot| ground(&spot))).max_by_key(|(texel, _)| texel.elevation)
+                (lattice().map(|spot| ground(&spot))).max_by_key(|(texel, _)| texel.elevation)
             })
             .expect("a world map has texels")
             .1
     }
 
+    /// The point of the ground in the direction `direction`: on the ray from the centre, at the
+    /// height that [`Planet::ground_height`] says.
+    fn ground_point(&self, direction: [f64; 3]) -> [f64; 3] {
+        let up = direction.map(|d| d / distance(direction));
+        let radius = self.shape.sea + self.ground_height(up);
+        up.map(|u| u * radius)
+    }
+
     /// Points on the ground, in Voxels from the centre, where a cave opens to the surface: one
-    /// for each tube that comes within four fifths of its radius of the ground from below, at the
-    /// first such place along it. For a debug camera to go to, and for tests. Takes a few
-    /// milliseconds.
-    pub fn cave_mouths(&self) -> Vec<[f64; 3]> {
+    /// for each tube of the caves of the cubes in the box from `low` to `high` that comes within
+    /// four fifths of its radius of the ground from below, at the first such place along it. For a
+    /// debug camera to go to, and for tests. The caves are made as they are asked for, so the box
+    /// is a few cubes (1 km) of ground and not the Planet: it takes a few milliseconds each.
+    pub fn cave_mouths(&self, low: [f64; 3], high: [f64; 3]) -> Vec<[f64; 3]> {
         let mut mouths = Vec::new();
-        for tube in self.caves.tubes() {
+        for tube in self.caves.tubes_in(low, high) {
             let length = distance(std::array::from_fn(|a| tube.b[a] - tube.a[a]));
             // A step is 2 m, which no tube is narrower than.
             let steps = (length / f64::from(voxels(2.0))).ceil().max(1.0) as u32;
@@ -838,10 +1040,10 @@ impl Planet {
                     std::array::from_fn(|a| tube.a[a] + (tube.b[a] - tube.a[a]) * along);
                 let radius = tube.ra + (tube.rb - tube.ra) * along;
                 let height = distance(at);
-                let elevation = self.map.elevation_at(at);
-                let depth = SEA_RADIUS + elevation - height;
-                (elevation >= f64::from(SEA_LEVEL) && (0.0..=0.8 * radius).contains(&depth))
-                    .then(|| at.map(|c| c / height * (SEA_RADIUS + elevation)))
+                let ground = self.ground_height(at);
+                let depth = self.shape.sea + ground - height;
+                (ground >= f64::from(SEA_LEVEL) && (0.0..=0.8 * radius).contains(&depth))
+                    .then(|| at.map(|c| c / height * (self.shape.sea + ground)))
             });
             mouths.extend(mouth);
         }
@@ -855,7 +1057,7 @@ impl Planet {
     fn clear_of_caves(&self, ground: [f64; 3], reach: i32) -> bool {
         let up = ground.map(|c| c / distance(ground));
         let (lowest, highest) = self.heights_near(ground, reach);
-        let at = |height: f64| -> [f64; 3] { up.map(|u| u * (SEA_RADIUS + height)) };
+        let at = |height: f64| -> [f64; 3] { up.map(|u| u * (self.shape.sea + height)) };
         self.caves.clear_of(
             at(lowest - (caves::MAX_DEPTH + 2.0 * caves::MAX_TUBE_RADIUS)),
             at(highest + f64::from(BRICK_SIZE)),
@@ -890,8 +1092,8 @@ impl Planet {
         // Along `up`, from two bricks below the lowest strata (the sphere curves up at the sides
         // of the cylinder, by a few Voxels) to a brick above the highest ground or the sea;
         // across it, `reach` and a brick.
-        let bottom = SEA_RADIUS + low - f64::from(STRATA_DEPTH + 2 * BRICK_SIZE);
-        let top = SEA_RADIUS + high.max(0.0) + f64::from(BRICK_SIZE);
+        let bottom = self.shape.sea + low - f64::from(STRATA_DEPTH + 2 * BRICK_SIZE);
+        let top = self.shape.sea + high.max(0.0) + f64::from(BRICK_SIZE);
         let across = f64::from(reach + BRICK_SIZE) + REACH;
         let ends = [bottom, top].map(|a| up.map(|u| u * a));
         let corner = |pick: fn(f64, f64) -> f64, margin: f64| {
@@ -950,7 +1152,7 @@ impl Planet {
     /// [`Planet::solid_below`], with or without the caves: without, it is what the ground alone
     /// proves.
     fn solid_below_with(&self, level: usize, coord: BrickCoord, caves: bool) -> bool {
-        if inside_interior(level, coord) {
+        if self.shape.inside_interior(level, coord) {
             return true;
         }
         let width = f64::from(BRICK_SIZE) * f64::from(1u32 << level);
@@ -960,23 +1162,27 @@ impl Planet {
         let corners: [[f64; 3]; 8] = std::array::from_fn(|i| {
             std::array::from_fn(|a| if i >> a & 1 == 0 { low[a] } else { high[a] })
         });
-        let (lowest, highest) = self.map.elevation_range(&corners);
+        let (lowest, highest) = self.ground_range(&corners, 1.0);
+        let sea = self.shape.sea;
         // Wholly above the ground and below the sea: water, or ice on a polar sea, which are
         // solid, and no cave is there (the deep sea is most of the bricks that no ground proves).
-        if far < SEA_RADIUS && SEA_RADIUS + highest - near + SLACK <= 0.0 {
+        if far < sea && sea + highest - near + SLACK <= 0.0 {
             return true;
         }
-        let shallowest = SEA_RADIUS + lowest - far - SLACK;
+        let shallowest = sea + lowest - far - SLACK;
         if shallowest <= 0.0 {
             return false;
         }
         // The Voxels are at `low` to `high` less one, so the box holds them all. A tube near
         // the box is a cave that may be in it, however wide the Voxels, since this is about
         // Voxels of level 0.
-        !caves
-            || shallowest >= caves::MAX_DEPTH
-            || highest < f64::from(SEA_LEVEL)
-            || !self.caves.touches(low, high, 1.0)
+        if !caves || shallowest >= caves::MAX_DEPTH || highest < f64::from(SEA_LEVEL) {
+            return true;
+        }
+        // The caves are made as they are asked for, cube by cube: a brick wider than a few cubes
+        // that is within the caves' depth of the ground (a coarse one's corner, over a slab of
+        // ground) is not asked, and is not known to be solid.
+        width <= 4.0 * f64::from(caves::CELL) && !self.caves.touches(low, high, 1.0)
     }
 
     /// Whether every Voxel of level 0 under the brick at `coord` of mip `level` is air, for
@@ -993,17 +1199,17 @@ impl Planet {
         let high = low.map(|l| l + width);
         let (near, _) = radii_of_box(low, high);
         // Nothing on the Planet is this far out, and nothing below the sea is air.
-        if near >= f64::from(MAX_RADIUS) {
+        if near >= f64::from(self.shape.max) {
             return true;
         }
-        if near < SEA_RADIUS {
+        if near < self.shape.sea {
             return false;
         }
         let corners: [[f64; 3]; 8] = std::array::from_fn(|i| {
             std::array::from_fn(|a| if i >> a & 1 == 0 { low[a] } else { high[a] })
         });
-        let (_, highest) = self.map.elevation_range(&corners);
-        near >= SEA_RADIUS + highest + SLACK
+        let (_, highest) = self.ground_range(&corners, 1.0);
+        near >= self.shape.sea + highest + SLACK
     }
 
     /// The Guard: the bricks of the whole Planet at the mip levels `levels` (8 to 12, the top of
@@ -1020,12 +1226,12 @@ impl Planet {
             assert!(level > 0, "level 0 is not coarse");
             // The bricks of this level that the ball the Planet is in touches.
             let size = f64::from(BRICK_SIZE) * f64::from(1u32 << level);
-            let reach = (f64::from(MAX_RADIUS) / size).floor() as i32 + 1;
+            let reach = (f64::from(self.shape.max) / size).floor() as i32 + 1;
             let found = par_bricks(BrickCoord([-reach; 3]), BrickCoord([reach; 3]), |coord| {
                 let low = coord.0.map(|c| f64::from(c) * size);
                 let high = low.map(|l| l + size);
-                if radii_of_box(low, high).0 >= f64::from(MAX_RADIUS)
-                    || inside_interior(level, coord)
+                if radii_of_box(low, high).0 >= f64::from(self.shape.max)
+                    || self.shape.inside_interior(level, coord)
                 {
                     return None;
                 }
@@ -1040,12 +1246,6 @@ impl Planet {
         }
         out
     }
-}
-
-/// Whether the brick at `coord` of mip `level` is wholly in the interior, which is solid all the
-/// way down: what both sources of a store say to [`BrickSource::solid_below`].
-fn inside_interior(level: usize, coord: BrickCoord) -> bool {
-    coord.within_ball_at(level, INTERIOR_RADIUS)
 }
 
 /// What a store reads where it holds no brick, when the Planet is to be drawn at every distance
@@ -1147,14 +1347,13 @@ impl BrickSource for RegionSource {
                 Brick::AIR
             };
         }
-        INTERIOR
-            .iter()
+        (self.planet.shape.layers().iter())
             .find(|&&(outer, _)| coord.within_ball_at(level, outer))
             .map_or(Brick::AIR, |&(_, material)| Brick::solid(material))
     }
 
     fn solid_below(&self, level: usize, coord: BrickCoord) -> bool {
-        inside_interior(level, coord)
+        self.planet.shape.inside_interior(level, coord)
     }
 
     /// What the Planet says: where it proves that all is air, this store reads air too, as it
@@ -1167,19 +1366,19 @@ impl BrickSource for RegionSource {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::world_map::{Biome, SEA_LEVEL, Texel};
+    use crate::world_map::{Biome, SEA_LEVEL, TEST_MAP_SIZE, TEST_RADIUS, Texel};
     use brick_store::VOXELS_PER_METRE;
     use std::sync::OnceLock;
 
     const SEED: u64 = 0xB4A7_A9AC;
     /// Texels along a face of the world map the tests share.
-    const SIZE: u32 = 512;
+    const SIZE: u32 = TEST_MAP_SIZE;
     /// Voxels around the spawn the tests take: the world map of the tests is too coarse for more.
     const SPAWN_REACH: i32 = 100;
 
     fn planet() -> &'static Planet {
         static PLANET: OnceLock<Planet> = OnceLock::new();
-        PLANET.get_or_init(|| Planet::new(WorldMap::generate(SEED, SIZE)))
+        PLANET.get_or_init(|| Planet::new(WorldMap::with_radius(SEED, SIZE, TEST_RADIUS)))
     }
 
     /// The Voxel `radius` Voxels from the centre along `direction`.
@@ -1211,7 +1410,7 @@ mod tests {
             .collect();
         let mut voxels: Vec<_> = heights
             .iter()
-            .map(|&h| planet().voxel(along(direction, SEA_RADIUS + h)))
+            .map(|&h| planet().voxel(along(direction, planet().sea_radius() + h)))
             .collect();
         for k in 1..voxels.len() - 1 {
             if voxels[k - 1] == voxels[k + 1] {
@@ -1275,17 +1474,24 @@ mod tests {
             assert_eq!(strata.last().unwrap().0, STRATA_DEPTH);
         }
         // Nothing the world map decides is inside the interior.
-        assert_eq!(INTERIOR_RADIUS, 299_040);
-        const { assert!(MOLTEN_RADIUS < INTERIOR_RADIUS) };
+        // The test Planet's: 40 km, less the 1 km trench, the detail's 467 Voxels (the octaves'
+        // 20.32 m and the valleys' 3 m) and the strata.
+        assert_eq!(planet().interior_radius(), 800_000 - 20_000 - 467 - 960);
+        assert_eq!(
+            interior_radius(WORLD_RADIUS),
+            6_400_000 - 20_000 - 467 - 960
+        );
+        assert_eq!(planet().molten_radius(), 160_000);
+        assert!(planet().molten_radius() < planet().interior_radius());
     }
 
     #[test]
     fn the_centre_is_molten_then_deep_rock_going_out() {
         let at = |x: i32| planet().voxel(VoxelCoord([x, 0, 0]));
         assert_eq!(at(0), Some(MOLTEN_CORE));
-        assert_eq!(at(MOLTEN_RADIUS), Some(MOLTEN_CORE));
-        assert_eq!(at(MOLTEN_RADIUS + 1), Some(DEEP_ROCK));
-        assert_eq!(at(INTERIOR_RADIUS), Some(DEEP_ROCK));
+        assert_eq!(at(planet().molten_radius()), Some(MOLTEN_CORE));
+        assert_eq!(at(planet().molten_radius() + 1), Some(DEEP_ROCK));
+        assert_eq!(at(planet().interior_radius()), Some(DEEP_ROCK));
     }
 
     #[test]
@@ -1294,9 +1500,9 @@ mod tests {
             ([0, 0, 0], MOLTEN_CORE),
             ([-1, -1, -1], MOLTEN_CORE),
             ([2000, 0, 0], MOLTEN_CORE),
-            ([0, -12_000, 0], DEEP_ROCK),
-            ([9000, 9000, 9000], DEEP_ROCK),
-            ([0, 0, 17_000], DEEP_ROCK),
+            ([0, -30_000, 0], DEEP_ROCK),
+            ([30_000, 30_000, 30_000], DEEP_ROCK),
+            ([0, 0, 60_000], DEEP_ROCK),
         ] {
             let brick = planet().brick(BrickCoord(c));
             assert!(brick.is_uniform(), "{c:?}");
@@ -1308,7 +1514,7 @@ mod tests {
     #[test]
     fn a_column_on_temperate_land_goes_deep_rock_shale_limestone_clay_soil_grass_then_air() {
         let d = find(|t| t.biome == Biome::Temperate && (300..600).contains(&t.elevation));
-        let surface = planet().map().elevation_at(d);
+        let surface = planet().ground_height(d);
         let runs = column(d, surface - 1040.0, surface + 40.0);
         let found: Vec<_> = runs.iter().map(|r| r.1).collect();
         let want = [DEEP_ROCK, SHALE, LIMESTONE, CLAY, SOIL, GRASSY_SOIL].map(Some);
@@ -1324,7 +1530,7 @@ mod tests {
     fn the_surface_follows_the_biome() {
         let top = |pick: fn(&Texel) -> bool| {
             let d = find(pick);
-            let surface = planet().map().elevation_at(d);
+            let surface = planet().ground_height(d);
             column(d, surface - 2.0, surface + 3.0)[0].1
         };
         assert_eq!(
@@ -1349,7 +1555,7 @@ mod tests {
     fn the_strata_below_the_surface_differ_by_biome() {
         let below = |biome| {
             let d = find(|t| t.biome == biome && t.elevation >= 100);
-            let surface = planet().map().elevation_at(d);
+            let surface = planet().ground_height(d);
             column(d, surface - 1040.0, surface - 1.0)
                 .iter()
                 .map(|r| r.1.unwrap())
@@ -1372,7 +1578,7 @@ mod tests {
     #[test]
     fn an_ocean_column_is_seabed_then_water_up_to_sea_level_then_air() {
         let d = find(|t| t.elevation < -400);
-        let surface = planet().map().elevation_at(d);
+        let surface = planet().ground_height(d);
         let runs = column(d, surface - 6.0, 60.0);
         let found: Vec<_> = runs.iter().map(|r| r.1).collect();
         assert_eq!(found, [Some(SAND), Some(WATER), None]);
@@ -1388,14 +1594,17 @@ mod tests {
                 for i in (0..map.size()).step_by(5) {
                     let texel = map.texel(face, i, j);
                     let d = map.texel_direction(face, i, j);
-                    if texel.elevation >= 0 {
+                    // The ground is the map's and the detail on it, which can dip a few metres
+                    // under the sea by a coast or rise over it.
+                    let ground = planet().ground_height(d);
+                    if texel.elevation >= 0 && ground >= 2.0 {
                         // Just under the surface, and at sea level itself where it is higher.
-                        for h in [texel.elevation_voxels() - 2.0, -2.0, 0.0] {
-                            let voxel = planet().voxel(along(d, SEA_RADIUS + h));
+                        for h in [ground - 2.0, -2.0, 0.0] {
+                            let voxel = planet().voxel(along(d, planet().sea_radius() + h));
                             assert!(voxel != Some(WATER), "{face} {i} {j} {h}");
                         }
-                    } else if texel.elevation < -20 {
-                        let sea = planet().voxel(along(d, SEA_RADIUS - 18.0));
+                    } else if ground < -20.0 {
+                        let sea = planet().voxel(along(d, planet().sea_radius() - 18.0));
                         assert_eq!(sea, Some(WATER), "{face} {i} {j}");
                     }
                 }
@@ -1406,7 +1615,7 @@ mod tests {
     #[test]
     fn ocean_bricks_below_sea_level_are_water() {
         let d = find(|t| t.elevation < -400);
-        let coord = along(d, SEA_RADIUS - 200.0).brick();
+        let coord = along(d, planet().sea_radius() - 200.0).brick();
         let brick = planet().brick(coord);
         assert!(brick.is_uniform());
         assert_eq!(brick.get([0, 0, 0]), Some(WATER));
@@ -1432,10 +1641,10 @@ mod tests {
     fn a_brick_is_what_its_voxels_are_wherever_it_is() {
         // Down radial lines, to the granite below the strata.
         for d in lines() {
-            let surface = planet().map().elevation_at(d);
+            let surface = planet().ground_height(d);
             let mut h = surface - 1120.0;
             while h < surface.max(0.0) + 80.0 {
-                let coord = along(d, SEA_RADIUS + h).brick();
+                let coord = along(d, planet().sea_radius() + h).brick();
                 let brick = planet().brick(coord);
                 for (local, voxel) in voxels_of(coord) {
                     assert_eq!(
@@ -1471,8 +1680,8 @@ mod tests {
             }
         }
         assert!(steepest > 100, "{steepest}");
-        let ground = planet().map().elevation_at(at);
-        let middle = along(at, SEA_RADIUS + ground).brick();
+        let ground = planet().ground_height(at);
+        let middle = along(at, planet().sea_radius() + ground).brick();
         for dx in -3..=3 {
             for dy in -3..=3 {
                 for dz in -24..=24 {
@@ -1488,7 +1697,7 @@ mod tests {
 
     #[test]
     fn bricks_across_the_interiors_boundaries_are_what_their_voxels_are() {
-        for r in [MOLTEN_RADIUS, INTERIOR_RADIUS, 5] {
+        for r in [planet().molten_radius(), planet().interior_radius(), 5] {
             for d in [[1.0, 0.0, 0.0], [1.0, 1.0, 1.0], [-0.3, 0.2, -1.0]] {
                 for k in -12..=12 {
                     let coord = along(d, f64::from(r + k)).brick();
@@ -1504,18 +1713,18 @@ mod tests {
     #[test]
     fn a_brick_is_generated_alone_and_the_same_every_time() {
         let d = find(|t| t.elevation > 100);
-        let coord = along(d, SEA_RADIUS + planet().map().elevation_at(d)).brick();
+        let coord = along(d, planet().sea_radius() + planet().ground_height(d)).brick();
         let a = planet().brick(coord);
-        let again = Planet::new(WorldMap::generate(SEED, SIZE)).brick(coord);
+        let again = Planet::new(WorldMap::with_radius(SEED, SIZE, TEST_RADIUS)).brick(coord);
         assert_eq!(a.content_hash(), again.content_hash());
         assert!(!a.is_uniform());
-        let other = Planet::new(WorldMap::generate(SEED + 1, SIZE)).brick(coord);
+        let other = Planet::new(WorldMap::with_radius(SEED + 1, SIZE, TEST_RADIUS)).brick(coord);
         assert_ne!(a.content_hash(), other.content_hash());
     }
 
     #[test]
     fn far_space_is_air() {
-        assert!(planet().brick(BrickCoord([50_000, 0, 0])).is_air());
+        assert!(planet().brick(BrickCoord([150_000, 0, 0])).is_air());
         assert!(
             planet()
                 .brick(BrickCoord([i32::MIN / 8, i32::MAX / 8, 5]))
@@ -1526,7 +1735,7 @@ mod tests {
     #[test]
     fn the_spawn_is_on_gentle_temperate_land_with_air_above_it() {
         let spawn = planet().spawn(SPAWN_REACH);
-        assert!(planet().map().elevation_at(spawn) >= f64::from(voxels(10.0)));
+        assert!(planet().ground_height(spawn) >= f64::from(voxels(10.0)));
         assert_eq!(planet().map().sample(spawn).biome, Biome::Temperate);
         let radius = spawn.iter().map(|c| c * c).sum::<f64>().sqrt();
         let voxel = |dr| planet().voxel(along(spawn, radius + dr));
@@ -1551,7 +1760,7 @@ mod tests {
         let spawn = planet().spawn(1_000_000);
         assert_eq!(spawn, planet().spawn_where(1_000_000, |_| true));
         assert!(!planet().clear_of_caves(spawn, 1_000_000));
-        let elevation = planet().map().elevation_at(spawn);
+        let elevation = planet().ground_height(spawn);
         assert!(elevation >= 0.0);
         let highest = (0..6)
             .flat_map(|f| {
@@ -1605,10 +1814,9 @@ mod tests {
             Brick::solid(MOLTEN_CORE)
         );
         // Beside the region the Planet has ground, but the store does not, until it is streamed.
-        let beside = along(spawn, radius).brick().0;
-        let far = BrickCoord(std::array::from_fn(|a| {
-            beside[a] + (aside[a] * 20.0).round() as i32
-        }));
+        let beside: [f64; 3] = std::array::from_fn(|a| spawn[a] + aside[a] * 160.0);
+        let ground = planet().ground_height(beside);
+        let far = along(beside, planet().sea_radius() + ground - 4.0).brick();
         assert!(store.brick_at(0, far).is_air());
         assert!(!planet().brick(far).is_air());
     }
@@ -1619,7 +1827,7 @@ mod tests {
         // camera, so none may be worked out from the world map.
         let spawn = planet().spawn(SPAWN_REACH);
         let store = region();
-        let at = along(spawn, f64::from(WORLD_RADIUS)).brick().0;
+        let at = along(spawn, f64::from(planet().radius())).brick().0;
         let before = BRICKS_MADE.with(|made| made.get());
         let mut read = 0;
         for x in -40..=40 {
@@ -1644,11 +1852,11 @@ mod tests {
         let at = |level, c| store.brick_at(level, BrickCoord(c)).into_owned();
         // Level 2 bricks are 32 Voxels across.
         assert_eq!(at(2, [100, 0, 0]), Brick::solid(MOLTEN_CORE));
-        assert_eq!(at(2, [3000, 0, 0]), Brick::solid(DEEP_ROCK));
-        // Over the core's edge (x = 64000 is brick 2000) it is the layer outside; over the
+        assert_eq!(at(2, [7000, 0, 0]), Brick::solid(DEEP_ROCK));
+        // Over the core's edge (x = 160000 is brick 5000) it is the layer outside; over the
         // interior's edge, and beyond, it is air until coarse bricks are generated directly.
-        assert_eq!(at(2, [2000, 0, 0]), Brick::solid(DEEP_ROCK));
-        assert!(at(2, [9346, 0, 0]).is_air());
+        assert_eq!(at(2, [5000, 0, 0]), Brick::solid(DEEP_ROCK));
+        assert!(at(2, [24_346, 0, 0]).is_air());
         assert!(at(2, [100_000, 0, 0]).is_air());
         assert_eq!(at(0, [0, 0, 0]), planet().brick(BrickCoord([0, 0, 0])));
     }
@@ -1735,11 +1943,11 @@ mod tests {
             Vec::new()
         };
         for d in lines().into_iter().chain(more) {
-            let surface = planet().map().elevation_at(d);
+            let surface = planet().ground_height(d);
             let step = f64::from(BRICK_SIZE << level);
             let mut h = surface - 1120.0;
             while h < surface.max(0.0) + 80.0 {
-                let coord = ancestor(along(d, SEA_RADIUS + h).brick(), level);
+                let coord = ancestor(along(d, planet().sea_radius() + h).brick(), level);
                 h += step;
                 let made = planet().coarse_brick(level, coord);
                 let real = downsampled(level, coord);
@@ -1803,8 +2011,12 @@ mod tests {
     fn bricks_over_the_ground(level: usize, directions: Vec<[f64; 3]>) -> Vec<BrickCoord> {
         let mut bricks = Vec::new();
         for d in directions {
-            let surface = planet().map().elevation_at(d);
-            let over = ancestor(along(d, SEA_RADIUS + surface.max(0.0)).brick(), level).0;
+            let surface = planet().ground_height(d);
+            let over = ancestor(
+                along(d, planet().sea_radius() + surface.max(0.0)).brick(),
+                level,
+            )
+            .0;
             for i in 0..7_i32 {
                 bricks.push(BrickCoord(std::array::from_fn(|a| {
                     over[a]
@@ -1887,7 +2099,7 @@ mod tests {
                         }
                         let mut beside = middle(level, coord, local);
                         beside[face / 2] += f64::from(step) * size;
-                        planet().material_at(beside).is_none()
+                        planet().material_sized(beside, size).is_none()
                     });
                     if exposed {
                         total += 1;
@@ -1912,14 +2124,14 @@ mod tests {
         let size = f64::from(1 << level);
         let mut coords = Vec::new();
         for d in lines() {
-            let surface = planet().map().elevation_at(d);
+            let surface = planet().ground_height(d);
             let mut h = surface - 1120.0 - 8.0 * size;
             while h < surface.max(0.0) + 80.0 + 8.0 * size {
-                coords.push(ancestor(along(d, SEA_RADIUS + h).brick(), level));
+                coords.push(ancestor(along(d, planet().sea_radius() + h).brick(), level));
                 h += 8.0 * size;
             }
         }
-        for r in [MOLTEN_RADIUS, INTERIOR_RADIUS, 5] {
+        for r in [planet().molten_radius(), planet().interior_radius(), 5] {
             for d in [[1.0, 0.0, 0.0], [1.0, 1.0, 1.0], [-0.3, 0.2, -1.0]] {
                 for k in -3..=3 {
                     let at = along(d, f64::from(r) + f64::from(k) * 8.0 * size);
@@ -1946,7 +2158,7 @@ mod tests {
         (0..6).any(|face| {
             let mut next = point;
             next[face / 2] += if face % 2 == 0 { -size } else { size };
-            planet().material_at(next).is_none()
+            planet().material_sized(next, size).is_none()
         })
     }
 
@@ -1962,7 +2174,7 @@ mod tests {
                 let brick = planet().coarse_brick(level, coord);
                 for local in locals() {
                     let middle = middle(level, coord, local);
-                    let at_middle = planet().material_at(middle);
+                    let at_middle = planet().material_sized(middle, f64::from(1 << level));
                     if brick.get(local) == at_middle {
                         exact += 1;
                         continue;
@@ -1985,10 +2197,10 @@ mod tests {
     /// short enough not to miss a corner of a Voxel that the line only clips.
     fn top_of_the_ground(direction: [f64; 3], level: usize) -> Option<Material> {
         let size = 1 << level;
-        let surface = planet().map().elevation_at(direction);
+        let surface = planet().ground_height(direction);
         let mut h = surface + 3.0 * f64::from(size);
         while h > surface - 3.0 * f64::from(size) {
-            let at = along(direction, SEA_RADIUS + h);
+            let at = along(direction, planet().sea_radius() + h);
             let voxel = at.0.map(|c| c.div_euclid(size));
             let brick = BrickCoord(voxel.map(|v| v.div_euclid(8)));
             let local = voxel.map(|v| v.rem_euclid(8) as u8);
@@ -2009,14 +2221,17 @@ mod tests {
         // Voxels are wider than the country that the line goes down: beyond it, the Voxel at
         // the top is another biome's.
         let temperate = find(|t| t.biome == Biome::Temperate && (300..600).contains(&t.elevation));
-        let snow = find(|t| t.biome == Biome::Snow && t.elevation >= 100);
-        let desert = find(|t| t.biome == Biome::Desert && t.elevation >= 100);
-        let volcanic = find(|t| t.biome == Biome::Volcanic && t.elevation >= 100);
+        // On lowland and not on a peak: the detail roughens the ground with its height (see
+        // `detail`), and a line down a steep slope enters a Voxel at its edge, which is not its top.
+        let low = |t: &Texel, biome| t.biome == biome && (100..1000).contains(&t.elevation);
+        let snow = find(|t| low(t, Biome::Snow));
+        let desert = find(|t| low(t, Biome::Desert));
+        let volcanic = find(|t| low(t, Biome::Volcanic));
         for (direction, top, levels) in [
             (temperate, GRASSY_SOIL, 11),
             (snow, SNOW, 11),
             (desert, SAND, 7),
-            (volcanic, BASALT, 9),
+            (volcanic, BASALT, 6),
         ] {
             for level in 1..=levels {
                 assert_eq!(
@@ -2100,7 +2315,9 @@ mod tests {
     #[test]
     fn digging_the_region_shows_in_the_coarse_bricks_over_it_and_not_the_ground_generated() {
         let spawn = planet().spawn(SPAWN_REACH);
-        let ground = along(spawn, distance(spawn)).brick();
+        // A little under the ground: a Voxel of level 3 is 40 cm across and a brick at the top of
+        // the ground may be air at its middle, with the detail it has at that level.
+        let ground = along(spawn, distance(spawn) - 100.0).brick();
         let mut store = region().clone();
         store.build_lod(3);
         let dug = ground.parent();
@@ -2129,7 +2346,7 @@ mod tests {
     #[test]
     fn a_polar_sea_is_ice_on_water_on_the_sea_floor() {
         let d = find(|t| t.biome == Biome::Snow && t.elevation < -300);
-        let surface = planet().map().elevation_at(d);
+        let surface = planet().ground_height(d);
         let runs = column(d, surface - 6.0, 60.0);
         let found: Vec<_> = runs.iter().map(|r| r.1).collect();
         assert_eq!(found, [Some(SAND), Some(WATER), Some(ICE), None]);
@@ -2139,7 +2356,7 @@ mod tests {
         // Whole bricks agree, including the ones that are all ice and the ones that are water
         // below it.
         for dr in (-80..=20).step_by(4) {
-            let coord = along(d, SEA_RADIUS + f64::from(dr)).brick();
+            let coord = along(d, planet().sea_radius() + f64::from(dr)).brick();
             let brick = planet().brick(coord);
             for (local, voxel) in voxels_of(coord) {
                 assert_eq!(brick.get(local), planet().voxel(voxel), "{coord:?}");
@@ -2173,8 +2390,8 @@ mod tests {
         let source = PlanetSource::new(planet().clone());
         // On the ground, in the sky and deep inside, at level 0 and at coarse levels.
         for radius in [
-            f64::from(WORLD_RADIUS) + 30.0,
-            f64::from(WORLD_RADIUS) + 400_000.0,
+            f64::from(planet().radius()) + 30.0,
+            f64::from(planet().radius()) + 400_000.0,
             1000.0,
         ] {
             let coord = along([0.3, 0.8, 0.5], radius).brick();
@@ -2227,10 +2444,7 @@ mod tests {
         // A brick well under the ground is proven, one that has the ground in it is not. (Not at
         // the spawn, which is the middle of a texel of the map, where the bounds are the widest.)
         let direction = [0.3, 0.8, 0.5];
-        let radius = f64::from(SEA_RADIUS as i32)
-            + planet()
-                .map()
-                .elevation_at(along(direction, SEA_RADIUS).0.map(f64::from));
+        let radius = planet().sea_radius() + planet().ground_height(direction);
         let at = |dr: f64, level: usize| {
             BrickCoord(along(direction, radius + dr).brick().0.map(|c| c >> level))
         };
@@ -2239,7 +2453,7 @@ mod tests {
         assert!(!planet().solid_below(0, at(0.0, 0)));
         assert!(!planet().solid_below(3, at(0.0, 3)));
         // Above the ground and the sea (over open sea, the water is solid up to its surface).
-        let sky = 200.0 + (SEA_RADIUS - radius).max(0.0);
+        let sky = 200.0 + (planet().sea_radius() - radius).max(0.0);
         assert!(!planet().solid_below(0, at(sky, 0)));
     }
 
@@ -2250,15 +2464,15 @@ mod tests {
         let direction = find(|t| t.elevation < -3000);
         let floor = planet()
             .map()
-            .elevation_at(along(direction, SEA_RADIUS).0.map(f64::from));
+            .elevation_at(along(direction, planet().sea_radius()).0.map(f64::from));
         let brick_at = |radius: f64, level: usize| {
             BrickCoord(along(direction, radius).brick().0.map(|c| c >> level))
         };
         let (mut proven, mut water) = (0, 0);
         for level in 0..5 {
             let step = 3.0 * f64::from(BRICK_SIZE << level);
-            let mut radius = SEA_RADIUS + floor - 40.0;
-            while radius < SEA_RADIUS + 60.0 {
+            let mut radius = planet().sea_radius() + floor - 40.0;
+            while radius < planet().sea_radius() + 60.0 {
                 let coord = brick_at(radius, level);
                 if planet().solid_below(level, coord) {
                     proven += 1;
@@ -2287,9 +2501,9 @@ mod tests {
             "{proven} proven, {water} water Voxels"
         );
         // A brick in the middle of the water is proven, and the one across the surface is not.
-        assert!(planet().solid_below(2, brick_at(SEA_RADIUS - 300.0, 2)));
-        assert!(!planet().solid_below(2, brick_at(SEA_RADIUS, 2)));
-        assert!(!planet().solid_below(0, brick_at(SEA_RADIUS + 20.0, 0)));
+        assert!(planet().solid_below(2, brick_at(planet().sea_radius() - 300.0, 2)));
+        assert!(!planet().solid_below(2, brick_at(planet().sea_radius(), 2)));
+        assert!(!planet().solid_below(0, brick_at(planet().sea_radius() + 20.0, 0)));
     }
 
     /// Panics if a Voxel of level 0 under the brick at `coord` of `level` is not air: every one
@@ -2319,12 +2533,15 @@ mod tests {
         // air all the way down, every Voxel of level 0 under it is air.
         let mut proven = 0;
         for direction in lines() {
-            let surface = planet().map().elevation_at(direction).max(0.0);
+            let surface = planet().ground_height(direction).max(0.0);
             for level in 0..=3 {
                 let size = f64::from(BRICK_SIZE << level);
                 let mut height = surface - 3.0 * size;
                 while height < surface + 12.0 * size {
-                    let coord = ancestor(along(direction, SEA_RADIUS + height).brick(), level);
+                    let coord = ancestor(
+                        along(direction, planet().sea_radius() + height).brick(),
+                        level,
+                    );
                     if planet().air_below(level, coord) {
                         proven += 1;
                         assert_air_under(level, coord);
@@ -2341,8 +2558,9 @@ mod tests {
         let sea = find(|t| t.elevation < -400);
         let land = find(|t| (100..300).contains(&t.elevation));
         for level in [0, 1, 4, 8, 12] {
-            let at =
-                |d: [f64; 3], height: f64| ancestor(along(d, SEA_RADIUS + height).brick(), level);
+            let at = |d: [f64; 3], height: f64| {
+                ancestor(along(d, planet().sea_radius() + height).brick(), level)
+            };
             for d in [sea, land, [1.0, 0.0, 0.0], [0.3, -0.5, 0.8]] {
                 // Over the highest peak, by more than the brick is wide.
                 let height = f64::from(PEAK) + 5_000.0 + 2.0 * f64::from(BRICK_SIZE << level);
@@ -2353,7 +2571,7 @@ mod tests {
             assert!(!planet().air_below(level, at(sea, -100.0)), "{level}");
             assert!(!planet().air_below(level, at(sea, -900.0)), "{level}");
             // In the ground.
-            let ground = planet().map().elevation_at(land);
+            let ground = planet().ground_height(land);
             assert!(
                 !planet().air_below(level, at(land, ground - 10.0)),
                 "{level}"
@@ -2368,19 +2586,27 @@ mod tests {
     fn air_below_is_never_claimed_for_a_brick_at_the_mouth_of_a_cave() {
         // A cave only carves ground, so the air in it is not a reason to prove a brick air, and a
         // brick over a mouth is air below only where it is clear of the ground.
-        let mouths = planet().cave_mouths();
+        // Around the Spawn: the caves are made as they are asked for, a few milliseconds a cube.
+        let spawn = planet().spawn(SPAWN_REACH);
+        let mouths =
+            planet().cave_mouths(spawn.map(|c| c - 100_000.0), spawn.map(|c| c + 100_000.0));
         assert!(mouths.len() > 20, "{} mouths", mouths.len());
         let mut proven = 0;
-        for mouth in mouths.into_iter().take(40) {
-            let at = VoxelCoord(mouth.map(|c| c.round() as i32)).brick();
-            for level in 0..=2 {
-                let centre = ancestor(at, level);
-                for (dx, dy, dz) in (0..27).map(|i| (i % 3 - 1, i / 3 % 3 - 1, i / 9 - 1)) {
-                    let [x, y, z] = centre.0;
-                    let coord = BrickCoord([x + dx, y + dy, z + dz]);
-                    if planet().air_below(level, coord) {
-                        proven += 1;
-                        assert_air_under(level, coord);
+        for mouth in mouths.into_iter().take(25) {
+            // At the mouth and over it: the bounds on the ground have the detail's reach in them
+            // (20 m), so a brick is clear of the ground only that far above it.
+            for rise in [0.0, 1000.0] {
+                let height = distance(mouth) + rise;
+                let at = along(mouth, height).brick();
+                for level in 0..=2 {
+                    let centre = ancestor(at, level);
+                    for (dx, dy, dz) in (0..27).map(|i| (i % 3 - 1, i / 3 % 3 - 1, i / 9 - 1)) {
+                        let [x, y, z] = centre.0;
+                        let coord = BrickCoord([x + dx, y + dy, z + dz]);
+                        if planet().air_below(level, coord) {
+                            proven += 1;
+                            assert_air_under(level, coord);
+                        }
                     }
                 }
             }
@@ -2436,14 +2662,15 @@ mod tests {
             })
             .collect();
         for level in 11..=12 {
-            let reach = MAX_RADIUS / (BRICK_SIZE << level) + 2;
+            let reach = planet().max_radius() / (BRICK_SIZE << level) + 2;
             let mut expected = 0;
             for x in -reach..=reach {
                 for y in -reach..=reach {
                     for z in -reach..=reach {
                         let coord = BrickCoord([x, y, z]);
                         let brick = planet().coarse_brick(level, coord);
-                        let wanted = !brick.is_air() && !inside_interior(level, coord);
+                        let wanted =
+                            !brick.is_air() && !planet().shape.inside_interior(level, coord);
                         assert_eq!(
                             found.contains_key(&(level, coord)),
                             wanted,
@@ -2479,8 +2706,7 @@ mod tests {
 
     #[test]
     fn bricks_over_the_ground_of_every_biome_and_across_its_strata_and_cells_are_their_voxels() {
-        let planet = planet();
-        let map = planet.map();
+        let map = planet().map();
         let mut places = vec![
             find(|t| t.biome == Biome::Temperate),
             find(|t| t.biome == Biome::Desert),
@@ -2493,15 +2719,15 @@ mod tests {
         // brick there is across the edge of a cell and reads its elevation as `elevation_at`
         // does), at a face's edge and at a cube corner.
         places.extend([
-            map.texel_direction(0, 200, 300),
+            map.texel_direction(0, 200, 100),
             map.texel_direction(2, 255, 3),
             map.texel_direction(4, 0, 0),
-            map.texel_direction(1, 511, 511),
+            map.texel_direction(1, 255, 255),
         ]);
         let mut bricks = std::collections::BTreeSet::new();
         for direction in places {
             let (ahead, aside) = tangents(direction);
-            let ground = SEA_RADIUS + map.elevation_at(direction);
+            let ground = planet().sea_radius() + planet().ground_height(direction);
             // From above the ground to below the strata's deepest layer (48 m), in steps that are
             // not a brick's, so that bricks lie across each boundary between layers.
             for depth in (-24..=1000).step_by(7).chain(0..=24) {
@@ -2521,7 +2747,7 @@ mod tests {
         }
         assert!(bricks.len() > 1500, "{} bricks", bricks.len());
         for coord in bricks {
-            assert_brick_is_its_voxels(planet, coord);
+            assert_brick_is_its_voxels(planet(), coord);
         }
     }
 
@@ -2546,4 +2772,50 @@ mod tests {
     }
 
     mod cave_tests;
+
+    /// The bounds on the ground over a brick (what the shortcuts of `generate` rest on) hold at
+    /// every Voxel of it, and are not far from what the Voxels have: the detail's bounds are the
+    /// noise's extremes over the box, from its corners, and not a Lipschitz bound at its middle,
+    /// which was ten Voxels loose each way, so that most bricks near the ground had to be worked
+    /// out Voxel by Voxel.
+    #[test]
+    fn the_bounds_on_the_ground_over_a_brick_hold_and_are_tight() {
+        let spawn = planet().spawn(SPAWN_REACH);
+        let up = spawn.map(|c| c / distance(spawn));
+        let axis = (0..3)
+            .max_by(|&a, &b| up[a].abs().total_cmp(&up[b].abs()))
+            .unwrap();
+        let sign = if up[axis] < 0.0 { -1 } else { 1 };
+        let centre = spawn.map(|c| (c / 8.0).floor() as i32);
+        let (mut bricks, mut loose) = (0, 0.0);
+        for dx in -12..12 {
+            for dy in -12..12 {
+                for dz in -8..8 {
+                    let mut c = centre;
+                    c[axis] += dz * sign;
+                    c[(axis + 1) % 3] += dx;
+                    c[(axis + 2) % 3] += dy;
+                    let samples = Samples::new(0, BrickCoord(c));
+                    let corners: [[f64; 3]; 8] =
+                        std::array::from_fn(|i| samples.corner([i & 1, i >> 1 & 1, i >> 2]));
+                    let (low, high) = planet().ground_range(&corners, 1.0);
+                    let heights = (0..512).map(|k| {
+                        let local = [k & 7, k >> 3 & 7, k >> 6 & 7].map(|v| v as u8);
+                        planet().ground_height(samples.at(local))
+                    });
+                    let (mut lowest, mut highest) = (f64::MAX, f64::MIN);
+                    for h in heights {
+                        assert!(low <= h && h <= high, "{c:?}: {h} not in {low}..{high}");
+                        lowest = lowest.min(h);
+                        highest = highest.max(h);
+                    }
+                    loose += (lowest - low) + (high - highest);
+                    bricks += 1;
+                }
+            }
+        }
+        // Measured: 2.6 Voxels in all, at both ends of a brick, of its 512 Voxels' heights.
+        let mean = loose / f64::from(bricks);
+        assert!(mean < 6.0, "{mean} Voxels loose in all");
+    }
 }

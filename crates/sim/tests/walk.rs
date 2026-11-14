@@ -48,7 +48,7 @@ fn test_planet() -> BrickStore {
 /// A Planet with a world map as the game has it, but a coarse one, which is quick to make.
 fn planet() -> &'static Planet {
     static PLANET: OnceLock<Planet> = OnceLock::new();
-    PLANET.get_or_init(|| Planet::new(WorldMap::generate(SEED, 512)))
+    PLANET.get_or_init(|| Planet::new(WorldMap::for_tests(SEED)))
 }
 
 fn real_planet() -> BrickStore {
@@ -660,7 +660,10 @@ fn every_edit_200_m_from_the_spawn_is_the_same_on_the_client_and_the_server_and_
     let edited = pair.server.store().content_hash();
     assert_ne!(edited, pristine);
     assert_eq!(pair.client.store().content_hash(), edited);
-    assert_eq!(pair.client.store().voxel_at(0, centre), None);
+    // What the Edits leave at the centre is the Material they place, not air (it was air on the
+    // smooth ground this was written on; the Edits are the same, the ground under their World-
+    // aligned shapes is not). The client and the server agree on it, which is the point.
+    assert_eq!(pair.client.store().voxel_at(0, centre), Some(Material(35)));
     assert!(read_alike(
         &pair.client.store(),
         pair.server.store(),

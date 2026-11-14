@@ -32,7 +32,7 @@ fn pole() -> Scene {
 /// The real Planet at its spawn, nothing held and everything read from the generator, as the
 /// server has it.
 fn spawn() -> Scene {
-    let planet = Planet::new(WorldMap::generate(SEED, 512));
+    let planet = Planet::new(WorldMap::for_tests(SEED));
     let at = planet.spawn(100).map(|c| c as i32);
     let mut store = BrickStore::new();
     store.set_source(PlanetSource::new(planet));

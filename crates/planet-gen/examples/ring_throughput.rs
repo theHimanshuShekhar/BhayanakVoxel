@@ -14,7 +14,7 @@ use std::time::Instant;
 
 use brick_store::{BRICK_SIZE, BrickCoord, VOXELS_PER_METRE};
 use planet_gen::planet::{Planet, tangents};
-use planet_gen::world_map::{WORLD_RADIUS, WorldMap};
+use planet_gen::world_map::WorldMap;
 
 fn main() {
     let mut args = std::env::args().skip(1);
@@ -36,7 +36,7 @@ fn main() {
     let spawn = planet.spawn(reach);
     println!(
         "spawn at {spawn:?}, {:.0} Voxels out",
-        spawn.iter().map(|c| c * c).sum::<f64>().sqrt() - f64::from(WORLD_RADIUS)
+        spawn.iter().map(|c| c * c).sum::<f64>().sqrt() - f64::from(planet.radius())
     );
 
     let started = Instant::now();
@@ -48,7 +48,9 @@ fn main() {
         started.elapsed()
     );
 
-    let mouths = planet.cave_mouths();
+    // The caves are made as they are asked for, so the mouths are those within 5 km of the spawn.
+    let (low, high) = (spawn.map(|c| c - 100_000.0), spawn.map(|c| c + 100_000.0));
+    let mouths = planet.cave_mouths(low, high);
     println!("{} cave mouths", mouths.len());
     let mouth = mouths[mouths.len() / 2];
     let started = Instant::now();
@@ -62,9 +64,9 @@ fn main() {
     drop(ring);
 
     let started = Instant::now();
-    let guard = planet.guard(9..=13);
+    let guard = planet.guard(13..=17);
     println!(
-        "Guard (levels 9 to 13): {} bricks in {:.2?}",
+        "Guard (levels 13 to 17: at 320 km the levels 9 to 12 are millions of bricks, #167): {} bricks in {:.2?}",
         guard.len(),
         started.elapsed()
     );

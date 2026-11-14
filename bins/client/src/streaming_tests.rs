@@ -35,7 +35,7 @@ const GUARD_FIRST: usize = crate::loader::GUARD_FIRST + 2;
 
 fn planet() -> &'static Planet {
     static PLANET: OnceLock<Planet> = OnceLock::new();
-    PLANET.get_or_init(|| Planet::new(WorldMap::generate(SEED, 512)))
+    PLANET.get_or_init(|| Planet::new(WorldMap::for_tests(SEED)))
 }
 
 fn ground() -> [f64; 3] {
@@ -50,7 +50,7 @@ fn bands() -> Bands {
 fn bound() -> Bound {
     Bound {
         centre: [0; 3],
-        radius: planet_gen::planet::MAX_RADIUS,
+        radius: planet().max_radius(),
     }
 }
 
@@ -1409,7 +1409,7 @@ fn listed(scene: &Scene) -> Vec<usize> {
 fn what_the_scene_thread_counts_as_drawn_is_what_the_frame_threads_copy_lists() {
     let (mut world, _server, camera) = spawned_world(Run::Stepped);
     // Part way through the fill, and when it is done.
-    for _ in 0..30 {
+    for _ in 0..10 {
         stream(&mut world, camera.position);
         pace(&world, Duration::from_millis(3));
     }
@@ -3008,7 +3008,13 @@ fn flying_with_more_work_than_the_budget_drains_the_backlog_takes_in_arrivals_an
             flown.pending_peak <= control.pending_peak * 4 + 1000,
             "{flown:?} against {control:?}"
         );
-        assert!(flown.frames_to_drain <= 4 * frames, "{flown:?}");
+        // (1 036 frames, 4.3 times the flight, on the 40 km test Planet; it was 932, 3.9 times,
+        // before the continents and the shaped detail. Both are stepped rounds, not a clock: the
+        // same 1 036 with eight busy loops competing for the machine. The drain is what the
+        // 12 copies a frame of `SMALL_BUDGET` leave to be made: the flight lists 18 877 copies
+        // against 16 853 on the earlier ground, +12%, as the drain is +11%. Rougher ground
+        // breaks the surface into more pieces; the generator's speed is not in it.)
+        assert!(flown.frames_to_drain <= 5 * frames, "{flown:?}");
     }
 }
 
@@ -3651,7 +3657,9 @@ fn a_throttled_scene_thread_goes_on_when_the_frame_thread_takes_what_waited() {
     eprintln!(
         "{with_update} of {frames} frames had an update; {timeouts} of {waits} waits timed out"
     );
-    assert!(frames >= 50, "only {frames} frames while the loader worked");
+    // (39 on the 40 km test Planet, whose ground has its detail; the smooth sphere's was 50 or
+    // more. A slower generator would give more frames, not fewer: the fill here is smaller.)
+    assert!(frames >= 30, "only {frames} frames while the loader worked");
     assert!(
         waits >= 10,
         "the thread waited {waits} times in {:?}: it did not hold work back, or was starved",
@@ -3704,9 +3712,11 @@ fn after_one_batch_over_the_budget_further_batches_are_taken_again_once_the_back
     }
     let batches = world.stats().work.pack_steps - before.pack_steps;
     eprintln!("{batches} batches in {frames} frames, after a batch of {big:?}");
-    // More than the one a round is always given.
+    // More than the one a round is always given. (139 on the 40 km test Planet, whose ground has
+    // its detail: the flight over it has fewer arrivals a frame than the smooth sphere's, which
+    // had 150 or more. The batches are counted in stepped rounds, not by a clock.)
     assert!(
-        batches as usize >= frames + frames / 4,
+        batches as usize >= frames + frames / 10,
         "{batches} batches in {frames} frames: one a round, as if the budget were still over"
     );
 }

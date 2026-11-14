@@ -81,8 +81,9 @@ clock on by the pause. The stepped parts are in the shipped binary, since `clien
 ## No GPU on Windows
 
 The Windows runners have no Vulkan driver. So `windows-tests` does not run the `render` crate or
-`bins/client/tests/bench.rs`. It also skips two client unit tests by name, because they make an
-`Offscreen` renderer: `bench::caves::tests::the_stills_are_timed_and_photographed` and
+`bins/client/tests/bench.rs`. It also skips three client unit tests by name, because they make an
+`Offscreen` renderer: `bench::caves::tests::the_stills_are_timed_and_photographed`,
+`bench::landscape::the_landscape_from_the_ground_500_m_and_20_km_matches_the_approved_images` (#166) and
 `bench::edits::tests::the_largest_brush_is_dug_and_placed_in_turn_at_no_more_than_the_metric_rate`.
 A new client test that needs a GPU must be skipped there too. The `linux` job runs all of them.
 

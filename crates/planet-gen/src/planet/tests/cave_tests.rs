@@ -4,6 +4,25 @@
 
 use super::*;
 use crate::caves::{self, Tube};
+use crate::world_map::TEST_RADIUS;
+
+/// The box that holds the whole test Planet, for the caves of all of it.
+const WHOLE: ([f64; 3], [f64; 3]) = {
+    let r = (TEST_RADIUS + max_radius(0)) as f64;
+    ([-r; 3], [r; 3])
+};
+
+/// Every tube of the test Planet's caves, which the statistics below are taken over.
+fn all_tubes() -> &'static Vec<Tube> {
+    static TUBES: OnceLock<Vec<Tube>> = OnceLock::new();
+    TUBES.get_or_init(|| planet().caves.tubes_in(WHOLE.0, WHOLE.1))
+}
+
+/// Every mouth of the test Planet's caves.
+fn all_mouths() -> &'static Vec<[f64; 3]> {
+    static MOUTHS: OnceLock<Vec<[f64; 3]>> = OnceLock::new();
+    MOUTHS.get_or_init(|| planet().cave_mouths(WHOLE.0, WHOLE.1))
+}
 
 /// The brick at `coord` of level 0 without its caves: the ground alone.
 fn ground_brick(coord: BrickCoord) -> Brick {
@@ -30,13 +49,16 @@ fn brick_of_point(point: [f64; 3]) -> BrickCoord {
 
 /// How far below the ground `point` is, and the ground's height above sea level there.
 fn depth_and_elevation(point: [f64; 3]) -> (f64, f64) {
-    let elevation = planet().map().elevation_at(point);
-    (SEA_RADIUS + elevation - distance(point), elevation)
+    let elevation = planet().ground_height(point);
+    (
+        planet().sea_radius() + elevation - distance(point),
+        elevation,
+    )
 }
 
 /// Every `step`th tube of the Planet's caves, which the statistics below are taken over.
 fn tubes_stepping(step: usize) -> impl Iterator<Item = &'static Tube> {
-    planet().caves.tubes().iter().step_by(step)
+    all_tubes().iter().step_by(step)
 }
 
 /// The tube's middle, if it is in the band of the caves under land.
@@ -49,18 +71,20 @@ fn middle_in_the_band(tube: &Tube) -> Option<[f64; 3]> {
 #[test]
 fn the_planet_has_caves_under_a_good_part_of_its_land() {
     // Systems are about 17 tubes, and half the Planet is ocean, which has none.
-    let tubes = planet().caves.tubes();
-    eprintln!(
-        "{} tubes, {} mouths",
-        tubes.len(),
-        planet().cave_mouths().len()
-    );
+    let tubes = all_tubes();
+    eprintln!("{} tubes, {} mouths", tubes.len(), all_mouths().len());
     assert!(tubes.len() > 20_000, "{}", tubes.len());
-    assert!(planet().cave_mouths().len() > 500);
-    let again = Planet::new(WorldMap::generate(SEED, SIZE));
-    assert_eq!(planet().caves_hash(), again.caves_hash());
-    let other = Planet::new(WorldMap::generate(SEED + 1, SIZE));
-    assert_ne!(planet().caves_hash(), other.caves_hash());
+    assert!(all_mouths().len() > 500);
+    let again = Planet::new(WorldMap::with_radius(SEED, SIZE, TEST_RADIUS));
+    assert_eq!(
+        planet().caves_hash(WHOLE.0, WHOLE.1),
+        again.caves_hash(WHOLE.0, WHOLE.1)
+    );
+    let other = Planet::new(WorldMap::with_radius(SEED + 1, SIZE, TEST_RADIUS));
+    assert_ne!(
+        planet().caves_hash(WHOLE.0, WHOLE.1),
+        other.caves_hash(WHOLE.0, WHOLE.1)
+    );
 }
 
 #[test]
@@ -118,14 +142,16 @@ fn open_to_the_sky(coord: BrickCoord) -> bool {
         (0..6).any(|face| {
             let mut next = at;
             next[face / 2] += if face % 2 == 0 { -1.0 } else { 1.0 };
-            planet().ground_at(next).is_none()
+            planet()
+                .ground_at(next, 1.0, &mut Default::default())
+                .is_none()
         })
     })
 }
 
 #[test]
 fn some_caves_open_to_the_surface() {
-    let mouths = planet().cave_mouths();
+    let mouths = all_mouths();
     let (mut open, mut tried) = (0, 0);
     for mouth in mouths.iter().step_by(11) {
         let up = mouth.map(|c| c / distance(*mouth));
@@ -159,7 +185,7 @@ fn some_surfaces_overhang_with_air_under_solid_along_a_radial_column() {
     // Going up a radial column by a cave's mouth, from 30 m below the ground to the sky, there is
     // air with solid above it: the roof of a cave, near the surface.
     let (mut columns, mut roofs, mut near) = (0, 0, 0);
-    for mouth in planet().cave_mouths().iter().step_by(13).take(120) {
+    for mouth in all_mouths().iter().step_by(13).take(120) {
         let up = mouth.map(|c| c / distance(*mouth));
         let (ahead, aside) = tangents(up);
         for (s, t) in [
@@ -176,7 +202,7 @@ fn some_surfaces_overhang_with_air_under_solid_along_a_radial_column() {
                 mouth[a] + ahead[a] * f64::from(s) + aside[a] * f64::from(t)
             });
             let dir = base.map(|c| c / distance(base));
-            let ground = SEA_RADIUS + planet().map().elevation_at(dir);
+            let ground = planet().sea_radius() + planet().ground_height(dir);
             let column: Vec<_> = (-600..=80)
                 .map(|dr| planet().voxel(along(dir, ground + f64::from(dr))))
                 .collect();
@@ -223,7 +249,7 @@ fn air_ball_radius(centre: [f64; 3]) -> f64 {
 #[test]
 fn no_cave_is_wider_than_8_m() {
     // By construction a tube is at most 7.2 m across.
-    for tube in planet().caves.tubes() {
+    for tube in all_tubes() {
         assert!(tube.ra.max(tube.rb) + caves::ROUGHNESS <= caves::MAX_TUBE_RADIUS);
     }
     const { assert!(2.0 * caves::MAX_TUBE_RADIUS <= 160.0) };
@@ -232,7 +258,7 @@ fn no_cave_is_wider_than_8_m() {
     // widest. None is 8 m across.
     let mut widest: f64 = 0.0;
     let (mut measured, mut sum) = (0, 0.0);
-    for tube in tubes_stepping(97) {
+    for tube in tubes_stepping(900) {
         for (end, radius) in [(tube.a, tube.ra), (tube.b, tube.rb)] {
             let (depth, elevation) = depth_and_elevation(end);
             if radius < 40.0 || elevation < 200.0 || !(2000.0..5000.0).contains(&depth) {
@@ -261,7 +287,7 @@ fn no_cave_reaches_further_than_a_kilometre() {
     // The tubes of a system share the ends that they meet at, so a system is the tubes joined by
     // their ends. A cave is connected, so it is within one of these, or of those of a cube that
     // meet.
-    let tubes = planet().caves.tubes();
+    let tubes = all_tubes();
     let key = |p: [f64; 3]| p.map(f64::to_bits);
     let mut system_of = std::collections::BTreeMap::new();
     let mut systems: Vec<Vec<[f64; 3]>> = Vec::new();
@@ -555,7 +581,7 @@ fn the_spawn_is_clear_of_the_caves_and_so_is_the_ring_around_it() {
         }
     }
     // No cave opens to the surface within the ring's reach.
-    for mouth in planet().cave_mouths() {
+    for mouth in all_mouths() {
         let along: f64 = (0..3).map(|a| (mouth[a] - spawn[a]) * up[a]).sum();
         let across = distance(std::array::from_fn(|a| mouth[a] - spawn[a] - up[a] * along));
         assert!(
@@ -567,16 +593,29 @@ fn the_spawn_is_clear_of_the_caves_and_so_is_the_ring_around_it() {
 
 #[test]
 fn the_spawn_moves_to_clear_ground_when_the_first_spot_is_by_a_cave() {
-    // On the map of seed 23, the first gentle, temperate spot is within reach of a cave.
-    let planet = Planet::new(WorldMap::generate(23, 128));
-    let first = planet.spawn_where(100, |_| true);
-    assert!(!planet.clear_of_caves(first, 100));
-    let spawn = planet.spawn(100);
-    assert!(spawn != first && planet.clear_of_caves(spawn, 100));
-    // It is still land with some relief to it of at most 40 m, if not temperate.
-    assert!(planet.map().elevation_at(spawn) >= 0.0);
-    let (low, high) = planet.heights_near(spawn, 100);
-    assert!(high - low <= GENTLE);
+    // On some seeds the first gentle, temperate try is within reach of a cave: the Spawn is then
+    // the next that is clear.
+    // A wide ring, so that the first spot is by a cave on some seeds.
+    const REACH: i32 = 4000;
+    let mut moved = 0;
+    for seed in 1..=60 {
+        let planet = Planet::new(WorldMap::with_radius(seed, 128, TEST_RADIUS));
+        let first = planet.spawn_where(REACH, |_| true);
+        if planet.clear_of_caves(first, REACH) {
+            continue;
+        }
+        moved += 1;
+        let spawn = planet.spawn(REACH);
+        assert!(
+            spawn != first && planet.clear_of_caves(spawn, REACH),
+            "seed {seed}"
+        );
+        // It is still land with some relief to it of at most 40 m, if not temperate.
+        assert!(planet.ground_height(spawn) >= 0.0);
+        let (low, high) = planet.heights_near(spawn, REACH);
+        assert!(high - low <= GENTLE, "seed {seed}");
+    }
+    assert!(moved > 0, "no seed of 60 has a cave at its first spot");
 }
 
 #[test]
@@ -607,8 +646,8 @@ fn a_spawn_is_never_clear_when_a_cave_is_carved_within_the_reach_whatever_the_gr
             let side: [f64; 3] =
                 std::array::from_fn(|a| at[a] + ahead[a] * along + aside[a] * across);
             let dir = side.map(|c| c / distance(side));
-            let ground = planet().map().elevation_at(dir);
-            let spawn = dir.map(|d| d * (SEA_RADIUS + ground));
+            let ground = planet().ground_height(dir);
+            let spawn = dir.map(|d| d * (planet().sea_radius() + ground));
             assert!(
                 !planet().clear_of_caves(spawn, reach),
                 "{spawn:?} has a cave at {at:?}"

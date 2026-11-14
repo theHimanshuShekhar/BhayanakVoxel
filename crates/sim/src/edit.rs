@@ -1287,7 +1287,7 @@ mod tests {
         use planet_gen::planet::{Planet, tangents};
         use planet_gen::world_map::WorldMap;
 
-        let planet = Planet::new(WorldMap::generate(0xB4A7_A9AC, 512));
+        let planet = Planet::new(WorldMap::for_tests(0xB4A7_A9AC));
         let ground = planet.spawn(100);
         let length = ground.iter().map(|c| c * c).sum::<f64>().sqrt();
         let up = ground.map(|c| c / length);
@@ -1377,7 +1377,7 @@ mod tests {
         use planet_gen::planet::{Planet, tangents};
         use planet_gen::world_map::WorldMap;
 
-        let planet = Planet::new(WorldMap::generate(0xB4A7_A9AC, 512));
+        let planet = Planet::new(WorldMap::for_tests(0xB4A7_A9AC));
         let ground = planet.spawn(100);
         let length = ground.iter().map(|c| c * c).sum::<f64>().sqrt();
         let up = ground.map(|c| c / length);

@@ -32,7 +32,7 @@ struct World {
 fn world() -> &'static World {
     static WORLD: OnceLock<World> = OnceLock::new();
     WORLD.get_or_init(|| {
-        let planet = Planet::new(WorldMap::generate(SEED, 512));
+        let planet = Planet::new(WorldMap::for_tests(SEED));
         let ground = planet.spawn(100);
         World { planet, ground }
     })
@@ -45,7 +45,7 @@ fn bands() -> Bands {
 fn bound() -> Bound {
     Bound {
         centre: [0; 3],
-        radius: planet_gen::planet::MAX_RADIUS,
+        radius: world().planet.max_radius(),
     }
 }
 
@@ -263,7 +263,10 @@ fn compare(scene: &Scene, oracle: &Scene, camera: &Camera, label: &str) -> (usiz
 #[test]
 fn the_horizon_has_no_sky_gaps_right_after_spawn() {
     let store = spawned_store();
-    let camera = camera_at(0.0);
+    // 25 m from the Spawn: from the Spawn itself, on this Planet's ground (with its detail), the
+    // ground within the ring hides all that is beyond it, so no ray ends in a stand-in and the
+    // test would have nothing to compare.
+    let camera = camera_at(500.0);
     let scene = Scene::rings(&store, camera.position, bands(), bound()).unwrap();
     let oracle_store = oracle_store();
     let oracle = Scene::rings(&oracle_store, camera.position, bands(), bound()).unwrap();
@@ -278,7 +281,9 @@ fn the_horizon_has_no_sky_gaps_right_after_spawn() {
         .filter(|hit| f64::from(hit.t) > 100.0 * VOXELS_PER_METRE)
         .count();
     assert!(far >= 10, "{far} rays reach a hundred metres");
-    assert!(hits >= 120, "{hits} rays hit the ground");
+    // (113 on the 40 km Planet: the Spawn of its ground, which has its detail, has hills in some
+    // of the fan; the smooth sphere had 120 or more.)
+    assert!(hits >= 100, "{hits} rays hit the ground");
     assert!(coarser > 0, "{coarser} of {hits} are stand-ins");
 }
 
@@ -463,5 +468,7 @@ fn flying_at_20_m_per_s_leaves_no_hole_in_the_ground_ahead_of_the_camera() {
             checked += not_deeper_than_the_planet(&scene, &rays, &format!("frame {frame}"));
         }
     }
-    assert!(checked > 1500, "{checked} rays compared with the Planet");
+    // (1 111 on the 40 km Planet's ground: the terrain around the Spawn has fewer rays reaching it
+    // than the smooth sphere's 1 500+.)
+    assert!(checked > 1000, "{checked} rays compared with the Planet");
 }

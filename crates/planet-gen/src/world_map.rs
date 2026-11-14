@@ -2,9 +2,16 @@
 //! generation (#45) samples instead of working out continents and climate itself.
 //!
 //! It is a cube-sphere: six faces of `size` x `size` texels (2048 for the real Planet, about
-//! 12 m a texel at the 16 km radius). Each texel holds its elevation, how much erosion changed
-//! it, its biome and its fantasy-region masks. Sea level is the constant [`SEA_LEVEL`], and
-//! rivers and lakes are not here yet (M1b).
+//! 240 m a texel at the 320 km radius of ADR 0008). Each texel holds its elevation, how much
+//! erosion changed it, its biome and its fantasy-region masks. Sea level is the constant
+//! [`SEA_LEVEL`], and rivers and lakes are not here yet (M1b). It keeps what is large:
+//! continents, climate and biomes. What is finer than a texel is made per brick, from the map's
+//! height (`crate::detail`).
+//!
+//! The Planet's radius is a value, not a constant read from inside: [`WorldMap::with_radius`]
+//! makes the map of a Planet of any radius, and everything that depends on the radius is derived
+//! from the map's. [`WORLD_RADIUS`] is the default, that of the one Planet of the Vertical
+//! slice, and the only radius constant in this crate.
 //!
 //! The map is the same whatever the size of a Voxel (ADR 0007): sizes are in metres, and the
 //! noise is sampled on a lattice of fixed 10 cm spacing ([`ELEVATION_UNITS_PER_METRE`]), not on
@@ -21,7 +28,7 @@
 
 use brick_store::VOXELS_PER_METRE;
 
-use super::value_noise;
+use super::{corner_value, value_noise};
 
 /// Elevations in the map's texels are whole numbers of this many to the metre: 10 cm, whatever
 /// the size of a Voxel. An `i16` holds 3.27 km of them, enough for the 2 km peak.
@@ -44,8 +51,21 @@ pub(crate) const fn units(metres: f64) -> i32 {
 /// Texels along one face's edge for the real Planet.
 pub const WORLD_MAP_SIZE: u32 = 2048;
 
-/// Distance of sea level from the Planet's centre, in Voxels: 16 km.
-pub const WORLD_RADIUS: i32 = voxels(16_000.0);
+/// Distance of sea level from the Planet's centre, in Voxels: 320 km (ADR 0008). The default
+/// radius of a [`WorldMap`], and the only radius constant in this crate: everything else derives
+/// from it, or from the radius a map is made with.
+pub const WORLD_RADIUS: i32 = voxels(320_000.0);
+
+/// The radius of a test Planet: an eighth of [`WORLD_RADIUS`] (40 km, a sixty-fourth of its area),
+/// which is a value derived from it and not a second radius. Tests of this and the other crates
+/// that need a Planet's ground but not its size use it with a world map of [`TEST_MAP_SIZE`]
+/// texels a face (an eighth of the real map's), so that a texel is the same 245 m as the real
+/// Planet's: the same detail at the same sizes in metres, the same erosion limit, and a map made
+/// in a fraction of a second. At 320 km the Guard alone (levels 9 to 13) is millions of bricks.
+pub const TEST_RADIUS: i32 = WORLD_RADIUS / 8;
+
+/// Texels along a face of a test Planet's world map: an eighth of [`WORLD_MAP_SIZE`].
+pub const TEST_MAP_SIZE: u32 = WORLD_MAP_SIZE / 8;
 
 /// Elevation of the sea surface. Texel elevations are in units of 10 cm above or below it.
 pub const SEA_LEVEL: i16 = 0;
@@ -60,10 +80,14 @@ pub const TRENCH: i32 = voxels(1_000.0);
 const PEAK_UNITS: i32 = units(2_000.0);
 const TRENCH_UNITS: i32 = units(1_000.0);
 
-/// Radius of the sphere that the noise is sampled on, in lattice points: 16 km at the lattice's
-/// 10 cm spacing. Its cells are powers of two of that spacing, so the map does not change with
-/// the size of a Voxel.
-const NOISE_RADIUS: i32 = units(16_000.0);
+/// Radius of the sphere that the noise is sampled on, in lattice points, for a Planet of
+/// `radius` Voxels: the radius in the lattice's 10 cm spacing. The cells of the noise are powers
+/// of two of that spacing, so the map does not change with the size of a Voxel, and they are a
+/// fixed size in metres, not a share of the radius: a bigger Planet has more continents, not
+/// bigger ones.
+const fn lattice_radius(radius: i32) -> i32 {
+    (radius as f64 / VOXELS_PER_UNIT + 0.5) as i32
+}
 
 /// Faces as (normal, u axis, v axis), each a signed unit vector along one of x, y and z. A face
 /// is the set of cube points `normal + a * u + b * v` for `a` and `b` in `[-1, 1]`. The order
@@ -123,6 +147,35 @@ pub struct Texel {
     pub erosion: i16,
     pub biome: Biome,
     pub regions: Regions,
+    /// How rough the ground is made between the texels, as a share of 255 of the roughest: from
+    /// the slope here (steeper is rougher), the biome (volcanic is jagged, snow and sand are
+    /// smoothed) and the drainage (smoother in a valley). See `detail`.
+    pub rough: u8,
+    /// How much water drains through this texel: 16 times the log base 2 of the texels that drain
+    /// into it (itself included, flowing downhill to the lowest of four neighbours), 0 on the sea
+    /// and where nothing drains in, at most 255 (about 60,000 texels). The ground is cut into
+    /// gullies where it is high. See `detail`.
+    pub drainage: u8,
+}
+
+/// The fields of the map that the detail is shaped by, at a point: interpolated between the
+/// texels' centres like the elevation is, so that they are continuous.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Fields {
+    /// [`WorldMap::elevation_at`], in Voxels.
+    pub elevation: f64,
+    /// [`Texel::rough`], in `[0, 1]`.
+    pub rough: f64,
+    /// [`Texel::drainage`], in `[0, 1]`.
+    pub drainage: f64,
+}
+
+/// Bounds on [`Fields`] over a box.
+#[derive(Clone, Copy, Debug)]
+pub struct FieldRange {
+    pub elevation: (f64, f64),
+    pub rough: (f64, f64),
+    pub drainage: (f64, f64),
 }
 
 impl Texel {
@@ -146,14 +199,14 @@ pub struct ElevationCell {
     face: usize,
     i: i32,
     j: i32,
-    /// The elevations at `(i, j)`, `(i + 1, j)`, `(i, j + 1)` and `(i + 1, j + 1)`.
-    a: [f64; 4],
+    /// The fields at `(i, j)`, `(i + 1, j)`, `(i, j + 1)` and `(i + 1, j + 1)`.
+    a: [[f64; 3]; 4],
 }
 
 impl ElevationCell {
-    /// What [`WorldMap::elevation_at`] says of `direction`, by the same sums, if it is in this
-    /// cell; else `None`.
-    pub fn elevation_at(&self, direction: [f64; 3]) -> Option<f64> {
+    /// What [`WorldMap::fields_at`] says of `direction`, by the same sums, if it is in this cell;
+    /// else `None`.
+    pub fn fields_at(&self, direction: [f64; 3]) -> Option<Fields> {
         let (face, x, y) = position(self.size, direction);
         let (x, y) = (x - 0.5, y - 0.5);
         let (i, j) = (x.floor() as i32, y.floor() as i32);
@@ -163,7 +216,13 @@ impl ElevationCell {
         let (fx, fy) = (x - f64::from(i), y - f64::from(j));
         let lerp = |a: f64, b: f64, t: f64| a + (b - a) * t;
         let [a00, a10, a01, a11] = self.a;
-        Some(lerp(lerp(a00, a10, fx), lerp(a01, a11, fx), fy))
+        let [elevation, rough, drainage] =
+            std::array::from_fn(|k| lerp(lerp(a00[k], a10[k], fx), lerp(a01[k], a11[k], fx), fy));
+        Some(Fields {
+            elevation,
+            rough,
+            drainage,
+        })
     }
 }
 
@@ -171,49 +230,84 @@ impl ElevationCell {
 pub struct WorldMap {
     seed: u64,
     size: u32,
+    /// Distance of sea level from the Planet's centre, in Voxels.
+    radius: i32,
     /// Face by face, each row by row (`i` fastest).
     texels: Vec<Texel>,
 }
 
 impl WorldMap {
-    /// Computes the map of `seed` with `size` x `size` texels a face, on all available cores.
-    /// The Planet uses [`WORLD_MAP_SIZE`]; tests use a coarser map. Panics if `size` is 0.
+    /// Computes the map of `seed` with `size` x `size` texels a face, on all available cores, for
+    /// a Planet of [`WORLD_RADIUS`]. The Planet uses [`WORLD_MAP_SIZE`]; tests use a coarser map.
+    /// Panics if `size` is 0.
     pub fn generate(seed: u64, size: u32) -> WorldMap {
-        let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
-        Self::generate_on(seed, size, threads)
+        Self::with_radius(seed, size, WORLD_RADIUS)
     }
 
-    fn generate_on(seed: u64, size: u32, threads: usize) -> WorldMap {
+    /// The map of the test Planet of `seed`: [`TEST_MAP_SIZE`] texels a face, [`TEST_RADIUS`]
+    /// Voxels from the centre to sea level.
+    pub fn for_tests(seed: u64) -> WorldMap {
+        Self::with_radius(seed, TEST_MAP_SIZE, TEST_RADIUS)
+    }
+
+    /// [`WorldMap::generate`] for a Planet of `radius` Voxels from the centre to sea level, which
+    /// is a value passed to the generator, so that there can be Planets of different radii in one
+    /// process. The size in metres of continents, peaks and everything else is the same
+    /// whatever the radius; the climate's latitude bands and the erosion's slope limit are what
+    /// scale with it. Panics if `size` is 0 or `radius` is too small to hold the 2 km peak or too
+    /// big for the coordinates (`i32` Voxels, and 10 cm lattice points).
+    pub fn with_radius(seed: u64, size: u32, radius: i32) -> WorldMap {
+        let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+        Self::generate_on(seed, size, radius, threads)
+    }
+
+    fn generate_on(seed: u64, size: u32, radius: i32, threads: usize) -> WorldMap {
         assert!(size > 0, "a world map needs at least one texel");
+        assert!(
+            radius > PEAK + TRENCH && i64::from(radius) < i64::from(i32::MAX) / 2,
+            "a Planet of {radius} Voxels does not fit its relief or the coordinates"
+        );
+        let noise = lattice_radius(radius);
         let count = 6 * (size as usize).pow(2);
         let mut raw = vec![0; count];
         par_fill(&mut raw, threads, |index| {
             let (face, i, j) = split(size, index);
-            raw_elevation(seed, centre(size, face, i, j))
+            raw_elevation(seed, noise, centre(size, face, i, j))
         });
         let base = normalise(&raw, size);
         drop(raw);
         let mut eroded = base.clone();
-        erode(&mut eroded, size, threads);
+        erode(&mut eroded, size, noise, threads);
         let blank = Texel {
             elevation: 0,
             erosion: 0,
             biome: Biome::Temperate,
             regions: Regions::default(),
+            rough: 0,
+            drainage: 0,
         };
+        let drainage = drainage(&eroded, size);
         let mut texels = vec![blank; count];
         par_fill(&mut texels, threads, |index| {
             let (face, i, j) = split(size, index);
             let direction = centre(size, face, i, j);
             let elevation = eroded[index];
+            let biome = biome(seed, noise, direction, elevation);
             Texel {
                 elevation,
                 erosion: (i32::from(base[index]) - i32::from(elevation)) as i16,
-                biome: biome(seed, direction, elevation),
-                regions: regions(seed, direction),
+                biome,
+                regions: regions(seed, noise, direction),
+                rough: roughness(slope(&eroded, size, noise, index), biome, drainage[index]),
+                drainage: drainage[index],
             }
         });
-        WorldMap { seed, size, texels }
+        WorldMap {
+            seed,
+            size,
+            radius,
+            texels,
+        }
     }
 
     /// The seed the map was made from, which per-brick generation draws its own randomness from
@@ -225,6 +319,11 @@ impl WorldMap {
     /// Texels along one face's edge.
     pub fn size(&self) -> u32 {
         self.size
+    }
+
+    /// The distance of sea level from the Planet's centre, in Voxels.
+    pub fn radius(&self) -> i32 {
+        self.radius
     }
 
     /// The texel `(i, j)` of `face`: 0 to 5 in the order +x, -x, +y, -y, +z, -z, with `i`
@@ -271,9 +370,23 @@ impl WorldMap {
 
     /// The elevation of texel `(i, j)` of `face`, where either may be one beyond the face's edge.
     fn elevation_beyond(&self, face: usize, i: i32, j: i32) -> f64 {
+        self.fields_beyond(face, i, j)[0]
+    }
+
+    /// The elevation (in Voxels), roughness and drainage of texel `(i, j)` of `face`, where
+    /// either may be one beyond the face's edge: across it, or at a cube corner the mean of the
+    /// three around it.
+    fn fields_beyond(&self, face: usize, i: i32, j: i32) -> [f64; 3] {
         let last = self.size as i32 - 1;
         let (inner_i, inner_j) = (i.clamp(0, last), j.clamp(0, last));
-        let read = |(face, i, j): (usize, u32, u32)| self.texel(face, i, j).elevation_voxels();
+        let read = |(face, i, j): (usize, u32, u32)| {
+            let texel = self.texel(face, i, j);
+            [
+                texel.elevation_voxels(),
+                f64::from(texel.rough) / 255.0,
+                f64::from(texel.drainage) / 255.0,
+            ]
+        };
         let (ci, cj) = (inner_i as u32, inner_j as u32);
         let inner = read((face, ci, cj));
         let across_i = || read(step(self.size, face, ci, cj, usize::from(i > 0)));
@@ -282,7 +395,29 @@ impl WorldMap {
             (false, false) => inner,
             (true, false) => across_i(),
             (false, true) => across_j(),
-            (true, true) => (inner + across_i() + across_j()) / 3.0,
+            (true, true) => {
+                let (a, b) = (across_i(), across_j());
+                std::array::from_fn(|k| (inner[k] + a[k] + b[k]) / 3.0)
+            }
+        }
+    }
+
+    /// The fields at the ray from the Planet's centre along `direction`: the elevation of
+    /// [`WorldMap::elevation_at`], and the roughness and drainage, interpolated the same way.
+    pub fn fields_at(&self, direction: [f64; 3]) -> Fields {
+        let (face, x, y) = position(self.size, direction);
+        let (x, y) = (x - 0.5, y - 0.5);
+        let (i, j) = (x.floor() as i32, y.floor() as i32);
+        let (fx, fy) = (x - f64::from(i), y - f64::from(j));
+        let at = |di, dj| self.fields_beyond(face, i + di, j + dj);
+        let lerp = |a: f64, b: f64, t: f64| a + (b - a) * t;
+        let (a00, a10, a01, a11) = (at(0, 0), at(1, 0), at(0, 1), at(1, 1));
+        let [elevation, rough, drainage] =
+            std::array::from_fn(|k| lerp(lerp(a00[k], a10[k], fx), lerp(a01[k], a11[k], fx), fy));
+        Fields {
+            elevation,
+            rough,
+            drainage,
         }
     }
 
@@ -304,13 +439,23 @@ impl WorldMap {
     /// bounds, since the hull is then not known to be on one face. Cheap, if they are near each
     /// other.
     pub fn elevation_range(&self, directions: &[[f64; 3]]) -> (f64, f64) {
+        self.field_range(directions).elevation
+    }
+
+    /// [`WorldMap::elevation_range`] for all of the [`Fields`] at once: each is interpolated the
+    /// same way, so each has its extremes where the elevation does.
+    pub fn field_range(&self, directions: &[[f64; 3]]) -> FieldRange {
         // The face the directions are on, and the extremes of where they are on it.
         let mut places = directions.iter().map(|&d| position(self.size, d));
         let (face, x, y) = places.next().expect("directions must not be empty");
         let (mut xs, mut ys) = ((x, x), (y, y));
         for (f, x, y) in places {
             if f != face {
-                return (-f64::from(TRENCH), f64::from(PEAK));
+                return FieldRange {
+                    elevation: (-f64::from(TRENCH), f64::from(PEAK)),
+                    rough: (0.0, 1.0),
+                    drainage: (0.0, 1.0),
+                };
             }
             xs = (xs.0.min(x), xs.1.max(x));
             ys = (ys.0.min(y), ys.1.max(y));
@@ -323,26 +468,54 @@ impl WorldMap {
             (lo, hi, lo.floor() as i32, hi.floor() as i32 + 1)
         };
         let ((x0, x1, i0, i1), (y0, y1, j0, j1)) = (span(xs), span(ys));
-        let texel = |i, j| self.elevation_beyond(face, i, j);
-        let (mut low, mut high) = (f64::INFINITY, f64::NEG_INFINITY);
-        if i1 - i0 == 1 && j1 - j0 == 1 {
+        let texel = |i, j| self.fields_beyond(face, i, j);
+        let mut low = [f64::INFINITY; 3];
+        let mut high = [f64::NEG_INFINITY; 3];
+        let mut take = |e: [f64; 3]| {
+            for k in 0..3 {
+                low[k] = low[k].min(e[k]);
+                high[k] = high[k].max(e[k]);
+            }
+        };
+        // Between the texels the fields are bilinear, so a rectangle of the face has its extremes
+        // where the lines of the texels cut it, and at its corners. A rectangle across a few
+        // texels is bounded that way, and not by all the texels that it is over, which would be
+        // the whole range of a few hundred metres for a brick that only has a texel's edge in it.
+        if i1 - i0 <= 4 && j1 - j0 <= 4 {
+            let breaks = |lo: f64, hi: f64| {
+                let mut at = vec![lo];
+                at.extend(
+                    ((lo.floor() as i32 + 1)..=(hi.floor() as i32))
+                        .map(f64::from)
+                        .filter(|&b| b < hi),
+                );
+                at.push(hi);
+                at
+            };
             let lerp = |a: f64, b: f64, t: f64| a + (b - a) * t;
-            let [a00, a10, a01, a11] =
-                [(0, 0), (1, 0), (0, 1), (1, 1)].map(|(di, dj)| texel(i0 + di, j0 + dj));
-            for (x, y) in [(x0, y0), (x1, y0), (x0, y1), (x1, y1)] {
-                let (fx, fy) = (x - f64::from(i0), y - f64::from(j0));
-                let e = lerp(lerp(a00, a10, fx), lerp(a01, a11, fx), fy);
-                (low, high) = (low.min(e), high.max(e));
+            for &y in &breaks(y0, y1) {
+                for &x in &breaks(x0, x1) {
+                    let (i, j) = (x.floor() as i32, y.floor() as i32);
+                    let (fx, fy) = (x - f64::from(i), y - f64::from(j));
+                    let [a00, a10, a01, a11] =
+                        [(0, 0), (1, 0), (0, 1), (1, 1)].map(|(di, dj)| texel(i + di, j + dj));
+                    take(std::array::from_fn(|k| {
+                        lerp(lerp(a00[k], a10[k], fx), lerp(a01[k], a11[k], fx), fy)
+                    }));
+                }
             }
         } else {
             for j in j0..=j1 {
                 for i in i0..=i1 {
-                    let e = texel(i, j);
-                    (low, high) = (low.min(e), high.max(e));
+                    take(texel(i, j));
                 }
             }
         }
-        (low, high)
+        FieldRange {
+            elevation: (low[0], high[0]),
+            rough: (low[1], high[1]),
+            drainage: (low[2], high[2]),
+        }
     }
 
     /// The one cell of the bilinear interpolation of [`WorldMap::elevation_at`] that all of
@@ -362,7 +535,7 @@ impl WorldMap {
         }
         (i0 == i1 && j0 == j1).then(|| {
             let [a00, a10, a01, a11] = [(0, 0), (1, 0), (0, 1), (1, 1)]
-                .map(|(di, dj)| self.elevation_beyond(face, i0 + di, j0 + dj));
+                .map(|(di, dj)| self.fields_beyond(face, i0 + di, j0 + dj));
             ElevationCell {
                 size: self.size,
                 face,
@@ -379,7 +552,16 @@ impl WorldMap {
         let texels = self.texels.iter().flat_map(|texel| {
             let [e0, e1] = texel.elevation.to_le_bytes();
             let [r0, r1] = texel.erosion.to_le_bytes();
-            [e0, e1, r0, r1, texel.biome as u8, texel.regions.0]
+            [
+                e0,
+                e1,
+                r0,
+                r1,
+                texel.biome as u8,
+                texel.regions.0,
+                texel.rough,
+                texel.drainage,
+            ]
         });
         for byte in self.size.to_le_bytes().into_iter().chain(texels) {
             hash = (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3);
@@ -496,9 +678,10 @@ fn step(size: u32, face: usize, i: u32, j: u32, side: usize) -> (usize, u32, u32
 
 /// Value noise summed over `octaves` octaves, from cells `1 << first` lattice points wide down,
 /// each half the weight of the one before; in `[-1, 1)`. The noise is sampled at the lattice
-/// point of the sphere of [`NOISE_RADIUS`] in `direction`.
-fn fractal(seed: u64, direction: [f64; 3], first: u32, octaves: u32) -> f64 {
-    let point = direction.map(|d| (d * f64::from(NOISE_RADIUS)).round() as i32);
+/// point of the sphere of `noise` lattice points in radius (see [`lattice_radius`]) in
+/// `direction`.
+fn fractal(seed: u64, noise: i32, direction: [f64; 3], first: u32, octaves: u32) -> f64 {
+    let point = direction.map(|d| (d * f64::from(noise)).round() as i32);
     let (mut total, mut weight, mut sum) = (0.0, 1.0, 0.0);
     for octave in 0..octaves {
         let salt = u64::from(octave).wrapping_mul(0x9e37_79b9_7f4a_7c15);
@@ -520,9 +703,82 @@ const REGION: [u64; 4] = [
     0x8eb4_4a87_6858_1511,
 ];
 
-/// The elevation noise at a point, in `[-2^20, 2^20)`, before it is scaled to elevation units.
-fn raw_elevation(seed: u64, direction: [f64; 3]) -> i32 {
-    (fractal(seed ^ ELEVATION, direction, 16, 9) * 1_048_576.0) as i32
+/// Where the noise's cells start, as the power of two of lattice points (10 cm) of the widest:
+/// the sizes of what the map shows, fixed in kilometres whatever the radius.
+///
+/// Continents: sites in cubes of 2^19 points (52 km), see [`continents`]. Elevation's noise: 2^17
+/// points, 13 km, down to 2^11 points (205 m, about a texel of the real map) in 7 octaves. Climate and biomes:
+/// 13 km patches. Volcanic hot spots and the fantasy regions: 6.5 km patches.
+const ELEVATION_CELL: u32 = 17;
+const ELEVATION_OCTAVES: u32 = 7;
+const CLIMATE_CELL: u32 = 17;
+const PATCH_CELL: u32 = 16;
+
+/// The continents' sites: one in each cube of `2^CONTINENT_CELL` lattice points (52 km), in 3D,
+/// so that there is no seam on the sphere. A site is a ball, and a continent is where the ball
+/// meets the sphere of the Planet: a ball that is far from the sphere's surface leaves a small
+/// island or nothing, one that is on it a continent of up to `CONTINENT_REACH` of a cell's width
+/// in radius. So the land is in separate masses of 30 to 60 km, and there are more of them on a
+/// bigger Planet, where noise alone at the median would join half the land in one mass (it is the
+/// threshold at which a random field's land percolates).
+const CONTINENT_CELL: u32 = 19;
+/// The most of a cell's width that a continent's radius is.
+const CONTINENT_REACH: f64 = 0.55;
+const CONTINENT: u64 = 0x3c6e_f372_fe94_f82b;
+
+/// How far a site is from the middle of its cube, as a share of the cube's width (1 is anywhere in
+/// it): the less, the more evenly the continents are spread, and the fewer touch.
+const CONTINENT_JITTER: f64 = 0.9;
+
+/// How much of the elevation is the continents' shape, against the noise's.
+const CONTINENT_SHARE: f64 = 0.62;
+
+/// The share of the Planet's area that is ocean. Not a half: land that is half of a random
+/// field's area joins in one mass, and the continents are separate masses.
+const OCEAN_SHARE: f64 = 0.54;
+
+/// The continents' shape at a lattice point of the sphere: 1 at the middle of a continent, falling
+/// smoothly to 0 at its edge and 0 where there is none; in `[0, 1]`. Deterministic: sums
+/// and products of integers and hashes, so the same on every machine.
+fn continents(seed: u64, point: [i32; 3]) -> f64 {
+    let cell = point.map(|p| p >> CONTINENT_CELL);
+    let width = f64::from(1u32 << CONTINENT_CELL);
+    let mut best: f64 = 0.0;
+    for k in 0..27 {
+        let at = [0, 1, 2].map(|a| cell[a] + (k / 3i32.pow(a as u32)) % 3 - 1);
+        // The site: three jitters in the cell, and the radius of its ball.
+        let jitter = |tag: u64| corner_value(seed ^ CONTINENT ^ tag, at);
+        let site = [1, 2, 3].map(|tag| 0.5 + CONTINENT_JITTER * (jitter(tag) - 0.5));
+        let reach = width * CONTINENT_REACH * (0.45 + 0.55 * jitter(4));
+        let d2: f64 = (0..3)
+            .map(|a| {
+                let d = (f64::from(at[a]) + site[a]) * width - f64::from(point[a]);
+                d * d
+            })
+            .sum();
+        if d2 < reach * reach {
+            // 1 - (d / reach)^2, squared: smooth at the edge.
+            let t = 1.0 - d2 / (reach * reach);
+            best = best.max(t * t);
+        }
+    }
+    best
+}
+
+/// The elevation noise at a point, in `[-2^20, 2^20)`, before it is scaled to elevation units:
+/// the continents' shape, and the noise that is the land's relief and the coasts' shape.
+fn raw_elevation(seed: u64, noise: i32, direction: [f64; 3]) -> i32 {
+    let point = direction.map(|d| (d * f64::from(noise)).round() as i32);
+    let relief = fractal(
+        seed ^ ELEVATION,
+        noise,
+        direction,
+        ELEVATION_CELL,
+        ELEVATION_OCTAVES,
+    );
+    let shape = 2.0 * continents(seed, point) - 1.0;
+    let total = CONTINENT_SHARE * shape + (1.0 - CONTINENT_SHARE) * relief;
+    (total * 1_048_576.0) as i32
 }
 
 /// The weight of each texel of a face, proportional to the area of sphere it covers.
@@ -538,8 +794,8 @@ fn area_weights(size: u32) -> Vec<u32> {
         .collect()
 }
 
-/// Scales the noise to elevation units so that sea level sits at the median by area, which makes
-/// half the Planet ocean, the highest point [`PEAK`] above it and the lowest [`TRENCH`] below.
+/// Scales the noise to elevation units so that sea level sits where [`OCEAN_SHARE`] of the area is
+/// below it, which makes that share of the Planet ocean, the highest point [`PEAK`] above it and the lowest [`TRENCH`] below.
 fn normalise(raw: &[i32], size: u32) -> Vec<i16> {
     const SHIFT: u32 = 5;
     const OFFSET: i32 = 1 << 20;
@@ -548,7 +804,7 @@ fn normalise(raw: &[i32], size: u32) -> Vec<i16> {
     for (index, &value) in raw.iter().enumerate() {
         area[((value + OFFSET) >> SHIFT) as usize] += u64::from(weights[index % weights.len()]);
     }
-    let half = area.iter().sum::<u64>() / 2;
+    let half = (area.iter().sum::<u64>() as f64 * OCEAN_SHARE) as u64;
     let mut below = 0;
     let median_bin = area
         .iter()
@@ -580,12 +836,12 @@ fn normalise(raw: &[i32], size: u32) -> Vec<i16> {
 /// the last step's heights and writes new ones, so the order of texels does not matter. The
 /// number of steps and the talus scale with the texel size, so the slope limit is the same at
 /// every size, but a coarse map is not a small copy of a fine one: material spreads about
-/// `sqrt(size / 16)` texels, and the amounts moved differ (on the test seed the largest change
-/// is about 1,250 units at 256 texels and 580 at 2048).
-fn erode(heights: &mut Vec<i16>, size: u32, threads: usize) {
-    // A slope of 0.2 (11 degrees) across one texel, which is 251,327 units / `size` wide: a
-    // quarter of the circumference of sea level, 25.1 km.
-    let talus = (251_327 / size as i32) / 5;
+/// `sqrt(size / 16)` texels, and the amounts moved differ.
+fn erode(heights: &mut Vec<i16>, size: u32, noise: i32, threads: usize) {
+    // A slope of 0.2 (11 degrees) across one texel, which is a quarter of the circumference of
+    // sea level (pi / 2 of the radius, 251,327 units at 16 km), divided by `size`, wide.
+    let quarter = i64::from(noise) * 1_570_796 / 1_000_000;
+    let talus = (quarter / i64::from(size)) as i32 / 5;
     let mut next = vec![0i16; heights.len()];
     for _ in 0..size / 16 {
         par_fill(&mut next, threads, |index| {
@@ -604,16 +860,108 @@ fn erode(heights: &mut Vec<i16>, size: u32, threads: usize) {
     }
 }
 
+/// The steepest slope from texel `index` to one of its four neighbours: the rise over the run,
+/// where a texel is `noise * pi / 2 / size` lattice points wide (10 cm, as the elevation's units).
+fn slope(heights: &[i16], size: u32, noise: i32, index: usize) -> f64 {
+    let (face, i, j) = split(size, index);
+    let here = i32::from(heights[index]);
+    let rise = (0..4)
+        .map(|side| {
+            let (f, i, j) = step(size, face, i, j, side);
+            (here - i32::from(heights[join(size, f, i, j)])).abs()
+        })
+        .max()
+        .unwrap_or(0);
+    let run = f64::from(noise) * std::f64::consts::FRAC_PI_2 / f64::from(size);
+    f64::from(rise) / run
+}
+
+/// How rough the ground between the texels is made, from the slope (a share of the steepest the
+/// erosion leaves, 0.2), the biome and the drainage: `[0, 255]` for `[0, 1]`. Only sums,
+/// products and quotients, so the same on every machine.
+fn roughness(slope: f64, biome: Biome, drainage: u8) -> u8 {
+    let steep = (slope / 0.12).min(1.0);
+    let biome = match biome {
+        Biome::Volcanic => 1.0,
+        Biome::Temperate => 0.85,
+        Biome::Snow => 0.8,
+        Biome::Desert => 0.65,
+    };
+    let valley = 1.0 - 0.5 * f64::from(drainage) / 255.0;
+    ((0.3 + 0.7 * steep) * biome * valley * 255.0 + 0.5) as u8
+}
+
+/// How much water drains through each texel: land flows to its lowest neighbour (of four, the
+/// first on a tie) if that is lower than it, so the texels' areas add up from the high ground
+/// down to the sea or to a pit. The log of the area in texels, 16 to the doubling (the log is
+/// from the integer's bits, not a function that machines differ on): 0 for a texel that nothing
+/// drains into, and on the sea. A proxy for the large drainage, at the map's texel: the map has
+/// no rivers (M1b-1).
+fn drainage(heights: &[i16], size: u32) -> Vec<u8> {
+    let count = heights.len();
+    // Highest first, by counting sort over the height (a texel's order among equals is its index).
+    let mut counts = vec![0u32; 1 << 16];
+    for &h in heights {
+        counts[(i32::from(h) + 32_768) as usize] += 1;
+    }
+    let mut start = 0u32;
+    for c in counts.iter_mut().rev() {
+        let n = *c;
+        *c = start;
+        start += n;
+    }
+    let mut order = vec![0u32; count];
+    for (index, &h) in heights.iter().enumerate() {
+        let slot = &mut counts[(i32::from(h) + 32_768) as usize];
+        order[*slot as usize] = index as u32;
+        *slot += 1;
+    }
+    let mut area = vec![1u32; count];
+    for &index in &order {
+        let index = index as usize;
+        let here = heights[index];
+        if here < SEA_LEVEL {
+            continue;
+        }
+        let (face, i, j) = split(size, index);
+        let mut lowest = (here, usize::MAX);
+        for side in 0..4 {
+            let (f, i, j) = step(size, face, i, j, side);
+            let at = join(size, f, i, j);
+            if heights[at] < lowest.0 {
+                lowest = (heights[at], at);
+            }
+        }
+        if lowest.1 != usize::MAX {
+            area[lowest.1] = area[lowest.1].saturating_add(area[index]);
+        }
+    }
+    area.iter()
+        .zip(heights)
+        .map(|(&a, &h)| {
+            if h < SEA_LEVEL || a < 2 {
+                return 0;
+            }
+            let shift = a.leading_zeros();
+            let whole = 31 - shift;
+            let part = ((a << shift) >> 27) & 15;
+            (whole * 16 + part).min(255) as u8
+        })
+        .collect()
+}
+
 /// The biome at a texel: cold at the poles and on high ground, dry in a band of subtropical
 /// latitudes, volcanic in rare hot spots.
-fn biome(seed: u64, direction: [f64; 3], elevation: i16) -> Biome {
+fn biome(seed: u64, noise: i32, direction: [f64; 3], elevation: i16) -> Biome {
     let latitude = direction[1].abs();
     let land = elevation >= SEA_LEVEL;
     let height = f64::from(elevation.max(SEA_LEVEL)) / f64::from(PEAK_UNITS);
-    let warmth = 1.0 - latitude - 0.8 * height + 0.1 * fractal(seed ^ WARMTH, direction, 15, 3);
+    let patch =
+        |tag: u64, first: u32, octaves: u32| fractal(seed ^ tag, noise, direction, first, octaves);
+    let warmth = 1.0 - latitude - 0.8 * height + 0.1 * patch(WARMTH, CLIMATE_CELL, 3);
     let subtropics = (1.0 - (latitude - 0.35).abs() / 0.35).max(0.0);
-    let aridity = fractal(seed ^ ARIDITY, direction, 15, 3) + 0.7 * subtropics;
-    if land && fractal(seed ^ VOLCANISM, direction, 15, 4) > 0.4 {
+    let aridity = patch(ARIDITY, CLIMATE_CELL, 3) + 0.7 * subtropics;
+    if land && patch(VOLCANISM, PATCH_CELL, 4) > 0.4 {
         Biome::Volcanic
     } else if warmth < 0.2 {
         Biome::Snow
@@ -625,12 +973,12 @@ fn biome(seed: u64, direction: [f64; 3], elevation: i16) -> Biome {
 }
 
 /// The fantasy regions at a texel: each a rare patch of its own noise.
-fn regions(seed: u64, direction: [f64; 3]) -> Regions {
+fn regions(seed: u64, noise: i32, direction: [f64; 3]) -> Regions {
     Regions(
         REGION
             .iter()
             .enumerate()
-            .filter(|&(_, &tag)| fractal(seed ^ tag, direction, 15, 3) > 0.35)
+            .filter(|&(_, &tag)| fractal(seed ^ tag, noise, direction, PATCH_CELL, 3) > 0.35)
             .fold(0, |bits, (k, _)| bits | 1 << k),
     )
 }
@@ -646,7 +994,7 @@ mod tests {
 
     fn map() -> &'static WorldMap {
         static MAP: OnceLock<WorldMap> = OnceLock::new();
-        MAP.get_or_init(|| WorldMap::generate(SEED, SIZE))
+        MAP.get_or_init(|| WorldMap::with_radius(SEED, SIZE, TEST_RADIUS))
     }
 
     fn all_texels(map: &WorldMap) -> impl Iterator<Item = (usize, u32, u32, Texel)> + '_ {
@@ -670,9 +1018,10 @@ mod tests {
 
     #[test]
     fn the_map_does_not_depend_on_the_thread_count() {
-        let one = WorldMap::generate_on(SEED, 64, 1).content_hash();
+        let one = WorldMap::generate_on(SEED, 64, TEST_RADIUS, 1).content_hash();
         for threads in [2, 3, 8] {
-            assert_eq!(one, WorldMap::generate_on(SEED, 64, threads).content_hash());
+            let many = WorldMap::generate_on(SEED, 64, TEST_RADIUS, threads);
+            assert_eq!(one, many.content_hash());
         }
     }
 
@@ -846,9 +1195,13 @@ mod tests {
                 for &a in &steps {
                     for &b in &steps {
                         let direction = at(a, b);
-                        if let Some(elevation) = cell.elevation_at(direction) {
+                        if let Some(fields) = cell.fields_at(direction) {
                             inside += 1;
-                            assert_eq!(elevation.to_bits(), map.elevation_at(direction).to_bits());
+                            assert_eq!(fields, map.fields_at(direction));
+                            assert_eq!(
+                                fields.elevation.to_bits(),
+                                map.elevation_at(direction).to_bits()
+                            );
                         }
                     }
                 }

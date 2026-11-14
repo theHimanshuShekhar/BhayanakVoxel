@@ -13,6 +13,8 @@ mod args;
 mod budget;
 mod caves;
 mod edits;
+#[cfg(test)]
+mod landscape;
 mod path;
 mod process;
 mod realtime;

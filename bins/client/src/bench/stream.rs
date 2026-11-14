@@ -25,7 +25,7 @@ use std::time::{Duration, Instant};
 use brick_store::{BrickStore, Budget, VOXELS_PER_METRE, VoxelCoord};
 use net::{ServerEnd, loopback};
 use planet_gen::planet::{Planet, tangents};
-use planet_gen::world_map::WorldMap;
+use planet_gen::world_map::{TEST_MAP_SIZE, TEST_RADIUS, WorldMap};
 use render::UploadCost;
 use render::lod::{Bands, LEVELS, Margins};
 use render::scene::Bound;
@@ -40,7 +40,9 @@ use crate::loader::{GUARD_FIRST, Loader, hold_guard};
 use crate::world::World;
 
 /// The test Planet: the world map's size, which the stepped tests use too.
-const MAP_SIZE: u32 = 512;
+/// Texels along a face of the test Planet's world map (an eighth of the real map's: 245 m a
+/// texel, as the real Planet's).
+const MAP_SIZE: u32 = TEST_MAP_SIZE;
 /// Voxels that the loader's first ring reaches round the spawn.
 const RING: i32 = 160;
 /// The bands' `d0`, in Voxels. A small one makes a fill of a few hundred frames; the sizing
@@ -746,7 +748,7 @@ pub(super) struct TestPlanet {
 
 /// The test Planet (see [`TestPlanet`]), which the stepped and the real-time modes both start from.
 pub(super) fn test_planet() -> TestPlanet {
-    let planet = Planet::new(WorldMap::generate(crate::SEED, MAP_SIZE));
+    let planet = Planet::new(WorldMap::with_radius(crate::SEED, MAP_SIZE, TEST_RADIUS));
     let ground = planet.spawn(100);
     let mut store = planet.crust_around(ground, RING, LEVELS - 1);
     hold_guard(&mut store, &planet, GUARD_FIRST);
@@ -758,7 +760,7 @@ pub(super) fn test_planet() -> TestPlanet {
         bands,
         Bound {
             centre: [0; 3],
-            radius: planet_gen::planet::MAX_RADIUS,
+            radius: planet.max_radius(),
         },
     )
     .expect("the rings of the spawn fit");

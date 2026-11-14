@@ -61,6 +61,23 @@ pub const MAX_AHEAD: usize = 512;
 /// How many jobs given up on the loader lets pile up before it takes them out of the queue.
 const PRUNE_FROM: usize = 256;
 
+/// The most bricks the Guard may hold at its first level: the ground of the whole Planet at that
+/// level, counted as the area of its sea over a brick's face. Level 9 holds 0.5 million of them on
+/// the test Planet (40 km) and 77 000 on the old 16 km one, which is what the Guard was sized for;
+/// at 320 km it would hold 31 million, and takes hours to make.
+const GUARD_MOST: f64 = 1_000_000.0;
+
+/// The first level of the Guard for `planet`: [`GUARD_FIRST`] while the whole Planet's ground at
+/// that level is at most [`GUARD_MOST`] bricks, else the first level up that it is (level 12 at
+/// 320 km). The levels under it are streamed like the others (#166: the renderer's own sizes
+/// for the 320 km Planet are #167's).
+pub fn guard_first(planet: &planet_gen::planet::Planet) -> usize {
+    let area = 4.0 * std::f64::consts::PI * f64::from(planet.radius()).powi(2);
+    (GUARD_FIRST..render::lod::LEVELS - 1)
+        .find(|&level| area / (8.0 * f64::from(1u32 << level)).powi(2) <= GUARD_MOST)
+        .unwrap_or(render::lod::LEVELS - 1)
+}
+
 /// The Guard: the whole Planet at the levels from `first` to the top of `store`'s pyramid, held
 /// in it; from then on the store streams, and a brick of level `first` is split when its children
 /// are resident. Returns how many bricks it holds. The bricks, and whether each is solid all the

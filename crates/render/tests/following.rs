@@ -34,7 +34,7 @@ struct World {
 fn world() -> &'static World {
     static WORLD: OnceLock<World> = OnceLock::new();
     WORLD.get_or_init(|| {
-        let planet = Planet::new(WorldMap::generate(SEED, 512));
+        let planet = Planet::new(WorldMap::for_tests(SEED));
         let ground = planet.spawn(100);
         let guard = planet.guard(GUARD);
         World {
@@ -177,7 +177,7 @@ fn run(seed: u64, steps: usize) -> Result<(usize, usize, usize), String> {
     let mut store = spawned_store();
     let bands = Bands::with_d0(D0);
     let top = select::top_level(&store);
-    let roots = select::top_bricks(&store, top, Some(([0; 3], planet_gen::planet::MAX_RADIUS)));
+    let roots = select::top_bricks(&store, top, Some(([0; 3], w.planet.max_radius())));
     let length = w.ground.iter().map(|c| c * c).sum::<f64>().sqrt();
     let up = w.ground.map(|c| c / length);
     let (ahead, aside) = tangents(up);

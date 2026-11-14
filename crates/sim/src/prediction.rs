@@ -211,14 +211,29 @@ impl Predictor {
         self.budget.refill();
         let character = self.character.as_mut()?;
         let seq = self.next_input_seq;
+        // Whether this tick's fill has been made already, in making a leash's ground.
+        let mut filled = false;
         let leash = leash_at(&self.leashes, seq)
             .filter(|_| self.pending_inputs.len() < MAX_PENDING_INPUTS)
             .filter(|leash| {
                 if self.covered != Some(*leash) {
                     if !self.ground.covers(leash) {
-                        // Not made yet: make it, even if the character is somewhere else.
+                        // Not made yet: make it now, ahead of the input that needs it and with
+                        // this tick's fill, even if the character is somewhere else. The server
+                        // decides a leash when its own ball is ready, which is about as the
+                        // client's is but not at the same Voxel of the walk, so its centre is
+                        // a brick or two from the client's (measured: one brick on the way
+                        // out, in the first 40 inputs); the bricks that the new centre lacks are a
+                        // crescent of a few hundred to a thousand, which one fill makes, so that
+                        // the input is not lost to a tick of waiting.
                         self.ground.centre_on(leash);
-                        return false;
+                        let filling = Instant::now();
+                        self.ground.fill();
+                        self.fill_time += filling.elapsed();
+                        filled = true;
+                        if !self.ground.covers(leash) {
+                            return false;
+                        }
                     }
                     self.covered = Some(*leash);
                 }
@@ -236,9 +251,11 @@ impl Predictor {
             ClientMessage::Input { seq, input }
         });
         self.ground.follow(character.state().position);
-        let filling = Instant::now();
-        self.ground.fill();
-        self.fill_time += filling.elapsed();
+        if !filled {
+            let filling = Instant::now();
+            self.ground.fill();
+            self.fill_time += filling.elapsed();
+        }
         request
     }
 
