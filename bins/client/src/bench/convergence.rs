@@ -37,6 +37,7 @@ pub use views::patch_store;
 use std::error::Error;
 use std::fs;
 use std::path::Path;
+use std::time::Instant;
 
 use render::{Camera, GpuInfo, Image, Offscreen, Resolution};
 use serde::Serialize;
@@ -131,6 +132,8 @@ pub struct ConvergenceReport {
     /// Where the pictures and the truths are, in the output folder, and the curve's file.
     pub folder: &'static str,
     pub csv: &'static str,
+    /// Wall-clock seconds the whole phase took: truths, the run, scoring and the files.
+    pub wall_s: f64,
     pub views: Vec<ViewReport>,
 }
 
@@ -227,6 +230,7 @@ impl Capture {
 
 /// Runs the phase on both views and writes the pictures and the curve to `out`.
 pub fn run(settings: &Settings, out: &Path) -> Result<ConvergenceReport, Box<dyn Error>> {
+    let started = Instant::now();
     let (width, height) = settings.size;
     eprintln!(
         "convergence: {width}x{height}, {} samples a view ({} for each of two truths, {} for the \
@@ -240,7 +244,7 @@ pub fn run(settings: &Settings, out: &Path) -> Result<ConvergenceReport, Box<dyn
     for view in [views::golden(), views::pit()] {
         views.push(run_view(view, settings, out)?);
     }
-    let report = ConvergenceReport {
+    let mut report = ConvergenceReport {
         width,
         height,
         scene: "patch",
@@ -260,10 +264,12 @@ pub fn run(settings: &Settings, out: &Path) -> Result<ConvergenceReport, Box<dyn
         min_line_over_floor: MIN_LINE_OVER_FLOOR,
         folder: FOLDER,
         csv: CSV_FILE,
+        wall_s: 0.0,
         views,
     };
     let csv = out.join(CSV_FILE);
     fs::write(&csv, csv_of(&report)).map_err(|e| format!("cannot write {}: {e}", csv.display()))?;
+    report.wall_s = started.elapsed().as_secs_f64();
     Ok(report)
 }
 
@@ -556,6 +562,7 @@ pub fn csv_of(report: &ConvergenceReport) -> String {
 
 /// The phase in brief, for whoever is watching the run.
 pub fn print_summary(report: &ConvergenceReport) {
+    eprintln!("convergence: {:.1} s in all", report.wall_s);
     let num =
         |v: Option<f64>, digits: usize| v.map_or("n/a".to_string(), |v| format!("{v:.digits$}"));
     for view in &report.views {
@@ -585,17 +592,17 @@ pub fn print_summary(report: &ConvergenceReport) {
             );
         }
         for l in &view.lines {
+            let note = if l.counts {
+                String::new()
+            } else {
+                format!(" (does not count here: under {MIN_LINE_OVER_FLOOR} times the floor)")
+            };
             eprintln!(
-                "  FLIP <= {}: {} samples, {} GPU s ({:?}){}",
+                "  FLIP <= {}: {} samples, {} GPU s ({:?}){note}",
                 l.flip,
                 num(l.samples, 1),
                 num(l.gpu_s, 3),
                 l.how,
-                if l.counts {
-                    ""
-                } else {
-                    " (does not count here: under 4 times the floor)"
-                }
             );
         }
     }
@@ -653,6 +660,7 @@ mod tests {
             lines: LINES.to_vec(),
             min_line_over_floor: MIN_LINE_OVER_FLOOR,
             folder: FOLDER,
+            wall_s: 0.0,
             csv: CSV_FILE,
             views: vec![view("golden"), view("pit")],
         }

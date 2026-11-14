@@ -505,12 +505,6 @@ impl Offscreen {
         self.tracer.set_seed(seed);
     }
 
-    /// Starts the reference image over, although nothing it depends on has changed: the next
-    /// sample is sample 0 again.
-    pub fn restart_reference(&mut self) {
-        self.tracer.reset_accumulation();
-    }
-
     /// Samples in the reference image so far.
     pub fn reference_samples(&self) -> u32 {
         self.tracer.samples()

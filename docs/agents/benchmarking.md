@@ -914,11 +914,12 @@ after. It runs on every `client bench` unless `--no-convergence`, after the cave
 client.exe bench --truth-spp 8192 --out bench-out
 ```
 
-That is the whole bench with the phase, which adds about 3 minutes to it (an estimate from #99's
-per-sample times and FLIP's measured 0.25 to 0.5 s an image at 1440p, not yet a measurement on the
-4090): per view 1024 samples of the run and two truths of 8192, at 2.58 ms (golden) and 6.15 ms
-(pit) a sample, so about 45 s and 107 s of GPU time, and about 20 s of FLIP, PNGs and files on the
-CPU. With the default `--truth-spp 1024` it adds about a minute. It writes `bench-out/report.json`
+That is the whole bench with the phase. It took about 5 minutes longer on the 4090 for each of three
+runs (the baseline of #187, in `docs/measurements.md`). With the default `--truth-spp 1024` the
+phase's time is not measured yet; the `wall_s` of the report's `convergence` block is the phase's
+wall-clock time. If the phase fails (a file it cannot write, say), the bench warns on stderr, leaves
+the block null and still writes the rest of the report: the phase has no budget to fail.
+It writes `bench-out/report.json`
 (the `convergence` block), `bench-out/convergence.csv` and `bench-out/convergence/golden/` and
 `convergence/pit/` (about 0.2 GB of truths at 8192 or 1024 alike: they are the image, not the samples).
 
@@ -927,7 +928,7 @@ golden image tests use: `planet_gen::generate_region`), not on the 320 km Planet
 sweep and the cave stills draw. The patch takes a fraction of a second to make, and the views are
 fixed Voxel for Voxel. `golden` is the reference golden's camera and sun
 (`render_reference` in `crates/render/tests/golden.rs`); `pit` is a pit dug into the same hillside
-(40 by 60 Voxels, 40 deep: 2 by 3 m and 2 m deep at 5 cm Voxels, which #99 measured as 4 by 6 m and
+(41 by 61 Voxels, 40 deep: 2 by 3 m and 2 m deep at 5 cm Voxels, which #99 measured as 4 by 6 m and
 4 m at 10 cm), looked into from its rim with the sun behind the far wall, so that its far wall and
 the far part of its floor are lit by bounce light. The pit is a fixed part of the bench scene
 (`bench/convergence/views.rs`), made by setting its Voxels to air in the patch's store, and the
@@ -1020,11 +1021,11 @@ their errors (the floor), and that a seed gives the same image every time.
   "budgets": { "source", "ok", "failed": ["primary/primary"], "unmatched": [] },
   "edits":   { ... } | null,                       // the Edit stress; null for --short
   "convergence": { "width", "height", "scene", "checkpoints", "truth_spp", "seeds", "flip",
-                   "lines", "min_line_over_floor", "folder", "csv",
+                   "lines", "min_line_over_floor", "folder", "csv", "wall_s",
                    "views": [ { "name", ...the view's camera and sun, "reference": STATS,
                                 "gpu_total": STATS, "ms_per_mpix_per_sample", "floor",
                                 "curve": [...], "lines": [...], "files": [...] }... ] } | null,
-                                                   // null with --no-convergence; see its section
+                                                   // null with --no-convergence or if the phase failed; see its section
   "streaming": { "deterministic": true, "schedule", "counts_hash", "upload", "soft_misses",
                  "rings", "work", "residency", "holes", "sizing",
                  "timing": { "deterministic": false, ... } } | null,  // --streaming only

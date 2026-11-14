@@ -44,10 +44,12 @@ Options:
                    and a pit lit by bounce light) at the output resolution, scored with FLIP and
                    squared error against a truth (the same view, another seed) after 1, 4, 16,
                    64, 256 and 1024 samples. It adds a `convergence` block to report.json,
-                   convergence.csv and a convergence/ folder of pictures and truths, and adds
-                   about a minute on the 4090. With --short it is a tiny run with no FLIP
+                   convergence.csv and a convergence/ folder of pictures and truths. Its
+                   wall-clock time is in the block as `wall_s`. With --short it is a tiny run
+                   with no FLIP
   --truth-spp N    Samples of each of the convergence phase's two truths [default: 1024]; ADR
-                   0005's 8192 takes eight times as long (about 3 minutes). At least 1024, the last checkpoint
+                   0005's 8192 takes eight times as long (about 5 minutes on the 4090). At
+                   least 1024, the last checkpoint
   --no-fail        Exit with status 0 even if a pass is over its budget, there is a hole or a
                    real-time gate is over
   -h, --help       Print this";

@@ -69,7 +69,7 @@ fn variance_of_one_sample() -> [f64; 3] {
 }
 
 /// Mean over the image's pixels and channels of the squared difference between the accumulation
-/// and `want`, and the per-channel mean variance the answer predicts for one sample.
+/// and `want`, the answer in each channel.
 fn mse_against(accumulation: &[f32], want: [f64; 3]) -> f64 {
     let squares: f64 = accumulation
         .as_chunks::<3>()

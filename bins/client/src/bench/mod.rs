@@ -276,7 +276,16 @@ fn run(args: &Args) -> Result<u8, Box<dyn Error>> {
         } else {
             convergence::Settings::full(traced, args.truth_spp)
         };
-        Some(convergence::run(&settings, &args.out)?)
+        // It is not budgeted, so a phase that fails must not take the timed results with it.
+        match convergence::run(&settings, &args.out) {
+            Ok(report) => Some(report),
+            Err(e) => {
+                eprintln!(
+                    "warning: the convergence phase failed, and is left out of the report: {e}"
+                );
+                None
+            }
+        }
     } else {
         None
     };

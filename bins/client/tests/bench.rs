@@ -81,6 +81,10 @@ fn check_convergence(convergence: &Value, out: &Path) {
     assert_eq!(convergence["seeds"]["truth_b"], 2);
     assert_eq!(convergence["lines"], serde_json::json!([0.05, 0.02]));
     assert_eq!(convergence["min_line_over_floor"], 4.0);
+    assert!(
+        number(&convergence["wall_s"]) > 0.0,
+        "the phase says how long it took"
+    );
     let (width, height) = (
         convergence["width"].as_u64().unwrap(),
         convergence["height"].as_u64().unwrap(),
@@ -335,6 +339,29 @@ fn the_convergence_phase_can_be_left_out_and_a_truth_needs_the_phase() {
     let wrong = bench(&["--short", "--no-convergence", "--truth-spp", "2048"]);
     assert_eq!(wrong.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&wrong.stderr).contains("--truth-spp"));
+    let _ = std::fs::remove_dir_all(&out);
+}
+
+#[test]
+fn a_failing_convergence_phase_warns_and_leaves_the_rest_of_the_report() {
+    let out = scratch("convergence-fails");
+    let run_dir = out.join("run");
+    std::fs::create_dir_all(&run_dir).unwrap();
+    // The phase's folder cannot be made where a file of that name is.
+    std::fs::write(run_dir.join("convergence"), "in the way").unwrap();
+    let run = bench(&["--short", "--no-fail", "--out", run_dir.to_str().unwrap()]);
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert_eq!(run.status.code(), Some(0), "{stderr}");
+    assert!(
+        stderr.contains("the convergence phase failed"),
+        "no warning: {stderr}"
+    );
+    let report = read_report(&run_dir);
+    assert!(report["convergence"].is_null());
+    assert!(
+        report["modes"]["primary"]["passes"].is_array(),
+        "the timed results are still there"
+    );
     let _ = std::fs::remove_dir_all(&out);
 }
 

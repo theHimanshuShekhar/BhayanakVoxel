@@ -192,9 +192,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_pit_is_dug_to_the_same_floor_as_on_99() {
-        // Held against #99's `summary.json` for the pit it measured: the same hillside, the same
-        // box, the same depth below the same rim.
+    fn the_pit_floor_is_the_depth_below_the_lowest_rim_ground_and_the_box_above_it_is_air() {
+        // What it checks is the pit's construction, not #99's numbers: #99's `summary.json` is
+        // not kept anywhere (the throwaway branch has the code that wrote it, not its values), so
+        // its absolute `floor_y` and `voxels_dug` cannot be pinned. The code is the same formula.
         let mut store = patch_store();
         let pit = dig_pit(&mut store);
         assert_eq!(pit.floor_y, pit.rim_low_y - 40);
