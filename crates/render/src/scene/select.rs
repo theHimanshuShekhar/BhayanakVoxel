@@ -683,14 +683,31 @@ impl Selection {
         roots: impl IntoIterator<Item = BrickCoord>,
         horizon: Option<Horizon>,
     ) -> (Self, Diff) {
+        Selection::new_reached(store, camera, bands, top, roots, horizon, Reach::NONE)
+    }
+
+    /// [`Selection::new_capped`] with the margins and the lead of `reach` (see
+    /// [`Selection::set_margins`] and [`Selection::set_ahead`]) in force from the first look at
+    /// the nodes, so that the cap is the raised camera's and the margin's children are wanted at
+    /// once, and not by a second look at every node (and a patch of what is drawn) after. Its
+    /// horizon is `horizon`, not the reach's.
+    pub fn new_reached(
+        store: &BrickStore,
+        camera: [f64; 3],
+        bands: Bands,
+        top: usize,
+        roots: impl IntoIterator<Item = BrickCoord>,
+        horizon: Option<Horizon>,
+        reach: Reach,
+    ) -> (Self, Diff) {
         assert!(top < LEVELS && top < store.level_count());
         let mut selection = Selection {
             bands,
             top,
             camera,
-            reach: Reach::NONE,
+            reach: Reach { horizon, ..reach },
             horizon,
-            placed: Reach::NONE.from(camera),
+            placed: Reach { horizon, ..reach }.from(camera),
             travelled: 0.0,
             rewanted: false,
             nodes: HashMap::default(),

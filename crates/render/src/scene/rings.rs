@@ -627,6 +627,7 @@ impl Scene {
             bound,
             Sizing::Fitted(2.0, (0, 0)),
             None,
+            Reach::NONE,
         )
     }
 
@@ -648,6 +649,7 @@ impl Scene {
             bound,
             Sizing::Fitted(2.0, (refs, words)),
             None,
+            Reach::NONE,
         )
     }
 
@@ -660,7 +662,15 @@ impl Scene {
         bound: Bound,
         room: Room,
     ) -> Result<Scene, RingsFull> {
-        Scene::rings_sized(store, camera, bands, bound, Sizing::Given(room), None)
+        Scene::rings_sized(
+            store,
+            camera,
+            bands,
+            bound,
+            Sizing::Given(room),
+            None,
+            Reach::NONE,
+        )
     }
 
     fn rings_sized(
@@ -670,10 +680,12 @@ impl Scene {
         bound: Bound,
         sizing: Sizing,
         horizon: Option<Horizon>,
+        reach: Reach,
     ) -> Result<Scene, RingsFull> {
         let top = select::top_level(store);
         let roots = select::top_bricks(store, top, Some((bound.centre, bound.radius)));
-        let (selection, _) = Selection::new_capped(store, camera, bands, top, roots, horizon);
+        let (selection, _) =
+            Selection::new_reached(store, camera, bands, top, roots, horizon, reach);
         Scene::pack_rings(store, selection, bound, sizing)
     }
 
@@ -1018,15 +1030,11 @@ impl Scene {
         let (reserved, reach) = (rings.reserved, rings.selection.reach());
         let horizon = rings.selection.horizon();
         let changed = self.changed;
-        *self = Scene::rings_sized(store, camera, bands, ball, sizing, horizon)?;
+        // The margins and the lead are in force for the first selection, so that what is packed
+        // is what the next update would leave (the cap is the raised camera's).
+        *self = Scene::rings_sized(store, camera, bands, ball, sizing, horizon, reach)?;
         self.changed = changed;
         self.bound = clipped.then_some(ball);
-        if !reach.is_none()
-            && let Some(rings) = &mut self.rings
-        {
-            rings.selection.set_ahead(reach.ahead);
-            rings.selection.set_margins(store, reach.margins);
-        }
         if let (Some(reserved), Some(rings)) = (reserved, &mut self.rings) {
             let scale = (bands.d0() / reserved.d0).powi(2);
             let by = |n: usize| (n as f64 * scale) as usize;
@@ -2127,6 +2135,30 @@ mod tests {
 
     fn rings_at(camera: [f64; 3]) -> Scene {
         Scene::rings(ground(), camera, bands(), bound()).unwrap()
+    }
+
+    #[test]
+    fn a_scene_made_again_for_a_jump_has_the_margins_cap_at_once_and_the_next_update_draws_nothing_new()
+     {
+        // The raised camera's cap (the vertical margin) is what is drawn: a scene that is packed
+        // from the unraised camera's and then patched out would upload twice.
+        let mut scene = rings_at(ABOVE);
+        scene
+            .set_horizon(ground(), Some(Horizon::new(1500.0)))
+            .unwrap();
+        scene.set_margins(ground(), Margins::standard());
+        scene.recentre(ground(), ABOVE).unwrap();
+        let counts = |scene: &Scene| {
+            (0..LEVELS)
+                .map(|l| scene.level_bricks(l))
+                .collect::<Vec<_>>()
+        };
+        let far = [ABOVE[0] + 300.0, ABOVE[1], ABOVE[2] - 200.0];
+        let rebuilt = scene.recentre(ground(), far).unwrap();
+        assert_eq!(rebuilt, Some(SceneUpdate::Rebuilt));
+        let after_rebuild = counts(&scene);
+        scene.recentre(ground(), far).unwrap();
+        assert_eq!(counts(&scene), after_rebuild);
     }
 
     #[test]
