@@ -61,6 +61,8 @@ release: a debug build's CPU side is slow enough to distort the frame times.
 | `--streaming` | Also runs the streaming mode (below): the test Planet streamed in, stepped, on a fixed frame schedule, with counts that are the same on every run. The report's `streaming` is null without it. |
 | `--real-time` | With `--streaming`, also runs the real-time mode (below): the full-size Planet with the real loader workers and scene thread, on the machine's clock, along paths of 50 m/s flights, a take-off, a turn, a stop and a cold start. It takes tens of minutes and is not deterministic. With `--short` it runs on the test Planet, as a smoke test. The report's `streaming_real_time` is null without it. |
 | `--runs N` | With `--real-time`, how many times to run the paths in this process. Default 3. The report keeps each run and the least and the most of every number over them; the gates use the worst. |
+| `--no-convergence` | Leave out the convergence phase (below), which otherwise runs after the caves. |
+| `--truth-spp N` | Samples of each of the convergence phase's two truths. Default 1024; ADR 0005's is 8192, which takes eight times as long (`client.exe bench --truth-spp 8192` is the 4090 baseline). At least 1024, the last checkpoint. |
 | `--no-fail` | Exit with status 0 even if a pass is over budget, a frame of the streaming mode has a hole, or a gate of the real-time mode is over. |
 
 It runs unattended and takes a minute or so (generating the whole Planet is about 22 s of it).
@@ -109,7 +111,12 @@ stops").
    the view to seconds to make, and the numbers say what the cave costs, not the far ground. The
    flight and the sweep are left alone. `--short` has no stills.
 
-6. With `--streaming`, after everything else (the cave stills included, so that the flag cannot
+6. Then the convergence phase (#187), unless `--no-convergence`: how fast the Reference view gets
+   clean, on two still views, scored against a truth. It has GPU contexts of its own and runs after
+   everything that is timed against the budgets, so it cannot move them. See "The convergence
+   phase" below.
+
+7. With `--streaming`, after everything else (the cave stills and the convergence phase included, so that the flag cannot
    move their timings), the streaming mode (#181), on a GPU of its own. See "The streaming mode"
    below. With `--real-time` as well, the real-time mode (#162) after it, on a world and a GPU of
    its own for each run. See "The real-time mode".
@@ -894,11 +901,105 @@ ends the process with **status 101 and no `report.json`**, as does any panic out
 process abort (an out-of-memory kill, a driver crash) ends it by signal, also with no report. In
 those cases the output on stderr is all there is.
 
+## The convergence phase
+
+ADR 0005 judges the Reference view, and Primary against it, by a convergence curve: how far the
+image is from a truth after 1, 4, 16, 64, 256 and 1024 samples. `client bench` makes that curve
+(#187), so that the estimator (#188) and the still-frame policy (#189) are measured before and
+after. It runs on every `client bench` unless `--no-convergence`, after the caves.
+
+**On the 4090**, from the Windows artifact, for ADR 0005's baseline (8192-sample truths):
+
+```
+client.exe bench --truth-spp 8192 --out bench-out
+```
+
+That is the whole bench with the phase, which adds about 3 minutes to it (an estimate from #99's
+per-sample times and FLIP's measured 0.25 to 0.5 s an image at 1440p, not yet a measurement on the
+4090): per view 1024 samples of the run and two truths of 8192, at 2.58 ms (golden) and 6.15 ms
+(pit) a sample, so about 45 s and 107 s of GPU time, and about 20 s of FLIP, PNGs and files on the
+CPU. With the default `--truth-spp 1024` it adds about a minute. It writes `bench-out/report.json`
+(the `convergence` block), `bench-out/convergence.csv` and `bench-out/convergence/golden/` and
+`convergence/pit/` (about 0.2 GB of truths at 8192 or 1024 alike: they are the image, not the samples).
+
+**The views.** Both are on the patch of the *test* Planet (the small sphere of 1500 Voxels that the
+golden image tests use: `planet_gen::generate_region`), not on the 320 km Planet that the flight, the
+sweep and the cave stills draw. The patch takes a fraction of a second to make, and the views are
+fixed Voxel for Voxel. `golden` is the reference golden's camera and sun
+(`render_reference` in `crates/render/tests/golden.rs`); `pit` is a pit dug into the same hillside
+(40 by 60 Voxels, 40 deep: 2 by 3 m and 2 m deep at 5 cm Voxels, which #99 measured as 4 by 6 m and
+4 m at 10 cm), looked into from its rim with the sun behind the far wall, so that its far wall and
+the far part of its floor are lit by bounce light. The pit is a fixed part of the bench scene
+(`bench/convergence/views.rs`), made by setting its Voxels to air in the patch's store, and the
+`golden` scene has none of it, so the golden's picture is the one of #99 and of the golden test.
+Each view is its own scene on its own GPU context.
+
+**What is drawn.** The Reference view traces at the output resolution (twice `--size` in each
+direction: 2560x1440 for the default), one sample a dispatch, each submitted and waited for and timed
+like the flight's reference mode times its samples (`reference` and `gpu_total`: the same pass and
+timers, so they can be set beside `modes.reference`, which is at 1280x720; the view's
+`ms_per_mpix_per_sample` is the mean of `reference` over the image's megapixels). The order, per view:
+truth A (seed 1) and truth B (seed 2), `truth_spp` samples each, which warm the GPU and are not
+timed; then the run (seed `0xB4A7A9AC`, the reference's own), timed, with the image and the `f32`
+accumulation read back at each checkpoint; then the GPU context is dropped and everything is scored
+on the CPU, **outside every timer**. The truth is the same view with another seed, never the run's
+own: with the same seed the first samples would be the truth's and every error would read low.
+
+**The scores** (`report.convergence.views[].curve[]`, each against truth A):
+
+- `flip_mean` and `flip_p99`: LDR-FLIP of `flip-rs` (`=0.1.2`, pinned in `bins/client/Cargo.toml`
+  and as `FLIP_VERSION` next to the seeds, and a test holds the two together), ppd 67.02, on the 8-bit
+  image that the Reference view shows (what `render_reference` reads back: the mean encoded with a gamma
+  of 2.2 and clamped, which is what the player sees today; ADR 0005's "true sRGB curve" is for when
+  the shader's `encode` changes, and the phase scores whatever it shows). `flip_p99` is the
+  error-weighted 99th percentile, a guard against speckles.
+- `mse_linear`: the mean squared difference per channel of the `f32` accumulations, in linear light.
+  `mse_linear_run_only` is that less half the floor's, which is the truth's own share, so it is the
+  run's noise alone and falls as 1/N.
+- `gpu_s`: the GPU seconds of the run's first N samples, as timed (null without timers).
+
+`floor` is truth B against truth A in the same three: the metric's noise in this view. `lines` has,
+for FLIP 0.05 and 0.02, the samples at which the curve gets there (`samples`; null if it never does),
+how that was found (`how`: `at-first-checkpoint`; `interpolated` on a log-log line between two
+checkpoints; `extrapolated` along the last two, which is an estimate, not a measurement;
+`not-reached`), the GPU seconds that takes at the mean and at the p95 of one sample's time (`gpu_s`,
+`gpu_s_p95`), and `counts`: **a line counts in a view when it is at least 4 times the view's floor
+FLIP mean**. Where it does not, the view cannot tell that line from noise (on #99, FLIP 0.02 in the
+pit at 720p). Read a line that does not count as nothing, and `extrapolated` as a hint to raise
+`--truth-spp`'s checkpoints, not as a number to quote.
+
+**The files.** `convergence.csv` has the curve for plotting: `view`, `samples`, `gpu_s`,
+`flip_mean`, `flip_p99`, `mse_linear`, `mse_linear_run_only`, and the view's floor
+(`floor_flip_mean`, `floor_mse_linear`) on every row. `convergence/VIEW/` has `sppNNNN.png` for each
+checkpoint and, for each truth, `truth-a|b.png`, `.f32` (little-endian RGB floats, linear, rows from
+the top) and `.json`, its inputs (the view, camera, sun, seed, samples, size, generator version, GPU,
+driver and build). **A truth is kept for looking at and for working out what a number was made of. It
+is for the machine, the driver and the build that made it: never compare one between machines or
+drivers, and never put one in `tests/golden/`.** Two machines' curves are compared as curves, each
+against its own truths.
+
+**A regression** is a PR whose curve on the 4090 is worse than main's by more than the floor (ADR
+0005); nothing gates on it yet, and the phase has no budget in `bench-budgets.toml`. Compare
+`curve[].flip_mean` per checkpoint, view by view, from two reports made with the same `--truth-spp`.
+Truth sample counts matter: the error against a truth of M samples carries the truth's own `1/M`.
+
+**In CI** (`--short`): the phase runs at half of the traced size with three checkpoints (1, 4, 16),
+truths of 16 samples and **no FLIP** (`convergence.flip` is null, and so are every FLIP number and
+`lines`), to see that it runs and that the report and the files have the right shape: the bench smoke
+test checks them. FLIP is never run in CI: `flip-rs` is compiled in (the Windows artifact needs it)
+and nothing calls it. Two ignored tests do, by hand: `cargo test -p client --bin client -- --ignored
+flip_of` (the wrapper) and `-- --ignored the_phase_with_flip` (the whole phase at 96x54, or at
+`CONVERGENCE_TEST_SIZE=WxH`). `crates/render/tests/convergence.rs` holds, on lavapipe at 32x32, that the
+squared error against a scene with a known answer (a flat sunlit floor: `albedo * (sun * cos + the sky
+averaged with the cosine weight)`) falls as 1/N from 1 to 256 samples, with N times the error equal to
+the variance of one sample worked out from the sky's gradient, that two seeds differ by the sum of
+their errors (the floor), and that a seed gives the same image every time.
+
 ## Reading the report
 
 ```
 {
-  "schema_version": 15,
+  "schema_version": 16,
   "build":   { "version", "commit" },          // commit: CI builds only, else null; on a PR
                                                // build it is GitHub's merge commit, not the head
   "machine": { "gpu", "device_type", "driver", "driver_info", "backend", "os", "arch",
@@ -918,6 +1019,12 @@ those cases the output on stderr is all there is.
   "screenshots": [ "primary-frame0000.png", ..., "primary-cave-mouth.png", ... ],
   "budgets": { "source", "ok", "failed": ["primary/primary"], "unmatched": [] },
   "edits":   { ... } | null,                       // the Edit stress; null for --short
+  "convergence": { "width", "height", "scene", "checkpoints", "truth_spp", "seeds", "flip",
+                   "lines", "min_line_over_floor", "folder", "csv",
+                   "views": [ { "name", ...the view's camera and sun, "reference": STATS,
+                                "gpu_total": STATS, "ms_per_mpix_per_sample", "floor",
+                                "curve": [...], "lines": [...], "files": [...] }... ] } | null,
+                                                   // null with --no-convergence; see its section
   "streaming": { "deterministic": true, "schedule", "counts_hash", "upload", "soft_misses",
                  "rings", "work", "residency", "holes", "sizing",
                  "timing": { "deterministic": false, ... } } | null,  // --streaming only

@@ -465,23 +465,7 @@ impl Offscreen {
     /// previous call. With zero samples it just reads the image again.
     pub fn render_reference(&mut self, camera: &Camera, samples: u32) -> Image {
         for _ in 0..samples {
-            let mut encoder = self
-                .device
-                .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
-            self.profiler.begin_frame();
-            self.tracer.encode_reference(
-                &self.device,
-                &self.queue,
-                &mut self.profiler,
-                &mut encoder,
-                camera,
-                &self.sun,
-                &self.target,
-            );
-            self.profiler.resolve(&mut encoder);
-            // The uniforms of the next sample are written over these.
-            self.queue.submit([encoder.finish()]);
-            self.profiler.collect(&self.device, true);
+            self.reference_sample(camera);
         }
         let size = self.target.resolution().internal;
         let texture = self.target.lit().texture.clone();
@@ -489,6 +473,72 @@ impl Offscreen {
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
         self.read_image(encoder, &texture, size)
+    }
+
+    /// Adds one sample of the reference path tracer to the image of `camera`, without reading
+    /// anything back, and waits until the GPU has done it: the pass is timed (see
+    /// [`Offscreen::timings`]) the same way as every sample of [`Offscreen::render_reference`].
+    pub fn reference_sample(&mut self, camera: &Camera) {
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        self.profiler.begin_frame();
+        self.tracer.encode_reference(
+            &self.device,
+            &self.queue,
+            &mut self.profiler,
+            &mut encoder,
+            camera,
+            &self.sun,
+            &self.target,
+        );
+        self.profiler.resolve(&mut encoder);
+        // The uniforms of the next sample are written over these.
+        self.queue.submit([encoder.finish()]);
+        self.profiler.collect(&self.device, true);
+    }
+
+    /// Sets the seed of the reference's random numbers (the default is
+    /// [`crate::tracer::RNG_SEED`]) and starts its image over. Another seed gives an independent
+    /// image of the same view, with the same expected value.
+    pub fn set_reference_seed(&mut self, seed: u32) {
+        self.tracer.set_seed(seed);
+    }
+
+    /// Starts the reference image over, although nothing it depends on has changed: the next
+    /// sample is sample 0 again.
+    pub fn restart_reference(&mut self) {
+        self.tracer.reset_accumulation();
+    }
+
+    /// Samples in the reference image so far.
+    pub fn reference_samples(&self) -> u32 {
+        self.tracer.samples()
+    }
+
+    /// The reference's running mean as the accumulation buffer holds it, in linear light before
+    /// the display encoding and the clamp to 0..1: RGB for each pixel of the traced image, rows
+    /// from the top (`3 * width * height` floats).
+    pub fn read_accumulation(&mut self) -> Vec<f32> {
+        let (width, height) = self.target.resolution().internal;
+        let size = u64::from(width) * u64::from(height) * 16;
+        let encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        let bytes = crate::read_buffer(
+            &self.device,
+            &self.queue,
+            encoder,
+            self.target.accum(),
+            size,
+        );
+        let mut rgb = Vec::with_capacity(width as usize * height as usize * 3);
+        for texel in bytes.as_chunks::<16>().0 {
+            for channel in texel[..12].as_chunks::<4>().0 {
+                rgb.push(f32::from_le_bytes(*channel));
+            }
+        }
+        rgb
     }
 
     /// Reads back `texture`, an image `(width, height)` big, after the work recorded in `encoder`,

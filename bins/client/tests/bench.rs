@@ -67,8 +67,82 @@ fn check_entry(entry: &Value) {
 /// `bench::stream` check as well (on Windows too, where there is no GPU for this test).
 const GOLDEN_COUNTS: &str = include_str!("../src/bench/streaming-counts.golden");
 
+/// The convergence phase of a `--short` run (#187): a tiny ladder on both views, with no FLIP, which
+/// CI never runs (ADR 0005); what is checked is the shape of the block and the files.
+fn check_convergence(convergence: &Value, out: &Path) {
+    assert!(convergence.is_object(), "the phase runs unless it is left out");
+    assert_eq!(string(&convergence["scene"]), "patch");
+    assert!(convergence["flip"].is_null(), "--short runs no FLIP");
+    assert_eq!(convergence["checkpoints"], serde_json::json!([1, 4, 16]));
+    assert_eq!(convergence["seeds"]["truth_a"], 1);
+    assert_eq!(convergence["seeds"]["truth_b"], 2);
+    assert_eq!(convergence["lines"], serde_json::json!([0.05, 0.02]));
+    assert_eq!(convergence["min_line_over_floor"], 4.0);
+    let (width, height) = (
+        convergence["width"].as_u64().unwrap(),
+        convergence["height"].as_u64().unwrap(),
+    );
+    let views = convergence["views"].as_array().expect("views");
+    let names: Vec<&str> = views.iter().map(|v| string(&v["name"])).collect();
+    assert_eq!(names, ["golden", "pit"]);
+    for view in views {
+        let name = string(&view["name"]);
+        check_stats(&view["reference"]);
+        check_stats(&view["gpu_total"]);
+        number_or_null(&view["ms_per_mpix_per_sample"]);
+        // Both views have a camera and a sun, and only the pit says what was dug.
+        assert_eq!(view["camera_from"].as_array().unwrap().len(), 3);
+        assert_eq!(view["pit"].is_object(), name == "pit", "{name}");
+        // No FLIP: its numbers are null, the squared error is there, and no line is worked out.
+        assert!(view["floor"]["flip_mean"].is_null());
+        assert!(number(&view["floor"]["mse_linear"]) >= 0.0);
+        assert_eq!(view["lines"], serde_json::json!([]));
+        let curve = view["curve"].as_array().expect("curve");
+        let samples: Vec<u64> = curve.iter().map(|p| p["samples"].as_u64().unwrap()).collect();
+        assert_eq!(samples, [1, 4, 16]);
+        for point in curve {
+            assert!(point["flip_mean"].is_null() && point["flip_p99"].is_null());
+            assert!(number(&point["mse_linear"]) >= 0.0);
+            number(&point["mse_linear_run_only"]);
+            number_or_null(&point["gpu_s"]);
+        }
+        // The truths with their inputs, and a picture of every checkpoint, are in the folder.
+        let folder = out.join(string(&convergence["folder"])).join(name);
+        for file in [
+            "truth-a.png",
+            "truth-a.f32",
+            "truth-a.json",
+            "truth-b.png",
+            "truth-b.f32",
+            "truth-b.json",
+            "spp0001.png",
+            "spp0004.png",
+            "spp0016.png",
+        ] {
+            assert!(folder.join(file).is_file(), "{name}/{file}");
+            assert!(
+                view["files"].as_array().unwrap().iter().any(|f| f == file),
+                "{file}"
+            );
+        }
+        let f32s = std::fs::metadata(folder.join("truth-a.f32")).unwrap().len();
+        assert_eq!(f32s, width * height * 3 * 4);
+        let inputs: Value = serde_json::from_str(
+            &std::fs::read_to_string(folder.join("truth-a.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(inputs["seed"], 1);
+        assert_eq!(inputs["samples"], convergence["truth_spp"]);
+        assert!(string(&inputs["note"]).contains("never compare"));
+    }
+    // The curve as CSV, one row for each checkpoint of each view.
+    let csv = std::fs::read_to_string(out.join(string(&convergence["csv"]))).unwrap();
+    assert_eq!(csv.lines().count(), 1 + 2 * 3, "{csv}");
+    assert!(csv.starts_with("view,samples,gpu_s,flip_mean,"), "{csv}");
+}
+
 fn check_schema(report: &Value, out: &Path) {
-    assert_eq!(report["schema_version"], 15);
+    assert_eq!(report["schema_version"], 16);
     // The Edit stress is of the whole Planet, which the patch is not.
     assert!(report["edits"].is_null());
     // The streaming mode is asked for (see its own test); the other tests do not. The real-time
@@ -112,6 +186,8 @@ fn check_schema(report: &Value, out: &Path) {
     assert!(config["keyframes"].as_u64().unwrap() >= 2);
     // The LOD bias is recorded (1 unless asked).
     assert_eq!(config["bias"], 1.0);
+
+    check_convergence(&report["convergence"], out);
 
     // The sweep over heights and the cave stills are of the whole Planet; the patch has none.
     assert_eq!(report["altitudes"], serde_json::json!([]));
@@ -236,12 +312,35 @@ fn the_short_bench_writes_a_report_and_screenshots_and_no_fail_ignores_the_budge
 }
 
 #[test]
+fn the_convergence_phase_can_be_left_out_and_a_truth_needs_the_phase() {
+    let out = scratch("no-convergence");
+    let run = bench(&[
+        "--short",
+        "--no-convergence",
+        "--no-fail",
+        "--out",
+        out.join("run").to_str().unwrap(),
+    ]);
+    assert_eq!(run.status.code(), Some(0));
+    let report = read_report(&out.join("run"));
+    assert!(report["convergence"].is_null());
+    assert!(!out.join("run/convergence").exists());
+    assert!(!out.join("run/convergence.csv").exists());
+    // A truth is the phase's: asking for one while leaving it out is a mistake, not a no-op.
+    let wrong = bench(&["--short", "--no-convergence", "--truth-spp", "2048"]);
+    assert_eq!(wrong.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&wrong.stderr).contains("--truth-spp"));
+    let _ = std::fs::remove_dir_all(&out);
+}
+
+#[test]
 fn a_pass_over_budget_fails_the_run_with_status_2() {
     let out = scratch("over");
     let budgets = out.join("impossible.toml");
     std::fs::write(&budgets, IMPOSSIBLE).unwrap();
     let run = bench(&[
         "--short",
+        "--no-convergence",
         "--out",
         out.join("run").to_str().unwrap(),
         "--budgets",
@@ -282,6 +381,7 @@ fn a_diagnostic_run_is_marked_in_its_report_and_is_not_held_to_the_budgets() {
     std::fs::write(&budgets, IMPOSSIBLE).unwrap();
     let run = bench(&[
         "--short",
+        "--no-convergence",
         "--out",
         out.join("run").to_str().unwrap(),
         "--budgets",
@@ -308,7 +408,12 @@ fn a_diagnostic_run_is_marked_in_its_report_and_is_not_held_to_the_budgets() {
     assert!(String::from_utf8_lossy(&run.stderr).contains("WARNING: a diagnostic run"));
     // A measurement has no switches and no reason.
     let plain = scratch("plain");
-    bench(&["--short", "--out", plain.join("run").to_str().unwrap()]);
+    bench(&[
+        "--short",
+        "--no-convergence",
+        "--out",
+        plain.join("run").to_str().unwrap(),
+    ]);
     let report = read_report(&plain.join("run"));
     assert_eq!(report["config"]["diag"], serde_json::json!([]));
     assert!(report["budgets"]["skipped"].is_null());

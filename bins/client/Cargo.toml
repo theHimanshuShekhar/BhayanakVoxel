@@ -19,6 +19,10 @@ png = "0.18.1"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 toml = { version = "1.1.6", default-features = false, features = ["std", "serde", "parse"] }
+# The bench's convergence phase scores images with FLIP (ADR 0005). It is pinned to one exact
+# version, and `bench::convergence::FLIP_VERSION` says which, next to the seeds, because the
+# metric's numbers move with the implementation. A test holds the two together. CI never calls it.
+flip-rs = "=0.1.2"
 
 # The loader's worker threads run at the lowest priority (src/priority.rs), which the standard
 # library cannot ask for. Both crates are in the build already, through winit.
