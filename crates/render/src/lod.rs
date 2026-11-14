@@ -231,6 +231,13 @@ impl Margins {
     }
 }
 
+/// How much further than the horizon what is wanted resident reaches, with a radial margin (the
+/// owner's decision of 2026-11-14, #146). The margin's own 1.25 is not enough for a climb: the
+/// horizon moves out a hundred metres for each metre the camera rises, and a vertical take-off at
+/// 48 m/s had 218 of 359 frames with soft misses at 1.25 and none at 1.75 (`docs/measurements.md`).
+/// With no radial margin the residency is what is drawn.
+pub const HORIZON_RADIAL: f64 = 1.75;
+
 /// The horizon cap (ADR 0004, #146): what the Planet hides from a camera above it.
 ///
 /// The Planet is a sphere of `radius` Voxels about the origin of the frame: sea level. The ground
@@ -247,7 +254,7 @@ impl Margins {
 /// A brick that cannot be seen from the camera raised by the vertical margin cannot be seen
 /// from the camera, which is below it, so what is drawn is what the raised camera could see:
 /// the margin is the part of the horizon that a climb brings in the first 20 m. Residency
-/// ([`Class::Margin`] and [`Class::Prefetch`]) reaches the radial margin times further, and
+/// ([`Class::Margin`] and [`Class::Prefetch`]) reaches [`HORIZON_RADIAL`] times further, and
 /// from the places that prefetch looks at as well ([`Placed::in_cap_wanted`]).
 ///
 /// A camera that is not above the sphere (under the sea, or dug into the Planet) is not
@@ -281,7 +288,7 @@ impl Horizon {
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct Cap {
     radius: f64,
-    /// The radial margin on the horizon: 1 for what is drawn.
+    /// The factor on the horizon: 1 for what is drawn, [`HORIZON_RADIAL`] for what is wanted.
     radial: f64,
     /// `radial · tangent` of the place the cap is seen from, for the farthest of the places, and its
     /// distance from the camera: what the cap reaches that does not depend on the brick.
@@ -434,7 +441,11 @@ impl Reach {
             horizon.tangent(norm(raised)) + from_camera(raised),
             height,
         );
-        let radial = self.margins.radial;
+        let radial = if self.margins.radial > 1.0 {
+            HORIZON_RADIAL.max(self.margins.radial)
+        } else {
+            1.0
+        };
         let place = |p: [f64; 3]| radial * horizon.tangent(norm(p)) + from_camera(p);
         let (mut a, mut low) = (place(raised), height);
         for &at in self.ahead.iter().flatten() {
@@ -509,7 +520,7 @@ impl Placed {
     }
 
     /// [`Placed::in_cap`] for what is wanted resident: the horizon of the camera raised and of the
-    /// places it is going to, times the radial margin.
+    /// places it is going to, times [`HORIZON_RADIAL`].
     #[inline]
     pub fn in_cap_wanted(&self, level: usize, coord: BrickCoord, was: bool) -> bool {
         self.wanted.is_none_or(|cap| {
@@ -953,7 +964,7 @@ mod tests {
     }
 
     #[test]
-    fn what_the_cap_wants_resident_reaches_the_radial_margin_further_and_covers_what_is_drawn() {
+    fn what_the_cap_wants_resident_reaches_further_than_what_is_drawn_and_covers_it() {
         let reach = capped(20.0 * VOXELS_PER_METRE);
         let camera = [0.0, SEA + 2.0 * VOXELS_PER_METRE, 0.0];
         let at = reach.from(camera);
@@ -965,8 +976,8 @@ mod tests {
                 0,
             ])
         };
-        // Drawn out to 4.17 km, wanted out to 1.25 times the raised camera's tangent and the
-        // brick's (5.1 km), and never less than what is drawn.
+        // Drawn out to 4.17 km, wanted out to 1.75 times the raised camera's tangent and the
+        // brick's (about 7 km), and never less than what is drawn.
         for metres in (0..8000).step_by(50) {
             let brick = on_the_ground(f64::from(metres));
             assert!(
@@ -976,7 +987,8 @@ mod tests {
         }
         assert!(!at.in_cap(0, on_the_ground(4700.0), false));
         assert!(at.in_cap_wanted(0, on_the_ground(4700.0), false));
-        assert!(!at.in_cap_wanted(0, on_the_ground(6000.0), false));
+        assert!(at.in_cap_wanted(0, on_the_ground(6000.0), false));
+        assert!(!at.in_cap_wanted(0, on_the_ground(9000.0), false));
     }
 
     #[test]

@@ -106,19 +106,17 @@ Every Milestone is **done** only when all of the following hold:
 - Edits persist across a restart.
 - Determinism and golden gates stay green.
 
-**M1a-2 order (2026-11-11, after the review of what is built).** The tracking issue is [#41](https://github.com/theHimanshuShekhar/bhayanakvoxel/issues/41). Measured numbers are in [`docs/measurements.md`](measurements.md).
-1. CI (#177): the client tests that run real threads move to a job that does not gate; Rust and the runner images are pinned; the crates that need no GPU are tested on Windows.
-2. #180, a stepped mode for the client's tests: the scene thread and the loader are driven a step at a time on one thread, so the tests that gate do not depend on the clock.
-3. The streaming bench, in two parts (with #64's measurement part): #181, the streaming mode on the test Planet in CI with residency and soft-miss counts and the measured sizing constants; then #162, the full-size run in real time on the 4090 with its four gates.
-4. #145 uploads: per-buffer growth and a per-frame budget, before the buffers grow.
-5. #166 the 320 km generator (#166: radius and seed are a value passed to the generator, the world map is 2048² a face, the ground has its detail added at generation, caves are made on demand per cube, the Spawn is seeded; measured in `measurements.md`), then the look-dev flythrough (#148) on it.
-6. #167 the renderer's levels, Guard and sizes, #146 the horizon cap, then #168 speed-scaled LOD and the 20 m spawn. #166 and #168 measure the sizing constants again.
-7. **A playtest on the 4090**: walk, fly, orbit and edit at 320 km. What it finds becomes tickets before saves start.
-8. #182, the wire codec (every message encoded, with a protocol version, the Planet's id in an Edit, golden bytes, and seeded delay, loss and reordering on the loopback), then #183, a throwaway prototype that recovers a Piece's frame from its stamped Voxels. The prototype's result decides whether a stamped Piece also keeps a record, before saves are designed.
-9. Saves in two parts: first #62, the schema, the Edit Journal (the codec's bytes), checkpoints, loading and crash tests; then #144 Edit epochs and #163 uploads; then #184, backups, the generator guard and migrations, any time before #63.
-10. The server bot soak (#169).
-11. The Reference view first (ADR 0005): #187 the bench's convergence phase, #188 the reference estimator, #189 the still-frame policy. Then #52 sun shadows, #53 atmosphere, #54 GI, #55 denoiser, then the #50 hardware RT spike.
-12. #57 swim, climb and fly, #58 camera and Zoom, #59 avatar, #150 and #151 bindings and HUD, Pieces (the system and about 12 Pieces, ADR 0011), #149 heatmap, #63 start menu, #64 final budgets and soak.
+**M1a-2 order (reset 2026-11-14 by the owner; before that 2026-11-11).** The tracking issue is [#41](https://github.com/theHimanshuShekhar/bhayanakvoxel/issues/41). Measured numbers are in [`docs/measurements.md`](measurements.md).
+
+The visuals, lighting and world come before saves and networking, so that generator changes need no migrations. #146 comes before #167, because the 320 km scene does not fit 512 MiB without the horizon cap.
+1. Done: #177 CI (the client tests that run real threads move to a job that does not gate; Rust and the runner images pinned; the GPU-free crates tested on Windows), #180 a stepped mode for the client's tests, #181 the streaming bench in CI, #162 the full-size real-time run on the 4090 with its four gates, #145 uploads (per-buffer growth and a per-frame budget), #166 the 320 km generator (radius and seed are a value passed to the generator, the world map is 2048² a face, the ground has its detail added at generation, caves are made on demand per cube, the Spawn is seeded; measured in `measurements.md`), and #148 the look-dev flythrough (the owner's picks are on #148).
+2. **The 320 km chain:** #146 the horizon cap, #167 the renderer's levels, Guard and sizes, then #168 speed-scaled LOD and the 20 m spawn. #167 and #168 measure the sizing constants again.
+3. **A playtest on the 4090**: walk, fly, orbit and edit at 320 km. What it finds becomes tickets.
+4. **Lighting.** The Reference view first (ADR 0005): #187 the bench's convergence phase, #188 the reference estimator, #189 the still-frame policy. Then #202 the art direction in the renderer (M1b-1's first ticket, so that shadows and GI are judged through it), #52 sun shadows, #53 atmosphere, #54 GI, #55 denoiser, and the #50 hardware RT spike.
+5. **The M1b-1 world block** (#201): #203 the day/night cycle, #204 placement rules and crystal clusters, #205 dense vegetation, #206 rivers and lakes (a prototype, then its build ticket), #207 fantasy landmarks.
+6. **Gameplay and UI:** #57 swim, climb and fly, #58 camera and Zoom, #59 avatar, #150 bindings, #151 Edit HUD, #171 Pieces (the system and about 12 Pieces, ADR 0011), #149 heatmap.
+7. **Saves and networking:** #182 the wire codec (every message encoded, with a protocol version, the Planet's id in an Edit, golden bytes, and seeded delay, loss and reordering on the loopback), #183 a throwaway prototype that recovers a Piece's frame from its stamped Voxels (its result decides whether a stamped Piece also keeps a record, before saves are designed), #62 saves (the schema, the Edit Journal in the codec's bytes, checkpoints, loading and crash tests), #144 Edit epochs, #163 uploads, #184 backups, the generator guard and migrations (any time before #63), and #169 the server bot soak.
+8. #63 start menu, then #64 final budgets and soak.
 
 The Reference view's contract (#100–#103) was decided on 2026-11-12 and is [ADR 0005](adr/0005-reference-view-contract.md). It adds scope to #53 (a sun-free sky table, sky sampling in the Reference, the haze bound), #54 (direct sampling of emissive Voxels in the Reference) and #55 (its gate is derived from the Reference's curve).
 
@@ -137,13 +135,14 @@ The Reference view's contract (#100–#103) was decided on 2026-11-12 and is [AD
 M1b is built in three ordered parts (2026-11-10; this replaces the single M1b of #138). Each has its own tracking issue, acceptance and playtest. The decisions behind the items are in [#135](https://github.com/theHimanshuShekhar/bhayanakvoxel/issues/135)–[#138](https://github.com/theHimanshuShekhar/bhayanakvoxel/issues/138), [#152](https://github.com/theHimanshuShekhar/bhayanakvoxel/issues/152) and [#153](https://github.com/theHimanshuShekhar/bhayanakvoxel/issues/153); [#139](https://github.com/theHimanshuShekhar/bhayanakvoxel/issues/139) records their detail here.
 
 **M1b-1: Look**
-- The art direction: tone curve, auto-exposure, palette (#135, tuned in the look-dev prototype #148).
-- **Dense vegetation**: tree species, undergrowth, vines and logs, with placement rules (#136).
-- **Fantasy accents**: glowing crystal caves, floating islands with static waterfalls, giant arches and spires, bioluminescent flora.
-- **Rivers and lakes** as static water. With the coarse world map (ADR 0008) rivers need a new design: the map gives large drainage only.
-- The **day/night cycle**: a world clock that can be paused and set, moon light and a starfield (#138).
-- **Undo** of a player's own last ~32 Edits (#138, ADR 0010).
-- The **Piece catalogue** grows to 50 or more as data: walls, slabs, stairs, posts, fences, roofs, window and door frames, lamps (ADR 0011).
+Its world block runs inside M1a's order, after the lighting and before gameplay and saves. The tracking issue is [#201](https://github.com/theHimanshuShekhar/bhayanakvoxel/issues/201). Undo and the Piece catalogue stay in M1b-1 and come after saves (#62) and Pieces (#171).
+- The art direction: tone curve, auto-exposure, palette (#135, tuned in the look-dev prototype #148). Built in #202. Its numbers are the owner's #148 picks ([the resolution](https://github.com/theHimanshuShekhar/bhayanakvoxel/issues/148#issuecomment-6878855048)): the Khronos PBR Neutral tone curve, auto-exposure with τ 2.5 s, smooth computed normals, a sun of 0.12 rad, hero light B (golden) and subtle bloom. The sun radius and bloom are checked again once GI and the denoiser exist.
+- **Dense vegetation**: tree species, undergrowth, vines and logs, with placement rules (#136; #204, #205).
+- **Fantasy accents**: glowing crystal caves, floating islands with static waterfalls, giant arches and spires, bioluminescent flora (#204, #207).
+- **Rivers and lakes** as static water (#206). With the coarse world map (ADR 0008) rivers need a new design: the map gives large drainage only.
+- The **day/night cycle**: a world clock that can be paused and set, moon light and a starfield (#138, #203).
+- **Undo** of a player's own last ~32 Edits (#138, ADR 0010). It needs the server's brick snapshots, so it comes after saves.
+- The **Piece catalogue** grows to 50 or more as data: walls, slabs, stairs, posts, fences, roofs, window and door frames, lamps (ADR 0011). It comes after #171.
 
 During M1b a throwaway **Debris and Fluids prototype** at 5 cm (CPU only, on the real brick store) measures active Voxels per millisecond, so that M3 and M4 are known to be feasible as specified, or re-specified, before M2 shapes the server.
 
