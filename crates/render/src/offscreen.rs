@@ -166,7 +166,7 @@ impl Offscreen {
     }
 
     fn create(resolution: Resolution, scene: &Scene, timers: bool) -> Result<Self> {
-        let (adapter, device, queue) = request_gpu(&shared_instance(), None, timers)?;
+        let (adapter, device, queue) = request_gpu(shared_instance(), None, timers)?;
         let info = adapter.get_info();
         let info = GpuInfo {
             name: info.name,

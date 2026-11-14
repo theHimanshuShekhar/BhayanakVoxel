@@ -63,14 +63,20 @@ fn create_instance() -> wgpu::Instance {
 /// The one Vulkan instance of a process's headless renderers (`Offscreen`), made on first use.
 ///
 /// An instance per renderer is a `vkCreateInstance` per renderer, and with VK_EXT_debug_utils on
-/// (wgpu's debug builds name every object) the Vulkan loader (1.4.309 here, and the same code in
-/// the versions after it) crashes when one thread creates an instance while another names an
-/// object: `vkSetDebugUtilsObjectNameEXT` walks the loader's global list of instances and reads
-/// the `icd_terms` of one that is on the list but still being built. Parallel tests make
-/// renderers in parallel, so they share one instance (#194).
-fn shared_instance() -> wgpu::Instance {
+/// (wgpu's debug builds name every object) the Vulkan loader, up to SDK 1.4.341 (1.4.309 here; fixed
+/// upstream in 1.4.350 by Vulkan-Loader 5ee27b30c0, which drops `loader_global_instance_list_lock`),
+/// crashes when one thread creates an instance while another names an object:
+/// `vkSetDebugUtilsObjectNameEXT` walks the loader's global list of instances and reads the
+/// `icd_terms` of one that is on the list but still being built. Parallel tests make renderers in
+/// parallel, so they share one instance (#194).
+///
+/// This removes the instance-creation race and no more. A narrower race at teardown may remain:
+/// `vkDestroyDevice` holds only `loader_lock` while it frees a device, and the same walk, under the
+/// instance-list lock, reads every device. It is not new and did not show in 30 stress runs. The
+/// workaround can go once the loaders in use are 1.4.350 or later.
+fn shared_instance() -> &'static wgpu::Instance {
     static INSTANCE: std::sync::OnceLock<wgpu::Instance> = std::sync::OnceLock::new();
-    INSTANCE.get_or_init(create_instance).clone()
+    INSTANCE.get_or_init(create_instance)
 }
 
 /// Requests a device on a Vulkan adapter, presentable to `surface` if one is given. With
@@ -161,7 +167,7 @@ mod tests {
     /// Needs a Vulkan driver; CI uses lavapipe (mesa-vulkan-drivers).
     #[test]
     fn vulkan_device_can_be_created_without_a_window() {
-        let (adapter, _device, _queue) = request_gpu(&shared_instance(), None, true).unwrap();
+        let (adapter, _device, _queue) = request_gpu(shared_instance(), None, true).unwrap();
         assert_eq!(adapter.get_info().backend, wgpu::Backend::Vulkan);
     }
 }
