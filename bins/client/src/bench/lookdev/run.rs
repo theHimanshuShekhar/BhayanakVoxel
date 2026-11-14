@@ -288,7 +288,7 @@ fn write_sheet(
     );
     let _ = write!(
         html,
-        "<h1>Look-dev contact sheet (#148)</h1><p class=d>PROTOTYPE, not to be merged. Rendered at {}×{}, {} samples a pixel \
+        "<h1>Look-dev contact sheet (#148)</h1><p class=d>PROTOTYPE, not to be merged. Rendered at {}×{}, {} samples a pixel (the caves and the descent, 4× and 2× that) \
          by the reference path tracer, in {took:.0} s. Every image is labelled with what varies. Compare within a row.</p>",
         options.size.0, options.size.1, options.spp
     );
@@ -467,7 +467,10 @@ fn shot_stills(
         let t = Instant::now();
         gpu.set_look(look_for(light, up));
         gpu.set_sun(sun_for(light, &camera, up));
-        hdrs.push((*light, hdr(gpu, &camera, o.spp)));
+        // A cave is lit by its crystals alone, which a path finds only by chance (the tracer has
+        // no light sampling for emissives): four times the samples.
+        let spp = if cave { o.spp * 4 } else { o.spp };
+        hdrs.push((*light, hdr(gpu, &camera, spp)));
         eprintln!("    {}: {:.0} s", light.slug, t.elapsed().as_secs_f64());
     }
     let find = |slug: &str| &hdrs.iter().find(|(l, _)| l.slug == slug).unwrap().1;
@@ -661,7 +664,7 @@ fn descent(
     for &frame in &frames {
         let camera = path.camera_at(frame, shot.frames);
         gpu.set_sun(sun_for(&HERO_A, &path.camera_at(0, shot.frames), up));
-        images.push(hdr(gpu, &camera, (o.spp / 2).max(4)));
+        images.push(hdr(gpu, &camera, o.spp * 2));
         eprintln!("    descent frame {frame}");
     }
     let targets: Vec<f32> = images

@@ -93,11 +93,17 @@ pub struct Writer<'a> {
 }
 
 impl Writer<'_> {
-    /// Sets `at` to `material` if it is air in a brick the store holds (the ring), and nothing
-    /// else, so that a stamp never replaces ground and never makes a brick.
+    /// Sets `at` to `material` if it is air, and nothing else, so that a stamp never replaces
+    /// ground. A brick that is not held (all air, as the ring does not hold those) is made
+    /// first, as the Planet has it.
     fn put(&mut self, at: [i32; 3], material: Material) {
         let coord = VoxelCoord(at);
-        if self.store.brick(coord.brick()).is_some() && self.store.get(coord).is_none() {
+        let brick = coord.brick();
+        if self.store.brick(brick).is_none() {
+            let made = self.store.brick_at(0, brick).into_owned();
+            self.store.insert(brick, made);
+        }
+        if self.store.get(coord).is_none() {
             self.store.set(coord, Some(material));
             self.written += 1;
         }

@@ -25,6 +25,16 @@ fn unit(a: [f32; 3]) -> [f32; 3] {
     a.map(|c| c / l)
 }
 
+/// Whether `at` is solid, without generating anything: a held brick says, and one that is not
+/// held is solid only if the Planet proves it solid all the way down (buried), else air.
+fn solid(store: &BrickStore, at: VoxelCoord) -> bool {
+    let brick = at.brick();
+    match store.brick(brick) {
+        Some(b) => b.get(at.local()).is_some(),
+        None => store.source_solid_below(0, brick),
+    }
+}
+
 /// The surface normal at the hit Voxel `voxel`, found by the face `face`: the direction away from
 /// the solid Voxels round the one in front of the face, each weighted by how near it is. On a
 /// stair-step slope that is the slope's normal; on a flat face, the face's.
@@ -35,7 +45,7 @@ pub fn smooth_normal(store: &BrickStore, voxel: [i32; 3], face: [i32; 3]) -> [f3
         for dy in -WINDOW..=WINDOW {
             for dz in -WINDOW..=WINDOW {
                 let at = VoxelCoord([front[0] + dx, front[1] + dy, front[2] + dz]);
-                if store.voxel_at(0, at).is_some() {
+                if solid(store, at) {
                     let d = [dx as f32, dy as f32, dz as f32];
                     let w = (-dot(d, d) / (2.0 * 1.4 * 1.4)).exp();
                     for a in 0..3 {
