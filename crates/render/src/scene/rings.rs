@@ -52,7 +52,7 @@ use super::{
     Bound, Level, MAX_LEVELS, REGION_BRICKS, REGION_FIRST_REF, REGION_VOXELS, REGION_WORDS,
     SOLID_FLAG, Scene, SceneUpdate, bit_of, encode_mixed, region_of,
 };
-use crate::lod::{AHEAD, Bands, LEVELS, Margins, Reach};
+use crate::lod::{AHEAD, Bands, Horizon, LEVELS, Margins, Reach};
 use crate::tracer::SceneHeader;
 
 /// How many words the buffers of a scene of rings have, for each level, when the scene is given
@@ -620,7 +620,14 @@ impl Scene {
         bands: Bands,
         bound: Bound,
     ) -> Result<Scene, RingsFull> {
-        Scene::rings_sized(store, camera, bands, bound, Sizing::Fitted(2.0, (0, 0)))
+        Scene::rings_sized(
+            store,
+            camera,
+            bands,
+            bound,
+            Sizing::Fitted(2.0, (0, 0)),
+            None,
+        )
     }
 
     /// [`Scene::rings`] with buffers of at least `refs` words of `brick_refs` and `words` of
@@ -640,6 +647,7 @@ impl Scene {
             bands,
             bound,
             Sizing::Fitted(2.0, (refs, words)),
+            None,
         )
     }
 
@@ -652,7 +660,7 @@ impl Scene {
         bound: Bound,
         room: Room,
     ) -> Result<Scene, RingsFull> {
-        Scene::rings_sized(store, camera, bands, bound, Sizing::Given(room))
+        Scene::rings_sized(store, camera, bands, bound, Sizing::Given(room), None)
     }
 
     fn rings_sized(
@@ -661,10 +669,11 @@ impl Scene {
         bands: Bands,
         bound: Bound,
         sizing: Sizing,
+        horizon: Option<Horizon>,
     ) -> Result<Scene, RingsFull> {
         let top = select::top_level(store);
         let roots = select::top_bricks(store, top, Some((bound.centre, bound.radius)));
-        let (selection, _) = Selection::new(store, camera, bands, top, roots);
+        let (selection, _) = Selection::new_capped(store, camera, bands, top, roots, horizon);
         Scene::pack_rings(store, selection, bound, sizing)
     }
 
@@ -1007,8 +1016,9 @@ impl Scene {
         let rings = self.rings.as_ref().expect("a scene of rings");
         let (ball, sizing, clipped) = (rings.ball, rings.sizing, self.bound.is_some());
         let (reserved, reach) = (rings.reserved, rings.selection.reach());
+        let horizon = rings.selection.horizon();
         let changed = self.changed;
-        *self = Scene::rings_sized(store, camera, bands, ball, sizing)?;
+        *self = Scene::rings_sized(store, camera, bands, ball, sizing, horizon)?;
         self.changed = changed;
         self.bound = clipped.then_some(ball);
         if !reach.is_none()
@@ -1247,6 +1257,22 @@ impl Scene {
         self.rings
             .as_ref()
             .map_or(Reach::NONE, |r| r.selection.reach())
+    }
+
+    /// Culls by the Planet's horizon (see [`crate::lod::Horizon`], [`Selection::set_horizon`]): what
+    /// is drawn and wanted resident is what a camera over `horizon`'s sphere could see. Kept when
+    /// the scene is made again for other bands or a jump. Returns what changed, as
+    /// [`Scene::recentre`] does.
+    pub fn set_horizon(
+        &mut self,
+        store: &BrickStore,
+        horizon: Option<Horizon>,
+    ) -> Result<Option<SceneUpdate>, RingsFull> {
+        let Some(rings) = &mut self.rings else {
+            return Ok(None);
+        };
+        let diff = rings.selection.set_horizon(store, horizon);
+        self.show_diff(store, &diff)
     }
 
     /// Wants the children of the bricks within `margins` resident, without drawing them (see
