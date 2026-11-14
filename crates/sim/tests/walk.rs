@@ -465,13 +465,13 @@ fn run_a_kilometre() -> (Pair, [f64; 3]) {
 #[test]
 fn a_character_runs_a_kilometre_from_the_spawn_without_stopping_while_the_ground_keeps_up() {
     let (pair, start) = run_a_kilometre();
+    let went = distance(pair.server_state().position, start);
     eprintln!(
         "went {:.0} m in {} inputs, waited {} ticks",
-        distance(pair.server_state().position, start) / VOXELS_PER_METRE,
+        went / VOXELS_PER_METRE,
         pair.sent,
         pair.waited
     );
-    let went = distance(pair.server_state().position, start);
     assert!(
         went >= 1000.0 * VOXELS_PER_METRE,
         "went {} m",

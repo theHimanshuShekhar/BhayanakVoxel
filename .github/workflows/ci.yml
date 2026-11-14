@@ -62,9 +62,9 @@ jobs:
             exit 1
           fi
 
-  # The client tests that are about real threads or real time (the frame thread's milliseconds, a
-  # thread that is busy or panics), and the sim's wall-clock tick limit (an ignored test), on both platforms. Some of them wait on wall-clock time and so
-  # fail now and then. `continue-on-error` keeps a failure here from failing the workflow. The
+  # The client tests that are about real threads or real time (the frame thread's milliseconds, a thread that is busy or panics), and the
+  # sim's two wall-clock tests (an ignored test each: the kilometre walk's tick time and the server thread's 60 Hz), on both platforms. Some of
+  # them wait on wall-clock time and so fail now and then. `continue-on-error` keeps a failure here from failing the workflow. The
   # streaming tests of behaviour run stepped, single-threaded, in the gating jobs.
   real-thread-tests:
     name: real-thread-tests (${{ matrix.os }})
@@ -90,10 +90,11 @@ jobs:
           set -euo pipefail
           mapfile -t filters < <(tr -d '\r' < .github/real-thread-tests.txt | grep -vE '^\s*(#|$)')
           cargo test -p client --bin client -- "${filters[@]}"
-      # Wall-clock limits of tests of other crates, which are `#[ignore]`d so that they do not gate
-      # (#193): the sim's tick time over the kilometre walk, whose counted checks gate.
-      # A filter that matches no test passes with nothing run, so the step checks that two ran.
+      # Wall-clock limits of tests of other crates, which are `#[ignore]`d so that they do not gate (#193): the sim's tick time over the
+      # kilometre walk and the server thread's 60 Hz, whose counted twins gate. It runs even when the step before it failed (that one is
+      # flaky), since those are the runs it is for. A filter that matches no test passes with nothing run, so it checks that two ran.
       - name: Run the wall-clock tests of the sim
+        if: ${{ !cancelled() }}
         shell: bash
         run: |
           set -euo pipefail
