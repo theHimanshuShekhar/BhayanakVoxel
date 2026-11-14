@@ -34,6 +34,12 @@ pub struct Camera {
     pub back: [f64; 3],
     /// Vertical field of view in radians.
     pub fov_y: f64,
+    /// Radians the view is rolled about `forward()`: positive leans the camera to the right (its
+    /// right side drops), so the horizon turns anticlockwise on the screen. Zero keeps the horizon
+    /// level, which is every camera but the debug free camera and a recorded path that rolls.
+    /// Roll turns `right()` and `up()` and nothing else: `forward()`, yaw, pitch and the horizon
+    /// are the same, so what steers by them is unchanged.
+    pub roll: f64,
 }
 
 /// Just short of straight up or down, where "right" would be undefined.
@@ -81,6 +87,7 @@ impl Camera {
             horizon_up: [0.0, 1.0, 0.0],
             back: [0.0, 0.0, 1.0],
             fov_y: 70f64.to_radians(),
+            roll: 0.0,
         }
     }
 
@@ -96,16 +103,36 @@ impl Camera {
         })
     }
 
-    /// Unit vector to the camera's right, level with the horizon.
-    pub fn right(&self) -> [f64; 3] {
+    /// Unit vector to the camera's right, level with the horizon, before the roll.
+    fn level_right(&self) -> [f64; 3] {
         let (sin_yaw, cos_yaw) = self.yaw.sin_cos();
         let side = cross(self.horizon_up, self.back);
         [0, 1, 2].map(|a| cos_yaw * side[a] + -sin_yaw * self.back[a])
     }
 
+    /// Unit vector to the camera's right: level with the horizon when `roll` is zero.
+    pub fn right(&self) -> [f64; 3] {
+        let (level, up) = (self.level_right(), self.unrolled_up());
+        let (sin, cos) = self.roll.sin_cos();
+        [0, 1, 2].map(|a| level[a] * cos - up[a] * sin)
+    }
+
     /// Unit vector up from the camera's view.
     pub fn up(&self) -> [f64; 3] {
-        cross(self.right(), self.forward())
+        let (level, up) = (self.level_right(), self.unrolled_up());
+        let (sin, cos) = self.roll.sin_cos();
+        [0, 1, 2].map(|a| up[a] * cos + level[a] * sin)
+    }
+
+    /// Unit vector up from the view before the roll.
+    fn unrolled_up(&self) -> [f64; 3] {
+        cross(self.level_right(), self.forward())
+    }
+
+    /// Rolls the camera by `by` radians (see `roll`), kept within a half turn either way.
+    pub fn roll_by(&mut self, by: f64) {
+        self.roll = (self.roll + by + std::f64::consts::PI).rem_euclid(std::f64::consts::TAU)
+            - std::f64::consts::PI;
     }
 
     /// Turns the camera: `yaw` anticlockwise seen from above, `pitch` upwards, in radians.
@@ -239,6 +266,60 @@ mod tests {
             for (a, b) in [(f, r), (f, u), (r, u)] {
                 assert!(dot(a, b).abs() < 1e-12, "at {spot:?}");
             }
+        }
+    }
+
+    #[test]
+    fn roll_turns_right_and_up_about_forward_and_leaves_the_rest() {
+        let level = carried_to([1000.0, 2000.0, -1500.0]);
+        for roll in [0.3, -1.2, 3.0] {
+            let mut rolled = level;
+            rolled.roll_by(roll);
+            assert_eq!(rolled.forward(), level.forward());
+            let (f, r, u) = (rolled.forward(), rolled.right(), rolled.up());
+            for (a, b) in [(f, r), (f, u), (r, u)] {
+                assert!(dot(a, b).abs() < 1e-12, "roll {roll}");
+            }
+            // The angle between the view's right and the horizon's is the roll, and it is a
+            // positive roll that drops the right side below the level.
+            assert!((dot(r, level.right()) - roll.cos()).abs() < 1e-12);
+            assert!((dot(r, level.up()) + roll.sin()).abs() < 1e-12);
+            assert!((dot(u, level.up()) - roll.cos()).abs() < 1e-12);
+        }
+    }
+
+    #[test]
+    fn a_roll_of_zero_is_the_level_camera_bit_for_bit_and_a_half_turn_flips_the_view() {
+        let level = carried_to([0.0, 3000.0, 0.0]);
+        let mut same = level;
+        same.roll_by(0.0);
+        assert_eq!((same.right(), same.up()), (level.right(), level.up()));
+        let mut upside_down = level;
+        upside_down.roll_by(std::f64::consts::PI);
+        for a in 0..3 {
+            assert!((upside_down.right()[a] + level.right()[a]).abs() < 1e-12);
+            assert!((upside_down.up()[a] + level.up()[a]).abs() < 1e-12);
+        }
+    }
+
+    #[test]
+    fn roll_is_kept_within_a_half_turn_either_way() {
+        let mut camera = carried_to([0.0, 3000.0, 0.0]);
+        camera.roll_by(3.0);
+        camera.roll_by(0.5);
+        assert!((camera.roll - (3.5 - std::f64::consts::TAU)).abs() < 1e-12);
+        camera.roll_by(-0.5);
+        assert!((camera.roll - 3.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn the_uniform_carries_the_rolled_right_and_up() {
+        let mut camera = carried_to([3000.0, 0.0, 0.0]);
+        camera.roll_by(0.7);
+        let uniform = camera.uniform();
+        for a in 0..3 {
+            assert_eq!(uniform.right[a], camera.right()[a] as f32);
+            assert_eq!(uniform.up[a], camera.up()[a] as f32);
         }
     }
 

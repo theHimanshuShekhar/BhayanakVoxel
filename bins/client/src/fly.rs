@@ -1,5 +1,5 @@
-//! Which movement keys are held, and what they do: move the free-fly debug camera (noclip), or
-//! become the character's input for a tick.
+//! Which movement keys are held, and what they do: move and roll the free-fly debug camera
+//! (noclip), or become the character's input for a tick.
 
 use brick_store::VOXELS_PER_METRE;
 use net::MoveInput;
@@ -11,6 +11,8 @@ const LOOK_SENSITIVITY: f64 = 0.0025;
 const SPEED: f64 = 6.0 * VOXELS_PER_METRE;
 /// Multiplier while the speed modifier is held.
 const FAST: f64 = 8.0;
+/// Radians per second the free camera rolls: 45 degrees.
+const ROLL_SPEED: f64 = std::f64::consts::FRAC_PI_4;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Action {
@@ -21,11 +23,15 @@ pub enum Action {
     Up,
     Down,
     Fast,
+    /// Lean the free camera to the left or the right (debug noclip only; the character does not
+    /// roll).
+    RollLeft,
+    RollRight,
 }
 
 #[derive(Debug, Default)]
 pub struct Fly {
-    held: [bool; 7],
+    held: [bool; 9],
 }
 
 impl Fly {
@@ -59,8 +65,10 @@ impl Fly {
 
     /// Moves the camera for `dt` seconds of the held keys: forward and back along where it
     /// looks, left and right across it, up and down along the horizon's up. The horizon is then
-    /// levelled to the Planet's centre-out direction at the new position.
+    /// levelled to the Planet's centre-out direction at the new position. The roll keys lean it
+    /// about where it looks, whether it moves or not; the roll stays until it is levelled.
     pub fn update(&self, camera: &mut Camera, dt: f64) {
+        camera.roll_by(self.axis(Action::RollRight, Action::RollLeft) * ROLL_SPEED * dt);
         let (forward, right) = (camera.forward(), camera.right());
         let wish = [0, 1, 2].map(|a| {
             forward[a] * self.axis(Action::Forward, Action::Back)
@@ -167,6 +175,37 @@ mod tests {
                 && (y - SPEED * 0.5f64.sqrt()).abs() < 1e-9
                 && (z + SPEED * 0.5f64.sqrt()).abs() < 1e-9
         );
+    }
+
+    #[test]
+    fn the_roll_keys_lean_the_camera_in_place_and_it_stays_leaned() {
+        let mut camera = camera();
+        held(&[Action::RollRight]).update(&mut camera, 1.0);
+        assert!((camera.roll - ROLL_SPEED).abs() < 1e-12);
+        assert_eq!(camera.position, [0.0; 3]);
+        assert_eq!(camera.forward(), self::camera().forward());
+        // The right side drops: the view's right points below the horizon.
+        assert!(camera.right()[1] < 0.0 && camera.up()[0] > 0.0);
+        Fly::default().update(&mut camera, 1.0);
+        assert!((camera.roll - ROLL_SPEED).abs() < 1e-12);
+        held(&[Action::RollLeft]).update(&mut camera, 0.5);
+        assert!((camera.roll - ROLL_SPEED / 2.0).abs() < 1e-12);
+        held(&[Action::RollLeft, Action::RollRight]).update(&mut camera, 1.0);
+        assert!((camera.roll - ROLL_SPEED / 2.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn strafing_follows_the_roll_and_up_and_down_stay_on_the_horizons_up() {
+        let mut camera = camera();
+        camera.roll_by(std::f64::consts::FRAC_PI_2);
+        held(&[Action::Right]).update(&mut camera, 0.5);
+        // Rolled a quarter turn to the right, the view's right is straight down.
+        let [x, y, z] = camera.position;
+        assert!(x.abs() < 1e-9 && (y + SPEED / 2.0).abs() < 1e-9 && z.abs() < 1e-9);
+        let mut camera = self::camera();
+        camera.roll_by(1.0);
+        held(&[Action::Up]).update(&mut camera, 1.0);
+        assert_eq!(camera.position, [0.0, SPEED, 0.0]);
     }
 
     #[test]

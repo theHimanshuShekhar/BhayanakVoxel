@@ -1019,6 +1019,39 @@ pass is named by the string given to `Profiler::compute_pass`). `reference` has 
 its 3.0 ms (a sample, pass and total) catches a gross regression, set from the first real run on the
 4090, which measured a mean of 1.10 ms.
 
+## The look-dev shot list
+
+`bins/client/src/bench/lookdev.rs` (#148) is a recorded camera path for judging the art direction
+(#135) on the real 320 km Planet: eight shots modelled on Crystal Islands' (a forest floor, a canyon
+with haze, a dark descent, two crystal caves of different dominant hue, a sunlit cliff, a meadow and
+a pull-out to the Planet). It is not a `client bench` mode and no pass is timed on it. Each shot is
+its own short `CameraPath` (the places are kilometres apart: they are cuts), with the roll of the
+debug free camera where it tilts (`Q` and `E` roll it, `X` levels it), and names the places where
+hand-placed stamps go for what M1b has not built yet (crystals and vegetation). The shot list
+holds no stamp code.
+
+The places are found on the seeded Planet and recorded as numbers in `lookdev/shots.rs`. They are
+for one `GENERATOR_VERSION`, seed and radius, and a test fails when any of them moves on. To find
+them again:
+
+```
+RECORD_TO=$PWD/bins/client/src/bench/lookdev/shots.rs \
+  cargo test --release -p client --bin client -- --ignored record_the_look_dev_sites
+cargo fmt -p client
+```
+
+Every build runs the fast tests in `lookdev.rs`: the recorded `GENERATOR_VERSION`, seed and radius
+are the current ones, the shots are the issue's list in order, every keyframe falls on a whole frame
+and the roll blends the short way round. They read the record only and never the Planet.
+
+Three tests are `#[ignore]`d because they make the 320 km world map (25 s to a minute), and are run
+by hand after the places are recorded or the generator changes:
+`record_the_look_dev_sites`, `the_recorded_places_are_the_ones_the_finder_picks` (the record is what
+the finder finds) and `the_recorded_shots_are_where_they_say` (every camera is in the open, every
+stamp place is air against rock, each cave shot is 20 m or more under the ground at every keyframe
+with rock straight overhead, and the dark descent ends 15 m or more under, roofed). Rock overhead
+says the chamber is roofed; it does not prove there is no sky from the side.
+
 ## Tests
 
 The statistics, budget evaluation and exit status, camera path, argument parsing and report shape

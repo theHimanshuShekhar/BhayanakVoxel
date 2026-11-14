@@ -15,6 +15,7 @@ mod caves;
 mod edits;
 #[cfg(test)]
 mod landscape;
+mod lookdev;
 mod path;
 mod process;
 mod realtime;
