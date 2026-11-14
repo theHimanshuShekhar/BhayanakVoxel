@@ -12,6 +12,7 @@
 mod args;
 mod budget;
 mod caves;
+mod convergence;
 mod edits;
 #[cfg(test)]
 mod landscape;
@@ -30,7 +31,7 @@ use std::path::Path;
 use std::process::ExitCode;
 use std::time::Instant;
 
-use brick_store::{BrickCoord, BrickStore};
+use brick_store::BrickStore;
 use render::{Camera, Image, Mode, Offscreen, Resolution, Scene};
 
 use args::{Args, Diag, Parsed, USAGE};
@@ -265,6 +266,29 @@ fn run(args: &Args) -> Result<u8, Box<dyn Error>> {
         cave_stills(&plan, &budgets, &args.out)?
     };
     screenshots.extend(cave_shots);
+    // The convergence phase (#187) has GPU contexts of its own, one for each of its views, and
+    // runs after everything that is timed against the budgets, so that it cannot
+    // move any of it. It is not timed against a budget itself.
+    let convergence = if args.convergence {
+        let traced = (plan.width, plan.height);
+        let settings = if plan.patch {
+            convergence::Settings::short(traced, args.truth_spp)
+        } else {
+            convergence::Settings::full(traced, args.truth_spp)
+        };
+        // It is not budgeted, so a phase that fails must not take the timed results with it.
+        match convergence::run(&settings, &args.out) {
+            Ok(report) => Some(report),
+            Err(e) => {
+                eprintln!(
+                    "warning: the convergence phase failed, and is left out of the report: {e}"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
     // The streaming mode runs last, so that `--streaming` cannot move the timings of anything else:
     // it has a GPU context of its own, and what it leaves behind (memory, a warm driver) comes after
     // every other measurement.
@@ -321,6 +345,7 @@ fn run(args: &Args) -> Result<u8, Box<dyn Error>> {
             &args.diag.switches(),
         ),
         edits,
+        convergence,
         modes,
         streaming,
         streaming_real_time,
@@ -413,12 +438,7 @@ fn failures(modes: &Modes) -> (Vec<String>, Vec<String>) {
 /// The patch of the test Planet near the +y pole that the golden image test also renders:
 /// Voxels x -440..=447, y 1360..=1575, z -360..=263.
 fn patch_scene() -> Scene {
-    let store = planet_gen::generate_region(
-        crate::SEED,
-        BrickCoord([-55, 170, -45]),
-        BrickCoord([55, 196, 32]),
-    );
-    Scene::new(&store, None)
+    Scene::new(&convergence::patch_store(), None)
 }
 
 /// The Planet being flown over: its packed bricks and, for rings, the bricks they are made from.
@@ -692,6 +712,9 @@ fn print_summary(report: &Report) {
     }
     if let Some(r) = &report.streaming_real_time {
         print_real_time(r);
+    }
+    if let Some(c) = &report.convergence {
+        convergence::print_summary(c);
     }
     for a in &report.altitudes {
         eprintln!(

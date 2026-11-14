@@ -313,3 +313,20 @@ Measured on the RTX 4090 on 2026-11-01 ([#99](https://github.com/theHimanshuShek
 - **One sample by part**, open view at 1440p (2.59 ms): the primary ray 0.52 ms, the sun's shadow ray 0.34 ms, bounces 1 to 4 1.04, 0.37, 0.21 and 0.12 ms. In the pit the bounces are 85 % of 6.1 ms.
 - **Stopping tiles early** would save 3.7 times the work at the 0.02 line on the open view and 1.5 times in the pit; 8 to 13 times at the 0.05 line. About 41 % of the open view's tiles, the sky, pass at 1 sample.
 
+
+### The bench's convergence phase (#187, 2026-11-14)
+
+`client bench` now draws these curves itself (`docs/agents/benchmarking.md`, "The convergence phase"), so the table above is the baseline that a run of the phase is compared with, and #188's estimator and #189's still-frame policy are measured against. The views are #99's, on the patch of the *test* Planet: `golden` is the reference golden's view, `pit` is #99's `interreflect` view (the same hillside, box, depth below the rim, camera and sun, in Voxels; at 5 cm Voxels it is 2 m by 3 m and 2 m deep, where #99's was 4 m by 6 m and 4 m deep). The seeds, FLIP (LDR, ppd 67.02, `flip-rs` 0.1.2), the checkpoints and the truths' seeds are #99's.
+
+- **The 4090 baseline of the phase**, from the owner's runs (`client.exe bench --truth-spp 8192`, via `bench-pr.sh`) at head `faa1fdd` of PR #210: the RTX 4090 with both clocks locked (2520 / 10501 MHz), 3 runs, identical to the stated precision. At 2560×1440, on the test-Planet patch, checkpoints 1 to 1024, with #99's capture (`e0f1229`) in brackets:
+
+  | view | per-sample ms (mean) | ms per Mpix per sample | spp to FLIP ≤ 0.05 | spp / GPU s to FLIP ≤ 0.02 | FLIP at 64 spp | floor FLIP / MSE |
+  |---|---|---|---|---|---|---|
+  | golden | 2.51 (2.58) | 0.682 | 1.2 (1.2) | 18.6 / 0.047 (18.6 / 0.05) | 0.0145 (0.0145) | 0.0034 / 3.6e-7 (same) |
+  | pit | 5.48 (6.15) | 1.487 | 6.2 (6.2) | 329.5 / 1.81, **does not count** (330 / 2.03) | 0.0267 (0.0267) | 0.0092 / 9.2e-7 (same) |
+
+  - **Agreement with #99:** every FLIP and MSE figure matches #99's, so the pit is the same scene in Voxels (its size in metres changed with the Voxel, the picture did not), and the seeds, the checkpoints and the FLIP settings reproduce #99's capture.
+  - **Per-sample cost** is 3 % lower than #99's on the golden view and 11 % lower on the pit. The two are not separated: the clocks were not locked the same way, and the code is not the same. A plausible cause, **not verified**, is the scene-layout changes since #99's base `8e07a5c` (#127's region-contiguous brick words, #123's table sizing), which would help the pit's extra bounces most.
+  - **The pit's 0.02 line does not count:** 0.02 is under 4 × the pit's floor of 0.0092 (`min_line_over_floor`), so the 329.5 spp is shown and not used. The rule works as designed.
+  - **Cost of the phase:** about 5 minutes on each run at `--truth-spp 8192`. At the default `--truth-spp 1024` the phase's `wall_s` is **44.0 s** for both views together (4090 at `d68cbb0`, 1 run, both clocks locked), so about 45 s; the block's `wall_s` has the phase's wall-clock time.
+- **On lavapipe (this box)**, at 96 by 54 with FLIP, the phase gives sensible curves and a floor under them; the numbers are of no use as timings. FLIP at 2560x1440 took 0.25 s an image (0.47 s with its statistics) on this box's CPU.

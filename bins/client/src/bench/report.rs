@@ -4,6 +4,7 @@
 use serde::Serialize;
 
 use super::budget::{Budgets, Status, status};
+use super::convergence::ConvergenceReport;
 use super::edits::EditsReport;
 use super::realtime::RealTimeReport;
 use super::stats::Stats;
@@ -42,7 +43,10 @@ use super::stream::StreamReport;
 /// told brought to 0 however far the camera had gone since), with the 99th percentile
 /// (`scene_lag_voxels_p99`, `scene_lag_d0_p99`) added to the most. The stepped mode's counts and
 /// hash are not changed.
-pub const SCHEMA_VERSION: u32 = 15;
+///
+/// 16 added `convergence` (#187): the convergence phase's curve, floor and lines for two views,
+/// null with `--no-convergence`. Nothing else is changed.
+pub const SCHEMA_VERSION: u32 = 16;
 
 /// One timed thing (a pass, or the GPU total of a profiler frame) in one mode, against its
 /// budget. In reference mode a profiler frame is one sample, so the entries of that mode have
@@ -324,6 +328,9 @@ pub struct Report {
     /// The Edit stress: the largest Brush, dug and placed in turn at the metric rate, on the
     /// whole Planet; null for `--short`.
     pub edits: Option<EditsReport>,
+    /// The convergence phase (#187, left out by `--no-convergence`): how fast the Reference view gets clean, in
+    /// two still views, scored against a truth. Not held to any budget; null with `--no-convergence`.
+    pub convergence: Option<ConvergenceReport>,
     /// The streaming mode (`--streaming`): counts made by the stepped, deterministic mode on the
     /// test Planet, and the GPU's timing of it, which is not deterministic; null without the flag.
     pub streaming: Option<StreamReport>,
@@ -509,6 +516,7 @@ mod tests {
             screenshots: vec!["primary-0.png".into()],
             budgets: summarize("embedded", &budgets(), &modes(0.5), &[], &[]),
             edits: None,
+            convergence: None,
             streaming: None,
             streaming_real_time: None,
         };
@@ -524,6 +532,7 @@ mod tests {
                 "build",
                 "caves",
                 "config",
+                "convergence",
                 "edits",
                 "machine",
                 "modes",
@@ -533,7 +542,8 @@ mod tests {
                 "streaming_real_time"
             ]
         );
-        assert_eq!(json["schema_version"], 15);
+        assert_eq!(json["schema_version"], 16);
+        assert_eq!(json["convergence"], serde_json::Value::Null);
         assert_eq!(json["streaming"], serde_json::Value::Null);
         assert_eq!(json["streaming_real_time"], serde_json::Value::Null);
         assert_eq!(

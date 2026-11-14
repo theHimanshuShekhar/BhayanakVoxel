@@ -2,6 +2,8 @@
 
 use std::path::PathBuf;
 
+use super::convergence::CHECKPOINTS;
+
 pub const USAGE: &str = "\
 Usage: client bench [OPTIONS]
 
@@ -37,6 +39,17 @@ Options:
   --runs N         With --real-time, how many times to run the paths in this process
                    [default: 3]. The report gives each count's min and max over the runs, and
                    the gates use the worst
+  --no-convergence Leave out the convergence phase (ADR 0005), which otherwise runs last of the
+                   timed phases: the Reference view on two still views (the reference golden's,
+                   and a pit lit by bounce light) at the output resolution, scored with FLIP and
+                   squared error against a truth (the same view, another seed) after 1, 4, 16,
+                   64, 256 and 1024 samples. It adds a `convergence` block to report.json,
+                   convergence.csv and a convergence/ folder of pictures and truths. It takes
+                   about 45 s at the default 1024 on the 4090, and says so in the block as
+                   `wall_s`. With --short it is a tiny run with no FLIP
+  --truth-spp N    Samples of each of the convergence phase's two truths [default: 1024]; ADR
+                   0005's 8192 takes eight times as long (about 5 minutes on the 4090). At
+                   least 1024, the last checkpoint
   --no-fail        Exit with status 0 even if a pass is over its budget, there is a hole or a
                    real-time gate is over
   -h, --help       Print this";
@@ -75,6 +88,10 @@ pub struct Args {
     pub real_time: bool,
     pub runs: u32,
     pub no_fail: bool,
+    /// The convergence phase (#187), which runs unless `--no-convergence`, and its truths' samples
+    /// if `--truth-spp` said.
+    pub convergence: bool,
+    pub truth_spp: Option<u32>,
     pub size: Option<(u32, u32)>,
     pub bias: f64,
     pub diag: Diag,
@@ -100,6 +117,8 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Parsed, String> {
         real_time: false,
         runs: DEFAULT_RUNS,
         no_fail: false,
+        convergence: true,
+        truth_spp: None,
         size: None,
         bias: 1.0,
         diag: Diag::default(),
@@ -118,6 +137,8 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Parsed, String> {
                 runs_given = true;
             }
             "--no-fail" => parsed.no_fail = true,
+            "--no-convergence" => parsed.convergence = false,
+            "--truth-spp" => parsed.truth_spp = Some(truth_spp(&value("--truth-spp")?)?),
             "--out" => parsed.out = value("--out")?.into(),
             "--budgets" => parsed.budgets = Some(value("--budgets")?.into()),
             "--size" => parsed.size = Some(size(&value("--size")?)?),
@@ -131,6 +152,11 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Parsed, String> {
     }
     if runs_given && !parsed.real_time {
         return Err("--runs is for --real-time".into());
+    }
+    if parsed.truth_spp.is_some() && !parsed.convergence {
+        return Err(
+            "--truth-spp is for the convergence phase, which --no-convergence leaves out".into(),
+        );
     }
     // `--diag` says that the budgets are not checked, and the real-time mode's gates are checked
     // whatever it says (they are a failure of their own): the two do not go together.
@@ -150,6 +176,15 @@ fn runs(text: &str) -> Result<u32, String> {
         .ok()
         .filter(|&n| n > 0)
         .ok_or_else(|| format!("`{text}` is not a number of runs like 3"))
+}
+
+/// `--truth-spp`: at least the last checkpoint, or the truth would be rougher than what it judges.
+fn truth_spp(text: &str) -> Result<u32, String> {
+    let least = CHECKPOINTS[CHECKPOINTS.len() - 1];
+    text.parse::<u32>()
+        .ok()
+        .filter(|&n| n >= least)
+        .ok_or_else(|| format!("`{text}` is not a number of samples of at least {least}"))
 }
 
 /// `--diag`'s comma-separated switches.
@@ -192,6 +227,7 @@ fn size(text: &str) -> Result<(u32, u32), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bench::convergence::DEFAULT_TRUTH_SPP;
 
     fn parse_all(args: &[&str]) -> Result<Parsed, String> {
         parse(args.iter().map(|a| a.to_string()))
@@ -216,6 +252,8 @@ mod tests {
                 real_time: false,
                 runs: 3,
                 no_fail: false,
+                convergence: true,
+                truth_spp: None,
                 size: None,
                 bias: 1.0,
                 diag: Diag::default()
@@ -263,6 +301,27 @@ mod tests {
         assert!(args.short && args.no_fail && args.streaming);
         assert_eq!(args.size, Some((640, 360)));
         assert_eq!(args.bias, 2.0);
+    }
+
+    #[test]
+    fn the_convergence_phase_is_on_unless_left_out_and_its_truth_is_read() {
+        let args = run(&[]);
+        assert!(args.convergence);
+        assert_eq!(args.truth_spp, None);
+        assert!(!run(&["--no-convergence"]).convergence);
+        assert_eq!(run(&["--truth-spp", "8192"]).truth_spp, Some(8192));
+        assert_eq!(run(&["--truth-spp", "1024"]).truth_spp, Some(1024));
+        assert_eq!(DEFAULT_TRUTH_SPP, 1024);
+        for bad in [
+            // A truth is of the convergence phase, which this leaves out.
+            &["--no-convergence", "--truth-spp", "8192"][..],
+            &["--truth-spp"],
+            &["--truth-spp", "1023"],
+            &["--truth-spp", "0"],
+            &["--truth-spp", "lots"],
+        ] {
+            assert!(parse_all(bad).is_err(), "{bad:?}");
+        }
     }
 
     #[test]
