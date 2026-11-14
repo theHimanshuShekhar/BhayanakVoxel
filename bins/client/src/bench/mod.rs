@@ -276,8 +276,11 @@ fn run(args: &Args) -> Result<u8, Box<dyn Error>> {
         } else {
             convergence::Settings::full(traced, args.truth_spp)
         };
-        // It is not budgeted, so a phase that fails must not take the timed results with it.
-        match convergence::run(&settings, &args.out) {
+        // It is not budgeted, so a phase that fails must not take the timed results with it: not
+        // by an error, and not by a panic either (the readback's `expect`s, wgpu's uncaptured-error
+        // handler, a worker of FLIP's thread pool), which would end the process with status 101
+        // and no report.
+        match realtime::catching(|| convergence::run(&settings, &args.out)) {
             Ok(report) => Some(report),
             Err(e) => {
                 eprintln!(

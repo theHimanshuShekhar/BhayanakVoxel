@@ -917,8 +917,9 @@ client.exe bench --truth-spp 8192 --out bench-out
 That is the whole bench with the phase. It took about 5 minutes longer on the 4090 for each of three
 runs (the baseline of #187, in `docs/measurements.md`). With the default `--truth-spp 1024` it takes
 about 45 s (measured on the 4090: 44.0 s for both views); the `wall_s` of the report's `convergence`
-block is the phase's wall-clock time. If the phase fails (a file it cannot write, say), the bench warns on stderr, leaves
-the block null and still writes the rest of the report: the phase has no budget to fail.
+block is the phase's wall-clock time. If the phase fails (a file it cannot write, say, or a panic),
+the bench warns on stderr, leaves the block null and still writes the rest of the report: the phase
+has no budget to fail.
 It writes `bench-out/report.json`
 (the `convergence` block), `bench-out/convergence.csv` and `bench-out/convergence/golden/` and
 `convergence/pit/` (about 0.2 GB of truths at 8192 or 1024 alike: they are the image, not the samples).
@@ -1025,7 +1026,8 @@ their errors (the floor), and that a seed gives the same image every time.
                    "views": [ { "name", ...the view's camera and sun, "reference": STATS,
                                 "gpu_total": STATS, "ms_per_mpix_per_sample", "floor",
                                 "curve": [...], "lines": [...], "files": [...] }... ] } | null,
-                                                   // null with --no-convergence or if the phase failed; see its section
+                                      // null with --no-convergence or if the phase failed;
+                                      // see its section
   "streaming": { "deterministic": true, "schedule", "counts_hash", "upload", "soft_misses",
                  "rings", "work", "residency", "holes", "sizing",
                  "timing": { "deterministic": false, ... } } | null,  // --streaming only

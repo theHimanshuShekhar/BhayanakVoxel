@@ -45,7 +45,7 @@ use super::stream::StreamReport;
 /// hash are not changed.
 ///
 /// 16 added `convergence` (#187): the convergence phase's curve, floor and lines for two views,
-/// null with `--no-convergence`. Nothing else is changed.
+/// null with `--no-convergence` or when the phase fails. Nothing else is changed.
 pub const SCHEMA_VERSION: u32 = 16;
 
 /// One timed thing (a pass, or the GPU total of a profiler frame) in one mode, against its
@@ -328,8 +328,9 @@ pub struct Report {
     /// The Edit stress: the largest Brush, dug and placed in turn at the metric rate, on the
     /// whole Planet; null for `--short`.
     pub edits: Option<EditsReport>,
-    /// The convergence phase (#187, left out by `--no-convergence`): how fast the Reference view gets clean, in
-    /// two still views, scored against a truth. Not held to any budget; null with `--no-convergence`.
+    /// The convergence phase (#187, left out by `--no-convergence`): how fast the Reference view
+    /// gets clean, in two still views, scored against a truth. Not held to any budget; null with
+    /// `--no-convergence` or when the phase fails (an error or a panic: the rest is still written).
     pub convergence: Option<ConvergenceReport>,
     /// The streaming mode (`--streaming`): counts made by the stepped, deterministic mode on the
     /// test Planet, and the GPU's timing of it, which is not deterministic; null without the flag.

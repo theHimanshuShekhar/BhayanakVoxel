@@ -1825,7 +1825,9 @@ fn panic_message(payload: &(dyn Any + Send)) -> String {
 
 /// `work`'s result, or if it panics an error that says so: a panic would end the process with status
 /// 101 and no report. The panic's own message is still printed by the hook.
-fn catching<T>(work: impl FnOnce() -> Result<T, Box<dyn Error>>) -> Result<T, Box<dyn Error>> {
+pub(super) fn catching<T>(
+    work: impl FnOnce() -> Result<T, Box<dyn Error>>,
+) -> Result<T, Box<dyn Error>> {
     match catch_unwind(AssertUnwindSafe(work)) {
         Ok(result) => result,
         Err(payload) => Err(format!("panicked: {}", panic_message(&*payload)).into()),

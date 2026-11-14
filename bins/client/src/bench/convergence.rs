@@ -132,7 +132,8 @@ pub struct ConvergenceReport {
     /// Where the pictures and the truths are, in the output folder, and the curve's file.
     pub folder: &'static str,
     pub csv: &'static str,
-    /// Wall-clock seconds the whole phase took: truths, the run, scoring and the files.
+    /// Wall-clock seconds the whole phase took: making the scenes and the GPU contexts, the
+    /// truths, the run, scoring and the files.
     pub wall_s: f64,
     pub views: Vec<ViewReport>,
 }
