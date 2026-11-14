@@ -4,7 +4,9 @@
 //!
 //! `cargo test --release -p client --bin client -- --ignored --nocapture record_the_look_dev_sites`
 //! prints `shots.rs`; `the_recorded_places_are_the_ones_the_finder_picks` checks that it is
-//! current, and `the_recorded_shots_are_where_they_say` that every camera is in the open.
+//! current, and `the_recorded_shots_are_where_they_say` that every camera is in the open, the caves and the
+//! descent are underground, and the caves are roofed (all three are `#[ignore]`: they make the
+//! 320 km world map, 25 s).
 
 use brick_store::VOXELS_PER_METRE as VPM;
 use planet_gen::Tube;
@@ -960,7 +962,11 @@ pub fn source(planet: &Planet, found: &[Found]) -> String {
         planet_gen::GENERATOR_VERSION
     ));
     let _ = planet;
-    out.push_str("/// The seed and size of the Planet they are on are the client's own: `crate::SEED`, 320 km.\n");
+    out.push_str(&format!(
+        "/// The seed and radius (Voxels) of the Planet they are on, which a test holds to the client's own.\npub const RECORDED_SEED: u64 = {:#X};\npub const RECORDED_RADIUS: i32 = {};\n\n",
+        crate::SEED,
+        planet_gen::world_map::WORLD_RADIUS
+    ));
     out.push_str("pub const SHOTS: [Shot; ");
     out.push_str(&format!("{}] = [\n", found.len()));
     for s in found {
@@ -1072,16 +1078,55 @@ fn the_recorded_shots_are_where_they_say() {
                 shot.name
             );
         }
-        // A cave is under the ground and a chamber has no sky in it.
+        // A cave is under the ground all along its path, with rock overhead where it is recorded.
         if shot.cave.is_some() {
-            let eye = shot.keys[0].position;
-            let depth = planet.sea_radius() + planet.ground_height(eye) - length(eye);
+            for key in shot.keys {
+                let depth = depth_under_ground(&planet, key.position);
+                assert!(
+                    depth > 20.0 * VPM,
+                    "{}: only {} m under at {:?}",
+                    shot.name,
+                    depth / VPM,
+                    key.position
+                );
+                assert!(
+                    rock_overhead(&solid, key.position),
+                    "{}: open to the sky straight up from {:?}",
+                    shot.name,
+                    key.position
+                );
+            }
+        }
+        // The dark descent ends underground, in the dark: 15 m or more under (it records 18.8 m), with
+        // rock overhead.
+        if shot.name == "dark descent" {
+            let end = shot.keys.last().expect("keyframes").position;
+            let depth = depth_under_ground(&planet, end);
             assert!(
-                depth > 20.0 * VPM,
-                "{}: only {} m under",
-                shot.name,
+                depth > 15.0 * VPM,
+                "the descent ends only {} m under",
                 depth / VPM
+            );
+            assert!(
+                rock_overhead(&solid, end),
+                "the descent ends open to the sky"
             );
         }
     }
+}
+
+/// How far under the ground (Voxels) `eye` is: negative above it.
+fn depth_under_ground(planet: &Planet, eye: [f64; 3]) -> f64 {
+    planet.sea_radius() + planet.ground_height(eye) - length(eye)
+}
+
+/// Whether there is rock somewhere straight up (away from the Planet's centre) from `eye`, within
+/// 400 m, looking every 25 cm: the cheap check that there is no sky overhead. It does not say
+/// there is none from the side (a cave's mouth), only that the chamber is roofed.
+fn rock_overhead(solid: &impl Fn([i32; 3]) -> bool, eye: [f64; 3]) -> bool {
+    let up = unit(eye);
+    (1..=(400.0 * 4.0) as u32).any(|step| {
+        let at = plus(eye, up, f64::from(step) * 0.25 * VPM);
+        solid(voxel(at))
+    })
 }

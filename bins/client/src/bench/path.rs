@@ -33,8 +33,10 @@ impl CameraPath {
     }
 
     /// The same path with the camera rolled by `rolls[k]` radians at keyframe `k` (positive
-    /// leans it to the right, `Camera::roll`) and by a straight blend between: a Dutch tilt in a
+    /// leans it to the right, `Camera::roll`) and by a blend between along the shorter way
+    /// round, so keys of 3.0 and -3.0 pass through a half turn, not through 0: a Dutch tilt in a
     /// canyon, recorded with the debug free camera's roll keys. Needs one roll for each keyframe.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn rolled(mut self, rolls: Vec<f64>) -> Self {
         assert_eq!(
             rolls.len(),
@@ -84,7 +86,7 @@ impl CameraPath {
             Camera::looking_at(position, target)
         };
         if let (Some(&a), Some(&b)) = (self.rolls.get(segment), self.rolls.get(segment + 1)) {
-            camera.roll = a * (1.0 - t) + b * t;
+            camera.roll = blend_roll(a, b, t);
         }
         camera
     }
@@ -100,6 +102,18 @@ impl CameraPath {
         at.dedup();
         at
     }
+}
+
+/// The roll `t` of the way from `a` to `b`, along the shorter arc (the rolls are kept within a
+/// half turn either way, as `Camera::roll_by` keeps them, so the straight blend of 3.0 and -3.0
+/// would swing the long way round through 0). Exact at 0 and 1 where the arc is straight.
+fn blend_roll(a: f64, b: f64, t: f64) -> f64 {
+    use std::f64::consts::{PI, TAU};
+    if (b - a).abs() <= PI {
+        return a * (1.0 - t) + b * t;
+    }
+    let short = (b - a + PI).rem_euclid(TAU) - PI;
+    (a + short * t + PI).rem_euclid(TAU) - PI
 }
 
 /// A camera at `position` looking at `target`, its horizon level with the Planet there.
@@ -252,6 +266,25 @@ mod tests {
             (level.position, level.forward())
         );
         assert_ne!(rolled.right(), level.right());
+    }
+
+    #[test]
+    fn a_roll_goes_the_short_way_round_a_half_turn() {
+        use std::f64::consts::PI;
+        let path = path().rolled(vec![3.0, -3.0, -3.0]);
+        let near_pi = |r: f64| (PI - r.abs()) < 0.2;
+        // Halfway from 3.0 to -3.0 is a half turn (3.14), not 0, and it stays within a half turn.
+        let half = path.camera_at(25, 101).roll;
+        assert!(near_pi(half), "{half}");
+        assert!(path.camera_at(10, 101).roll > 3.0 || path.camera_at(10, 101).roll < -3.0);
+        for frame in 0..=100 {
+            assert!(path.camera_at(frame, 101).roll.abs() <= PI + 1e-12);
+        }
+        // Ends are exact, and a short way is the straight one.
+        assert_eq!(path.camera_at(0, 101).roll, 3.0);
+        assert_eq!(path.camera_at(50, 101).roll, -3.0);
+        let straight = self::path().rolled(vec![0.5, -0.5, 0.0]);
+        assert!(straight.camera_at(25, 101).roll.abs() < 1e-12);
     }
 
     #[test]
