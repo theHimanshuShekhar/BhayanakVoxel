@@ -60,6 +60,19 @@ fn create_instance() -> wgpu::Instance {
     wgpu::Instance::new(desc)
 }
 
+/// The one Vulkan instance of a process's headless renderers (`Offscreen`), made on first use.
+///
+/// An instance per renderer is a `vkCreateInstance` per renderer, and with VK_EXT_debug_utils on
+/// (wgpu's debug builds name every object) the Vulkan loader (1.4.309 here, and the same code in
+/// the versions after it) crashes when one thread creates an instance while another names an
+/// object: `vkSetDebugUtilsObjectNameEXT` walks the loader's global list of instances and reads
+/// the `icd_terms` of one that is on the list but still being built. Parallel tests make
+/// renderers in parallel, so they share one instance (#194).
+fn shared_instance() -> wgpu::Instance {
+    static INSTANCE: std::sync::OnceLock<wgpu::Instance> = std::sync::OnceLock::new();
+    INSTANCE.get_or_init(create_instance).clone()
+}
+
 /// Requests a device on a Vulkan adapter, presentable to `surface` if one is given. With
 /// `timers`, it has timestamp queries if the adapter does.
 fn request_gpu(
@@ -148,7 +161,7 @@ mod tests {
     /// Needs a Vulkan driver; CI uses lavapipe (mesa-vulkan-drivers).
     #[test]
     fn vulkan_device_can_be_created_without_a_window() {
-        let (adapter, _device, _queue) = request_gpu(&create_instance(), None, true).unwrap();
+        let (adapter, _device, _queue) = request_gpu(&shared_instance(), None, true).unwrap();
         assert_eq!(adapter.get_info().backend, wgpu::Backend::Vulkan);
     }
 }
