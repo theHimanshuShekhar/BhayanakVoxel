@@ -9,7 +9,7 @@ use crate::sun::Sun;
 use crate::timing::Timings;
 use crate::tracer::{Plane, Target, Tracer};
 use crate::upscale::Resolution;
-use crate::{Result, create_instance, finish_and_read, request_gpu, staging_buffer};
+use crate::{Result, finish_and_read, request_gpu, shared_instance, staging_buffer};
 
 /// Copies a `width` x `height` texture of `bytes` per texel to the CPU after the work in
 /// `encoder`, tightly packed, rows from the top.
@@ -166,7 +166,7 @@ impl Offscreen {
     }
 
     fn create(resolution: Resolution, scene: &Scene, timers: bool) -> Result<Self> {
-        let (adapter, device, queue) = request_gpu(&create_instance(), None, timers)?;
+        let (adapter, device, queue) = request_gpu(&shared_instance(), None, timers)?;
         let info = adapter.get_info();
         let info = GpuInfo {
             name: info.name,
