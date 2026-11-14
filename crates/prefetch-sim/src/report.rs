@@ -14,15 +14,17 @@ use crate::path::{self, Path};
 /// (Not measured again yet.)
 pub const GUARD_BYTES: f64 = 73.9 * 1024.0 * 1024.0;
 
-/// Bytes a drawn brick costs in one packed copy of the scene, as the client measures it: 474 MiB
-/// for the 3.44 million bricks of the full fill at 5 cm (#142), 144.5 B, which is the 34 words of
+/// Bytes a drawn brick costs in one packed copy of the scene, as the client measures it: 792 MiB
+/// for the 4.65 million bricks of the full fill at 5 cm on the 320 km Planet with no horizon cap
+/// (#146), 178.5 B (it was 474 MiB for 3.44 million, 144.5 B, on the 16 km Planet: #142), which is
+/// the 34 words of
 /// `bricks` and `brick_refs` per brick that `room_for` in the client is sized from (136 B, as
 /// #123 measured it) and the region records and tables that go with them. The memory the client
 /// holds is more than this times the bricks: the scene thread's copy and the frame thread's copy
 /// of it (ADR 0006: about 542 MiB each at full size), and the host `BrickStore`, which holds the
 /// ancestors and the bricks the bands split but do not draw. Every MB in the report is one packed
 /// copy; a copy for the frame thread doubles it.
-pub const BRICK_BYTES: f64 = 474.0 * 1024.0 * 1024.0 / 3_439_848.0;
+pub const BRICK_BYTES: f64 = 792.0 * 1024.0 * 1024.0 / 4_652_474.0;
 
 /// Drawn bricks a second that the loader and the scene thread get from the Planet to the scene
 /// today, end to end: the full fill at 5 cm drew 3.44 million bricks
@@ -428,7 +430,7 @@ pub fn markdown(
     }
     let _ = writeln!(
         w,
-        "\nRadial margin {}, vertical margin {} m, crust {}, Guard from level {:?} ({:.1} MiB, not in the shell columns), {} workers at {:.0} generated bricks/s/core ({:.0} µs, as the fill implies), jobs of {}, today's intake {:.1} K drawn bricks/s. The client generated {:.2} bricks per drawn brick in its fill (9.41 million for 3.44 million), the model {:.2} on the paths: scale the generation columns by that ratio for the client's.",
+        "\nRadial margin {}, vertical margin {} m, crust {}, Guard from level {:?} ({:.1} MiB, not in the shell columns), {} workers at {:.0} generated bricks/s/core ({:.0} µs, as the fill implies), jobs of {}, today's intake {:.1} K drawn bricks/s. The client generated {:.2} bricks per drawn brick in its fill (9.41 million for 3.44 million, on the 16 km Planet), the model {:.2} on the paths: scale the generation columns by that ratio for the client's.",
         model.radial_margin,
         model.vertical_margin / VOXELS_PER_METRE,
         model.crust,
@@ -652,7 +654,7 @@ mod tests {
 
     #[test]
     fn a_full_fill_draws_what_the_client_measured() {
-        // 3.25 d0^2 bricks (3.44 million), within 10%.
+        // 4.40 d0^2 bricks (4.65 million at 320 km), within 10%.
         let model = Model::real();
         let d0 = model.bands.d0();
         let drawn = drawn_bricks(&model) as f64 / (d0 * d0);
@@ -664,14 +666,14 @@ mod tests {
     }
 
     #[test]
-    fn the_scene_at_rest_is_the_client_s_474_mib_and_the_shell_is_the_part_inside_the_horizon() {
-        // The client draws the whole Planet, as the bands say, with no horizon cap: 3.44 million
-        // bricks, 474 MiB per scene copy at BRICK_BYTES, within 10%.
+    fn the_scene_at_rest_is_the_client_s_792_mib_and_the_shell_is_the_part_inside_the_horizon() {
+        // The client without a horizon cap draws the whole Planet, as the bands say: 4.65 million
+        // bricks, 792 MiB per scene copy at BRICK_BYTES, within 10%.
         let model = Model::real();
         let built = built_size(&model, 2.0);
         let mib_built = mib(built as f64 * BRICK_BYTES);
         assert!(
-            (427.0..521.0).contains(&mib_built),
+            (713.0..871.0).contains(&mib_built),
             "{built} bricks, {mib_built} MiB"
         );
         // The simulator's shell at rest, 227 to 259 MB (#49), is what a horizon cap would keep:
@@ -684,23 +686,30 @@ mod tests {
 
     #[test]
     fn a_shell_at_the_ground_holds_about_the_surface_in_its_band() {
-        // No margins: level 0 owns 2 d0 = 102.8 m, level 1 to 205.6 m, and level 2 to the 253 m
-        // horizon. The surface there is a disc of 253 m: pi r^2 over the bricks' areas, times what
-        // a cubic grid makes of a surface (between 1 and sqrt 3 times the area, 1.5 on average).
+        // No margins: level 0 owns 2 d0 = 102.8 m, each level twice as far as the one before, up to
+        // the 1131 m horizon at 2 m over a 320 km sea (level 4 owns the last of it). The surface
+        // there is a disc of 1131 m: pi r^2 over the bricks' areas (0.16 m^2 at level 0, four times
+        // as much a level), times what a cubic grid makes of a surface (between 1 and sqrt 3 times
+        // the area, 1.5 on average).
         let mut model = Model::real();
         model.crust = 0.0;
         model.vertical_margin = 0.0;
         model.radial_margin = 1.0;
         let size = shell_size(&model, 2.0);
-        let (r0, r1, r2) = (102.8f64, 205.6f64, 253.0f64);
-        let flat = std::f64::consts::PI
-            * (r0 * r0 / 0.16 + (r1 * r1 - r0 * r0) / 0.64 + (r2 * r2 - r1 * r1) / 2.56);
+        let horizon = 1131.0_f64;
+        let (mut flat, mut inner) = (0.0, 0.0);
+        for level in 0..=4 {
+            let outer = (102.8_f64 * f64::from(1 << level)).min(horizon);
+            flat += std::f64::consts::PI * (outer * outer - inner * inner)
+                / (0.16 * 4.0_f64.powi(level));
+            inner = outer;
+        }
         let ratio = size.bricks as f64 / flat;
         assert!(
             (1.0..1.75).contains(&ratio),
             "{} bricks, {ratio} of flat",
             size.bricks
         );
-        assert_eq!(size.levels, (0, 2));
+        assert_eq!(size.levels, (0, 4));
     }
 }

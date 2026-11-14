@@ -764,6 +764,9 @@ pub(super) fn test_planet() -> TestPlanet {
         },
     )
     .expect("the rings of the spawn fit");
+    scene
+        .set_horizon(&store, crate::horizon(&planet))
+        .expect("the horizon's rings fit");
     scene.set_margins(&store, Margins::standard());
     let start = Start::of(&store);
     TestPlanet {

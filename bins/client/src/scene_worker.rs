@@ -836,6 +836,17 @@ impl SceneWorker {
         self.shared.forget_largest.store(true, Ordering::Release);
     }
 
+    /// The nodes of the selection of a stepped thread (see [`Scene::nodes`]).
+    #[cfg(test)]
+    pub fn selection_nodes(&self) -> usize {
+        let engine = self.stepped.as_ref().expect("only a stepped thread");
+        engine
+            .lock()
+            .expect("the engine is not poisoned")
+            .scene
+            .nodes()
+    }
+
     /// How many waits for the frame thread to take what was published the scene thread began, and
     /// how many of those ended by the timeout and not by a wake-up.
     #[cfg(test)]

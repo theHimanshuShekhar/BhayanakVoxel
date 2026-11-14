@@ -127,7 +127,8 @@ of following the camera, done inline.
 
 `--streaming` runs the loader, the rings' recentring, the scene thread's packing and the copy to
 the GPU on the test Planet (the world map of 512 texels a face, the one the stepped tests use),
-which the flight above leaves out. It runs **stepped** (#180, `docs/agents/ci.md`): no threads, no
+which the flight above leaves out, **with the horizon cap** (ADR 0004, #146: the test Planet's scene has the Planet's
+horizon, as the game's does). It runs **stepped** (#180, `docs/agents/ci.md`): no threads, no
 sleeps, and a clock that only the bench moves, a frame (16.667 ms) at a time, so the work of each
 frame does not depend on how long anything took. The code is the game's (`World`, `Loader`,
 `SceneWorker`); the game starts threads and never steps, and its clock is the machine's (see
@@ -153,7 +154,7 @@ except `timing`.
   constants). It is the one number to compare: `bins/client/src/bench/streaming-counts.golden` has the committed value, a unit
   test (`the_counts_are_the_committed_ones`, which runs on Linux and on Windows, since it needs no
   GPU) and `tests/bench.rs` check it. When a change to the streaming code moves the counts on
-  purpose, the test prints the new hash; put it in the file and say why in the PR.
+  purpose, the test prints the new hash; put it in the file and say why in the PR. It is `38b58d66b96791af` since #146: the stepped scene has the horizon cap, so the drawn bricks of the Guard's levels went from 9 536 to 8 482, the rings' and a follow step's counts and the upload (64.30 to 64.80 MB, 6 439 to 6 986 copies) moved with them; what is streamed, arrived and evicted did not (`docs/measurements.md`).
 - `upload`: bytes written to the GPU per frame (`bytes`: `total`, `max`, frames and frames with
   any) and the belt copies per frame (`writes`, the same, each a copy with a barrier of
   its own: neighbouring ranges of a patch are joined into one when they are within `COPY_GAP`
@@ -272,7 +273,7 @@ Voxels) with the **real loader workers and the real scene thread**, on the machi
 frame at 60 a second, drawn on the GPU. What the threads have done by a frame depends on what the
 operating system let them do, so **everything in `streaming_real_time` is not deterministic**, is
 made by this mode only, and is not in the counts hash. The stepped test Planet mode and its hash
-(`e621feef18ef1801` since #145, which added the `upload` writes and budget counts) still run first.
+(`38b58d66b96791af` since #146, which put the horizon cap in it; `e621feef18ef1801` from #145, which added the `upload` writes and budget counts, until #166's terrain) still run first.
 
 It runs after the stepped mode, and takes tens of minutes at full size: each run generates the
 world map (about 25 s), loads, fills (a few minutes) and flies the paths, with the loader caught
@@ -821,7 +822,7 @@ over exits with status 2 (0 with `--no-fail`).
 | Frame time | `frame_time_p99_ms` | 16.7 | the p99 of `frame_time`, of every path |
 | Frame-thread CPU | `frame_cpu_p99_ms` | 8.0 | the p99 of `frame_cpu`, of every path |
 | Holes | `holes` | 0 | the holes that the scene thread's looks found over each **whole run**, from the moment the measuring began, summed over the runs. It also fails if a run, or a path of a run, had **no look at all**: a gate that looked at nothing has not passed |
-| Memory | `scene_mib` | 512 | the scene's buffers **in use** (`scene_used_peak_mib`; the full-size test's 474 MiB measured, #143). **It is not VRAM**: what the GPU reserves is `scene_reserved_mib`, reported and not gated |
+| Memory | `scene_mib` | 512 | the scene's buffers **in use** (`scene_used_peak_mib`; at 320 km the full-size runs measure **792 MiB without the horizon cap and 510 to 512 MiB with it** on the dev box (#146), and the 4090's real-time run **514.8 MiB at its peak, 2.8 over the gate**, which is left to #167, by the owner's decision). **It is not VRAM**: what the GPU reserves is `scene_reserved_mib`, reported and not gated |
 | Memory | (the store's own budget) | | the store's size against its limit, `store_limit_bricks`, which the client sets from `STREAMED_PER_D0_SQUARED` and `BUDGET_OVERFLOW` |
 
 **Frame time is the pessimistic figure.** Here a frame is the CPU's work and then the wait for the

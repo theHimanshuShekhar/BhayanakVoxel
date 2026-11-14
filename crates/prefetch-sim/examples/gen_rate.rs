@@ -54,7 +54,7 @@ fn main() {
         let jobs: Vec<BrickCoord> = picks[level]
             .iter()
             .map(|coord| {
-                // The model's Planet is a smooth sphere of 16 km at sea level: move the brick
+                // The model's Planet is a smooth sphere of 320 km at sea level: move the brick
                 // radially to the real Planet's ground there (320 km, `GENERATOR_VERSION` 5: the
                 // ground the detail is on too), so that the jobs are over ground and not open
                 // sea.
@@ -93,9 +93,9 @@ fn main() {
 fn contiguous(planet: &Planet, source: &PlanetSource) {
     let spawn = planet.spawn(100);
     let radius = spawn.iter().map(|c| c * c).sum::<f64>().sqrt();
-    // The model's sphere is 16 km, so its keys fit: the jobs are found over it, at the spawn's
-    // direction, and moved as a whole, a level's bricks by the same number of bricks, to the
-    // spawn's ground (the ground is flat to 14 Voxels in 150 m, which is under two bricks).
+    // The model's sphere is the real Planet's 320 km, and a key holds it: the jobs are found over
+    // it, at the spawn's direction, and moved as a whole, a level's bricks by the same number of
+    // bricks, to the spawn's ground (the ground is flat to 14 Voxels in 150 m, which is under two bricks).
     let model = Model::real();
     let up = unit(spawn);
     let point = Point {
