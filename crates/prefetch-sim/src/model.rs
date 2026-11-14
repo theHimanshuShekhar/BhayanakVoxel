@@ -8,24 +8,28 @@ pub use brick_store::VOXELS_PER_METRE;
 use render::lod::{Bands, GUARD_FIRST, LEVELS};
 
 /// Bricks a full fill draws, in units of d0 squared (a level's bricks are the surface within its
-/// band, so they go with d0²): measured by the client on the full-size Planet, 3.44 million at a
-/// bias of 1 (`BRICKS_PER_D0_SQUARED` in `bins/client/src/main.rs`; 3.56 million, 3.37 d0², before
-/// #142 stopped the deep sea from being drawn).
-pub const DRAWN_PER_D0_SQUARED: f64 = 3.25;
+/// band, so they go with d0²): measured by the client on the full-size 320 km Planet, 4 652 474
+/// bricks at a bias of 1 with the camera 2 m up and no horizon cap (#146, the `FULLSIZE_HORIZON=0`
+/// run of `the_resident_set_at_2_m_50_m_500_m_and_5_km_over_the_spawn`). On the 16 km Planet it was
+/// 3.44 million, 3.25 d0² (3.56 million, 3.37 d0², before #142 stopped the deep sea from being
+/// drawn): the Planet is twenty times as large and a level's bricks go with the surface in its
+/// band, not the Planet's, so the difference is the Guard's levels (all but two are drawn from the
+/// bands now: `guard_first` is 12 at 320 km) and the ground's relief, which the generator has
+/// more of.
+pub const DRAWN_PER_D0_SQUARED: f64 = 4.40;
 
 /// The model's [`Model::crust`].
-pub const CRUST: f64 = 0.4;
+pub const CRUST: f64 = 0.27;
 
 /// The eye's height above the ground when walking or flying low: 2 m.
 pub const EYE: f64 = 2.0 * VOXELS_PER_METRE;
 
-/// The radius of the Planet that the simulator models, in Voxels: 16 km, the client's Planet when
-/// the simulator was calibrated against it (`DRAWN_PER_D0_SQUARED`, the tests of `report`). The
-/// real Planet is 320 km now (ADR 0008, #166), whose keys do not fit a [`crate::key::Key`] and
-/// whose fill the client has not measured yet: recalibrating is #167's, with the renderer's
-/// levels. The bricks that the band rule picks near a camera do not depend on the radius but
-/// through the horizon, which is what is calibrated.
-pub const SIM_RADIUS: i32 = 16_000 * VOXELS_PER_METRE as i32;
+/// The radius of the Planet that the simulator models, in Voxels: 320 km, the client's Planet
+/// (ADR 0008, #166). It was 16 km, the Planet the simulator was calibrated on
+/// (`DRAWN_PER_D0_SQUARED`, the tests of `report`), until a [`crate::key::Key`] was widened to hold
+/// the coordinates of a Planet this size. The bricks that the band rule picks near a camera do not
+/// depend on the radius but through the horizon, which is what makes the sizes at 320 km differ.
+pub const SIM_RADIUS: i32 = 320_000 * VOXELS_PER_METRE as i32;
 
 /// What is resident, what is required, and by which rules.
 #[derive(Clone, Debug)]
@@ -170,12 +174,13 @@ mod tests {
     #[test]
     fn horizon_is_the_tangent_length() {
         let model = Model::real();
-        // 2 m up, a 16 km sphere: sqrt(2 · 16000 · 2) = 253 m, the research's figure.
+        // 2 m up, a 320 km sphere: sqrt(2 · 320000 · 2) = 1131 m (253 m on the 16 km sphere the
+        // research used).
         let metres = model.horizon(EYE) / VOXELS_PER_METRE;
-        assert!((metres - 253.0).abs() < 1.0, "{metres}");
-        // The margin is 1.25 of that: 316 m.
+        assert!((metres - 1131.0).abs() < 2.0, "{metres}");
+        // The margin is 1.25 of that: 1414 m.
         let reach = model.shell_reach(EYE) / VOXELS_PER_METRE;
-        assert!((reach - 316.0).abs() < 1.5, "{reach}");
+        assert!((reach - 1414.0).abs() < 3.0, "{reach}");
         // Below the ground there is no horizon.
         assert_eq!(model.horizon(-5.0), 0.0);
     }
