@@ -112,6 +112,9 @@ struct Pair {
     client_costs: Costs,
     /// The most bytes the ground of the client and of the server have taken.
     ground_bytes: (usize, usize),
+    /// The most bricks the ground of the client and of the server have generated in one tick: the
+    /// work of a tick that is counted, not timed.
+    ground_made: (u64, u64),
 }
 
 impl Pair {
@@ -148,6 +151,7 @@ impl Pair {
             server_costs: Costs::default(),
             client_costs: Costs::default(),
             ground_bytes: (0, 0),
+            ground_made: (0, 0),
         }
     }
 
@@ -163,9 +167,14 @@ impl Pair {
 
     /// The client's tick alone: it sends an input, or waits.
     fn client_tick(&mut self, input: MoveInput) {
+        let made = self.client.ground().generated();
         let started = Instant::now();
         let request = self.client.walk(input);
         self.client_costs.0.push(started.elapsed());
+        self.ground_made.0 = self
+            .ground_made
+            .0
+            .max(self.client.ground().generated().saturating_sub(made));
         match request {
             Some(request) => {
                 self.sent += 1;
@@ -177,9 +186,15 @@ impl Pair {
 
     /// The server's tick, and the delivery of what it said `lag` ticks ago.
     fn serve(&mut self) {
+        let made = self.server.ground(0).map_or(0, Ground::generated);
         let started = Instant::now();
         self.server.tick(std::slice::from_ref(&self.server_end));
         self.server_costs.0.push(started.elapsed());
+        let made = self
+            .server
+            .ground(0)
+            .map_or(0, |g| g.generated().saturating_sub(made));
+        self.ground_made.1 = self.ground_made.1.max(made);
         self.in_flight
             .push_back(std::iter::from_fn(|| self.link.try_recv().ok()).collect());
         while self.in_flight.len() > self.lag {
@@ -414,17 +429,13 @@ fn distance(a: [f64; 3], b: [f64; 3]) -> f64 {
         .sqrt()
 }
 
-// The controller's tick, held to half of one: 2.1 ms in the mean (release) at 10 cm Voxels. At
-// 5 cm the capsule's bounds hold about 7 times the Voxels, which the controller used to ask the
-// store for one by one (9 ms of the 13 ms tick); it now asks per brick, skips the air ones and the
-// Voxels out of reach, and the tick is the ground's generation (about 4 ms in the mean, and 13 ms
-// in the 99th percentile, when the ball is moved and a tick makes the most it may).
-#[test]
-fn a_character_runs_a_kilometre_from_the_spawn_without_stopping_while_the_ground_keeps_up() {
+/// Runs the kilometre from the spawn that the next two tests are about: 7 m/s for 150 s, and a
+/// little to spare, the client predicting and the server running it, the ground generated on each
+/// side as the character goes. Prints what a tick cost and how far it got.
+fn run_a_kilometre() -> (Pair, [f64; 3]) {
     let (start, axis) = spawn_and_way();
     let mut pair = Pair::new(real_planet, None, 2);
     pair.spawn(start);
-    // 7 m/s for 150 s, and a little to spare.
     let inputs = 150 * u64::from(TICK_RATE_HZ);
     pair.run(inputs, 2 * inputs, |pair, _| MoveInput {
         forward: 1,
@@ -439,21 +450,77 @@ fn a_character_runs_a_kilometre_from_the_spawn_without_stopping_while_the_ground
         pair.ground_bytes,
         Ground::MAX_BYTES
     );
-    let went = distance(pair.server_state().position, start);
+    eprintln!(
+        "bricks generated in one tick at the most (client, server): {:?}",
+        pair.ground_made
+    );
+    (pair, start)
+}
+
+// What the ground has to do for the character to run on it, counted and not timed, so that this test
+// gates on every machine (#193). The ground keeps up (the character never waits for it: #166), it
+// does so within the work a tick is allowed (at most `Ground::rate` bricks, which is what makes a
+// tick fit in its time, below) and it takes a bounded memory. That a tick of that work fits in the
+// time it has is a wall-clock check, in the next test.
+#[test]
+fn a_character_runs_a_kilometre_from_the_spawn_without_stopping_while_the_ground_keeps_up() {
+    let (pair, start) = run_a_kilometre();
     eprintln!(
         "went {:.0} m in {} inputs, waited {} ticks",
-        went / VOXELS_PER_METRE,
+        distance(pair.server_state().position, start) / VOXELS_PER_METRE,
         pair.sent,
         pair.waited
     );
+    let went = distance(pair.server_state().position, start);
     assert!(
         went >= 1000.0 * VOXELS_PER_METRE,
         "went {} m",
         went / VOXELS_PER_METRE
     );
+    // The owner's decision (#166): the character never stops to wait for the ground.
     assert_eq!(pair.waited, 0, "stopped to wait for the ground");
     pair.assert_agree();
 
+    // A tick generates no more bricks than a fill may, on each side: the work that a tick's time
+    // is spent on is bounded, whatever the machine.
+    let rate = pair.client.ground().rate() as u64;
+    assert!(
+        pair.ground_made.0 <= rate && pair.ground_made.1 <= rate,
+        "bricks generated in a tick (client, server): {:?}, of {rate} at the most",
+        pair.ground_made
+    );
+    // And a tick makes far fewer in the mean (the ground is made once per input): the headroom
+    // that the time limit of the next test rests on.
+    let made = pair.client.ground().generated();
+    eprintln!(
+        "bricks generated per input in the mean: {:.1}",
+        made as f64 / pair.sent as f64
+    );
+    assert!(
+        made < pair.sent * rate / 2,
+        "{made} bricks in {} inputs, of {rate} at the most each",
+        pair.sent
+    );
+    // The ground of each takes a bounded amount of memory (a few MiB walking; never more than
+    // `Ground::MAX_BYTES`).
+    assert!(pair.ground_bytes.0.max(pair.ground_bytes.1) < Ground::MAX_BYTES);
+}
+
+// The controller's tick, held to half of one: 2.1 ms in the mean (release) at 10 cm Voxels. At
+// 5 cm the capsule's bounds hold about 7 times the Voxels, which the controller used to ask the
+// store for one by one (9 ms of the 13 ms tick); it now asks per brick, skips the air ones and the
+// Voxels out of reach, and the tick is the ground's generation (about 4 ms in the mean, and 13 ms
+// in the 99th percentile, when the ball is moved and a tick makes the most it may).
+//
+// This is a wall-clock limit, so it does not gate (#193): a busy runner crossed it (18.6 ms against
+// 16.7 on Windows CI, in a PR that did not touch `sim`). It is ignored here, and the
+// `real-thread-tests` job runs it (`--ignored`) on Linux and on Windows, where a failure is
+// visible and does not fail the workflow. Run it where the machine is quiet:
+// `cargo test -p sim --test walk -- --ignored --nocapture a_tick_of_the_kilometre_walk`
+#[test]
+#[ignore = "wall-clock limits: run by the real-thread-tests job (#193)"]
+fn a_tick_of_the_kilometre_walk_stays_within_the_time_it_has_with_the_ground_generated_in_it() {
+    let (pair, _) = run_a_kilometre();
     // Each tick, the server's and the client's, stays within the time it has, with the
     // generation of the ground in it. The worst is reported: one slow tick is a machine's
     // doing as much as the code's, so only the mean and the 99th percentile are held to it.
@@ -462,9 +529,6 @@ fn a_character_runs_a_kilometre_from_the_spawn_without_stopping_while_the_ground
         assert!(costs.mean() < tick / 2, "{}", costs.summary("tick"));
         assert!(costs.p99() < tick, "{}", costs.summary("tick"));
     }
-    // The ground of each takes a bounded amount of memory (a few MiB walking; never more than
-    // `Ground::MAX_BYTES`).
-    assert!(pair.ground_bytes.0.max(pair.ground_bytes.1) < Ground::MAX_BYTES);
 }
 
 /// A source that counts the bricks it is asked for.

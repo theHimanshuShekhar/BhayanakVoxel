@@ -63,7 +63,7 @@ jobs:
           fi
 
   # The client tests that are about real threads or real time (the frame thread's milliseconds, a
-  # thread that is busy or panics), on both platforms. Some of them wait on wall-clock time and so
+  # thread that is busy or panics), and the sim's wall-clock tick limit (an ignored test), on both platforms. Some of them wait on wall-clock time and so
   # fail now and then. `continue-on-error` keeps a failure here from failing the workflow. The
   # streaming tests of behaviour run stepped, single-threaded, in the gating jobs.
   real-thread-tests:
@@ -90,6 +90,16 @@ jobs:
           set -euo pipefail
           mapfile -t filters < <(tr -d '\r' < .github/real-thread-tests.txt | grep -vE '^\s*(#|$)')
           cargo test -p client --bin client -- "${filters[@]}"
+      # Wall-clock limits of tests of other crates, which are `#[ignore]`d so that they do not gate
+      # (#193): the sim's tick time over the kilometre walk, whose counted checks gate.
+      # A filter that matches no test passes with nothing run, so the step checks that two ran.
+      - name: Run the wall-clock tests of the sim
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p sim --test walk -- --ignored --nocapture a_tick_of_the_kilometre_walk 2>&1 | tee walk.out
+          cargo test -p sim --lib -- --ignored on_its_own_thread_it_ticks_at_about_60_hz 2>&1 | tee -a walk.out
+          [ "$(grep -c '^test result: .* 1 passed' walk.out)" -eq 2 ] || { echo "::error::a wall-clock test of the sim did not run"; exit 1; }
 
   # Windows is the game's target. The runners have no Vulkan driver, so nothing here may need a GPU:
   # no `render` tests and no tests/bench.rs.

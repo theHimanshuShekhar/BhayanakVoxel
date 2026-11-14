@@ -31,6 +31,17 @@ you change the loader, the scene thread or streaming:
 cargo test -p client --bin client -- streaming_tests:: loader:: priority::
 ```
 
+The job also runs two `#[ignore]`d wall-clock tests of the `sim` crate in a step of their own (the
+list below is for the client binary only; #193), and that step fails if either did not run:
+`a_tick_of_the_kilometre_walk_stays_within_the_time_it_has_...` (`crates/sim/tests/walk.rs`) holds
+the mean and the 99th percentile of a tick's cost to the time a tick has, and
+`on_its_own_thread_it_ticks_at_about_60_hz_and_answers` (`crates/sim/src/server.rs`) holds the
+server thread's ticks in half a second to a range. Their counted twins gate: the kilometre walk's
+character never waits for the ground (#166), makes at most `Ground::rate` bricks a tick and takes
+bounded memory; the server thread ticks on and answers. A wall-clock limit does not belong in a
+gating test: put the counted part in the gating one and the timed part in an `#[ignore]`d test
+that this job runs.
+
 The list of these tests is `.github/real-thread-tests.txt`, one test-name filter per line. The
 gating jobs `--skip` each line and `real-thread-tests` runs only those lines, so every client test
 runs in exactly one place.
