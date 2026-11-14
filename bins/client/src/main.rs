@@ -837,6 +837,8 @@ impl App {
     fn toggle_noclip(&mut self) -> Result<(), Box<dyn Error>> {
         self.walking = !self.walking;
         self.eyes = None;
+        // The character does not roll.
+        self.camera.roll = 0.0;
         if let (true, Some(world), Some(ground)) = (self.walking, &mut self.world, &self.spawn) {
             let leash = world.leash();
             world.spawn(landing(self.camera.position, leash, *ground))?;
@@ -1126,6 +1128,8 @@ fn action_for(code: KeyCode) -> Option<Action> {
         KeyCode::Space => Action::Up,
         KeyCode::ControlLeft | KeyCode::KeyC => Action::Down,
         KeyCode::ShiftLeft | KeyCode::ShiftRight => Action::Fast,
+        KeyCode::KeyQ => Action::RollLeft,
+        KeyCode::KeyE => Action::RollRight,
         _ => return None,
     })
 }
@@ -1184,6 +1188,8 @@ impl ApplicationHandler for App {
                                     event_loop.exit();
                                 }
                             }
+                            // Levels the noclip camera after a roll.
+                            KeyCode::KeyX if !event.repeat => self.camera.roll = 0.0,
                             // Cycles through the debug views.
                             KeyCode::KeyV if !event.repeat => {
                                 if let Some(renderer) = &mut self.renderer {

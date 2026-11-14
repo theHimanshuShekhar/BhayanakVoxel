@@ -92,6 +92,7 @@ window title says when it is done.
 | `Space` | Jump |
 | `Ctrl` or `C` | Crouch |
 | `N` | Switch between walking and the debug noclip camera |
+| `Q` `E` | Roll the noclip camera left or right; `X` levels it |
 | Arrow keys | Turn the sun |
 | `R` | Switch between primary visibility and the reference path tracer |
 | `V` | Cycle debug views |
@@ -100,7 +101,8 @@ window title says when it is done.
 
 The client walks the Planet as a character (1.8 m tall, walks 4.5 m/s, runs 7, crouches 2, jumps
 about 1.2 m, steps up to 0.5 m; numbers in `crates/sim/movement.toml`). In noclip, `W` `A` `S` `D`
-fly along the view, `Space` and `Ctrl`/`C` go up and down, and `Shift` flies faster; nothing
+fly along the view, `Space` and `Ctrl`/`C` go up and down, and `Shift` flies faster; `Q` and `E`
+roll the camera about where it looks (45 degrees a second) and `X` levels it; nothing
 collides. Coming out of noclip sets the character down where the camera is.
 
 The hotbar is along the bottom of the window and is clickable while the mouse is released (`Esc`, or
