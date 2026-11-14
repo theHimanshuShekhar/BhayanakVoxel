@@ -915,9 +915,9 @@ client.exe bench --truth-spp 8192 --out bench-out
 ```
 
 That is the whole bench with the phase. It took about 5 minutes longer on the 4090 for each of three
-runs (the baseline of #187, in `docs/measurements.md`). With the default `--truth-spp 1024` the
-phase's time is not measured yet; the `wall_s` of the report's `convergence` block is the phase's
-wall-clock time. If the phase fails (a file it cannot write, say), the bench warns on stderr, leaves
+runs (the baseline of #187, in `docs/measurements.md`). With the default `--truth-spp 1024` it takes
+about 45 s (measured on the 4090: 44.0 s for both views); the `wall_s` of the report's `convergence`
+block is the phase's wall-clock time. If the phase fails (a file it cannot write, say), the bench warns on stderr, leaves
 the block null and still writes the rest of the report: the phase has no budget to fail.
 It writes `bench-out/report.json`
 (the `convergence` block), `bench-out/convergence.csv` and `bench-out/convergence/golden/` and
