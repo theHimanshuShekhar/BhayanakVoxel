@@ -3008,8 +3008,12 @@ fn flying_with_more_work_than_the_budget_drains_the_backlog_takes_in_arrivals_an
             flown.pending_peak <= control.pending_peak * 4 + 1000,
             "{flown:?} against {control:?}"
         );
-        // (1 036 frames, 4.3 times the flight, on the 40 km test Planet, whose ground has its
-        // detail and so has more bricks to take in; stepped rounds, not a clock.)
+        // (1 036 frames, 4.3 times the flight, on the 40 km test Planet; it was 932, 3.9 times,
+        // before the continents and the shaped detail. Both are stepped rounds, not a clock: the
+        // same 1 036 with eight busy loops competing for the machine. The drain is what the
+        // 12 copies a frame of `SMALL_BUDGET` leave to be made: the flight lists 18 877 copies
+        // against 16 853 on the earlier ground, +12%, as the drain is +11%. Rougher ground
+        // breaks the surface into more pieces; the generator's speed is not in it.)
         assert!(flown.frames_to_drain <= 5 * frames, "{flown:?}");
     }
 }
