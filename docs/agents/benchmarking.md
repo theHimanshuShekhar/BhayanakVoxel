@@ -1019,6 +1019,30 @@ pass is named by the string given to `Profiler::compute_pass`). `reference` has 
 its 3.0 ms (a sample, pass and total) catches a gross regression, set from the first real run on the
 4090, which measured a mean of 1.10 ms.
 
+## The look-dev shot list
+
+`bins/client/src/bench/lookdev.rs` (#148) is a recorded camera path for judging the art direction
+(#135) on the real 320 km Planet: eight shots modelled on Crystal Islands' (a forest floor, a canyon
+with haze, a dark descent, two crystal caves of different dominant hue, a sunlit cliff, a meadow and
+a pull-out to the Planet). It is not a `client bench` mode and no pass is timed on it. Each shot is
+its own short `CameraPath` (the places are kilometres apart: they are cuts), with the roll of the
+debug free camera where it tilts (`Q` and `E` roll it, `X` levels it), and names the places where
+hand-placed stamps go for what M1b has not built yet (crystals and vegetation). The shot list
+holds no stamp code.
+
+The places are found on the seeded Planet and recorded as numbers in `lookdev/shots.rs`. They are
+for one `GENERATOR_VERSION`, and a test fails when the generator moves on. To find them again:
+
+```
+RECORD_TO=$PWD/bins/client/src/bench/lookdev/shots.rs \
+  cargo test --release -p client --bin client -- --ignored record_the_look_dev_sites
+cargo fmt -p client
+```
+
+Two ignored tests, each a minute (the world map is 25 s), check the record against the generator:
+`the_recorded_places_are_the_ones_the_finder_picks` and `the_recorded_shots_are_where_they_say`
+(every camera is in the open, every stamp place is air against rock, a cave is under the ground).
+
 ## Tests
 
 The statistics, budget evaluation and exit status, camera path, argument parsing and report shape

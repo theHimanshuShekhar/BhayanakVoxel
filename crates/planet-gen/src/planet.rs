@@ -1023,6 +1023,13 @@ impl Planet {
         up.map(|u| u * radius)
     }
 
+    /// The tubes of the caves of the cubes in the box from `low` to `high` (see
+    /// [`Planet::cave_mouths`] for how big a box to ask for): the generator's own, for a camera
+    /// that goes into a cave and for the tests that check where one is.
+    pub fn cave_tubes(&self, low: [f64; 3], high: [f64; 3]) -> Vec<crate::Tube> {
+        self.caves.tubes_in(low, high)
+    }
+
     /// Points on the ground, in Voxels from the centre, where a cave opens to the surface: one
     /// for each tube of the caves of the cubes in the box from `low` to `high` that comes within
     /// four fifths of its radius of the ground from below, at the first such place along it. For a

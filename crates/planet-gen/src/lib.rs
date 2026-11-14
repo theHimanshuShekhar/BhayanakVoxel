@@ -26,6 +26,8 @@ mod detail;
 pub mod planet;
 pub mod world_map;
 
+pub use caves::Tube;
+
 /// Identifies the generation algorithm. Bump it whenever generated bricks change. 5 was the 320 km
 /// Planet of ADR 0008: a different world map, detail made per brick, caves made on demand, and
 /// the Planet's radius a value passed to the generator. 6 has continents of 30 to 60 km (a ball
