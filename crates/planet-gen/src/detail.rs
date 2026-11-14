@@ -9,8 +9,14 @@
 //! 3.2 m. Each octave's amplitude is [`AMPLITUDE`] of its cell, so the ground gets rougher at
 //! every scale alike (hills of 10 m on 205 m, rises of 0.2 m on 3 m). The three widest are
 //! *ridged* (`2|n| - 1`), which cuts a valley along each line where the noise is zero: the small
-//! valleys of the issue. The whole is scaled by [`factor`] of the map's height, so that the
-//! sea floor and the lowlands are gentle and the mountains rough, and is continuous everywhere.
+//! valleys of the issue. The whole is scaled by how rough the map says the ground is there, which
+//! is [`factor`] of the map's height (the sea floor and the lowlands are gentle, the mountains
+//! rough) times `0.35 + 0.65 * rough`, where the map's `rough` field is made from the slope
+//! (steeper is rougher), the biome (volcanic is jagged, desert smooth) and the drainage (calmer
+//! in a valley). And where much water drains (the map's `drainage` field) the ground is cut into
+//! a valley, up to [`VALLEY`] deep, which follows the drainage the way the map has it. All the
+//! fields are interpolated between texels like the elevation, so the ground is continuous
+//! everywhere, over the edges of the cube's faces too.
 //!
 //! A brick's Voxels of mip `level` are samples `size = 2^level` Voxels apart. An octave whose
 //! cell is under [`MIN_CELL`] samples is left out of them: it is under a Voxel's own amplitude,
@@ -21,7 +27,7 @@
 
 use brick_store::VOXELS_PER_METRE;
 
-use crate::world_map::ELEVATION_UNITS_PER_METRE;
+use crate::world_map::{ELEVATION_UNITS_PER_METRE, FieldRange, Fields};
 use crate::{Corners, value_noise};
 
 /// An octave: its cell in lattice points (10 cm, a power of two) and whether it is ridged.
@@ -56,14 +62,23 @@ const fn amplitude(o: Octave) -> f64 {
     o.cell as f64 * VOXELS_PER_POINT * AMPLITUDE
 }
 
-/// The most that the detail moves the ground, in Voxels: the amplitudes' sum, which is 20 m.
+/// How deep the ground is cut where the most water drains, in Voxels: 3 m.
+const VALLEY: f64 = 3.0 * VOXELS_PER_METRE;
+/// The drainage (of 1) from which the ground is cut, and where it is cut the whole `VALLEY`.
+const VALLEY_FROM: f64 = 0.25;
+const VALLEY_FULL: f64 = 0.75;
+/// The height above sea level, in Voxels, from which a valley is cut the whole way: 30 m. On the
+/// coast and under the sea there are none.
+const VALLEY_ABOVE: f64 = 30.0 * VOXELS_PER_METRE;
+
+/// The most that the detail moves the ground, in Voxels: the amplitudes' sum (20 m) and a valley.
 pub const REACH: f64 = {
     let (mut sum, mut k) = (0.0, 0);
     while k < OCTAVES.len() {
         sum += amplitude(OCTAVES[k]);
         k += 1;
     }
-    sum
+    sum + VALLEY
 };
 
 /// The fewest samples an octave's cell must be for a brick sampled `size` Voxels apart to have it.
@@ -78,6 +93,22 @@ const ROUGH_FROM: f64 = 600.0 * VOXELS_PER_METRE;
 /// `CALM` at and below sea level, rising to 1 at 600 m, never more.
 fn factor(elevation: f64) -> f64 {
     CALM + (1.0 - CALM) * (elevation / ROUGH_FROM).clamp(0.0, 1.0)
+}
+
+/// How much of the octaves' sum is kept where the map's fields are `elevation` Voxels and `rough`
+/// (of 1): `factor` of the height, and from 0.35 of that where the map says the ground is smooth
+/// to all of it where it is rough. Rises with both.
+fn scale(elevation: f64, rough: f64) -> f64 {
+    factor(elevation) * (0.35 + 0.65 * rough)
+}
+
+/// How far the ground is cut into a valley where the map's fields are `elevation` Voxels and
+/// `drainage` (of 1), in Voxels, never negative: none where little drains or the ground is near
+/// the sea, the whole `VALLEY` where much does and it is high. Rises with both.
+fn valley(elevation: f64, drainage: f64) -> f64 {
+    let wet = ((drainage - VALLEY_FROM) / (VALLEY_FULL - VALLEY_FROM)).clamp(0.0, 1.0);
+    let high = (elevation / VALLEY_ABOVE).clamp(0.0, 1.0);
+    VALLEY * wet * wet * (3.0 - 2.0 * wet) * high
 }
 
 /// Whether a brick sampled `size` Voxels apart has the octave.
@@ -165,15 +196,20 @@ impl Detail {
     }
 
     /// The detail, in Voxels, at `point`, `radius` from the centre (not zero), where the map's
-    /// elevation is `elevation` Voxels, in a brick sampled `size` Voxels apart.
+    /// fields are `fields`, in a brick sampled `size` Voxels apart.
     pub fn height(
         &self,
         point: [f64; 3],
         radius: f64,
-        elevation: f64,
+        fields: Fields,
         size: f64,
         cache: &mut Cache,
     ) -> f64 {
+        let Fields {
+            elevation,
+            rough,
+            drainage,
+        } = fields;
         let at = self.lattice(point, radius);
         let slot = (at[0].wrapping_mul(73_856_093)
             ^ at[1].wrapping_mul(19_349_663)
@@ -182,7 +218,7 @@ impl Detail {
         if let Some(Some((kept, total))) = cache.sums.get(slot)
             && *kept == at
         {
-            return total * factor(elevation);
+            return total * scale(elevation, rough) - valley(elevation, drainage);
         }
         let mut total = 0.0;
         for (k, (o, cached)) in OCTAVES.into_iter().zip(&mut cache.corners).enumerate() {
@@ -194,19 +230,25 @@ impl Detail {
         if let Some(kept) = cache.sums.get_mut(slot) {
             *kept = Some((at, total));
         }
-        total * factor(elevation)
+        total * scale(elevation, rough) - valley(elevation, drainage)
     }
 
     /// Bounds `(lowest, highest)` on [`Detail::height`] at every point in the box that has
     /// `corners` among its corners (the hull of them), for a brick sampled `size` Voxels apart,
-    /// where the map's elevation is within `elevation`.
-    pub fn bounds(&self, corners: &[[f64; 3]], size: f64, elevation: (f64, f64)) -> (f64, f64) {
-        let (calm, rough) = (factor(elevation.0), factor(elevation.1));
+    /// where the map's fields are within `fields`.
+    pub fn bounds(&self, corners: &[[f64; 3]], size: f64, fields: FieldRange) -> (f64, f64) {
+        // The scale and the valley both rise with each field, so their extremes are at the ends.
+        let calm = scale(fields.elevation.0, fields.rough.0);
+        let rough = scale(fields.elevation.1, fields.rough.1);
         let (lo, hi) = self.sum_bounds(corners, size);
         let extremes = [lo * calm, lo * rough, hi * calm, hi * rough];
+        let cut = (
+            valley(fields.elevation.0, fields.drainage.0),
+            valley(fields.elevation.1, fields.drainage.1),
+        );
         (
-            extremes.into_iter().fold(f64::INFINITY, f64::min) - SLACK,
-            extremes.into_iter().fold(f64::NEG_INFINITY, f64::max) + SLACK,
+            extremes.into_iter().fold(f64::INFINITY, f64::min) - cut.1 - SLACK,
+            extremes.into_iter().fold(f64::NEG_INFINITY, f64::max) - cut.0 + SLACK,
         )
     }
 
@@ -233,30 +275,17 @@ impl Detail {
         let span = (0..3)
             .map(|a| f64::from(high[a] - low[a]))
             .fold(0.0, f64::max);
-        let margin = 2 + (span * span / (8.0 * self.sea)).ceil() as i32;
-        // The box in lattice points, with room for the sphere's curve and the rounding: its middle
-        // and how far a point of it can be from the middle along each axis.
-        let middle = std::array::from_fn::<i32, 3, _>(|a| {
-            ((i64::from(low[a]) + i64::from(high[a])) / 2) as i32
-        });
-        let reach = std::array::from_fn::<i32, 3, _>(|a| {
-            (high[a] - middle[a]).max(middle[a] - low[a]) + margin
-        });
+        // The rounding of a point to its lattice point is monotone, so a point of the box is
+        // within the corners' lattice points but for the sphere's curve between them.
+        let margin = 1 + (span * span / (8.0 * self.sea)).ceil() as i32;
+        let low = low.map(|l| l - margin);
+        let high = high.map(|h| h + margin);
         let (mut lo, mut hi) = (0.0, 0.0);
         for (k, o) in OCTAVES.into_iter().enumerate() {
             if !has(o, size) {
                 continue;
             }
-            // The noise goes at most 3 / cell along an axis: the fade `3t² - 2t³` goes at most
-            // 1.5 as fast as `t`, the corners are within `[0, 1)` of each other, and the noise
-            // is twice that. So within `reach` of the middle on each axis it is within the sum of
-            // those of its value at the middle: tight for a box of a few lattice points in a cell
-            // of hundreds, and no tighter than the whole range for a big one.
-            let n = middle_noise(salt(self.seed, k), k, middle, o.cell);
-            let slope = reach.iter().map(|&r| f64::from(r)).sum::<f64>() * 3.0 / f64::from(o.cell)
-                * (1.0 + 1e-12)
-                + 1e-12;
-            let (n_lo, n_hi) = ((n - slope).max(-1.0), (n + slope).min(1.0));
+            let (n_lo, n_hi) = noise_range(salt(self.seed, k), k, low, high, o.cell);
             let (s_lo, s_hi) = shape_bounds(o, n_lo, n_hi);
             lo += amplitude(o) * s_lo;
             hi += amplitude(o) * s_hi;
@@ -273,6 +302,54 @@ impl Detail {
             .sum();
         (-sum, sum)
     }
+}
+
+/// The least and greatest of [`value_noise`] of octave `k` over the box of lattice points from
+/// `low` to `high`, exactly. In one lattice cell the noise is multilinear in the three faded
+/// fractions, which rise with the point, so over a box in the cell it is at its extremes at the
+/// box's corners; across the face between two cells it is so on each side, and the face is where
+/// the box is cut. So the extremes are at the corners of the box and where it is cut. A box
+/// across more than two cells along an axis is bounded by the whole range.
+fn noise_range(seed: u64, k: usize, low: [i32; 3], high: [i32; 3], cell: i32) -> (f64, f64) {
+    let shift = cell.trailing_zeros();
+    // The places along each axis: the ends, and the face between two cells if it is between them.
+    let mut places = [[0; 3]; 3];
+    let mut counts = [0; 3];
+    for a in 0..3 {
+        let (first, last) = (low[a] >> shift, high[a] >> shift);
+        if last - first > 1 {
+            return (-1.0, 1.0);
+        }
+        places[a][0] = low[a];
+        counts[a] = 1;
+        if last > first {
+            places[a][1] = last << shift;
+            counts[a] = 2;
+        }
+        places[a][counts[a]] = high[a];
+        counts[a] += 1;
+    }
+    let one_cell = (0..3).all(|a| low[a] >> shift == high[a] >> shift);
+    let mut local = [None; 8];
+    let (mut n_lo, mut n_hi) = (f64::INFINITY, f64::NEG_INFINITY);
+    for iz in 0..counts[2] {
+        for iy in 0..counts[1] {
+            for ix in 0..counts[0] {
+                let point = [places[0][ix], places[1][iy], places[2][iz]];
+                let n = if one_cell {
+                    middle_noise(seed, k, point, cell)
+                } else {
+                    // Two cells along an axis are told apart by the odd one.
+                    let slot =
+                        (0..3).fold(0, |slot, a| slot | ((point[a] >> shift) as usize & 1) << a);
+                    value_noise(seed, point, cell, &mut local[slot])
+                };
+                n_lo = n_lo.min(n);
+                n_hi = n_hi.max(n);
+            }
+        }
+    }
+    (n_lo, n_hi)
 }
 
 /// [`value_noise`] of octave `k` at `point`, for the bounds: the corners of the last cell are kept
@@ -302,8 +379,68 @@ mod tests {
     const SEA: i32 = 800_000;
 
     #[test]
-    fn the_amplitudes_sum_to_twenty_metres() {
-        assert!((REACH / VOXELS_PER_METRE - 20.32).abs() < 0.01, "{REACH}");
+    fn the_noise_range_over_a_box_holds_at_every_point_and_is_reached_at_its_corners() {
+        // Boxes in one cell and across the face between two, of cells of 32 lattice points.
+        for (low, high) in [
+            ([3, 5, 7], [9, 8, 11]),
+            ([28, 5, 7], [37, 8, 11]),
+            ([28, 29, 30], [35, 34, 33]),
+            ([-5, -3, -40], [4, 2, -30]),
+        ] {
+            let (lo, hi) = noise_range(9, 6, low, high, 32);
+            let (mut least, mut greatest) = (f64::INFINITY, f64::NEG_INFINITY);
+            for x in low[0]..=high[0] {
+                for y in low[1]..=high[1] {
+                    for z in low[2]..=high[2] {
+                        let n = value_noise(9, [x, y, z], 32, &mut None);
+                        least = least.min(n);
+                        greatest = greatest.max(n);
+                    }
+                }
+            }
+            assert!(lo <= least && greatest <= hi, "{low:?} {high:?}");
+            assert!(
+                least - lo < 1e-9 && hi - greatest < 1e-9,
+                "{low:?} {high:?}"
+            );
+        }
+        // A box across more cells than two is the whole range.
+        assert_eq!(noise_range(9, 6, [0, 0, 0], [100, 0, 0], 32), (-1.0, 1.0));
+    }
+
+    #[test]
+    fn the_amplitudes_sum_to_twenty_metres_and_the_valley_is_three_more() {
+        assert!((REACH / VOXELS_PER_METRE - 23.32).abs() < 0.01, "{REACH}");
+    }
+
+    #[test]
+    fn each_field_shapes_the_detail_the_way_it_is_said_to() {
+        let detail = Detail::new(5, SEA);
+        let at = [f64::from(SEA) + 1.0, 4_000.0, 9_000.0];
+        let radius = crate::distance(at);
+        let fields = |elevation, rough, drainage| Fields {
+            elevation,
+            rough,
+            drainage,
+        };
+        let h = |f: Fields| detail.height(at, radius, f, 1.0, &mut Cache::default());
+        // Rougher ground (from slope or biome) is moved more, either way; valleys do not move the
+        // noise but lower it.
+        let (smooth, rough) = (h(fields(30_000.0, 0.0, 0.0)), h(fields(30_000.0, 1.0, 0.0)));
+        assert!(
+            smooth.abs() <= rough.abs() + 1e-9 && smooth != rough,
+            "{smooth} {rough}"
+        );
+        // More drainage cuts deeper, to the whole valley and no more, and not at the sea.
+        let dry = h(fields(30_000.0, 0.5, 0.0));
+        let wet = h(fields(30_000.0, 0.5, 1.0));
+        assert!((dry - wet - VALLEY).abs() < 1e-9, "{dry} {wet}");
+        let little = h(fields(30_000.0, 0.5, 0.5));
+        assert!(wet < little && little < dry);
+        assert_eq!(h(fields(0.0, 0.5, 1.0)), h(fields(0.0, 0.5, 0.0)));
+        // Higher ground is rougher: the same noise, scaled up.
+        let (low, high) = (h(fields(0.0, 0.5, 0.0)), h(fields(30_000.0, 0.5, 0.0)));
+        assert!(low.abs() < high.abs(), "{low} {high}");
     }
 
     /// Points on the ground's sphere, and boxes of Voxels at them.
@@ -323,19 +460,35 @@ mod tests {
                 let corners: [[f64; 3]; 8] = std::array::from_fn(|i| {
                     std::array::from_fn(|a| centre[a] + if i >> a & 1 == 0 { 0.0 } else { width })
                 });
-                for elevation in [(-300.0, 100.0), (0.0, 5_000.0), (-200.0, -100.0)] {
-                    let (low, high) = detail.bounds(&corners, size, elevation);
+                for (elevation, rough, drainage) in [
+                    ((-300.0, 100.0), (0.0, 1.0), (0.0, 1.0)),
+                    ((0.0, 5_000.0), (0.2, 0.6), (0.3, 0.9)),
+                    ((-200.0, -100.0), (0.5, 0.5), (0.0, 0.0)),
+                    ((1_000.0, 3_000.0), (0.0, 1.0), (0.5, 0.5)),
+                ] {
+                    let range = FieldRange {
+                        elevation,
+                        rough,
+                        drainage,
+                    };
+                    let (low, high) = detail.bounds(&corners, size, range);
                     assert!(low <= high);
                     for k in 0..27 {
                         let at: [f64; 3] = std::array::from_fn(|a| {
                             centre[a] + width * f64::from(k / 3i32.pow(a as u32) % 3) / 2.0
                         });
                         let radius = crate::distance(at);
-                        for e in [elevation.0, elevation.1, (elevation.0 + elevation.1) / 2.0] {
-                            let h = detail.height(at, radius, e, size, &mut Cache::default());
+                        for t in [0.0, 0.5, 1.0] {
+                            let mix = |(a, b): (f64, f64)| a + (b - a) * t;
+                            let fields = Fields {
+                                elevation: mix(elevation),
+                                rough: mix(rough),
+                                drainage: mix(drainage),
+                            };
+                            let h = detail.height(at, radius, fields, size, &mut Cache::default());
                             assert!(
                                 (low..=high).contains(&h),
-                                "{n} {width} {elevation:?}: {low} {h} {high}"
+                                "{n} {width} {range:?}: {low} {h} {high}"
                             );
                         }
                     }
@@ -351,12 +504,18 @@ mod tests {
         let corners: [[f64; 3]; 8] = std::array::from_fn(|i| {
             std::array::from_fn(|a| centre[a] + if i >> a & 1 == 0 { 0.0 } else { 7.0 })
         });
-        let (low, high) = detail.bounds(&corners, 1.0, (10_000.0, 10_000.0));
+        let still = |elevation: f64, rough: f64, drainage: f64| FieldRange {
+            elevation: (elevation, elevation),
+            rough: (rough, rough),
+            drainage: (drainage, drainage),
+        };
+        let (low, high) = detail.bounds(&corners, 1.0, still(10_000.0, 1.0, 0.0));
         assert!(high - low < 30.0 * VOXELS_PER_METRE, "{low} {high}");
         let wide = [[0.0, 0.0, 1.0], [f64::from(SEA) * 2.0, 0.0, 1.0]];
-        let (low, high) = detail.bounds(&wide, 1.0, (50_000.0, 50_000.0));
+        let (low, high) = detail.bounds(&wide, 1.0, still(50_000.0, 1.0, 1.0));
+        // The octaves' sum up, less the valley that is there, and down with the valley too.
         assert!(
-            (high - REACH).abs() < 1e-3 && (low + REACH).abs() < 1e-3,
+            (high - (REACH - 2.0 * VALLEY)).abs() < 1e-3 && (low + REACH).abs() < 1e-3,
             "{low} {high} {REACH}"
         );
     }

@@ -540,7 +540,7 @@ fn with_a_slow_generator_the_character_stops_at_the_edge_of_the_ground_and_never
         pair.client.body_desyncs()
     );
     // 25 s of running is 175 m; it waited for the ground instead, and got some of the way.
-    assert!(stopped > 150, "stopped on {stopped} inputs");
+    assert!(stopped > 500, "stopped on {stopped} inputs");
     assert!((10.0..60.0).contains(&went), "went {went} m");
     assert_eq!(
         pair.server_state().position.map(f64::to_bits),
@@ -660,12 +660,10 @@ fn every_edit_200_m_from_the_spawn_is_the_same_on_the_client_and_the_server_and_
     let edited = pair.server.store().content_hash();
     assert_ne!(edited, pristine);
     assert_eq!(pair.client.store().content_hash(), edited);
-    // The Edits changed what is at the centre (the Planet's ground there, made of the map and its
-    // detail, is dug and filled in again, and what is left depends on the slope of it).
-    assert_ne!(
-        pair.client.store().voxel_at(0, centre),
-        planet().voxel(centre)
-    );
+    // What the Edits leave at the centre is the Material they place, not air (it was air on the
+    // smooth ground this was written on; the Edits are the same, the ground under their World-
+    // aligned shapes is not). The client and the server agree on it, which is the point.
+    assert_eq!(pair.client.store().voxel_at(0, centre), Some(Material(35)));
     assert!(read_alike(
         &pair.client.store(),
         pair.server.store(),

@@ -38,7 +38,8 @@ pub use crate::SOIL;
 use crate::caves::{self, Caves, Tube};
 use crate::detail::{self, Detail};
 use crate::world_map::{
-    Biome, ElevationCell, PEAK, SEA_LEVEL, TRENCH, Texel, WORLD_RADIUS, WorldMap, units, voxels,
+    Biome, ElevationCell, Fields, PEAK, SEA_LEVEL, TRENCH, Texel, WORLD_RADIUS, WorldMap, units,
+    voxels,
 };
 use crate::{Corners, distance, par_bricks};
 
@@ -351,11 +352,11 @@ impl GroundBounds {
         {
             return Some(material);
         }
-        let elevation = self
+        let fields = self
             .cell
-            .and_then(|cell| cell.elevation_at(point))
-            .unwrap_or_else(|| planet.map.elevation_at(point));
-        planet.ground_below(point, radius, elevation, size, cache, Some(self.biome))
+            .and_then(|cell| cell.fields_at(point))
+            .unwrap_or_else(|| planet.map.fields_at(point));
+        planet.ground_below(point, radius, fields, size, cache, Some(self.biome))
     }
 }
 
@@ -434,36 +435,37 @@ impl Planet {
     /// and as a float: the map's elevation there, bilinear between texel centres, and the detail
     /// that the generator adds to it. The Voxels it makes solid are those below it.
     pub fn ground_height(&self, point: [f64; 3]) -> f64 {
-        let elevation = self.map.elevation_at(point);
-        elevation
+        let fields = self.map.fields_at(point);
+        fields.elevation
             + self.detail_at(
                 point,
                 distance(point),
-                elevation,
+                fields,
                 1.0,
                 &mut detail::Cache::default(),
             )
     }
 
-    /// The detail at `point`, `radius` from the centre, where the map's elevation is `elevation`,
-    /// in a brick sampled `size` Voxels apart.
+    /// The detail at `point`, `radius` from the centre, where the map's fields are `fields`, in a
+    /// brick sampled `size` Voxels apart.
     fn detail_at(
         &self,
         point: [f64; 3],
         radius: f64,
-        elevation: f64,
+        fields: Fields,
         size: f64,
         cache: &mut detail::Cache,
     ) -> f64 {
-        self.detail.height(point, radius, elevation, size, cache)
+        self.detail.height(point, radius, fields, size, cache)
     }
 
     /// Bounds `(lowest, highest)` on [`Planet::ground_height`] over every point in the hull of
     /// `corners`, for a brick sampled `size` Voxels apart: the map's bounds (see
     /// [`WorldMap::elevation_range`]) and the detail's.
     fn ground_range(&self, corners: &[[f64; 3]], size: f64) -> (f64, f64) {
-        let (low, high) = self.map.elevation_range(corners);
-        let (below, above) = self.detail.bounds(corners, size, (low, high));
+        let fields = self.map.field_range(corners);
+        let (low, high) = fields.elevation;
+        let (below, above) = self.detail.bounds(corners, size, fields);
         (low + below, high + above)
     }
 
@@ -508,8 +510,9 @@ impl Planet {
         }
         let radius = distance(point);
         let size = 2.0 * half + 1.0;
-        let map = self.map.elevation_at(point);
-        let height = map + self.detail_at(point, radius, map, size, &mut detail::Cache::default());
+        let fields = self.map.fields_at(point);
+        let height = fields.elevation
+            + self.detail_at(point, radius, fields, size, &mut detail::Cache::default());
         let depth = self.shape.sea + height - radius;
         height >= f64::from(SEA_LEVEL) && depth > 0.0 && depth < caves::MAX_DEPTH
     }
@@ -543,8 +546,8 @@ impl Planet {
         if let Some(material) = self.shape.interior(radius) {
             return Some(material);
         }
-        let elevation = self.map.elevation_at(point);
-        self.ground_below(point, radius, elevation, size, cache, None)
+        let fields = self.map.fields_at(point);
+        self.ground_below(point, radius, fields, size, cache, None)
     }
 
     /// [`Planet::ground_at`] outside the interior, where the map's elevation is `elevation`, and
@@ -553,13 +556,13 @@ impl Planet {
         &self,
         point: [f64; 3],
         radius: f64,
-        elevation: f64,
+        fields: Fields,
         size: f64,
         cache: &mut detail::Cache,
         biome: Option<Biome>,
     ) -> Option<Material> {
         let sea = self.shape.sea;
-        let height = elevation + self.detail_at(point, radius, elevation, size, cache);
+        let height = fields.elevation + self.detail_at(point, radius, fields, size, cache);
         let depth = sea + height - radius;
         let biome = || biome.unwrap_or_else(|| self.map.sample(point).biome);
         if depth <= 0.0 {
@@ -882,9 +885,9 @@ impl Planet {
         if radius == 0.0 {
             return None;
         }
-        let elevation = self.map.elevation_at(point);
+        let fields = self.map.fields_at(point);
         let sea = self.shape.sea;
-        let ground = sea + elevation + self.detail_at(point, radius, elevation, size, cache);
+        let ground = sea + fields.elevation + self.detail_at(point, radius, fields, size, cache);
         if ground <= radius {
             return None;
         }
@@ -1471,11 +1474,12 @@ mod tests {
             assert_eq!(strata.last().unwrap().0, STRATA_DEPTH);
         }
         // Nothing the world map decides is inside the interior.
-        // The test Planet's: 40 km, less the 1 km trench, the detail's 407 Voxels and the strata.
-        assert_eq!(planet().interior_radius(), 800_000 - 20_000 - 407 - 960);
+        // The test Planet's: 40 km, less the 1 km trench, the detail's 467 Voxels (the octaves'
+        // 20.32 m and the valleys' 3 m) and the strata.
+        assert_eq!(planet().interior_radius(), 800_000 - 20_000 - 467 - 960);
         assert_eq!(
             interior_radius(WORLD_RADIUS),
-            6_400_000 - 20_000 - 407 - 960
+            6_400_000 - 20_000 - 467 - 960
         );
         assert_eq!(planet().molten_radius(), 160_000);
         assert!(planet().molten_radius() < planet().interior_radius());
@@ -1925,7 +1929,7 @@ mod tests {
     /// by the tests below) with a margin. The ground is not a boundary between layers that a
     /// Voxel can sit on either side of with the same majority, so the fraction grows with the
     /// Voxel's size, from under 1% at 10 cm to about 4% at 12.8 m.
-    const TOLERANCE: [f64; 7] = [0.010, 0.019, 0.023, 0.032, 0.033, 0.040, 0.050];
+    const TOLERANCE: [f64; 7] = [0.010, 0.015, 0.015, 0.022, 0.023, 0.040, 0.050];
 
     /// The fraction of the Voxels of the coarse bricks of mip `level` that hold ground that
     /// differ between [`Planet::coarse_brick`] and [`downsampled`]. Takes 8 times as long for
@@ -2068,7 +2072,7 @@ mod tests {
     /// was 9% to 48% from level 4 to level 12, and 13% at level 15, where the Voxel's middle is
     /// in the deep rock.
     const EXPOSED_TOLERANCE: [f64; 15] = [
-        0.011, 0.005, 0.005, 0.038, 0.066, 0.036, 0.051, 0.074, 0.075, 0.099, 0.141, 0.141, 0.155,
+        0.005, 0.005, 0.005, 0.038, 0.066, 0.036, 0.031, 0.030, 0.059, 0.099, 0.141, 0.141, 0.155,
         0.191, 0.277,
     ];
 
@@ -2227,7 +2231,7 @@ mod tests {
             (temperate, GRASSY_SOIL, 11),
             (snow, SNOW, 11),
             (desert, SAND, 7),
-            (volcanic, BASALT, 9),
+            (volcanic, BASALT, 6),
         ] {
             for level in 1..=levels {
                 assert_eq!(
@@ -2768,4 +2772,50 @@ mod tests {
     }
 
     mod cave_tests;
+
+    /// The bounds on the ground over a brick (what the shortcuts of `generate` rest on) hold at
+    /// every Voxel of it, and are not far from what the Voxels have: the detail's bounds are the
+    /// noise's extremes over the box, from its corners, and not a Lipschitz bound at its middle,
+    /// which was ten Voxels loose each way, so that most bricks near the ground had to be worked
+    /// out Voxel by Voxel.
+    #[test]
+    fn the_bounds_on_the_ground_over_a_brick_hold_and_are_tight() {
+        let spawn = planet().spawn(SPAWN_REACH);
+        let up = spawn.map(|c| c / distance(spawn));
+        let axis = (0..3)
+            .max_by(|&a, &b| up[a].abs().total_cmp(&up[b].abs()))
+            .unwrap();
+        let sign = if up[axis] < 0.0 { -1 } else { 1 };
+        let centre = spawn.map(|c| (c / 8.0).floor() as i32);
+        let (mut bricks, mut loose) = (0, 0.0);
+        for dx in -12..12 {
+            for dy in -12..12 {
+                for dz in -8..8 {
+                    let mut c = centre;
+                    c[axis] += dz * sign;
+                    c[(axis + 1) % 3] += dx;
+                    c[(axis + 2) % 3] += dy;
+                    let samples = Samples::new(0, BrickCoord(c));
+                    let corners: [[f64; 3]; 8] =
+                        std::array::from_fn(|i| samples.corner([i & 1, i >> 1 & 1, i >> 2]));
+                    let (low, high) = planet().ground_range(&corners, 1.0);
+                    let heights = (0..512).map(|k| {
+                        let local = [k & 7, k >> 3 & 7, k >> 6 & 7].map(|v| v as u8);
+                        planet().ground_height(samples.at(local))
+                    });
+                    let (mut lowest, mut highest) = (f64::MAX, f64::MIN);
+                    for h in heights {
+                        assert!(low <= h && h <= high, "{c:?}: {h} not in {low}..{high}");
+                        lowest = lowest.min(h);
+                        highest = highest.max(h);
+                    }
+                    loose += (lowest - low) + (high - highest);
+                    bricks += 1;
+                }
+            }
+        }
+        // Measured: 2.6 Voxels in all, at both ends of a brick, of its 512 Voxels' heights.
+        let mean = loose / f64::from(bricks);
+        assert!(mean < 6.0, "{mean} Voxels loose in all");
+    }
 }

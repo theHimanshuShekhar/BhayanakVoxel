@@ -454,7 +454,7 @@ fn coarse_bricks_with_caves(level: usize, step: usize, most: usize) -> Vec<Brick
 /// by the test below) with a margin. A tube of 1 to 7 m is a few Voxels wide at level 1, and
 /// less than one at level 4, where the pyramid drops it unless it is a chamber; the sample at
 /// the middle of a Voxel and the majority of its children's differ at the walls.
-const CAVE_TOLERANCE: [f64; 4] = [0.008, 0.030, 0.026, 0.040];
+const CAVE_TOLERANCE: [f64; 4] = [0.008, 0.030, 0.026, 0.025];
 
 #[test]
 fn a_coarse_brick_with_caves_is_the_planets_downsampled_but_for_a_few_voxels() {
@@ -613,7 +613,7 @@ fn the_spawn_moves_to_clear_ground_when_the_first_spot_is_by_a_cave() {
         // It is still land with some relief to it of at most 40 m, if not temperate.
         assert!(planet.ground_height(spawn) >= 0.0);
         let (low, high) = planet.heights_near(spawn, REACH);
-        assert!(high - low <= GENTLE + 2.0 * detail::REACH, "seed {seed}");
+        assert!(high - low <= GENTLE, "seed {seed}");
     }
     assert!(moved > 0, "no seed of 60 has a cave at its first spot");
 }

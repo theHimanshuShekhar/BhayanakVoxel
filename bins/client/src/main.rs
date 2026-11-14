@@ -160,12 +160,13 @@ const BRICKS_PER_D0_SQUARED: f64 = 3.25;
 /// Planet's did.
 ///
 /// #166 (the ground has its detail added at generation, so more of a Ring's bricks are mixed):
-/// the test Planet measures 43.28 words a brick, 8.8% over the 39.78 it measured before, which was
-/// over the limit of 42.75. The constant is raised by that ratio, 34.2 to 37.3 (limit 46.6), as an
+/// the test Planet measures 43.77 words a brick, 10% over the 39.78 it measured before, which was
+/// over the limit of 42.75. The constant is raised by that ratio, 34.2 to 37.7 (limit 47.1), as an
 /// estimate for the 320 km Planet until the full-size run measures it there (#162, on the 4090,
-/// `needs-stream-bench`; #167 sizes the scene for 320 km).
+/// `needs-stream-bench`; #167 sizes the scene for 320 km). It follows from the terrain (a count of
+/// words, not a time), not from the cost of making a brick.
 const REFS_PER_BRICK: f64 = 1.0;
-const WORDS_PER_BRICK: f64 = 37.3;
+const WORDS_PER_BRICK: f64 = 37.7;
 
 /// What the tables that hold the Planet are made roomy for at the start, for the full bands at a
 /// bias of 1: the most each held in the measurement of [`BRICKS_PER_D0_SQUARED`], with

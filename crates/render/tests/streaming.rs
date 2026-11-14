@@ -263,7 +263,10 @@ fn compare(scene: &Scene, oracle: &Scene, camera: &Camera, label: &str) -> (usiz
 #[test]
 fn the_horizon_has_no_sky_gaps_right_after_spawn() {
     let store = spawned_store();
-    let camera = camera_at(0.0);
+    // 25 m from the Spawn: from the Spawn itself, on this Planet's ground (with its detail), the
+    // ground within the ring hides all that is beyond it, so no ray ends in a stand-in and the
+    // test would have nothing to compare.
+    let camera = camera_at(500.0);
     let scene = Scene::rings(&store, camera.position, bands(), bound()).unwrap();
     let oracle_store = oracle_store();
     let oracle = Scene::rings(&oracle_store, camera.position, bands(), bound()).unwrap();
@@ -278,7 +281,9 @@ fn the_horizon_has_no_sky_gaps_right_after_spawn() {
         .filter(|hit| f64::from(hit.t) > 100.0 * VOXELS_PER_METRE)
         .count();
     assert!(far >= 10, "{far} rays reach a hundred metres");
-    assert!(hits >= 120, "{hits} rays hit the ground");
+    // (113 on the 40 km Planet: the Spawn of its ground, which has its detail, has hills in some
+    // of the fan; the smooth sphere had 120 or more.)
+    assert!(hits >= 100, "{hits} rays hit the ground");
     assert!(coarser > 0, "{coarser} of {hits} are stand-ins");
 }
 
@@ -314,9 +319,7 @@ fn walking_at_5_m_per_s_while_the_loader_keeps_up_a_little_at_a_time_leaves_no_h
         }
     }
     assert!(checks == 12 && hits > 1000, "{checks} checks, {hits} hits");
-    // (381 of the 480 frames' 12 checks on the 40 km Planet's ground, which has its detail: fewer
-    // of the rays meet the ground than on the smooth one.)
-    assert!(compared > 300, "{compared} rays compared with the Planet");
+    assert!(compared > 400, "{compared} rays compared with the Planet");
     // The loader is slow enough that some of the rays are on a stand-in, and fast enough that
     // not all of them are.
     assert!(coarser > 0 && coarser < hits, "{coarser} of {hits}");
@@ -465,6 +468,7 @@ fn flying_at_20_m_per_s_leaves_no_hole_in_the_ground_ahead_of_the_camera() {
             checked += not_deeper_than_the_planet(&scene, &rays, &format!("frame {frame}"));
         }
     }
-    // (1 376 on the 40 km Planet, whose ground is rougher than the smooth one it had.)
+    // (1 111 on the 40 km Planet's ground: the terrain around the Spawn has fewer rays reaching it
+    // than the smooth sphere's 1 500+.)
     assert!(checked > 1000, "{checked} rays compared with the Planet");
 }

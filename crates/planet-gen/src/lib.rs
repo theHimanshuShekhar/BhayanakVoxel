@@ -26,10 +26,12 @@ mod detail;
 pub mod planet;
 pub mod world_map;
 
-/// Identifies the generation algorithm. Bump it whenever generated bricks change. 5 is the 320 km
+/// Identifies the generation algorithm. Bump it whenever generated bricks change. 5 was the 320 km
 /// Planet of ADR 0008: a different world map, detail made per brick, caves made on demand, and
-/// the Planet's radius a value passed to the generator.
-pub const GENERATOR_VERSION: u32 = 5;
+/// the Planet's radius a value passed to the generator. 6 has continents of 30 to 60 km (a ball
+/// to a 52 km cell) and the detail shaped by the map's slope, biome and drainage as well as its
+/// height.
+pub const GENERATOR_VERSION: u32 = 6;
 
 /// Mean radius of the test Planet in Voxels: 75 m at 5 cm Voxels, so 150 m across.
 pub const PLANET_RADIUS: i32 = 1500;

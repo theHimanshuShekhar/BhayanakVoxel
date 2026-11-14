@@ -5,7 +5,7 @@
 //! places.
 
 use brick_store::{VOXELS_PER_METRE, VoxelCoord};
-use planet_gen::planet::{Planet, WATER};
+use planet_gen::planet::{ICE, Planet, WATER};
 use planet_gen::world_map::{SEA_LEVEL, TEST_RADIUS, WORLD_RADIUS, WorldMap};
 use std::sync::OnceLock;
 
@@ -63,7 +63,11 @@ fn the_sea_is_at_sea_level_and_the_ground_is_where_the_height_says() {
         // A few Voxels' margin: a point is rounded to a Voxel, which moves it off the line.
         if ground < -3.0 {
             oceans += 1;
-            assert_eq!(at(-2.0), Some(WATER), "{place:?}");
+            // Water, or the sea ice over it at the poles.
+            assert!(
+                matches!(at(-2.0), Some(m) if m == WATER || m == ICE),
+                "{place:?}"
+            );
             assert_eq!(at(3.0), None, "{place:?}");
             assert!(at(ground - 3.0).is_some_and(|m| m != WATER), "{place:?}");
         } else if ground > 3.0 {
@@ -199,19 +203,43 @@ fn land_masses(map: &WorldMap) -> Vec<f64> {
     areas
 }
 
-/// How many separate continents the Planet has at least: land masses of 1,000 km² or more (30 km
-/// across, the least of ADR 0008's 30 to 60 km). Measured on the full 2048 map of this seed: 20,
-/// and 17 to 29 on the 256 map of each of 12 other seeds.
-const CONTINENTS: usize = 15;
+/// The diameter, in km, of the circle of the same area as a land mass of `area` km².
+fn equivalent_diameter(area: f64) -> f64 {
+    2.0 * (area / std::f64::consts::PI).sqrt()
+}
+
+/// How many separate continents the Planet has at least: land masses of 707 km² or more, which
+/// are 30 km across or more as circles (the least of ADR 0008's 30 to 60 km). Measured on the full
+/// 2048 map of this seed: 77, of a median 51 km across, 46 of them 30 to 60 km; and 86 to 118 on
+/// the 256 map of this seed and each of 11 others (median 49 to 58 km), so 70 is held.
+const CONTINENTS: usize = 70;
+
+/// The median equivalent diameter of those continents, in km: 49 to 58 measured at both sizes of
+/// map, and ADR 0008 says "about 30 to 60 km".
+const MEDIAN_DIAMETER_KM: std::ops::RangeInclusive<f64> = 40.0..=65.0;
 
 #[test]
-fn there_are_many_separate_continents() {
+fn there_are_many_separate_continents_30_to_60_km_across() {
     let areas = land_masses(planet().map());
-    let continents = areas.iter().filter(|&&a| a >= 1_000.0).count();
-    assert!(continents >= CONTINENTS, "{continents}: {areas:?}");
-    // About half of the Planet's 1.29 million km² is land.
+    let mut diameters: Vec<f64> = areas
+        .iter()
+        .filter(|&&a| equivalent_diameter(a) >= 30.0)
+        .map(|&a| equivalent_diameter(a))
+        .collect();
+    diameters.sort_by(f64::total_cmp);
+    assert!(
+        diameters.len() >= CONTINENTS,
+        "{}: {areas:?}",
+        diameters.len()
+    );
+    let median = diameters[diameters.len() / 2];
+    assert!(MEDIAN_DIAMETER_KM.contains(&median), "{median} km");
+    // No land mass is a supercontinent: the largest is a fifth of the land at most (measured 12%
+    // of this map at 256 and 22% at 2048, where the least of the others are told apart).
     let land: f64 = areas.iter().sum();
-    assert!((500_000.0..=800_000.0).contains(&land), "{land} km²");
+    assert!(areas[0] <= 0.3 * land, "{} of {land} km²", areas[0]);
+    // About half of the Planet's 1.29 million km² is land: the ocean share is 54%.
+    assert!((500_000.0..=700_000.0).contains(&land), "{land} km²");
 }
 
 #[test]
