@@ -677,16 +677,16 @@ mod tests {
             material: Material(material),
             ..EditOp::dig_sphere(VoxelCoord([0; 3]), 3)
         };
-        // 1 is rock and 55 the last light, both in the table; 0 and 56 are not.
+        // 1 is rock and 63 the last crystal (the prototype's), both in the table; 0 and 64 are not.
         for mode in [EditMode::Place, EditMode::Flatten] {
             assert_eq!(validate(&place(mode, 1)), Ok(()));
-            assert_eq!(validate(&place(mode, 55)), Ok(()));
+            assert_eq!(validate(&place(mode, 63)), Ok(()));
             assert_eq!(
                 validate(&place(mode, 0)),
                 Err(RejectReason::UnknownMaterial)
             );
             assert_eq!(
-                validate(&place(mode, 56)),
+                validate(&place(mode, 64)),
                 Err(RejectReason::UnknownMaterial)
             );
         }
