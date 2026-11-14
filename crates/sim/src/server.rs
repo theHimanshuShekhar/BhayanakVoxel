@@ -752,8 +752,8 @@ mod tests {
         assert_eq!(edits_heard(&b).len(), 1);
     }
 
-    #[test]
-    fn on_its_own_thread_it_ticks_at_about_60_hz_and_answers() {
+    /// A server on its own thread, and a client that has stood and dug and heard the answer.
+    fn a_server_thread_that_has_answered() -> (ServerHandle, ClientEnd) {
         let (client, end) = loopback();
         let handle = spawn(
             || Server::new(stone_store(), [0.0; 3]).without_dig_timing(),
@@ -766,7 +766,8 @@ mod tests {
             match client.try_recv() {
                 Ok(ServerMessage::Body { .. }) => {}
                 Ok(reply) => break reply,
-                Err(TryRecvError::Empty) if started.elapsed() < Duration::from_secs(5) => {
+                // Only a guard against a hang: how long the answer takes is not what is checked.
+                Err(TryRecvError::Empty) if started.elapsed() < Duration::from_secs(60) => {
                     std::thread::sleep(Duration::from_millis(1));
                 }
                 Err(err) => panic!("no reply: {err:?}"),
@@ -780,13 +781,41 @@ mod tests {
                 ..
             }
         ));
+        (handle, client)
+    }
+
+    /// The thread keeps ticking, and answers: counted, not timed (#193). Its pace is the
+    /// `FixedTimestep`'s, tested with a clock of the test's own above, and the rate on the
+    /// machine's clock is in the next test.
+    #[test]
+    fn on_its_own_thread_it_ticks_on_and_answers() {
+        let (handle, _client) = a_server_thread_that_has_answered();
         let first = handle.ticks();
-        std::thread::sleep(Duration::from_millis(500));
-        // 30 ticks expected; the bounds leave room for a loaded CI machine.
-        let ran = handle.ticks() - first;
-        assert!((15..=45).contains(&ran), "{ran} ticks in half a second");
+        // A hang guard of a minute, not a rate: a busy machine only makes this take longer.
+        let started = Instant::now();
+        while handle.ticks() < first + 5 {
+            assert!(
+                started.elapsed() < Duration::from_secs(60),
+                "the thread stopped ticking"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
         let server = handle.stop();
         assert_eq!(server.store().get(VoxelCoord([3, 3, 3])), None);
+    }
+
+    /// The thread's rate on the machine's clock, which a loaded machine misses: it does not gate
+    /// (#193). The `real-thread-tests` job runs it (`--ignored`).
+    #[test]
+    #[ignore = "a wall-clock limit: run by the real-thread-tests job (#193)"]
+    fn on_its_own_thread_it_ticks_at_about_60_hz_and_answers() {
+        let (handle, _client) = a_server_thread_that_has_answered();
+        let first = handle.ticks();
+        std::thread::sleep(Duration::from_millis(500));
+        // 30 ticks expected; the bounds leave room for a busy machine.
+        let ran = handle.ticks() - first;
+        assert!((15..=45).contains(&ran), "{ran} ticks in half a second");
+        handle.stop();
     }
 
     /// The kinds of Edit, one request each, as the server answers them in one tick.
