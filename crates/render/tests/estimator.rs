@@ -91,10 +91,10 @@ fn mean_and_error(accumulation: &[f32]) -> (f64, f64) {
 
 /// What the closed box's image comes to after `samples` samples, with `fault`: the mean and its
 /// standard error, in units of the exact answer.
-fn box_estimate(albedo: f32, fault: Fault, samples: u32) -> (f64, f64) {
+fn box_estimate(albedo: f32, fault: Fault, size: u32, samples: u32) -> (f64, f64) {
     let emission = 1.0 - albedo; // so that the exact answer is 1
     let mut offscreen = Offscreen::with_materials(
-        Resolution::native(SIZE, SIZE),
+        Resolution::native(size, size),
         &closed_box(),
         &table(albedo, emission, 1.0, 0.0),
     )
@@ -113,33 +113,56 @@ fn box_estimate(albedo: f32, fault: Fault, samples: u32) -> (f64, f64) {
     mean_and_error(&offscreen.read_accumulation())
 }
 
-/// The relative bound on the light that the depth cap leaves out (ADR 0005's bias ledger): at
-/// most `albedo^256` of the answer.
+/// The light that the depth cap leaves out (ADR 0005's bias ledger): `albedo^256` of the answer.
 fn ledger_bound(albedo: f32) -> f64 {
     f64::from(albedo).powi(256)
 }
 
+/// What the box comes to with the cap, in units of the exact answer L / (1 - albedo): a path
+/// collects L at each of its (at most 256) surfaces, which is L (1 - albedo^256) / (1 - albedo).
+fn answer_at_the_cap(albedo: f32) -> f64 {
+    1.0 - ledger_bound(albedo)
+}
+
+/// The image of the precise test: 64 by 64 pixels and 256 samples. At 0.98 the pixels' standard
+/// error is about 0.09 %, so five of them are 0.46 %: under the ledger's 0.57 % and well under
+/// ADR 0005's 1 % rule, so a bias of 2 % (a depth cap of 190, say) cannot pass.
+const PRECISE_SIZE: u32 = 64;
 const SAMPLES: u32 = 256;
 
+/// The precise test: the box comes to L / (1 - albedo), less the light the cap leaves out, within
+/// five standard errors, which are themselves under the ledger's 0.57 %.
+fn the_box_comes_to_its_answer(albedo: f32) {
+    let started = std::time::Instant::now();
+    let (mean, error) = box_estimate(albedo, Fault::None, PRECISE_SIZE, SAMPLES);
+    // The exact answer is 1 in these units (L = 1 - albedo, so L / (1 - albedo) = 1); with the cap
+    // it is 1 - albedo^256, which the estimate is off from by noise only, measured from the
+    // pixels.
+    let expected = answer_at_the_cap(albedo);
+    eprintln!(
+        "albedo {albedo}: {mean:.5} of the answer, expected {expected:.5} with the cap, error \
+         {error:.5} ({:.1} s)",
+        started.elapsed().as_secs_f64()
+    );
+    assert!(
+        5.0 * error < 0.0057,
+        "albedo {albedo}: the test's own precision, five errors = {}, is above the 0.57 % bound",
+        5.0 * error
+    );
+    assert!(
+        (mean - expected).abs() < 5.0 * error,
+        "albedo {albedo}: the box comes to {mean} of its answer, expected {expected} (error {error})"
+    );
+}
+
 #[test]
-fn a_closed_box_that_emits_light_comes_to_l_over_one_minus_albedo_at_0_9_and_0_98() {
-    for albedo in [0.9, 0.98] {
-        let started = std::time::Instant::now();
-        let (mean, error) = box_estimate(albedo, Fault::None, SAMPLES);
-        // The exact answer is 1 in these units (L = 1 - albedo, so L / (1 - albedo) = 1). The
-        // estimate may be short of it by the ledger's bound, and is off by noise, which is
-        // measured from the pixels: five standard errors.
-        let bound = ledger_bound(albedo);
-        eprintln!(
-            "albedo {albedo}: {mean:.5} of the answer, error {error:.5}, ledger bound {bound:.5} \
-             ({:.1} s)",
-            started.elapsed().as_secs_f64()
-        );
-        assert!(
-            mean <= 1.0 + 5.0 * error && mean >= 1.0 - bound - 5.0 * error,
-            "albedo {albedo}: the box comes to {mean} of its answer (error {error}, ledger bound {bound})"
-        );
-    }
+fn a_closed_box_that_emits_light_comes_to_l_over_one_minus_albedo_at_0_9() {
+    the_box_comes_to_its_answer(0.9);
+}
+
+#[test]
+fn a_closed_box_that_emits_light_comes_to_l_over_one_minus_albedo_at_0_98() {
+    the_box_comes_to_its_answer(0.98);
 }
 
 #[test]
@@ -147,11 +170,10 @@ fn the_closed_box_fails_with_the_4_bounce_cut_put_back() {
     // The estimator that ADR 0005 replaced stops after five surfaces: at albedo 0.9 it leaves out
     // 0.9^5 = 59 % of the light, at 0.98 90 %. The test above cannot pass with it.
     for (albedo, loses) in [(0.9f32, 0.59f64), (0.98, 0.904)] {
-        let (mean, error) = box_estimate(albedo, Fault::FourBounceCut, 16);
+        let (mean, error) = box_estimate(albedo, Fault::FourBounceCut, SIZE, 16);
         eprintln!("albedo {albedo}, 4-bounce cut: {mean:.4} of the answer (error {error:.4})");
-        let bound = ledger_bound(albedo);
         assert!(
-            mean < 1.0 - bound - 5.0 * error,
+            mean < answer_at_the_cap(albedo) - 5.0 * error,
             "the cut was not caught at albedo {albedo}: {mean}"
         );
         assert!(
@@ -162,14 +184,28 @@ fn the_closed_box_fails_with_the_4_bounce_cut_put_back() {
 }
 
 #[test]
+fn the_closed_box_fails_with_a_depth_cap_of_190_instead_of_256() {
+    // The cap at 190 leaves out 0.98^190 = 2.2 % of the light at albedo 0.98: more than ADR
+    // 0005's 1 % rule, and what the precise test above must see.
+    let albedo = 0.98f32;
+    let (mean, error) = box_estimate(albedo, Fault::ShortCap, PRECISE_SIZE, SAMPLES);
+    let expected = answer_at_the_cap(albedo);
+    eprintln!("albedo {albedo}, cap of 190: {mean:.5} of the answer (error {error:.5})");
+    assert!(
+        (mean - expected).abs() > 5.0 * error,
+        "a cap of 190 was not caught: {mean}, expected {expected} (error {error})"
+    );
+}
+
+#[test]
 fn the_closed_box_fails_with_the_roulettes_rescale_dropped() {
     // A path that goes on is not counted for more, so each roulette takes a share of the light
     // away: the box comes out dark at both albedos.
     for albedo in [0.9f32, 0.98] {
-        let (mean, error) = box_estimate(albedo, Fault::NoRescale, 64);
+        let (mean, error) = box_estimate(albedo, Fault::NoRescale, SIZE, 64);
         eprintln!("albedo {albedo}, no rescale: {mean:.4} of the answer (error {error:.4})");
         assert!(
-            mean < 1.0 - ledger_bound(albedo) - 5.0 * error,
+            mean < answer_at_the_cap(albedo) - 5.0 * error,
             "a dropped rescale was not caught at albedo {albedo}: {mean}"
         );
         assert!(mean < 0.9, "albedo {albedo}: {mean}");

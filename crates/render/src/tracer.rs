@@ -114,6 +114,8 @@ pub enum Fault {
     FourBounceCut,
     /// The roulette without the rescale of the paths that go on.
     NoRescale,
+    /// A depth cap of 190 surfaces in place of 256.
+    ShortCap,
 }
 
 impl ReferenceOptions {
@@ -128,6 +130,7 @@ impl ReferenceOptions {
                     Fault::None => 0.0,
                     Fault::FourBounceCut => 1.0,
                     Fault::NoRescale => 2.0,
+                    Fault::ShortCap => 3.0,
                 },
             ),
         ]
@@ -302,7 +305,6 @@ pub struct Tracer {
     accumulator: Accumulator<View>,
     /// The reference's random seed: [`RNG_SEED`] unless [`Tracer::set_seed`] changed it.
     seed: u32,
-    options: ReferenceOptions,
     debug_view: DebugView,
     /// Bytes of the Planet that have been written to the GPU, creating its buffers included.
     uploaded: u64,
@@ -748,7 +750,6 @@ impl Tracer {
             history: History::default(),
             accumulator: Accumulator::new(),
             seed: RNG_SEED,
-            options: ReferenceOptions::default(),
             debug_view: DebugView::default(),
             uploaded: scene_bytes,
             last_writes: 0,
@@ -1050,7 +1051,6 @@ impl Tracer {
             &self.scene_layout,
             &options.constants(),
         );
-        self.options = options;
         self.accumulator.reset();
     }
 

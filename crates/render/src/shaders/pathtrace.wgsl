@@ -16,9 +16,11 @@
 // without the chance (Russian roulette, Arvo and Kirk 1990; PBRT 4, section 13.4). The brightest
 // channel, not the luminance, so that no channel is scaled down. The one approximation is the
 // depth cap, MAX_DEPTH: a path that is still going after that many surfaces stops. Among
-// Materials with albedo 1 a path would never end otherwise. The cap leaves out at most
-// albedo^MAX_DEPTH of the light, 0.57 % in snow (albedo 0.98) and nothing measurable elsewhere:
-// ADR 0005's bias ledger, held by the closed-box test.
+// Materials with albedo 1 a path would never end otherwise. No colour is above 1 in any channel
+// (`varied_albedo` clamps it), so the cap leaves out at most albedo^MAX_DEPTH of the light:
+// 0.57 % in snow (albedo 0.98), nothing measurable for the darker Materials, and for albedo 1,
+// whatever part of the light is still bouncing after 256 surfaces (ADR 0005's bias ledger, held
+// by the closed-box test).
 //
 // NOTHING IS CLAMPED, FILTERED OR REJECTED. Not a bright sample, not a sample that is not a
 // number, not a firefly: each one would remove light that the estimate has to add up, and no
@@ -57,6 +59,9 @@ const FAULT_FOUR_BOUNCE_CUT = 1u;
 const FAULT_CUT_SURFACES = 5u;
 // The roulette without its rescale of the paths that go on.
 const FAULT_NO_RESCALE = 2u;
+// A depth cap of 190 surfaces instead of 256, which leaves out 2 % of the light at albedo 0.98.
+const FAULT_SHORT_CAP = 3u;
+const FAULT_SHORT_CAP_SURFACES = 190u;
 
 // The most surfaces a path visits, the camera ray's first hit being the first.
 const MAX_DEPTH = 256u;
@@ -89,18 +94,22 @@ fn leave(ray: Ray, hit: Hit, dir: vec3<f32>) -> Ray {
 }
 
 // The light arriving along one path from the camera: one sample of the pixel's value.
-fn radiance(first: Ray, pixel_seed: u32, sample: u32) -> vec3<f32> {
+fn radiance(first: Ray, pixel_seed: u32, sample: u32, first_group: vec4<f32>) -> vec3<f32> {
     var ray = first;
     var throughput = vec3<f32>(1.0);
     var light = vec3<f32>(0.0);
     // The sun's samples of this surface are slots 2 and 3 of group `depth`; the bounce's of the
     // surface before are slots 0 and 1 of the same group, so one group serves both.
-    var group = sample_group(pixel_seed, sample, 0u, WHITE_NOISE);
+    var group = first_group;
     var max_depth = MAX_DEPTH;
     if FAULT == FAULT_FOUR_BOUNCE_CUT {
         max_depth = FAULT_CUT_SURFACES;
     }
+    if FAULT == FAULT_SHORT_CAP {
+        max_depth = FAULT_SHORT_CAP_SURFACES;
+    }
     for (var depth = 0u; depth < max_depth; depth++) {
+        // lighting: Bounce light
         let hit = trace(ray);
         if !hit.hit {
             // lighting: Sky and atmosphere
@@ -112,27 +121,28 @@ fn radiance(first: Ray, pixel_seed: u32, sample: u32) -> vec3<f32> {
         // lighting: Emissive Voxels
         light += throughput * emission(hit.material);
 
-        // lighting: Sun and shadows
         // The mean of the cosine over the sun's cone is (1 + cos(radius)) / 2 of its value at the
         // cone's centre, so the sample's weight is divided by that: the estimate is then the
         // sun's light exactly, not 0.04 % short of it. Facing away it is zero, as it was.
+        // lighting: Sun and shadows
         let to_sun = sample_cone(frame.sun.xyz, frame.sun.w, group.zw);
         let facing = dot(hit.normal, to_sun);
+        // lighting: Sun and shadows
         if facing > 0.0 && !trace(leave(ray, hit, to_sun)).hit {
+            // lighting: Sun and shadows
             light += throughput * colour * SUN_RADIANCE * (facing / (0.5 * (1.0 + frame.sun.w)));
         }
 
         throughput *= colour;
         if FAULT != FAULT_FOUR_BOUNCE_CUT && depth >= ROULETTE_FROM {
             let brightest = max(throughput.x, max(throughput.y, throughput.z));
-            if brightest < 1.0 {
-                // The path goes on with probability `brightest`, and then counts for 1 / brightest.
-                if hashed_f32(pixel_seed, sample, ROULETTE_COIN_DIM + depth) >= brightest {
-                    break;
-                }
-                if FAULT != FAULT_NO_RESCALE {
-                    throughput /= brightest;
-                }
+            // The colour is at most 1 in every channel (`varied_albedo`), so is the throughput.
+            // The path goes on with probability `brightest`, and then counts for 1 / brightest.
+            if hashed_f32(pixel_seed, sample, ROULETTE_COIN_DIM + depth) >= brightest {
+                break;
+            }
+            if FAULT != FAULT_NO_RESCALE {
+                throughput /= brightest;
             }
         }
         if depth + 1u == max_depth {
@@ -154,9 +164,9 @@ fn reference(@builtin(global_invocation_id) id: vec3<u32>) {
     let sample_index = frame.params.x;
     let pixel_seed = pixel_hash(id.xy, frame.params.y);
     // A point in the pixel from the first group's first two dimensions, so edges anti-alias as
-    // samples accumulate. `radiance` takes group 0 again for its own: the same numbers.
-    let offset = sample_group(pixel_seed, sample_index, 0u, WHITE_NOISE).xy;
-    let estimate = radiance(camera_ray(id.xy, size, offset), pixel_seed, sample_index);
+    // samples accumulate. Slots 2 and 3 of the same group are the first surface's sun sample.
+    let group0 = sample_group(pixel_seed, sample_index, 0u, WHITE_NOISE);
+    let estimate = radiance(camera_ray(id.xy, size, group0.xy), pixel_seed, sample_index, group0);
 
     // The running mean: after n samples, mean + (new - mean) / (n + 1). The first replaces
     // whatever the buffer held. Unlike a sum, it keeps its precision however long it runs.
@@ -171,6 +181,7 @@ fn reference(@builtin(global_invocation_id) id: vec3<u32>) {
     // lit image loses no samples.
     if frame.params.z != 0u {
         let first = camera_ray(id.xy, size, vec2<f32>(0.5));
+        // lighting: Geometry (LOD and what is loaded)
         shown = debug_colour(frame.params.z, trace(first), sample_index);
     }
     textureStore(output, id.xy, vec4<f32>(shown, 1.0));

@@ -328,17 +328,40 @@ fn groups_on_gpu(queries: &[Query]) -> Vec<[u32; 4]> {
 /// points: each thread is one pixel `(t % 64, t / 64)` of a 64 by 64 image (4096 threads) and
 /// writes `samples` samples of `group` (its first `slots` slots) in a row.
 fn grid_on_gpu(group: u32, samples: u32, first_sample: u32, seed: u32, white: bool) -> Vec<f32> {
+    grid_of(
+        samples,
+        seed,
+        &format!("sample_group(pixel_seed, {first_sample}u + s, {group}u, {white})"),
+    )
+}
+
+/// `grid_on_gpu` for any WGSL expression of `pixel_seed` and the sample's number `s` that makes a
+/// `vec4<f32>`.
+fn grid_of(samples: u32, seed: u32, expression: &str) -> Vec<f32> {
     let body = format!(
         "@compute @workgroup_size(64)\nfn probe(@builtin(global_invocation_id) id: vec3<u32>) {{\n\
          {THREAD}\n if t >= 4096u {{ return; }}\n\
          let pixel_seed = pixel_hash(vec2<u32>(t % 64u, t / 64u), {seed}u);\n\
          for (var s = 0u; s < {samples}u; s++) {{\n\
-           let g = sample_group(pixel_seed, {first_sample}u + s, {group}u, {white});\n\
+           let g = {expression};\n\
            let at = (t * {samples}u + s) * 4u;\n\
            out[at] = bitcast<u32>(g.x); out[at + 1u] = bitcast<u32>(g.y);\n\
            out[at + 2u] = bitcast<u32>(g.z); out[at + 3u] = bitcast<u32>(g.w);\n }}\n}}",
     );
     floats(&run(&body, 4096, 4096 * samples as usize * 4))
+}
+
+/// Group `group` as `sample_group` makes it, but with the index shuffle left out: every group
+/// reads the same Sobol index and only the points are scrambled (Burley's section 4 says why
+/// that is not enough). The fault that the per-pixel correlation test must be able to see.
+fn without_the_index_shuffle(group: u32) -> String {
+    format!(
+        "vec4<f32>(\
+         unit_f32(nested_uniform_scramble(sobol4(s).x, hash_combine(hash_combine(pixel_seed, {group}u), 0u))), \
+         unit_f32(nested_uniform_scramble(sobol4(s).y, hash_combine(hash_combine(pixel_seed, {group}u), 1u))), \
+         unit_f32(nested_uniform_scramble(sobol4(s).z, hash_combine(hash_combine(pixel_seed, {group}u), 2u))), \
+         unit_f32(nested_uniform_scramble(sobol4(s).w, hash_combine(hash_combine(pixel_seed, {group}u), 3u))))"
+    )
 }
 
 #[test]
@@ -645,4 +668,57 @@ fn groups_and_neighbouring_pixels_are_not_correlated() {
             );
         }
     }
+}
+
+/// The mean over the pixels of |r|, the correlation of the pixel's own `samples` samples of `a`
+/// with those of `b`. Each pixel has its own scramble, so the sign of a pixel's r is random and
+/// the pooled correlation hides a dependence between the groups; |r| does not.
+fn mean_absolute_correlation_per_pixel(a: &[f32], b: &[f32], samples: usize) -> f64 {
+    let pixels = a.len() / samples;
+    (0..pixels)
+        .map(|p| correlation(&a[p * samples..][..samples], &b[p * samples..][..samples]).abs())
+        .sum::<f64>()
+        / pixels as f64
+}
+
+fn column(values: &[f32], slot: usize) -> Vec<f32> {
+    values.as_chunks::<4>().0.iter().map(|c| c[slot]).collect()
+}
+
+#[test]
+fn the_groups_of_one_pixel_are_not_correlated_with_each_other() {
+    // The 64 samples of one pixel, group 0 against group 1 (and 9): independent numbers give a
+    // mean |r| of about 0.125 (1 / sqrt(64)). A group that reads the same index as another, and
+    // is only scrambled differently, gives 0.7 or more, though the pooled correlation over the
+    // pixels is no different from zero (see the next test).
+    const SAMPLES: usize = 64;
+    let g = |group| grid_on_gpu(group, SAMPLES as u32, 0, 21, false);
+    let (g0, g1, g9) = (g(0), g(1), g(9));
+    for (name, a, b) in [
+        ("0.x and 1.x", column(&g0, 0), column(&g1, 0)),
+        ("0.y and 1.y", column(&g0, 1), column(&g1, 1)),
+        ("0.x and 9.x", column(&g0, 0), column(&g9, 0)),
+        ("0.z and 1.z", column(&g0, 2), column(&g1, 2)),
+    ] {
+        let r = mean_absolute_correlation_per_pixel(&a, &b, SAMPLES);
+        eprintln!("{name}: mean |r| per pixel {r:.3}");
+        assert!(r < 0.15, "{name}: mean |r| per pixel {r}");
+    }
+}
+
+#[test]
+fn the_per_pixel_correlation_check_fails_without_the_index_shuffle() {
+    // The same check on groups that read one index: it must fail, and the pooled correlation of
+    // the same numbers must not, which is why the check above is per pixel.
+    const SAMPLES: usize = 64;
+    let g0 = grid_of(SAMPLES as u32, 21, &without_the_index_shuffle(0));
+    let g1 = grid_of(SAMPLES as u32, 21, &without_the_index_shuffle(1));
+    let r = mean_absolute_correlation_per_pixel(&column(&g0, 0), &column(&g1, 0), SAMPLES);
+    let pooled = correlation(&column(&g0, 0), &column(&g1, 0));
+    eprintln!("no shuffle: mean |r| per pixel {r:.3}, pooled {pooled:.4}");
+    assert!(r > 0.4, "the fault was not seen: mean |r| per pixel {r}");
+    assert!(
+        pooled.abs() < 0.02,
+        "the pooled correlation sees it too: {pooled}"
+    );
 }

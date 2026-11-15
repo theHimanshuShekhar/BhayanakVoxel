@@ -85,7 +85,9 @@ fn varied_albedo(material: u32, voxel: vec3<i32>) -> vec3<f32> {
     let angle = hue * params.y;
     let axis = vec3<f32>(0.57735027);
     let turned = base * cos(angle) + cross(axis, base) * sin(angle) + axis * dot(axis, base) * (1.0 - cos(angle));
-    return max(turned, vec3<f32>(0.0)) * (1.0 + value * params.z);
+    // No more than 1 in any channel: a surface that gave back more light than it took would let a
+    // path's throughput grow, and the reference's depth cap would no longer bound its bias.
+    return min(max(turned, vec3<f32>(0.0)) * (1.0 + value * params.z), vec3<f32>(1.0));
 }
 
 // The colour of the Voxel's surface before it is lit: the one function that both views take
@@ -97,6 +99,7 @@ fn surface_albedo(hit: Hit, flat_colours: bool) -> vec3<f32> {
     if flat_colours {
         return albedo(hit.material);
     }
+    // lighting: Per-Voxel colour variation
     return varied_albedo(hit.material, hit.voxel);
 }
 

@@ -17,13 +17,12 @@ fn pcg(v: u32) -> u32 {
 // give the same bits on every device. A path asks for its dimensions by number, in any order,
 // and a path that ends early simply never asks for the later ones.
 //
-// The first SOBOL_DIMS dimensions are Sobol, in groups of four. Each group has its own scramble,
+// The first SOBOL_GROUPS * 4 = 64 dimensions are Sobol, in groups of four. Each group has its own scramble,
 // so the groups are not correlated with each other (Burley, section 4), and within a group the
 // four dimensions keep Sobol's stratification: the first two are a (0,2)-sequence, so 4^k
 // consecutive samples put one point in each cell of every 2^i by 2^(k-i) grid. Dimensions past
-// SOBOL_DIMS are hashed random numbers. `white` replaces all of them by hashed random numbers:
+// those are hashed random numbers. `white` replaces all of them by hashed random numbers:
 // white noise, which tests use as the plain Monte Carlo baseline.
-const SOBOL_DIMS = 64u;
 const SOBOL_GROUPS = 16u;
 
 // The scramble of one pixel under one seed. Whole numbers, so it is the same on every device.
@@ -137,11 +136,6 @@ fn sample_group(pixel_seed: u32, sample: u32, group: u32, white: bool) -> vec4<f
         unit_f32(nested_uniform_scramble(point.z, hash_combine(seed, 2u))),
         unit_f32(nested_uniform_scramble(point.w, hash_combine(seed, 3u))),
     );
-}
-
-// One dimension of sample `sample`.
-fn sample_dim(pixel_seed: u32, sample: u32, dim: u32, white: bool) -> f32 {
-    return sample_group(pixel_seed, sample, dim / 4u, white)[dim % 4u];
 }
 
 // A right-handed frame whose z axis is the unit vector `n`, as columns (Duff et al., "Building
