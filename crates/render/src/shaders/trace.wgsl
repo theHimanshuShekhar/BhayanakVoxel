@@ -385,11 +385,15 @@ fn trace(ray: Ray) -> Hit {
 }
 
 // Whether the Voxel of level 0 at the absolute coordinate `voxel` is solid, as the scene holds it:
-// a Voxel in a brick that is not listed is air. (A brick of the Planet that is not listed is air,
-// or buried: solid, with solid bricks on all six sides. A buried brick has no air near it, so the
-// Voxels within a few of a surface that a ray found are never in one.) For the shading, which asks
-// about the Voxels round one that was hit: it is not part of the walk. The last brick looked up is
-// kept in `cache`, because the Voxels asked about one after another are mostly in the same brick.
+// a Voxel in a brick that is not listed is air. A brick of the Planet that is not listed is air or
+// buried (solid, with solid bricks round it); a buried brick shares a face with no air brick, but
+// it may touch one along an edge or at a corner, and can hold air there, so a Voxel counted as air
+// in an unlisted brick may be solid. Next to a surface that is off by a few Voxels of the window
+// at a concave notch, which tilts the normal there by up to about 7 degrees (ADR 0005's ledger).
+// Level 0 only reaches so far: the shading stops before its end (`smooth_limit`, tracer.rs), where
+// the bricks past it are another level's and read as air here. For the shading, which asks about
+// the Voxels round one that was hit: it is not part of the walk. The last brick looked up is kept
+// in `cache`, because the Voxels asked about one after another are mostly in the same brick.
 struct BrickCache {
     brick: vec3<i32>,
     // The brick's entry in `brick_refs`: SOLID_FLAG and its Material if it is one, else the word of

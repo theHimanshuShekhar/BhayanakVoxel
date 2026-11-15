@@ -70,7 +70,14 @@ use super::stream::StreamReport;
 /// sleep, so that `time_ms`, `after_ms`, `between_ms`, `sleep_asked_ms` and `sleep_over_ms` add up
 /// to `cycle_ms`. Each path has `slowest_cycles`, its frames with the longest turn.
 /// Nothing else is changed.
-pub const SCHEMA_VERSION: u32 = 19;
+///
+/// 20 (#202) moved the lighting out of `primary`: `primary` excludes `normals` and `shade`; new
+/// pass lines `normals`, `shade`, `exposure`, `exposure_adapt`, `bloom_down`, `bloom_h`, `bloom_v`
+/// and `tone` are in `passes[]` (the report lists passes generically, so they need no field of
+/// their own). So `passes[primary]`, the cave-still `primary` and the real-time `gpu_primary_ms`
+/// no longer include the lighting: a number of schema 19 or before is not comparable with them
+/// except as `primary` + `normals` + `shade`. Nothing else is changed.
+pub const SCHEMA_VERSION: u32 = 20;
 
 /// One timed thing (a pass, or the GPU total of a profiler frame) in one mode, against its
 /// budget. In reference mode a profiler frame is one sample, so the entries of that mode have
@@ -567,7 +574,7 @@ mod tests {
                 "streaming_real_time"
             ]
         );
-        assert_eq!(json["schema_version"], 19);
+        assert_eq!(json["schema_version"], 20);
         assert_eq!(json["convergence"], serde_json::Value::Null);
         assert_eq!(json["streaming"], serde_json::Value::Null);
         assert_eq!(json["streaming_real_time"], serde_json::Value::Null);

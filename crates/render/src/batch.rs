@@ -33,7 +33,9 @@ use std::collections::VecDeque;
 
 /// What a Still frame's dispatch may take on the GPU, in milliseconds: 12 of the 16.7 at 60 Hz,
 /// leaving 1 for the copy to the window and the overlay and 3.7 of slack against a spike
-/// (`reference-scheduling.md`, 3.3).
+/// (`reference-scheduling.md`, 3.3). The budget is sized from the `reference` pass alone (the
+/// timers' tag): the display transform that follows it adds about 0.06 ms on the 4090 (#202), which
+/// the 1 ms and the slack cover, so the post passes are not counted in a batch's time.
 pub const BATCH_BUDGET_MS: f64 = 12.0;
 
 /// The most samples in one dispatch at 1440p ([`REFERENCE_MPIX`]); a bigger image takes fewer

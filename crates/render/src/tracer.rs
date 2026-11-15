@@ -12,7 +12,7 @@ use crate::camera::{Camera, CameraUniform};
 use crate::debug_view::DebugView;
 use crate::gpu_materials;
 use crate::look::{Look, LookUniform};
-use crate::post::{self, HDR_FORMAT, Post, Scratch, Stages};
+use crate::post::{self, Exposed, HDR_FORMAT, Metering, Post, Scratch, Stages};
 use crate::profiler::Profiler;
 use crate::reference::{Hit, Ray};
 use crate::scene::{MAX_LEVELS, Part, REGION_WORDS, Scene, SceneUpdate, UploadCost, spare_words};
@@ -322,6 +322,12 @@ impl Target {
         &self.lit
     }
 
+    /// Primary's lit image as linear light, before the display transform (`Rgba16Float`), and the
+    /// bloom that the transform made of it, at a quarter of the size. For tests.
+    pub(crate) fn lit_hdr_and_bloom(&self) -> (&Plane, (&Plane, (u32, u32))) {
+        (&self.lit_hdr, self.lit_scratch.bloom())
+    }
+
     /// The image of the reference path tracer: the mean so far, through the display transform and
     /// encoded for display, at [`Target::reference_size`].
     pub fn reference(&self) -> &Plane {
@@ -406,6 +412,8 @@ pub struct Tracer {
     stages: Stages,
     /// The time of the last frame of [`Tracer::encode_frame`], for how far the exposure adapts.
     last_frame_at: Option<std::time::Duration>,
+    /// Where the smooth normals end, in Voxels from the camera ([`smooth_end`]).
+    smooth_end: f32,
     upscale: UpscalePass,
     /// Decides what each frame of [`Tracer::encode_frame`] draws.
     still: Still<(View, u64)>,
@@ -916,6 +924,7 @@ impl Tracer {
             look: Look::default(),
             stages: Stages::default(),
             last_frame_at: None,
+            smooth_end: smooth_end(scene),
             upscale: UpscalePass::new(device),
             still: Still::new(),
             scene_epoch: 0,
@@ -1055,8 +1064,16 @@ impl Tracer {
             &target.reference_hdr.view,
             target,
         );
-        // The mean is shown through the display transform. It settles its exposure at once: a
-        // still view has nothing to adapt to. The accumulation is read, never written.
+        // The mean is shown through the display transform, with an exposure of its own. A still
+        // view has nothing to adapt to, so the exposure is set at once to what the mean's boxes
+        // meter, until the view has enough samples for that to be steady; from then on it is held,
+        // and the image converges at one brightness (the issue: Reference frames use the settled
+        // exposure). The accumulation is read, never written.
+        let metering = if first < post::REFERENCE_METERED_UP_TO {
+            Metering::Adapt(1.0)
+        } else {
+            Metering::Hold
+        };
         self.post.encode(
             device,
             queue,
@@ -1067,7 +1084,8 @@ impl Tracer {
             &target.reference,
             self.stages,
             self.debug_view != DebugView::Lit,
-            1.0,
+            Exposed::Reference,
+            metering,
         );
         samples
     }
@@ -1149,6 +1167,7 @@ impl Tracer {
         update: &SceneUpdate,
     ) -> Result<()> {
         self.restart_reference();
+        self.smooth_end = smooth_end(scene);
         // Counted where each write is made, not summed from the patch's cost: [`upload_cost`] is
         // the other count, and the two are compared. Both go over `RingPatch::copies()`, so the
         // comparison does not check that list (the stepped tests' `GpuCopy::assert_is` does).
@@ -1328,6 +1347,11 @@ impl Tracer {
         self.debug_view = view;
     }
 
+    /// The buffer that holds the exposure of `view`: see [`Post::state`].
+    pub(crate) fn exposure_state(&self, view: Exposed) -> &wgpu::Buffer {
+        self.post.state(view)
+    }
+
     pub fn look(&self) -> Look {
         self.look
     }
@@ -1418,7 +1442,12 @@ impl Tracer {
                 [x as f32, y as f32, z as f32, 0.0]
             },
             look: self.look.uniform(),
-            flags: [u32::from(self.stages.smooth_normals), 0, 0, 0],
+            flags: [
+                u32::from(self.stages.smooth_normals),
+                self.smooth_end.to_bits(),
+                0,
+                0,
+            ],
         };
         queue.write_buffer(&self.frame_buffer, 0, bytemuck::bytes_of(&frame));
     }
@@ -1464,7 +1493,8 @@ impl Tracer {
             &target.lit,
             self.stages,
             debug,
-            rate,
+            Exposed::Primary,
+            Metering::Adapt(rate),
         );
     }
 
@@ -1693,6 +1723,26 @@ impl Tracer {
 /// The pixels in an image of `size`.
 fn pixels(size: (u32, u32)) -> u64 {
     u64::from(size.0) * u64::from(size.1)
+}
+
+/// How far from the camera the smooth normals reach, in Voxels: 30 m, the prototype's, and no
+/// further than level 0 does.
+pub const SMOOTH_UP_TO: f32 = 600.0;
+
+/// A smoothed hit looks at the Voxels of a cube of 5 round the one in front of its face: its far
+/// corner is at most `|(4, 3, 3)|`, under 6 Voxels, from the point that was hit.
+const SMOOTH_REACH: f32 = 6.0;
+
+/// Where the smooth normals end for `scene`, in Voxels from the camera: [`SMOOTH_UP_TO`], or
+/// where that is more than level 0 holds, the distance that a brick is certain to be level 0's up
+/// to (a level 1 brick is only split while it is nearer than its boundary less the hysteresis,
+/// [`crate::lod::HYSTERESIS`]) less the reach of the window. A scene that is not made of rings has
+/// one level, and no end but 30 m.
+fn smooth_end(scene: &Scene) -> f32 {
+    scene.bands().map_or(SMOOTH_UP_TO, |bands| {
+        let level_0 = bands.floor(1) * (1.0 - crate::lod::HYSTERESIS);
+        SMOOTH_UP_TO.min(level_0 as f32 - SMOOTH_REACH).max(1.0)
+    })
 }
 
 /// The samples one dispatch takes when `samples` are asked for on an image of `size`: at least 1,

@@ -378,3 +378,367 @@ fn the_exposure_follows_a_change_of_light_over_seconds_not_at_once() {
     }
     assert!((last - 0.18).abs() < 0.01, "{last}");
 }
+
+/// The linear luminance of the middle pixel of an image.
+fn middle_luminance(image: &Image) -> f64 {
+    let c = linear(image, image.width / 2, image.height / 2);
+    0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2]
+}
+
+/// The floor with the exposure alone on, under the legacy light with the sun at `direction`.
+fn exposure_only(sun: [f32; 3]) -> Offscreen {
+    let mut gpu = Offscreen::new(SIZE, SIZE, &floor_of(material("clear glass"))).unwrap();
+    gpu.set_stages(Stages {
+        exposure: true,
+        ..OFF
+    });
+    gpu.set_look(Look::LEGACY);
+    gpu.set_sun(Sun::new(sun, 0.02).unwrap());
+    gpu
+}
+
+// Low enough that the floor is under 1 (the 8-bit image clips at 1).
+const BRIGHT_SUN: [f32; 3] = [0.0, 1.0, 3.0];
+const NO_SUN: [f32; 3] = [0.0, -1.0, 0.0];
+
+#[test]
+fn the_exposure_moves_one_minus_e_to_the_minus_dt_over_tau_of_the_way_in_stops() {
+    use std::time::Duration;
+    // What the floor is under each sun with nothing adapting: the exposure's range holds both, and
+    // the exposure that settles a scene is 0.18 over its luminance.
+    let settled = |sun| {
+        let mut gpu = exposure_only(sun);
+        gpu.set_stages(OFF);
+        let image = gpu.render(&overhead());
+        let mut logs = 0.0;
+        for y in 0..image.height {
+            for x in 0..image.width {
+                let c = linear(&image, x, y);
+                logs += (0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2])
+                    .max(1e-4)
+                    .ln();
+            }
+        }
+        (0.18 / (logs / f64::from(image.width * image.height)).exp()).log2() as f32
+    };
+    let (from, to) = (settled(BRIGHT_SUN), settled(NO_SUN));
+    assert!(
+        (-3.0..=5.0).contains(&from) && (-3.0..=5.0).contains(&to),
+        "{from} {to}"
+    );
+
+    let mut gpu = exposure_only(BRIGHT_SUN);
+    gpu.draw_frame(&overhead(), false, Duration::ZERO);
+    let first = gpu.exposure_stops(false).unwrap();
+    assert!(
+        (first - from).abs() < 0.02,
+        "the first frame sets it at once: {first} for {from}"
+    );
+    gpu.set_sun(Sun::new(NO_SUN, 0.02).unwrap());
+    // One second on (dt = 1 s, tau = 2.5 s): the exposure has moved 1 - e^(-0.4) = 33 % of the way
+    // from where it was to where the dark scene settles it, measured in stops.
+    gpu.draw_frame(&overhead(), false, Duration::from_secs(1));
+    let stops = gpu.exposure_stops(false).unwrap();
+    let moved = f64::from((stops - first) / (to - first));
+    let expected = 1.0 - (-1.0f64 / 2.5).exp();
+    assert!(
+        (moved - expected).abs() < 0.02,
+        "moved {moved} of the way, expected {expected}"
+    );
+}
+
+#[test]
+fn primary_keeps_its_own_exposure_through_a_still_view_of_the_reference() {
+    use std::time::Duration;
+    let mut gpu = exposure_only(BRIGHT_SUN);
+    gpu.draw_frame(&overhead(), false, Duration::ZERO);
+    let before = middle_luminance(&gpu.shown());
+    assert!((before - 0.18).abs() < 0.01, "{before}");
+    // The Reference view is looking at a dark scene (the sun gone), and meters it: far brighter
+    // exposure than the bright floor's.
+    gpu.set_sun(Sun::new(NO_SUN, 0.02).unwrap());
+    gpu.reference_batch(&overhead(), 4);
+    let reference = middle_luminance(&gpu.render_reference(&overhead(), 0));
+    assert!(
+        reference > 0.1,
+        "the Reference view meters its own scene: {reference}"
+    );
+    // The camera moves on and the light is back: Primary's first frame starts from its own last
+    // exposure, so the bright floor is what it was, not the dark scene's exposure on a bright floor.
+    gpu.set_sun(Sun::new(BRIGHT_SUN, 0.02).unwrap());
+    gpu.draw_frame(&overhead(), false, Duration::from_millis(17));
+    let after = middle_luminance(&gpu.shown());
+    assert!((after - before).abs() < 0.01, "{after} after {before}");
+}
+
+/// A courtyard, 10 Voxels square and 14 deep, in a floor: light reaches its floor by the sky and
+/// the walls' bounces, so a few samples of it are mostly dark noise.
+fn courtyard() -> Scene {
+    let mut store = BrickStore::new();
+    for x in -40..40 {
+        for z in -40..40 {
+            let inside = (-5..5).contains(&x) && (-5..5).contains(&z);
+            let top = if inside { -14 } else { 0 };
+            for y in -30..top {
+                store.set(VoxelCoord([x, y, z]), Some(STONE));
+            }
+        }
+    }
+    Scene::new(&store, None)
+}
+
+#[test]
+fn the_reference_view_looks_as_bright_at_four_samples_as_at_sixty_four() {
+    // Looking into the courtyard: four samples' mean is mostly dark pixels, and a meter that
+    // read each of them would push the exposure up. The Reference view meters the mean's 4 x 4 boxes
+    // and holds the exposure from 16 samples, so the brightness the view converges at is the
+    // one it starts at, to within the noise.
+    let scene = courtyard();
+    let camera = Camera::looking_at([0.5, 12.0, 0.5], [0.5, -14.0, 0.5]);
+    let mut gpu = Offscreen::new(SIZE * 2, SIZE * 2, &scene).unwrap();
+    gpu.set_stages(Stages {
+        exposure: true,
+        ..OFF
+    });
+    gpu.set_sun(Sun::from_angles(0.3, 0.9, 0.3));
+    let stops = |gpu: &mut Offscreen, taken| {
+        gpu.reference_batch(&camera, taken);
+        gpu.exposure_stops(true).unwrap()
+    };
+    let one = stops(&mut gpu, 4);
+    let sixty_four = stops(&mut gpu, 60);
+    let later = stops(&mut gpu, 192);
+    eprintln!("exposure at 4: {one}, 64: {sixty_four}, 256: {later} stops");
+    // Within 0.04 stops (3 % in brightness). Metered on pixels, not boxes, the same views differ by
+    // 0.065 on lavapipe: the bound is between the two.
+    assert!(
+        (one - sixty_four).abs() < 0.04,
+        "{one} stops at 4 samples, {sixty_four} at 64"
+    );
+    // Held from 16 samples: more of them make the noise fall and do not move the brightness.
+    assert_eq!(later, sixty_four, "the exposure is held");
+}
+
+/// A flat ground, Voxels y -4..=-1 (its top face is at y = 0), x and z -120..120, as rings: the
+/// bands' `d0` of 40 puts the end of level 0 at 80 Voxels.
+fn ringed_ground() -> Scene {
+    let mut store = BrickStore::new();
+    for x in -120..120 {
+        for z in -120..120 {
+            for y in -4..0 {
+                store.set(VoxelCoord([x, y, z]), Some(STONE));
+            }
+        }
+    }
+    store.build_lod(4);
+    let bound = render::scene::Bound {
+        centre: [0, 0, 0],
+        radius: 400,
+    };
+    Scene::rings(
+        &store,
+        [0.5, 20.0, 0.5],
+        render::lod::Bands::with_d0(40.0),
+        bound,
+    )
+    .unwrap()
+}
+
+#[test]
+fn the_smooth_normals_end_before_level_zero_does() {
+    // Level 0 ends at 80 Voxels (a brick is certain to be its own up to 0.95 of that). Smoothed at
+    // the seam, a Voxel's window would hold the next level's bricks, which level 0 does not list,
+    // as air, and the flat ground's normal would tilt along the ring where they begin. On flat
+    // ground every normal is straight up, at every distance.
+    let scene = ringed_ground();
+    let camera = Camera::looking_at([0.5, 20.0, 0.5], [60.5, 8.0, 0.5]);
+    let image = shading_normals(&scene, &camera, Stages::default());
+    let mut ground = 0;
+    for y in 0..image.height {
+        for x in 0..image.width {
+            let n = normal_of(&image, (x, y));
+            if n[1] > 0.0 {
+                ground += 1;
+                assert!(n[1] > 0.98, "({x}, {y}): the normal {n:?} is tilted");
+            }
+        }
+    }
+    assert!(
+        ground > SIZE * SIZE / 4,
+        "the ground fills the view: {ground}"
+    );
+}
+
+#[test]
+fn the_smooth_normal_fades_into_the_face_normal_over_the_last_fifth_of_its_range() {
+    // Straight down onto the stairs from `t` Voxels over them: the middle of the image is `t`
+    // away, on the tread of the step at x = 32, 33. The tilt (the normal's x) is the smooth normal's
+    // up to 24 m (480 Voxels), is none from 30 m (600), and goes between in a line.
+    let (_, scene) = staircase(STONE);
+    let tilt_at = |t: f64| {
+        let camera = over_the_stairs(17.0 + t);
+        let image = shading_normals(&scene, &camera, Stages::default());
+        normal_of(&image, (SIZE / 2, SIZE / 2))[0]
+    };
+    let full = tilt_at(300.0);
+    assert!(full.abs() > 0.1, "the stairs tilt the normal: {full}");
+    assert!(
+        (tilt_at(470.0) - full).abs() < 0.02,
+        "full smoothing before 24 m"
+    );
+    let half = tilt_at(540.0);
+    assert!(
+        (half - full / 2.0).abs() < 0.03,
+        "half way: {half} for {full}"
+    );
+    let near_end = tilt_at(588.0);
+    assert!(
+        (near_end - full / 10.0).abs() < 0.03,
+        "a tenth left at 29.4 m: {near_end}"
+    );
+    assert!(tilt_at(610.0).abs() < 0.01, "none past 30 m");
+}
+
+/// `image` (RGB, `width` wide) blurred along `axis` by a Gaussian of `sigma` pixels, its edge
+/// repeated beyond it: what the prototype's CPU blur did, at full resolution.
+fn gaussian(
+    image: &[[f32; 3]],
+    (width, height): (usize, usize),
+    vertical: bool,
+    sigma: f32,
+) -> Vec<[f32; 3]> {
+    let radius = (sigma * 3.0).ceil() as i32;
+    let weights: Vec<f32> = (-radius..=radius)
+        .map(|i| (-((i * i) as f32) / (2.0 * sigma * sigma)).exp())
+        .collect();
+    let total: f32 = weights.iter().sum();
+    let mut out = vec![[0.0; 3]; image.len()];
+    for y in 0..height {
+        for x in 0..width {
+            let mut sum = [0.0f32; 3];
+            for (k, w) in weights.iter().enumerate() {
+                let i = k as i32 - radius;
+                let (sx, sy) = if vertical {
+                    (x, (y as i32 + i).clamp(0, height as i32 - 1) as usize)
+                } else {
+                    ((x as i32 + i).clamp(0, width as i32 - 1) as usize, y)
+                };
+                for c in 0..3 {
+                    sum[c] += image[sy * width + sx][c] * w;
+                }
+            }
+            out[y * width + x] = sum.map(|v| v / total);
+        }
+    }
+    out
+}
+
+/// The bloom of the prototype, at full resolution: the mean of three Gaussians of
+/// `[2.5, 7, 18] * scale` pixels.
+fn full_resolution_bloom(image: &[[f32; 3]], size: (usize, usize), scale: f32) -> Vec<[f32; 3]> {
+    let blurs: Vec<_> = [2.5, 7.0, 18.0]
+        .map(|s| {
+            gaussian(
+                &gaussian(image, size, false, s * scale),
+                size,
+                true,
+                s * scale,
+            )
+        })
+        .into();
+    (0..image.len())
+        .map(|i| std::array::from_fn(|c| (blurs[0][i][c] + blurs[1][i][c] + blurs[2][i][c]) / 3.0))
+        .collect()
+}
+
+/// The GPU's quarter-size bloom, read at full-resolution pixel `(x, y)` as the `tone` pass does:
+/// bilinear, at the pixel's centre.
+fn bloom_at(
+    bloom: &(u32, u32, Vec<[f32; 3]>),
+    full: (usize, usize),
+    x: usize,
+    y: usize,
+) -> [f32; 3] {
+    let (w, h, pixels) = (bloom.0 as usize, bloom.1 as usize, &bloom.2);
+    let u = (x as f32 + 0.5) / full.0 as f32 * w as f32 - 0.5;
+    let v = (y as f32 + 0.5) / full.1 as f32 * h as f32 - 0.5;
+    let (x0, y0) = (u.floor(), v.floor());
+    let (fx, fy) = (u - x0, v - y0);
+    let at = |i: f32, j: f32| {
+        pixels[(j.clamp(0.0, h as f32 - 1.0) as usize) * w + i.clamp(0.0, w as f32 - 1.0) as usize]
+    };
+    std::array::from_fn(|c| {
+        let top = at(x0, y0)[c] * (1.0 - fx) + at(x0 + 1.0, y0)[c] * fx;
+        let bottom = at(x0, y0 + 1.0)[c] * (1.0 - fx) + at(x0 + 1.0, y0 + 1.0)[c] * fx;
+        top * (1.0 - fy) + bottom * fy
+    })
+}
+
+#[test]
+fn the_bloom_of_a_bright_pixel_is_the_prototypes_blur_at_its_sigmas_within_the_quarter_size_error()
+{
+    // One lamp in a black sky, seen from 91 Voxels away, so that it is about a pixel: the image is
+    // black everywhere but there, and what the GPU's bloom is, is the blur of that pixel.
+    let (width, height) = (640usize, 360usize);
+    let mut store = BrickStore::new();
+    store.set(VoxelCoord([0, 0, 0]), Some(material("white light")));
+    let scene = Scene::new(&store, None);
+    let mut gpu = Offscreen::new(width as u32, height as u32, &scene).unwrap();
+    gpu.set_stages(Stages { bloom: true, ..OFF });
+    gpu.set_look(Look {
+        sun: [0.0; 3],
+        zenith: [0.0; 3],
+        horizon: [0.0; 3],
+        ..Look::LEGACY
+    });
+    gpu.render(&Camera::looking_at([0.5, 91.0, 0.5], [0.5, 0.0, 0.5]));
+    let ((_, _, hdr), bloom) = gpu.read_hdr_and_bloom();
+    let size = (width, height);
+    let truth = full_resolution_bloom(&hdr, size, width as f32 / 640.0);
+    // Over the lamp and out to 80 pixels from it, along the row it is in.
+    let lamp = (0..hdr.len())
+        .max_by(|&a, &b| hdr[a][1].total_cmp(&hdr[b][1]))
+        .unwrap();
+    let (lx, ly) = (lamp % width, lamp / width);
+    let peak = truth[lamp][1];
+    assert!(
+        hdr[lamp][1] > 1.0 && hdr[lamp + 40][1] == 0.0,
+        "one lamp in the dark"
+    );
+    // How far the GPU's bloom along the lamp's row, from 10 pixels out (the tail, which the
+    // widest blurs make) to 60, is from a full-resolution blur at `scale` times the decided
+    // sigmas, as a share of the light in that tail. The narrowest blur (2.5 pixels here) is under
+    // a texel at a quarter of the size and is read bilinearly, so over the lamp itself the bloom is
+    // about half its true value, and at 6 to 8 pixels out a quarter high; that is the accepted
+    // departure of the quarter-size bloom, and the tail is where the sigmas are told.
+    let tail = |scale: f32| {
+        let blur = full_resolution_bloom(&hdr, size, width as f32 / 640.0 * scale);
+        let (mut difference, mut light) = (0.0f32, 0.0f32);
+        for dx in 10..=60usize {
+            let at = ly * width + lx + dx;
+            difference += (bloom_at(&bloom, size, lx + dx, ly)[1] - blur[at][1]).abs();
+            light += truth[at][1];
+        }
+        difference / light
+    };
+    let (decided, narrower, wider) = (tail(1.0), tail(0.8), tail(1.25));
+    eprintln!(
+        "tail error: decided {decided:.3}, 20 % narrower {narrower:.3}, 25 % wider {wider:.3}"
+    );
+    assert!(decided < 0.06, "{decided}");
+    assert!(
+        narrower > 2.0 * decided && wider > 2.0 * decided,
+        "the sigmas are told: {narrower} and {wider} against {decided}"
+    );
+    // Over the lamp the quarter-size bloom is about half the true one (0.5 of the peak on
+    // lavapipe); it is bounded, and it is 0.05 of that which is added.
+    let core = (bloom_at(&bloom, size, lx, ly)[1] - peak).abs() / peak;
+    assert!(core < 0.6, "{core}");
+    // The light that it carries: the bloom's total (a texel is 16 pixels) is the truth's, to 2 %.
+    let gpu_total: f32 = bloom.2.iter().map(|p| p[1]).sum::<f32>() * 16.0;
+    let true_total: f32 = truth.iter().map(|p| p[1]).sum();
+    assert!(
+        (gpu_total / true_total - 1.0).abs() < 0.02,
+        "{gpu_total} against {true_total}"
+    );
+}

@@ -23,12 +23,13 @@ struct Post {
     // 1 if the stage is on: the tone curve, auto-exposure, bloom; then 1 if the image holds a debug
     // view's colours, which are already encoded and are copied as they are.
     stages: vec4<u32>,
-    // How much of the bloom is added; the adaptation rate k (1 sets the exposure at once); then two
-    // unused.
+    // How much of the bloom is added; the adaptation rate k (1 sets the exposure at once); 1 if the
+    // exposure is held as it is; one unused.
     params: vec4<f32>,
     // The three bloom blurs' standard deviations, in pixels of the bloom images; one unused.
     sigmas: vec4<f32>,
-    // The number of partial sums (the workgroups of `exposure`), then three unused.
+    // The number of partial sums (the workgroups of `exposure`); 1 if the exposure is metered on
+    // 4 x 4 boxes of pixels (the Reference view's), 0 if on pixels; then two unused.
     counts: vec4<u32>,
 }
 
@@ -77,11 +78,28 @@ fn exposure(
 ) {
     var value = 0.0;
     if id.x < post.sizes.x && id.y < post.sizes.y {
-        let c = textureLoad(source, vec2<i32>(id.xy), 0).rgb;
-        // A pixel that is black or not a number counts as the darkest the exposure looks at.
-        value = log(max(luminance(c), 1e-4));
-        if value != value {
-            value = log(1e-4);
+        let boxes = post.counts.y != 0u;
+        // Metered on boxes, the thread at a box's corner takes the box's mean and the rest of the
+        // box's threads count nothing: a few noisy samples' dark pixels then weigh as the box's
+        // light does, not each as the darkest the exposure looks at.
+        if !boxes || (id.x % 4u == 0u && id.y % 4u == 0u) {
+            var c = vec3<f32>(0.0);
+            if boxes {
+                let last = vec2<i32>(post.sizes.xy) - 1;
+                for (var y = 0; y < 4; y++) {
+                    for (var x = 0; x < 4; x++) {
+                        c += textureLoad(source, min(vec2<i32>(id.xy) + vec2<i32>(x, y), last), 0).rgb;
+                    }
+                }
+                c /= 16.0;
+            } else {
+                c = textureLoad(source, vec2<i32>(id.xy), 0).rgb;
+            }
+            // A pixel that is black or not a number counts as the darkest the exposure looks at.
+            value = log(max(luminance(c), 1e-4));
+            if value != value {
+                value = log(1e-4);
+            }
         }
     }
     sums[local] = value;
@@ -112,13 +130,21 @@ fn exposure_adapt(@builtin(local_invocation_index) local: u32) {
         workgroupBarrier();
     }
     if local == 0u {
-        let pixels = f32(post.sizes.x) * f32(post.sizes.y);
+        var pixels = f32(post.sizes.x) * f32(post.sizes.y);
+        if post.counts.y != 0u {
+            pixels = f32(post.sizes.z) * f32(post.sizes.w);
+        }
         let target_stops = log2(settled_exposure(sums[0] / pixels));
         // The eye adapts in stops, so a step of N stops takes the same time to cross whether the
         // image went brighter or darker. The first frame has nothing to adapt from.
         var stops = target_stops;
         if exposure_state[2] != 0.0 {
             stops = exposure_state[0] + (target_stops - exposure_state[0]) * post.params.y;
+            // A held exposure is the one already metered (the Reference view's, once it has enough
+            // samples to meter): it is kept as it is.
+            if post.params.z != 0.0 {
+                stops = exposure_state[0];
+            }
         }
         exposure_state[0] = stops;
         exposure_state[1] = exp2(stops);

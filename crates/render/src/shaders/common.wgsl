@@ -119,8 +119,8 @@ fn surface_albedo(hit: Hit, flat_colours: bool) -> vec3<f32> {
     return varied_albedo(hit.material, hit.voxel);
 }
 
-// Whether a hit of `material` is shaded with smooth computed normals: every Material that is not a
-// Building one (see gpu_materials.rs). Built walls keep their hard edges.
+// Whether a hit of `material` is shaded with smooth computed normals: every Natural Material (see
+// gpu_materials.rs). Built walls and Lights keep their hard edges.
 fn is_smooth(material: u32) -> bool {
     let at = material * RECORD_VEC4S;
     return at + 3u < arrayLength(&materials) && materials[at + 3u].w != 0.0;
@@ -143,9 +143,11 @@ fn hazed(light: vec3<f32>, t: f32) -> vec3<f32> {
     return mix(frame.horizon.xyz, light, exp(-frame.horizon.w * t));
 }
 
-// Hits further than this (30 m) keep their face normals: the bricks are not the held level 0 ring
-// past it, and a Voxel is under a pixel there anyway.
-const SMOOTH_UP_TO = 600.0;
+// Hits keep their face normals from `smooth_end()` on, which is 30 m (600 Voxels) or, where level 0
+// ends sooner, a little before that (see `smooth_limit` in tracer.rs), and the smooth normal is
+// faded in over the last fifth of the way to it: the window is over level 0's bricks, and past
+// level 0 it would count the coarser level's bricks (not listed in level 0) as air.
+const SMOOTH_BLEND_FROM = 0.8;
 // The smoothing looks at the Voxels of a cube of 5 round the empty Voxel in front of the face.
 const SMOOTH_WINDOW = 2;
 // How much the solid Voxels at each squared distance (0 to 12 Voxels, in a cube of 5) count:
@@ -181,12 +183,17 @@ fn smooth_normal(voxel: vec3<i32>, face: vec3<f32>) -> vec3<f32> {
 }
 
 // The normal that `hit` is shaded with: smooth, for a natural Material in range when the stage is
-// on, else the face's.
+// on, else the face's; in between (the last fifth of the range), the two mixed.
 fn shading_normal(hit: Hit) -> vec3<f32> {
-    if frame.flags.x == 0u || hit.t > SMOOTH_UP_TO || !is_smooth(hit.material) {
+    let end = bitcast<f32>(frame.flags.y);
+    if frame.flags.x == 0u || hit.t >= end || !is_smooth(hit.material) {
         return hit.normal;
     }
-    return smooth_normal(hit.voxel, hit.normal);
+    // Over 24 to 30 m the face's normal gives way to the smooth one, so that the change at 30 m is
+    // not a ring on the ground.
+    let weight = clamp((end - hit.t) / (end * (1.0 - SMOOTH_BLEND_FROM)), 0.0, 1.0);
+    let smoothed = smooth_normal(hit.voxel, hit.normal);
+    return normalize(mix(hit.normal, smoothed, weight) + 1e-6 * hit.normal);
 }
 
 // The ray from the camera through `pixel` of an image `size` pixels across. `offset` says where

@@ -9,7 +9,7 @@
 //! | 0    | base colour (linear RGB)        | roughness        |
 //! | 1    | noise scale (Voxels), hue jitter (radians), value jitter | metalness |
 //! | 2    | emitted light: colour times intensity | unused     |
-//! | 3    | transparency, IOR, `defined` (1 if the table has the id) | `smooth` (1 if the surface is shaded with smooth computed normals: every Material that is not a Building one, #202) |
+//! | 3    | transparency, IOR, `defined` (1 if the table has the id) | `smooth` (1 if the surface is shaded with smooth computed normals: every Natural Material, #202; Building and Light ones keep their face normals) |
 //!
 //! The ids are 16 bits, so the table is at most 64 Ki records of 64 bytes. Hardness, density and
 //! the Fluid kind are for the simulation, not the shaders, so they are not here. Keep the layout
@@ -40,9 +40,11 @@ pub fn pack(table: &MaterialTable) -> Vec<[f32; 4]> {
                 d.transparency,
                 d.ior,
                 1.0,
-                // Built Materials keep their face normals: a wall is flat, and its edges are meant to
-                // be hard. The rest (the ground, rock, crystals) are shaded smooth.
-                f32::from(d.category != Category::Building),
+                // Only Natural Materials (the ground, rock, crystals) are shaded smooth. Built
+                // ones keep their face normals (a wall is flat, its edges are meant to be hard),
+                // and so do Lights (the lamps; lava is Natural). A Piece that a player places is
+                // made of ordinary Voxels, so one of a Natural Material (wood) is smoothed too.
+                f32::from(d.category == Category::Natural),
             ],
         ]);
     }
@@ -79,18 +81,19 @@ mod tests {
         assert_eq!(r[1][2], lava.value_jitter);
         // Emitted light is colour times intensity.
         assert_eq!(r[2][0], lava.emissive[0] * lava.emissive_intensity);
+        // Lava is Natural, so smooth.
         assert_eq!(r[3], [lava.transparency, lava.ior, 1.0, 1.0]);
     }
 
     #[test]
-    fn only_built_materials_keep_their_face_normals() {
+    fn only_natural_materials_are_shaded_smooth() {
         let table = MaterialTable::built_in();
         let packed = pack(table);
         for d in table.defs() {
             let smooth = record(&packed, d.id)[3][3];
             assert_eq!(
                 smooth,
-                f32::from(d.category != Category::Building),
+                f32::from(d.category == Category::Natural),
                 "{}",
                 d.name
             );

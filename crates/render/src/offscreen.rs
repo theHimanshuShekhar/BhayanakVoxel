@@ -13,6 +13,18 @@ use crate::tracer::{Plane, ReferenceOptions, Target, Tracer};
 use crate::upscale::Resolution;
 use crate::{Result, finish_and_read, request_gpu, shared_instance, staging_buffer};
 
+/// A half-precision float's value.
+fn half_to_f32(bits: u16) -> f32 {
+    let sign = if bits & 0x8000 != 0 { -1.0 } else { 1.0 };
+    let (exponent, fraction) = (i32::from((bits >> 10) & 0x1f), f32::from(bits & 0x3ff));
+    match exponent {
+        0 => sign * fraction * 2f32.powi(-24),
+        31 if fraction == 0.0 => sign * f32::INFINITY,
+        31 => f32::NAN,
+        _ => sign * (1.0 + fraction / 1024.0) * 2f32.powi(exponent - 15),
+    }
+}
+
 /// Copies a `width` x `height` texture of `bytes` per texel to the CPU after the work in
 /// `encoder`, tightly packed, rows from the top.
 fn read_texture(
@@ -386,6 +398,56 @@ impl Offscreen {
     /// Whether the device can time passes.
     pub fn timers_supported(&self) -> bool {
         self.profiler.supported()
+    }
+
+    /// The exposure, in stops (log2), that the display transform has kept for the Reference view
+    /// (`reference`) or for Primary, or `None` if it has not metered one. For tests.
+    pub fn exposure_stops(&mut self, reference: bool) -> Option<f32> {
+        let view = if reference {
+            crate::post::Exposed::Reference
+        } else {
+            crate::post::Exposed::Primary
+        };
+        let encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        let bytes = crate::read_buffer(
+            &self.device,
+            &self.queue,
+            encoder,
+            self.tracer.exposure_state(view),
+            16,
+        );
+        let word = |i: usize| f32::from_le_bytes(bytes[i * 4..i * 4 + 4].try_into().unwrap());
+        (word(2) != 0.0).then(|| word(0))
+    }
+
+    /// Primary's last frame as linear light before the display transform, and the bloom the
+    /// transform made of it at a quarter of the size: both as RGB, rows from the top, with their
+    /// sizes. For tests of the bloom, which the 8-bit image shows only coarsely.
+    #[allow(clippy::type_complexity)]
+    pub fn read_hdr_and_bloom(&mut self) -> ((u32, u32, Vec<[f32; 3]>), (u32, u32, Vec<[f32; 3]>)) {
+        let size = self.target.resolution().internal;
+        let (hdr, (bloom, bloom_size)) = self.target.lit_hdr_and_bloom();
+        let (hdr, bloom) = (hdr.texture.clone(), bloom.texture.clone());
+        let read = |texture: &wgpu::Texture, size: (u32, u32)| {
+            let encoder = self
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+            let bytes = read_texture(&self.device, &self.queue, encoder, texture, size, 8);
+            let pixels = bytes
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .map(|texel| {
+                    std::array::from_fn(|c| {
+                        half_to_f32(u16::from_le_bytes([texel[2 * c], texel[2 * c + 1]]))
+                    })
+                })
+                .collect();
+            (size.0, size.1, pixels)
+        };
+        (read(&hdr, size), read(&bloom, bloom_size))
     }
 
     /// Keeps every pass time from now on, for a report over many frames.

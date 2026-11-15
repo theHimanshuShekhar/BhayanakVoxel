@@ -10,8 +10,9 @@
 //! The numbers are the prototype's, as rendered (#200, `bench/lookdev/post.rs`):
 //! - **Tone curve:** Khronos PBR Neutral, then the sRGB curve of the image.
 //! - **Auto-exposure:** the scene's log-average luminance to middle grey 0.18, within 0.125 to 32
-//!   (-3 to +5 stops), adapting in stops with `k = 1 - e^(-dt / tau)`, tau 2.5 s. The Reference
-//!   view's still frames use the settled exposure (`k = 1`).
+//!   (-3 to +5 stops), adapting in stops with `k = 1 - e^(-dt / tau)`, tau 2.5 s. Each view has an
+//!   exposure of its own. The Reference view's still frames use the settled one (`k = 1`), metered
+//!   on the mean's 4 x 4 boxes and held from [`REFERENCE_METERED_UP_TO`] samples.
 //! - **Bloom:** 0.05 of the mean of the exposed image blurred at three scales. The Gaussians'
 //!   standard deviations are `[2.5, 7, 18] * width / 640` pixels of the image they are of: 5, 14 and
 //!   36 px of a 1280-wide image and 10, 28 and 72 px of a 2560-wide one (the prototype scaled them
@@ -124,6 +125,24 @@ pub fn neutral(colour: [f32; 3]) -> [f32; 3] {
 /// 60 Hz frame, so that what they draw does not depend on how fast the machine is.
 pub const NOMINAL_FRAME: f32 = 1.0 / 60.0;
 
+/// What a view's exposure does in a frame.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum Metering {
+    /// Moves `rate` of the way to what the image meters ([`adaptation_rate`]); 1 sets it at once.
+    Adapt(f32),
+    /// Stays as it is: the Reference view's, once it has [`REFERENCE_METERED_UP_TO`] samples.
+    Hold,
+}
+
+impl Metering {
+    fn rate(self) -> f32 {
+        match self {
+            Metering::Adapt(rate) => rate,
+            Metering::Hold => 0.0,
+        }
+    }
+}
+
 /// `Post` in `post.wgsl`.
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -149,6 +168,11 @@ pub(crate) struct Scratch {
 }
 
 impl Scratch {
+    /// The bloom image (`Rgba16Float`) and its size.
+    pub fn bloom(&self) -> (&Plane, (u32, u32)) {
+        (&self.bloom, self.quarter)
+    }
+
     pub fn new(device: &wgpu::Device, size: (u32, u32)) -> Self {
         let quarter = (
             size.0.div_ceil(BLOOM_DOWN).max(1),
@@ -177,13 +201,27 @@ impl Scratch {
     }
 }
 
-/// The passes, and the exposure they keep from frame to frame. Views share one, so that the
-/// exposure carries from Primary to the Reference view and back.
+/// Which view an image is of. Each keeps an exposure of its own: the Reference view's is metered
+/// on the still view it accumulates, and Primary, when the camera moves again, goes on adapting
+/// from what it showed before, not from the Reference's metering of a view that has gone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Exposed {
+    Primary,
+    Reference,
+}
+
+/// The samples after which the Reference view holds the exposure it has metered. The mean of fewer
+/// is too noisy to meter (its dark pixels read as a dark scene and push the exposure up), and the
+/// exposure that settles is the one of a view that has enough for the metering to be steady; from
+/// there on the image converges at the exposure it has, as a settled view should.
+pub const REFERENCE_METERED_UP_TO: u32 = 16;
+
+/// The passes, and the exposure each view keeps from frame to frame.
 pub(crate) struct Post {
     uniform: wgpu::Buffer,
-    /// The exposure's state (`exposure_state` in `post.wgsl`): in stops, as an exposure, and
-    /// whether it has been set.
-    state: wgpu::Buffer,
+    /// The exposure's state of each view ([`Exposed`]; `exposure_state` in `post.wgsl`): in stops,
+    /// as an exposure, and whether it has been set.
+    states: [wgpu::Buffer; 2],
     sampler: wgpu::Sampler,
     exposure: Pipeline,
     adapt: Pipeline,
@@ -251,11 +289,15 @@ impl Post {
                 usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             }),
-            state: device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("exposure state"),
-                size: 16,
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-                mapped_at_creation: false,
+            states: ["primary exposure state", "reference exposure state"].map(|label| {
+                device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some(label),
+                    size: 16,
+                    usage: wgpu::BufferUsages::STORAGE
+                        | wgpu::BufferUsages::COPY_SRC
+                        | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                })
             }),
             sampler: device.create_sampler(&wgpu::SamplerDescriptor {
                 label: Some("bloom"),
@@ -303,12 +345,17 @@ impl Post {
         }
     }
 
+    /// The buffer that holds the exposure of `view` (`[stops, exposure, set]`, as `f32`s).
+    pub fn state(&self, view: Exposed) -> &wgpu::Buffer {
+        &self.states[view as usize]
+    }
+
     /// Records the passes that turn the linear image `hdr` (of the size `scratch` is for) into the
     /// 8-bit image `shown`, each timed by `profiler`.
     ///
     /// `passthrough` says that `hdr` holds a debug view's colours (already encoded): they are
-    /// copied as they are. `rate` is how far the exposure moves to its settled value this frame
-    /// ([`adaptation_rate`]; 1 settles it at once). The uniforms are written when this is called.
+    /// copied as they are. `view` says whose exposure it is. `exposure` is what the exposure does
+    /// this frame ([`Metering`]). The uniforms are written when this is called.
     #[allow(clippy::too_many_arguments)]
     pub fn encode(
         &self,
@@ -321,7 +368,8 @@ impl Post {
         shown: &Plane,
         stages: Stages,
         passthrough: bool,
-        rate: f32,
+        view: Exposed,
+        exposure: Metering,
     ) {
         let (width, height) = scratch.size;
         let sigmas = bloom_sigmas(width).map(|s| s / BLOOM_DOWN as f32);
@@ -336,9 +384,19 @@ impl Post {
                     u32::from(stages.bloom),
                     u32::from(passthrough),
                 ],
-                params: [BLOOM_STRENGTH, rate.clamp(0.0, 1.0), 0.0, 0.0],
+                params: [
+                    BLOOM_STRENGTH,
+                    exposure.rate().clamp(0.0, 1.0),
+                    f32::from(matches!(exposure, Metering::Hold)),
+                    0.0,
+                ],
                 sigmas: [sigmas[0], sigmas[1], sigmas[2], 0.0],
-                counts: [scratch.partial_count, 0, 0, 0],
+                counts: [
+                    scratch.partial_count,
+                    u32::from(view == Exposed::Reference),
+                    0,
+                    0,
+                ],
             }),
         );
         let group = |pipeline: &Pipeline, entries: &[wgpu::BindGroupEntry<'_>]| {
@@ -348,6 +406,12 @@ impl Post {
                 entries,
             })
         };
+        let state = &self.states[view as usize];
+        if !stages.exposure {
+            // Nothing meters with the stage off, and what the state holds goes stale: it is
+            // metered afresh when the stage is switched on.
+            queue.write_buffer(state, 0, &[0u8; 16]);
+        }
         let buffer = buffer_entry;
         let view = plane_entry;
         let uniform = buffer(0, &self.uniform);
@@ -383,7 +447,7 @@ impl Post {
                         &[
                             uniform.clone(),
                             buffer(2, &scratch.partials),
-                            buffer(3, &self.state),
+                            buffer(3, state),
                         ],
                     ),
                     (256, 1),
@@ -443,7 +507,7 @@ impl Post {
                 &[
                     uniform,
                     view(1, hdr),
-                    buffer(3, &self.state),
+                    buffer(3, state),
                     view(13, &scratch.bloom),
                     wgpu::BindGroupEntry {
                         binding: 14,
