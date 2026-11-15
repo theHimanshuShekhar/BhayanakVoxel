@@ -688,7 +688,9 @@ fn column(values: &[f32], slot: usize) -> Vec<f32> {
 #[test]
 fn the_groups_of_one_pixel_are_not_correlated_with_each_other() {
     // The 64 samples of one pixel, group 0 against group 1 (and 9): independent numbers give a
-    // mean |r| of about 0.125 (1 / sqrt(64)). A group that reads the same index as another, and
+    // mean |r| of about 0.099 (white noise through this code), and the sampler gives 0.125: the
+    // index shuffle keeps the samples in blocks (indices 2j and 2j + 1 move together), so there
+    // are effectively 32 pairs and not 64 independent samples. A group that reads the same index as another, and
     // is only scrambled differently, gives 0.7 or more, though the pooled correlation over the
     // pixels is no different from zero (see the next test).
     const SAMPLES: usize = 64;

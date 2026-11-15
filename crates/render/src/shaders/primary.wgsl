@@ -28,12 +28,13 @@ fn face_code(hit: Hit) -> u32 {
 
 // The light leaving the hit, towards the camera; `colour` is its surface_albedo.
 //
-// Every read of a source of light, and every term of the light that is returned, carries a
-// `// lighting: <feature>` comment on its line or one of the two lines above it, naming its row
-// in ADR 0005's table of lighting features. A test (`shaders.rs`) fails when a feature has no
-// row, when a read is not marked, and when a new binding appears. A PR that adds a lighting
-// feature here adds it to the Reference view or marks it in that table (ADR 0005, "How a feature
-// enters"). One term to a line, so that one comment cannot cover two.
+// Every read of a source of light, every `trace(` call and every line of this function, control
+// flow aside, needs a whole-line `// lighting: <feature>` comment on one of the two lines directly
+// above it, naming its row in ADR 0005's table of lighting features (a comment at the end of the
+// line does not count). One comment covers the next two lines, so give each term its own. A test
+// (`shaders.rs`) fails when a feature has no row, when a line is not marked, and when a binding
+// or a shader file appears that it does not know. A PR that adds a lighting feature here adds it to
+// the Reference view or marks it in that table (ADR 0005, "How a feature enters").
 fn shade(ray: Ray, hit: Hit, colour: vec3<f32>) -> vec3<f32> {
     if !hit.hit {
         // lighting: Sky and atmosphere

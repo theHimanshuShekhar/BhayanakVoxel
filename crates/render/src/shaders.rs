@@ -112,9 +112,10 @@ mod tests {
     // -----------------------------------------------------------------------------------------
     // The contract's table of lighting features (ADR 0005, "Lighting features").
     //
-    // How features are listed: the shader says it, on the line. A `// lighting: <feature>`
-    // comment, naming a row of the ADR's table, must stand on the line or on one of the two lines
-    // above it for:
+    // How features are listed: the shader says it. A whole-line `// lighting: <feature>` comment,
+    // naming a row of the ADR's table, must stand on one of the two lines directly above (a
+    // comment at the end of a line does not count; one comment covers the next two lines, so one
+    // term to a line) for:
     //   - every read of a source of light, by the identifiers in `READS` (the sun, the sky, a
     //     Material's emission, the Voxel's colour), and that comment must name that source's
     //     feature;
@@ -205,23 +206,48 @@ mod tests {
             })
     }
 
-    /// The problems with `source` against `rows`.
-    fn lighting_problems(source: &str, rows: &[(String, String)]) -> Vec<String> {
+    /// The shader files that `PRIMARY` and `PATHTRACE` are joined from, in order (a test holds
+    /// that they are), so that a problem is reported as `file:line` of the file that has it.
+    const PRIMARY_FILES: [(&str, &str); 3] = [
+        ("trace.wgsl", include_str!("shaders/trace.wgsl")),
+        ("common.wgsl", include_str!("shaders/common.wgsl")),
+        ("primary.wgsl", include_str!("shaders/primary.wgsl")),
+    ];
+    const PATHTRACE_FILES: [(&str, &str); 4] = [
+        ("trace.wgsl", include_str!("shaders/trace.wgsl")),
+        ("common.wgsl", include_str!("shaders/common.wgsl")),
+        ("sampling.wgsl", include_str!("shaders/sampling.wgsl")),
+        ("pathtrace.wgsl", include_str!("shaders/pathtrace.wgsl")),
+    ];
+
+    /// The problems with the `files` of a kernel against `rows`, each as `file:line: ...`.
+    fn lighting_problems(files: &[(&str, &str)], rows: &[(String, String)]) -> Vec<String> {
+        files
+            .iter()
+            .flat_map(|(name, source)| file_problems(name, source, rows))
+            .collect()
+    }
+
+    /// The problems with one file.
+    fn file_problems(file: &str, source: &str, rows: &[(String, String)]) -> Vec<String> {
         let raw: Vec<&str> = source.lines().collect();
         let lines: Vec<&str> = raw.iter().map(|l| l.trim()).collect();
         let mut problems = Vec::new();
-        // The features named on a line, and on the two before it.
+        // The features named by whole-line comments on the two lines before line `i`.
         let marks = |i: usize| -> Vec<String> {
-            (i.saturating_sub(2)..=i)
+            (i.saturating_sub(2)..i)
                 .filter_map(|j| lines[j].strip_prefix("// lighting:"))
                 .map(|f| f.trim().to_lowercase())
                 .collect()
         };
-        for line in &lines {
+        for (i, line) in lines.iter().enumerate() {
             if let Some(feature) = line.strip_prefix("// lighting:") {
                 let feature = feature.trim().to_lowercase();
                 if !rows.iter().any(|(row, _)| *row == feature) {
-                    problems.push(format!("`{feature}` has no row in ADR 0005's table"));
+                    problems.push(format!(
+                        "{file}:{}: `{feature}` has no row in ADR 0005's table",
+                        i + 1
+                    ));
                 }
             }
         }
@@ -236,7 +262,8 @@ mod tests {
             for (identifier, feature) in READS {
                 if reads(line, identifier) && !marks(i).iter().any(|m| m == feature) {
                     problems.push(format!(
-                        "line {}: reads `{identifier}` with no `// lighting: {feature}` within two lines above: {line}",
+                        "{file}:{}: reads `{identifier}` with no whole-line `// lighting: {feature}` \
+                         comment on one of the two lines above: {line}",
                         i + 1
                     ));
                 }
@@ -254,7 +281,8 @@ mod tests {
                             .any(|c| line.starts_with(c))));
             if (finds_light || is_light) && marks(i).is_empty() {
                 problems.push(format!(
-                    "line {}: light is found or added with no `// lighting:` comment within two lines above: {line}",
+                    "{file}:{}: light is found or added with no whole-line `// lighting:` comment on \
+                     one of the two lines above: {line}",
                     i + 1
                 ));
             }
@@ -267,13 +295,27 @@ mod tests {
                     .unwrap_or("");
                 if !BINDINGS.contains(&name) {
                     problems.push(format!(
-                        "line {}: the binding `{name}` is not one the check knows; say whether it carries light",
+                        "{file}:{}: the binding `{name}` is not one the check knows; say whether it \
+                         carries light",
                         i + 1
                     ));
                 }
             }
         }
         problems
+    }
+
+    /// `lighting_problems` of one piece of source.
+    fn problems_of(source: &str, rows: &[(String, String)]) -> Vec<String> {
+        lighting_problems(&[("source", source)], rows)
+    }
+
+    #[test]
+    fn the_files_that_are_checked_are_the_ones_the_kernels_are_joined_from() {
+        let join =
+            |files: &[(&str, &str)]| files.iter().map(|(_, s)| *s).collect::<Vec<_>>().join("\n");
+        assert_eq!(join(&PRIMARY_FILES), PRIMARY);
+        assert_eq!(join(&PATHTRACE_FILES), PATHTRACE);
     }
 
     #[test]
@@ -304,8 +346,11 @@ mod tests {
     #[test]
     fn every_lighting_feature_in_primary_and_the_reference_has_a_row_in_the_adrs_table() {
         let rows = table_rows();
-        for (name, source) in [("PRIMARY", PRIMARY), ("PATHTRACE", PATHTRACE)] {
-            let problems = lighting_problems(source, &rows);
+        for (name, files) in [
+            ("Primary", &PRIMARY_FILES[..]),
+            ("the Reference", &PATHTRACE_FILES[..]),
+        ] {
+            let problems = lighting_problems(files, &rows);
             assert!(problems.is_empty(), "{name}: {problems:#?}");
         }
         // And both really name some: the check is not passing on an empty shader.
@@ -340,8 +385,10 @@ mod tests {
                 .map(|f| f.trim().to_lowercase())
                 .collect()
         };
-        let reference = named(PATHTRACE);
-        for feature in named(PRIMARY) {
+        // The kernels' own files, not `common.wgsl`, which both are joined from: a feature marked
+        // there would count for the Reference whichever kernel it was for.
+        let reference = named(include_str!("shaders/pathtrace.wgsl"));
+        for feature in named(include_str!("shaders/primary.wgsl")) {
             let state = table_rows()
                 .into_iter()
                 .find(|(row, _)| *row == feature)
@@ -364,19 +411,19 @@ mod tests {
         // A feature that Primary's shader names and the table does not have.
         let ambient = "// lighting: Ambient occlusion\nlet ao = 1.0;";
         assert_eq!(
-            lighting_problems(ambient, &rows),
-            ["`ambient occlusion` has no row in ADR 0005's table"]
+            problems_of(ambient, &rows),
+            ["source:1: `ambient occlusion` has no row in ADR 0005's table"]
         );
         // The same with the name: it passes.
         let marked = "// lighting: Sky and atmosphere\nreturn sky(dir);";
-        assert!(lighting_problems(marked, &rows).is_empty());
+        assert!(problems_of(marked, &rows).is_empty());
     }
 
     #[test]
     fn a_source_of_light_read_without_its_comment_fails_the_check() {
         let rows = table_rows();
         let has = |source: &str, what: &str| {
-            let problems = lighting_problems(source, &rows);
+            let problems = problems_of(source, &rows);
             assert!(
                 problems.iter().any(|p| p.contains(what)),
                 "{source:?} gives {problems:?}, not {what}"
@@ -388,7 +435,7 @@ mod tests {
         // passed it, because the name was in the file.
         has(
             "// lighting: Sky and atmosphere\nlet a = sky(d);\nlet x = 1.0;\nlet y = 2.0;\nlet b = sky(e);",
-            "line 5: reads `sky(`",
+            "source:5: reads `sky(`",
         );
         // A read marked as another feature.
         has(
@@ -408,6 +455,11 @@ mod tests {
             "fn radiance() {\n    light += vec3<f32>(0.1);\n}",
             "light is found or added",
         );
+        // A comment at the end of the line is not a whole-line comment: it does not count.
+        has(
+            "let a = sky(d); // lighting: Sky and atmosphere",
+            "source:1: reads `sky(`",
+        );
         // A buffer of light: a radiance cache.
         has(
             "@group(1) @binding(9) var<storage, read_write> radiance_cache: array<vec4<f32>>;",
@@ -420,16 +472,12 @@ mod tests {
             "let c = base_sky(d);",
             "@group(1) @binding(3) var<storage, read_write> accum: array<vec4<f32>>;",
         ] {
-            assert_eq!(
-                lighting_problems(fine, &rows),
-                Vec::<String>::new(),
-                "{fine}"
-            );
+            assert_eq!(problems_of(fine, &rows), Vec::<String>::new(), "{fine}");
         }
         // Inside `shade`, one comment covers a line and the two after it, no more.
         has(
             "fn shade() {\n    // lighting: Ambient term\n    let a = 0.25;\n    let b = 1.0;\n    let c = 2.0;\n    let d = 3.0;\n}",
-            "line 6",
+            "source:6: light is found",
         );
     }
 
