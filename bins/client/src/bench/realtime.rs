@@ -662,6 +662,11 @@ pub struct ColdStart {
     pub world_map_s: Option<f64>,
     /// [`crate::load`]: the spawn ring, the Guard, and the first scene.
     pub load_s: f64,
+    /// The spawn ring (20 m, #168), which is when the player has control (ADR 0009), and the Guard
+    /// after it, which the window waits for as well so that nothing past the ring is sky. Both
+    /// are in `load_s`. **The time-to-control gate is on the ring.**
+    pub ring_s: f64,
+    pub guard_s: f64,
     /// From the start of the load to the first frame with level 0 under the camera: one ray from
     /// the camera straight down hits the ground at level 0. This is **not** the spec's time to
     /// control (the ring of 20 m round the Spawn at full detail, and the character standing in it:
@@ -790,7 +795,18 @@ pub struct Gates {
     /// the store.
     pub scene_mib: Limit,
     pub store_bricks: Limit,
-    /// The gates that are over: `frame_time`, `frame_cpu`, `holes`, `memory`.
+    /// Frames with a soft miss on the flights (the flights at 2 m and 50 m, the take-off and the
+    /// turn: the speed-scaled level is not a soft miss, #168), at the most of a run.
+    pub soft_miss_frames: Limit,
+    /// The spawn ring's generation, which is the player's control (ADR 0009), at the most of the
+    /// runs. The Guard that the window waits for after it is not in it (`ColdStart::guard_s`).
+    pub time_to_control_s: Limit,
+    /// The settle time after the stop, at the most of the runs (the cap's if one did not settle,
+    /// which is over whatever the limit).
+    /// **Proposed**: the limit is not agreed (`bench-budgets.toml`).
+    pub settle_s: Limit,
+    /// The gates that are over: `frame_time`, `frame_cpu`, `holes`, `memory`, `soft_misses`,
+    /// `time_to_control`, `settle`.
     pub over: Vec<&'static str>,
 }
 
@@ -827,11 +843,41 @@ pub fn gates(runs: &[RunReport], budgets: &StreamingBudgets) -> Gates {
             .reduce(f64::min)
             .unwrap_or(0.0),
     };
+    // The paths that are flown at speed, whose scene is drawn at the level the speed asks for.
+    const FLIGHTS: [&str; 4] = [
+        "flight at 2 m",
+        "flight at 50 m",
+        "vertical take-off",
+        "180 degree turn",
+    ];
+    let soft_miss_frames = Limit {
+        worst: worst(&mut runs.iter().map(|r| {
+            r.paths
+                .iter()
+                .filter(|p| FLIGHTS.contains(&p.name))
+                .map(|p| p.soft_misses.frames_with as f64)
+                .sum::<f64>()
+        })),
+        limit: budgets.soft_miss_frames as f64,
+    };
+    let time_to_control_s = Limit {
+        worst: worst(&mut runs.iter().map(|r| r.cold_start.ring_s)),
+        limit: budgets.time_to_control_s,
+    };
+    let unsettled = paths().any(|p| p.settle.is_some_and(|s| !s.settled));
+    let settle_s = Limit {
+        worst: worst(&mut paths().filter_map(|p| p.settle.map(|s| s.seconds))),
+        limit: budgets.settle_s,
+    };
     let over = [
         ("frame_time", frame_time_p99_ms.over()),
         ("frame_cpu", frame_cpu_p99_ms.over()),
         ("holes", holes.over() || !looked),
         ("memory", scene_mib.over() || store_bricks.over()),
+        ("soft_misses", soft_miss_frames.over()),
+        ("time_to_control", time_to_control_s.over()),
+        // A run that was still unsettled at the cap is over, whatever the cap is.
+        ("settle", settle_s.over() || unsettled),
     ]
     .into_iter()
     .filter_map(|(name, over)| over.then_some(name))
@@ -844,6 +890,9 @@ pub fn gates(runs: &[RunReport], budgets: &StreamingBudgets) -> Gates {
         hole_looks_fewest_in_a_path,
         scene_mib,
         store_bricks,
+        soft_miss_frames,
+        time_to_control_s,
+        settle_s,
         over,
     }
 }
@@ -1004,6 +1053,9 @@ struct Setup {
     constants: Constants,
     world_map_s: Option<f64>,
     load: Duration,
+    /// The spawn ring and the Guard, in `load` ([`ColdStart::ring_s`]); 0 for the test Planet's.
+    ring: Duration,
+    guard: Duration,
 }
 
 /// The Planet of the client, at full size: made as `main.rs` makes it.
@@ -1043,6 +1095,8 @@ fn build_full() -> Result<Built, Box<dyn Error>> {
             },
             world_map_s: Some(world_map.as_secs_f64()),
             load,
+            ring: loaded.ring_took,
+            guard: loaded.guard_took,
         },
     })
 }
@@ -1083,6 +1137,8 @@ fn build_test() -> Result<Built, Box<dyn Error>> {
             constants: Constants::of_the_client(),
             world_map_s: None,
             load: began.elapsed(),
+            ring: Duration::ZERO,
+            guard: Duration::ZERO,
         },
     })
 }
@@ -1677,6 +1733,8 @@ impl<'a> Session<'a> {
         let cold = ColdStart {
             world_map_s: setup.world_map_s,
             load_s: setup.load.as_secs_f64(),
+            ring_s: setup.ring.as_secs_f64(),
+            guard_s: setup.guard.as_secs_f64(),
             time_to_level_0_under_camera_s: control
                 .expect("the loop ends with control")
                 .as_secs_f64(),
@@ -2056,6 +2114,9 @@ mod tests {
         frame_cpu_p99_ms: 8.0,
         holes: 0,
         scene_mib: 512.0,
+        soft_miss_frames: 0,
+        time_to_control_s: 2.0,
+        settle_s: 30.0,
     };
 
     fn path(name: &'static str, frame_p99: f64, cpu_p99: f64, holes: u64) -> PathReport {
@@ -2166,6 +2227,8 @@ mod tests {
             cold_start: ColdStart {
                 world_map_s: Some(25.0),
                 load_s: 60.0,
+                ring_s: 1.0,
+                guard_s: 4.0,
                 time_to_level_0_under_camera_s: 61.0,
                 fill_s: 200.0,
             },
@@ -2323,17 +2386,68 @@ mod tests {
         let gates = gates(&runs, &BUDGETS);
         assert_eq!(gates.frame_time_p99_ms.worst, 20.0);
         assert_eq!(gates.over, ["frame_time"]);
-        // Soft misses, time to control and settle time are reported and not gated: a run with
-        // many, and a long time to control, is still within.
-        let slow_to_settle = run_with(|r| {
-            r.cold_start.time_to_level_0_under_camera_s = 600.0;
-            r.paths[1].soft_misses_per_frame = 5000.0;
-            r.paths[1].settle = Some(Settle {
-                seconds: 120.0,
-                settled: false,
-            });
-        });
-        assert!(over(&[slow_to_settle]).is_empty());
+    }
+
+    /// A path of `name` with a soft miss in `frames` of its frames.
+    fn soft_misses_in(run: &mut RunReport, name: &str, frames: usize) {
+        let path = run.paths.iter_mut().find(|p| p.name == name).unwrap();
+        path.soft_misses = Series {
+            frames: 100,
+            total: frames as u64 * 10,
+            max: 10,
+            frames_with: frames,
+        };
+    }
+
+    #[test]
+    fn the_soft_miss_gate_fires_alone_for_one_frame_with_one_on_a_flight() {
+        let one = run_with(|r| soft_misses_in(r, "flight at 2 m", 1));
+        assert_eq!(over(std::slice::from_ref(&one)), ["soft_misses"]);
+        // Frames are summed over the flights, and the worst run is the one that counts.
+        let report = RealTimeReport::new("test".into(), 64.0, vec![one], &BUDGETS);
+        assert_eq!(report.gates.soft_miss_frames.worst, 1.0);
+        assert_eq!(exit_code(&report, false), 2);
+        // The cold start and the stop are not flights: they fill and refine, and have soft misses.
+        let cold = run_with(|r| soft_misses_in(r, "cold start", 9000));
+        assert!(over(&[cold]).is_empty());
+    }
+
+    #[test]
+    fn the_time_to_control_gate_fires_alone_for_a_spawn_ring_over_its_limit() {
+        let slow = run_with(|r| r.cold_start.ring_s = 2.01);
+        assert_eq!(over(std::slice::from_ref(&slow)), ["time_to_control"]);
+        assert!(over(&[run_with(|r| r.cold_start.ring_s = 2.0)]).is_empty());
+        // The Guard after the ring, and the load as a whole, are reported and not gated.
+        assert!(
+            over(&[run_with(|r| {
+                r.cold_start.guard_s = 60.0;
+                r.cold_start.load_s = 600.0;
+                r.cold_start.time_to_level_0_under_camera_s = 600.0;
+            })])
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn the_settle_gate_fires_alone_for_a_stop_that_takes_longer_than_its_limit_or_never_settles() {
+        let settle = |seconds: f64, settled: bool| {
+            run_with(|r| {
+                let stop = r
+                    .paths
+                    .iter_mut()
+                    .find(|p| p.name == "flight at 2 m")
+                    .unwrap();
+                stop.settle = Some(Settle { seconds, settled });
+            })
+        };
+        assert_eq!(over(&[settle(30.1, true)]), ["settle"]);
+        assert!(over(&[settle(30.0, true)]).is_empty());
+        // At the cap: over whatever the limit is.
+        assert_eq!(over(&[settle(20.0, false)]), ["settle"]);
+        // Reported, and not gated, for any other path: those have no settle.
+        let report = RealTimeReport::new("test".into(), 64.0, vec![settle(31.0, true)], &BUDGETS);
+        assert_eq!(report.gates.settle_s.worst, 31.0);
+        assert_eq!(exit_code(&report, false), 2);
     }
 
     #[test]
@@ -2625,7 +2739,9 @@ mod tests {
             keys(&json["runs"][0]["cold_start"]),
             [
                 "fill_s",
+                "guard_s",
                 "load_s",
+                "ring_s",
                 "time_to_level_0_under_camera_s",
                 "world_map_s"
             ]
@@ -2640,7 +2756,10 @@ mod tests {
                 "holes",
                 "over",
                 "scene_mib",
-                "store_bricks"
+                "settle_s",
+                "soft_miss_frames",
+                "store_bricks",
+                "time_to_control_s"
             ]
         );
     }
@@ -3140,6 +3259,60 @@ mod tests {
         assert!(report.gates.hole_looks_fewest_in_a_path >= 1);
         assert!(!report.gates.over.contains(&"holes"), "{:?}", report.gates);
         serde_json::to_string(&report).expect("the report serializes");
+    }
+
+    /// One run of the paths at **full size with no GPU**: the real loader and scene thread on the
+    /// machine's clock, the frame thread's work without the copy and the draw. What the scene
+    /// thread does (soft misses, the drawn lag, the settle time, the time to level 0) is what a
+    /// run with a GPU has to within the machine's speed; the frame times are not (#168 chose the
+    /// speed-scaled curve from it, on a box with no GPU). `BENCH_RUNS` runs (default 1).
+    /// `cargo test --release -p client --bin client -- --ignored --nocapture a_full_size_run_with_no_gpu`
+    #[test]
+    #[ignore = "generates the full-size world map and takes about 15 minutes a run"]
+    fn a_full_size_run_with_no_gpu_reports_what_the_scene_thread_did() {
+        let runs: u32 = std::env::var("BENCH_RUNS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1);
+        for run in 1..=runs {
+            let built = build_full().expect("the full-size Planet builds");
+            let report = one_run(
+                built,
+                &mut NoGpu,
+                &Script::full(),
+                BUDGETS.frame_time_p99_ms,
+            )
+            .unwrap_or_else(|stopped| {
+                panic!("the run stopped at {}: {}", stopped.step, stopped.error)
+            });
+            eprintln!(
+                "RUN {run}: load {:.1} s, level 0 under the camera {:.1} s, fill {:.0} s, holes {}",
+                report.cold_start.load_s,
+                report.cold_start.time_to_level_0_under_camera_s,
+                report.cold_start.fill_s,
+                report.holes
+            );
+            for path in &report.paths {
+                eprintln!(
+                    "  {:>20}: {:>5} frames, soft misses/frame {:>9.0} (frames with {:>5}, max {:>7}), lag max {:>5.2} d0, \
+                     cpu p99 {:>5.2} ms, scene follow {:>7.0} ms pack {:>7.0} ms, settle {:?}",
+                    path.name,
+                    path.frames,
+                    path.soft_misses_per_frame,
+                    path.soft_misses.frames_with,
+                    path.soft_misses.max,
+                    path.scene_lag_d0_max,
+                    path.frame_cpu.p99_ms,
+                    path.scene_thread.follow_ms,
+                    path.scene_thread.pack_ms,
+                    path.settle.map(|s| (s.seconds, s.settled)),
+                );
+            }
+            eprintln!(
+                "  scene used peak {:.1} MiB",
+                report.memory.scene_used_peak_mib
+            );
+        }
     }
 
     /// A run that cannot finish says at which step, and why: here the cold start, with no time to

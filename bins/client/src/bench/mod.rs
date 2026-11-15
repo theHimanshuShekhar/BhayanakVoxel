@@ -820,10 +820,12 @@ fn print_real_time(r: &realtime::RealTimeReport) {
     for (n, run) in r.runs.iter().enumerate() {
         let c = &run.cold_start;
         eprintln!(
-            "  run {}: level 0 under the camera {:.1} s after the load began (load {:.1} s), resident set complete after {:.1} s",
+            "  run {}: level 0 under the camera {:.1} s after the load began (load {:.1} s: spawn ring {:.2} s, Guard {:.1} s), resident set complete after {:.1} s",
             n + 1,
             c.time_to_level_0_under_camera_s,
             c.load_s,
+            c.ring_s,
+            c.guard_s,
             c.fill_s
         );
         for p in &run.paths {
@@ -927,6 +929,9 @@ fn print_real_time(r: &realtime::RealTimeReport) {
         ("holes", g.holes),
         ("scene (MiB)", g.scene_mib),
         ("store (bricks)", g.store_bricks),
+        ("soft-miss frames, flights", g.soft_miss_frames),
+        ("time to control (s)", g.time_to_control_s),
+        ("settle (s, proposed)", g.settle_s),
     ] {
         eprintln!(
             "  gate {name:<20} worst {:>12.2} limit {:>12.2}{}",

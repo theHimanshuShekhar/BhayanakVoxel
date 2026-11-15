@@ -70,7 +70,13 @@ use super::stream::StreamReport;
 /// sleep, so that `time_ms`, `after_ms`, `between_ms`, `sleep_asked_ms` and `sleep_over_ms` add up
 /// to `cycle_ms`. Each path has `slowest_cycles`, its frames with the longest turn.
 /// Nothing else is changed.
-pub const SCHEMA_VERSION: u32 = 19;
+///
+/// 21 (#168; 20 is #202's, which is open: the number is the later of the two) added to the real-time
+/// report's cold start `ring_s` and `guard_s` (the 20 m spawn ring, and the Guard that the window
+/// waits for as well), and to its gates `soft_miss_frames`, `time_to_control_s` and `settle_s`
+/// (`over` may now also name `soft_misses`, `time_to_control` and `settle`). The budgets file has
+/// the three keys, in `[streaming]`. Nothing else is changed.
+pub const SCHEMA_VERSION: u32 = 21;
 
 /// One timed thing (a pass, or the GPU total of a profiler frame) in one mode, against its
 /// budget. In reference mode a profiler frame is one sample, so the entries of that mode have
@@ -567,7 +573,7 @@ mod tests {
                 "streaming_real_time"
             ]
         );
-        assert_eq!(json["schema_version"], 19);
+        assert_eq!(json["schema_version"], 21);
         assert_eq!(json["convergence"], serde_json::Value::Null);
         assert_eq!(json["streaming"], serde_json::Value::Null);
         assert_eq!(json["streaming_real_time"], serde_json::Value::Null);
