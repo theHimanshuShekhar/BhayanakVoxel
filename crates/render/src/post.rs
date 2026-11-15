@@ -407,9 +407,10 @@ impl Post {
             })
         };
         let state = &self.states[view as usize];
-        if !stages.exposure {
-            // Nothing meters with the stage off, and what the state holds goes stale: it is
-            // metered afresh when the stage is switched on.
+        if !stages.exposure || passthrough {
+            // Nothing meters with the stage off or while a debug view is shown, and what the state
+            // holds goes stale (the Reference view could hold, from 16 samples of another view, an
+            // exposure it never metered): it is metered afresh at the next lit frame.
             queue.write_buffer(state, 0, &[0u8; 16]);
         }
         let buffer = buffer_entry;

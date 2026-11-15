@@ -393,6 +393,10 @@ fn descent(
         .collect();
     // The sun of the shot's first frame all the way: the light does not move, the eye adapts.
     gpu.set_sun(sun_for(&path.camera_at(0, shot.frames)));
+    // The still before it left Primary's exposure at the still's metering. The strip starts from
+    // frame 0's own, as the prototype's curve did: one frame of it, with nothing carried over,
+    // sets the exposure at once.
+    gpu.render(&path.camera_at(0, shot.frames));
     let t = Instant::now();
     for frame in 0..shot.frames {
         let camera = path.camera_at(frame, shot.frames);

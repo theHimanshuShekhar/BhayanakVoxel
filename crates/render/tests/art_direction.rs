@@ -742,3 +742,46 @@ fn the_bloom_of_a_bright_pixel_is_the_prototypes_blur_at_its_sigmas_within_the_q
         "{gpu_total} against {true_total}"
     );
 }
+
+#[test]
+fn the_reference_view_meters_afresh_after_a_debug_view_instead_of_holding_a_stale_exposure() {
+    // A bright view is metered; a debug view is shown (the exposure passes are skipped); the view
+    // changes, and 20 samples pass (more than the 16 after which the exposure is held); back on the
+    // lit image the Reference view must have metered the new view, not hold the old one.
+    let scene = floor_of(material("clear glass"));
+    let mut gpu = Offscreen::new(SIZE, SIZE, &scene).unwrap();
+    gpu.set_stages(Stages {
+        exposure: true,
+        ..OFF
+    });
+    gpu.set_look(Look::LEGACY);
+    gpu.set_sun(Sun::new(BRIGHT_SUN, 0.02).unwrap());
+    gpu.reference_batch(&overhead(), 4);
+    let bright = gpu.exposure_stops(true).unwrap();
+    gpu.set_debug_view(DebugView::Normals);
+    gpu.reference_batch(&overhead(), 1);
+    // The view changes (the sun goes down) and takes 20 samples under the debug view.
+    gpu.set_sun(Sun::new(NO_SUN, 0.02).unwrap());
+    gpu.reference_batch(&overhead(), 20);
+    gpu.set_debug_view(DebugView::Lit);
+    gpu.reference_batch(&overhead(), 1);
+    let metered = gpu.exposure_stops(true).unwrap();
+    // What a fresh Reference view meters of the dark scene, with the stage on from the start.
+    let mut fresh = Offscreen::new(SIZE, SIZE, &scene).unwrap();
+    fresh.set_stages(Stages {
+        exposure: true,
+        ..OFF
+    });
+    fresh.set_look(Look::LEGACY);
+    fresh.set_sun(Sun::new(NO_SUN, 0.02).unwrap());
+    fresh.reference_batch(&overhead(), 21);
+    let truth = fresh.exposure_stops(true).unwrap();
+    assert!(
+        (metered - truth).abs() < 0.05,
+        "held {metered}, the view meters {truth} (was {bright})"
+    );
+    assert!(
+        (metered - bright).abs() > 0.3,
+        "the scene changed enough to tell"
+    );
+}
