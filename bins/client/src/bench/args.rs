@@ -53,8 +53,8 @@ Options:
                    what the estimator moved, in one run. Adds about as much time as the FLIP
                    it repeats
   --truth-spp N    Samples of each of the convergence phase's two truths [default: 1024]; ADR
-                   0005's 8192 makes each truth eight times as long (the phase takes about 5
-                   minutes on the 4090). At least 1024, the last checkpoint
+                   0005's 8192 makes each truth eight times as long (the phase takes about 2.5
+                   minutes on the 4090 since #188). At least 1024, the last checkpoint
   --no-fail        Exit with status 0 even if a pass is over its budget, there is a hole or a
                    real-time gate is over
   -h, --help       Print this";

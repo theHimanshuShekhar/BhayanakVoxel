@@ -112,16 +112,24 @@ mod tests {
     // -----------------------------------------------------------------------------------------
     // The contract's table of lighting features (ADR 0005, "Lighting features").
     //
-    // How features are listed: a line of a view's shader that reads a source of light carries
-    // (or follows, in its comment block) a `// lighting: <feature>` comment, naming the feature
-    // by its row in the ADR's table. This checks both ways: every feature a shader names has a
-    // row, and every source of light that the shader reads, which `READS` lists by the identifier
-    // that reads it, is named by such a comment. So a PR that adds a lighting feature to Primary
-    // has to say what it is in the shader, and the test then asks for its row in the ADR: it adds
-    // the row and the feature to the Reference view, or marks it absent with a reason. A feature
-    // that reads a new kind of source adds it to `READS` here (a shader that uses an identifier
-    // that is not in the list and is not marked is the one thing this cannot see; review is
-    // what is left for it).
+    // How features are listed: the shader says it, on the line. A `// lighting: <feature>`
+    // comment, naming a row of the ADR's table, must stand on the line or on one of the two lines
+    // above it for:
+    //   - every read of a source of light, by the identifiers in `READS` (the sun, the sky, a
+    //     Material's emission, the Voxel's colour), and that comment must name that source's
+    //     feature;
+    //   - every call of `trace(`, which is how light is found (the camera ray, a bounce, a shadow
+    //     ray, an ambient-occlusion ray all pass through it), with any row;
+    //   - every line of `shade()` (Primary's light) but its control flow, so that a constant term, like the flat 0.25
+    //     ambient, has its row too, and every line of `radiance()` that changes `light`.
+    // It scans the whole source of each view's kernel, `PRIMARY` and `PATHTRACE`: `common.wgsl`,
+    // `sampling.wgsl` and any file that is added to either. A binding that is not in `BINDINGS`
+    // fails it (a radiance cache, a light buffer): whoever adds one decides there whether it
+    // carries light, and gives it a row. And a shader file that no list knows fails it.
+    //
+    // What it cannot see: a source of light with its own name in a function that is neither
+    // `shade` nor `radiance`, and a marked line whose comment is wrong about the feature (a `trace(`
+    // may carry any row). Review is what is left for those.
 
     const ADR: &str = include_str!("../../../docs/adr/0005-reference-view-contract.md");
 
@@ -154,29 +162,115 @@ mod tests {
         ("varied_albedo(", "per-voxel colour variation"),
     ];
 
-    /// The problems with `source` against `rows`: a feature it names that has no row, and a
-    /// source of light it reads that it does not name.
+    /// The bindings the shaders have, none of which is a source of light that has no row. A new
+    /// one fails the check until it is added here with a decision.
+    const BINDINGS: [&str; 12] = [
+        "scene",
+        "table",
+        "regions",
+        "brick_refs",
+        "bricks",
+        "camera",
+        "output",
+        "frame",
+        "materials",
+        "accum",
+        "gbuffer",
+        "probe_rays",
+    ];
+
+    /// The shader files, all of them known: a new one is neither of a view nor checked until it is
+    /// listed here.
+    const FILES: [&str; 8] = [
+        "trace.wgsl",
+        "common.wgsl",
+        "sampling.wgsl",
+        "primary.wgsl",
+        "pathtrace.wgsl",
+        "probe.wgsl",
+        "upscale.wgsl",
+        "blit.wgsl",
+    ];
+
+    /// Whether `line` (trimmed, code) contains `needle` as a call or member, not in `fn needle(`.
+    fn reads(line: &str, needle: &str) -> bool {
+        !line.starts_with("//")
+            && !line.starts_with("fn ")
+            && line.match_indices(needle).any(|(at, _)| {
+                // not the tail of a longer name: `varied_albedo(` is not a read of `albedo(`.
+                !line[..at]
+                    .chars()
+                    .next_back()
+                    .is_some_and(|c| c.is_alphanumeric() || c == '_')
+            })
+    }
+
+    /// The problems with `source` against `rows`.
     fn lighting_problems(source: &str, rows: &[(String, String)]) -> Vec<String> {
+        let raw: Vec<&str> = source.lines().collect();
+        let lines: Vec<&str> = raw.iter().map(|l| l.trim()).collect();
         let mut problems = Vec::new();
-        let mut named = Vec::new();
-        for line in source.lines() {
-            if let Some(feature) = line.trim().strip_prefix("// lighting:") {
+        // The features named on a line, and on the two before it.
+        let marks = |i: usize| -> Vec<String> {
+            (i.saturating_sub(2)..=i)
+                .filter_map(|j| lines[j].strip_prefix("// lighting:"))
+                .map(|f| f.trim().to_lowercase())
+                .collect()
+        };
+        for line in &lines {
+            if let Some(feature) = line.strip_prefix("// lighting:") {
                 let feature = feature.trim().to_lowercase();
                 if !rows.iter().any(|(row, _)| *row == feature) {
                     problems.push(format!("`{feature}` has no row in ADR 0005's table"));
                 }
-                named.push(feature);
             }
         }
-        for (identifier, feature) in READS {
-            let reads = source.lines().any(|l| {
-                let code = l.trim();
-                !code.starts_with("//") && code.contains(identifier) && !code.starts_with("fn ")
-            });
-            if reads && !named.iter().any(|n| n == feature) {
+        let mut in_function = "";
+        for (i, line) in lines.iter().enumerate() {
+            if let Some(rest) = line.strip_prefix("fn ") {
+                in_function = rest.split('(').next().unwrap();
+            } else if raw[i] == "}" {
+                in_function = "";
+            }
+            let code = !line.is_empty() && !line.starts_with("//") && *line != "}";
+            for (identifier, feature) in READS {
+                if reads(line, identifier) && !marks(i).iter().any(|m| m == feature) {
+                    problems.push(format!(
+                        "line {}: reads `{identifier}` with no `// lighting: {feature}` within two lines above: {line}",
+                        i + 1
+                    ));
+                }
+            }
+            let finds_light = reads(line, "trace(");
+            let is_light = code
+                && ((in_function == "shade"
+                    && !line.starts_with("fn ")
+                    && !["if ", "} else", "for ", "while ", "loop"]
+                        .iter()
+                        .any(|c| line.starts_with(c)))
+                    || (in_function == "radiance"
+                        && ["light +=", "light -=", "light *=", "light ="]
+                            .iter()
+                            .any(|c| line.starts_with(c))));
+            if (finds_light || is_light) && marks(i).is_empty() {
                 problems.push(format!(
-                    "reads `{identifier}` and does not say `// lighting: {feature}`"
+                    "line {}: light is found or added with no `// lighting:` comment within two lines above: {line}",
+                    i + 1
                 ));
+            }
+            if line.starts_with("@group(") {
+                let name = line
+                    .split("var")
+                    .nth(1)
+                    .and_then(|v| v.split(':').next())
+                    .map(|v| v.rsplit(['>', ' ']).next().unwrap_or(v).trim())
+                    .unwrap_or("");
+                if !BINDINGS.contains(&name) {
+                    problems.push(format!(
+                        "line {}: the binding `{name}` is not one the check knows; say whether it carries light",
+                        i + 1
+                    ));
+                }
             }
         }
         problems
@@ -194,8 +288,14 @@ mod tests {
         }
         for (feature, state) in &rows {
             assert!(
-                ["exact", "approximate, shared model", "shared", "absent"]
-                    .contains(&state.as_str()),
+                [
+                    "exact",
+                    "approximate, shared model",
+                    "shared",
+                    "primary only",
+                    "absent"
+                ]
+                .contains(&state.as_str()),
                 "{feature}: state {state:?}"
             );
         }
@@ -204,25 +304,35 @@ mod tests {
     #[test]
     fn every_lighting_feature_in_primary_and_the_reference_has_a_row_in_the_adrs_table() {
         let rows = table_rows();
-        for (name, source) in [
-            ("primary.wgsl", include_str!("shaders/primary.wgsl")),
-            ("pathtrace.wgsl", include_str!("shaders/pathtrace.wgsl")),
-        ] {
+        for (name, source) in [("PRIMARY", PRIMARY), ("PATHTRACE", PATHTRACE)] {
             let problems = lighting_problems(source, &rows);
-            assert!(problems.is_empty(), "{name}: {problems:?}");
+            assert!(problems.is_empty(), "{name}: {problems:#?}");
         }
-        // And Primary really names some: the check is not passing on an empty shader.
-        let named = include_str!("shaders/primary.wgsl")
-            .matches("// lighting:")
-            .count();
-        assert!(named >= 4, "{named}");
+        // And both really name some: the check is not passing on an empty shader.
+        for source in [PRIMARY, PATHTRACE] {
+            assert!(source.matches("// lighting:").count() >= 4);
+        }
     }
 
     #[test]
-    fn a_feature_primary_has_is_in_the_reference_unless_the_table_says_it_is_shared() {
+    fn every_shader_file_is_one_the_lighting_check_knows() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/shaders");
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let name = entry.unwrap().file_name().into_string().unwrap();
+            assert!(
+                FILES.contains(&name.as_str()),
+                "{name} is a new shader: join it to PRIMARY or PATHTRACE, which the lighting check \
+                 reads, or list it in FILES as one that lights nothing"
+            );
+        }
+    }
+
+    #[test]
+    fn a_feature_primary_has_is_in_the_reference_unless_the_table_says_otherwise() {
         // The table's rule for how a feature enters: in the same PR, the Reference view gets it, or
-        // the table marks it absent (and then Primary may not have it either, until it is
-        // exact or approximate with a shared model).
+        // the table says what it is: shared data, or Primary's alone (a stand-in the Reference does
+        // not have, and the views that show it are out of the gate). Absent is for features that
+        // neither view has, so Primary may not name one.
         let named = |source: &str| -> Vec<String> {
             source
                 .lines()
@@ -230,8 +340,8 @@ mod tests {
                 .map(|f| f.trim().to_lowercase())
                 .collect()
         };
-        let reference = named(include_str!("shaders/pathtrace.wgsl"));
-        for feature in named(include_str!("shaders/primary.wgsl")) {
+        let reference = named(PATHTRACE);
+        for feature in named(PRIMARY) {
             let state = table_rows()
                 .into_iter()
                 .find(|(row, _)| *row == feature)
@@ -242,7 +352,7 @@ mod tests {
                 "Primary has `{feature}`, which the table calls absent"
             );
             assert!(
-                state == "shared" || reference.contains(&feature),
+                state == "shared" || state == "primary only" || reference.contains(&feature),
                 "Primary has `{feature}` ({state}) and the Reference view does not"
             );
         }
@@ -257,15 +367,70 @@ mod tests {
             lighting_problems(ambient, &rows),
             ["`ambient occlusion` has no row in ADR 0005's table"]
         );
-        // A source of light that is read and not named.
-        let unmarked = "fn shade() {\n    return sky(dir);\n}";
-        assert_eq!(
-            lighting_problems(unmarked, &rows),
-            ["reads `sky(` and does not say `// lighting: sky and atmosphere`"]
-        );
         // The same with the name: it passes.
         let marked = "// lighting: Sky and atmosphere\nreturn sky(dir);";
         assert!(lighting_problems(marked, &rows).is_empty());
+    }
+
+    #[test]
+    fn a_source_of_light_read_without_its_comment_fails_the_check() {
+        let rows = table_rows();
+        let has = |source: &str, what: &str| {
+            let problems = lighting_problems(source, &rows);
+            assert!(
+                problems.iter().any(|p| p.contains(what)),
+                "{source:?} gives {problems:?}, not {what}"
+            );
+        };
+        // A read that is not marked.
+        has("fn f() {\n    return sky(dir);\n}", "reads `sky(`");
+        // A second, unmarked read of a source that the shader names elsewhere: the old check
+        // passed it, because the name was in the file.
+        has(
+            "// lighting: Sky and atmosphere\nlet a = sky(d);\nlet x = 1.0;\nlet y = 2.0;\nlet b = sky(e);",
+            "line 5: reads `sky(`",
+        );
+        // A read marked as another feature.
+        has(
+            "// lighting: Emissive Voxels\nlet a = sky(d);",
+            "reads `sky(`",
+        );
+        // A new ray: ambient occlusion, a shadow ray of another light.
+        has("fn shade() {\n    let ao = trace(r);\n}", "light is found");
+        has("let ao = trace(r);", "light is found");
+        // A constant term of Primary's light, the flat ambient.
+        has(
+            "fn shade() {\n    let k = 0.25;\n}",
+            "light is found or added",
+        );
+        // A term of the Reference's light.
+        has(
+            "fn radiance() {\n    light += vec3<f32>(0.1);\n}",
+            "light is found or added",
+        );
+        // A buffer of light: a radiance cache.
+        has(
+            "@group(1) @binding(9) var<storage, read_write> radiance_cache: array<vec4<f32>>;",
+            "the binding `radiance_cache`",
+        );
+        // The marked versions pass, and a name that only ends like a source does not count.
+        for fine in [
+            "// lighting: Ambient term\nlet k = 0.25;",
+            "// lighting: Geometry (LOD and what is loaded)\nlet h = trace(r);",
+            "let c = base_sky(d);",
+            "@group(1) @binding(3) var<storage, read_write> accum: array<vec4<f32>>;",
+        ] {
+            assert_eq!(
+                lighting_problems(fine, &rows),
+                Vec::<String>::new(),
+                "{fine}"
+            );
+        }
+        // Inside `shade`, one comment covers a line and the two after it, no more.
+        has(
+            "fn shade() {\n    // lighting: Ambient term\n    let a = 0.25;\n    let b = 1.0;\n    let c = 2.0;\n    let d = 3.0;\n}",
+            "line 6",
+        );
     }
 
     #[test]

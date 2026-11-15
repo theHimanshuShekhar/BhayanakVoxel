@@ -18,7 +18,7 @@ The 4-bounce cut the reference has today fails the rule: it loses up to 90 % of 
 
 ### Lighting features
 
-One row per lighting feature. **Exact** means unbiased. **Approximate, shared model** means both views read the same model and the reference integrates it without bias. **Shared** means both views use the same data and the reference does not judge it. **Absent** means neither view has it.
+One row per lighting feature. **Exact** means unbiased. **Approximate, shared model** means both views read the same model and the reference integrates it without bias. **Shared** means both views use the same data and the reference does not judge it. **Primary only** means Primary has a stand-in term that the reference does not have (the reference gets that light from its estimator), so the two differ by design and the views that show it are out of the Primary-against-reference gate. **Absent** means neither view has it.
 
 | Feature | State | Notes |
 |---|---|---|
@@ -26,6 +26,7 @@ One row per lighting feature. **Exact** means unbiased. **Approximate, shared mo
 | Emissive Voxels | exact | Sampled directly as lights, so a room lit by one emissive Voxel converges. |
 | Bounce light | exact | Followed until it fades by chance, with no fixed bounce count. The safety cap is a ledger row. |
 | Per-Voxel colour variation | exact | One function shared with Primary, a fixed function of the Voxel's position and `materials.toml`. A flat-colour mode remains for tests with a known exact answer. |
+| Ambient term | primary only | Primary adds a flat 0.25 of the surface's colour to its sun term, a stand-in for the light of the sky and of the bounces. The reference has no such term: it gets that light from the sky lookup and the bounce rays, so Primary's shadows are lighter than the reference's by design. It goes when Primary has a real source of that light. |
 | Sky and atmosphere | approximate, shared model | The placeholder gradient today. After [#53](https://github.com/theHimanshuShekhar/bhayanakvoxel/issues/53): the same lookup tables as Primary, a sun-free copy for rays that escape to the sky, and the same haze on the camera ray. The reference does not march through the air. |
 | Geometry (LOD and what is loaded) | shared | The reference traces the same loaded scene at the same levels as Primary in that frame. LOD and streaming are judged by the streaming bench and the LOD tests. |
 | Glossy reflections | absent | Must enter as exact. |
@@ -41,7 +42,7 @@ A PR that adds a lighting feature to Primary must, in the same PR, either add it
 
 | Approximation | Bound | Why it is accepted | Test |
 |---|---|---|---|
-| Path depth capped at 256 | at most 0.57 % (snow, albedo 0.98); about 0 elsewhere | A path among Materials of albedo 1 would never end. | The closed-box test with a known answer, in CI (#188): `crates/render/tests/estimator.rs`. |
+| Path depth capped at 256 | at most ρ^256 of the light in a sealed cavity, where ρ is the brightest channel of the cavity's surfaces (the colour function clamps every channel to 1, so ρ ≤ 1): 0.57 % at snow's 0.98, 0.00 % at 0.9. **For ρ = 1 it does not hold:** a Material with a channel at exactly 1.0 (the light Materials) gives ρ^256 = 1, so a cavity of such surfaces alone, with no opening, has no bound under 1 % (its true answer has no limit, and the cap gives 256 bounces of it). In an open scene a surface of ρ = 1 is bounded by the light that leaves: if a fraction e of bounce rays escapes at each bounce, the loss is at most (1 − e)^256, under 1 % when e is at least 1.8 %. | A path among Materials of albedo 1 would never end. | The closed-box test with a known answer, in CI (#188): `crates/render/tests/estimator.rs`, at albedo 0.9 and 0.98 to five standard errors of 0.46 %, and a depth cap of 190 put in fails it. ρ = 1 is not tested: it has no answer to compare with. |
 | No haze on bounce rays (after #53) | to be shown under 1 % by #53, or haze is added to bounce rays | Bounce rays near the ground are short against the scale of the air. | Set by #53. |
 
 ## Estimator

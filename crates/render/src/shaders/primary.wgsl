@@ -28,11 +28,12 @@ fn face_code(hit: Hit) -> u32 {
 
 // The light leaving the hit, towards the camera; `colour` is its surface_albedo.
 //
-// Every line that reads a source of light carries a `// lighting: <feature>` comment naming its
-// row in ADR 0005's table of lighting features, and a test (`shaders.rs`) fails when a feature
-// has no row, or when a line that reads one is not marked. A PR that adds a lighting feature here
-// adds it to the Reference view or marks it absent in that table (ADR 0005, "How a feature
-// enters").
+// Every read of a source of light, and every term of the light that is returned, carries a
+// `// lighting: <feature>` comment on its line or one of the two lines above it, naming its row
+// in ADR 0005's table of lighting features. A test (`shaders.rs`) fails when a feature has no
+// row, when a read is not marked, and when a new binding appears. A PR that adds a lighting
+// feature here adds it to the Reference view or marks it in that table (ADR 0005, "How a feature
+// enters"). One term to a line, so that one comment cannot cover two.
 fn shade(ray: Ray, hit: Hit, colour: vec3<f32>) -> vec3<f32> {
     if !hit.hit {
         // lighting: Sky and atmosphere
@@ -40,8 +41,12 @@ fn shade(ray: Ray, hit: Hit, colour: vec3<f32>) -> vec3<f32> {
     }
     // lighting: Sun and shadows
     let diffuse = max(dot(hit.normal, normalize(frame.sun.xyz)), 0.0);
+    // lighting: Ambient term
+    let ambient = 0.25;
+    // lighting: Sun and shadows
+    let lit = colour * (ambient + 0.75 * diffuse);
     // lighting: Emissive Voxels
-    return colour * (0.25 + 0.75 * diffuse) + emission(hit.material);
+    return lit + emission(hit.material);
 }
 
 @compute @workgroup_size(8, 8)
@@ -51,6 +56,7 @@ fn primary(@builtin(global_invocation_id) id: vec3<u32>) {
         return;
     }
     let ray = camera_ray(id.xy, size, frame.jitter.xy);
+    // lighting: Geometry (LOD and what is loaded)
     let hit = trace(ray);
     var colour = vec3<f32>(0.0);
     if hit.hit {

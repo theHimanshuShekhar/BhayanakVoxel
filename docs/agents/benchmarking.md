@@ -915,9 +915,10 @@ after. It runs on every `client bench` unless `--no-convergence`, after the cave
 client.exe bench --truth-spp 8192 --out bench-out
 ```
 
-That is the whole bench with the phase. It took about 5 minutes longer on the 4090 for each of three
-runs (the baseline of #187, in `docs/measurements.md`). With the default `--truth-spp 1024` it takes
-about 45 s (measured on the 4090: 44.0 s for both views); the `wall_s` of the report's `convergence`
+That is the whole bench with the phase. At `--truth-spp 8192` the phase took 146 s a run on the 4090
+with #188's estimator (about 5 minutes with the 4-bounce one, the baseline of #187; both in
+`docs/measurements.md`). With the default `--truth-spp 1024` it takes about 45 s (44.0 s for both
+views, measured on the 4090 before #188 and not measured again); the `wall_s` of the report's `convergence`
 block is the phase's wall-clock time. If the phase fails (a file it cannot write, say, or a panic),
 the bench warns on stderr, leaves the block null and still writes the rest of the report: the phase
 has no budget to fail.
@@ -1037,6 +1038,7 @@ their errors (the floor), and that a seed gives the same image every time.
   "budgets": { "source", "ok", "failed": ["primary/primary"], "unmatched": [] },
   "edits":   { ... } | null,                       // the Edit stress; null for --short
   "convergence": { "width", "height", "scene", "checkpoints", "truth_spp", "seeds", "flip",
+                   "flip_gamma22",
                    "lines", "min_line_over_floor", "folder", "csv", "wall_s",
                    "views": [ { "name", ...the view's camera and sun, "reference": STATS,
                                 "gpu_total": STATS, "ms_per_mpix_per_sample", "converged", "floor",
