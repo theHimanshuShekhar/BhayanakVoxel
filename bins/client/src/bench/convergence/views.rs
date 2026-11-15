@@ -192,15 +192,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_pit_floor_is_the_depth_below_the_lowest_rim_ground_and_the_box_above_it_is_air() {
-        // What it checks is the pit's construction, not #99's numbers: #99's `summary.json` is
-        // not kept anywhere (the throwaway branch has the code that wrote it, not its values), so
-        // its absolute `floor_y` and `voxels_dug` cannot be pinned. The code is the same formula.
+    fn the_pit_is_the_one_on_99_and_its_floor_is_the_depth_below_the_lowest_rim_ground() {
+        // #99's `summary.json` is not kept, but a reviewer ran `client bench --short` on #187 and
+        // its report matched it exactly. These are those values: if the generator, the patch or
+        // the pit's construction changes, the pit moves, and the docs would still call it #99's.
         let mut store = patch_store();
         let pit = dig_pit(&mut store);
-        assert_eq!(pit.floor_y, pit.rim_low_y - 40);
-        assert!(pit.rim_high_y >= pit.rim_low_y);
-        assert!(pit.voxels_dug > 40 * 60 * 40 / 2, "{}", pit.voxels_dug);
+        assert_eq!(
+            (pit.floor_y, pit.rim_low_y, pit.rim_high_y, pit.voxels_dug),
+            (1470, 1510, 1518, 110_281)
+        );
+        assert_eq!(pit.floor_y, pit.rim_low_y - PIT_DEPTH);
+        let view = super::pit();
+        assert_eq!(view.description.camera_from, [-40.0, 1538.0, 4.0]);
+        assert_eq!(view.description.camera_to, [-40.0, 1478.0, -45.0]);
         // Everything above the floor inside the box is air, the floor itself is not.
         for (x, z) in [(PIT_X.0, PIT_Z.0), (-40, -40), (PIT_X.1, PIT_Z.1)] {
             assert!(store.get(VoxelCoord([x, pit.floor_y + 1, z])).is_none());

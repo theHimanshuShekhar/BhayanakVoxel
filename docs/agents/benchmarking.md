@@ -65,7 +65,7 @@ release: a debug build's CPU side is slow enough to distort the frame times.
 | `--truth-spp N` | Samples of each of the convergence phase's two truths. Default 1024; ADR 0005's is 8192, which takes eight times as long (`client.exe bench --truth-spp 8192` is the 4090 baseline). At least 1024, the last checkpoint. |
 | `--no-fail` | Exit with status 0 even if a pass is over budget, a frame of the streaming mode has a hole, or a gate of the real-time mode is over. |
 
-It runs unattended and takes a minute or so (generating the whole Planet is about 22 s of it).
+It runs unattended. Without the convergence phase it takes a minute or so (generating the whole Planet is about 22 s of it); the convergence phase, on by default, adds about 45 s on the 4090 at the default `--truth-spp`, and more on a slower GPU or with a larger `--truth-spp`.
 The report is written to `DIR/report.json` and also printed on stdout; progress and a table go
 to stderr.
 
@@ -967,8 +967,9 @@ checkpoints; `extrapolated` along the last two, which is an estimate, not a meas
 `not-reached`), the GPU seconds that takes at the mean and at the p95 of one sample's time (`gpu_s`,
 `gpu_s_p95`), and `counts`: **a line counts in a view when it is at least 4 times the view's floor
 FLIP mean**. Where it does not, the view cannot tell that line from noise (on #99, FLIP 0.02 in the
-pit at 720p). Read a line that does not count as nothing, and `extrapolated` as a hint to raise
-`--truth-spp`'s checkpoints, not as a number to quote.
+pit at 720p). Read a line that does not count as nothing, and `extrapolated` as a sign that the curve
+had not reached the line by the last checkpoint (1024 samples, fixed; `--truth-spp` does not move
+the checkpoints), so the number is an estimate to look into, not one to quote.
 
 **The files.** `convergence.csv` has the curve for plotting: `view`, `samples`, `gpu_s`,
 `flip_mean`, `flip_p99`, `mse_linear`, `mse_linear_run_only`, and the view's floor
