@@ -27,6 +27,12 @@
 //! adds where the camera is going. [`Reach::class`] says which of the three (drawn, margin,
 //! prefetch) wants a brick's children, which is the order the loader works in.
 //!
+//! **The horizon cap** ([`Horizon`], ADR 0004, #146) is the other limit of what is refined: a brick is
+//! split, drawn or wanted resident only if some place the camera can be seen from could see a
+//! part of it. Nothing beyond the Planet's horizon can be seen, so a brick that is past it is
+//! drawn whole at the coarse level that holds it, or not at all, and the store never makes its
+//! children. The Guard is not evicted whatever the cap says.
+//!
 //! **Coarsening** ([`Bands::coarsened`]) is the last resort at the memory cap: the farthest bands
 //! use a larger bias, so that fewer bricks are drawn and wanted.
 
@@ -225,6 +231,115 @@ impl Margins {
     }
 }
 
+/// How much further than the horizon what is wanted resident reaches, with a radial margin (the
+/// owner's decision of 2026-11-14, #146). The margin's own 1.25 is not enough for a climb: the
+/// horizon moves out a hundred metres for each metre the camera rises, and a vertical take-off at
+/// 48 m/s had 218 of 359 frames with soft misses at 1.25 and none at 1.75 (`docs/measurements.md`).
+/// With no radial margin the residency is what is drawn.
+pub const HORIZON_RADIAL: f64 = 1.75;
+
+/// The horizon cap (ADR 0004, #146): what the Planet hides from a camera above it.
+///
+/// The Planet is a sphere of `radius` Voxels about the origin of the frame: sea level. The ground
+/// is nowhere under it (the land is at sea level or above, and the sea is a Material as far as
+/// the renderer goes), so a line that crosses the sphere has the ground, or the sea, in front of
+/// whatever is past it, and the sphere is an occluder. Two points, `c` and `r` from the centre,
+/// see each other only if the distance between them is at most
+/// `sqrt(c² - R²) + sqrt(r² - R²)`, the two [`Horizon::tangent`]s, which is the line that grazes
+/// the sphere and the longest that does not cross it. So a brick whose box is `d` from the
+/// camera, and whose highest point is `r` from the centre, can be seen only if
+/// `d <= tangent(c) + tangent(r)`: the brick's own height is in it, so that a peak is seen from
+/// beyond the sea's horizon, and a view over a ridge keeps what it looks at.
+///
+/// A brick that cannot be seen from the camera raised by the vertical margin cannot be seen
+/// from the camera, which is below it, so what is drawn is what the raised camera could see:
+/// the margin is the part of the horizon that a climb brings in the first 20 m. Residency
+/// ([`Class::Margin`] and [`Class::Prefetch`]) reaches [`HORIZON_RADIAL`] times further, and
+/// from the places that prefetch looks at as well ([`Placed::in_cap_wanted`]).
+///
+/// A camera that is not above the sphere (under the sea, or dug into the Planet) is not
+/// shadowed by it: it has no cap, and everything is as the bands say.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Horizon {
+    /// Sea level's distance from the centre of the Planet, in Voxels.
+    pub radius: f64,
+}
+
+impl Horizon {
+    /// The cap of a Planet whose sea level is `radius` Voxels from its centre.
+    pub fn new(radius: f64) -> Self {
+        assert!(radius > 0.0 && radius.is_finite(), "radius is {radius}");
+        Self { radius }
+    }
+
+    /// The length of the line from a point `r` from the centre that touches the sphere, which is
+    /// how far it sees along the ground: 0 for a point on or under it.
+    #[inline]
+    pub fn tangent(&self, r: f64) -> f64 {
+        (r * r - self.radius * self.radius).max(0.0).sqrt()
+    }
+}
+
+/// The horizon cap seen from one camera, for one of the two reaches that [`Placed`] gives it (what is
+/// drawn, and what is wanted resident). A brick whose box is `d` from the camera and whose highest
+/// point is `top` from the centre is in it if `hold · (radial · tangent(top) + a) - d` is not
+/// negative, with `hold` 1 for a brick that is out and `1 + HYSTERESIS` for one that is in, which is
+/// what [`Cap::margin`] says.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Cap {
+    radius: f64,
+    /// The factor on the horizon: 1 for what is drawn, [`HORIZON_RADIAL`] for what is wanted.
+    radial: f64,
+    /// `radial · tangent` of the place the cap is seen from, for the farthest of the places, and its
+    /// distance from the camera: what the cap reaches that does not depend on the brick.
+    a: f64,
+    /// The lowest altitude, over the sphere, of the places the cap is seen from, in Voxels (0 if
+    /// one is not above it).
+    low: f64,
+}
+
+impl Cap {
+    fn tangent(&self, r: f64) -> f64 {
+        (r * r - self.radius * self.radius).max(0.0).sqrt()
+    }
+
+    /// How far inside the cap a brick is, in Voxels: negative outside.
+    #[inline]
+    fn margin(&self, top: f64, distance: f64, was: bool) -> f64 {
+        let hold = if was { 1.0 + HYSTERESIS } else { 1.0 };
+        hold * (self.radial * self.tangent(top) + self.a) - distance
+    }
+
+    /// How far the camera can go (its path, and the places that prefetch looks at, which count as
+    /// path too) before a brick that is `margin` inside the cap could be on the other side of it:
+    /// a lower bound.
+    ///
+    /// A unit of path moves the margin by at most `1 + hold · (radial · t' + 1)`, where `t'`, the
+    /// growth of a tangent length with altitude (`(R + h) / t(h)`), is the steeper the nearer the
+    /// ground: a hundred and more at 20 m over a Planet of 320 km, so a climb of a metre
+    /// brings the horizon in by a hundred. The tangent length is concave in the altitude, so
+    /// its slope at the lowest place's altitude is the bound while the path stays above half of it
+    /// (`near`); and it is subadditive, so a climb of `x` adds no more than `t(x)` whatever the
+    /// altitude it starts at (`far`), which is what bounds a brick that is far from the edge.
+    fn slack(&self, margin: f64) -> f64 {
+        let hold = 1.0 + HYSTERESIS;
+        let margin = margin.abs();
+        // The altitude of a place moves with the camera's, and a little more (the up it is raised
+        // along turns): 0.1% is more than 1 + 400 / 6 400 000.
+        const EXTRA: f64 = 1.001;
+        let half = self.radius + self.low / 2.0;
+        let slope_of_tangent = half / self.tangent(half).max(f64::MIN_POSITIVE);
+        let slope = 1.0 + hold * (self.radial * slope_of_tangent + 1.0);
+        let near = (margin / (slope * EXTRA)).min(self.low / 2.0 / EXTRA);
+        // Half of the margin for the tangent, half for the rest of the path: the tangent grows by
+        // `g` in a climb of `x(g)`.
+        let g = margin / (2.0 * hold * self.radial);
+        let climb = g * g / ((self.radius * self.radius + g * g).sqrt() + self.radius);
+        let far = (climb / EXTRA).min(margin / (2.0 * (1.0 + hold) * EXTRA));
+        near.max(far).max(0.0)
+    }
+}
+
 /// Places that prefetch looks at, along the camera's velocity: [`Reach::ahead`] holds this many.
 pub const AHEAD: usize = 2;
 
@@ -246,6 +361,8 @@ pub enum Class {
 pub struct Reach {
     pub margins: Margins,
     pub ahead: [Option<[f64; 3]>; AHEAD],
+    /// The horizon cap, if there is one (see [`Horizon`]).
+    pub horizon: Option<Horizon>,
 }
 
 impl Reach {
@@ -253,11 +370,13 @@ impl Reach {
     pub const NONE: Reach = Reach {
         margins: Margins::NONE,
         ahead: [None; AHEAD],
+        horizon: None,
     };
 
-    /// Whether this asks for nothing beyond the bands.
+    /// Whether this asks for nothing beyond the bands: no margins and no lead. (The horizon cap
+    /// takes away from what the bands ask for, and is not asked about here.)
     pub fn is_none(&self) -> bool {
-        *self == Reach::NONE
+        self.margins == Margins::NONE && self.ahead == [None; AHEAD]
     }
 
     /// Whether the margins ask for anything beyond the bands.
@@ -277,14 +396,64 @@ impl Reach {
         std::array::from_fn(|a| camera[a] + up[a] * self.margins.vertical)
     }
 
+    /// How high the raised camera is above the sphere of the horizon cap, in Voxels, if there is a
+    /// horizon: the cap is on while this is above nothing.
+    pub fn height(&self, camera: [f64; 3]) -> Option<f64> {
+        let horizon = self.horizon?;
+        let raised = self.raised(camera);
+        Some(raised.iter().map(|c| c * c).sum::<f64>().sqrt() - horizon.radius)
+    }
+
     /// This reach seen from `camera`, with the raised camera worked out once for the many bricks
     /// that are asked about.
     pub fn from(&self, camera: [f64; 3]) -> Placed {
+        let raised = self.raised(camera);
+        let (drawn, wanted) = self.caps(camera, raised);
         Placed {
             reach: *self,
             camera,
-            raised: self.raised(camera),
+            raised,
+            drawn,
+            wanted,
         }
+    }
+
+    /// The caps of what is drawn and of what is wanted resident, from `camera` and the places it
+    /// is raised to: none if there is no horizon, or the raised camera is not above the sphere.
+    fn caps(&self, camera: [f64; 3], raised: [f64; 3]) -> (Option<Cap>, Option<Cap>) {
+        let Some(horizon) = self.horizon else {
+            return (None, None);
+        };
+        let norm = |p: [f64; 3]| p.iter().map(|c| c * c).sum::<f64>().sqrt();
+        let height = norm(raised) - horizon.radius;
+        if height <= 0.0 {
+            return (None, None);
+        }
+        let from_camera = |p: [f64; 3]| norm(std::array::from_fn(|a| p[a] - camera[a]));
+        let cap = |radial: f64, a: f64, low: f64| Cap {
+            radius: horizon.radius,
+            radial,
+            a,
+            low,
+        };
+        let drawn = cap(
+            1.0,
+            horizon.tangent(norm(raised)) + from_camera(raised),
+            height,
+        );
+        let radial = if self.margins.radial > 1.0 {
+            HORIZON_RADIAL.max(self.margins.radial)
+        } else {
+            1.0
+        };
+        let place = |p: [f64; 3]| radial * horizon.tangent(norm(p)) + from_camera(p);
+        let (mut a, mut low) = (place(raised), height);
+        for &at in self.ahead.iter().flatten() {
+            let at = self.raised(at);
+            a = a.max(place(at));
+            low = low.min(norm(at) - horizon.radius);
+        }
+        (Some(drawn), Some(cap(radial, a, low.max(0.0))))
     }
 
     /// [`Placed::distance`], for one brick.
@@ -311,9 +480,71 @@ pub struct Placed {
     reach: Reach,
     camera: [f64; 3],
     raised: [f64; 3],
+    /// The horizon cap of what is drawn, and of what is wanted resident (see [`Horizon`]).
+    drawn: Option<Cap>,
+    wanted: Option<Cap>,
 }
 
 impl Placed {
+    /// The camera.
+    pub fn camera(&self) -> [f64; 3] {
+        self.camera
+    }
+
+    /// Whether the horizon cap is on: there is one, and the camera raised is above its sphere.
+    pub fn has_cap(&self) -> bool {
+        self.drawn.is_some()
+    }
+
+    /// Whether the horizon cap leaves the brick at `coord` of `level` in what is drawn: the camera
+    /// raised by the vertical margin could see a part of it. `was` is whether it was in already:
+    /// it is held in until the camera is [`HYSTERESIS`] past. Always true with no cap.
+    #[inline]
+    pub fn in_cap(&self, level: usize, coord: BrickCoord, was: bool) -> bool {
+        self.in_cap_at(level, coord, brick_distance(self.camera, level, coord), was)
+    }
+
+    /// [`Placed::in_cap`] for a brick that is `distance` from the camera.
+    #[inline]
+    pub fn in_cap_at(&self, level: usize, coord: BrickCoord, distance: f64, was: bool) -> bool {
+        self.drawn
+            .is_none_or(|cap| cap.margin(brick_top(level, coord), distance, was) >= 0.0)
+    }
+
+    /// How far the camera can go before [`Placed::in_cap_at`] could say otherwise, in Voxels (the
+    /// path of the camera, and of the places that prefetch looks at): infinite with no cap.
+    pub fn cap_slack(&self, level: usize, coord: BrickCoord, distance: f64, was: bool) -> f64 {
+        self.drawn.map_or(f64::INFINITY, |cap| {
+            cap.slack(cap.margin(brick_top(level, coord), distance, was))
+        })
+    }
+
+    /// [`Placed::in_cap`] for what is wanted resident: the horizon of the camera raised and of the
+    /// places it is going to, times [`HORIZON_RADIAL`].
+    #[inline]
+    pub fn in_cap_wanted(&self, level: usize, coord: BrickCoord, was: bool) -> bool {
+        self.wanted.is_none_or(|cap| {
+            cap.margin(
+                brick_top(level, coord),
+                brick_distance(self.camera, level, coord),
+                was,
+            ) >= 0.0
+        })
+    }
+
+    /// [`Placed::cap_slack`] for what is wanted resident.
+    pub fn cap_slack_wanted(
+        &self,
+        level: usize,
+        coord: BrickCoord,
+        distance: f64,
+        was: bool,
+    ) -> f64 {
+        self.wanted.map_or(f64::INFINITY, |cap| {
+            cap.slack(cap.margin(brick_top(level, coord), distance, was))
+        })
+    }
+
     /// Whether the reach asks for nothing beyond the bands.
     pub fn is_none(&self) -> bool {
         self.reach.is_none()
@@ -339,12 +570,17 @@ impl Placed {
 
     /// Who wants the children of the brick at `coord` of `level`, with the bands applied as
     /// [`Bands::split`] does to a brick that is split already (it stays wanted until the camera is
-    /// [`HYSTERESIS`] past the boundary). `None` if nothing does.
+    /// [`HYSTERESIS`] past the boundary). `None` if nothing does. The bands do not split a brick
+    /// that the horizon cap leaves out (nothing could see what is under it, so it is drawn whole,
+    /// or not at all), and the margin and the lead do not want what is outside their own, wider cap.
     pub fn class(&self, bands: Bands, level: usize, coord: BrickCoord) -> Option<Class> {
         let reach = &self.reach;
         let drawn = brick_distance(self.camera, level, coord);
-        if bands.split(level, drawn, Some(true)) {
+        if bands.split(level, drawn, Some(true)) && self.in_cap_at(level, coord, drawn, true) {
             return Some(Class::Drawn);
+        }
+        if !self.in_cap_wanted(level, coord, true) {
+            return None;
         }
         if reach.has_margins() {
             let mut near = drawn;
@@ -362,6 +598,20 @@ impl Placed {
             .any(|&at| bands.split(level, brick_distance(at, level, coord), Some(true)))
             .then_some(Class::Prefetch)
     }
+}
+
+/// The distance from the centre of the Planet (the origin of the frame) to the farthest point of
+/// the box of the brick at `coord` of mip `level`: how high the brick reaches, for the horizon cap.
+#[inline]
+pub fn brick_top(level: usize, coord: BrickCoord) -> f64 {
+    let size = (8u64 << level) as f64;
+    let mut sum = 0.0;
+    for &b in &coord.0 {
+        let low = f64::from(b) * size;
+        let far = low.abs().max((low + size).abs());
+        sum += far * far;
+    }
+    sum.sqrt()
 }
 
 /// The distance from `camera`, a position in Voxels, to the nearest point of the box of the
@@ -584,6 +834,7 @@ mod tests {
                 vertical: 0.0,
             },
             ahead: [Some([1000.0, 0.0, 0.0]), None],
+            horizon: None,
         };
         let camera = [0.0, 0.0, 0.0];
         let at = |x: i32| BrickCoord([x, 0, 0]);
@@ -630,6 +881,7 @@ mod tests {
                 vertical: 400.0,
             },
             ahead: [None; AHEAD],
+            horizon: None,
         };
         // On the +x axis the radial up is +x.
         let up = reach.raised([5000.0, 0.0, 0.0]);
@@ -641,5 +893,238 @@ mod tests {
         assert!((plain - raised - 400.0).abs() < 1e-9, "{plain} {raised}");
         // At the origin there is no up to take: a fixed one is used instead of a NaN.
         assert!(reach.raised([0.0; 3]).iter().all(|c| c.is_finite()));
+    }
+
+    /// The Planet of the client: 320 km of 5 cm Voxels.
+    const SEA: f64 = 320_000.0 * VOXELS_PER_METRE;
+
+    fn capped(vertical: f64) -> Reach {
+        Reach {
+            margins: Margins {
+                radial: 1.25,
+                vertical,
+            },
+            ahead: [None; AHEAD],
+            horizon: Some(Horizon::new(SEA)),
+        }
+    }
+
+    #[test]
+    fn the_horizon_is_a_kilometre_and_a_tenth_from_the_ground_of_320_km() {
+        let horizon = Horizon::new(SEA);
+        // 2 m up: sqrt(2 R h) = 1131 m. 20 m up: 3578 m.
+        let metres = |up: f64| horizon.tangent(SEA + up * VOXELS_PER_METRE) / VOXELS_PER_METRE;
+        assert!((metres(2.0) - 1131.4).abs() < 0.5, "{}", metres(2.0));
+        assert!((metres(20.0) - 3577.7).abs() < 1.0, "{}", metres(20.0));
+        assert_eq!(horizon.tangent(SEA - 10.0), 0.0);
+    }
+
+    #[test]
+    fn a_brick_is_in_the_cap_by_how_far_it_and_the_camera_see_along_the_ground() {
+        // A camera 2 m up (the vertical margin raises it 20 m: the horizon is 3.6 km), on the +y
+        // axis. A brick on the ground a distance `along` away.
+        let reach = capped(20.0 * VOXELS_PER_METRE);
+        let camera = [0.0, SEA + 2.0 * VOXELS_PER_METRE, 0.0];
+        let at = reach.from(camera);
+        assert!(at.has_cap());
+        let on_the_ground = |metres: f64| {
+            let angle = metres * VOXELS_PER_METRE / SEA;
+            BrickCoord([
+                (SEA * angle.sin() / 8.0) as i32,
+                (SEA * angle.cos() / 8.0) as i32,
+                0,
+            ])
+        };
+        // The raised camera, 22 m up, sees 3.75 km along the ground (and 20 m of the distance is
+        // the way up), and the brick's own height, 0.25 m, adds 0.4 km: 4.17 km. 3 km on: in. 4.6
+        // km on: out.
+        assert!(at.in_cap(0, on_the_ground(3000.0), false));
+        assert!(!at.in_cap(0, on_the_ground(4600.0), false));
+        // A brick that was in is held in until the camera is a twentieth further.
+        assert!(!at.in_cap(0, on_the_ground(4250.0), false));
+        assert!(at.in_cap(0, on_the_ground(4250.0), true));
+        // A ridge: the same place 400 m up is seen from 22 km further (sqrt(2 R 400 m) = 16 km).
+        let on_a_ridge = {
+            let angle = 15_000.0 * VOXELS_PER_METRE / SEA;
+            let r = SEA + 400.0 * VOXELS_PER_METRE;
+            BrickCoord([
+                (r * angle.sin() / 8.0) as i32,
+                (r * angle.cos() / 8.0) as i32,
+                0,
+            ])
+        };
+        assert!(at.in_cap(0, on_a_ridge, false));
+        // The camera under the sea has no cap, and neither has a reach with no horizon.
+        assert!(!reach.from([0.0, SEA - 3000.0, 0.0]).has_cap());
+        assert!(
+            Reach::NONE
+                .from(camera)
+                .in_cap(0, on_the_ground(500_000.0), false)
+        );
+    }
+
+    #[test]
+    fn what_the_cap_wants_resident_reaches_further_than_what_is_drawn_and_covers_it() {
+        let reach = capped(20.0 * VOXELS_PER_METRE);
+        let camera = [0.0, SEA + 2.0 * VOXELS_PER_METRE, 0.0];
+        let at = reach.from(camera);
+        let on_the_ground = |metres: f64| {
+            let angle = metres * VOXELS_PER_METRE / SEA;
+            BrickCoord([
+                (SEA * angle.sin() / 8.0) as i32,
+                (SEA * angle.cos() / 8.0) as i32,
+                0,
+            ])
+        };
+        // Drawn out to 4.17 km, wanted out to 1.75 times the raised camera's tangent and the
+        // brick's (about 7 km), and never less than what is drawn.
+        for metres in (0..8000).step_by(50) {
+            let brick = on_the_ground(f64::from(metres));
+            assert!(
+                at.in_cap_wanted(0, brick, false) || !at.in_cap(0, brick, false),
+                "{metres}"
+            );
+        }
+        assert!(!at.in_cap(0, on_the_ground(4700.0), false));
+        assert!(at.in_cap_wanted(0, on_the_ground(4700.0), false));
+        assert!(at.in_cap_wanted(0, on_the_ground(6000.0), false));
+        assert!(!at.in_cap_wanted(0, on_the_ground(9000.0), false));
+    }
+
+    #[test]
+    fn the_camera_cannot_change_a_bricks_side_of_the_cap_in_less_than_its_slack() {
+        // Random bricks about a random camera over the Planet, at every height from 2 m to 100 km:
+        // go the slack in random directions, and in the two that matter, straight up and straight
+        // down, and the brick is where it was, drawn and wanted.
+        let reach = capped(20.0 * VOXELS_PER_METRE);
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move || {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (state >> 11) as f64 / (1u64 << 53) as f64
+        };
+        let mut checked = 0;
+        for _ in 0..4000 {
+            let up = 40.0 * 2f64.powf(next() * 15.0);
+            let tilt = next() * 0.2;
+            let direction = |a: f64, b: f64| {
+                let v = [a.sin() * b.cos(), a.cos(), a.sin() * b.sin()];
+                let n = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+                v.map(|c| c / n)
+            };
+            let up_dir = direction(tilt, next() * std::f64::consts::TAU);
+            let camera = up_dir.map(|c| c * (SEA + up));
+            let at = reach.from(camera);
+            // A brick about as far as the cap reaches.
+            let level = (next() * 6.0) as usize;
+            let reachable = at.cap_slack(level, BrickCoord([0, 0, 0]), 0.0, false);
+            let _ = reachable;
+            let angle =
+                (next() * 2.0 - 1.0) * (reach.height(camera).unwrap_or(0.0) / SEA).sqrt() * 3.0
+                    + tilt;
+            let spot = direction(angle.abs().max(1e-9), next() * std::f64::consts::TAU);
+            let r = SEA + (next() * 2.0 - 0.2) * 5000.0 * VOXELS_PER_METRE;
+            let size = (8u64 << level) as f64;
+            let coord = BrickCoord(spot.map(|c| (c * r / size).floor() as i32));
+            let d = brick_distance(camera, level, coord);
+            for was in [false, true] {
+                let now = (
+                    at.in_cap(level, coord, was),
+                    at.in_cap_wanted(level, coord, was),
+                );
+                let slack = at
+                    .cap_slack(level, coord, d, was)
+                    .min(at.cap_slack_wanted(level, coord, d, was));
+                if !slack.is_finite() || slack > 1.0e7 {
+                    continue;
+                }
+                checked += 1;
+                for step in [
+                    up_dir,
+                    up_dir.map(|c| -c),
+                    direction(
+                        next() * std::f64::consts::PI,
+                        next() * std::f64::consts::TAU,
+                    ),
+                ] {
+                    let moved: [f64; 3] =
+                        std::array::from_fn(|a| camera[a] + step[a] * slack * 0.999);
+                    let after = reach.from(moved);
+                    // Down under the sea the cap is off, which the selection looks at on its own.
+                    if !after.has_cap() {
+                        continue;
+                    }
+                    // The brick's distance changed, and so must be asked of the new camera.
+                    let state = (
+                        after.in_cap(level, coord, was),
+                        after.in_cap_wanted(level, coord, was),
+                    );
+                    assert_eq!(
+                        state,
+                        now,
+                        "level {level} {coord:?} was {was}: slack {slack} at {up} up; margin {:?} then {:?}, step {step:?}, d {d} then {}",
+                        at.drawn.map(|c| c.margin(brick_top(level, coord), d, was)),
+                        after.drawn.map(|c| c.margin(
+                            brick_top(level, coord),
+                            brick_distance(moved, level, coord),
+                            was
+                        )),
+                        brick_distance(moved, level, coord)
+                    );
+                }
+            }
+        }
+        assert!(checked > 2000, "{checked}");
+    }
+
+    #[test]
+    fn nothing_that_a_camera_can_see_is_outside_the_cap_whatever_the_ridge_or_the_height() {
+        // Random cameras over the Planet (2 m to 20 km up, and under the 20 m of the margin: the
+        // cap is for the raised camera) and random points of the ground and above it (peaks of
+        // 0 to 600 m), at every bearing and range: if the segment between them does not cross the
+        // sphere of the sea, the brick at that point, at every level, is in the cap.
+        let reach = capped(20.0 * VOXELS_PER_METRE);
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = move || {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (state >> 11) as f64 / (1u64 << 53) as f64
+        };
+        let unit = |a: f64, b: f64| [a.sin() * b.cos(), a.cos(), a.sin() * b.sin()];
+        let mut seen = 0;
+        for _ in 0..20_000 {
+            let up = 2.0 * VOXELS_PER_METRE * 10f64.powf(next() * 4.0);
+            let camera = unit(next() * 0.1, next() * std::f64::consts::TAU).map(|c| c * (SEA + up));
+            let at = reach.from(camera);
+            let peak = next() * 600.0 * VOXELS_PER_METRE;
+            // Range of the line of sight at most, about, so most of them see the point.
+            let range = (2.0 * SEA * (up + peak)).sqrt() * 1.2 * next();
+            let direction = unit((range / SEA).max(1e-9), next() * std::f64::consts::TAU);
+            let point = direction.map(|c| c * (SEA + peak));
+            // The distance from the centre of the nearest point of the segment from the camera.
+            let along: [f64; 3] = std::array::from_fn(|a| point[a] - camera[a]);
+            let length2 = along.iter().map(|v| v * v).sum::<f64>();
+            let t = (-camera.iter().zip(&along).map(|(c, a)| c * a).sum::<f64>() / length2)
+                .clamp(0.0, 1.0);
+            let nearest: f64 = (0..3)
+                .map(|a| (camera[a] + along[a] * t).powi(2))
+                .sum::<f64>()
+                .sqrt();
+            if nearest < SEA {
+                continue;
+            }
+            seen += 1;
+            for level in 0..6 {
+                let size = (8u64 << level) as f64;
+                let coord = BrickCoord(point.map(|c| (c / size).floor() as i32));
+                assert!(
+                    at.in_cap(level, coord, false),
+                    "level {level}, {up} up, point {peak} high at {range}"
+                );
+            }
+        }
+        assert!(seen > 5_000, "{seen}");
     }
 }
