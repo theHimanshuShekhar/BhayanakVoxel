@@ -20,11 +20,12 @@
 struct Post {
     // The source image's size in pixels, then the bloom images' (a quarter, rounded up).
     sizes: vec4<u32>,
-    // 1 if the stage is on: the tone curve, auto-exposure, bloom; then 1 if the image holds a debug
-    // view's colours, which are already encoded and are copied as they are.
+    // The tone curve (0 off, 1 Neutral, 2 AgX, 3 Neutral desaturated); 1 if auto-exposure is on;
+    // 1 if bloom is; then 1 if the image holds a debug view's colours, which are already encoded
+    // and are copied as they are.
     stages: vec4<u32>,
     // How much of the bloom is added; the adaptation rate k (1 sets the exposure at once); 1 if the
-    // exposure is held as it is; one unused.
+    // exposure is held as it is; the share of colour that curve 3 keeps.
     params: vec4<f32>,
     // The three bloom blurs' standard deviations, in pixels of the bloom images; one unused.
     sigmas: vec4<f32>,
@@ -229,6 +230,30 @@ fn neutral(colour: vec3<f32>) -> vec3<f32> {
     return mix(c, vec3<f32>(new_peak), g);
 }
 
+// The prototype's AgX-like curve (Sobotka's, in the polynomial form of Wrensch), as it rendered the
+// look-dev sheet (#200). Its result is already display-encoded.
+fn agx(colour: vec3<f32>) -> vec3<f32> {
+    let agx_in = mat3x3<f32>(
+        vec3<f32>(0.842479, 0.04232824, 0.04237565),
+        vec3<f32>(0.0784336, 0.8784686, 0.0784336),
+        vec3<f32>(0.07922374, 0.07916613, 0.87914297),
+    );
+    let agx_out = mat3x3<f32>(
+        vec3<f32>(1.1968790, -0.05289685, -0.05297164),
+        vec3<f32>(-0.09802088, 1.1519031, -0.09804345),
+        vec3<f32>(-0.09902974, -0.09896118, 1.1510737),
+    );
+    let min_ev = -12.47393;
+    let max_ev = 4.026069;
+    let v = agx_in * max(colour, vec3<f32>(1e-10));
+    let x = (clamp(log2(v), vec3<f32>(min_ev), vec3<f32>(max_ev)) - min_ev) / (max_ev - min_ev);
+    let x2 = x * x;
+    let x4 = x2 * x2;
+    let curve = 15.5 * x4 * x2 - 40.14 * x4 * x + 31.96 * x4 - 6.868 * x2 * x + 0.4298 * x2
+        + 0.1191 * x - 0.00232;
+    return clamp(agx_out * curve, vec3<f32>(0.0), vec3<f32>(1.0));
+}
+
 // Linear colour to the image's sRGB-encoded values with the true curve, clamped to 0..1 (the same
 // as `encode` in common.wgsl, which the kernels use; this file is a module of its own).
 fn encode_srgb(linear: vec3<f32>) -> vec3<f32> {
@@ -255,8 +280,16 @@ fn tone(@builtin(global_invocation_id) id: vec3<u32>) {
     if post.stages.y != 0u {
         colour *= exposure_state[1];
     }
+    if post.stages.x == 2u {
+        textureStore(shown, id.xy, vec4<f32>(agx(max(colour, vec3<f32>(0.0))), 1.0));
+        return;
+    }
     if post.stages.x != 0u {
         colour = neutral(max(colour, vec3<f32>(0.0)));
+    }
+    if post.stages.x == 3u {
+        let luminance = dot(colour, vec3<f32>(0.2126, 0.7152, 0.0722));
+        colour = vec3<f32>(luminance) + (colour - vec3<f32>(luminance)) * post.params.w;
     }
     textureStore(shown, id.xy, vec4<f32>(encode_srgb(colour), 1.0));
 }

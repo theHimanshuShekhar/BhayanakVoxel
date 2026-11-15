@@ -642,6 +642,34 @@ impl Offscreen {
         self.profiler.collect(&self.device, true);
     }
 
+    /// Shows the Reference view's mean so far again, under the current [`Stages`](crate::Stages)
+    /// and with the exposure it has (held, not metered again), and reads it back. The mean is not
+    /// touched: the tone curve is only a way of showing it, so one accumulation can be seen
+    /// through every curve.
+    pub fn reshow_reference(&mut self) -> Image {
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        self.profiler.begin_frame();
+        self.tracer.encode_reference_post(
+            &self.device,
+            &self.queue,
+            &mut self.profiler,
+            &mut encoder,
+            &self.target,
+            crate::post::REFERENCE_METERED_UP_TO,
+        );
+        self.profiler.resolve(&mut encoder);
+        self.queue.submit([encoder.finish()]);
+        self.profiler.collect(&self.device, true);
+        let size = self.target.reference_size();
+        let texture = self.target.reference().texture.clone();
+        let encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        self.read_image(encoder, &texture, size)
+    }
+
     /// The most samples one dispatch of the Reference view may take at the size it is traced at
     /// ([`crate::batch::max_samples`]).
     pub fn max_batch_samples(&self) -> u32 {

@@ -48,7 +48,7 @@ pub use camera::Camera;
 pub use debug_view::DebugView;
 pub use look::Look;
 pub use offscreen::{DrawTimes, FrameDrawn, GpuInfo, GpuPasses, Image, Offscreen, UpdateTimes};
-pub use post::Stages;
+pub use post::{NormalBias, Stages, ToneCurve};
 pub use profiler::Profiler;
 pub use scene::{
     Lengths, PatchCopy, Rebuild, RingPatch, RingsFull, Room, Scene, SceneUpdate, UploadCost,

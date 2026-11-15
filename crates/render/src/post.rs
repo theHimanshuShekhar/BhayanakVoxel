@@ -52,8 +52,12 @@ const EXPOSURE_TILE: u32 = 16;
 /// The stages of the art direction that can be switched off, for comparison. All on is the game.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Stages {
-    /// The Khronos PBR Neutral tone curve. Off, light above 1 is white, as before #202.
+    /// The tone curve ([`Stages::curve`]). Off, light above 1 is white, as before #202.
     pub tone: bool,
+    /// Which tone curve, when the stage is on. Neutral is the game's until the owner picks.
+    pub curve: ToneCurve,
+    /// How the smooth normals are kept to the face's side. Face (0.25) is the game's.
+    pub normal_bias: NormalBias,
     /// Auto-exposure. Off, the exposure is 1.
     pub exposure: bool,
     pub bloom: bool,
@@ -65,6 +69,8 @@ impl Stages {
     /// Every stage off: what the renderer drew before #202, bar the light's palette.
     pub const NONE: Stages = Stages {
         tone: false,
+        curve: ToneCurve::Neutral,
+        normal_bias: NormalBias::Face,
         exposure: false,
         bloom: false,
         smooth_normals: false,
@@ -75,11 +81,136 @@ impl Default for Stages {
     fn default() -> Self {
         Self {
             tone: true,
+            curve: ToneCurve::Neutral,
+            normal_bias: NormalBias::Face,
             exposure: true,
             bloom: true,
             smooth_normals: true,
         }
     }
+}
+
+/// The tone curves the look-dev sheet compares (the owner's pick of the combination is still to
+/// come, #202). The game's is [`ToneCurve::Neutral`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ToneCurve {
+    /// Khronos PBR Neutral, then the sRGB curve.
+    Neutral,
+    /// The prototype's AgX-like curve, which is the display-encoded image itself.
+    Agx,
+    /// Neutral, then [`NEUTRAL_DESAT_KEPT`] of its colourfulness in linear light, then sRGB.
+    NeutralDesat,
+}
+
+impl ToneCurve {
+    pub const ALL: [ToneCurve; 3] = [ToneCurve::Neutral, ToneCurve::Agx, ToneCurve::NeutralDesat];
+
+    pub fn slug(self) -> &'static str {
+        match self {
+            ToneCurve::Neutral => "neutral",
+            ToneCurve::Agx => "agx",
+            ToneCurve::NeutralDesat => "neutral-desat",
+        }
+    }
+
+    pub fn from_slug(slug: &str) -> Option<ToneCurve> {
+        Self::ALL.into_iter().find(|c| c.slug() == slug)
+    }
+
+    /// What the display transform shows of the linear, exposed `colour` (the CPU twin of `tone` in
+    /// `post.wgsl`), as 0..1 encoded values.
+    pub fn apply(self, colour: [f32; 3]) -> [f32; 3] {
+        let colour = colour.map(|x| x.max(0.0));
+        match self {
+            ToneCurve::Neutral => neutral(colour).map(srgb_encode),
+            ToneCurve::Agx => agx(colour),
+            ToneCurve::NeutralDesat => {
+                desaturate(neutral(colour), NEUTRAL_DESAT_KEPT).map(srgb_encode)
+            }
+        }
+    }
+}
+
+/// The share of Neutral's colourfulness that [`ToneCurve::NeutralDesat`] keeps: the rest is taken
+/// toward Rec.709 luminance, in linear light. Fitted on the real renderer's Reference images of the
+/// six open-air look-dev shots under hero light B, with face normals: the value at which the mean
+/// HSV saturation of Neutral matches AgX's (ratio 1.0 at 0.55; 1.77 undesaturated) and the
+/// colour (RGB over luma) differs least from AgX's (error 0.095 undesaturated, 0.019 at 0.6,
+/// 0.021 at 0.5). The tones themselves stay Neutral's: that is not what this changes.
+pub const NEUTRAL_DESAT_KEPT: f32 = 0.55;
+
+/// How the smooth normal is kept to the side of the face the ray came through.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NormalBias {
+    /// A quarter of the face's normal is added to the smooth one: the prototype's, as rendered.
+    Face,
+    /// Nothing is added: the normal is the smooth one alone.
+    None,
+}
+
+impl NormalBias {
+    pub const ALL: [NormalBias; 2] = [NormalBias::Face, NormalBias::None];
+
+    pub fn slug(self) -> &'static str {
+        match self {
+            NormalBias::Face => "face-bias",
+            NormalBias::None => "no-bias",
+        }
+    }
+
+    /// How much of the face's normal is added to the unit smooth normal.
+    pub fn weight(self) -> f32 {
+        match self {
+            NormalBias::Face => 0.25,
+            NormalBias::None => 0.0,
+        }
+    }
+}
+
+/// The true sRGB encoding of one linear value, clamped to 0..1.
+pub fn srgb_encode(linear: f32) -> f32 {
+    let c = linear.clamp(0.0, 1.0);
+    if c <= 0.003_130_8 {
+        12.92 * c
+    } else {
+        1.055 * c.powf(1.0 / 2.4) - 0.055
+    }
+}
+
+/// `colour` with its distance from its Rec.709 luminance scaled by `kept` (1 is unchanged, 0 is
+/// grey), in the light it is given in.
+pub fn desaturate(colour: [f32; 3], kept: f32) -> [f32; 3] {
+    let luminance = 0.2126 * colour[0] + 0.7152 * colour[1] + 0.0722 * colour[2];
+    colour.map(|x| luminance + (x - luminance) * kept)
+}
+
+/// The prototype's AgX-like curve (Sobotka's, in the polynomial form of Wrensch) on one linear
+/// colour: the CPU twin of `agx` in `post.wgsl`, and the prototype's `agx` as it was (#200,
+/// `bench/lookdev/post.rs`). Its result is the display-encoded value, not light.
+pub fn agx(colour: [f32; 3]) -> [f32; 3] {
+    const IN: [[f32; 3]; 3] = [
+        [0.842_479, 0.078_433_6, 0.079_223_74],
+        [0.042_328_24, 0.878_468_6, 0.079_166_13],
+        [0.042_375_65, 0.078_433_6, 0.879_143],
+    ];
+    const OUT: [[f32; 3]; 3] = [
+        [1.196_879, -0.098_020_88, -0.099_029_74],
+        [-0.052_896_85, 1.151_903_1, -0.098_961_18],
+        [-0.052_971_64, -0.098_043_45, 1.151_073_7],
+    ];
+    const MIN_EV: f32 = -12.473_93;
+    const MAX_EV: f32 = 4.026_069;
+    let mul = |m: [[f32; 3]; 3], c: [f32; 3]| -> [f32; 3] {
+        std::array::from_fn(|i| m[i][0] * c[0] + m[i][1] * c[1] + m[i][2] * c[2])
+    };
+    let v = mul(IN, colour.map(|x| x.max(1e-10)));
+    let v = v.map(|x| (x.log2().clamp(MIN_EV, MAX_EV) - MIN_EV) / (MAX_EV - MIN_EV));
+    let contrast = |x: f32| {
+        let (x2, x4) = (x * x, x * x * x * x);
+        15.5 * x4 * x2 - 40.14 * x4 * x + 31.96 * x4 - 6.868 * x2 * x + 0.4298 * x2 + 0.1191 * x
+            - 0.00232
+    };
+    mul(OUT, v.map(contrast)).map(|x| x.clamp(0.0, 1.0))
 }
 
 /// The standard deviations, in pixels of an image `width` wide, of the bloom's three blurs.
@@ -379,7 +510,12 @@ impl Post {
             bytemuck::bytes_of(&PostUniform {
                 sizes: [width, height, scratch.quarter.0, scratch.quarter.1],
                 stages: [
-                    u32::from(stages.tone),
+                    // 0 is off, else the curve's number from 1.
+                    if stages.tone {
+                        stages.curve as u32 + 1
+                    } else {
+                        0
+                    },
                     u32::from(stages.exposure),
                     u32::from(stages.bloom),
                     u32::from(passthrough),
@@ -388,7 +524,7 @@ impl Post {
                     BLOOM_STRENGTH,
                     exposure.rate().clamp(0.0, 1.0),
                     f32::from(matches!(exposure, Metering::Hold)),
-                    0.0,
+                    NEUTRAL_DESAT_KEPT,
                 ],
                 sigmas: [sigmas[0], sigmas[1], sigmas[2], 0.0],
                 counts: [
@@ -579,5 +715,70 @@ mod tests {
         let hot = neutral([40.0, 10.0, 2.0]);
         let cool = neutral([4.0, 1.0, 0.2]);
         assert!(hot[2] / hot[0] > cool[2] / cool[0]);
+    }
+
+    #[test]
+    fn the_agx_like_curve_is_the_prototypes_at_a_few_inputs() {
+        // The prototype's `agx` (bench/lookdev/post.rs of proto-148-lookdev), evaluated apart in
+        // double precision.
+        let cases: [([f32; 3], [f32; 3]); 6] = [
+            ([0.18; 3], [0.49668, 0.49674, 0.49675]),
+            ([1.0, 0.5, 0.2], [0.80099, 0.68350, 0.53879]),
+            ([0.02, 0.05, 0.2], [0.20344, 0.29617, 0.52947]),
+            ([8.0, 2.0, 0.5], [0.99131, 0.88655, 0.75717]),
+            ([0.0; 3], [0.0; 3]),
+            ([100.0; 3], [0.99841, 0.99863, 0.99864]),
+        ];
+        for (input, want) in cases {
+            let got = agx(input);
+            for c in 0..3 {
+                assert!(
+                    (got[c] - want[c]).abs() < 2e-4,
+                    "{input:?}: {got:?} is not {want:?}"
+                );
+            }
+        }
+        // It is the encoded image itself: the curve's result is what ToneCurve shows.
+        assert_eq!(ToneCurve::Agx.apply([1.0, 0.5, 0.2]), agx([1.0, 0.5, 0.2]));
+    }
+
+    #[test]
+    fn the_desaturating_curve_takes_colour_toward_luminance_in_linear_light_and_keeps_grey() {
+        let c = [0.6, 0.3, 0.1];
+        let luminance = 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
+        let d = desaturate(c, 0.5);
+        for i in 0..3 {
+            assert!((d[i] - (luminance + (c[i] - luminance) * 0.5)).abs() < 1e-6);
+        }
+        // The luminance does not move, nothing moves at 1, everything is grey at 0, and grey stays.
+        let l = |c: [f32; 3]| 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
+        assert!((l(d) - luminance).abs() < 1e-6);
+        for (a, b) in desaturate(c, 1.0).into_iter().zip(c) {
+            assert!((a - b).abs() < 1e-6);
+        }
+        let grey = desaturate(c, 0.0);
+        assert!(grey.iter().all(|x| (x - luminance).abs() < 1e-6));
+        assert_eq!(desaturate([0.4; 3], 0.3), [0.4; 3]);
+        // The curve is Neutral's, then that, then sRGB: less colourful than Neutral, same order.
+        let shown = ToneCurve::NeutralDesat.apply([0.9, 0.4, 0.1]);
+        let plain = ToneCurve::Neutral.apply([0.9, 0.4, 0.1]);
+        assert!(shown[0] - shown[2] < plain[0] - plain[2]);
+        assert!(shown[0] > shown[1] && shown[1] > shown[2]);
+        let want = desaturate(neutral([0.9, 0.4, 0.1]), NEUTRAL_DESAT_KEPT).map(srgb_encode);
+        assert_eq!(shown, want);
+    }
+
+    #[test]
+    fn the_default_stages_are_neutral_with_the_face_bias() {
+        let stages = Stages::default();
+        assert_eq!(
+            (stages.curve, stages.normal_bias),
+            (ToneCurve::Neutral, NormalBias::Face)
+        );
+        assert_eq!(NormalBias::Face.weight(), 0.25);
+        assert_eq!(NormalBias::None.weight(), 0.0);
+        for curve in ToneCurve::ALL {
+            assert_eq!(ToneCurve::from_slug(curve.slug()), Some(curve));
+        }
     }
 }

@@ -165,7 +165,8 @@ struct FrameUniform {
     look_up: [f32; 4],
     /// The light's palette (see [`Look`]).
     look: LookUniform,
-    /// 1 if natural Materials are shaded with smooth computed normals, then three unused.
+    /// 1 if natural Materials are shaded with smooth computed normals; the end of the smooth range
+    /// in Voxels and the face normal's weight in it (both an f32's bits); one unused.
     flags: [u32; 4],
 }
 
@@ -1064,11 +1065,25 @@ impl Tracer {
             &target.reference_hdr.view,
             target,
         );
-        // The mean is shown through the display transform, with an exposure of its own. A still
-        // view has nothing to adapt to, so the exposure is set at once to what the mean's boxes
-        // meter, until the view has enough samples for that to be steady; from then on it is held,
-        // and the image converges at one brightness (the issue: Reference frames use the settled
-        // exposure). The accumulation is read, never written.
+        self.encode_reference_post(device, queue, profiler, encoder, target, first);
+        samples
+    }
+
+    /// The Reference view's mean through the display transform, with an exposure of its own. A still
+    /// view has nothing to adapt to, so the exposure is set at once to what the mean's boxes
+    /// meter, until the view has enough samples for that to be steady (`first` is the index of the
+    /// batch's first sample); from then on it is held, and the image converges at one brightness
+    /// (the issue: Reference frames use the settled exposure). The accumulation is read, never
+    /// written, so this can be run again on the same mean, under other [`Stages`].
+    pub fn encode_reference_post(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        profiler: &mut Profiler,
+        encoder: &mut wgpu::CommandEncoder,
+        target: &Target,
+        first: u32,
+    ) {
         let metering = if first < post::REFERENCE_METERED_UP_TO {
             Metering::Adapt(1.0)
         } else {
@@ -1087,7 +1102,6 @@ impl Tracer {
             Exposed::Reference,
             metering,
         );
-        samples
     }
 
     /// Records a frame of a window: the still-frame policy of ADR 0005 (see [`Still`]).
@@ -1375,7 +1389,9 @@ impl Tracer {
     /// the tone curve only change how it is shown, which the accumulation never holds.
     pub fn set_stages(&mut self, stages: Stages) {
         if stages != self.stages {
-            if stages.smooth_normals != self.stages.smooth_normals {
+            if stages.smooth_normals != self.stages.smooth_normals
+                || stages.normal_bias != self.stages.normal_bias
+            {
                 self.restart_reference();
             }
             self.stages = stages;
@@ -1445,7 +1461,7 @@ impl Tracer {
             flags: [
                 u32::from(self.stages.smooth_normals),
                 self.smooth_end.to_bits(),
-                0,
+                self.stages.normal_bias.weight().to_bits(),
                 0,
             ],
         };

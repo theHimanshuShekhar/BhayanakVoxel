@@ -155,8 +155,8 @@ fn staircase(material: Material) -> (BrickStore, Scene) {
 
 /// What the shaders do (`smooth_normal` in `common.wgsl`): the solid Voxels of a cube of 5 round
 /// the empty Voxel in front of the face, each weighted by a Gaussian of 1.4 Voxels in its distance,
-/// pushed away from; kept to the face's side with a quarter of its normal.
-fn smooth_normal(store: &BrickStore, voxel: [i32; 3], face: [i32; 3]) -> [f64; 3] {
+/// pushed away from; kept to the face's side with `bias` of its normal.
+fn smooth_normal(store: &BrickStore, voxel: [i32; 3], face: [i32; 3], bias: f64) -> [f64; 3] {
     let front = [0, 1, 2].map(|a| voxel[a] + face[a]);
     let mut sum = [0.0f64; 3];
     for dz in -2..=2 {
@@ -179,7 +179,7 @@ fn smooth_normal(store: &BrickStore, voxel: [i32; 3], face: [i32; 3]) -> [f64; 3
     if l * l < 1e-6 {
         return face;
     }
-    let tilted = [0, 1, 2].map(|a| -sum[a] / l + 0.25 * face[a]);
+    let tilted = [0, 1, 2].map(|a| -sum[a] / l + bias * face[a]);
     let l = length(tilted);
     tilted.map(|c| c / l)
 }
@@ -231,7 +231,7 @@ fn smooth_normals_follow_the_slope_the_stairs_make_and_match_the_cpu_twin() {
             let Some(hit) = trace(&scene, &ray) else {
                 continue;
             };
-            let want = smooth_normal(&store, hit.voxel, hit.normal);
+            let want = smooth_normal(&store, hit.voxel, hit.normal, 0.25);
             let got = normal_of(&smooth, (x, y));
             compared += 1;
             // 8 bits of a component, and the half floats it went through.
@@ -783,5 +783,119 @@ fn the_reference_view_meters_afresh_after_a_debug_view_instead_of_holding_a_stal
     assert!(
         (metered - bright).abs() > 0.3,
         "the scene changed enough to tell"
+    );
+}
+
+/// A floor under hero light B, its colour as the sky and sun make it, shown under `curve`.
+fn floor_under(curve: render::ToneCurve) -> Image {
+    let mut gpu = Offscreen::new(SIZE, SIZE, &floor_of(material("grassy soil"))).unwrap();
+    gpu.set_stages(Stages {
+        tone: true,
+        curve,
+        ..OFF
+    });
+    gpu.set_sun(Sun::new([0.3, 0.8, 0.5], 0.12).unwrap());
+    gpu.render(&overhead())
+}
+
+#[test]
+fn each_tone_curve_shows_the_light_the_way_its_cpu_twin_says() {
+    let plain = {
+        let mut gpu = Offscreen::new(SIZE, SIZE, &floor_of(material("grassy soil"))).unwrap();
+        gpu.set_stages(OFF);
+        gpu.set_sun(Sun::new([0.3, 0.8, 0.5], 0.12).unwrap());
+        gpu.render(&overhead())
+    };
+    let light = linear(&plain, 16, 16).map(|c| c as f32);
+    let mut shown = Vec::new();
+    for curve in render::ToneCurve::ALL {
+        let image = floor_under(curve);
+        let at = ((16 * image.width + 16) * 4) as usize;
+        let got = [0, 1, 2].map(|c| f32::from(image.rgba[at + c]) / 255.0);
+        let want = curve.apply(light);
+        for c in 0..3 {
+            assert!(
+                (got[c] - want[c]).abs() < 0.012,
+                "{curve:?} channel {c}: {} is not {} (light {light:?})",
+                got[c],
+                want[c]
+            );
+        }
+        shown.push(got);
+    }
+    // The three are three different pictures: AgX is not Neutral, and the desaturated one is
+    // less colourful than Neutral.
+    let spread = |c: [f32; 3]| c[0].max(c[1]).max(c[2]) - c[0].min(c[1]).min(c[2]);
+    assert!((shown[0][0] - shown[1][0]).abs() > 0.02, "{shown:?}");
+    assert!(spread(shown[2]) < spread(shown[0]), "{shown:?}");
+}
+
+#[test]
+fn without_the_face_bias_the_smooth_normal_is_the_smooth_one_alone_and_the_image_starts_over() {
+    let (store, scene) = staircase(STONE);
+    let camera = over_the_stairs(60.0);
+    let stages = Stages {
+        normal_bias: render::NormalBias::None,
+        ..Stages::default()
+    };
+    let unbiased = shading_normals(&scene, &camera, stages);
+    let biased = shading_normals(&scene, &camera, Stages::default());
+    let mut compared = 0;
+    let mut agree = 0;
+    for y in (2..SIZE - 2).step_by(3) {
+        for x in (2..SIZE - 2).step_by(3) {
+            let ray = pixel_ray(&camera, (x, y), SIZE);
+            let Some(hit) = trace(&scene, &ray) else {
+                continue;
+            };
+            let want = smooth_normal(&store, hit.voxel, hit.normal, 0.0);
+            let got = normal_of(&unbiased, (x, y));
+            compared += 1;
+            if (0..3).all(|c| (got[c] - want[c]).abs() < 0.03) {
+                agree += 1;
+            }
+        }
+    }
+    assert!(compared >= 40, "{compared}");
+    assert!(
+        agree * 10 >= compared * 9,
+        "{agree} of {compared} agree with the CPU twin"
+    );
+    // Without the bias the normal leans further over the slope than with it.
+    let (a, b) = (normal_of(&unbiased, (16, 16)), normal_of(&biased, (16, 16)));
+    assert!(a[0] < b[0] - 0.05, "{a:?} against {b:?}");
+
+    // The bias is part of what is lit: the Reference image starts over when it changes (and does
+    // not when only the tone curve does).
+    let mut gpu = Offscreen::new(SIZE, SIZE, &scene).unwrap();
+    let camera = over_the_stairs(60.0);
+    gpu.reference_batch(&camera, 4);
+    assert_eq!(gpu.reference_samples(), 4);
+    gpu.set_stages(Stages {
+        curve: render::ToneCurve::Agx,
+        ..Stages::default()
+    });
+    assert_eq!(gpu.reference_samples(), 4);
+    gpu.set_stages(stages);
+    assert_eq!(gpu.reference_samples(), 0);
+}
+
+#[test]
+fn the_reference_mean_can_be_shown_again_under_another_curve_without_taking_a_sample() {
+    let mut gpu = Offscreen::new(SIZE, SIZE, &floor_of(material("grassy soil"))).unwrap();
+    let camera = overhead();
+    let first = gpu.render_reference(&camera, 4);
+    gpu.set_stages(Stages {
+        curve: render::ToneCurve::Agx,
+        ..Stages::default()
+    });
+    let agx = gpu.reshow_reference();
+    assert_eq!(gpu.reference_samples(), 4);
+    assert_ne!(first.rgba, agx.rgba);
+    gpu.set_stages(Stages::default());
+    let again = gpu.reshow_reference();
+    assert_eq!(
+        first.rgba, again.rgba,
+        "the same mean, curve and exposure give the same image"
     );
 }

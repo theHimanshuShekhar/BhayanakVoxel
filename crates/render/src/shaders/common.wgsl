@@ -31,8 +31,9 @@ struct Frame {
     zenith: vec4<f32>,
     // The sky at the horizon and below, then the haze per Voxel along the camera ray.
     horizon: vec4<f32>,
-    // 1 if natural Materials are shaded with smooth computed normals (0: face normals), then three
-    // unused.
+    // 1 if natural Materials are shaded with smooth computed normals (0: face normals); the end of
+    // the smooth range in Voxels (an f32's bits); the weight of the face's normal that the smooth
+    // normal is kept to the face's side with (an f32's bits); one unused.
     flags: vec4<u32>,
 }
 
@@ -160,7 +161,7 @@ const SMOOTH_WEIGHTS = array<f32, 13>(
 // The surface's normal at the Voxel `voxel`, which a ray entered through the face with unit normal
 // `face`: the direction away from the solid Voxels round the empty one in front of that face, each
 // weighted by how near it is (a Gaussian of 1.4 Voxels), kept to the face's side by adding a
-// quarter of the face's normal. On a stair-step slope that is the slope's normal; on a flat face,
+// quarter of the face's normal (`flags.z`: the owner may pick none, #202). On a stair-step slope that is the slope's normal; on a flat face,
 // the face's; where there is no solid round it, the face's. The prototype's, as rendered (#148).
 fn smooth_normal(voxel: vec3<i32>, face: vec3<f32>) -> vec3<f32> {
     let front = voxel + vec3<i32>(face);
@@ -179,7 +180,7 @@ fn smooth_normal(voxel: vec3<i32>, face: vec3<f32>) -> vec3<f32> {
     if dot(sum, sum) < 1e-6 {
         return face;
     }
-    return normalize(normalize(-sum) + 0.25 * face);
+    return normalize(normalize(-sum) + bitcast<f32>(frame.flags.z) * face);
 }
 
 // The normal that `hit` is shaded with: smooth, for a natural Material in range when the stage is
