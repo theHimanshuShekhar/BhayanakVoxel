@@ -1058,10 +1058,23 @@ Nothing in `bench-budgets.toml` moved: `reference` is still one sample.
 
 **The policy's constants** are all in `crates/render/src/batch.rs` (`BATCH_BUDGET_MS` 12,
 `MAX_BATCH_SAMPLES` 16, `RECENT_BATCHES` 16, `RISE_AFTER_FRAMES` 4) and `crates/render/src/still.rs`
-(`STILL_FRAMES` 2, `FADE` 150 ms). The cap is 16 because 16 samples of the slowest sample measured on the
-4090 at 1440p (7.92 ms, #99's pit), three times over for a snow cave, is 0.38 s: a fifth of Windows'
-default 2 s timeout (TDR), and a test holds it under a quarter. The budget, not the cap, sets the size
-at 1440p (1 to 4 samples); the cap is for timers that lie.
+(`STILL_FRAMES` 2, `FADE` 150 ms). The cap is on the work in a
+dispatch: 16 samples at 1440p, and the same work at any size (`max_samples`: 7 at 4K, 1 at 8K). The worst
+sample known at 1440p is 10.98 ms (#99's pit, the maximum of 1 024 samples, before #188; the pit's mean is
+4.38 ms now), so a capped batch is 16 x 10.98 = 176 ms, 9 % of Windows' default 2 s timeout (TDR), and 0.53 s
+(26 %) with ADR 0005's factor of 3 for a snow cave. A GPU would have to be 11 times slower than the 4090 on
+that sample (3.8 times with the snow cave) to reach the timeout with a capped batch. The budget, not the
+cap, sets the size: the 4090 takes 4 samples at most at 1440p (the runs on #216); the cap is for what the
+budget cannot see, timers that lie and views that cost under 0.75 ms a sample. A time of 0 or under
+`MIN_SAMPLE_MS_PER_MPIX` (0.05 ms a Mpix a sample) is no data: it is left out, and the size is held.
+
+**Times arrive late, and the flight's `reference` is not the player's number.** The GPU's times come in
+one to three frames after the batches they are of (the profiler's ring), so the size can rise sooner than 4
+frames at the new size: the rule counts timed batches that fit, and some of them were drawn at the size
+before. A drop is still at once, on the first time that says so. And the flight's `reference` pass (the
+budget in `bench-budgets.toml`, one sample) times the *internal* size, a quarter of the pixels at the
+default 0.5 render scale, while the window traces the Reference view at the full output size. The
+still-view phase, at full size with batching, is the player's number.
 
 ## Reading the report
 

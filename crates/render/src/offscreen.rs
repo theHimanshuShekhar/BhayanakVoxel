@@ -561,7 +561,7 @@ impl Offscreen {
     /// Adds `samples` samples of the reference path tracer in **one dispatch**, without reading
     /// anything back, and waits until the GPU has done it. The accumulation is that of the same
     /// number of [`Offscreen::reference_sample`]s, bit for bit. Returns the samples taken, which
-    /// is `samples` up to the cap ([`crate::batch::MAX_BATCH_SAMPLES`]).
+    /// is `samples` up to the cap ([`crate::batch::max_samples`]).
     pub fn reference_batch(&mut self, camera: &Camera, samples: u32) -> u32 {
         let mut encoder = self
             .device

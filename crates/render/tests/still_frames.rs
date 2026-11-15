@@ -306,6 +306,32 @@ fn a_change_cuts_to_primary_and_restarts_from_sample_zero() {
     }
 }
 
+/// Leaving Reference mode and coming back with nothing else changed (the same camera, the same
+/// sun, the same Planet): the key of the view is the same all along, so only the Primary frames'
+/// reset starts the Reference view over. Without it the old samples would be added to.
+#[test]
+fn leaving_reference_mode_and_coming_back_starts_from_sample_zero_with_nothing_else_changed() {
+    let mut gpu = new_gpu();
+    let drawn = frames(&mut gpu, &camera(), 0, 12);
+    assert!(drawn.last().unwrap().samples > 1, "samples were taken");
+    // Primary mode, on the same view: a few Primary frames.
+    for n in 12..15 {
+        let drawn = gpu.draw_frame(&camera(), false, FRAME * n);
+        assert_eq!((drawn.plan, drawn.samples), (Plan::Primary, 0));
+    }
+    assert_eq!(gpu.reference_samples(), 0, "nothing of the view is kept");
+    // Back to Reference mode: it is shown at once (the view is still), from sample 0, in a batch
+    // of 1.
+    let back = gpu.draw_frame(&camera(), true, FRAME * 15);
+    assert!(
+        matches!(back.plan, Plan::Reference { samples: 1, .. }),
+        "{:?}",
+        back.plan
+    );
+    assert_eq!(back.samples, 1);
+    assert_eq!(bits(&gpu.read_accumulation()), singles(&camera(), 1));
+}
+
 #[test]
 fn primary_mode_never_draws_the_reference_view() {
     let mut gpu = new_gpu();

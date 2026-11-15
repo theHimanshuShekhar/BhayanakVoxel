@@ -76,7 +76,7 @@ impl<K> Default for Still<K> {
         Self {
             last: None,
             unchanged: 0,
-            budget: BatchBudget::new(),
+            budget: BatchBudget::default(),
             first_batch: None,
             last_plan: Plan::Primary,
         }
@@ -93,9 +93,13 @@ impl<K: Clone + PartialEq> Still<K> {
     /// the state follows the view all the same, so that switching to Reference mode on a view
     /// that is already still shows it at once.
     ///
+    /// `pixels` is the size of the Reference image: it sets the most a batch may be
+    /// ([`crate::batch::max_samples`]).
+    ///
     /// A Primary frame is also the cue to start the Reference view over: see
     /// [`Plan::Primary`].
-    pub fn plan(&mut self, key: &K, reference: bool, now: Duration) -> Plan {
+    pub fn plan(&mut self, key: &K, reference: bool, now: Duration, pixels: u64) -> Plan {
+        self.budget.resize(pixels);
         if self.last.as_ref() == Some(key) {
             self.unchanged = self.unchanged.saturating_add(1);
         } else {
@@ -140,6 +144,8 @@ mod tests {
     use super::*;
 
     const FRAME: Duration = Duration::from_micros(16_667);
+    /// 2560 × 1440.
+    const PIXELS: u64 = 3_686_400;
 
     /// Frame `n` of a clock at 60 Hz.
     fn at(n: u32) -> Duration {
@@ -149,7 +155,9 @@ mod tests {
     #[test]
     fn a_view_is_shown_as_primary_for_two_frames_and_then_as_reference() {
         let mut still = Still::new();
-        let plans: Vec<Plan> = (0..5).map(|n| still.plan(&"a", true, at(n))).collect();
+        let plans: Vec<Plan> = (0..5)
+            .map(|n| still.plan(&"a", true, at(n), PIXELS))
+            .collect();
         assert_eq!(plans[0], Plan::Primary);
         assert_eq!(plans[1], Plan::Primary);
         assert!(matches!(plans[2], Plan::Reference { .. }), "{plans:?}");
@@ -170,16 +178,24 @@ mod tests {
         for (what, changed) in changes {
             let mut still = Still::new();
             for n in 0..40 {
-                still.plan(&still_view, true, at(n));
+                still.plan(&still_view, true, at(n), PIXELS);
             }
-            let shown = still.plan(&still_view, true, at(40));
+            let shown = still.plan(&still_view, true, at(40), PIXELS);
             assert_eq!(shown.fade(), 1.0, "{what}: the fade is over by now");
             assert!(shown.samples() > 0);
             // The very next frame is Primary, and has none of the Reference view in it.
-            assert_eq!(still.plan(&changed, true, at(41)), Plan::Primary, "{what}");
-            assert_eq!(still.plan(&changed, true, at(42)), Plan::Primary, "{what}");
+            assert_eq!(
+                still.plan(&changed, true, at(41), PIXELS),
+                Plan::Primary,
+                "{what}"
+            );
+            assert_eq!(
+                still.plan(&changed, true, at(42), PIXELS),
+                Plan::Primary,
+                "{what}"
+            );
             // Still again: it starts over, with a batch of 1 and the fade from 0.
-            let again = still.plan(&changed, true, at(43));
+            let again = still.plan(&changed, true, at(43), PIXELS);
             assert_eq!(
                 again,
                 Plan::Reference {
@@ -195,10 +211,10 @@ mod tests {
     fn primary_mode_is_always_primary_and_reference_mode_picks_up_a_view_that_is_still() {
         let mut still = Still::new();
         for n in 0..10 {
-            assert_eq!(still.plan(&"a", false, at(n)), Plan::Primary);
+            assert_eq!(still.plan(&"a", false, at(n), PIXELS), Plan::Primary);
         }
         assert!(matches!(
-            still.plan(&"a", true, at(10)),
+            still.plan(&"a", true, at(10), PIXELS),
             Plan::Reference { .. }
         ));
     }
@@ -206,11 +222,11 @@ mod tests {
     #[test]
     fn the_fade_goes_from_nothing_to_all_in_150_ms_from_the_first_batch() {
         let mut still = Still::new();
-        still.plan(&"a", true, at(0));
-        still.plan(&"a", true, at(1));
+        still.plan(&"a", true, at(0), PIXELS);
+        still.plan(&"a", true, at(1), PIXELS);
         let started = at(2);
         let fades: Vec<f32> = (0..12)
-            .map(|n| still.plan(&"a", true, started + FRAME * n).fade())
+            .map(|n| still.plan(&"a", true, started + FRAME * n, PIXELS).fade())
             .collect();
         assert_eq!(
             fades[0], 0.0,
@@ -229,12 +245,12 @@ mod tests {
     fn a_change_in_the_middle_of_a_fade_starts_the_next_fade_from_nothing() {
         let mut still = Still::new();
         for n in 0..6 {
-            still.plan(&"a", true, at(n));
+            still.plan(&"a", true, at(n), PIXELS);
         }
-        assert!(still.plan(&"a", true, at(6)).fade() > 0.0);
-        assert_eq!(still.plan(&"b", true, at(7)), Plan::Primary);
-        still.plan(&"b", true, at(8));
-        let first = still.plan(&"b", true, at(9));
+        assert!(still.plan(&"a", true, at(6), PIXELS).fade() > 0.0);
+        assert_eq!(still.plan(&"b", true, at(7), PIXELS), Plan::Primary);
+        still.plan(&"b", true, at(8), PIXELS);
+        let first = still.plan(&"b", true, at(9), PIXELS);
         assert_eq!(first.fade(), 0.0);
     }
 
@@ -243,7 +259,7 @@ mod tests {
         let mut still = Still::new();
         let mut sizes = Vec::new();
         for n in 0..60 {
-            let plan = still.plan(&"a", true, at(n));
+            let plan = still.plan(&"a", true, at(n), PIXELS);
             if let Plan::Reference { samples, .. } = plan {
                 // The GPU says each sample took 1 ms.
                 let tag = still.tag();
@@ -254,8 +270,8 @@ mod tests {
         assert_eq!(sizes[0], 1);
         assert!(*sizes.last().unwrap() > 4, "{sizes:?}");
         // A new view: 1 on its first frame, whatever the old one had got to.
-        still.plan(&"b", true, at(60));
-        still.plan(&"b", true, at(61));
-        assert_eq!(still.plan(&"b", true, at(62)).samples(), 1);
+        still.plan(&"b", true, at(60), PIXELS);
+        still.plan(&"b", true, at(61), PIXELS);
+        assert_eq!(still.plan(&"b", true, at(62), PIXELS).samples(), 1);
     }
 }

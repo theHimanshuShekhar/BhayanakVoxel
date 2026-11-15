@@ -413,15 +413,26 @@ That is within the research's ρ⁵ bound for rock, soil and grass (1.3 to 3.1 %
 
 ### The Reference view's still-frame policy (#189)
 
-#189 gave the Reference view its still-frame policy (ADR 0005): it traces at full output resolution whatever Primary's render scale is, takes as many samples in one dispatch as fit in 12 ms (1 on the first frame of a view, rising by one after 4 frames that fit, dropping at once on an overrun, 16 at most), cuts to Primary on any change and starts again from sample 0, and fades in over the last Primary image in 150 ms for display only. The bench's single-sample curve, the truths and every timed pass are unchanged; its still-view part (`client bench`, the `still` block of each convergence view; `docs/agents/benchmarking.md`) measures the policy from the stop, in wall-clock time at 60 Hz, scored against the same truths.
+#189 gave the Reference view its still-frame policy (ADR 0005): it traces at full output resolution whatever Primary's render scale is, takes as many samples in one dispatch as fit in 12 ms (1 on the first frame of a view, rising by one after 4 timed batches that fit, dropping at once on an overrun, 16 at most at 1440p and fewer on a bigger image), cuts to Primary on any change and starts again from sample 0, and fades in over the last Primary image in 150 ms for display only. The bench's single-sample curve, the truths and every timed pass are unchanged; its still-view part (`client bench`, the `still` block of each convergence view; `docs/agents/benchmarking.md`) measures the policy from the stop, in wall-clock time at 60 Hz, scored against the same truths.
 
-**The 4090 numbers are not in yet.** They are the orchestrator's to run (`client.exe bench --truth-spp 8192`, 3 runs, both clocks locked, 1440p) and to post here and on #189. The table to fill in:
+**Measured on the 4090 at `c4dd827`** (the orchestrator's runs, posted on #216: `client.exe bench --truth-spp 8192`, both clocks locked, 3 runs identical to the precision stated). The still-view phase is at 2560×1440 at full resolution, paced at 60 Hz, and timed by wall clock from the stop. **Every acceptance target is met in both views, in all 3 runs** (`flip_within_target` and `frame_p99_within_target` true, `batching_bit_exact` true).
 
-| view | batch (first / last / most) | frame work, mean / p95 / p99 ms | frames over 16.7 ms | samples a second | FLIP at 0.25 s (target ≤ 0.05) | seconds to FLIP ≤ 0.02 (counts?) |
-|---|---|---|---|---|---|---|
-| golden | | | | | | |
-| pit | | | | | | |
+| | golden (open view) | pit |
+|---|---|---|
+| FLIP ≤ 0.05 after the stop (target ≤ 0.25 s) | **0.053 s** (1.3 spp) | **0.109 s** (4.7 spp) |
+| FLIP ≤ 0.02 after the stop | **0.139 s** (9.7 spp) | **0.776 s** (84.5 spp) |
+| FLIP mean at 0.1 / 0.25 / 0.5 / 1.0 s | 0.0275 / 0.0147 / 0.0109 / 0.0087 | 0.0530 / 0.0318 / 0.0239 / 0.0187 |
+| samples at 0.25 s / 1.0 s | 28 / 208 | 22 / 112 |
+| frame time while accumulating, p99 (target ≤ 16.7 ms) | **10.0–10.5 ms**, 0 frames over | **9.1–9.5 ms**, 0 over |
+| GPU time a batch, mean / p99 | 9.15 / 9.7–10.2 ms | 8.54 / 8.73–9.27 ms |
+| batch: first → last (most) | 1 → 4 (4) | 1 → 2 (2) |
+| samples a second | 228.6 | 118.4 |
+| `batching_bit_exact` | true | true |
 
-- **The acceptance:** FLIP ≤ 0.05 within 0.25 s of stopping; frame time p99 ≤ 16.7 ms while accumulating in the open view; the time to FLIP ≤ 0.02 reported.
+- **The batch uses about 55 % of each 16.7 ms frame, under its 12 ms budget**, because the controller judges from the slowest recent samples: at about 2.5 ms a sample (golden) and 4.4 ms (pit), 4 and 2 samples are what fit with that margin. The rule is conservative by design. **The 4090 never needs more than 4 samples in a batch at 1440p**, so the cap (16 at 1440p) never limits it there.
+- **The rest of the bench** is as on main: single-sample timings golden 2.49 ms and pit 4.41 ms (#188: 2.46 / 4.38), primary 0.260, upscale 0.083 and gpu_total 0.349 ms, every budget within. The flight's `reference` line reads 0.907 ms: it times one sample at the *internal* size (a quarter of the pixels at the default render scale of 0.5), while the window traces at full size, so it is not the player's number; the still-view phase is (`docs/agents/benchmarking.md`).
+- **The phase takes 158.7 s a run at 8192**, against #188's 146 s.
+
+- **The acceptance** (met, above): FLIP ≤ 0.05 within 0.25 s of stopping; frame time p99 ≤ 16.7 ms while accumulating in the open view; the time to FLIP ≤ 0.02 reported.
 - **What was verified without the 4090** (lavapipe, this box): two batches of 3 samples are 6 single samples bit for bit, whatever the split; a change of the camera, the sun, the window's size or an Edit cuts to Primary at once and the Reference view starts from sample 0; the accumulation after a fade, a cut or a restart equals that of plain samples bit for bit, so it never holds a Primary or a faded pixel; the goldens are unchanged. The phase's code ran at 96 by 54 with FLIP (`the_phase_with_flip`): not a timing.
-- **The cap:** 16 samples of the slowest sample measured on the 4090 at 1440p (7.92 ms, #99's pit p95), three times over for a snow cave (ADR 0005), is 0.38 s, a fifth of Windows' 2 s timeout (TDR); a test holds it under a quarter. At 1440p the budget sets the size (1 to 4 samples: 2.5 to 7.9 ms a sample), so the cap never limits the quality there.
+- **The cap** is on the work in a dispatch, samples times pixels: 16 samples at 1440p (3.69 Mpix), and the same work at any size (7 at 4K, 1 at 8K). The worst sample known at 1440p is 10.98 ms (#99's pit, the maximum of 1 024 samples, before #188; its mean was 6.15 ms and p95 7.92 ms, and after #188 the pit's mean is 4.38 ms), so a capped batch of it is 16 × 10.98 = 176 ms, 9 % of Windows' 2 s timeout (TDR), and 0.53 s (26 %) with the snow cave's factor of 3 (ADR 0005). A GPU would have to be 11 times slower than the 4090 on that sample, or 3.8 times with the snow cave, before a capped batch reached the timeout. The 4090 never gets near the cap: it takes at most 4 samples (above). The cap is for what the budget cannot see, timers that lie and a view that costs under 0.75 ms a sample. A time of 0, or under 0.05 ms a Mpix a sample (under 0.18 ms at 1440p), is not a measurement: it is left out and the size is held, not raised.

@@ -7,7 +7,7 @@ use materials::MaterialTable;
 use wgpu::util::DeviceExt;
 
 use crate::accumulation::Accumulator;
-use crate::batch::MAX_BATCH_SAMPLES;
+use crate::batch::max_samples;
 use crate::camera::{Camera, CameraUniform};
 use crate::debug_view::DebugView;
 use crate::gpu_materials;
@@ -873,8 +873,8 @@ impl Tracer {
     /// adds them to the running mean, which is written once. The accumulation is what the same
     /// number of single samples ([`Tracer::encode_reference`]) would have made, bit for bit.
     /// Returns the samples taken: `samples`, but at least 1 and at most
-    /// [`MAX_BATCH_SAMPLES`](crate::batch::MAX_BATCH_SAMPLES), the hard cap that keeps one dispatch
-    /// far under the driver's timeout.
+    /// [`max_samples`] of the image, the hard cap that keeps one dispatch far under the driver's
+    /// timeout.
     #[allow(clippy::too_many_arguments)]
     pub fn encode_reference_batch(
         &mut self,
@@ -887,7 +887,8 @@ impl Tracer {
         target: &Target,
         samples: u32,
     ) -> u32 {
-        let samples = samples.clamp(1, MAX_BATCH_SAMPLES);
+        let (width, height) = target.reference_size;
+        let samples = samples.clamp(1, max_samples(u64::from(width) * u64::from(height)));
         let view = View::new(camera, sun, target);
         let first = self.accumulator.begin_batch(&view, samples);
         self.write_uniforms(queue, camera, sun, first, CENTRE, samples);
@@ -936,7 +937,10 @@ impl Tracer {
             self.still.timed(tag, ms);
         }
         let key = (View::new(camera, sun, target), self.scene_epoch);
-        let plan = self.still.plan(&key, reference, now);
+        let (width, height) = target.reference_size;
+        let plan = self
+            .still
+            .plan(&key, reference, now, u64::from(width) * u64::from(height));
         match plan {
             Plan::Primary => {
                 self.encode_upscaled(device, queue, profiler, encoder, camera, sun, target);
