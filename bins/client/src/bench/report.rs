@@ -66,7 +66,9 @@ use super::stream::StreamReport;
 /// `sleep_overshoot`, so that a 30 ms frame says whether the frame thread woke late (the
 /// harness's) or did the work. A slow frame also says how much of `before_ms` was the harness's own
 /// look at a stop (`harness_ms`) and how much of `after_ms` was the store's lock
-/// (`after_lock_ms`), and each path has `slowest_cycles`, its frames with the longest turn.
+/// (`after_lock_ms`), and `between_ms` is the harness's work between the look at the memory and the
+/// sleep, so that `time_ms`, `after_ms`, `between_ms`, `sleep_asked_ms` and `sleep_over_ms` add up
+/// to `cycle_ms`. Each path has `slowest_cycles`, its frames with the longest turn.
 /// Nothing else is changed.
 pub const SCHEMA_VERSION: u32 = 19;
 
