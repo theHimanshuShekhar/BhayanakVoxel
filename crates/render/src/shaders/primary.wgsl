@@ -26,20 +26,28 @@ fn face_code(hit: Hit) -> u32 {
     return 1u + 2u * axis + select(0u, 1u, along > 0.0);
 }
 
-// The colour of the hit's surface, which is not lit yet. Voxels are never more than about a pixel
-// across (the LOD bands, see lod.rs), so the Voxel's own normal and colour variation are drawn at
-// every distance; there is no blending towards the Planet's radial direction or a plain colour.
-fn surface_albedo(hit: Hit) -> vec3<f32> {
-    return varied_albedo(hit.material, hit.voxel);
-}
-
 // The light leaving the hit, towards the camera; `colour` is its surface_albedo.
+//
+// Every read of a source of light, every `trace(` call and every line of this function, control
+// flow aside, needs a whole-line `// lighting: <feature>` comment on one of the two lines directly
+// above it, naming its row in ADR 0005's table of lighting features (a comment at the end of the
+// line does not count). One comment covers the next two lines, so give each term its own. A test
+// (`shaders.rs`) fails when a feature has no row, when a line is not marked, and when a binding
+// or a shader file appears that it does not know. A PR that adds a lighting feature here adds it to
+// the Reference view or marks it in that table (ADR 0005, "How a feature enters").
 fn shade(ray: Ray, hit: Hit, colour: vec3<f32>) -> vec3<f32> {
     if !hit.hit {
+        // lighting: Sky and atmosphere
         return sky(ray.dir);
     }
+    // lighting: Sun and shadows
     let diffuse = max(dot(hit.normal, normalize(frame.sun.xyz)), 0.0);
-    return colour * (0.25 + 0.75 * diffuse) + emission(hit.material);
+    // lighting: Ambient term
+    let ambient = 0.25;
+    // lighting: Sun and shadows
+    let lit = colour * (ambient + 0.75 * diffuse);
+    // lighting: Emissive Voxels
+    return lit + emission(hit.material);
 }
 
 @compute @workgroup_size(8, 8)
@@ -49,10 +57,12 @@ fn primary(@builtin(global_invocation_id) id: vec3<u32>) {
         return;
     }
     let ray = camera_ray(id.xy, size, frame.jitter.xy);
+    // lighting: Geometry (LOD and what is loaded)
     let hit = trace(ray);
     var colour = vec3<f32>(0.0);
     if hit.hit {
-        colour = surface_albedo(hit);
+        // lighting: Per-Voxel colour variation
+        colour = surface_albedo(hit, false);
     }
     let surface = pack4x8unorm(vec4<f32>(encode(colour), f32(face_code(hit)) / 255.0));
     textureStore(gbuffer, id.xy, vec4<u32>(bitcast<u32>(select(-1.0, hit.t, hit.hit)), surface, 0u, 0u));

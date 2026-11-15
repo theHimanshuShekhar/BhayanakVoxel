@@ -391,3 +391,48 @@ Measured on the RTX 4090 on 2026-11-01 ([#99](https://github.com/theHimanshuShek
   - **The pit's 0.02 line does not count:** 0.02 is under 4 × the pit's floor of 0.0092 (`min_line_over_floor`), so the 329.5 spp is shown and not used. The rule works as designed.
   - **Cost of the phase:** about 5 minutes on each run at `--truth-spp 8192`. At the default `--truth-spp 1024` the phase's `wall_s` is **44.0 s** for both views together (4090 at `d68cbb0`, 1 run, both clocks locked), so about 45 s; the block's `wall_s` has the phase's wall-clock time.
 - **On lavapipe (this box)**, at 96 by 54 with FLIP, the phase gives sensible curves and a floor under them; the numbers are of no use as timings. FLIP at 2560x1440 took 0.25 s an image (0.47 s with its statistics) on this box's CPU.
+
+### The Reference view's estimator (#188, 2026-11-15)
+
+#188 replaced the Reference view's estimator (ADR 0005): Owen-scrambled Sobol instead of white noise, bounce light followed with Russian roulette from the third surface (depth cap 256) instead of cut at 4 bounces, Primary's per-Voxel colours (each channel clamped to 1) instead of flat ones, and the true sRGB curve in both views instead of gamma 2.2.
+
+Measured on the RTX 4090 with both clocks locked, `--truth-spp 8192 --flip-gamma-2-2`, 3 runs, identical to the stated precision, on `14817d4`. The clamp of the colour function that review asked for after it changed no golden image, so it is expected to change nothing in these two views, which are the golden's patch; it was not measured again on the 4090. "Before" is #187's three 8192 runs on `faa1fdd`, the same estimator as main `cc82b02`. The curves are FLIP mean against truth A at 2560×1440 on the test-Planet patch; before is on gamma 2.2, after is on sRGB with gamma 2.2 on the same samples in brackets.
+
+| spp | golden before | golden after | pit before | pit after |
+|---|---|---|---|---|
+| 1 | 0.0534 | 0.0564 (0.0564) | 0.0944 | 0.1014 (0.1018) |
+| 4 | 0.0326 | **0.0275** (0.0275) | 0.0575 | **0.0530** (0.0526) |
+| 16 | 0.0208 | 0.0167 (0.0167) | 0.0371 | 0.0324 (0.0320) |
+| 64 | 0.0145 | **0.0115** (0.0115) | 0.0267 | **0.0219** (0.0216) |
+| 256 | 0.0111 | 0.0081 (0.0080) | 0.0211 | 0.0140 (0.0141) |
+| 1024 | 0.0080 | 0.0051 (0.0050) | 0.0157 | 0.0085 (0.0086) |
+
+- **From 4 samples on the new curve is below the old in both views**, as the acceptance asked. At 1 sample it is a little worse (roulette's variance and the varied colours).
+- **The sRGB curve barely moves FLIP:** under 0.0005 at every checkpoint (the bracketed column against the one before it). The gain is the estimator's.
+- **Linear MSE** at 1024 spp: 1.64e-6 → 0.53e-6 (golden), 4.14e-6 → 2.39e-6 (pit).
+
+| | golden before | golden after | pit before | pit after |
+|---|---|---|---|---|
+| spp to FLIP ≤ 0.05 | 1.2 | 1.26 | 6.2 | **4.7** |
+| spp / GPU s to FLIP ≤ 0.02 | 18.6 / 0.047 | **9.7 / 0.024** | 329.5 / 1.81 (does not count) | **84.5 / 0.37 (counts)** |
+| floor, FLIP / linear MSE | 0.0034 / 3.6e-7 | 0.0027 / 1.1e-7 | 0.0092 / 9.2e-7 | 0.0045 / 5.2e-7 |
+
+The pit's 0.02 line now counts: its floor fell from 0.0092 to 0.0045, so 0.02 is over 4 × the floor.
+
+| per-sample cost | before | after |
+|---|---|---|
+| golden | 2.51 ms (0.682 ms/Mpix) | 2.46 ms (0.668 ms/Mpix), −2 % |
+| pit | 5.48 ms (1.487 ms/Mpix) | **4.38 ms (1.189 ms/Mpix), −20 %** |
+
+The issue expected the pit's cost to rise; it fell. That is consistent with the research's table (`docs/research/reference-estimator.md`, "Does RR win at equal cost here?"): in rock and soil (ρ about 0.4 to 0.5) roulette ends most paths before the old cap of five surfaces, about 2.8× cheaper a path. Only high-albedo enclosures (snow, limestone caves) cost more, and neither view is one. In the normal bench the Reference pass is 0.848 ms (main's 0.866 to 0.91 band); Primary 0.261 ms and the upscale 0.083 ms are unchanged; every budget is within.
+
+| converged luminance (truth A, mean Rec. 709 in linear light) | before | after |
+|---|---|---|
+| golden | 0.55085 | 0.55080 (−0.01 %) |
+| pit | 0.57610 | 0.57630 (+0.03 %) |
+
+That is within the research's ρ⁵ bound for rock, soil and grass (1.3 to 3.1 %), and far under it: the bound is reached only in a closed cavity, and the pit is open to the sky, so most light leaves after one or two bounces. So "brighter by about what the research predicts" holds only as "within the bound". **Caveat:** the brightness change mixes the estimator with flat → varied colours, and the research's prediction assumes flat colours. The bias this ticket removes shows in enclosed high-albedo places, which neither bench view has; the closed-box tests (`crates/render/tests/estimator.rs`) are what show it.
+
+**Cost of the phase:** 146 s a run at `--truth-spp 8192` (it was about 5 minutes). The default `--truth-spp 1024` was not measured again: about 45 s, measured before #188.
+
+**The closed box, on lavapipe in CI** (64×64 pixels, 256 samples; 11 s at albedo 0.9 and 15 s at 0.98 on this box in a debug build): 1.00085 of the answer at 0.9 (error 0.00091) and 0.99384 at 0.98 against 0.99433 expected with the cap (error 0.00095), so five errors are 0.46 %, under the ledger's 0.57 %. The 4-bounce cut, a dropped `/(1 − q)` and a depth cap of 190 each fail it.

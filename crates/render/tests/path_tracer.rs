@@ -2,7 +2,7 @@
 //! Needs a Vulkan device (lavapipe in CI).
 
 use brick_store::{BrickStore, Material, VoxelCoord};
-use render::{Camera, Offscreen, Scene, Sun};
+use render::{Camera, Offscreen, ReferenceOptions, Scene, Sun};
 
 const STONE: Material = Material(1);
 /// Rock in `materials.toml`.
@@ -32,8 +32,18 @@ fn overhead() -> Camera {
     Camera::looking_at([0.5, 20.0, 0.5], [0.5, 0.0, 0.5])
 }
 
+/// The Reference view with flat colours, which is what the answers below are worked out for: the
+/// Voxels' colour variation would add structure to the image that samples do not average away.
+fn flat_colours(offscreen: &mut Offscreen) {
+    offscreen.set_reference_options(ReferenceOptions {
+        flat_colours: true,
+        ..Default::default()
+    });
+}
+
 fn on_floor(sun: Sun) -> Offscreen {
     let mut offscreen = Offscreen::new(32, 32, &floor()).unwrap();
+    flat_colours(&mut offscreen);
     offscreen.set_sun(sun);
     offscreen
 }
@@ -42,8 +52,8 @@ fn mean_linear(image: &render::Image) -> [f64; 3] {
     let mut sum = [0.0; 3];
     for pixel in image.rgba.chunks(4) {
         for c in 0..3 {
-            // Undo the display encoding (a gamma of 2.2).
-            sum[c] += (f64::from(pixel[c]) / 255.0).powf(2.2);
+            // Undo the display encoding (the sRGB curve).
+            sum[c] += f64::from(render::srgb_decode(f32::from(pixel[c]) / 255.0));
         }
     }
     let n = f64::from(image.width * image.height);
@@ -92,6 +102,7 @@ fn a_floor_in_the_shade_of_a_slab_gets_no_sun() {
     }
     let scene = Scene::new(&store, None);
     let mut offscreen = Offscreen::new(32, 32, &scene).unwrap();
+    flat_colours(&mut offscreen);
     // Straight above: any ray from the floor under the middle of the slab that gets to the sun
     // passes through the slab.
     offscreen.set_sun(Sun::new([0.0, 1.0, 0.0], 0.02).unwrap());
@@ -156,7 +167,7 @@ fn more_samples_make_a_smoother_image() {
         let mean = mean_linear(&image);
         let mut squares = 0.0;
         for pixel in image.rgba.chunks(4) {
-            let v = (f64::from(pixel[1]) / 255.0).powf(2.2);
+            let v = f64::from(render::srgb_decode(f32::from(pixel[1]) / 255.0));
             squares += (v - mean[1]).powi(2);
         }
         squares / f64::from(image.width * image.height)
@@ -174,6 +185,7 @@ fn a_light_source_adds_its_emission_to_what_it_reflects() {
     let emitted = f64::from(moss.emissive[0] * moss.emissive_intensity);
     let reflected = f64::from(moss.colour[0]) * 0.92;
     let mut offscreen = Offscreen::new(32, 32, &floor_of(Material(moss.id))).unwrap();
+    flat_colours(&mut offscreen);
     offscreen.set_sun(Sun::from_angles(0.0, -0.5, 0.02));
     let got = mean_linear(&offscreen.render_reference(&overhead(), 32))[0];
     assert!(

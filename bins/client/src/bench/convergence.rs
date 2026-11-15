@@ -10,7 +10,9 @@
 //! truth with a third seed gives the metric's noise floor in that view.
 //!
 //! **The scores** are FLIP (mean and 99th percentile, LDR, ppd [`score::FLIP_PPD`], `flip-rs`
-//! [`FLIP_VERSION`]) on the 8-bit image the player sees, and the squared error of the `f32`
+//! [`FLIP_VERSION`]) on the 8-bit image the player sees (drawn with the true sRGB curve since #188;
+//! it was a gamma of 2.2 before, and `--flip-gamma-2-2` scores that too, from the same samples,
+//! so that a change of the curve can be told from a change of the estimator), and the squared error of the `f32`
 //! accumulation in linear light. They are made on the CPU after every sample of the view is drawn,
 //! outside every timer. The report has each checkpoint's scores, the samples and the GPU seconds
 //! that it takes to get to FLIP 0.05 and 0.02, the floor, and whether each of those lines counts
@@ -81,17 +83,21 @@ pub struct Settings {
     pub truth_spp: u32,
     /// Whether to score with FLIP. Off for the smoke test, so that CI never runs it.
     pub flip: bool,
+    /// Whether to score with FLIP a second time, on the images as the old gamma-2.2 curve would
+    /// have drawn them from the same samples (`--flip-gamma-2-2`, #188). Only with `flip`.
+    pub flip_gamma22: bool,
 }
 
 impl Settings {
     /// The measurement: 1440p for the default `--size` (twice the traced size, the size that the
     /// player sees), the ladder of ADR 0005, FLIP.
-    pub fn full(traced: (u32, u32), truth_spp: Option<u32>) -> Self {
+    pub fn full(traced: (u32, u32), truth_spp: Option<u32>, flip_gamma22: bool) -> Self {
         Self {
             size: (traced.0 * 2, traced.1 * 2),
             checkpoints: CHECKPOINTS.to_vec(),
             truth_spp: truth_spp.unwrap_or(DEFAULT_TRUTH_SPP),
             flip: true,
+            flip_gamma22,
         }
     }
 
@@ -103,6 +109,7 @@ impl Settings {
             checkpoints: vec![1, 4, 16],
             truth_spp: truth_spp.unwrap_or(16),
             flip: false,
+            flip_gamma22: false,
         }
     }
 
@@ -125,6 +132,8 @@ pub struct ConvergenceReport {
     pub seeds: Seeds,
     /// How the images were scored; null where FLIP was not run (`--short`).
     pub flip: Option<FlipInfo>,
+    /// Whether the `*_gamma22` scores are there (`--flip-gamma-2-2`).
+    pub flip_gamma22: bool,
     /// The FLIP levels that `views[].lines` are for.
     pub lines: Vec<f64>,
     /// A line counts in a view where it is at least this many times the view's floor.
@@ -164,6 +173,8 @@ pub struct ViewReport {
     pub gpu_total: Stats,
     /// The mean time of the `reference` pass, per megapixel of the image, for one sample.
     pub ms_per_mpix_per_sample: Option<f64>,
+    /// How bright the converged image is: truth A, the same view at `truth_spp` samples.
+    pub converged: Converged,
     pub floor: Floor,
     pub curve: Vec<Point>,
     /// For each of [`LINES`]; empty where FLIP was not run.
@@ -172,11 +183,48 @@ pub struct ViewReport {
     pub files: Vec<String>,
 }
 
+/// How bright a view's converged image is, in linear light before the display encoding, over all
+/// its pixels (#188): what a change of the estimator moves in a view where light bounces, which
+/// FLIP only shows indirectly. Both truths are of the same view and agree to the noise.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct Converged {
+    /// The mean of truth A's pixels, per channel.
+    pub mean_linear: [f64; 3],
+    /// The mean of the pixels' luminance (Rec. 709 weights).
+    pub mean_luminance: f64,
+    /// The same of truth B, which shows how well the two agree.
+    pub mean_luminance_b: f64,
+}
+
+impl Converged {
+    fn of(a: &[f32], b: &[f32]) -> Self {
+        let means = |linear: &[f32]| {
+            let pixels = (linear.len() / 3) as f64;
+            let mut sum = [0.0f64; 3];
+            for p in linear.as_chunks::<3>().0 {
+                for c in 0..3 {
+                    sum[c] += f64::from(p[c]);
+                }
+            }
+            sum.map(|s| s / pixels)
+        };
+        let luminance = |m: [f64; 3]| 0.2126 * m[0] + 0.7152 * m[1] + 0.0722 * m[2];
+        let (ma, mb) = (means(a), means(b));
+        Self {
+            mean_linear: ma,
+            mean_luminance: luminance(ma),
+            mean_luminance_b: luminance(mb),
+        }
+    }
+}
+
 /// The metric's noise floor in a view: truth A against truth B.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct Floor {
     pub flip_mean: Option<f64>,
     pub flip_p99: Option<f64>,
+    /// The same on images drawn with the old gamma-2.2 curve (`--flip-gamma-2-2`).
+    pub flip_mean_gamma22: Option<f64>,
     pub mse_linear: f64,
 }
 
@@ -188,6 +236,9 @@ pub struct Point {
     pub gpu_s: Option<f64>,
     pub flip_mean: Option<f64>,
     pub flip_p99: Option<f64>,
+    /// FLIP's mean of the same samples drawn with the old gamma-2.2 curve, both this image and
+    /// truth A (`--flip-gamma-2-2`): the curve's effect on the score, apart from the estimator's.
+    pub flip_mean_gamma22: Option<f64>,
     /// The squared error of the `f32` accumulation against truth A, in linear light, per channel.
     pub mse_linear: f64,
     /// `mse_linear` less the truth's own share of it, half the floor's: what remains is the
@@ -256,6 +307,7 @@ pub fn run(settings: &Settings, out: &Path) -> Result<ConvergenceReport, Box<dyn
             truth_a: TRUTH_SEEDS[0],
             truth_b: TRUTH_SEEDS[1],
         },
+        flip_gamma22: settings.flip && settings.flip_gamma22,
         flip: settings.flip.then_some(FlipInfo {
             crate_version: FLIP_VERSION,
             mode: "ldr",
@@ -365,9 +417,19 @@ fn run_view(view: View, settings: &Settings, out: &Path) -> Result<ViewReport, B
         &truth_b,
         &truth_a_rgb,
     )?;
+    // The same samples as the old gamma-2.2 curve would have drawn them (`--flip-gamma-2-2`).
+    let truth_a_gamma = score::gamma22_rgb(&truth_a.linear);
+    let flip_gamma = |what: &str, test: &Capture| -> Result<Option<f64>, String> {
+        if !settings.flip || !settings.flip_gamma22 {
+            return Ok(None);
+        }
+        eprintln!("convergence: {name}: FLIP of {what}, old curve...");
+        score::flip(&truth_a_gamma, &score::gamma22_rgb(&test.linear), pixels).map(|f| Some(f.mean))
+    };
     let floor = Floor {
         flip_mean: floor_flip.map(|f| f.mean),
         flip_p99: floor_flip.map(|f| f.p99),
+        flip_mean_gamma22: flip_gamma("truth B against truth A (the floor)", &truth_b)?,
         mse_linear: floor_mse,
     };
     let mut curve = Vec::new();
@@ -383,6 +445,7 @@ fn run_view(view: View, settings: &Settings, out: &Path) -> Result<ViewReport, B
             gpu_s: gpu_s(capture.samples),
             flip_mean: scores.map(|f| f.mean),
             flip_p99: scores.map(|f| f.p99),
+            flip_mean_gamma22: flip_gamma(&format!("{} samples", capture.samples), capture)?,
             mse_linear,
             mse_linear_run_only: mse_linear - floor_mse / 2.0,
         });
@@ -432,6 +495,7 @@ fn run_view(view: View, settings: &Settings, out: &Path) -> Result<ViewReport, B
         name,
         description: view.description,
         ms_per_mpix_per_sample: reference.mean_ms.map(|ms| ms / megapixels),
+        converged: Converged::of(&truth_a.linear, &truth_b.linear),
         reference,
         gpu_total,
         floor,
@@ -540,12 +604,12 @@ pub fn csv_of(report: &ConvergenceReport) -> String {
     }
     let mut csv = String::from(
         "view,samples,gpu_s,flip_mean,flip_p99,mse_linear,mse_linear_run_only,\
-         floor_flip_mean,floor_mse_linear\n",
+         floor_flip_mean,floor_mse_linear,flip_mean_gamma22,floor_flip_mean_gamma22\n",
     );
     for view in &report.views {
         for p in &view.curve {
             csv += &format!(
-                "{},{},{},{},{},{},{},{},{}\n",
+                "{},{},{},{},{},{},{},{},{},{},{}\n",
                 view.name,
                 p.samples,
                 cell(p.gpu_s),
@@ -555,6 +619,8 @@ pub fn csv_of(report: &ConvergenceReport) -> String {
                 p.mse_linear_run_only,
                 cell(view.floor.flip_mean),
                 view.floor.mse_linear,
+                cell(p.flip_mean_gamma22),
+                cell(view.floor.flip_mean_gamma22),
             );
         }
     }
@@ -579,17 +645,26 @@ pub fn print_summary(report: &ConvergenceReport) {
             view.floor.mse_linear
         );
         eprintln!(
-            "  {:>8} {:>9} {:>10} {:>10} {:>12}",
-            "samples", "gpu s", "FLIP mean", "FLIP p99", "mse linear"
+            "  converged brightness: luminance {:.5} (truth B {:.5}), RGB {:.5} {:.5} {:.5}",
+            view.converged.mean_luminance,
+            view.converged.mean_luminance_b,
+            view.converged.mean_linear[0],
+            view.converged.mean_linear[1],
+            view.converged.mean_linear[2]
+        );
+        eprintln!(
+            "  {:>8} {:>9} {:>10} {:>10} {:>12} {:>14}",
+            "samples", "gpu s", "FLIP mean", "FLIP p99", "mse linear", "FLIP, gamma 2.2"
         );
         for p in &view.curve {
             eprintln!(
-                "  {:>8} {:>9} {:>10} {:>10} {:>12.3e}",
+                "  {:>8} {:>9} {:>10} {:>10} {:>12.3e} {:>14}",
                 p.samples,
                 num(p.gpu_s, 3),
                 num(p.flip_mean, 4),
                 num(p.flip_p99, 4),
-                p.mse_linear
+                p.mse_linear,
+                num(p.flip_mean_gamma22, 4)
             );
         }
         for l in &view.lines {
@@ -619,6 +694,7 @@ mod tests {
             gpu_s: Some(f64::from(samples) * 0.003),
             flip_mean,
             flip_p99: flip_mean.map(|m| m * 4.0),
+            flip_mean_gamma22: None,
             mse_linear: 1.0 / f64::from(samples),
             mse_linear_run_only: 0.5 / f64::from(samples),
         }
@@ -634,9 +710,15 @@ mod tests {
                 reference: Stats::of(&[2.0, 3.0]),
                 gpu_total: Stats::of(&[2.5, 3.5]),
                 ms_per_mpix_per_sample: Some(0.7),
+                converged: Converged {
+                    mean_linear: [0.3, 0.3, 0.3],
+                    mean_luminance: 0.3,
+                    mean_luminance_b: 0.3,
+                },
                 floor: Floor {
                     flip_mean: flip.then_some(0.003),
                     flip_p99: flip.then_some(0.02),
+                    flip_mean_gamma22: None,
                     mse_linear: 4e-7,
                 },
                 curve: [1, 4, 16]
@@ -658,6 +740,7 @@ mod tests {
                 truth_b: TRUTH_SEEDS[1],
             },
             flip: None,
+            flip_gamma22: false,
             lines: LINES.to_vec(),
             min_line_over_floor: MIN_LINE_OVER_FLOOR,
             folder: FOLDER,
@@ -704,11 +787,11 @@ mod tests {
         assert_eq!(rows.len(), 1 + 2 * 3);
         assert_eq!(
             rows[0],
-            "view,samples,gpu_s,flip_mean,flip_p99,mse_linear,mse_linear_run_only,floor_flip_mean,floor_mse_linear"
+            "view,samples,gpu_s,flip_mean,flip_p99,mse_linear,mse_linear_run_only,floor_flip_mean,floor_mse_linear,flip_mean_gamma22,floor_flip_mean_gamma22"
         );
         // No FLIP: its three cells are empty, and the squared error is there.
         let cells: Vec<&str> = rows[1].split(',').collect();
-        assert_eq!(cells.len(), 9);
+        assert_eq!(cells.len(), 11);
         assert_eq!(&cells[..2], ["golden", "1"]);
         assert!(cells[3].is_empty() && cells[4].is_empty() && cells[7].is_empty());
         assert_eq!(cells[5], "1");
@@ -725,15 +808,18 @@ mod tests {
         let short = Settings::short((160, 90), None);
         assert!(!short.flip);
         assert_eq!(short.size, (80, 45));
-        let full = Settings::full((1280, 720), None);
+        let full = Settings::full((1280, 720), None, false);
         assert!(full.flip);
         assert_eq!(full.size, (2560, 1440));
         assert_eq!(full.checkpoints, CHECKPOINTS);
         assert_eq!(full.truth_spp, 1024);
-        assert_eq!(Settings::full((1280, 720), Some(8192)).truth_spp, 8192);
+        assert_eq!(
+            Settings::full((1280, 720), Some(8192), false).truth_spp,
+            8192
+        );
         // Two truths and the run: 2 * 8192 + 1024 samples a view.
         assert_eq!(
-            Settings::full((1280, 720), Some(8192)).samples_per_view(),
+            Settings::full((1280, 720), Some(8192), false).samples_per_view(),
             17_408
         );
     }
@@ -756,6 +842,7 @@ mod tests {
             checkpoints: vec![1, 4, 16, 64],
             truth_spp: 64,
             flip: true,
+            flip_gamma22: true,
         };
         let out = std::env::temp_dir().join(format!("bhayanak-convergence-{}", std::process::id()));
         let _ = fs::remove_dir_all(&out);

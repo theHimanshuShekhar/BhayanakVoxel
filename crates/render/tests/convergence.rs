@@ -6,7 +6,7 @@
 //! CI. It runs no FLIP: that is the bench's, on a real GPU. Needs a Vulkan device.
 
 use brick_store::{BrickStore, Material, VoxelCoord};
-use render::{Camera, Offscreen, Scene, Sun};
+use render::{Camera, Offscreen, ReferenceOptions, Scene, Sun};
 
 /// Rock in `materials.toml`.
 const STONE: Material = Material(1);
@@ -42,10 +42,22 @@ fn sun() -> Sun {
     Sun::new([0.8, 0.6, 0.0], 0.02).unwrap()
 }
 
-fn offscreen() -> Offscreen {
+/// The Reference view over the floor, with flat colours (the answer below is worked out from the
+/// Material table; the Voxels' colour variation is not in it) and `white_noise` or not.
+fn offscreen_with(white_noise: bool) -> Offscreen {
     let mut offscreen = Offscreen::new(SIZE, SIZE, &floor()).unwrap();
+    offscreen.set_reference_options(ReferenceOptions {
+        flat_colours: true,
+        white_noise,
+        ..Default::default()
+    });
     offscreen.set_sun(sun());
     offscreen
+}
+
+/// The player's sequence: Owen-scrambled Sobol.
+fn offscreen() -> Offscreen {
+    offscreen_with(false)
 }
 
 /// The light the floor sends up, in linear light, which every pixel of the image converges to. A
@@ -100,8 +112,13 @@ const SEED: u32 = 0xB4A7_A9AC;
 const COUNTS: [u32; 5] = [1, 4, 16, 64, 256];
 
 #[test]
-fn the_squared_error_against_a_known_answer_falls_as_one_over_n() {
-    let mut offscreen = offscreen();
+fn with_white_noise_the_squared_error_against_a_known_answer_falls_as_one_over_n() {
+    // This test is about independent samples, which is what white noise is: the variance of the
+    // mean of N of them is the variance of one over N, exactly, and a line through the errors has
+    // the slope -1. Owen-scrambled Sobol is better than that by design (its samples are not
+    // independent: they are stratified), so the player's sequence is held to something else, in
+    // the test after this one.
+    let mut offscreen = offscreen_with(true);
     let want = answer();
     let errors: Vec<f64> = COUNTS
         .iter()
@@ -147,6 +164,55 @@ fn the_squared_error_against_a_known_answer_falls_as_one_over_n() {
 }
 
 #[test]
+fn owen_scrambled_sobol_is_unbiased_and_has_less_error_than_white_noise_from_4_samples_on() {
+    // The same known answer. The scrambled sequence is unbiased (each sample is uniform: the
+    // dimension tests in sampling_tests.rs), so its errors are noise around the answer and not
+    // an offset; and its samples are stratified, so that the error is lower at the same count,
+    // and falls faster than 1/N where the integrand is smooth, as this one is (a gradient).
+    let want = answer();
+    let mut sobol = offscreen_with(false);
+    let mut white = offscreen_with(true);
+    let mut ratios = Vec::new();
+    for &n in &COUNTS[1..] {
+        let s = mse_against(&accumulate(&mut sobol, SEED, n), want);
+        let w = mse_against(&accumulate(&mut white, SEED, n), want);
+        eprintln!(
+            "N = {n:>3}: Sobol {s:.3e}, white {w:.3e}, ratio {:.2}",
+            w / s
+        );
+        assert!(
+            s < w,
+            "N = {n}: Sobol {s:.3e} is not under white noise {w:.3e}"
+        );
+        ratios.push(w / s);
+    }
+    // Several times lower by 64 samples: stratification at work.
+    assert!(ratios[2] > 3.0, "{ratios:?}");
+    // And the mean of the Sobol image over all its pixels is the answer, to well under the
+    // noise (an offset would not average away): 256 samples of 1024 pixels.
+    let accumulation = accumulate(&mut sobol, SEED, 256);
+    let mean: Vec<f64> = (0..3)
+        .map(|c| {
+            accumulation
+                .as_chunks::<3>()
+                .0
+                .iter()
+                .map(|p| f64::from(p[c]))
+                .sum::<f64>()
+                / f64::from(SIZE * SIZE)
+        })
+        .collect();
+    for c in 0..3 {
+        assert!(
+            (mean[c] / want[c] - 1.0).abs() < 0.002,
+            "channel {c}: mean {} against the answer {}",
+            mean[c],
+            want[c]
+        );
+    }
+}
+
+#[test]
 fn two_seeds_differ_by_twice_what_each_differs_from_the_answer() {
     // The floor of the convergence phase: two truths with different seeds are two independent
     // estimates of the answer, so their mean squared difference is the sum of their errors.
@@ -186,8 +252,8 @@ fn the_same_seed_gives_the_same_accumulation_and_a_new_seed_starts_over() {
 
 #[test]
 fn the_image_that_is_read_back_is_the_accumulation_encoded() {
-    // What the player sees is the mean, encoded with a gamma of 2.2 and clamped; the bench scores
-    // the two and they must be of the same samples.
+    // What the player sees is the mean, encoded with the true sRGB curve and clamped; the bench
+    // scores the two and they must be of the same samples.
     let mut offscreen = offscreen();
     let accumulation = accumulate(&mut offscreen, SEED, 16);
     let image = offscreen.render_reference(&overhead(), 0);
@@ -199,7 +265,7 @@ fn the_image_that_is_read_back_is_the_accumulation_encoded() {
         .zip(accumulation.as_chunks::<3>().0)
     {
         for c in 0..3 {
-            let shown = f64::from(linear[c]).clamp(0.0, 1.0).powf(1.0 / 2.2) * 255.0;
+            let shown = f64::from(render::srgb_encode(linear[c].clamp(0.0, 1.0))) * 255.0;
             assert!(
                 (f64::from(pixel[c]) - shown).abs() <= 1.0,
                 "{} against {shown}",

@@ -61,11 +61,12 @@ release: a debug build's CPU side is slow enough to distort the frame times.
 | `--streaming` | Also runs the streaming mode (below): the test Planet streamed in, stepped, on a fixed frame schedule, with counts that are the same on every run. The report's `streaming` is null without it. |
 | `--real-time` | With `--streaming`, also runs the real-time mode (below): the full-size Planet with the real loader workers and scene thread, on the machine's clock, along paths of 50 m/s flights, a take-off, a turn, a stop and a cold start. It takes tens of minutes and is not deterministic. With `--short` it runs on the test Planet, as a smoke test. The report's `streaming_real_time` is null without it. |
 | `--runs N` | With `--real-time`, how many times to run the paths in this process. Default 3. The report keeps each run and the least and the most of every number over them; the gates use the worst. |
+| `--flip-gamma-2-2` | Also score each checkpoint with the old gamma-2.2 curve (#188), from the same samples, to tell the sRGB move from the estimator's effect. Not with `--no-convergence` or `--short`. |
 | `--no-convergence` | Leave out the convergence phase (below), which otherwise runs after the caves. |
 | `--truth-spp N` | Samples of each of the convergence phase's two truths. Default 1024; ADR 0005's is 8192, which takes eight times as long (`client.exe bench --truth-spp 8192` is the 4090 baseline). At least 1024, the last checkpoint. |
 | `--no-fail` | Exit with status 0 even if a pass is over budget, a frame of the streaming mode has a hole, or a gate of the real-time mode is over. |
 
-It runs unattended and takes a minute or so (generating the whole Planet is about 22 s of it).
+It runs unattended. Without the convergence phase it takes a minute or so (generating the whole Planet is about 22 s of it); the convergence phase, on by default, adds about 45 s on the 4090 at the default `--truth-spp`, and more on a slower GPU or with a larger `--truth-spp`.
 The report is written to `DIR/report.json` and also printed on stdout; progress and a table go
 to stderr.
 
@@ -360,7 +361,7 @@ is made there (below): the run's **Edit latency**. Its frames are not those of a
     and the frame's look at the memory after its time was taken (the store's lock again, every 6
     frames). Both are reported for a slow frame as `camera_ms` and `after_ms`. The pacing sleep is
     in neither.
-  - `frame_cycle` and `sleep_overshoot` (schema 17, #167): `samples`, `mean_ms`, `p99_ms`,
+  - `frame_cycle` and `sleep_overshoot` (schema 18, #167): `samples`, `mean_ms`, `p99_ms`,
     `worst_ms` of the **pacing** that `frame_time` leaves out. `frame_cycle` is the time from the
     start of a frame to the start of the next (the path's last frame has none): with the pacing
     sleep it is 16.7 ms when the frames are short, and a cycle that is longer than the frame and
@@ -381,7 +382,7 @@ is made there (below): the run's **Edit latency**. Its frames are not those of a
     allocation, and a path with fewer frames has fewer), each with:
     - `index` (the frame's place in the path, from 0) and `at_ms` (from the path's start to the
       frame's start), `time_ms` and `cpu_ms`;
-    - **the frame's pacing** (schema 17, #167), outside `time_ms`: `before_ms` (from the end of the
+    - **the frame's pacing** (schema 18, #167), outside `time_ms`: `before_ms` (from the end of the
       frame before, its sleep done, to this frame's start: working out the camera and the
       harness's own bookkeeping), `sleep_asked_ms` (the sleep that fills the frame to 16.667 ms; 0
       if it was longer), `sleep_over_ms` (by how much the sleep ran over that) and `cycle_ms` (from
@@ -937,9 +938,10 @@ after. It runs on every `client bench` unless `--no-convergence`, after the cave
 client.exe bench --truth-spp 8192 --out bench-out
 ```
 
-That is the whole bench with the phase. It took about 5 minutes longer on the 4090 for each of three
-runs (the baseline of #187, in `docs/measurements.md`). With the default `--truth-spp 1024` it takes
-about 45 s (measured on the 4090: 44.0 s for both views); the `wall_s` of the report's `convergence`
+That is the whole bench with the phase. At `--truth-spp 8192` the phase took 146 s a run on the 4090
+with #188's estimator (about 5 minutes with the 4-bounce one, the baseline of #187; both in
+`docs/measurements.md`). With the default `--truth-spp 1024` it takes about 45 s (44.0 s for both
+views, measured on the 4090 before #188 and not measured again); the `wall_s` of the report's `convergence`
 block is the phase's wall-clock time. If the phase fails (a file it cannot write, say, or a panic),
 the bench warns on stderr, leaves the block null and still writes the rest of the report: the phase
 has no budget to fail.
@@ -974,14 +976,26 @@ own: with the same seed the first samples would be the truth's and every error w
 
 - `flip_mean` and `flip_p99`: LDR-FLIP of `flip-rs` (`=0.1.2`, pinned in `bins/client/Cargo.toml`
   and as `FLIP_VERSION` next to the seeds, and a test holds the two together), ppd 67.02, on the 8-bit
-  image that the Reference view shows (what `render_reference` reads back: the mean encoded with a gamma
-  of 2.2 and clamped, which is what the player sees today; ADR 0005's "true sRGB curve" is for when
-  the shader's `encode` changes, and the phase scores whatever it shows). `flip_p99` is the
+  image that the Reference view shows (what `render_reference` reads back: the mean encoded with the
+  true sRGB curve, since #188; before it the curve was a gamma of 2.2, which `--flip-gamma-2-2` scores
+  again, see below). `flip_p99` is the
   error-weighted 99th percentile, a guard against speckles.
 - `mse_linear`: the mean squared difference per channel of the `f32` accumulations, in linear light.
   `mse_linear_run_only` is that less half the floor's, which is the truth's own share, so it is the
   run's noise alone and falls as 1/N.
 - `gpu_s`: the GPU seconds of the run's first N samples, as timed (null without timers).
+
+- `flip_mean_gamma22` (only with `--flip-gamma-2-2`; null otherwise): the same FLIP mean on the same
+  samples, with the mean encoded by the old gamma-2.2 curve on the CPU. #188 moved the Reference and
+  Primary to the true sRGB curve, which shifts FLIP a little against #187's baseline whatever the
+  estimator does; this column is the new estimator on the old curve, so the two effects separate:
+  `flip_mean_gamma22` against #187's `flip_mean` is the estimator, `flip_mean` against
+  `flip_mean_gamma22` is the curve.
+
+`converged` is how bright the view's truth A is (`mean_linear`: the mean of each channel, linear;
+`mean_luminance`: Rec. 709 luminance of that mean; `mean_luminance_b`: the same for truth B). #188
+reads the pit's converged brightness off it: the estimator's bounce light shows as a brighter pit,
+and a truth from before #188 is compared by the same mean of its `truth-a.f32`.
 
 `floor` is truth B against truth A in the same three: the metric's noise in this view. `lines` has,
 for FLIP 0.05 and 0.02, the samples at which the curve gets there (`samples`; null if it never does),
@@ -990,12 +1004,14 @@ checkpoints; `extrapolated` along the last two, which is an estimate, not a meas
 `not-reached`), the GPU seconds that takes at the mean and at the p95 of one sample's time (`gpu_s`,
 `gpu_s_p95`), and `counts`: **a line counts in a view when it is at least 4 times the view's floor
 FLIP mean**. Where it does not, the view cannot tell that line from noise (on #99, FLIP 0.02 in the
-pit at 720p). Read a line that does not count as nothing, and `extrapolated` as a hint to raise
-`--truth-spp`'s checkpoints, not as a number to quote.
+pit at 720p). Read a line that does not count as nothing, and `extrapolated` as a sign that the curve
+had not reached the line by the last checkpoint (1024 samples, fixed; `--truth-spp` does not move
+the checkpoints), so the number is an estimate to look into, not one to quote.
 
 **The files.** `convergence.csv` has the curve for plotting: `view`, `samples`, `gpu_s`,
 `flip_mean`, `flip_p99`, `mse_linear`, `mse_linear_run_only`, and the view's floor
-(`floor_flip_mean`, `floor_mse_linear`) on every row. `convergence/VIEW/` has `sppNNNN.png` for each
+(`floor_flip_mean`, `floor_mse_linear`) on every row, then `flip_mean_gamma22` and
+`floor_flip_mean_gamma22` (empty without `--flip-gamma-2-2`). `convergence/VIEW/` has `sppNNNN.png` for each
 checkpoint and, for each truth, `truth-a|b.png`, `.f32` (little-endian RGB floats, linear, rows from
 the top) and `.json`, its inputs (the view, camera, sun, seed, samples, size, generator version, GPU,
 driver and build). **A truth is kept for looking at and for working out what a number was made of. It
@@ -1024,7 +1040,7 @@ their errors (the floor), and that a seed gives the same image every time.
 
 ```
 {
-  "schema_version": 17,
+  "schema_version": 18,
   "build":   { "version", "commit" },          // commit: CI builds only, else null; on a PR
                                                // build it is GitHub's merge commit, not the head
   "machine": { "gpu", "device_type", "driver", "driver_info", "backend", "os", "arch",
@@ -1045,9 +1061,10 @@ their errors (the floor), and that a seed gives the same image every time.
   "budgets": { "source", "ok", "failed": ["primary/primary"], "unmatched": [] },
   "edits":   { ... } | null,                       // the Edit stress; null for --short
   "convergence": { "width", "height", "scene", "checkpoints", "truth_spp", "seeds", "flip",
+                   "flip_gamma22",
                    "lines", "min_line_over_floor", "folder", "csv", "wall_s",
                    "views": [ { "name", ...the view's camera and sun, "reference": STATS,
-                                "gpu_total": STATS, "ms_per_mpix_per_sample", "floor",
+                                "gpu_total": STATS, "ms_per_mpix_per_sample", "converged", "floor",
                                 "curve": [...], "lines": [...], "files": [...] }... ] } | null,
                                       // null with --no-convergence or if the phase failed;
                                       // see its section
