@@ -42,8 +42,23 @@ fn resolution() -> Resolution {
     }
 }
 
+/// On the light and display of before #202: these tests are about the upscaler, and some work out
+/// colours from the Material table. The exposure of the art direction follows the light over
+/// frames, so a first frame and a later one would differ by a level or two with it on.
 fn gpu() -> Offscreen {
-    Offscreen::with_resolution(resolution(), &floor_and_block()).unwrap()
+    legacy(Offscreen::with_resolution(resolution(), &floor_and_block()).unwrap())
+}
+
+fn legacy(mut gpu: Offscreen) -> Offscreen {
+    gpu.use_legacy_light();
+    // Primary's own light before #202 was a flat 0.25 and 0.75 of a neutral sun (the Reference
+    // view's sun was 1.6): the colours below are worked out for that, and the sharpness limits
+    // were set on it.
+    gpu.set_look(render::Look {
+        sun: [0.75; 3],
+        ..render::Look::LEGACY
+    });
+    gpu
 }
 
 /// Looks at the block and the floor around it from above and to the side.
@@ -62,8 +77,7 @@ fn panned(frames: u32) -> Camera {
 /// What the camera sees, as well as it can be known at the output's resolution: traced at four
 /// times as many pixels and averaged down, so that edges are anti-aliased.
 fn truth(camera: &Camera) -> Image {
-    let big = Offscreen::new(OUTPUT.0 * 2, OUTPUT.1 * 2, &floor_and_block())
-        .unwrap()
+    let big = legacy(Offscreen::new(OUTPUT.0 * 2, OUTPUT.1 * 2, &floor_and_block()).unwrap())
         .render(camera);
     let mut rgba = Vec::new();
     for y in 0..OUTPUT.1 {
@@ -262,7 +276,7 @@ fn check_motion(path: fn(u32) -> Camera, gain: f64) {
     // A frame of history that was not moved with the camera would be this far from it.
     let unmoved = mse(&image, &truth(&path(frames - 8)));
     // A single upscaled frame is the least that the motion can be asked to match.
-    let mut fresh = Offscreen::with_resolution(resolution(), &floor_and_block()).unwrap();
+    let mut fresh = legacy(Offscreen::with_resolution(resolution(), &floor_and_block()).unwrap());
     let single = mse(&fresh.render_upscaled(&path(frames)), &truth(&path(frames)));
     eprintln!(
         "motion: {now:.1} against the camera now, {unmoved:.1} against 8 frames back, a single frame {single:.1}"
@@ -303,7 +317,7 @@ fn history_that_no_longer_matches_is_thrown_away_and_the_new_colour_wins_at_once
     let camera = Camera::looking_at([0.5, 10.0, 0.5], [0.5, 0.0, 0.5]);
     // Twenty frames of stone, then one frame of soil, shown as `view`.
     let frame_after_the_change = |view| {
-        let mut gpu = Offscreen::with_resolution(resolution(), &scene(STONE)).unwrap();
+        let mut gpu = legacy(Offscreen::with_resolution(resolution(), &scene(STONE)).unwrap());
         for _ in 0..20 {
             gpu.render_upscaled(&camera);
         }
@@ -380,7 +394,7 @@ fn a_debug_view_shows_what_was_traced_and_leaves_no_history_behind() {
     gpu.set_debug_view(DebugView::Lit);
     let back = gpu.render_upscaled(&view());
     // The lit image is not coloured by the debug view's: it is a first frame again.
-    let mut fresh = Offscreen::with_resolution(resolution(), &floor_and_block()).unwrap();
+    let mut fresh = legacy(Offscreen::with_resolution(resolution(), &floor_and_block()).unwrap());
     assert_eq!(back, fresh.render_upscaled(&view()));
 }
 
@@ -389,7 +403,9 @@ fn a_frame_runs_the_primary_pass_then_the_upscale_pass_and_times_both() {
     let mut gpu = gpu();
     gpu.render_upscaled(&view());
     let names: Vec<_> = gpu.timings().passes().iter().map(|p| &*p.name).collect();
-    assert_eq!(names, ["primary", "upscale"]);
+    // The light is drawn from the G-buffer by its own pass and the display transform makes the
+    // image (#202); with its stages off (this test's light) only the tone pass's copy is left.
+    assert_eq!(names, ["primary", "shade", "tone", "upscale"]);
     if gpu.timers_supported() {
         for pass in gpu.timings().passes() {
             assert!(

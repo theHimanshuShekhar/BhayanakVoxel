@@ -184,7 +184,11 @@ fn render(planet: &Planet) -> Vec<(&'static str, Image)> {
         // horizon's one colour, and its low sun leaves the ground nothing to show its relief with.
         let mut gpu = Offscreen::new(WIDTH, HEIGHT, &current).unwrap();
         gpu.use_legacy_light();
-        gpu.set_sun(render::Sun::new([0.5, 0.8, 0.3], 0.04).expect("a direction"));
+        // Primary's own sun before #202 was a flat 0.75 (use_legacy_light's is the Reference's 1.6).
+        gpu.set_look(render::Look {
+            sun: [0.75; 3],
+            ..render::Look::LEGACY
+        });
         images.push((name, gpu.render(&camera)));
         scene = Some(current);
     }

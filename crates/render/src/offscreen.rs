@@ -303,14 +303,16 @@ impl Offscreen {
         self.tracer.set_stages(stages);
     }
 
-    /// The light and display the renderer had before #202: [`Look::LEGACY`](crate::Look::LEGACY)
-    /// and no stage of the art direction ([`Stages::NONE`](crate::Stages::NONE)), so that the lit
-    /// image is the sRGB encoding of the light of the old constants. For the tests whose answers
-    /// are worked out from those constants, and the bench's convergence phase, whose numbers are
-    /// compared from report to report.
+    /// The light and display the renderer had before #202: [`Look::LEGACY`](crate::Look::LEGACY),
+    /// no stage of the art direction ([`Stages::NONE`](crate::Stages::NONE)) and the old default
+    /// sun (high, 0.04 rad), so that the lit image is the sRGB encoding of the light of the old
+    /// constants. For the tests whose answers are worked out from those constants, and the bench's
+    /// convergence phase, whose numbers are compared from report to report. A sun set afterwards
+    /// with [`Offscreen::set_sun`] replaces the old one.
     pub fn use_legacy_light(&mut self) {
         self.set_look(crate::look::Look::LEGACY);
         self.set_stages(crate::post::Stages::NONE);
+        self.set_sun(Sun::new([0.5, 0.8, 0.3], 0.04).expect("a direction"));
     }
 
     /// Chooses what is drawn: the lit image, or one of the debug views.
