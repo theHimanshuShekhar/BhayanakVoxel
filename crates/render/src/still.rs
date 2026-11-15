@@ -274,4 +274,41 @@ mod tests {
         still.plan(&"b", true, at(61), PIXELS);
         assert_eq!(still.plan(&"b", true, at(62), PIXELS).samples(), 1);
     }
+
+    #[test]
+    fn a_big_image_never_plans_more_than_its_cap_whatever_the_timers_say() {
+        // 4K, every batch timed at 0.5 ms a sample: 12 fit in the budget, but the work in a
+        // dispatch of 8.3 Mpix is capped at 7 samples.
+        const FOUR_K: u64 = 8_294_400;
+        let mut still = Still::new();
+        let mut most = 0;
+        for n in 0..300 {
+            let plan = still.plan(&"a", true, at(n), FOUR_K);
+            if let Plan::Reference { samples, .. } = plan {
+                let tag = still.tag();
+                still.timed(tag, 0.5 * f64::from(samples));
+                most = most.max(samples);
+            }
+        }
+        assert_eq!(most, 7, "it rises to the cap and no further");
+
+        // The same Still at 1440p reaches 12 or more (the cap there is 16), and then the image
+        // is made 4K: the plan drops to the cap at once.
+        let mut still = Still::new();
+        let mut n = 0;
+        let mut at_1440p = 0;
+        while n < 300 {
+            if let Plan::Reference { samples, .. } = still.plan(&"a", true, at(n), PIXELS) {
+                let tag = still.tag();
+                still.timed(tag, 0.5 * f64::from(samples));
+                at_1440p = at_1440p.max(samples);
+            }
+            n += 1;
+        }
+        assert!(at_1440p > 7, "{at_1440p}");
+        // A real window's key has the size in it, so it would cut to Primary here; this holds the
+        // key to check the cap on its own: it follows the size, and drops at once.
+        let plan = still.plan(&"a", true, at(n), FOUR_K);
+        assert!(plan.samples() <= 7, "{plan:?}");
+    }
 }

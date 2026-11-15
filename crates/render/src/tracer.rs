@@ -277,6 +277,12 @@ impl Target {
         self.reference_size
     }
 
+    /// The most samples one dispatch of the reference path tracer may take at this size
+    /// ([`max_samples`]).
+    pub fn max_batch(&self) -> u32 {
+        max_samples(pixels(self.reference_size))
+    }
+
     /// The image that the upscaler builds, at the output resolution.
     pub fn image(&self) -> &Plane {
         &self.image
@@ -887,8 +893,7 @@ impl Tracer {
         target: &Target,
         samples: u32,
     ) -> u32 {
-        let (width, height) = target.reference_size;
-        let samples = samples.clamp(1, max_samples(u64::from(width) * u64::from(height)));
+        let samples = batch_of(samples, target.reference_size);
         let view = View::new(camera, sun, target);
         let first = self.accumulator.begin_batch(&view, samples);
         self.write_uniforms(queue, camera, sun, first, CENTRE, samples);
@@ -937,10 +942,9 @@ impl Tracer {
             self.still.timed(tag, ms);
         }
         let key = (View::new(camera, sun, target), self.scene_epoch);
-        let (width, height) = target.reference_size;
         let plan = self
             .still
-            .plan(&key, reference, now, u64::from(width) * u64::from(height));
+            .plan(&key, reference, now, pixels(target.reference_size));
         match plan {
             Plan::Primary => {
                 self.encode_upscaled(device, queue, profiler, encoder, camera, sun, target);
@@ -1371,8 +1375,31 @@ impl Tracer {
     }
 }
 
+/// The pixels in an image of `size`.
+fn pixels(size: (u32, u32)) -> u64 {
+    u64::from(size.0) * u64::from(size.1)
+}
+
+/// The samples one dispatch takes when `samples` are asked for on an image of `size`: at least 1,
+/// and at most [`max_samples`] of the size, the cap that keeps a dispatch's work bounded.
+fn batch_of(samples: u32, size: (u32, u32)) -> u32 {
+    samples.clamp(1, max_samples(pixels(size)))
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_batch_is_clamped_by_the_size_of_the_image_it_is_of() {
+        use crate::batch::MAX_BATCH_SAMPLES;
+        assert_eq!(batch_of(0, (2560, 1440)), 1);
+        assert_eq!(batch_of(100, (2560, 1440)), MAX_BATCH_SAMPLES);
+        assert_eq!(batch_of(100, (1280, 720)), MAX_BATCH_SAMPLES);
+        assert_eq!(batch_of(100, (3840, 2160)), 7, "4K");
+        assert_eq!(batch_of(5, (3840, 2160)), 5);
+        assert_eq!(batch_of(100, (7680, 4320)), 1, "8K");
+        assert_eq!(pixels((3840, 2160)), 8_294_400);
+    }
+
     use super::*;
     use crate::{request_gpu, shared_instance};
 

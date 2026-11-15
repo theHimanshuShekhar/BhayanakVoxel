@@ -128,12 +128,14 @@ fn wait_until(start: Instant, until: Duration) {
 /// it on lavapipe, and this holds it on the machine that measures.
 pub fn batching_is_exact(gpu: &mut Offscreen, camera: &Camera) -> bool {
     let bits = |a: Vec<f32>| a.into_iter().map(f32::to_bits).collect::<Vec<_>>();
+    // Two batches of 3, or of the most that the size allows (an image of over 19.7 Mpix has a cap
+    // under 3), against as many single samples.
+    let each = 3.min(gpu.max_batch_samples());
     gpu.set_reference_seed(RUN_SEED);
-    gpu.reference_batch(camera, 3);
-    gpu.reference_batch(camera, 3);
+    let taken = gpu.reference_batch(camera, each) + gpu.reference_batch(camera, each);
     let batched = bits(gpu.read_accumulation());
     gpu.set_reference_seed(RUN_SEED);
-    for _ in 0..6 {
+    for _ in 0..taken {
         gpu.reference_sample(camera);
     }
     batched == bits(gpu.read_accumulation())
@@ -328,11 +330,14 @@ pub struct ToLine {
 
 /// The block from a run, its scores and the single-sample curve's lines.
 ///
+/// `max_batch_samples` is the cap of the size the run traced at ([`Offscreen::max_batch_samples`]).
+///
 /// `scores` is the FLIP mean and 99th percentile of each of `run.captures` against truth A (all
 /// `None` where FLIP was not run), and `mse` the squared error of its accumulation, in the same
 /// order.
 pub fn report(
     batching_bit_exact: bool,
+    max_batch_samples: u32,
     settings: &Settings,
     run: &Run,
     scores: &[Option<score::Flip>],
@@ -354,7 +359,7 @@ pub fn report(
         batching_bit_exact,
         hz: HZ,
         budget_ms: render::batch::BATCH_BUDGET_MS,
-        max_batch_samples: render::batch::MAX_BATCH_SAMPLES,
+        max_batch_samples,
         still_frames: render::still::STILL_FRAMES,
         fade_ms: render::still::FADE.as_millis() as u64,
         seconds: settings.seconds,
@@ -524,7 +529,7 @@ mod tests {
             marks: Vec::new(),
             captures: Vec::new(),
         };
-        let report = report(true, &Settings::short(), &run, &[], &[], &[]);
+        let report = report(true, 16, &Settings::short(), &run, &[], &[], &[]);
         assert_eq!((report.frames, report.accumulating_frames), (7, 5));
         assert_eq!(report.frames_over, 1);
         assert_eq!(report.frame.max_ms, Some(20.0));

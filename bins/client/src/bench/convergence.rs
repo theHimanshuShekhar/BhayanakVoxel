@@ -415,6 +415,7 @@ fn run_view(view: View, settings: &Settings, out: &Path) -> Result<ViewReport, B
     let (from, to) = (view.description.camera_from, view.description.camera_to);
     let elsewhere = Camera::looking_at([from[0] + 1.0, from[1], from[2]], to);
     let batching_exact = still::batching_is_exact(&mut gpu, &view.camera);
+    let max_batch_samples = gpu.max_batch_samples();
     let still_run = still::run(&mut gpu, &view.camera, &elsewhere, &settings.still);
     drop(gpu);
 
@@ -511,6 +512,7 @@ fn run_view(view: View, settings: &Settings, out: &Path) -> Result<ViewReport, B
     }
     let still = still::report(
         batching_exact,
+        max_batch_samples,
         &settings.still,
         &still_run,
         &still_scores,

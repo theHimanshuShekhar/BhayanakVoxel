@@ -72,8 +72,12 @@ pub const WORST_SAMPLE_MS: f64 = 10.98;
 pub const COST_MARGIN: f64 = 3.0;
 
 /// A sample cheaper than this, in milliseconds a million pixels, is not a time that was measured:
-/// the cheapest view on the 4090 (the open view, mostly sky) costs 0.67 ms a Mpix, so it is
-/// 13 times under that.
+/// the cheapest view on the 4090 (the open view, 0.67 ms a Mpix) is 13 times over it.
+///
+/// **A view that is all sky has not been measured.** Its samples could come near this floor
+/// (0.18 ms at 1440p). If one did fall under it, its times would be left out as no data and the
+/// batch would stay at 1; that is harmless, because sky converges at once (a sample or two is
+/// the answer).
 pub const MIN_SAMPLE_MS_PER_MPIX: f64 = 0.05;
 
 /// The most samples one dispatch of an image of `pixels` pixels may take: the cap's work
@@ -248,7 +252,7 @@ mod tests {
         let mut budget = BatchBudget::new(P1440);
         // 14 ms a sample: over the budget alone. The frame rate drops, and the size does not.
         assert_eq!(run(&mut budget, 30, 14.0), vec![1; 30]);
-        // The pit at 1440p, 7.92 ms: 1 fits.
+        // #99's pit at 1440p, its p95 of 7.92 ms (before #188): 1 fits.
         assert_eq!(run(&mut BatchBudget::new(P1440), 30, 7.92), vec![1; 30]);
     }
 

@@ -558,6 +558,12 @@ impl Offscreen {
         self.profiler.collect(&self.device, true);
     }
 
+    /// The most samples one dispatch of the Reference view may take at the size it is traced at
+    /// ([`crate::batch::max_samples`]).
+    pub fn max_batch_samples(&self) -> u32 {
+        self.target.max_batch()
+    }
+
     /// Adds `samples` samples of the reference path tracer in **one dispatch**, without reading
     /// anything back, and waits until the GPU has done it. The accumulation is that of the same
     /// number of [`Offscreen::reference_sample`]s, bit for bit. Returns the samples taken, which
