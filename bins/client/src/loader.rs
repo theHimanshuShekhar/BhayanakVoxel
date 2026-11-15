@@ -766,6 +766,7 @@ mod tests {
                 vertical: 0.0,
             },
             ahead: [None; 2],
+            horizon: None,
         });
         loader.sync([0.0; 3], bands());
         // 8 Voxels a brick at level 0; level 1 bricks are 16 across: x = 4 is 64 away, 9 is 144.
@@ -786,6 +787,7 @@ mod tests {
         loader.set_reach(Reach {
             margins: render::lod::Margins::NONE,
             ahead: [Some([650.0, 0.0, 0.0]), None],
+            horizon: None,
         });
         loader.request(&BrickStore::new(), [far], [0.0; 3]);
         assert_eq!(loader.outbox[0].class, Class::Prefetch);

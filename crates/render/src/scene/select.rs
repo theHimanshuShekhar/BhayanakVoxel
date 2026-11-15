@@ -22,6 +22,14 @@
 //! everything under it is out of the tree. That is what keeps the bricks drawn to a skin
 //! around the surface, however deep the Planet is, instead of its volume.
 //!
+//! **The horizon cap** ([`Horizon`], ADR 0004). A brick that the bands split is split only if the
+//! cap leaves it in: a brick past the horizon of the camera raised by the vertical margin cannot
+//! be seen, so it stays whole at the coarse level that holds it (never a hole), and its children
+//! are not wanted. The cap is another reason for a node to change, tracked like the bands' by
+//! how far the camera has to go for it to (a unit of path moves the margin by up to a hundred near
+//! the ground, for a climb: see `Cap::slack`). It is off for a camera under sea level, and is
+//! turned on again [`CAP_ON`] above it, so that a swimmer does not flip it.
+//!
 //! **Incremental.** The distance of a brick's box changes no faster than the camera moves, so a
 //! brick that is `s` from where its decision would change cannot change it until the camera has
 //! travelled `s` (the path length, not the displacement). Each node is queued for the total
@@ -33,9 +41,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::hash::{BuildHasherDefault, Hasher};
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
-use brick_store::{Brick, BrickCoord, BrickStore, TableSize};
+use brick_store::{Brick, BrickCoord, BrickStore, TableSize, VOXELS_PER_METRE};
 
-use crate::lod::{Bands, HYSTERESIS, LEVELS, Margins, Placed, Reach, brick_distance};
+use crate::lod::{Bands, HYSTERESIS, Horizon, LEVELS, Margins, Placed, Reach, brick_distance};
 
 /// A fast hash for the small integer keys of the maps here, which SipHash is slow for: the
 /// selection looks nodes up thousands of times a frame. It is not a defence against anything; the
@@ -461,7 +469,7 @@ pub fn par_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec
 
 /// How far the camera (and the places it looks ahead to) must go before the node `key`, `distance`
 /// from the camera, could change: what is drawn, or for a whole node whether it is in reach of
-/// `reach` (`margin` says whether it is).
+/// `reach` (`margin` says whether it is). Both are the bands' and the horizon cap's.
 fn node_slack(
     bands: Bands,
     reach: Placed,
@@ -470,19 +478,42 @@ fn node_slack(
     split: bool,
     margin: bool,
 ) -> f64 {
-    let drawn = bands.slack(key.0, distance, split);
-    if split || reach.is_none() || key.0 == 0 {
+    let (level, coord) = key;
+    if split {
+        return bands
+            .slack(level, distance, true)
+            .min(reach.cap_slack(level, coord, distance, true));
+    }
+    // A whole brick that the bands split is as it is for the cap: it is split when the cap lets
+    // it, and that is all that can change it. One that they do not is split when they do.
+    let eligible = bands.split(level, distance, Some(false));
+    let drawn = if eligible {
+        reach.cap_slack(level, coord, distance, false)
+    } else {
+        bands.slack(level, distance, false)
+    };
+    if level == 0 || reach.is_none() {
         return drawn;
     }
-    let floor = bands.floor(key.0);
+    let floor = bands.floor(level);
     let edge = floor
         * if margin {
             1.0 + HYSTERESIS
         } else {
             1.0 - HYSTERESIS
         };
-    drawn.min((reach.distance(key.0, key.1) - edge).abs())
+    let near = reach.distance(level, coord);
+    let mut slack = drawn.min((near - edge).abs());
+    if bands.split(level, near, Some(margin)) {
+        slack = slack.min(reach.cap_slack_wanted(level, coord, distance, margin));
+    }
+    slack
 }
+
+/// How high over the horizon cap's sphere the raised camera must be for the cap to come back on
+/// after it was off (it goes off when the raised camera is under the sphere): a swimmer bobbing at
+/// sea level does not turn it on and off, which looks at every node.
+const CAP_ON: f64 = 50.0 * VOXELS_PER_METRE;
 
 /// What to do with a brick that is in the tree.
 enum Plan {
@@ -495,10 +526,10 @@ enum Plan {
 }
 
 /// Whether the brick `key`, which is `p` and is new, is drawn whole or split.
-fn plan(store: &BrickStore, bands: Bands, camera: [f64; 3], key: Key, p: Probe) -> Plan {
+fn plan(store: &BrickStore, bands: Bands, at: Placed, key: Key, p: Probe) -> Plan {
     let (level, coord) = key;
-    let distance = brick_distance(camera, level, coord);
-    if bands.split(level, distance, None) {
+    let distance = brick_distance(at.camera(), level, coord);
+    if bands.split(level, distance, None) && at.in_cap_at(level, coord, distance, false) {
         decide(store, level, coord, || p)
     } else {
         Plan::Whole
@@ -579,8 +610,13 @@ pub struct Selection {
     /// The coarsest level, which is drawn from where it starts to infinity.
     top: usize,
     camera: [f64; 3],
-    /// What residency looks at besides the bands (see [`Selection::set_margins`]).
+    /// What residency looks at besides the bands (see [`Selection::set_margins`]), with the
+    /// horizon cap if it is on.
     reach: Reach,
+    /// The horizon cap that was asked for, which is in `reach` while the camera is over it.
+    horizon: Option<Horizon>,
+    /// `reach` seen from the camera.
+    placed: Placed,
     /// Total length of the camera's path since the selection began, and of the places it was
     /// looking ahead to (a node's distance changes no faster than that sum).
     travelled: f64,
@@ -634,12 +670,44 @@ impl Selection {
         top: usize,
         roots: impl IntoIterator<Item = BrickCoord>,
     ) -> (Self, Diff) {
+        Selection::new_capped(store, camera, bands, top, roots, None)
+    }
+
+    /// [`Selection::new`] under the horizon cap `horizon` (see [`Selection::set_horizon`]), which
+    /// is on if the camera is over it.
+    pub fn new_capped(
+        store: &BrickStore,
+        camera: [f64; 3],
+        bands: Bands,
+        top: usize,
+        roots: impl IntoIterator<Item = BrickCoord>,
+        horizon: Option<Horizon>,
+    ) -> (Self, Diff) {
+        Selection::new_reached(store, camera, bands, top, roots, horizon, Reach::NONE)
+    }
+
+    /// [`Selection::new_capped`] with the margins and the lead of `reach` (see
+    /// [`Selection::set_margins`] and [`Selection::set_ahead`]) in force from the first look at
+    /// the nodes, so that the cap is the raised camera's and the margin's children are wanted at
+    /// once, and not by a second look at every node (and a patch of what is drawn) after. Its
+    /// horizon is `horizon`, not the reach's.
+    pub fn new_reached(
+        store: &BrickStore,
+        camera: [f64; 3],
+        bands: Bands,
+        top: usize,
+        roots: impl IntoIterator<Item = BrickCoord>,
+        horizon: Option<Horizon>,
+        reach: Reach,
+    ) -> (Self, Diff) {
         assert!(top < LEVELS && top < store.level_count());
         let mut selection = Selection {
             bands,
             top,
             camera,
-            reach: Reach::NONE,
+            reach: Reach { horizon, ..reach },
+            horizon,
+            placed: Reach { horizon, ..reach }.from(camera),
             travelled: 0.0,
             rewanted: false,
             nodes: HashMap::default(),
@@ -658,6 +726,9 @@ impl Selection {
             fresh: Vec::new(),
             cancelled: Vec::new(),
         };
+        // Asked for, so that it is on above the sphere itself.
+        selection.reach.horizon = horizon;
+        selection.place();
         let mut diff = Diff::default();
         // Level by level, from the top, so that the bricks of a level are looked at on all the
         // threads at once.
@@ -670,8 +741,8 @@ impl Selection {
             .map(|(&coord, p)| ((top, coord), p))
             .collect();
         while !frontier.is_empty() {
-            let (bands, camera) = (selection.bands, selection.camera);
-            let plans = par_map(&frontier, |&(key, p)| plan(store, bands, camera, key, p));
+            let (bands, at, camera) = (selection.bands, selection.placed, selection.camera);
+            let plans = par_map(&frontier, |&(key, p)| plan(store, bands, at, key, p));
             let mut next = Vec::new();
             for (&(key, p), plan) in frontier.iter().zip(plans) {
                 let distance = brick_distance(camera, key.0, key.1);
@@ -900,7 +971,7 @@ impl Selection {
     /// under it if it is to be split.
     fn build(&mut self, store: &BrickStore, key: Key, p: Probe, diff: &mut Diff) {
         let distance = brick_distance(self.camera, key.0, key.1);
-        match plan(store, self.bands, self.camera, key, p) {
+        match plan(store, self.bands, self.placed, key, p) {
             Plan::Whole => self.make_whole(store, key, distance, p, diff),
             Plan::Wait => {
                 self.make_whole(store, key, distance, p, diff);
@@ -962,9 +1033,13 @@ impl Selection {
 
     /// The bricks of [`Selection::take_wanted`] that are not wanted any more since this was last
     /// called, because the node was removed (merged into its parent, or buried) before its
-    /// children arrived. Whatever is generating them can stop.
+    /// children arrived. Whatever is generating them can stop. A brick that is waiting again
+    /// (its node came back) is not listed: its children are wanted after all.
     pub fn take_cancelled(&mut self) -> Vec<Key> {
-        std::mem::take(&mut self.cancelled)
+        let waiting = &self.waiting;
+        let mut cancelled = std::mem::take(&mut self.cancelled);
+        cancelled.retain(|key| !waiting.contains(key));
+        cancelled
     }
 
     /// Takes `key` off the bricks that wait because its node is gone.
@@ -994,9 +1069,7 @@ impl Selection {
                 .nodes
                 .get(&(level, coord))
                 .is_some_and(|node| node.draws)
-                && self
-                    .bands
-                    .split(level, brick_distance(self.camera, level, coord), None)
+                && self.drawn_split((level, coord), None)
                 && let Some(count) = by_level.get_mut(level)
             {
                 *count += 1;
@@ -1065,7 +1138,76 @@ impl Selection {
             return;
         }
         self.reach.margins = margins;
+        let flipped = self.place();
         self.look_again(store);
+        // The cap seen from a camera raised by another margin has other nodes in it, whether or not
+        // it came on or went off.
+        if flipped || self.reach.horizon.is_some() {
+            self.reconsider_all();
+        }
+    }
+
+    /// The horizon cap that was asked for, which [`Selection::reach`] has while it is on.
+    pub fn horizon(&self) -> Option<Horizon> {
+        self.horizon
+    }
+
+    /// Culls by `horizon` (see [`Horizon`]), or by none: what is past the horizon of the camera
+    /// raised by the vertical margin is not split or wanted. Looks at every node once, so it is
+    /// for a selection that is new, not for every frame. Returns what changed in what is drawn.
+    pub fn set_horizon(&mut self, store: &BrickStore, horizon: Option<Horizon>) -> Diff {
+        if self.horizon == horizon {
+            return Diff::default();
+        }
+        self.horizon = horizon;
+        // As when it was new: on above the sphere itself.
+        self.reach.horizon = horizon;
+        self.place();
+        self.reconsider_all();
+        self.update(store, self.camera)
+    }
+
+    /// Works out `placed`, and whether the cap is on: it is while the raised camera is over its
+    /// sphere, and comes back on [`CAP_ON`] over. Returns whether the cap changed.
+    fn place(&mut self) -> bool {
+        let was = self.reach.horizon;
+        let height = Reach {
+            horizon: self.horizon,
+            ..self.reach
+        }
+        .height(self.camera);
+        let on = height.is_some_and(|h| h > if was.is_some() { 0.0 } else { CAP_ON });
+        self.reach.horizon = if on { self.horizon } else { None };
+        self.placed = self.reach.from(self.camera);
+        self.reach.horizon != was
+    }
+
+    /// Looks at every node at the next [`Selection::update`], for a change of the cap.
+    fn reconsider_all(&mut self) {
+        self.rewanted = true;
+        self.queue.clear();
+        self.hot.clear();
+        for (&key, node) in &mut self.nodes {
+            self.stamps += 1;
+            node.stamp = self.stamps;
+            self.hot.push(Hot {
+                key,
+                stamp: self.stamps,
+                split: node.state == State::Split,
+                margin: node.margin,
+            });
+        }
+    }
+
+    /// Whether the bands split the brick `key`, as `was` says it is (see [`Bands::split`]), and the
+    /// horizon cap leaves it in: what a node is split by.
+    fn drawn_split(&self, key: Key, was: Option<bool>) -> bool {
+        let (level, coord) = key;
+        let distance = brick_distance(self.camera, level, coord);
+        self.bands.split(level, distance, was)
+            && self
+                .placed
+                .in_cap_at(level, coord, distance, was.unwrap_or(false))
     }
 
     /// Wants the children of the whole bricks that are near the places `ahead` (where the camera
@@ -1093,6 +1235,7 @@ impl Selection {
             .fold(0.0, f64::max);
         self.travelled += moved;
         self.reach.ahead = ahead;
+        self.place();
     }
 
     /// Looks at every whole brick again, for a change of [`Reach`].
@@ -1103,7 +1246,7 @@ impl Selection {
             .filter(|(_, node)| node.state == State::Whole)
             .map(|(&key, _)| key)
             .collect();
-        let at = self.reach.from(self.camera);
+        let at = self.placed;
         for key in keys {
             self.settle_margin(store, at, key);
             if self.nodes.get(&key).is_some_and(|node| node.stamp != 0) {
@@ -1124,7 +1267,8 @@ impl Selection {
         };
         let (level, coord) = key;
         let reach = at.distance(level, coord);
-        let inside = self.bands.split(level, reach, Some(node.margin));
+        let inside = self.bands.split(level, reach, Some(node.margin))
+            && at.in_cap_wanted(level, coord, node.margin);
         if inside && !store.children_resident(level, coord) {
             self.want(key);
         } else if inside {
@@ -1154,7 +1298,9 @@ impl Selection {
                 continue;
             }
             let reach = at.distance(level - 1, child);
-            if !self.bands.split(level - 1, reach, None) || !probe(store, level - 1, child).present
+            if !self.bands.split(level - 1, reach, None)
+                || !at.in_cap_wanted(level - 1, child, false)
+                || !probe(store, level - 1, child).present
             {
                 continue;
             }
@@ -1169,14 +1315,7 @@ impl Selection {
     /// How far the camera and the places it looks ahead to must go before the whole node `key`, at
     /// `distance` from the camera, could change what is drawn or whether it is in reach.
     fn whole_slack(&self, key: Key, distance: f64, margin: bool) -> f64 {
-        node_slack(
-            self.bands,
-            self.reach.from(self.camera),
-            key,
-            distance,
-            false,
-            margin,
-        )
+        node_slack(self.bands, self.placed, key, distance, false, margin)
     }
 
     /// Splits the bricks `parents` that were waiting, now that the bricks under them are resident.
@@ -1194,7 +1333,7 @@ impl Selection {
                     .get(&key)
                     .is_none_or(|node| node.state == State::Whole)
                 {
-                    self.want_below(store, self.reach.from(self.camera), key);
+                    self.want_below(store, self.placed, key);
                 }
             }
             // The bricks that touch the children just made resident were told, when they were looked
@@ -1276,8 +1415,8 @@ impl Selection {
                 stamp: 0,
             },
         );
-        self.settle_margin(store, self.reach.from(self.camera), key);
-        let stuck = self.bands.split(key.0, distance, Some(false));
+        self.settle_margin(store, self.placed, key);
+        let stuck = self.drawn_split(key, Some(false));
         if p.draws {
             self.drawn[key.0] += 1;
             diff.add(key);
@@ -1295,7 +1434,7 @@ impl Selection {
     fn queue_node(&mut self, key: Key, distance: f64, split: bool) {
         let margin = self.nodes.get(&key).is_some_and(|node| node.margin);
         let slack = if split {
-            self.bands.slack(key.0, distance, true)
+            node_slack(self.bands, self.placed, key, distance, true, margin)
         } else {
             self.whole_slack(key, distance, margin)
         };
@@ -1385,7 +1524,7 @@ impl Selection {
         let distance = brick_distance(self.camera, level, coord);
         match node.state {
             State::Whole => {
-                if self.bands.split(level, distance, whole_was) {
+                if self.drawn_split(key, whole_was) {
                     match decide(store, level, coord, || probe(store, level, coord)) {
                         Plan::Split(children) => {
                             if node.draws {
@@ -1400,16 +1539,16 @@ impl Selection {
                     if node.draws {
                         self.add_stuck(key);
                     }
-                    if self.bands.split(level, distance, Some(false)) {
+                    if self.drawn_split(key, Some(false)) {
                         self.unwatch(key);
                         return;
                     }
                 }
-                self.settle_margin(store, self.reach.from(self.camera), key);
+                self.settle_margin(store, self.placed, key);
                 self.queue_node(key, distance, false);
             }
             State::Split => {
-                if self.bands.split(level, distance, Some(true)) {
+                if self.drawn_split(key, Some(true)) {
                     self.queue_node(key, distance, true);
                     return;
                 }
@@ -1434,6 +1573,10 @@ impl Selection {
             .sqrt();
         self.camera = camera;
         self.travelled += moved;
+        // A change of the cap looks at every node: they are on the hot list now.
+        if self.place() {
+            self.reconsider_all();
+        }
         self.rewanted = false;
         let mut diff = Diff::default();
         // The nodes that may have become hot are taken out first, and each is either hot now,
@@ -1448,16 +1591,21 @@ impl Selection {
             popped.extend(entry.remove());
         }
         let (bands, camera) = (self.bands, self.camera);
-        let reach = self.reach.from(camera);
+        let reach = self.placed;
         // Whether a node `distance` from the camera changes: what is drawn, or (for a whole node)
         // whether it is in reach.
         let changes = |key: Key, distance: f64, split: bool, margin: bool| {
+            let (level, coord) = key;
             if split {
-                !bands.split(key.0, distance, Some(true))
+                !(bands.split(level, distance, Some(true))
+                    && reach.in_cap_at(level, coord, distance, true))
             } else {
-                bands.split(key.0, distance, Some(false))
+                (bands.split(level, distance, Some(false))
+                    && reach.in_cap_at(level, coord, distance, false))
                     || (!reach.is_none()
-                        && bands.split(key.0, reach.distance(key.0, key.1), Some(margin)) != margin)
+                        && (bands.split(level, reach.distance(level, coord), Some(margin))
+                            && reach.in_cap_wanted(level, coord, margin))
+                            != margin)
             }
         };
         let slack = |key: Key, distance: f64, split: bool, margin: bool| {
@@ -1775,6 +1923,231 @@ mod tests {
             // Within a brick of the ball's skin.
             assert!(radius > 400.0 - 2.0 * size, "{level} {c:?} {radius}");
         }
+    }
+
+    /// A ball of rock of 400 Voxels, whose skin is what is seen (like the Planet, with the sea at
+    /// its surface), with a pyramid of four levels, and its roots.
+    fn ball() -> (BrickStore, usize, Vec<BrickCoord>) {
+        let mut store = BrickStore::new();
+        store.set_source(Interior {
+            radius: 400,
+            material: ROCK,
+        });
+        store.build_lod(3);
+        let top = top_level(&store);
+        let roots = top_bricks(&store, top, Some(([0; 3], 450)));
+        (store, top, roots)
+    }
+
+    const SEA: f64 = 400.0;
+
+    fn capped_ball(camera: [f64; 3], capped: bool) -> (BrickStore, Selection) {
+        let (store, top, roots) = ball();
+        let horizon = capped.then(|| Horizon::new(SEA));
+        let (selection, _) =
+            Selection::new_capped(&store, camera, Bands::with_d0(256.0), top, roots, horizon);
+        (store, selection)
+    }
+
+    /// Nobody is drawn under a brick that is drawn: the bricks drawn are a cut through the tree.
+    fn is_a_cut(selection: &Selection) {
+        let drawn: BTreeSet<Key> = selection.bricks().collect();
+        for &(level, coord) in &drawn {
+            let mut c = coord;
+            for l in level + 1..=selection.top() {
+                c = c.parent();
+                assert!(
+                    !drawn.contains(&(l, c)),
+                    "{level} {coord:?} under {l} {c:?}"
+                );
+            }
+        }
+    }
+
+    /// What the selection keeps true of every node: a split node is split by the rule and the cap,
+    /// and a whole one that they split is unwatched (it is stuck or waits).
+    fn is_as_the_rule_says(selection: &Selection, at: &str) {
+        for (&key, node) in &selection.nodes {
+            match node.state {
+                State::Split => assert!(selection.drawn_split(key, Some(true)), "{at}: {key:?}"),
+                State::Whole => assert!(
+                    node.stamp == 0 || !selection.drawn_split(key, Some(false)),
+                    "{at}: {key:?} is whole and split by the rule"
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn the_horizon_cap_leaves_what_is_past_the_horizon_coarse_and_draws_far_fewer_bricks() {
+        let camera = [0.0, SEA + 8.0, 0.0];
+        let (_, free) = capped_ball(camera, false);
+        let (_, capped) = capped_ball(camera, true);
+        assert!(capped.reach().horizon.is_some());
+        is_a_cut(&capped);
+        let (free_count, capped_count) = (free.bricks().count(), capped.bricks().count());
+        assert!(
+            capped_count * 3 < free_count,
+            "{capped_count} drawn capped, {free_count} not"
+        );
+        // Each brick that was split into finer ones is one that the cap leaves out; the finer
+        // bricks that are drawn are all in the cap.
+        let at = capped.reach().from(camera);
+        for (level, coord) in capped.bricks() {
+            if level < capped.top() {
+                let distance = brick_distance(camera, level, coord);
+                let parent_in = at.in_cap(level + 1, coord.parent(), true);
+                assert!(
+                    parent_in,
+                    "{level} {coord:?} {distance} under a parent out of the cap"
+                );
+            }
+        }
+        // The nearest of it is what it was.
+        for key @ (level, coord) in free.bricks() {
+            if brick_distance(camera, level, coord) < 60.0 {
+                assert!(capped.draws(key.0, key.1), "{key:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_horizon_cap_is_off_for_a_camera_under_the_sea_and_back_on_well_over_it() {
+        // A margin of 100 Voxels: the raised camera is 100 over the camera.
+        let margins = Margins {
+            radial: 1.25,
+            vertical: 100.0,
+        };
+        let (store, mut selection) = capped_ball([0.0, 150.0, 0.0], true);
+        selection.set_margins(&store, margins);
+        assert!(selection.reach().horizon.is_none());
+        assert_eq!(selection.horizon(), Some(Horizon::new(SEA)));
+        let (_, free) = capped_ball([0.0, 150.0, 0.0], false);
+        assert_eq!(
+            selection.bricks().collect::<BTreeSet<_>>(),
+            free.bricks().collect::<BTreeSet<_>>()
+        );
+        // Rising, it comes on only when the raised camera is 50 m (1000 Voxels) over the sea, not
+        // as soon as it is over it (from 300).
+        let mut on_at = None;
+        for step in 0..180 {
+            let y = 150.0 + f64::from(step) * 10.0;
+            selection.update(&store, [0.0, y, 0.0]);
+            if on_at.is_none() && selection.reach().horizon.is_some() {
+                on_at = Some(y);
+            }
+        }
+        let on_at = on_at.expect("it came on");
+        assert!((1300.0..1320.0).contains(&on_at), "{on_at}");
+        is_a_cut(&selection);
+        // Coming down it stays on until the raised camera is under the sea.
+        let mut off_at = None;
+        for step in 0..180 {
+            let y = 1900.0 - f64::from(step) * 10.0;
+            selection.update(&store, [0.0, y, 0.0]);
+            if off_at.is_none() && selection.reach().horizon.is_none() {
+                off_at = Some(y);
+            }
+        }
+        assert!(
+            (290.0..310.0).contains(&off_at.expect("it went off")),
+            "{off_at:?}"
+        );
+        is_a_cut(&selection);
+    }
+
+    #[test]
+    fn climbing_over_the_horizon_keeps_every_node_as_the_rule_says_and_the_cut_whole() {
+        let (store, mut selection) = capped_ball([0.0, SEA + 8.0, 0.0], true);
+        selection.set_margins(&store, Margins::standard());
+        let mut camera = [0.0, SEA + 8.0, 0.0];
+        // Up in small steps (the horizon moves a hundred times as fast as the camera), then
+        // over, then down again at a slant.
+        for step in 0..1500 {
+            let climb = if step < 400 { 0.5 } else { 3.0 };
+            camera[1] += climb;
+            selection.update(&store, camera);
+            if step % 25 == 0 {
+                is_as_the_rule_says(&selection, &format!("up {step} {camera:?}"));
+            }
+        }
+        is_a_cut(&selection);
+        for step in 0..1400 {
+            camera[1] -= 3.0;
+            camera[0] += 2.0;
+            selection.update(&store, camera);
+            if step % 25 == 0 {
+                is_as_the_rule_says(&selection, &format!("down {step} {camera:?}"));
+            }
+        }
+        is_a_cut(&selection);
+    }
+
+    #[test]
+    fn following_a_camera_under_the_cap_draws_what_a_fresh_selection_does_up_to_the_hysteresis() {
+        let (store, mut followed) = capped_ball([0.0, SEA + 8.0, 0.0], true);
+        let mut camera = [0.0, SEA + 8.0, 0.0];
+        for step in 0..600 {
+            camera = [
+                30.0 * (f64::from(step) * 0.05).sin(),
+                SEA + 8.0 + f64::from(step) * 0.7,
+                20.0 * (f64::from(step) * 0.07).cos(),
+            ];
+            followed.update(&store, camera);
+        }
+        let (_, fresh) = capped_ball(camera, true);
+        let at = followed.reach().from(camera);
+        let bands = Bands::with_d0(256.0);
+        let a: BTreeSet<Key> = followed.bricks().collect();
+        let b: BTreeSet<Key> = fresh.bricks().collect();
+        for &(level, coord) in a.symmetric_difference(&b) {
+            // The brick, or one of those over it, is within a hysteresis of its band or of the
+            // edge of the cap.
+            let mut near = false;
+            let mut c = coord;
+            for l in level..=followed.top() {
+                let d = brick_distance(camera, l, c);
+                near |= (bands.floor(l) > 0.0
+                    && (d - bands.floor(l)).abs() <= 0.05 * bands.floor(l) + 1e-6)
+                    || at.in_cap(l, c, false) != at.in_cap(l, c, true);
+                c = c.parent();
+            }
+            assert!(near, "{level} {coord:?}");
+        }
+        assert!(
+            a.len().abs_diff(b.len()) * 5 < b.len(),
+            "{} {}",
+            a.len(),
+            b.len()
+        );
+    }
+
+    #[test]
+    fn a_ridge_above_the_sea_is_drawn_from_beyond_the_horizon_of_the_sea() {
+        // The brick whose top is high is in the cap from further than the sea's horizon.
+        let reach = Reach {
+            horizon: Some(Horizon::new(SEA)),
+            ..Reach::NONE
+        };
+        let camera = [0.0, SEA + 8.0, 0.0];
+        let at = reach.from(camera);
+        // On the surface, 150 Voxels along it from the camera: a level 0 brick is outside the
+        // cap (the sea's horizon from 8 up is 80, and the brick's top is 80 more).
+        let along = |x: f64, y: f64| {
+            let angle = x / y;
+            [
+                (y * angle.sin() / 8.0).floor() as i32,
+                (y * angle.cos() / 8.0).floor() as i32,
+                0,
+            ]
+        };
+        let flat_ground = BrickCoord(along(200.0, SEA));
+        let on_a_ridge = BrickCoord(along(200.0, SEA + 120.0));
+        assert!(!at.in_cap(0, flat_ground, false));
+        assert!(
+            at.in_cap(0, on_a_ridge, false),
+            "a peak 120 up is seen from further"
+        );
     }
 
     #[test]
@@ -2648,6 +3021,23 @@ mod tests {
                 .all(|&(level, coord)| !selection.draws(level, coord))
         );
         assert!(selection.take_cancelled().is_empty(), "each is said once");
+    }
+
+    #[test]
+    fn a_brick_that_is_wanted_again_before_the_cancellation_is_taken_is_not_cancelled() {
+        // Its node is gone, and comes back, between two calls: the loader must not be told to stop
+        // generating the children of a brick that waits for them (it kept the earlier request, and
+        // the cancellation killed it, so the brick waited for ever).
+        let store = streamed(64, 4, 2);
+        let mut selection = select(&store, [0.5, 20.0, 0.5], D0);
+        let wanted = selection.take_wanted();
+        let (back, gone) = (wanted[0], wanted[1]);
+        selection.forget(back);
+        selection.forget(gone);
+        selection.want(back);
+        assert_eq!(selection.take_cancelled(), [gone]);
+        assert_eq!(selection.take_wanted(), [back]);
+        assert_eq!(selection.waiting(), wanted.len() - 1);
     }
 
     #[test]

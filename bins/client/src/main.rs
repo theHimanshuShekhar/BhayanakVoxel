@@ -417,6 +417,17 @@ fn margins() -> render::lod::Margins {
     render::lod::Margins::standard()
 }
 
+/// The Planet's horizon cap (ADR 0004, #146): what is past the horizon of the camera raised by the
+/// vertical margin is not refined or made resident. The full-size test can run without it to
+/// measure what it buys (`FULLSIZE_HORIZON=0`).
+fn horizon(planet: &Planet) -> Option<render::lod::Horizon> {
+    #[cfg(test)]
+    if std::env::var_os("FULLSIZE_HORIZON").is_some_and(|v| v == "0") {
+        return None;
+    }
+    Some(render::lod::Horizon::new(planet.sea_radius()))
+}
+
 /// Makes the Planet of `map` into what the client starts with: the spawn ring on gentle land,
 /// then the Guard, and the scene of the bands drawn from them, with a loader to make the resident set complete
 /// (#86). The ring and the Guard are timed, and reported, apart.
@@ -446,8 +457,9 @@ fn load(map: WorldMap, reach: i32) -> Result<Loaded, RingsFull> {
     let mut scene = planet_scene(&store, camera.position, bands, planet.max_radius())?;
     let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
     scene.reserve(room.nodes, room.waiting, room.stuck);
-    // The margins of ADR 0004, on from the start: the selection is only the Guard and the spawn
-    // ring now, so looking at its bricks again is cheap.
+    // The horizon cap and the margins of ADR 0004, on from the start: the selection is only the
+    // Guard and the spawn ring now, so looking at its bricks again is cheap.
+    scene.set_horizon(&store, horizon(&planet))?;
     scene.set_margins(&store, margins());
     let mut loader = Loader::new(
         store.source().expect("the ring's store has a source"),

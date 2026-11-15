@@ -171,7 +171,8 @@ impl Target {
         let accum = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("accumulation"),
             size: u64::from(internal.0) * u64::from(internal.1) * 16,
-            usage: wgpu::BufferUsages::STORAGE,
+            // COPY_SRC so that the bench's convergence phase can read the float mean back.
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
         Self {
@@ -204,6 +205,12 @@ impl Target {
     /// its normal.
     pub fn gbuffer(&self) -> &Plane {
         &self.gbuffer
+    }
+
+    /// The reference path tracer's running mean: one `vec4<f32>` a pixel (the fourth is 1), rows
+    /// from the top, at the traced resolution.
+    pub(crate) fn accum(&self) -> &wgpu::Buffer {
+        &self.accum
     }
 
     /// The upscaler's history image `which` (0 or 1).
@@ -245,6 +252,8 @@ pub struct Tracer {
     upscale: UpscalePass,
     history: History,
     accumulator: Accumulator<View>,
+    /// The reference's random seed: [`RNG_SEED`] unless [`Tracer::set_seed`] changed it.
+    seed: u32,
     debug_view: DebugView,
     /// Bytes of the Planet that have been written to the GPU, creating its buffers included.
     uploaded: u64,
@@ -673,6 +682,7 @@ impl Tracer {
             upscale: UpscalePass::new(device),
             history: History::default(),
             accumulator: Accumulator::new(),
+            seed: RNG_SEED,
             debug_view: DebugView::default(),
             uploaded: scene_bytes,
             last_writes: 0,
@@ -954,6 +964,14 @@ impl Tracer {
         self.debug_view = view;
     }
 
+    /// Sets the seed of the reference's random numbers (the default is [`RNG_SEED`]) and starts
+    /// its image over: the same view, sample count and seed give the same image, and another seed
+    /// gives an independent one of the same expected value.
+    pub fn set_seed(&mut self, seed: u32) {
+        self.seed = seed;
+        self.accumulator.reset();
+    }
+
     /// Samples in the reference image so far.
     pub fn samples(&self) -> u32 {
         self.accumulator.samples()
@@ -974,7 +992,7 @@ impl Tracer {
         );
         let frame = FrameUniform {
             sun: sun.uniform(),
-            params: [sample_index, RNG_SEED, self.debug_view.index(), 0],
+            params: [sample_index, self.seed, self.debug_view.index(), 0],
             jitter: [jitter[0], jitter[1], 0.0, 0.0],
         };
         queue.write_buffer(&self.frame_buffer, 0, bytemuck::bytes_of(&frame));
