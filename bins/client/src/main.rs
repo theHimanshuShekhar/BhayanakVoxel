@@ -209,13 +209,17 @@ struct Room {
 fn room_for(bands: Bands) -> Room {
     let s = (bands.d0() / 1028.2).powi(2);
     let scaled = |n: f64| (n * s) as usize + 1024;
-    // The most each level held in the fill, the walk and the 5 km flight at 320 km with the
-    // horizon cap (#167, 18 levels, the Guard from level 13), from level 1, with `HEADROOM` (the
-    // table of which are solid below is reserved the same): 1.11, 1.01, 1.04, 1.03, 1.14, 1.12,
-    // 0.99, 0.68, 0.32, 0.11, 0.042 and 0.018 million bricks. The cap leaves the bricks beyond the
-    // horizon whole, so the levels from 9 up hold far fewer than before (1.0 million each). A
-    // table is a power of two less an eighth, so the figures between 0.92 and 1.84 million reserve
-    // the same.
+    // The most each level held in the fill, the walk, the 5 km flight and the climb to 5 km over
+    // the spawn (#167, 320 km, 18 levels, the Guard from level 13, the horizon cap), from level 1,
+    // with `HEADROOM` (the table of which are solid below is reserved the same). The peaks, in
+    // millions of bricks, at levels 1 to 12: 0.89, 0.81, 0.83, 0.82, 0.91, 0.90, 0.92, 1.16, 1.00,
+    // 0.76, 0.23 and 0.069 (the climb, not the fill, is the peak from level 7 up: a camera that
+    // rises sees the horizon's levels move out, and their bricks are held on the way); with the
+    // headroom, 1.11, 1.01, 1.04, 1.03, 1.14, 1.12, 1.15, 1.45, 1.25, 0.95, 0.29 and 0.086. The
+    // cap leaves the bricks beyond the horizon whole, so the levels from 9 up hold far fewer than
+    // the 720 000, 110 000 and 20 000 that main reserved for levels 9, 10 and 11 and 12 held at
+    // 14 levels. A table is a power of two less an eighth, so the figures between 0.92 and 1.84
+    // million reserve the same.
     const HELD_AT_LEVELS_1_TO_12: [f64; 12] = [
         1_110_000.0,
         1_010_000.0,
@@ -223,12 +227,12 @@ fn room_for(bands: Bands) -> Room {
         1_030_000.0,
         1_140_000.0,
         1_120_000.0,
-        990_000.0,
-        680_000.0,
-        320_000.0,
-        110_000.0,
-        42_000.0,
-        18_500.0,
+        1_150_000.0,
+        1_450_000.0,
+        1_250_000.0,
+        955_000.0,
+        290_000.0,
+        86_000.0,
     ];
     let mut held = vec![1_500_000 + scaled(1_700_000.0)];
     held.extend((1..RING_LEVELS).map(|level| match level {
@@ -241,11 +245,17 @@ fn room_for(bands: Bands) -> Room {
     }));
     Room {
         held,
-        // 2.18 million bricks had their children resident at the end of the 5 km flight (#167;
+        // 2.44 million bricks had their children resident at the most, in the climb to 5 km (#167;
         // 3.70 million in #143's walk, before the cap left the bricks beyond the horizon whole).
-        resident: scaled(2_800_000.0),
-        // The tree held 4.99 million nodes.
-        nodes: scaled(6_300_000.0),
+        resident: scaled(3_050_000.0),
+        // The tree held 4.99 million nodes after a fill and 5.05 million at the most in the climb
+        // (looked at at every publish), and the table has to be twice that for the entries that are
+        // taken out and put in again (a hash table that has no room left cleans its deleted entries
+        // out in place only if it is under half full, else it doubles): the 11.8 million, which is
+        // room for 14.68 million, that it was reserved for before the cap. The selection's reserve
+        // is for that many **in all** (see `Selection::reserve`): it asked for that many more, on
+        // the 5 million of a scene just rebuilt, and doubled the table in the climb.
+        nodes: scaled(11_800_000.0),
         // Waiting, and asked of the loader, were 442 000 at the most (the loader's queue 564 000,
         // the margins' children included), and stuck 250 000.
         waiting: scaled(700_000.0),
@@ -284,9 +294,13 @@ fn room_for(bands: Bands) -> Room {
 /// level that holds them). It is the store's budget as well as the check, and the 4090's
 /// real-time run of #146 peaked at 16.05 million counted, over the fill's 12.8 and its 10% of
 /// overflow: a budget cut to the fill would evict in the turns and the flights, which the 4090
-/// has not been asked to run with. The tables and the memory do not depend on it (the tables are
-/// `room_for`'s), only the point where eviction starts; lowering it is for a run that measures
-/// the eviction.
+/// has not been asked to run with. It is the only bound on what the store holds: the tables are
+/// sized from what the measured paths held (`room_for`), and a store that the budget lets reach
+/// 20.9 million counted bricks (23.0 million with the overflow) would grow its tables where those
+/// paths did not reach (the climb to 5 km reaches 16.4 million with nothing evicted, and a longer
+/// climb or flight goes on from there). Reserving for the whole budget would be tables for a
+/// store that no path of the benches fills, so they are left to grow beyond what was measured; a
+/// lower budget would make eviction start where the paths go and is for a run that measures it.
 const STREAMED_PER_D0_SQUARED: f64 = 19.8;
 /// The spawn ring's share of what the store counted at full size: 5.63 million of the 20.90 million
 /// (level 0's bricks round the spawn, held before the fill starts), at the `d0` of 1028.2 Voxels
@@ -335,12 +349,21 @@ fn budget_for(bands: Bands) -> Budget {
 /// Words of `brick_refs` and `bricks` to reserve for a scene that is going to fill to what the
 /// `bands` draw: what that is expected to take, with [`HEADROOM`].
 fn expected_words(bands: Bands) -> (usize, usize) {
-    let bricks = BRICKS_PER_D0_SQUARED * bands.d0() * bands.d0() * HEADROOM;
+    let bricks = BRICKS_PER_D0_SQUARED * bands.d0() * bands.d0() * HEADROOM * CLIMB_ROOM;
     (
         (bricks * REFS_PER_BRICK) as usize,
         (bricks * WORDS_PER_BRICK) as usize,
     )
 }
+
+/// How much more of the scene's buffers is reserved than the bricks drawn need, for a climb. The
+/// words of a region are one run of a buffer, so a camera that rises (the levels' bands move, and
+/// regions are freed and taken as it goes) leaves gaps that a larger region does not fit in: in the
+/// climb to 500 m the `bricks` buffer, reserved at 159.8 million words for 116 million in use,
+/// grew by a quarter to its limit of 185.5 million, and `brick_refs` from 4.10 to 4.19 million
+/// (#167). 1.3 over what the bricks drawn need, with [`HEADROOM`], is 207 million; the buffers'
+/// GPU copies are as long, but only the words in use are in the scene's gate.
+const CLIMB_ROOM: f64 = 1.3;
 
 /// The Planet as the client and the in-process server each hold it, the client's packed copy of
 /// it, and where the client starts.
@@ -492,7 +515,7 @@ fn load(map: WorldMap, reach: i32) -> Result<Loaded, RingsFull> {
     );
     loader.reserve(room.waiting);
     // The bricks the Guard leaves to split are asked for here, as load time, and not in the first
-    // frame: there are 178 thousand.
+    // frame: there are 5 085 at 320 km (the log's "asked for the children of" line).
     let asked = Instant::now();
     let first = scene.take_wanted();
     let first_count = first.len();

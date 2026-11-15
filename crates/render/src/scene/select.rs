@@ -624,6 +624,10 @@ pub struct Selection {
     /// which is to run whether the camera has moved or not.
     rewanted: bool,
     nodes: HashMap<Key, Node>,
+    /// The most nodes there have been at once, as far as a node is made (an eviction or a merge
+    /// that takes nodes away does not lower it): what the table's room has to be for, which
+    /// a look at its length between rounds misses when it is a climb's transient.
+    most_nodes: usize,
     /// The nodes that are not hot, by the bucket of the camera's travel in which they are to be
     /// looked at to see if they have become hot, with the stamp they were queued with (an entry for
     /// a node that was queued again since is stale).
@@ -711,6 +715,7 @@ impl Selection {
             travelled: 0.0,
             rewanted: false,
             nodes: HashMap::default(),
+            most_nodes: 0,
             queue: BTreeMap::new(),
             hot: Vec::new(),
             stamps: 0,
@@ -1007,11 +1012,15 @@ impl Selection {
     }
 
     /// Makes room for `nodes` nodes in the tree, `waiting` bricks waiting and `stuck` bricks
-    /// stuck, so that the tables do not double in the middle of a frame.
+    /// stuck (in all, with those it holds already), so that the tables do not double in the middle of a frame.
     pub fn reserve(&mut self, nodes: usize, waiting: usize, stuck: usize) {
-        self.nodes.reserve(nodes);
-        self.waiting.reserve(waiting);
-        self.stuck.reserve(stuck);
+        // Room for that many **in all**: `HashMap::reserve` is for that many *more*, which on a
+        // table that holds entries already (the selection a rebuild has just made) asks for room
+        // for the entries and the reservation both, and doubles the table.
+        self.nodes.reserve(nodes.saturating_sub(self.nodes.len()));
+        self.waiting
+            .reserve(waiting.saturating_sub(self.waiting.len()));
+        self.stuck.reserve(stuck.saturating_sub(self.stuck.len()));
     }
 
     /// The size of every table that [`Selection::reserve`] makes room in.
@@ -1019,7 +1028,7 @@ impl Selection {
         vec![
             TableSize::hash::<(Key, Node)>(
                 "selection nodes",
-                self.nodes.len(),
+                self.nodes.len().max(self.most_nodes),
                 self.nodes.capacity(),
             ),
             TableSize::hash::<Key>(
@@ -1379,6 +1388,7 @@ impl Selection {
                 stamp: 0,
             },
         );
+        self.most_nodes = self.most_nodes.max(self.nodes.len());
         self.queue_node(key, distance, true);
     }
 
@@ -1415,6 +1425,7 @@ impl Selection {
                 stamp: 0,
             },
         );
+        self.most_nodes = self.most_nodes.max(self.nodes.len());
         self.settle_margin(store, self.placed, key);
         let stuck = self.drawn_split(key, Some(false));
         if p.draws {

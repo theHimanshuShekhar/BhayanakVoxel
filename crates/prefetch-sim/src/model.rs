@@ -10,12 +10,12 @@ use render::lod::{Bands, GUARD_FIRST, LEVELS};
 /// Bricks a full fill draws, in units of d0 squared (a level's bricks are the surface within its
 /// band, so they go with d0²): measured by the client on the full-size 320 km Planet, 4 652 474
 /// bricks at a bias of 1 with the camera 2 m up and no horizon cap (#146, the `FULLSIZE_HORIZON=0`
-/// run of `the_resident_set_at_2_m_50_m_500_m_and_5_km_over_the_spawn`). On the 16 km Planet it was
+/// run of `the_resident_set_at_2_m_50_m_500_m_2_km_and_5_km_over_the_spawn`). On the 16 km Planet it was
 /// 3.44 million, 3.25 d0² (3.56 million, 3.37 d0², before #142 stopped the deep sea from being
 /// drawn): the Planet is twenty times as large and a level's bricks go with the surface in its
-/// band, not the Planet's, so the difference is the Guard's levels (all of them
-/// are drawn from the bands now: `guard_first` is 13 at 320 km) and the ground's relief, which the generator has
-/// more of.
+/// band, not the Planet's, so the difference is the Guard's levels (the Guard begins at level 13,
+/// `render::lod::GUARD_FIRST`, so the levels below it are all drawn from the bands) and the
+/// ground's relief, which the generator has more of.
 pub const DRAWN_PER_D0_SQUARED: f64 = 4.40;
 
 /// The model's [`Model::crust`].

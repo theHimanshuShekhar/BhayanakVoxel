@@ -667,16 +667,16 @@ mod tests {
 
     #[test]
     fn the_pyramid_reaches_the_farthest_zoom_distance_and_no_further() {
-        // A level's Voxel covers a pixel at the floor of the level above (2 d0 times the level's
-        // own), so the top level's Voxels are a pixel or less at `floor(LEVELS)`, which must be
-        // beyond the farthest the Zoom shows: its far side, 20 Planet radii out and one more
-        // across at 320 km (ADR 0008). The level before the top is the last that the farthest
-        // distance needs by its band alone: the top level is the one the horizon cap's roots are
-        // at, and the pyramid has no level that nothing could see.
+        // A level owns what is beyond its floor, so the farthest the Zoom shows (its far side:
+        // 20 Planet radii out and one more across at 320 km, ADR 0008, 6 720 km) is owned by the
+        // level whose floor is the last one under it, level 16, and the top level, 17, begins just
+        // past it: it is only what the horizon cap's roots are drawn at. One level fewer would
+        // stop short of the Zoom's far side, and one more would be a level that nothing could
+        // reach, so both bounds pin the count at 18.
         let bands = Bands::new(1440, VFOV, 1.0);
         let farthest = 21.0 * 320_000.0 * VOXELS_PER_METRE;
-        assert!(bands.floor(LEVELS) > farthest);
         assert!(bands.floor(LEVELS - 2) <= farthest);
+        assert!(bands.floor(LEVELS - 1) > farthest);
     }
 
     #[test]
