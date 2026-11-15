@@ -91,6 +91,10 @@ fn streamed(store: BrickStore, scene: Scene, camera: [f64; 3], run: Run) -> (Wor
         Run::Stepped => world.with_stepped_loader(Loader::stepped(source, camera, bands())),
         Run::Threads(workers) => world.with_loader(Loader::new(source, camera, bands(), workers)),
     };
+    // The tests of following, the budget and eviction fly at speeds that the bands' speed scale
+    // (ADR 0009, #168) changes: they are of the bands as they are. The tests of the scale turn it
+    // on.
+    world.worker().speed_scale(false);
     (world, server)
 }
 
@@ -458,6 +462,59 @@ fn after_walking_at_5_m_per_s_the_loader_fills_in_and_the_ground_under_the_camer
     );
     let hit = trace(world.scene(), &down).expect("ground under the camera");
     assert_eq!(world.scene().level_at(hit.voxel), Some(0));
+}
+
+/// How many bricks the scene draws at each level, for the golden of
+/// [`standing_and_walking_under_10_m_per_s_draw_exactly_what_they_drew_before_speed_scaling`].
+fn drawn_by_level(world: &World) -> Vec<usize> {
+    (0..LEVELS).map(|level| world.level_bricks(level)).collect()
+}
+
+/// Standing and walking (under 10 m/s) draw exactly what they drew before the camera's speed
+/// scaled the bands (#168, ADR 0009: full detail up to 10 m/s). The golden is what the bricks
+/// drawn at each level came to on main before that change (`b309516`): a stand of a second
+/// and then a walk of six seconds at 6 m/s with the camera's velocity told to the scene thread (as
+/// the game does), each ended by the resident set being complete. It is a count at each of the
+/// 18 levels, a fingerprint of the cut of the pyramid that is drawn; the bands are also
+/// compared whole, for the scale the speed puts on them.
+#[test]
+fn standing_and_walking_under_10_m_per_s_draw_exactly_what_they_drew_before_speed_scaling() {
+    const STANDING: [usize; LEVELS] = [
+        1298, 1538, 1551, 1539, 1541, 1522, 1531, 1586, 1555, 1572, 1607, 1540, 1551, 1503, 404, 0,
+        0, 0,
+    ];
+    const WALKING: [usize; LEVELS] = [
+        1806, 1547, 1517, 1506, 1542, 1553, 1572, 1579, 1555, 1572, 1607, 1540, 1551, 1503, 404, 0,
+        0, 0,
+    ];
+    let (mut world, _server, mut camera) = spawned_world(Run::Stepped);
+    world.worker().speed_scale(true);
+    let (ahead, _) = tangents(camera.horizon_up);
+    let speed = 6.0 * VOXELS_PER_METRE;
+    let velocity = ahead.map(|c| c * speed);
+    for _ in 0..60 {
+        world.recentre_moving(camera.position, [0.0; 3]).unwrap();
+        stream(&mut world, camera.position);
+        pace(&world, FRAME);
+        assert_eq!(world.bands(), Some(bands()));
+    }
+    fill(&mut world, camera.position);
+    let standing = drawn_by_level(&world);
+    let mut walked = camera.position;
+    for _ in 0..360 {
+        walked = std::array::from_fn(|a| walked[a] + ahead[a] * speed / 60.0);
+        let position = over_the_ground(&world.store(), walked);
+        camera.position = position;
+        camera.carry_up(position);
+        world.recentre_moving(position, velocity).unwrap();
+        stream(&mut world, position);
+        pace(&world, FRAME);
+        assert_eq!(world.bands(), Some(bands()), "walking is not scaled");
+    }
+    fill(&mut world, camera.position);
+    let walking = drawn_by_level(&world);
+    assert_eq!(standing, STANDING);
+    assert_eq!(walking, WALKING);
 }
 
 #[test]

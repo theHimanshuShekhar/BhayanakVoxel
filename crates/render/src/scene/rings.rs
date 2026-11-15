@@ -1014,6 +1014,22 @@ impl Scene {
             .map(Some)
     }
 
+    /// Draws by other `bands` for the camera where it is, patching what changes level instead of
+    /// making the scene again (see [`Selection::set_bands`]): what the camera's speed asks of the
+    /// bands (ADR 0009, #168), which changes a few times in a flight. A scene that is not rings
+    /// has no bands, and changes nothing. Returns what changed, as [`Scene::recentre`] does.
+    pub fn reband(
+        &mut self,
+        store: &BrickStore,
+        bands: Bands,
+    ) -> Result<Option<SceneUpdate>, RingsFull> {
+        let Some(rings) = &mut self.rings else {
+            return Ok(None);
+        };
+        let diff = rings.selection.set_bands(store, bands);
+        self.show_diff(store, &diff)
+    }
+
     /// The scene made again for `camera` and `bands`, in place, from nothing: what a jump of the
     /// camera or another bias asks for. Reported as [`SceneUpdate::Rebuilt`]. The selection is
     /// made roomy again as [`Scene::reserve`] did, in proportion to `d0` squared if the bands
@@ -1215,9 +1231,13 @@ impl Scene {
         }
     }
 
-    /// How many bricks wait for the bricks under them to be resident.
+    /// How many bricks wait for the bricks under them to be resident, and how many nodes wait to be
+    /// looked at again for new bands ([`Scene::reband`]): what the scene is yet to do before it
+    /// draws what its bands ask for.
     pub fn waiting(&self) -> usize {
-        self.rings.as_ref().map_or(0, |r| r.selection.waiting())
+        self.rings
+            .as_ref()
+            .map_or(0, |r| r.selection.waiting() + r.selection.relooking())
     }
 
     /// Whether the selection has a brick to look at again that no camera move will bring (see

@@ -43,7 +43,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use brick_store::{BrickCoord, BrickStore, Candidate, LodWork, TableSize, VOXELS_PER_METRE};
-use render::lod::{AHEAD, Bands, Class, LEVELS, brick_distance};
+use render::lod::{AHEAD, Bands, Class, LEVELS, SpeedScale, brick_distance};
 use render::{PatchCopy, RingPatch, RingsFull, Scene, SceneUpdate, UploadCost};
 use sim::SharedStore;
 
@@ -218,6 +218,19 @@ const LEAD: [f64; AHEAD] = [1.0, 2.0];
 /// Slower than this, in Voxels a second (1 m/s), the camera is standing and there is no lead.
 const LEAD_FROM_SPEED: f64 = VOXELS_PER_METRE;
 
+/// The speed scale of a camera at rest. A test can measure another curve: `SPEED_DEPTH` is the
+/// depth in levels that the ramp ends at (1.5 is the curve, 0 is no speed scaling).
+fn speed_scale_at_rest() -> SpeedScale {
+    #[cfg(test)]
+    if let Some(most) = std::env::var("SPEED_DEPTH")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+    {
+        return SpeedScale::at_rest_up_to(most);
+    }
+    SpeedScale::AT_REST
+}
+
 /// `bands` at `step` of [`COARSENING`] (0 is as they are).
 fn coarsened(bands: Bands, step: usize) -> Bands {
     match step.checked_sub(1).and_then(|i| COARSENING.get(i)) {
@@ -361,6 +374,10 @@ pub struct Done {
     pub holes_found: u64,
     /// Rounds in which the thread held work back for the upload budget.
     pub budget_cuts: u64,
+    /// Times the camera's speed moved the bands to another depth (ADR 0009), and the bricks drawn
+    /// that changed in them, which came or went.
+    pub speed_changes: u64,
+    pub speed_bricks: u64,
 }
 
 /// The parts of a round that [`Spent`] times.
@@ -619,6 +636,9 @@ struct Shared {
     /// [`SceneWorker::forget_largest`]).
     #[cfg(test)]
     forget_largest: AtomicBool,
+    /// A test turned the speed scale off (see [`SceneWorker::without_speed_scale`]).
+    #[cfg(test)]
+    no_speed_scale: AtomicBool,
     /// The most words a buffer of the scene may have (see [`SceneWorker::set_buffer_limit`]).
     buffer_limit: AtomicUsize,
 }
@@ -740,6 +760,8 @@ impl SceneWorker {
             budget_writes: AtomicU32::new(UPLOAD_BUDGET.writes),
             #[cfg(test)]
             forget_largest: AtomicBool::new(false),
+            #[cfg(test)]
+            no_speed_scale: AtomicBool::new(false),
             buffer_limit: AtomicUsize::new(usize::MAX),
         });
         let (garbage, graveyard) = mpsc::channel();
@@ -764,6 +786,7 @@ impl SceneWorker {
             evict_from: 0,
             eviction: EvictionStats::default(),
             user_bands,
+            speed: speed_scale_at_rest(),
             coarsening: 0,
             coarsened_at: clock.now(),
             units_per_node: 0.0,
@@ -834,6 +857,14 @@ impl SceneWorker {
     #[cfg(test)]
     pub fn forget_largest(&self) {
         self.shared.forget_largest.store(true, Ordering::Release);
+    }
+
+    /// Turns the speed scale of the bands (ADR 0009: the camera's speed makes `d0` coarser from
+    /// 10 m/s) on or off. The tests of what following and the budget do are in worlds that have it
+    /// off, as their flights are at the speeds that it changes; the tests of the scale turn it on.
+    #[cfg(test)]
+    pub fn speed_scale(&self, on: bool) {
+        self.shared.no_speed_scale.store(!on, Ordering::Release);
     }
 
     /// The nodes of the selection of a stepped thread (see [`Scene::nodes`]).
@@ -1252,8 +1283,11 @@ struct Engine {
     /// Eviction does not begin before the store holds more than this (see [`EVICT_RETRY`]).
     evict_from: usize,
     eviction: EvictionStats,
-    /// The bands the frame thread asked for, which the scene's are [`COARSENING`] of.
+    /// The bands the frame thread asked for, which the scene's are the camera's speed and then
+    /// [`COARSENING`] of (see [`Engine::bands_at`]).
     user_bands: Option<Bands>,
+    /// How many levels coarser than at rest the bands are for the camera's speed (ADR 0009, #168).
+    speed: SpeedScale,
     /// How many steps of [`COARSENING`] the scene's bands are at, and when that last changed.
     coarsening: usize,
     coarsened_at: Instant,
@@ -1558,6 +1592,13 @@ impl Engine {
             self.next_place(camera)
         };
         self.look_ahead(place, velocity);
+        let rescaled = match self.rescale(velocity) {
+            Ok(rescaled) => rescaled,
+            Err(full) => {
+                self.fail(full);
+                return false;
+            }
+        };
         self.paused = self.shared.paused.load(Ordering::Acquire);
         self.scene
             .set_buffer_limit(self.shared.buffer_limit.load(Ordering::Relaxed));
@@ -1568,7 +1609,7 @@ impl Engine {
             self.largest_batch = UploadCost::default();
             self.largest_follow = UploadCost::default();
         }
-        let mut worked = !jobs.is_empty();
+        let mut worked = rescaled || !jobs.is_empty();
         // A sync is done when the rest of what the thread does in this round is.
         #[cfg_attr(not(test), allow(unused_mut))]
         let mut synced: Option<u64> = None;
@@ -1765,6 +1806,42 @@ impl Engine {
         }
     }
 
+    /// The bands the scene is selected by at `step` of [`COARSENING`]: the frame thread's, drawn
+    /// coarser for the camera's speed ([`SpeedScale`], ADR 0009), and then the farthest of them
+    /// coarser still at the memory cap. The two multiply, so where both apply the coarser wins and
+    /// the bands stay in order (see `render::lod`).
+    fn bands_at(&self, step: usize) -> Bands {
+        let user = self.user_bands.expect("the frame thread asked for bands");
+        coarsened(user.speed_scaled(self.speed.depth()), step)
+    }
+
+    /// Shows the speed of the camera to the bands' scale (ADR 0009, #168): when it takes a step,
+    /// the scene is selected in place for the new `d0` (a coarser one at once, a finer one when
+    /// the speed has fallen), and what that changed is packed and noted like a follow step.
+    fn rescale(&mut self, velocity: [f64; 3]) -> Result<bool, RingsFull> {
+        #[cfg(test)]
+        if self.shared.no_speed_scale.load(Ordering::Acquire) {
+            return Ok(false);
+        }
+        if self.user_bands.is_none() {
+            return Ok(false);
+        }
+        let speed = velocity.iter().map(|v| v * v).sum::<f64>().sqrt();
+        if !self.speed.observe(speed) {
+            return Ok(false);
+        }
+        let began = self.began();
+        let store = self.store.read().expect("the store's lock is not poisoned");
+        let before = self.scene.bricks_changed();
+        let update = self.scene.reband(&store, self.bands_at(self.coarsening))?;
+        drop(store);
+        self.work.speed_changes += 1;
+        self.work.speed_bricks += self.scene.bricks_changed() - before;
+        self.note(update);
+        self.spend(Part::Follow, began);
+        Ok(true)
+    }
+
     fn run_job(&mut self, job: Job) -> Result<(), RingsFull> {
         let store = self.store.read().expect("the store's lock is not poisoned");
         let update = match job {
@@ -1782,7 +1859,7 @@ impl Engine {
             Job::Bands(bands) => {
                 self.user_bands = Some(bands);
                 self.scene
-                    .set_bands(&store, coarsened(bands, self.coarsening))?
+                    .set_bands(&store, self.bands_at(self.coarsening))?
             }
             Job::Look { .. } => unreachable!("not run here"),
             #[cfg(test)]
@@ -2190,14 +2267,11 @@ impl Engine {
     /// [`COARSEN_HOLD`]: the scene is selected and packed again, and the units that the coarser
     /// bands do not want are for eviction to take. Whether it did.
     fn coarsen(&mut self, step: usize) -> bool {
-        let Some(bands) = self.user_bands else {
-            return false;
-        };
-        if self.clock.since(self.coarsened_at) < COARSEN_HOLD {
+        if self.user_bands.is_none() || self.clock.since(self.coarsened_at) < COARSEN_HOLD {
             return false;
         }
         let store = self.store.read().expect("the store's lock is not poisoned");
-        let update = self.scene.set_bands(&store, coarsened(bands, step));
+        let update = self.scene.set_bands(&store, self.bands_at(step));
         drop(store);
         match update {
             Ok(update) => {
@@ -2244,8 +2318,8 @@ impl Engine {
             }
             self.barred = None;
         }
-        let before = coarsened(bands, self.coarsening - 1).weight();
-        let now = coarsened(bands, self.coarsening).weight();
+        let before = self.bands_at(self.coarsening - 1).weight();
+        let now = self.bands_at(self.coarsening).weight();
         let would_want = self.scene.nodes() as f64 * before / now * self.units_per_node;
         let fits = {
             let store = self.store.read().expect("the store's lock is not poisoned");

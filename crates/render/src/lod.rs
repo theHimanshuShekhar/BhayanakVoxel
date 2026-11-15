@@ -35,6 +35,12 @@
 //!
 //! **Coarsening** ([`Bands::coarsened`]) is the last resort at the memory cap: the farthest bands
 //! use a larger bias, so that fewer bricks are drawn and wanted.
+//!
+//! **Speed** ([`SpeedScale`], [`Bands::speed_scaled`], ADR 0009, #168): `d0` shrinks as the camera
+//! moves faster, so that a fast camera selects coarser levels, on purpose and everywhere (the
+//! bands, the margins, the lead and the loader all use the scaled rule). The two compose by
+//! multiplication: a level's floor is `d0 · 2^-depth · 2^level`, nearer still by a coarsening's
+//! factor, so where both apply the coarser wins at every level, and the bands stay in order.
 
 use brick_store::{BrickCoord, VOXELS_PER_METRE};
 
@@ -78,6 +84,10 @@ pub const VFOV: f64 = 70.0 * std::f64::consts::PI / 180.0;
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Bands {
     d0: f64,
+    /// `d0`'s factor for the camera's speed: 1 for a slow camera, `2^-depth` for a fast one (see
+    /// [`SpeedScale`]). [`Bands::d0`] is not scaled, so that what is measured in `d0` (a jump, a
+    /// step of following the camera, the room reserved) does not change with the speed.
+    scale: f64,
     coarsening: Option<Coarsening>,
 }
 
@@ -98,6 +108,7 @@ impl Bands {
         let focal = f64::from(output_height) / (2.0 * (vfov / 2.0).tan());
         Self {
             d0: focal / bias,
+            scale: 1.0,
             coarsening: None,
         }
     }
@@ -113,8 +124,32 @@ impl Bands {
         assert!(d0 > 0.0 && d0.is_finite(), "d0 is {d0}");
         Self {
             d0,
+            scale: 1.0,
             coarsening: None,
         }
+    }
+
+    /// These bands for a camera moving fast enough to be `depth` levels coarser (0 is the camera at
+    /// rest, and the bands as they are): `d0` is halved for each level, so every level starts where
+    /// the level `depth` below it did. See [`SpeedScale`] for the depth a speed has.
+    pub fn speed_scaled(self, depth: f64) -> Self {
+        assert!(depth >= 0.0 && depth.is_finite(), "depth is {depth}");
+        Self {
+            scale: if depth == 0.0 { 1.0 } else { (-depth).exp2() },
+            ..self
+        }
+    }
+
+    /// The factor on `d0` that the camera's speed puts on these bands: 1 at rest (see
+    /// [`Bands::speed_scaled`]).
+    pub fn scale(&self) -> f64 {
+        self.scale
+    }
+
+    /// `d0` as the bands use it, with the speed's factor: what a level-0 Voxel covering one pixel
+    /// means for the camera as it moves.
+    pub fn scaled_d0(&self) -> f64 {
+        self.d0 * self.scale
     }
 
     /// These bands with the levels from `from` up drawn coarser by `factor` (1 to 2, 1 is none).
@@ -144,7 +179,7 @@ impl Bands {
         if level == 0 {
             return 0.0;
         }
-        let floor = self.d0 * (1u64 << level) as f64;
+        let floor = self.scaled_d0() * (1u64 << level) as f64;
         match self.coarsening {
             Some(c) if level >= c.from => floor / c.factor,
             _ => floor,
@@ -165,7 +200,7 @@ impl Bands {
                 (to * to - from * from) / (across * across)
             })
             .sum::<f64>()
-            / (self.d0 * self.d0)
+            / (self.scaled_d0() * self.scaled_d0())
             * 64.0
     }
 
@@ -216,6 +251,102 @@ impl Bands {
     /// at least this far. Zero for level 0.
     pub fn clear_radius(&self, level: usize) -> f64 {
         self.floor(level) * (1.0 - HYSTERESIS)
+    }
+}
+
+/// The speed, in metres a second, up to which the bands are what they are at rest: a walk (ADR
+/// 0009: "full detail up to 10 m/s").
+pub const FULL_DETAIL_UP_TO: f64 = 10.0;
+
+/// The speed, in metres a second, at which the bands are [`MOST_DEPTH`] coarser: the flight's.
+pub const FLIGHT_SPEED: f64 = 50.0;
+
+/// How many levels coarser than at rest the bands are at [`FLIGHT_SPEED`] and above (ADR 0009: "about
+/// one and a half").
+pub const MOST_DEPTH: f64 = 1.5;
+
+/// The steps the depth moves in, in levels. A change of depth looks at every node of the
+/// selection once, so the curve is a few steps and not a slope: 0, 0.5, 1 and 1.5 levels.
+pub const DEPTH_STEP: f64 = 0.5;
+
+/// How far under a step's speed the camera must fall before the step is given back, as a factor
+/// on the speed: a step is given back when 1.1 times the camera's speed no longer asks for it (3 to
+/// 4 m/s under the step's, 1 m/s under the 10 m/s that begins the ramp), so that speed noise about
+/// a step's speed does not flip it.
+pub const RELEASE: f64 = 1.1;
+
+/// The depth, in levels coarser than at rest, that a speed asks for before the steps and the
+/// hysteresis: nothing up to [`FULL_DETAIL_UP_TO`], a ramp to [`MOST_DEPTH`] at [`FLIGHT_SPEED`].
+/// `speed` is in Voxels a second.
+pub fn depth_for(speed: f64) -> f64 {
+    depth_up_to(speed, MOST_DEPTH)
+}
+
+/// [`depth_for`] with a ramp that ends at `most` levels (what the bench's measurements of other
+/// curves are made with).
+pub fn depth_up_to(speed: f64, most: f64) -> f64 {
+    let metres = speed / VOXELS_PER_METRE;
+    ((metres - FULL_DETAIL_UP_TO) / (FLIGHT_SPEED - FULL_DETAIL_UP_TO)).clamp(0.0, 1.0) * most
+}
+
+/// The depth of the speed-scaled bands (ADR 0009, #168): how many levels coarser than at rest a
+/// camera of the speed it was last shown is drawn at, in steps of [`DEPTH_STEP`].
+///
+/// **It coarsens at once and refines when the camera has slowed**: a speed that asks for a deeper
+/// step takes it on the spot, rounded up, and a step is given back only when the speed is
+/// [`RELEASE`] under what the step below asks for. A camera at a steady speed therefore
+/// stays at one depth, whatever noise the speed has within that hysteresis.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SpeedScale {
+    /// The step: the depth in units of [`DEPTH_STEP`].
+    step: u32,
+    /// The depth the ramp ends at: [`MOST_DEPTH`].
+    most: f64,
+}
+
+impl Default for SpeedScale {
+    fn default() -> Self {
+        Self::AT_REST
+    }
+}
+
+impl SpeedScale {
+    /// The camera at rest: depth 0.
+    pub const AT_REST: SpeedScale = SpeedScale {
+        step: 0,
+        most: MOST_DEPTH,
+    };
+
+    /// A camera at rest whose ramp ends at `most` levels instead of [`MOST_DEPTH`]: for measuring
+    /// other curves. 0 is no speed scaling at all.
+    pub fn at_rest_up_to(most: f64) -> Self {
+        assert!(most >= 0.0 && most.is_finite(), "most is {most}");
+        Self { step: 0, most }
+    }
+
+    /// The depth now, in levels coarser than at rest.
+    pub fn depth(&self) -> f64 {
+        f64::from(self.step) * DEPTH_STEP
+    }
+
+    /// Shows the camera's `speed`, in Voxels a second. Returns whether the depth changed. The
+    /// Zoom's hook: the speed it is given is the camera's along the Zoom (#58), the same rule.
+    pub fn observe(&mut self, speed: f64) -> bool {
+        let most = self.most;
+        let steps = |speed: f64| {
+            (depth_up_to(speed, most) / DEPTH_STEP - 1e-9)
+                .ceil()
+                .max(0.0) as u32
+        };
+        let (up, down) = (steps(speed), steps(speed * RELEASE));
+        let step = if up > self.step {
+            up
+        } else if down < self.step {
+            down
+        } else {
+            self.step
+        };
+        std::mem::replace(&mut self.step, step) != step
     }
 }
 
@@ -1145,5 +1276,99 @@ mod tests {
             }
         }
         assert!(seen > 5_000, "{seen}");
+    }
+
+    fn metres(speed: f64) -> f64 {
+        speed * VOXELS_PER_METRE
+    }
+
+    #[test]
+    fn a_camera_under_ten_metres_a_second_is_at_full_detail_and_the_bands_are_the_plain_ones() {
+        let mut scale = SpeedScale::AT_REST;
+        for speed in [0.0, 1.0, 5.0, 9.0, 10.0] {
+            assert!(!scale.observe(metres(speed)), "{speed} m/s");
+            assert_eq!(scale.depth(), 0.0);
+        }
+        // Not a rounding of the bands: the same bands, bit for bit.
+        let bands = Bands::with_d0(1028.27);
+        assert_eq!(bands.speed_scaled(scale.depth()), bands);
+        assert_eq!(bands.speed_scaled(0.0).scale(), 1.0);
+    }
+
+    #[test]
+    fn the_ramp_reaches_a_level_and_a_half_at_fifty_metres_a_second_and_stays() {
+        assert_eq!(depth_for(metres(10.0)), 0.0);
+        assert!((depth_for(metres(30.0)) - 0.75).abs() < 1e-12);
+        assert!((depth_for(metres(50.0)) - 1.5).abs() < 1e-12);
+        assert_eq!(depth_for(metres(400.0)), 1.5);
+        let mut scale = SpeedScale::AT_REST;
+        assert!(scale.observe(metres(50.0)));
+        assert_eq!(scale.depth(), 1.5);
+        let bands = Bands::with_d0(1000.0).speed_scaled(scale.depth());
+        // Every level starts where the level a level and a half finer did: 2^-1.5 of the distance.
+        let plain = Bands::with_d0(1000.0);
+        for level in 1..10 {
+            let ratio = bands.floor(level) / plain.floor(level);
+            assert!((ratio - 2f64.powf(-1.5)).abs() < 1e-12, "{level}: {ratio}");
+        }
+        // `d0` is the same for what is measured in it: a jump, a step, the room.
+        assert_eq!(bands.d0(), 1000.0);
+    }
+
+    #[test]
+    fn a_camera_coarsens_at_once_and_refines_only_when_it_has_slowed() {
+        let mut scale = SpeedScale::AT_REST;
+        // At once, to the step that holds the speed (rounded up).
+        assert!(scale.observe(metres(50.0)));
+        assert_eq!(scale.depth(), 1.5);
+        // Slower, but within what the step holds and its release: no change.
+        assert!(!scale.observe(metres(40.0)));
+        assert!(!scale.observe(metres(35.0)));
+        assert_eq!(scale.depth(), 1.5);
+        // Well under it: the step is given back, to the step the speed holds.
+        assert!(scale.observe(metres(30.0)));
+        assert_eq!(scale.depth(), 1.0);
+        assert!(scale.observe(metres(15.0)));
+        assert_eq!(scale.depth(), 0.5);
+        // Stopped: full detail.
+        assert!(scale.observe(0.0));
+        assert_eq!(scale.depth(), 0.0);
+    }
+
+    #[test]
+    fn speed_noise_about_a_steady_speed_never_flips_a_step() {
+        // A camera at each speed from 1 to 60 m/s, with noise of 4% either way (the prefetch's
+        // running mean over a tenth of a second is steadier than that), however it began.
+        for tenth in 10..600 {
+            let speed = f64::from(tenth) / 10.0;
+            let mut scale = SpeedScale::AT_REST;
+            scale.observe(metres(speed));
+            let first = scale.depth();
+            let mut changes = 0;
+            for n in 0..200 {
+                // A fixed pseudo-random wobble in [-4%, +4%].
+                let wobble = ((n * 7919 % 17) as f64 / 16.0 - 0.5) * 0.08;
+                changes += usize::from(scale.observe(metres(speed * (1.0 + wobble))));
+            }
+            // The wobble may take the one step up at a boundary that it straddles (the speed is
+            // held to a step that the top of the noise needs), and then it stays there.
+            assert!(changes <= 1, "{speed} m/s: {changes} changes from {first}");
+        }
+    }
+
+    #[test]
+    fn speed_scaling_and_the_memory_coarsening_multiply_and_the_bands_stay_in_order() {
+        let both = Bands::with_d0(1000.0).speed_scaled(1.0).coarsened(3, 1.5);
+        let plain = Bands::with_d0(1000.0);
+        for level in 1..12 {
+            let factor = if level >= 3 { 1.5 } else { 1.0 };
+            let want = plain.floor(level) * 0.5 / factor;
+            assert!((both.floor(level) - want).abs() < 1e-9, "{level}");
+            assert!(both.floor(level + 1) > both.floor(level));
+        }
+        // The weight is of the shape of the bands, not of how near they are: a camera at speed
+        // wants the same share of what it holds as one at rest (the coarsening's relaxation reads
+        // it as a ratio).
+        assert!((both.weight() - Bands::with_d0(1000.0).coarsened(3, 1.5).weight()).abs() < 1e-9);
     }
 }
