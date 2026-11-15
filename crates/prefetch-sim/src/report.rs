@@ -9,10 +9,12 @@ use crate::demand::{Point, build, traverse};
 use crate::model::{EYE, Model, VOXELS_PER_METRE, add, scale, unit};
 use crate::path::{self, Path};
 
-/// Bytes the Guard takes, measured at 10 cm Voxels: 680 K bricks of levels 8 to 12, 73.9 MiB. The
-/// Guard of 5 cm Voxels is levels 9 to 13: the same Voxel sizes, and so about the same bricks.
-/// (Not measured again yet.)
-pub const GUARD_BYTES: f64 = 73.9 * 1024.0 * 1024.0;
+/// Bytes the Guard takes, measured at 320 km (#167, `planet-gen`'s `guard_size` example): 274 488
+/// bricks of levels 13 to 17, 44.8 MiB of payload (49.0 with the handles), made in 4 s on eight
+/// cores. (It was 680 K bricks of levels 8 to 12 at 10 cm Voxels on the 16 km Planet, 73.9 MiB: the
+/// Guard of ADR 0008 is "about 74 MiB and about 5 s", and level 12 at 320 km would be 1.29 million
+/// bricks, 192 MiB and 13 s.)
+pub const GUARD_BYTES: f64 = 44.8 * 1024.0 * 1024.0;
 
 /// Bytes a drawn brick costs in one packed copy of the scene, as the client measures it: 792 MiB
 /// for the 4.65 million bricks of the full fill at 5 cm on the 320 km Planet with no horizon cap

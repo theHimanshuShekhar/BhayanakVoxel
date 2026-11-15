@@ -46,7 +46,12 @@ use super::stream::StreamReport;
 ///
 /// 16 added `convergence` (#187): the convergence phase's curve, floor and lines for two views,
 /// null with `--no-convergence` or when the phase fails. Nothing else is changed.
-pub const SCHEMA_VERSION: u32 = 16;
+///
+/// 17 added the frame's pacing to the real-time report (#167): each slow frame has `before_ms`,
+/// `sleep_asked_ms`, `sleep_over_ms` and `cycle_ms`, and each path `frame_cycle` and
+/// `sleep_overshoot`, so that a 30 ms frame says whether the frame thread woke late (the
+/// harness's) or did the work. Nothing else is changed.
+pub const SCHEMA_VERSION: u32 = 17;
 
 /// One timed thing (a pass, or the GPU total of a profiler frame) in one mode, against its
 /// budget. In reference mode a profiler frame is one sample, so the entries of that mode have
@@ -543,7 +548,7 @@ mod tests {
                 "streaming_real_time"
             ]
         );
-        assert_eq!(json["schema_version"], 16);
+        assert_eq!(json["schema_version"], 17);
         assert_eq!(json["convergence"], serde_json::Value::Null);
         assert_eq!(json["streaming"], serde_json::Value::Null);
         assert_eq!(json["streaming_real_time"], serde_json::Value::Null);

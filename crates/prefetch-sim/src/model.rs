@@ -13,8 +13,8 @@ use render::lod::{Bands, GUARD_FIRST, LEVELS};
 /// run of `the_resident_set_at_2_m_50_m_500_m_and_5_km_over_the_spawn`). On the 16 km Planet it was
 /// 3.44 million, 3.25 d0² (3.56 million, 3.37 d0², before #142 stopped the deep sea from being
 /// drawn): the Planet is twenty times as large and a level's bricks go with the surface in its
-/// band, not the Planet's, so the difference is the Guard's levels (all but two are drawn from the
-/// bands now: `guard_first` is 12 at 320 km) and the ground's relief, which the generator has
+/// band, not the Planet's, so the difference is the Guard's levels (all of them
+/// are drawn from the bands now: `guard_first` is 13 at 320 km) and the ground's relief, which the generator has
 /// more of.
 pub const DRAWN_PER_D0_SQUARED: f64 = 4.40;
 
@@ -67,7 +67,7 @@ pub struct Model {
 }
 
 impl Model {
-    /// The real Planet (as [`SIM_RADIUS`] has it), with the ADR 0004 margins, the Guard at levels 9 to the top, the
+    /// The real Planet (as [`SIM_RADIUS`] has it), with the ADR 0004 margins, the Guard at levels 13 to the top, the
     /// renderer's strict band rule at 1440p, and a 1 to 2 s prefetch lead.
     pub fn real() -> Self {
         let tan_v = (render::lod::VFOV / 2.0).tan();

@@ -151,7 +151,7 @@ fn check_convergence(convergence: &Value, out: &Path) {
 }
 
 fn check_schema(report: &Value, out: &Path) {
-    assert_eq!(report["schema_version"], 16);
+    assert_eq!(report["schema_version"], 17);
     // The Edit stress is of the whole Planet, which the patch is not.
     assert!(report["edits"].is_null());
     // The streaming mode is asked for (see its own test); the other tests do not. The real-time
@@ -482,10 +482,10 @@ fn check_streaming(streaming: &Value) {
     for phase in ["fill", "steady", "moving"] {
         let misses = &streaming["soft_misses"][phase];
         series(&misses["bricks"]);
-        assert_eq!(misses["by_level"].as_array().unwrap().len(), 14, "{phase}");
+        assert_eq!(misses["by_level"].as_array().unwrap().len(), 18, "{phase}");
     }
     let rings = streaming["rings"].as_array().unwrap();
-    assert_eq!(rings.len(), 14);
+    assert_eq!(rings.len(), 18);
     for ring in rings {
         for key in ["level", "at_start", "when_complete", "at_end"] {
             assert!(ring[key].is_u64(), "{ring}");

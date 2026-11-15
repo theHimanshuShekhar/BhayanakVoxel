@@ -138,7 +138,13 @@ const HEADROOM: f64 = 1.25;
 /// the measurement leaves out (they do not scale with `d0`), so the like-for-like value at full
 /// size is (3 439 848 - 178 000) / 1028.2² = 3.09, and the limit is 1.32 times it. The test Planet
 /// measures 3.51: 8% over the constant, 14% over the full-size Rings' 3.09, and 86% of the limit.
-const BRICKS_PER_D0_SQUARED: f64 = 3.25;
+///
+/// #167 (18 levels, the Guard from level 13, the horizon cap): the full-size Planet's resident set
+/// at 2 m, complete after 182 s, drew 2 971 209 bricks below the Guard, 2.81 per `d0` squared (3.25
+/// before; 3.01 with #146's cap and 14 levels, whose Guard held level 12 apart), and 3 545 of the
+/// Guard's. The test Planet (its Guard from level 10, see `bench::stream`) measures 3.69. The
+/// constant is 3.1: 10% over the full-size Planet, and the limit, 3.88, 5% over the test Planet.
+const BRICKS_PER_D0_SQUARED: f64 = 3.1;
 /// Words of `brick_refs` and of `bricks` per brick drawn when the resident set was complete: 3.44
 /// million and 117.6 million words of them. The scene's first reservation, 28 words a brick and a
 /// tenth over, ran out 3.09 million bricks into the fill at 10 cm: the 10.4 s frame of #119 was
@@ -166,7 +172,14 @@ const BRICKS_PER_D0_SQUARED: f64 = 3.25;
 /// `needs-stream-bench`; #167 sizes the scene for 320 km). It follows from the terrain (a count of
 /// words, not a time), not from the cost of making a brick.
 const REFS_PER_BRICK: f64 = 1.0;
-const WORDS_PER_BRICK: f64 = 37.7;
+///
+/// #167, measured on the full-size Planet's complete resident set at 2 m: 1.001 references and 38.6
+/// words a brick (114.79 million words of `bricks` and 2.979 million of `brick_refs` for the 2.975
+/// million bricks drawn, the Guard's included), and 45.3 on the test Planet, which is rougher in
+/// the bricks it draws than the real one (the 37.7 was an estimate from the test Planet's 43.77
+/// less what the full-size run had measured to be under it). The constant is 39.0: 1% over the
+/// full-size Planet, and the limit, 48.75, 7% over the test Planet.
+const WORDS_PER_BRICK: f64 = 39.0;
 
 /// What the tables that hold the Planet are made roomy for at the start, for the full bands at a
 /// bias of 1: the most each held in the measurement of [`BRICKS_PER_D0_SQUARED`], with
@@ -196,47 +209,47 @@ struct Room {
 fn room_for(bands: Bands) -> Room {
     let s = (bands.d0() / 1028.2).powi(2);
     let scaled = |n: f64| (n * s) as usize + 1024;
-    // The most each level held in the fill and the walk, from level 1, with `HEADROOM` (the table
-    // of which are solid below is reserved the same): 1.20, 1.03, 1.06, 1.09, 1.09, 0.99, 0.91
-    // and 0.84 million bricks.
-    const HELD_AT_LEVELS_1_TO_8: [f64; 8] = [
-        1_500_000.0,
-        1_290_000.0,
-        1_320_000.0,
-        1_360_000.0,
-        1_360_000.0,
-        1_240_000.0,
+    // The most each level held in the fill, the walk and the 5 km flight at 320 km with the
+    // horizon cap (#167, 18 levels, the Guard from level 13), from level 1, with `HEADROOM` (the
+    // table of which are solid below is reserved the same): 1.11, 1.01, 1.04, 1.03, 1.14, 1.12,
+    // 0.99, 0.68, 0.32, 0.11, 0.042 and 0.018 million bricks. The cap leaves the bricks beyond the
+    // horizon whole, so the levels from 9 up hold far fewer than before (1.0 million each). A
+    // table is a power of two less an eighth, so the figures between 0.92 and 1.84 million reserve
+    // the same.
+    const HELD_AT_LEVELS_1_TO_12: [f64; 12] = [
+        1_110_000.0,
+        1_010_000.0,
+        1_040_000.0,
+        1_030_000.0,
         1_140_000.0,
-        1_050_000.0,
+        1_120_000.0,
+        990_000.0,
+        680_000.0,
+        320_000.0,
+        110_000.0,
+        42_000.0,
+        18_500.0,
     ];
-    // The Guard's levels hold what they hold whatever the bands are: level 9 577 000 (all of it
-    // the Guard), level 10 85 000, levels 11 to 13 14 000 and fewer.
-    const GUARD_SECOND: usize = GUARD_FIRST + 1;
-    // Level 0 held 6.99 million bricks, of which 5.63 million are the spawn ring, held already when
-    // this is reserved and not scaled, so more is made room for than is held: `HEADROOM` over the
-    // ring is 1.41 million more (1.5 million here), and 1.25 times the 1.36 million that scale is
-    // 1.70 million.
     let mut held = vec![1_500_000 + scaled(1_700_000.0)];
     held.extend((1..RING_LEVELS).map(|level| match level {
-        1..GUARD_FIRST => scaled(HELD_AT_LEVELS_1_TO_8[level - 1]),
-        GUARD_FIRST => 720_000,
-        GUARD_SECOND => 110_000,
+        1..GUARD_FIRST => scaled(HELD_AT_LEVELS_1_TO_12[level - 1]),
+        // 212 000 at level 13 (the Guard's 197 000 and the few the walk and the flight split),
+        // 47 600 at level 14, 11 300 at level 15 and fewer above: each with `HEADROOM`.
+        GUARD_FIRST => 270_000,
+        14 => 60_000,
         _ => 20_000,
     }));
     Room {
         held,
-        // 3.15 million bricks had their children resident at the end of the fill with the margins
-        // (#143; 2.18 million without), and 3.70 million after the walk, with the lead
-        // (2.53 million without both): the store's budget counts them (see `budget_for`).
-        resident: scaled(4_400_000.0),
-        // The tree held 9.44 million nodes.
-        nodes: scaled(11_800_000.0),
-        // Waiting, and asked of the loader, were 884 000 at the most with the margins (#143: the
-        // first request is 296 000 bricks, and the margin's children, a brick at the edge of
-        // every band, are asked for as the fill goes outward; 219 000 without them), and stuck
-        // 116 000.
-        waiting: scaled(1_100_000.0),
-        stuck: scaled(150_000.0),
+        // 2.18 million bricks had their children resident at the end of the 5 km flight (#167;
+        // 3.70 million in #143's walk, before the cap left the bricks beyond the horizon whole).
+        resident: scaled(2_800_000.0),
+        // The tree held 4.99 million nodes.
+        nodes: scaled(6_300_000.0),
+        // Waiting, and asked of the loader, were 442 000 at the most (the loader's queue 564 000,
+        // the margins' children included), and stuck 250 000.
+        waiting: scaled(700_000.0),
+        stuck: scaled(320_000.0),
     }
 }
 
@@ -263,6 +276,17 @@ fn room_for(bands: Bands) -> Room {
 /// complete, less the spawn ring it started with (which is not scaled with `d0`), per `d0`
 /// squared. It must not be over this times [`HEADROOM`], once the constant has the spawn ring's
 /// and level 0's share beyond the ring taken out (below): 16.49, not 24.75.
+///
+/// #167 re-measured it and left it at 19.8: the full-size Planet counted 13.46 million at the end
+/// of its fill at 2 m (12.73 per `d0` squared; 11.86 million bricks held, 1.60 million units
+/// resident) and 14.92 million (14.11) after the 5 km flight, with 18 levels and the horizon cap,
+/// against 20.90 million before the cap (the bricks beyond the horizon are held whole at the coarse
+/// level that holds them). It is the store's budget as well as the check, and the 4090's
+/// real-time run of #146 peaked at 16.05 million counted, over the fill's 12.8 and its 10% of
+/// overflow: a budget cut to the fill would evict in the turns and the flights, which the 4090
+/// has not been asked to run with. The tables and the memory do not depend on it (the tables are
+/// `room_for`'s), only the point where eviction starts; lowering it is for a run that measures
+/// the eviction.
 const STREAMED_PER_D0_SQUARED: f64 = 19.8;
 /// The spawn ring's share of what the store counted at full size: 5.63 million of the 20.90 million
 /// (level 0's bricks round the spawn, held before the fill starts), at the `d0` of 1028.2 Voxels
@@ -446,10 +470,9 @@ fn load(map: WorldMap, reach: i32) -> Result<Loaded, RingsFull> {
     store.reserve_resident(room.resident);
     store.set_budget(budget_for(bands));
     let guarded = Instant::now();
-    let guard_first = loader::guard_first(&planet);
-    let held = loader::hold_guard(&mut store, &planet, guard_first);
+    let held = loader::hold_guard(&mut store, &planet, GUARD_FIRST);
     eprintln!(
-        "Guard (levels {guard_first} to {}, the whole Planet): {held} bricks in {:.2?}",
+        "Guard (levels {GUARD_FIRST} to {}, the whole Planet): {held} bricks in {:.2?}",
         RING_LEVELS - 1,
         guarded.elapsed()
     );

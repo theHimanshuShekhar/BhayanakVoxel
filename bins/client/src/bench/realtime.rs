@@ -461,6 +461,20 @@ pub struct SlowFrame {
     /// The frame's look at the memory after its time was taken: the store's lock. Not in
     /// `time_ms`.
     pub after_ms: f64,
+    /// The frame's pacing, which `time_ms` leaves out (#167): the milliseconds from the end of the
+    /// frame before (its pacing sleep done) to this frame's start (`before_ms`: working out the
+    /// camera and the harness's own bookkeeping), the sleep this frame asked for to fill the
+    /// 16.667 ms (`sleep_asked_ms`, 0 for a frame that was already longer) and by how much the
+    /// sleep ran over what it asked (`sleep_over_ms`: the thread waking late, which on Windows is
+    /// the timer's tick and the scheduler), and the frame's cycle from its start to the end of its
+    /// sleep (`cycle_ms`, so the cycle from this frame's start to the next frame's is `cycle_ms`
+    /// plus the next frame's `before_ms`). A frame whose `time_ms` is long with a `wait_ms` that is
+    /// not the GPU's (`wait_not_passes_ms`) and a normal `cpu_ms` is a late wake-up of the frame
+    /// thread inside the device poll; a long `sleep_over_ms` is one inside the sleep.
+    pub before_ms: f64,
+    pub sleep_asked_ms: f64,
+    pub sleep_over_ms: f64,
+    pub cycle_ms: f64,
     /// What the update copied: `none`, `patch` (the words it lists) or `rebuild` (new buffers, all
     /// of the scene written), the bytes in all (header and tables included) and those of a patch's
     /// words.
@@ -566,6 +580,13 @@ pub struct PathReport {
     /// Frame time, up to the GPU being done, and the frame thread's CPU time (see the module).
     pub frame_time: Spread,
     pub frame_cpu: Spread,
+    /// The frames' cycle from the start of one to the start of the next (the last frame of the
+    /// path has none), and by how much their pacing sleeps ran over what they asked for, over the
+    /// frames that slept (#167). A cycle over 16.7 ms that `frame_time` does not show is the
+    /// thread waking late from its sleep or the harness between frames; see
+    /// [`SlowFrame::sleep_over_ms`].
+    pub frame_cycle: Spread,
+    pub sleep_overshoot: Spread,
     /// Frames whose time was over the frame-time limit (the gate's: the 99th percentile is held to
     /// it, and this is how many frames there were above it), and the slowest few, worst first, with
     /// their parts. In the min and the max the i-th slowest of each run is taken with the i-th of
@@ -1102,6 +1123,9 @@ struct Capture {
     frames_done: Option<Spent>,
     frame_ms: Vec<f64>,
     cpu_ms: Vec<f64>,
+    /// The start of each frame, to work the cycles out from, and the overshoot of the sleeps.
+    started: Vec<Instant>,
+    sleep_over_ms: Vec<f64>,
     soft_misses: Series,
     /// The update of each frame that had one: its time, bytes and copies.
     update_ms: Vec<f64>,
@@ -1155,6 +1179,8 @@ impl Capture {
             holes: work.holes_found,
             frame_ms: Vec::new(),
             cpu_ms: Vec::new(),
+            started: Vec::new(),
+            sleep_over_ms: Vec::new(),
             soft_misses: Series::default(),
             update_ms: Vec::new(),
             update_bytes: Vec::new(),
@@ -1196,6 +1222,10 @@ impl Capture {
         }
         self.frame_ms.push(frame.time_ms);
         self.cpu_ms.push(frame.cpu_ms);
+        self.started.push(frame.began);
+        if frame.parts.sleep_asked_ms > 0.0 {
+            self.sleep_over_ms.push(frame.parts.sleep_over_ms);
+        }
         self.soft_misses.add(frame.soft_misses as u64);
         if frame.parts.update != "none" {
             self.update_ms.push(frame.parts.update_ms);
@@ -1239,6 +1269,14 @@ impl Capture {
                 .unwrap_or_else(|| self.began.elapsed().as_secs_f64()),
             frame_time: Spread::of(&self.frame_ms),
             frame_cpu: Spread::of(&self.cpu_ms),
+            frame_cycle: Spread::of(
+                &self
+                    .started
+                    .windows(2)
+                    .map(|pair| (pair[1] - pair[0]).as_secs_f64() * 1e3)
+                    .collect::<Vec<_>>(),
+            ),
+            sleep_overshoot: Spread::of(&self.sleep_over_ms),
             frames_over_limit: self.over_limit,
             frames_over_limit_by_update: self.over_by_update,
             slowest: self.worst.sorted(),
@@ -1347,6 +1385,8 @@ struct Session<'a> {
     limit_ms: f64,
     /// How long working out the camera of the next frame took (a flight reads the store).
     camera_wait: Duration,
+    /// When the frame before ended, its sleep done (none before the first).
+    last_ended: Option<Instant>,
 }
 
 /// What an update copies to the GPU: its kind, the bytes in all and those of a patch's words.
@@ -1372,6 +1412,7 @@ impl<'a> Session<'a> {
             gpu,
             limit_ms,
             camera_wait: Duration::ZERO,
+            last_ended: None,
             step: "starting".to_string(),
             work_before,
             scene_used_peak_bytes: 0,
@@ -1391,6 +1432,9 @@ impl<'a> Session<'a> {
     fn frame(&mut self, camera: &Camera, lead: bool) -> Result<Frame, Box<dyn Error>> {
         let camera_wait = std::mem::take(&mut self.camera_wait);
         let began = Instant::now();
+        let before = self
+            .last_ended
+            .map_or(Duration::ZERO, |ended| began - ended);
         let looking = self.world.looking_for_holes();
         let edit_before = self.world.edit_taken();
         let update = if lead {
@@ -1448,6 +1492,10 @@ impl<'a> Session<'a> {
                 .map(|t| ms(gpu.wait) - t),
             other_ms: ms(time.saturating_sub(followed + gpu.cpu() + gpu.wait)),
             after_ms: ms(after),
+            before_ms: ms(before),
+            sleep_asked_ms: 0.0,
+            sleep_over_ms: 0.0,
+            cycle_ms: 0.0,
             update: kind,
             upload_bytes,
             patch_bytes,
@@ -1457,7 +1505,17 @@ impl<'a> Session<'a> {
             over_budget,
             hole_look: looking,
         };
-        std::thread::sleep(FRAME.saturating_sub(began.elapsed()));
+        let asked = FRAME.saturating_sub(began.elapsed());
+        let slept = Instant::now();
+        std::thread::sleep(asked);
+        let ended = Instant::now();
+        self.last_ended = Some(ended);
+        let parts = SlowFrame {
+            sleep_asked_ms: ms(asked),
+            sleep_over_ms: ms((ended - slept).saturating_sub(asked)),
+            cycle_ms: ms(ended - began),
+            ..parts
+        };
         Ok(Frame {
             began,
             time_ms: parts.time_ms,
@@ -1961,6 +2019,8 @@ mod tests {
                 p99_ms: cpu_p99,
                 worst_ms: cpu_p99 * 2.0,
             },
+            frame_cycle: Spread::default(),
+            sleep_overshoot: Spread::default(),
             frames_over_limit: 0,
             frames_over_limit_by_update: UpdateKinds::default(),
             slowest: vec![slow_frame(0, frame_p99 * 2.0)],
@@ -2005,6 +2065,10 @@ mod tests {
             wait_not_passes_ms: Some(time_ms - 1.8 - 1.6),
             other_ms: 0.0,
             after_ms: 0.0,
+            before_ms: 0.1,
+            sleep_asked_ms: 0.0,
+            sleep_over_ms: 0.0,
+            cycle_ms: time_ms,
             update: "patch",
             upload_bytes: 4096,
             patch_bytes: 4000,
@@ -2393,6 +2457,7 @@ mod tests {
             [
                 "end_look_ms",
                 "frame_cpu",
+                "frame_cycle",
                 "frame_time",
                 "frames",
                 "frames_over_limit",
@@ -2410,6 +2475,7 @@ mod tests {
                 "scene_thread",
                 "seconds",
                 "settle",
+                "sleep_overshoot",
                 "slowest",
                 "soft_misses",
                 "soft_misses_per_frame",
@@ -2440,8 +2506,10 @@ mod tests {
             [
                 "after_ms",
                 "at_ms",
+                "before_ms",
                 "camera_ms",
                 "cpu_ms",
+                "cycle_ms",
                 "encode_ms",
                 "gpu_primary_ms",
                 "gpu_total_ms",
@@ -2455,6 +2523,8 @@ mod tests {
                 "over_budget",
                 "patch_bytes",
                 "recentre_ms",
+                "sleep_asked_ms",
+                "sleep_over_ms",
                 "submit_ms",
                 "time_ms",
                 "update",
@@ -2918,6 +2988,25 @@ mod tests {
             assert!(path.frames > 0, "{}", path.name);
             assert_eq!(path.frame_time.samples, path.frames);
             assert_eq!(path.frame_cpu.samples, path.frames);
+            // The cycles are from one frame's start to the next's (the last has none), and the
+            // frames are paced to 16.667 ms: a cycle is never shorter, and the sleeps that ran
+            // over by more than a frame would show in the worst figure.
+            assert_eq!(path.frame_cycle.samples, path.frames - 1, "{}", path.name);
+            assert!(path.frame_cycle.mean_ms >= 16.6, "{}", path.name);
+            assert!(path.sleep_overshoot.samples <= path.frames);
+            assert!(path.sleep_overshoot.worst_ms >= 0.0);
+            for frame in &path.slowest {
+                // A frame's cycle is its time, the sleep it asked for and the sleep's overshoot
+                // (to a few microseconds of the harness's own work between them).
+                assert!(
+                    frame.cycle_ms + 0.05
+                        >= frame.time_ms + frame.sleep_asked_ms + frame.sleep_over_ms
+                        && frame.cycle_ms
+                            <= frame.time_ms + frame.sleep_asked_ms + frame.sleep_over_ms + 2.0,
+                    "{}: {frame:?}",
+                    path.name
+                );
+            }
             assert_eq!(path.soft_misses.frames, path.frames);
             // Every path has a look at the holes: one is forced at its end.
             assert!(path.hole_looks >= 1, "{}", path.name);

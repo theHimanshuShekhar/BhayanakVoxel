@@ -30,8 +30,10 @@ use crate::world::{STILL_FRAMES, SceneWork, Stillness, World, loading_paused_for
 const SEED: u64 = 0xB4A7_A9AC;
 const RING: i32 = 160;
 const D0: f64 = 64.0;
-/// Two levels above the real Guard's, so that a test's Guard is quick to make.
-const GUARD_FIRST: usize = crate::loader::GUARD_FIRST + 2;
+/// Two levels below the real Guard's (the test Planet is an eighth of the radius: level 11 holds a
+/// quarter of a million bricks here, as level 13 does at 320 km; the Guard was at level 11 before
+/// #167 raised the real one from 9 to 13, and the tests' sizes and budgets are made for it).
+const GUARD_FIRST: usize = crate::loader::GUARD_FIRST - 2;
 
 fn planet() -> &'static Planet {
     static PLANET: OnceLock<Planet> = OnceLock::new();
@@ -1022,6 +1024,11 @@ fn the_full_size_planet_streams_in_and_walking_over_it_does_not_stall() {
         tables.grown
     );
     HELD_FLIGHT.assert("the flight", &fly_work, &fly_updates);
+    // A look for holes at the end of the flight (#167): the scene thread's scan of every split
+    // brick, which the soft misses do not count.
+    world.look_now(true).unwrap();
+    eprintln!("holes after the 5 km flight: {}", world.stats().holes);
+    assert_eq!(world.stats().holes, 0, "holes after the flight");
     // The host store stays within its budget and the overflow (#141): with the flight asking for
     // far more than the loader makes, the most it counted at the end of any frame is bounded by
     // the limit, not growing with the distance; and the scene, which the bands bound, does not
@@ -2523,24 +2530,46 @@ fn the_resident_set_at_2_m_50_m_500_m_and_5_km_over_the_spawn() {
     let mut world =
         World::new(loaded.scene, Predictor::new(loaded.store), client).with_loader(loaded.loader);
     let spawn = loaded.camera;
+    // The scene thread counts the holes its looks find (and times its rounds).
+    world.measure_scene_thread();
     let began = Instant::now();
     wait_idle(&mut world, spawn.position, Duration::from_secs(5400));
     eprintln!("filled after {:.0?}", began.elapsed());
     let up = spawn.horizon_up;
-    for metres in [2.0_f64, 50.0, 500.0, 5000.0] {
+    for metres in [2.0_f64, 50.0, 500.0, 2000.0, 5000.0] {
         // 2 m is the spawn; the others are that much higher over it.
         let camera: [f64; 3] = std::array::from_fn(|a| {
             spawn.position[a] + up[a] * (metres - 2.0).max(0.0) * VOXELS_PER_METRE
         });
         let from = Instant::now();
         wait_idle(&mut world, camera, Duration::from_secs(5400));
+        // A look of the scene thread at every split brick for a hole (#167: none at the spawn, and
+        // none from 2 km up, where the horizon is 80 km away and what is past it is the Guard's
+        // and the caps' coarse bricks).
+        let before = world.stats().work;
+        world.look_now(true).unwrap();
+        let after = world.stats().work;
+        let (looked, holes) = (
+            after.hole_scans - before.hole_scans,
+            after.holes_found - before.holes_found,
+        );
+        assert!(looked >= 1, "AT {metres} m: no look for holes was made");
+        assert_eq!(holes, 0, "AT {metres} m: {holes} holes");
+        if metres >= 500.0 {
+            let (hit, rays) = rays_at_the_horizon(world.scene(), camera, up);
+            eprintln!("AT {metres} m: {hit} of {rays} rays just under the horizon hit");
+            assert_eq!(
+                hit, rays,
+                "AT {metres} m: a ray under the horizon sees the sky"
+            );
+        }
         let by_level: Vec<usize> = (0..LEVELS).map(|l| world.level_bricks(l)).collect();
         let store = world.store();
         let held: usize = (0..store.level_count())
             .map(|l| store.level(l).map_or(0, |l| l.len()))
             .sum();
         eprintln!(
-            "AT {metres} m: drawn {} bricks (per level {by_level:?}), scene {:.1} MiB used; store \
+            "AT {metres} m: {holes} holes; drawn {} bricks (per level {by_level:?}), scene {:.1} MiB used; store \
              counts {} streamed and holds {held}; {} waiting; reached in {:.0?}; {}",
             by_level.iter().sum::<usize>(),
             world.used_bytes() as f64 / (1024.0 * 1024.0),
@@ -2550,6 +2579,34 @@ fn the_resident_set_at_2_m_50_m_500_m_and_5_km_over_the_spawn() {
             memory(&world, "then"),
         );
     }
+}
+
+/// Rays from `at` all round, 0.3, 1 and 3 degrees under the horizon of the sea (the Planet's
+/// sphere: a ray above it escapes to the sky, and one under it must meet the ground or the sea,
+/// at the coarse bricks that are all that is resident out there): how many hit, and how many
+/// there are. A hole at the horizon shows as a ray that sees the sky.
+fn rays_at_the_horizon(scene: &Scene, at: [f64; 3], up: [f64; 3]) -> (usize, usize) {
+    let radius = |p: [f64; 3]| p.iter().map(|c| c * c).sum::<f64>().sqrt();
+    // The horizon's dip from the camera's height over the sea: acos(R / r).
+    let sea = f64::from(planet_gen::world_map::WORLD_RADIUS);
+    let dip = (sea / radius(at)).min(1.0).acos();
+    let (ahead, right) = tangents(up);
+    let (cell, origin) = camera::split(at);
+    let mut rays = 0;
+    let mut hit = 0;
+    for turn in 0..24 {
+        let angle = f64::from(turn) * std::f64::consts::TAU / 24.0;
+        let along: [f64; 3] =
+            std::array::from_fn(|a| angle.cos() * ahead[a] + angle.sin() * right[a]);
+        for extra in [0.3_f64, 1.0, 3.0] {
+            let under = dip + extra.to_radians();
+            let dir: [f32; 3] =
+                std::array::from_fn(|a| (under.cos() * along[a] - under.sin() * up[a]) as f32);
+            rays += 1;
+            hit += usize::from(trace(scene, &Ray { cell, origin, dir }).is_some());
+        }
+    }
+    (hit, rays)
 }
 
 /// Streams with the camera at `camera` until the loader has nothing left (or `cap` is over). A

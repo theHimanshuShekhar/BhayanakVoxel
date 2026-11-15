@@ -38,15 +38,30 @@
 
 use brick_store::{BrickCoord, VOXELS_PER_METRE};
 
-/// Levels of the pyramid that are drawn: 0 to 13. Level 13's Voxels are 410 m across, which is
-/// under a pixel at 800 km, the greatest distance of the Zoom range.
-pub const LEVELS: usize = 14;
+/// Levels of the pyramid that are drawn: 0 to 17. Level 17's Voxels are 6.6 km across: a pixel at
+/// 6 740 km, which is the far side of the Planet seen from 6 400 km, 20 Planet radii, the greatest
+/// distance of the Zoom range (ADR 0008).
+/// (It was 14 levels, 0 to 13, on the 16 km Planet: level 13's 410 m Voxels were under a pixel at
+/// 800 km.) The levels past 13 draw what the horizon cap leaves whole beyond the horizon: with
+/// 14 levels that was level 13's 211 thousand bricks, and with 18 it is a few thousand of the
+/// coarsest.
+pub const LEVELS: usize = 18;
 
-/// The first level of the Guard: the levels from here to the top of the pyramid (9 to 13, since
-/// [`LEVELS`] is 14) are generated for the whole Planet right after the spawn ring (ADR 0004).
-/// Level 9 is the one whose Voxels are 25.6 m across, as level 8 was at 10 cm. The client's loader
-/// and the prefetch simulator both use it.
-pub const GUARD_FIRST: usize = 9;
+/// The first level of the Guard: the levels from here to the top of the pyramid (13 to 17, since
+/// [`LEVELS`] is 18) are generated for the whole Planet right after the spawn ring (ADR 0004).
+/// Level 13 is the one whose Voxels are 410 m across. It is four levels coarser than the Guard of
+/// the 16 km Planet (level 9, 25.6 m), which is what keeps the whole Planet to 274 thousand
+/// bricks, 45 MiB and about 4 s on eight cores at 320 km (ADR 0008; level 12 is 1.29 million bricks,
+/// 192 MiB and 13 s). The client's loader and the prefetch simulator both use it.
+pub const GUARD_FIRST: usize = 13;
+
+/// The levels that [`Bands::weight`] counts: 0 to 8, as when the Guard began at level 9. At 320
+/// km the horizon cap (ADR 0004, #146) leaves what is beyond the horizon whole, so the levels from
+/// 9 up draw 79 000, 32 000, 13 000, 5 600, 2 500 and fewer bricks (#167: the complete resident
+/// set at 2 m, against 310 000 to 350 000 for each of 0 to 7), and the coarsening steps are all of
+/// level 8 and below: the weight is the ratio of two sums of what a step changes, and the levels
+/// that draw next to nothing are left out of it, as they were when the Guard held them.
+pub const WEIGHTED_LEVELS: usize = 9;
 
 /// How far past a boundary a brick must go before it changes level, as a fraction of the
 /// boundary's distance: out at `1 + HYSTERESIS` times it, back in at `1 - HYSTERESIS` times.
@@ -136,13 +151,14 @@ impl Bands {
         }
     }
 
-    /// How many bricks the levels below the Guard hold over flat ground, in units of `d0` squared
+    /// How many bricks the levels below [`WEIGHTED_LEVELS`] hold over flat ground, in units of `d0`
+    /// squared
     /// (a level owns a ring of ground from `floor(level)` to `floor(level + 1)`, and its bricks
     /// are `8 << level` Voxels across): 4 for level 0 and 3 for each of the others, less for those
     /// that a [`Coarsening`] draws coarser. Only the ratio of two of these means anything: it says
     /// how much more, or less, the bands want than other bands do.
     pub fn weight(&self) -> f64 {
-        (0..GUARD_FIRST)
+        (0..WEIGHTED_LEVELS)
             .map(|level| {
                 let (from, to) = (self.floor(level), self.floor(level + 1));
                 let across = (8u64 << level) as f64;
@@ -651,13 +667,16 @@ mod tests {
 
     #[test]
     fn the_pyramid_reaches_the_farthest_zoom_distance_and_no_further() {
-        // A level owns everything beyond its floor, so the top level must start before the Zoom
-        // range's 800 km, and one more would only start beyond it: the levels follow from the
-        // size of a Voxel.
+        // A level's Voxel covers a pixel at the floor of the level above (2 d0 times the level's
+        // own), so the top level's Voxels are a pixel or less at `floor(LEVELS)`, which must be
+        // beyond the farthest the Zoom shows: its far side, 20 Planet radii out and one more
+        // across at 320 km (ADR 0008). The level before the top is the last that the farthest
+        // distance needs by its band alone: the top level is the one the horizon cap's roots are
+        // at, and the pyramid has no level that nothing could see.
         let bands = Bands::new(1440, VFOV, 1.0);
-        let farthest = 800_000.0 * VOXELS_PER_METRE;
-        assert!(bands.floor(LEVELS - 1) <= farthest);
+        let farthest = 21.0 * 320_000.0 * VOXELS_PER_METRE;
         assert!(bands.floor(LEVELS) > farthest);
+        assert!(bands.floor(LEVELS - 2) <= farthest);
     }
 
     #[test]
