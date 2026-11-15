@@ -77,7 +77,7 @@ The unbiased view of the same world that the Primary view is measured against. I
 _Avoid_: Ground truth, path-traced mode, reference mode
 
 **Still**:
-The camera, the sun and the window have not changed and no Edit has happened. The Reference view is shown only while the view is Still.
+The camera, the sun and the window have not changed for 2 frames and no Edit has happened. The Reference view is shown only while the view is Still; any change cuts to the Primary view at once and the Reference view starts again from sample 0.
 _Avoid_: Idle, paused
 
 ### Walking

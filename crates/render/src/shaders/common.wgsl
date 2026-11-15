@@ -16,8 +16,9 @@ struct Camera {
 struct Frame {
     // The unit vector towards the sun, then the cosine of the sun's angular radius.
     sun: vec4<f32>,
-    // The index of this sample among those accumulated (0 starts a new image), the seed of the
-    // random numbers, the debug view (0 is the lit image), then one unused.
+    // The index of this sample among those accumulated (0 starts a new image; of a batch, its
+    // first), the seed of the random numbers, the debug view (0 is the lit image), then the
+    // number of samples in the batch (0 is 1).
     params: vec4<u32>,
     // Where in its pixel primary visibility traces its ray, (0, 0) to (1, 1), then two unused.
     jitter: vec4<f32>,

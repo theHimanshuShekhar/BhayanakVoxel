@@ -46,6 +46,8 @@ struct InFlight {
     mapping: bool,
     /// Counts frames, so that the oldest is read first.
     sequence: u64,
+    /// What [`Profiler::tag_frame`] said of the frame (0 for nothing).
+    tag: u64,
 }
 
 struct Readback {
@@ -101,7 +103,16 @@ pub struct Profiler {
     /// The times of the frame that the last [`collect`](Self::collect) was called for, if its own
     /// readback was in by then (see [`Profiler::times_of_this_frame`]).
     this_frame: Option<FrameTimes>,
+    /// What [`Profiler::tag_frame`] has said of the frame being built.
+    tag: u64,
+    /// The times of frames that had a tag, as they came in, until
+    /// [`Profiler::take_tagged`] takes them: at most [`MAX_TAGGED`].
+    tagged: Vec<(u64, FrameTimes)>,
 }
+
+/// Tagged frames kept until they are taken: more than the ring holds, and a caller that never
+/// takes them does not grow without end.
+const MAX_TAGGED: usize = 16;
 
 impl Profiler {
     /// A profiler for `device`, which times passes if it was created with [`FEATURES`].
@@ -118,6 +129,8 @@ impl Profiler {
             sequence: 0,
             last_frame: None,
             this_frame: None,
+            tag: 0,
+            tagged: Vec::new(),
         }
     }
 
@@ -157,6 +170,32 @@ impl Profiler {
                 .record_wall(now.duration_since(last).as_secs_f64() * 1e3);
         }
         self.slots.clear();
+        self.tag = 0;
+    }
+
+    /// Labels the frame being built with `tag` (not 0), to be handed back with its times by
+    /// [`Profiler::take_tagged`], whenever they come in: a frame's times arrive a frame or two
+    /// after it, and a caller that varies what a frame does (the Reference view's batch size)
+    /// needs to know which frame a time is of.
+    pub fn tag_frame(&mut self, tag: u64) {
+        self.tag = tag;
+    }
+
+    /// The times of the pass called `name`, in the frames that were tagged and whose times have
+    /// come in since the last call, oldest first, with their tags. A tagged frame that the ring
+    /// could not time, or whose readback failed, is not among them.
+    pub fn take_tagged(&mut self, name: &str) -> Vec<(u64, f64)> {
+        let timings = &self.timings;
+        std::mem::take(&mut self.tagged)
+            .into_iter()
+            .filter_map(|(tag, times)| {
+                let &(_, ms) = times
+                    .passes
+                    .iter()
+                    .find(|&&(pass, _)| timings.passes()[pass].name == name)?;
+                Some((tag, ms))
+            })
+            .collect()
     }
 
     /// The timestamps to put in a pass called `name`. The name registers the pass the first time
@@ -238,6 +277,7 @@ impl Profiler {
             state: Arc::new(AtomicU8::new(PENDING)),
             mapping: false,
             sequence: self.sequence,
+            tag: self.tag,
         });
         self.sequence += 1;
         self.resolved_to = Some(index);
@@ -307,6 +347,12 @@ impl Profiler {
             readback.buffer.unmap();
             let times = frame_times(&stamps, &flight.slots, q.period_ns);
             self.timings.record_frame(&times);
+            if flight.tag != 0 {
+                if self.tagged.len() == MAX_TAGGED {
+                    self.tagged.remove(0);
+                }
+                self.tagged.push((flight.tag, times.clone()));
+            }
             if mine == Some(flight.sequence) {
                 self.this_frame = Some(times);
             }

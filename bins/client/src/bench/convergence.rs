@@ -32,6 +32,7 @@
 //! real GPU only, and by one ignored test.
 
 mod score;
+mod still;
 mod views;
 
 pub use views::patch_store;
@@ -86,6 +87,9 @@ pub struct Settings {
     /// Whether to score with FLIP a second time, on the images as the old gamma-2.2 curve would
     /// have drawn them from the same samples (`--flip-gamma-2-2`, #188). Only with `flip`.
     pub flip_gamma22: bool,
+    /// The still-view part (#189): the Reference view with the still-frame policy on, from the
+    /// stop.
+    pub still: still::Settings,
 }
 
 impl Settings {
@@ -98,6 +102,7 @@ impl Settings {
             truth_spp: truth_spp.unwrap_or(DEFAULT_TRUTH_SPP),
             flip: true,
             flip_gamma22,
+            still: still::Settings::full(),
         }
     }
 
@@ -110,6 +115,7 @@ impl Settings {
             truth_spp: truth_spp.unwrap_or(16),
             flip: false,
             flip_gamma22: false,
+            still: still::Settings::short(),
         }
     }
 
@@ -181,6 +187,8 @@ pub struct ViewReport {
     pub lines: Vec<Line>,
     /// The files of this view in the output folder's `convergence/`, sorted.
     pub files: Vec<String>,
+    /// The Reference view with the still-frame policy on, from the stop (#189).
+    pub still: still::StillReport,
 }
 
 /// How bright a view's converged image is, in linear light before the display encoding, over all
@@ -398,6 +406,17 @@ fn run_view(view: View, settings: &Settings, out: &Path) -> Result<ViewReport, B
         (reference_times.len() as u32 >= samples)
             .then(|| reference_times[..samples as usize].iter().sum::<f64>() / 1e3)
     };
+    // The still-view run (#189): the policy on, batched, at 60 Hz, from the stop. After everything
+    // that is timed above, which it cannot move, on the same GPU and the same views.
+    eprintln!(
+        "convergence: {name}: the still view, {} s...",
+        settings.still.seconds
+    );
+    let (from, to) = (view.description.camera_from, view.description.camera_to);
+    let elsewhere = Camera::looking_at([from[0] + 1.0, from[1], from[2]], to);
+    let batching_exact = still::batching_is_exact(&mut gpu, &view.camera);
+    let max_batch_samples = gpu.max_batch_samples();
+    let still_run = still::run(&mut gpu, &view.camera, &elsewhere, &settings.still);
     drop(gpu);
 
     // Scoring, on the CPU.
@@ -480,6 +499,27 @@ fn run_view(view: View, settings: &Settings, out: &Path) -> Result<ViewReport, B
         }
     }
 
+    // The still run's images against the same truth A, as the curve's.
+    let mut still_scores = Vec::new();
+    let mut still_mse = Vec::new();
+    for capture in &still_run.captures {
+        still_scores.push(flip(
+            &format!("the still run's {} samples", capture.samples),
+            capture,
+            &truth_a_rgb,
+        )?);
+        still_mse.push(score::mse(&capture.linear, &truth_a.linear));
+    }
+    let still = still::report(
+        batching_exact,
+        max_batch_samples,
+        &settings.still,
+        &still_run,
+        &still_scores,
+        &still_mse,
+        &lines,
+    );
+
     let mut files = write_files(
         &folder,
         &view,
@@ -488,6 +528,7 @@ fn run_view(view: View, settings: &Settings, out: &Path) -> Result<ViewReport, B
         &truth_a,
         &truth_b,
         &checkpoints,
+        &still_run,
     )?;
     files.sort();
     let megapixels = f64::from(settings.size.0) * f64::from(settings.size.1) / 1e6;
@@ -502,6 +543,7 @@ fn run_view(view: View, settings: &Settings, out: &Path) -> Result<ViewReport, B
         curve,
         lines,
         files,
+        still,
     })
 }
 
@@ -533,6 +575,7 @@ struct TruthInputs<'a> {
 type Writer<'a> = dyn Fn(&Path) -> Result<(), Box<dyn Error>> + 'a;
 
 /// Writes the pictures, and the truths with their inputs, to `folder`; returns the names.
+#[allow(clippy::too_many_arguments)]
 fn write_files(
     folder: &Path,
     view: &View,
@@ -541,6 +584,7 @@ fn write_files(
     truth_a: &Capture,
     truth_b: &Capture,
     checkpoints: &[Capture],
+    still_run: &still::Run,
 ) -> Result<Vec<String>, Box<dyn Error>> {
     let mut names = Vec::new();
     let mut put = |name: String, write: &Writer<'_>| {
@@ -591,6 +635,14 @@ fn write_files(
         put(format!("spp{:04}.png", capture.samples), &|path| {
             write_png(path, &capture.image)
         })?;
+    }
+    // The still run's image at each mark (#189): what the Reference view had by then.
+    for &(seconds, at) in &still_run.marks {
+        let capture = &still_run.captures[at];
+        put(
+            format!("still-{:04}ms.png", (seconds * 1e3).round() as u32),
+            &|path| write_png(path, &capture.image),
+        )?;
     }
     Ok(names)
 }
@@ -667,6 +719,7 @@ pub fn print_summary(report: &ConvergenceReport) {
                 num(p.flip_mean_gamma22, 4)
             );
         }
+        still::print(view.name, &view.still);
         for l in &view.lines {
             let note = if l.counts {
                 String::new()
@@ -700,6 +753,32 @@ mod tests {
         }
     }
 
+    fn still_report() -> still::StillReport {
+        let tail = still::Tail::of(&[8.0, 9.0, 10.0]);
+        still::StillReport {
+            batching_bit_exact: true,
+            hz: 60,
+            budget_ms: 12.0,
+            max_batch_samples: 16,
+            still_frames: 2,
+            fade_ms: 150,
+            seconds: 0.3,
+            frames: 18,
+            accumulating_frames: 16,
+            frame: tail.clone(),
+            frames_over: 0,
+            gpu_batch: tail,
+            batch_first: 1,
+            batch_last: 3,
+            batch_max: 3,
+            samples_per_s: Some(100.0),
+            marks: Vec::new(),
+            flip_within_target: None,
+            frame_p99_within_target: Some(true),
+            to_line: Vec::new(),
+        }
+    }
+
     fn report(flip: bool) -> ConvergenceReport {
         let view = |name| {
             let mut view = views_description();
@@ -726,6 +805,7 @@ mod tests {
                     .to_vec(),
                 lines: Vec::new(),
                 files: vec!["spp0001.png".into()],
+                still: still_report(),
             }
         };
         ConvergenceReport {
@@ -843,6 +923,10 @@ mod tests {
             truth_spp: 64,
             flip: true,
             flip_gamma22: true,
+            still: still::Settings {
+                marks_s: vec![0.1, 0.25],
+                seconds: 0.3,
+            },
         };
         let out = std::env::temp_dir().join(format!("bhayanak-convergence-{}", std::process::id()));
         let _ = fs::remove_dir_all(&out);
@@ -870,6 +954,29 @@ mod tests {
             // The floor is under what the first sample scores.
             assert!(view.floor.flip_mean.unwrap() < flips[0]);
             assert!(view.floor.flip_p99.unwrap() >= view.floor.flip_mean.unwrap());
+            // The still run (#189): its images are scored against the same truth, so more samples
+            // are closer to it, and the time to each line is the run's.
+            let still = &view.still;
+            assert!(still.batching_bit_exact);
+            assert!(!still.marks.is_empty(), "{}", view.name);
+            let marked: Vec<(u32, f64)> = still
+                .marks
+                .iter()
+                .map(|m| (m.samples, m.flip_mean.unwrap()))
+                .collect();
+            assert!(
+                marked.windows(2).all(|w| w[0].0 <= w[1].0),
+                "{} {marked:?}",
+                view.name
+            );
+            assert!(
+                marked
+                    .windows(2)
+                    .all(|w| w[1].0 == w[0].0 || w[1].1 < w[0].1),
+                "{} {marked:?}",
+                view.name
+            );
+            assert_eq!(still.to_line.len(), 2);
             assert_eq!(view.lines.len(), 2);
             for line in &view.lines {
                 // A line that counts is at least four times the floor.
