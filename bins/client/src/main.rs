@@ -248,18 +248,22 @@ fn room_for(bands: Bands) -> Room {
         // 2.44 million bricks had their children resident at the most, in the climb to 5 km (#167;
         // 3.70 million in #143's walk, before the cap left the bricks beyond the horizon whole).
         resident: scaled(3_050_000.0),
-        // The tree held 4.99 million nodes after a fill and 5.05 million at the most in the climb
-        // (looked at at every publish), and the table has to be twice that for the entries that are
-        // taken out and put in again (a hash table that has no room left cleans its deleted entries
-        // out in place only if it is under half full, else it doubles): the 11.8 million, which is
-        // room for 14.68 million, that it was reserved for before the cap. The selection's reserve
-        // is for that many **in all** (see `Selection::reserve`): it asked for that many more, on
-        // the 5 million of a scene just rebuilt, and doubled the table in the climb.
+        // The tree held 4.99 million nodes after a fill and 5.05 million at the most (the scene
+        // thread's sample, every 250 ms), and the table has to be twice that for the entries that
+        // are taken out and put in again (a hash table cleans its deleted entries out in place only
+        // while it is at most half full, else it doubles): the 11.8 million, which is room for
+        // 14.68 million, that it was reserved for before the cap. The selection's reserve is for
+        // that many **in all** (see `Selection::reserve`): it asked for that many more, on the 5
+        // million of a scene just rebuilt, and doubled the table in a climb.
         nodes: scaled(11_800_000.0),
         // Waiting, and asked of the loader, were 442 000 at the most (the loader's queue 564 000,
-        // the margins' children included), and stuck 250 000.
-        waiting: scaled(700_000.0),
-        stuck: scaled(320_000.0),
+        // the margins' children included), and stuck 250 000. The same rule: twice the peak with
+        // `HEADROOM` (1.1 million, 640 000), so that neither table is over half full where it
+        // would double rather than clean in place; the 700 000 and 320 000 of the first sizing
+        // had 458 000 and 229 000 in place (3% and -9% over the peaks). 1.1 million is main's
+        // figure for waiting.
+        waiting: scaled(1_100_000.0),
+        stuck: scaled(640_000.0),
     }
 }
 
@@ -358,11 +362,15 @@ fn expected_words(bands: Bands) -> (usize, usize) {
 
 /// How much more of the scene's buffers is reserved than the bricks drawn need, for a climb. The
 /// words of a region are one run of a buffer, so a camera that rises (the levels' bands move, and
-/// regions are freed and taken as it goes) leaves gaps that a larger region does not fit in: in the
-/// climb to 500 m the `bricks` buffer, reserved at 159.8 million words for 116 million in use,
-/// grew by a quarter to its limit of 185.5 million, and `brick_refs` from 4.10 to 4.19 million
-/// (#167). 1.3 over what the bricks drawn need, with [`HEADROOM`], is 207 million; the buffers'
-/// GPU copies are as long, but only the words in use are in the scene's gate.
+/// regions are freed and taken as it goes) leaves gaps that a larger region does not fit in. In
+/// #167's first run of the resident-set test the `bricks` buffer, reserved at 159.8 million words
+/// for 114.8 million in use at the ground and 116.3 million at the most in use at the heights
+/// (`Tables::report`), grew in the climb (to 185.5 million, which is what that growth made it, not
+/// a measure of what was needed: the tests set no limit), and `brick_refs` from 4.10 to 4.19
+/// million. 1.3 over what the bricks drawn need, with [`HEADROOM`], is 207.7 million words and
+/// 5.33 million of refs: 1.79 times the words in use at the most, and no growth in the climbs of
+/// the tests (`docs/measurements.md`, #167). Only the words in use are in the scene's gate, but
+/// the buffers' GPU copies are as long.
 const CLIMB_ROOM: f64 = 1.3;
 
 /// The Planet as the client and the in-process server each hold it, the client's packed copy of

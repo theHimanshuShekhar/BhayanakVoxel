@@ -476,6 +476,10 @@ pub struct SlowFrame {
     /// not the GPU's (`wait_not_passes_ms`) and a normal `cpu_ms` is a late wake-up of the frame
     /// thread inside the device poll; a long `sleep_over_ms` is one inside the sleep.
     pub before_ms: f64,
+    /// The harness's own work between the look at the memory and the sleep (working out what the
+    /// frame uploaded and its parts for this report), so that `time_ms`, `after_ms`, `between_ms`, `sleep_asked_ms` and
+    /// `sleep_over_ms` add up to `cycle_ms`.
+    pub between_ms: f64,
     pub sleep_asked_ms: f64,
     pub sleep_over_ms: f64,
     pub cycle_ms: f64,
@@ -1480,7 +1484,8 @@ impl<'a> Session<'a> {
         let looking = looking || self.world.looking_for_holes();
         let time = began.elapsed();
         let lock_wait = self.look_at_memory();
-        let after = began.elapsed() - time;
+        let after_end = began.elapsed();
+        let after = after_end - time;
         let (kind, upload_bytes, patch_bytes) = uploaded(self.world.scene(), update.as_ref());
         self.scene_host_peak_bytes = host_growth_peak(
             self.scene_host_peak_bytes,
@@ -1522,6 +1527,7 @@ impl<'a> Session<'a> {
             after_lock_ms: ms(lock_wait),
             harness_ms: ms(harness_wait),
             before_ms: ms(before),
+            between_ms: 0.0,
             sleep_asked_ms: 0.0,
             sleep_over_ms: 0.0,
             cycle_ms: 0.0,
@@ -1534,12 +1540,13 @@ impl<'a> Session<'a> {
             over_budget,
             hole_look: looking,
         };
-        let asked = FRAME.saturating_sub(began.elapsed());
         let slept = Instant::now();
+        let asked = FRAME.saturating_sub(slept - began);
         std::thread::sleep(asked);
         let ended = Instant::now();
         self.last_ended = Some(ended);
         let parts = SlowFrame {
+            between_ms: ms((slept - began).saturating_sub(after_end)),
             sleep_asked_ms: ms(asked),
             sleep_over_ms: ms((ended - slept).saturating_sub(asked)),
             cycle_ms: ms(ended - began),
@@ -2117,6 +2124,7 @@ mod tests {
             after_ms: 0.0,
             after_lock_ms: 0.0,
             harness_ms: 0.0,
+            between_ms: 0.0,
             before_ms: 0.1,
             sleep_asked_ms: 0.0,
             sleep_over_ms: 0.0,
@@ -2561,6 +2569,7 @@ mod tests {
                 "after_ms",
                 "at_ms",
                 "before_ms",
+                "between_ms",
                 "camera_ms",
                 "cpu_ms",
                 "cycle_ms",
@@ -3051,18 +3060,20 @@ mod tests {
             assert!(path.frame_cycle.mean_ms >= 16.6, "{}", path.name);
             assert!(path.sleep_overshoot.samples <= path.frames);
             assert!(path.sleep_overshoot.worst_ms >= 0.0);
-            for frame in &path.slowest {
-                // A frame's cycle is at least its time, the look at the memory after it, the
-                // sleep it asked for and the sleep's overshoot, which are all inside it (it is
-                // more by the microseconds of the harness's own work between them: no upper
-                // bound is asserted, as how long anything took is not for a test to hold).
+            for frame in path.slowest.iter().chain(&path.slowest_cycles) {
+                // A frame's cycle is its parts, all of them: the time, the look at the memory
+                // after it, the harness's work between that and the sleep, the sleep it asked for
+                // and the sleep's overshoot (they are taken at the same instants, so they add up
+                // to the microsecond; 0.05 ms is for the rounding of the f64 milliseconds). A part
+                // that went missing from the report would show as a cycle over their sum.
+                let parts = frame.time_ms
+                    + frame.after_ms
+                    + frame.between_ms
+                    + frame.sleep_asked_ms
+                    + frame.sleep_over_ms;
                 assert!(
-                    frame.cycle_ms + 0.05
-                        >= frame.time_ms
-                            + frame.after_ms
-                            + frame.sleep_asked_ms
-                            + frame.sleep_over_ms,
-                    "{}: {frame:?}",
+                    (frame.cycle_ms - parts).abs() < 0.05,
+                    "{}: the parts of the cycle do not add up to it: {frame:?}",
                     path.name
                 );
             }

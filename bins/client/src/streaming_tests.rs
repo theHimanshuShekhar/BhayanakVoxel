@@ -20,7 +20,7 @@ use planet_gen::planet::{Planet, tangents};
 use planet_gen::world_map::WorldMap;
 use render::lod::{Bands, LEVELS};
 use render::reference::{Ray, trace};
-use render::scene::{Bound, REGION_WORDS};
+use render::scene::{Bound, REGION_WORDS, Rebuild};
 use render::{Camera, Mode, RingsFull, Scene, SceneUpdate, camera};
 use sim::Predictor;
 
@@ -568,8 +568,8 @@ struct Tables {
     peak: HashMap<String, usize>,
     /// `(frame, table, was, is)` for each growth.
     grown: Vec<(usize, String, usize, usize)>,
-    /// The frames in which the scene was rebuilt.
-    rebuilt: Vec<usize>,
+    /// The frames in which the scene was rebuilt, and why.
+    rebuilt: Vec<(usize, Option<Rebuild>)>,
     frames: usize,
 }
 
@@ -600,7 +600,8 @@ impl Tables {
         }
         if rebuilt {
             // The scene made its tables again: they are the ones to compare with from now on.
-            self.rebuilt.push(self.frames);
+            self.rebuilt
+                .push((self.frames, world.scene().rebuild_reason()));
             self.highest_room = sizes;
         } else {
             self.highest_room = crate::growth::raised(&self.highest_room, sizes);
@@ -625,6 +626,24 @@ impl Tables {
                 room
             );
         }
+    }
+
+    /// Fails if a table grew since the first frame, or the scene was rebuilt for any reason but a
+    /// jump of the camera (a step that is over `JUMP` is one, and makes its tables again: what is
+    /// shown for a scene after it is not that a scene that is patched all the way does not grow).
+    fn assert_only_jumps_rebuilt(&self) {
+        assert!(
+            self.grown.is_empty(),
+            "tables grew in the middle of a frame, so their reservations are too small: {:?}",
+            self.grown
+        );
+        assert!(
+            self.rebuilt
+                .iter()
+                .all(|(_, why)| *why == Some(Rebuild::Jump)),
+            "the scene was rebuilt but not for a jump: {:?}",
+            self.rebuilt
+        );
     }
 
     /// Fails if a table grew or the scene was rebuilt since the first frame.
@@ -2608,6 +2627,91 @@ fn the_resident_set_at_2_m_50_m_500_m_2_km_and_5_km_over_the_spawn() {
         );
     }
     tables.report();
+    // Each height is a step over `JUMP`, so it is a jump and makes its tables again: this shows the
+    // reservations hold for each of those scenes. The climb that does not jump is the next test's.
+    tables.assert_only_jumps_rebuilt();
+}
+
+/// The climb from the spawn to 5 km that is **one path**, in steps of a frame (0.8 m at 48 m/s,
+/// far under `JUMP`'s 103 m): the scene is patched all the way, with the gaps in its buffers and the
+/// deleted entries in its tables that a patched scene has and a fresh one has not (#167: the
+/// resident-set test's heights are each a jump, and a scene after a jump is a fresh one). Every table is looked at
+/// after every frame; none may grow and the scene may not be rebuilt. `CLIMB_M_PER_S` sets the
+/// speed (48 m/s, as the flight and the take-off). A few minutes at full size:
+/// `cargo test --release -p client -- --ignored --nocapture a_continuous_climb`.
+#[test]
+#[ignore = "generates the full-size world map"]
+fn a_continuous_climb_from_2_m_to_5_km_grows_no_table_and_no_buffer() {
+    let loaded = crate::load_planet();
+    let (client, _server) = loopback();
+    let mut world =
+        World::new(loaded.scene, Predictor::new(loaded.store), client).with_loader(loaded.loader);
+    let spawn = loaded.camera;
+    world.measure_scene_thread();
+    let mut tables = Tables::new(&world);
+    let began = Instant::now();
+    wait_idle(
+        &mut world,
+        spawn.position,
+        Duration::from_secs(5400),
+        Some(&mut tables),
+    );
+    eprintln!("filled after {:.0?}", began.elapsed());
+    let speed: f64 = std::env::var("CLIMB_M_PER_S")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(48.0);
+    let up = spawn.horizon_up;
+    let at = |metres: f64| -> [f64; 3] {
+        std::array::from_fn(|a| spawn.position[a] + up[a] * metres * VOXELS_PER_METRE)
+    };
+    let step = speed / 60.0;
+    assert!(
+        step * VOXELS_PER_METRE < render::scene::JUMP * world.bands().unwrap().d0(),
+        "a step of the climb is a jump"
+    );
+    let velocity: [f64; 3] = std::array::from_fn(|a| up[a] * speed * VOXELS_PER_METRE);
+    let frame = Duration::from_micros(16_667);
+    let (mut frames, mut peak_used) = (0_u32, 0_u64);
+    let climbing = Instant::now();
+    while f64::from(frames) * step < 5000.0 {
+        let tick = Instant::now();
+        frames += 1;
+        let camera = at(f64::from(frames) * step);
+        let moved = world.recentre_moving(camera, velocity).unwrap();
+        let rebuilt = matches!(moved, Some(SceneUpdate::Rebuilt));
+        tables.after_frame(&world, rebuilt);
+        peak_used = peak_used.max(world.used_bytes());
+        if frames % 1250 == 0 {
+            eprintln!(
+                "  {:.0} m after {:.0?}: {:.0} MiB used, {} waiting, {} pending, lag {:.0} Voxels",
+                f64::from(frames) * step,
+                climbing.elapsed(),
+                world.used_bytes() as f64 / (1024.0 * 1024.0),
+                world.waiting(),
+                world.loader().unwrap().pending,
+                world.lag(camera)
+            );
+        }
+        std::thread::sleep(frame.saturating_sub(tick.elapsed()));
+    }
+    eprintln!(
+        "climbed 5 km at {speed} m/s in {frames} frames ({:.0?}); scene at most {:.1} MiB used",
+        climbing.elapsed(),
+        peak_used as f64 / (1024.0 * 1024.0)
+    );
+    wait_idle(
+        &mut world,
+        at(5000.0),
+        Duration::from_secs(5400),
+        Some(&mut tables),
+    );
+    eprintln!(
+        "at 5 km, settled: scene {:.1} MiB used; {}",
+        world.used_bytes() as f64 / (1024.0 * 1024.0),
+        memory(&world, "then")
+    );
+    tables.report();
     tables.assert_none_grew();
 }
 
@@ -2659,10 +2763,16 @@ fn wait_idle(world: &mut World, camera: [f64; 3], cap: Duration, mut watch: Opti
     // for a few seconds.
     let mut idle_since: Option<Instant> = None;
     loop {
-        world.recentre_moving(camera, [0.0; 3]).unwrap();
-        world.stream::<RingsFull>(camera, |_, _| Ok(())).unwrap();
+        let moved = world.recentre_moving(camera, [0.0; 3]).unwrap();
+        let mut rebuilt = matches!(moved, Some(SceneUpdate::Rebuilt));
+        world
+            .stream::<RingsFull>(camera, |_, update| {
+                rebuilt |= matches!(update, SceneUpdate::Rebuilt);
+                Ok(())
+            })
+            .unwrap();
         if let Some(tables) = watch.as_deref_mut() {
-            tables.after_frame(world, false);
+            tables.after_frame(world, rebuilt);
         }
         if idle(world) && world.lag(camera) < 1.0 {
             if idle_since.get_or_insert_with(Instant::now).elapsed() > Duration::from_secs(3) {

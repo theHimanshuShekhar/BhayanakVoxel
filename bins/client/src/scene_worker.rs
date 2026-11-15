@@ -2445,11 +2445,18 @@ impl Engine {
 
     fn publish_changes(&mut self, job: Option<u64>) {
         let exactly = self.shared.count_exactly.load(Ordering::Relaxed);
-        // Counting exactly is the benches' and the tests': they look at the tables at every
-        // publish, so that a table's transient peak (a climb's) is not missed between two samples.
-        if exactly || self.clock.since(self.slow_at) >= TABLES_EVERY {
+        if self.clock.since(self.slow_at) >= TABLES_EVERY {
             self.slow_at = self.clock.now();
             self.slow = slow_of(&self.scene, &self.loader, exactly);
+        } else if exactly {
+            // The words by level are of the scene as it is in this publish, with the bricks drawn
+            // in it: a round publishes several times, and the others would keep the words of an
+            // earlier one. The game does not count exactly and does not pay for this.
+            self.slow = Arc::new(Slow {
+                tables: self.slow.tables.clone(),
+                used_bytes: self.slow.used_bytes,
+                words_by_level: self.scene.words_by_level(),
+            });
         }
         while let Ok(garbage) = self.graveyard.try_recv() {
             if let Garbage::Copy(copy) = garbage

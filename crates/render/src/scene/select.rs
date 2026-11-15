@@ -624,10 +624,6 @@ pub struct Selection {
     /// which is to run whether the camera has moved or not.
     rewanted: bool,
     nodes: HashMap<Key, Node>,
-    /// The most nodes there have been at once, as far as a node is made (an eviction or a merge
-    /// that takes nodes away does not lower it): what the table's room has to be for, which
-    /// a look at its length between rounds misses when it is a climb's transient.
-    most_nodes: usize,
     /// The nodes that are not hot, by the bucket of the camera's travel in which they are to be
     /// looked at to see if they have become hot, with the stamp they were queued with (an entry for
     /// a node that was queued again since is stale).
@@ -715,7 +711,6 @@ impl Selection {
             travelled: 0.0,
             rewanted: false,
             nodes: HashMap::default(),
-            most_nodes: 0,
             queue: BTreeMap::new(),
             hot: Vec::new(),
             stamps: 0,
@@ -1028,7 +1023,7 @@ impl Selection {
         vec![
             TableSize::hash::<(Key, Node)>(
                 "selection nodes",
-                self.nodes.len().max(self.most_nodes),
+                self.nodes.len(),
                 self.nodes.capacity(),
             ),
             TableSize::hash::<Key>(
@@ -1388,7 +1383,6 @@ impl Selection {
                 stamp: 0,
             },
         );
-        self.most_nodes = self.most_nodes.max(self.nodes.len());
         self.queue_node(key, distance, true);
     }
 
@@ -1425,7 +1419,6 @@ impl Selection {
                 stamp: 0,
             },
         );
-        self.most_nodes = self.most_nodes.max(self.nodes.len());
         self.settle_margin(store, self.placed, key);
         let stuck = self.drawn_split(key, Some(false));
         if p.draws {
@@ -1822,6 +1815,28 @@ mod tests {
     }
 
     const D0: f64 = 32.0;
+
+    /// `reserve` is room for that many in all, not that many more (#167): reserving what the
+    /// table's room already is, on a selection that holds nodes, makes no new room (`HashMap::reserve`
+    /// would have asked for the nodes it holds and that many more, and doubled the table).
+    #[test]
+    fn reserving_room_on_a_selection_that_holds_nodes_is_for_that_many_in_all() {
+        let store = flat(8, 4);
+        let mut selection = select(&store, [0.0, 4.0, 0.0], D0);
+        let held = selection.nodes.len();
+        assert!(held > 100, "{held} nodes");
+        selection.reserve(held * 3, held, held);
+        let room = selection.nodes.capacity();
+        assert!(room >= held * 3);
+        // The same reservation again, and the room the table has: no growth.
+        selection.reserve(held * 3, held, held);
+        assert_eq!(selection.nodes.capacity(), room);
+        selection.reserve(room, 0, 0);
+        assert_eq!(selection.nodes.capacity(), room);
+        // More than it has is more room.
+        selection.reserve(room + 1, 0, 0);
+        assert!(selection.nodes.capacity() > room);
+    }
 
     fn select(store: &BrickStore, camera: [f64; 3], d0: f64) -> Selection {
         let top = top_level(store);

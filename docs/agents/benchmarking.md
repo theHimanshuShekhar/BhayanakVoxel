@@ -373,7 +373,11 @@ is made there (below): the run's **Edit latency**. Its frames are not those of a
     part of a long cycle it was, and `frame_cycle.worst_ms` is the number to read against it. A
     gate on the worst cycle would be on one frame of a thousand, which a Windows scheduler tick
     can make 30 ms, and the p99 of a paced cycle is 17.3 ms whatever the work, so a gate on that
-    would hold nothing either.
+    would hold nothing either. **`harness_ms` is more than the wait for the scene thread:** the
+    look at the stop also draws a frame on the GPU with the update that the look made, which the game
+    would make in its next frame, so a stop's `harness_ms` is the wait plus one frame's copy and
+    draw, and not all of it is work the game would not do. It is left out of the cycle as the bench's
+    own call, not as time the game does not spend.
     `sleep_overshoot` is by how much each pacing sleep ran **over what it asked for** (the frames
     that slept; a frame that was already over 16.667 ms does not). On Windows a `thread::sleep` is
     rounded up to the timer's tick (up to 15.6 ms unless the process raised the resolution) and
@@ -395,7 +399,9 @@ is made there (below): the run's **Edit latency**. Its frames are not those of a
       harness's own bookkeeping; 0 for a path's first frame, since the end look of the path before
       it, about 0.3 s at full size, is not a wait for a wake-up), `sleep_asked_ms` (the sleep that
       fills the frame to 16.667 ms; 0 if it was longer), `sleep_over_ms` (by how much the sleep ran
-      over that) and `cycle_ms` (from the frame's start to the end of its sleep; the cycle to the
+      over that), `between_ms` (the harness's bookkeeping between the look at the memory and the sleep; `time_ms`,
+      `after_ms`, `between_ms`, `sleep_asked_ms` and `sleep_over_ms` add up to `cycle_ms`, which a
+      test of the report holds to 0.05 ms) and `cycle_ms` (from the frame's start to the end of its sleep; the cycle to the
       next frame's start is `cycle_ms` plus the next frame's `before_ms`), and `harness_ms` (of
       `before_ms`, the look the harness makes at the stop of a flight: it waits for the scene
       thread to finish a round and counts the soft misses, then copies what that made to the GPU;
