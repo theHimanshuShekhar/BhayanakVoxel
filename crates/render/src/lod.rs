@@ -51,7 +51,7 @@ pub const LEVELS: usize = 18;
 /// [`LEVELS`] is 18) are generated for the whole Planet right after the spawn ring (ADR 0004).
 /// Level 13 is the one whose Voxels are 410 m across. It is four levels coarser than the Guard of
 /// the 16 km Planet (level 9, 25.6 m), which is what keeps the whole Planet to 274 thousand
-/// bricks, 45 MiB and about 4 s on eight cores at 320 km (ADR 0008; level 12 is 1.29 million bricks,
+/// bricks, 45 MiB and 4 to 7 s on eight cores at 320 km (ADR 0008; level 12 is 1.29 million bricks,
 /// 192 MiB and 13 s). The client's loader and the prefetch simulator both use it.
 pub const GUARD_FIRST: usize = 13;
 
