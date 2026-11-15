@@ -1,6 +1,7 @@
 // The Reference view's path tracer: the unbiased estimate of the light in the world that the
-// Primary view is measured against (ADR 0005, whose rules this follows). Each dispatch adds one
-// sample per pixel to a running mean in `accum`, and shows the mean.
+// Primary view is measured against (ADR 0005, whose rules this follows). Each dispatch adds a
+// batch of samples per pixel (one, unless the still-frame policy asks for more) to a running
+// mean in `accum`, and shows the mean.
 //
 // A sample follows a path from the camera. At every hit on a Lambertian surface it:
 //   - adds the light the Material itself gives off;
@@ -161,19 +162,38 @@ fn reference(@builtin(global_invocation_id) id: vec3<u32>) {
     if id.x >= size.x || id.y >= size.y {
         return;
     }
-    let sample_index = frame.params.x;
+    let first_sample = frame.params.x;
+    // A batch: this many samples of every pixel in one dispatch (the still-frame policy, ADR 0005
+    // and #189). 0 is a batch of 1, so a caller that never heard of batches is unchanged.
+    let batch = max(frame.params.w, 1u);
     let pixel_seed = pixel_hash(id.xy, frame.params.y);
-    // A point in the pixel from the first group's first two dimensions, so edges anti-alias as
-    // samples accumulate. Slots 2 and 3 of the same group are the first surface's sun sample.
-    let group0 = sample_group(pixel_seed, sample_index, 0u, WHITE_NOISE);
-    let estimate = radiance(camera_ray(id.xy, size, group0.xy), pixel_seed, sample_index, group0);
+    let at = id.y * size.x + id.x;
 
     // The running mean: after n samples, mean + (new - mean) / (n + 1). The first replaces
     // whatever the buffer held. Unlike a sum, it keeps its precision however long it runs.
-    let at = id.y * size.x + id.x;
-    var mean = estimate;
-    if sample_index > 0u {
-        mean = accum[at].xyz + (estimate - accum[at].xyz) / f32(sample_index + 1u);
+    //
+    // The batch is a loop over the samples a frame would otherwise have taken one dispatch each:
+    // the same operations on the same numbers in the same order, with the mean kept in a register
+    // and written once at the end. An f32 stored and loaded again is the same f32, so a batch of k
+    // gives the accumulation, bit for bit, that k single samples do (a test holds it). The sample
+    // index is what seeds a sample, so how the samples are split into batches changes nothing.
+    var mean = vec3<f32>(0.0);
+    if first_sample > 0u {
+        mean = accum[at].xyz;
+    }
+    for (var i = 0u; i < batch; i++) {
+        let sample_index = first_sample + i;
+        // A point in the pixel from the first group's first two dimensions, so edges anti-alias
+        // as samples accumulate. Slots 2 and 3 of the same group are the first surface's sun
+        // sample.
+        let group0 = sample_group(pixel_seed, sample_index, 0u, WHITE_NOISE);
+        let estimate =
+            radiance(camera_ray(id.xy, size, group0.xy), pixel_seed, sample_index, group0);
+        if sample_index == 0u {
+            mean = estimate;
+        } else {
+            mean = mean + (estimate - mean) / f32(sample_index + 1u);
+        }
     }
     accum[at] = vec4<f32>(mean, 1.0);
     var shown = encode(mean);
@@ -182,7 +202,7 @@ fn reference(@builtin(global_invocation_id) id: vec3<u32>) {
     if frame.params.z != 0u {
         let first = camera_ray(id.xy, size, vec2<f32>(0.5));
         // lighting: Geometry (LOD and what is loaded)
-        shown = debug_colour(frame.params.z, trace(first), sample_index);
+        shown = debug_colour(frame.params.z, trace(first), first_sample + batch - 1u);
     }
     textureStore(output, id.xy, vec4<f32>(shown, 1.0));
 }

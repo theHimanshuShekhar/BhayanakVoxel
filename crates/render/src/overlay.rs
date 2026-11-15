@@ -53,6 +53,8 @@ pub struct Info<'a> {
     pub timers_supported: bool,
     /// Samples in the reference image so far.
     pub samples: u32,
+    /// Samples that the last frame added to it (the batch): 0 where the frame showed Primary.
+    pub samples_per_frame: u32,
     /// Whether bricks that are being generated are kept out of the scene (while the reference
     /// image accumulates) and some wait.
     pub loading_paused: bool,
@@ -316,6 +318,7 @@ pub fn show(ctx: &Context, info: &Info, controls: &mut Controls) {
             }
             if controls.mode == Mode::Reference {
                 ui.label(format!("samples: {}", info.samples));
+                ui.label(format!("samples a frame: {}", info.samples_per_frame));
                 if info.loading_paused {
                     ui.label("loading paused");
                 }
@@ -414,6 +417,7 @@ mod tests {
             present_mode: wgpu::PresentMode::Fifo,
             timers_supported: true,
             samples: 0,
+            samples_per_frame: 0,
             loading_paused: false,
             scene_memory: SceneMemory::default(),
             lod: None,
@@ -431,6 +435,7 @@ mod tests {
             present_mode: wgpu::PresentMode::Fifo,
             timers_supported: true,
             samples: 0,
+            samples_per_frame: 0,
             loading_paused: false,
             scene_memory: SceneMemory::default(),
             lod: None,
@@ -467,6 +472,7 @@ mod tests {
             present_mode: wgpu::PresentMode::Mailbox,
             timers_supported: true,
             samples: 0,
+            samples_per_frame: 0,
             loading_paused: false,
             scene_memory: SceneMemory::default(),
             lod: None,
@@ -508,6 +514,7 @@ mod tests {
             present_mode: wgpu::PresentMode::Fifo,
             timers_supported: true,
             samples: 7,
+            samples_per_frame: 3,
             loading_paused: false,
             scene_memory: SceneMemory {
                 used: 5 * 1024 * 1024 + 512 * 1024,
@@ -539,6 +546,7 @@ mod tests {
         assert!(!text.contains("not supported"));
         // Not in reference mode, so no sample count yet.
         assert!(!text.contains("samples: 7"));
+        assert!(!text.contains("samples a frame"));
     }
 
     #[test]
@@ -551,6 +559,7 @@ mod tests {
             present_mode: wgpu::PresentMode::Fifo,
             timers_supported: false,
             samples: 0,
+            samples_per_frame: 0,
             loading_paused: false,
             scene_memory: SceneMemory::default(),
             lod: None,
@@ -569,6 +578,7 @@ mod tests {
             present_mode: wgpu::PresentMode::Fifo,
             timers_supported: true,
             samples: 42,
+            samples_per_frame: 5,
             loading_paused: true,
             scene_memory: SceneMemory::default(),
             lod: None,
@@ -582,6 +592,7 @@ mod tests {
         let before = controls;
         let text = draw(&info, &mut controls);
         assert!(text.contains("samples: 42"), "{text}");
+        assert!(text.contains("samples a frame: 5"), "{text}");
         assert!(text.contains("loading paused"), "{text}");
         assert!(text.contains("Depth"), "{text}");
         // Showing the panel is not an edit.

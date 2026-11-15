@@ -54,14 +54,21 @@ use super::stream::StreamReport;
 /// were drawn with a gamma of 2.2, so a FLIP number is not comparable with one of schema 16 or
 /// before except through `flip_mean_gamma22`. Nothing else is changed.
 ///
-/// 18 added the frame's pacing to the real-time report (#167): each slow frame has `before_ms`,
+/// 18 (#189) added to each convergence view `still`: the Reference view with the still-frame policy
+/// on (batched samples, the 12 ms budget, 60 Hz), from the stop: the work of a frame that took a
+/// batch (mean, p95, p99, max, how many were over 16.7 ms), the batch's size and GPU time, the
+/// samples the run had at 0.1, 0.25, 0.5, 1 and 2 s and the FLIP of the image at each, and the time
+/// from the stop to the FLIP lines. `convergence/VIEW/` also has `still-NNNNms.png`. Nothing
+/// else is changed: the single-sample curve, the truths and every timed pass are as they were.
+///
+/// 19 added the frame's pacing to the real-time report (#167): each slow frame has `before_ms`,
 /// `sleep_asked_ms`, `sleep_over_ms` and `cycle_ms`, and each path `frame_cycle` and
 /// `sleep_overshoot`, so that a 30 ms frame says whether the frame thread woke late (the
 /// harness's) or did the work. A slow frame also says how much of `before_ms` was the harness's own
 /// look at a stop (`harness_ms`) and how much of `after_ms` was the store's lock
 /// (`after_lock_ms`), and each path has `slowest_cycles`, its frames with the longest turn.
 /// Nothing else is changed.
-pub const SCHEMA_VERSION: u32 = 18;
+pub const SCHEMA_VERSION: u32 = 19;
 
 /// One timed thing (a pass, or the GPU total of a profiler frame) in one mode, against its
 /// budget. In reference mode a profiler frame is one sample, so the entries of that mode have
@@ -558,7 +565,7 @@ mod tests {
                 "streaming_real_time"
             ]
         );
-        assert_eq!(json["schema_version"], 18);
+        assert_eq!(json["schema_version"], 19);
         assert_eq!(json["convergence"], serde_json::Value::Null);
         assert_eq!(json["streaming"], serde_json::Value::Null);
         assert_eq!(json["streaming_real_time"], serde_json::Value::Null);

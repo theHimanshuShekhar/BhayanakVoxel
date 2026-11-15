@@ -116,6 +116,33 @@ fn check_convergence(convergence: &Value, out: &Path) {
             number(&point["mse_linear_run_only"]);
             number_or_null(&point["gpu_s"]);
         }
+        // The still view (#189): the policy ran, batches were drawn, and the policy's numbers are
+        // the renderer's. FLIP's numbers are null here, as above; their count is what differs.
+        let still = &view["still"];
+        assert_eq!(still["batching_bit_exact"], true, "{name}");
+        assert_eq!(still["hz"], 60);
+        assert_eq!(number(&still["budget_ms"]), 12.0);
+        assert_eq!(still["max_batch_samples"], 16);
+        assert_eq!(still["still_frames"], 2);
+        assert_eq!(still["fade_ms"], 150);
+        assert!(
+            still["accumulating_frames"].as_u64().unwrap() >= 3,
+            "{name}"
+        );
+        assert!(
+            still["frames"].as_u64().unwrap() >= still["accumulating_frames"].as_u64().unwrap()
+        );
+        assert_eq!(still["batch_first"], 1, "the first batch of a view is 1");
+        assert!(still["batch_max"].as_u64().unwrap() <= 16);
+        assert!(number(&still["frame"]["p99_ms"]) > 0.0);
+        assert!(still["frame"]["samples"].as_u64().unwrap() >= 3);
+        assert!(still["flip_within_target"].is_null(), "no FLIP: {name}");
+        assert!(still["frame_p99_within_target"].is_boolean());
+        for mark in still["marks"].as_array().unwrap() {
+            assert!(mark["flip_mean"].is_null());
+            assert!(mark["samples"].as_u64().unwrap() >= 1);
+            assert!(number(&mark["mse_linear"]) >= 0.0);
+        }
         // The truths with their inputs, and a picture of every checkpoint, are in the folder.
         let folder = out.join(string(&convergence["folder"])).join(name);
         for file in [
@@ -151,7 +178,7 @@ fn check_convergence(convergence: &Value, out: &Path) {
 }
 
 fn check_schema(report: &Value, out: &Path) {
-    assert_eq!(report["schema_version"], 18);
+    assert_eq!(report["schema_version"], 19);
     // The Edit stress is of the whole Planet, which the patch is not.
     assert!(report["edits"].is_null());
     // The streaming mode is asked for (see its own test); the other tests do not. The real-time

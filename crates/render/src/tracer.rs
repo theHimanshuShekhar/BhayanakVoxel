@@ -7,12 +7,14 @@ use materials::MaterialTable;
 use wgpu::util::DeviceExt;
 
 use crate::accumulation::Accumulator;
+use crate::batch::max_samples;
 use crate::camera::{Camera, CameraUniform};
 use crate::debug_view::DebugView;
 use crate::gpu_materials;
 use crate::profiler::Profiler;
 use crate::reference::{Hit, Ray};
 use crate::scene::{MAX_LEVELS, Part, REGION_WORDS, Scene, SceneUpdate, UploadCost, spare_words};
+use crate::still::{Plan, Still};
 use crate::sun::{Sun, SunUniform};
 use crate::upscale::{History, Resolution, UpscalePass};
 use crate::{Result, shaders};
@@ -142,7 +144,8 @@ impl ReferenceOptions {
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct FrameUniform {
     sun: SunUniform,
-    /// The sample's index, the random seed, the debug view, then one unused.
+    /// The sample's index (a batch's first), the random seed, the debug view, then the number of
+    /// samples in the batch (0 for a dispatch that has none, and for one is the same as 1).
     params: [u32; 4],
     /// Where in its pixel primary visibility traces, then two unused.
     jitter: [f32; 4],
@@ -200,10 +203,13 @@ pub(crate) fn storage_texture(format: wgpu::TextureFormat) -> wgpu::BindingType 
 /// At the traced (internal) resolution, primary visibility draws the lit image and, beside it, the
 /// G-buffer for the passes after it: the distance to the hit, its face normal and its albedo.
 ///
-/// The reference path tracer also draws the lit image, with the float buffer that holds its
-/// running mean, one `vec4<f32>` per pixel. It stays at the traced resolution: it costs the same
-/// per sample as the bench budgets for, and it anti-aliases itself, so it needs no upscaling. (A
-/// reference at the output's resolution is one traced at that resolution: `Resolution::native`.)
+/// The reference path tracer draws an image of its own, with the float buffer that holds its
+/// running mean, one `vec4<f32>` per pixel. Where that is traced is the target's *reference
+/// size*: the traced resolution for [`Target::new`] (what the bench's flight times, and the tests
+/// use: the cost of a sample is a unit that the budgets are written in), and the output
+/// resolution for [`Target::with_full_reference`], which is how the window draws it (ADR 0005:
+/// the Reference view traces at full output resolution, whatever Primary's render scale is). It
+/// anti-aliases itself, so it needs no upscaling.
 ///
 /// At the output resolution is the image that is presented, which the upscaler builds from the
 /// lit image and from its own history (two images, which take turns).
@@ -211,17 +217,29 @@ pub struct Target {
     resolution: Resolution,
     lit: Plane,
     gbuffer: Plane,
+    reference_size: (u32, u32),
+    reference: Plane,
     accum: wgpu::Buffer,
     image: Plane,
     history: [Plane; 2],
 }
 
 impl Target {
+    /// A target whose Reference view is traced at the traced (internal) resolution.
     pub fn new(device: &wgpu::Device, resolution: Resolution) -> Self {
+        Self::build(device, resolution, resolution.internal)
+    }
+
+    /// A target whose Reference view is traced at the output resolution, as the window's is.
+    pub fn with_full_reference(device: &wgpu::Device, resolution: Resolution) -> Self {
+        Self::build(device, resolution, resolution.output)
+    }
+
+    fn build(device: &wgpu::Device, resolution: Resolution, reference_size: (u32, u32)) -> Self {
         let Resolution { internal, output } = resolution;
         let accum = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("accumulation"),
-            size: u64::from(internal.0) * u64::from(internal.1) * 16,
+            size: u64::from(reference_size.0) * u64::from(reference_size.1) * 16,
             // COPY_SRC so that the bench's convergence phase can read the float mean back.
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
@@ -230,6 +248,8 @@ impl Target {
             resolution,
             lit: Plane::new(device, "lit image", internal, IMAGE_FORMAT),
             gbuffer: Plane::new(device, "G-buffer", internal, GBUFFER_FORMAT),
+            reference_size,
+            reference: Plane::new(device, "reference image", reference_size, IMAGE_FORMAT),
             accum,
             image: Plane::new(device, "upscaled image", output, IMAGE_FORMAT),
             history: [0, 1]
@@ -241,10 +261,26 @@ impl Target {
         self.resolution
     }
 
-    /// The lit image that primary visibility and the reference path tracer draw, at the internal
-    /// resolution.
+    /// The lit image that primary visibility draws, at the internal resolution.
     pub fn lit(&self) -> &Plane {
         &self.lit
+    }
+
+    /// The image that the reference path tracer draws: the mean so far, encoded for display, at
+    /// [`Target::reference_size`].
+    pub fn reference(&self) -> &Plane {
+        &self.reference
+    }
+
+    /// The size the reference path tracer traces at, and of its image and its running mean.
+    pub fn reference_size(&self) -> (u32, u32) {
+        self.reference_size
+    }
+
+    /// The most samples one dispatch of the reference path tracer may take at this size
+    /// ([`max_samples`]).
+    pub fn max_batch(&self) -> u32 {
+        max_samples(pixels(self.reference_size))
     }
 
     /// The image that the upscaler builds, at the output resolution.
@@ -259,7 +295,7 @@ impl Target {
     }
 
     /// The reference path tracer's running mean: one `vec4<f32>` a pixel (the fourth is 1), rows
-    /// from the top, at the traced resolution.
+    /// from the top, at the reference size.
     pub(crate) fn accum(&self) -> &wgpu::Buffer {
         &self.accum
     }
@@ -276,16 +312,17 @@ impl Target {
 pub struct View {
     camera: Camera,
     sun: Sun,
+    /// The size the reference image is traced at.
     size: (u32, u32),
 }
 
 impl View {
-    /// The view of `camera` and `sun` into an image of `target`.
+    /// The view of `camera` and `sun` into the reference image of `target`.
     pub(crate) fn new(camera: &Camera, sun: &Sun, target: &Target) -> Self {
         Self {
             camera: *camera,
             sun: *sun,
-            size: target.resolution.internal,
+            size: target.reference_size,
         }
     }
 }
@@ -301,6 +338,10 @@ pub struct Tracer {
     primary: wgpu::ComputePipeline,
     reference: wgpu::ComputePipeline,
     upscale: UpscalePass,
+    /// Decides what each frame of [`Tracer::encode_frame`] draws.
+    still: Still<(View, u64)>,
+    /// Counts what changes the Planet or the images, which the key of `still` cannot see.
+    scene_epoch: u64,
     history: History,
     accumulator: Accumulator<View>,
     /// The reference's random seed: [`RNG_SEED`] unless [`Tracer::set_seed`] changed it.
@@ -747,6 +788,8 @@ impl Tracer {
             primary,
             reference,
             upscale: UpscalePass::new(device),
+            still: Still::new(),
+            scene_epoch: 0,
             history: History::default(),
             accumulator: Accumulator::new(),
             seed: RNG_SEED,
@@ -775,8 +818,8 @@ impl Tracer {
         sun: &Sun,
         target: &Target,
     ) {
-        self.write_uniforms(queue, camera, sun, 0, CENTRE);
-        self.dispatch(device, profiler, encoder, "primary", &self.primary, target);
+        self.write_uniforms(queue, camera, sun, 0, CENTRE, 0);
+        self.dispatch_primary(device, profiler, encoder, target);
     }
 
     /// Records a frame of primary visibility from `camera`, lit by `sun`: the primary pass, one ray
@@ -805,15 +848,15 @@ impl Tracer {
         let frame = self
             .history
             .begin(target.resolution(), camera, self.debug_view);
-        self.write_uniforms(queue, camera, sun, 0, frame.jitter());
-        self.dispatch(device, profiler, encoder, "primary", &self.primary, target);
+        self.write_uniforms(queue, camera, sun, 0, frame.jitter(), 0);
+        self.dispatch_primary(device, profiler, encoder, target);
         self.upscale
             .encode(device, queue, profiler, encoder, &frame, target);
     }
 
-    /// Records one more sample of the reference path tracer for every pixel of the lit image of
-    /// `target`, added to the running mean there. If the camera, the sun or the size of `target`
-    /// differs from the last call, the mean starts over.
+    /// Records one more sample of the reference path tracer for every pixel of the reference image
+    /// of `target`, added to the running mean there. If the camera, the sun or the size of
+    /// `target` differs from the last call, the mean starts over.
     ///
     /// The uniforms are written when this is called, so each sample must be submitted before the
     /// next is encoded. The pass is timed by `profiler`.
@@ -828,17 +871,95 @@ impl Tracer {
         sun: &Sun,
         target: &Target,
     ) {
+        self.encode_reference_batch(device, queue, profiler, encoder, camera, sun, target, 1);
+    }
+
+    /// Records `samples` more samples of the reference path tracer in **one dispatch**, for every
+    /// pixel of the reference image of `target`: each pixel takes them one after the other and
+    /// adds them to the running mean, which is written once. The accumulation is what the same
+    /// number of single samples ([`Tracer::encode_reference`]) would have made, bit for bit.
+    /// Returns the samples taken: `samples`, but at least 1 and at most
+    /// [`max_samples`] of the image, the hard cap that keeps one dispatch far under the driver's
+    /// timeout.
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_reference_batch(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        profiler: &mut Profiler,
+        encoder: &mut wgpu::CommandEncoder,
+        camera: &Camera,
+        sun: &Sun,
+        target: &Target,
+        samples: u32,
+    ) -> u32 {
+        let samples = batch_of(samples, target.reference_size);
         let view = View::new(camera, sun, target);
-        let sample_index = self.accumulator.begin_sample(&view);
-        self.write_uniforms(queue, camera, sun, sample_index, CENTRE);
+        let first = self.accumulator.begin_batch(&view, samples);
+        self.write_uniforms(queue, camera, sun, first, CENTRE, samples);
         self.dispatch(
             device,
             profiler,
             encoder,
             "reference",
             &self.reference,
+            target.reference_size,
+            &target.reference.view,
             target,
         );
+        samples
+    }
+
+    /// Records a frame of a window: the still-frame policy of ADR 0005 (see [`Still`]).
+    ///
+    /// With `reference` false (Primary mode) it is primary visibility, upscaled. With it true, the
+    /// frame is primary visibility too until the view has been still for
+    /// [`STILL_FRAMES`](crate::still::STILL_FRAMES) frames, and then a batch of the Reference view,
+    /// as many samples in one dispatch as fit the budget ([`crate::batch`]), with the Reference
+    /// view starting from sample 0. Any change of the camera, the sun, the size of the image or
+    /// the Planet (an Edit, bricks arriving) cuts to primary visibility the same frame.
+    ///
+    /// `now` is the time on any clock that does not run backwards, for the fade. Returns what was
+    /// drawn, for the pass that copies the images to the window to mix them by `fade`.
+    ///
+    /// The uniforms are written when this is called, so each frame must be submitted before the
+    /// next is encoded. The Reference pass is timed by `profiler`, and what the timers say of
+    /// earlier frames' batches is taken in here.
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_frame(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        profiler: &mut Profiler,
+        encoder: &mut wgpu::CommandEncoder,
+        camera: &Camera,
+        sun: &Sun,
+        target: &Target,
+        reference: bool,
+        now: std::time::Duration,
+    ) -> Plan {
+        for (tag, ms) in profiler.take_tagged("reference") {
+            self.still.timed(tag, ms);
+        }
+        let key = (View::new(camera, sun, target), self.scene_epoch);
+        let plan = self
+            .still
+            .plan(&key, reference, now, pixels(target.reference_size));
+        match plan {
+            Plan::Primary => {
+                self.encode_upscaled(device, queue, profiler, encoder, camera, sun, target);
+                // Whatever the Reference view had is of a view that has gone: it starts again
+                // from sample 0 when the view is next still, not from where it was.
+                self.accumulator.reset();
+            }
+            Plan::Reference { samples, .. } => {
+                profiler.tag_frame(self.still.tag());
+                self.encode_reference_batch(
+                    device, queue, profiler, encoder, camera, sun, target, samples,
+                );
+            }
+        }
+        plan
     }
 
     /// Brings the GPU copy of the Planet up to date with `scene`, which `update` describes the
@@ -851,7 +972,7 @@ impl Tracer {
         scene: &Scene,
         update: &SceneUpdate,
     ) -> Result<()> {
-        self.accumulator.reset();
+        self.restart_reference();
         // Counted where each write is made, not summed from the patch's cost: [`upload_cost`] is
         // the other count, and the two are compared. Both go over `RingPatch::copies()`, so the
         // comparison does not check that list (the stepped tests' `GpuCopy::assert_is` does).
@@ -1017,7 +1138,7 @@ impl Tracer {
     /// Starts the reference image and the upscaler's history over, for what the `View` cannot see:
     /// a new `Target`, whose buffer and history are empty whatever the count says.
     pub fn reset_accumulation(&mut self) {
-        self.accumulator.reset();
+        self.restart_reference();
         self.history.reset();
     }
 
@@ -1036,7 +1157,7 @@ impl Tracer {
     /// gives an independent one of the same expected value.
     pub fn set_seed(&mut self, seed: u32) {
         self.seed = seed;
-        self.accumulator.reset();
+        self.restart_reference();
     }
 
     /// Builds the reference pipeline with `options` (see [`ReferenceOptions`]) and starts its
@@ -1051,7 +1172,15 @@ impl Tracer {
             &self.scene_layout,
             &options.constants(),
         );
+        self.restart_reference();
+    }
+
+    /// Starts the reference image over for something that changed what it is of that the `View`
+    /// cannot see (the Planet, the seed, the pipeline), and counts it for the still-frame policy:
+    /// the view is not Still until it has been unchanged again.
+    fn restart_reference(&mut self) {
         self.accumulator.reset();
+        self.scene_epoch += 1;
     }
 
     /// Samples in the reference image so far.
@@ -1066,6 +1195,7 @@ impl Tracer {
         sun: &Sun,
         sample_index: u32,
         jitter: [f32; 2],
+        batch: u32,
     ) {
         queue.write_buffer(
             &self.camera_buffer,
@@ -1074,13 +1204,35 @@ impl Tracer {
         );
         let frame = FrameUniform {
             sun: sun.uniform(),
-            params: [sample_index, self.seed, self.debug_view.index(), 0],
+            params: [sample_index, self.seed, self.debug_view.index(), batch],
             jitter: [jitter[0], jitter[1], 0.0, 0.0],
         };
         queue.write_buffer(&self.frame_buffer, 0, bytemuck::bytes_of(&frame));
     }
 
-    /// Runs `pipeline` over every pixel of the lit image of `target`, at the internal resolution.
+    /// Primary visibility over every pixel of the lit image of `target`, at the internal
+    /// resolution.
+    fn dispatch_primary(
+        &self,
+        device: &wgpu::Device,
+        profiler: &mut Profiler,
+        encoder: &mut wgpu::CommandEncoder,
+        target: &Target,
+    ) {
+        self.dispatch(
+            device,
+            profiler,
+            encoder,
+            "primary",
+            &self.primary,
+            target.resolution.internal,
+            &target.lit.view,
+            target,
+        );
+    }
+
+    /// Runs `pipeline` over every pixel of an image `size` big, drawing to `image`.
+    #[allow(clippy::too_many_arguments)]
     fn dispatch(
         &self,
         device: &wgpu::Device,
@@ -1088,9 +1240,10 @@ impl Tracer {
         encoder: &mut wgpu::CommandEncoder,
         name: &str,
         pipeline: &wgpu::ComputePipeline,
+        (width, height): (u32, u32),
+        image: &wgpu::TextureView,
         target: &Target,
     ) {
-        let (width, height) = target.resolution.internal;
         let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("camera, image, accumulation, materials and G-buffer"),
             layout: &self.camera_layout,
@@ -1101,7 +1254,7 @@ impl Tracer {
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: wgpu::BindingResource::TextureView(&target.lit.view),
+                    resource: wgpu::BindingResource::TextureView(image),
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
@@ -1219,5 +1372,59 @@ impl Tracer {
                 })
             })
             .collect()
+    }
+}
+
+/// The pixels in an image of `size`.
+fn pixels(size: (u32, u32)) -> u64 {
+    u64::from(size.0) * u64::from(size.1)
+}
+
+/// The samples one dispatch takes when `samples` are asked for on an image of `size`: at least 1,
+/// and at most [`max_samples`] of the size, the cap that keeps a dispatch's work bounded.
+fn batch_of(samples: u32, size: (u32, u32)) -> u32 {
+    samples.clamp(1, max_samples(pixels(size)))
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn a_batch_is_clamped_by_the_size_of_the_image_it_is_of() {
+        use crate::batch::MAX_BATCH_SAMPLES;
+        assert_eq!(batch_of(0, (2560, 1440)), 1);
+        assert_eq!(batch_of(100, (2560, 1440)), MAX_BATCH_SAMPLES);
+        assert_eq!(batch_of(100, (1280, 720)), MAX_BATCH_SAMPLES);
+        assert_eq!(batch_of(100, (3840, 2160)), 7, "4K");
+        assert_eq!(batch_of(5, (3840, 2160)), 5);
+        assert_eq!(batch_of(100, (7680, 4320)), 1, "8K");
+        assert_eq!(pixels((3840, 2160)), 8_294_400);
+    }
+
+    use super::*;
+    use crate::{request_gpu, shared_instance};
+
+    /// The size of the window is part of the view that the Reference view is of (#189): a window
+    /// that is resized is a change, and cuts to Primary. Needs a Vulkan device.
+    #[test]
+    fn the_size_of_the_window_is_part_of_the_view() {
+        let (_, device, _) = request_gpu(shared_instance(), None, false).unwrap();
+        let (camera, sun) = (
+            Camera::looking_at([0.0, 5.0, 0.0], [0.0; 3]),
+            Sun::default(),
+        );
+        let at = |size: (u32, u32), scale: f32| {
+            let target = Target::with_full_reference(&device, Resolution::scaled(size, scale));
+            View::new(&camera, &sun, &target)
+        };
+        assert_eq!(at((64, 36), 0.5), at((64, 36), 0.5));
+        assert_ne!(at((64, 36), 0.5), at((96, 54), 0.5), "the window's size");
+        // The Reference view is traced at the window's size, so Primary's scale is not in it.
+        assert_eq!(at((64, 36), 0.5), at((64, 36), 1.0));
+        let moved = Camera::looking_at([1.0, 5.0, 0.0], [0.0; 3]);
+        let target = Target::with_full_reference(&device, Resolution::native(64, 36));
+        assert_ne!(
+            View::new(&camera, &sun, &target),
+            View::new(&moved, &sun, &target)
+        );
     }
 }
