@@ -57,7 +57,10 @@ use super::stream::StreamReport;
 /// 18 added the frame's pacing to the real-time report (#167): each slow frame has `before_ms`,
 /// `sleep_asked_ms`, `sleep_over_ms` and `cycle_ms`, and each path `frame_cycle` and
 /// `sleep_overshoot`, so that a 30 ms frame says whether the frame thread woke late (the
-/// harness's) or did the work. Nothing else is changed.
+/// harness's) or did the work. A slow frame also says how much of `before_ms` was the harness's own
+/// look at a stop (`harness_ms`) and how much of `after_ms` was the store's lock
+/// (`after_lock_ms`), and each path has `slowest_cycles`, its frames with the longest turn.
+/// Nothing else is changed.
 pub const SCHEMA_VERSION: u32 = 18;
 
 /// One timed thing (a pass, or the GPU total of a profiler frame) in one mode, against its

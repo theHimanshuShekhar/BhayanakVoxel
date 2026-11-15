@@ -458,9 +458,13 @@ pub struct SlowFrame {
     /// submit. Null with `gpu_total_ms`.
     pub wait_not_passes_ms: Option<f64>,
     pub other_ms: f64,
-    /// The frame's look at the memory after its time was taken: the store's lock. Not in
-    /// `time_ms`.
+    /// The frame's look at the memory after its time was taken: the store's lock, and the read of
+    /// the process's resident memory. Not in `time_ms`. `after_lock_ms` is what of it was the wait
+    /// for the store's read lock (taken every sixth frame); the rest is the harness's own read of
+    /// the resident memory (every thirtieth) and its bookkeeping, which a player's frame does not
+    /// do.
     pub after_ms: f64,
+    pub after_lock_ms: f64,
     /// The frame's pacing, which `time_ms` leaves out (#167): the milliseconds from the end of the
     /// frame before (its pacing sleep done) to this frame's start (`before_ms`: working out the
     /// camera and the harness's own bookkeeping), the sleep this frame asked for to fill the
@@ -475,6 +479,11 @@ pub struct SlowFrame {
     pub sleep_asked_ms: f64,
     pub sleep_over_ms: f64,
     pub cycle_ms: f64,
+    /// Of `before_ms`, what the harness itself did between the frames: the look it makes at the
+    /// stop of a flight (`Session::look`), which waits for the scene thread to finish a round and
+    /// copies what that made to the GPU. A player's frame does not do it. The rest of `before_ms`
+    /// is working out the camera (`camera_ms`) and the microseconds of the loop.
+    pub harness_ms: f64,
     /// What the update copied: `none`, `patch` (the words it lists) or `rebuild` (new buffers, all
     /// of the scene written), the bytes in all (header and tables included) and those of a patch's
     /// words.
@@ -587,6 +596,12 @@ pub struct PathReport {
     /// [`SlowFrame::sleep_over_ms`].
     pub frame_cycle: Spread,
     pub sleep_overshoot: Spread,
+    /// The frames with the longest turn (`before_ms` + `cycle_ms`: from the end of the frame before
+    /// to the end of this one's sleep), longest first, with their parts: where a long cycle that
+    /// `frame_time` does not show is, and which of `camera_ms`, `harness_ms`, `after_lock_ms`, the
+    /// rest of `after_ms` or the sleep it was (#167). Reported; not gated, as a cycle's length
+    /// is as much the harness's work between frames as the frame's.
+    pub slowest_cycles: Vec<SlowFrame>,
     /// Frames whose time was over the frame-time limit (the gate's: the 99th percentile is held to
     /// it, and this is how many frames there were above it), and the slowest few, worst first, with
     /// their parts. In the min and the max the i-th slowest of each run is taken with the i-th of
@@ -1125,6 +1140,9 @@ struct Capture {
     cpu_ms: Vec<f64>,
     /// The start of each frame, to work the cycles out from, and the overshoot of the sleeps.
     started: Vec<Instant>,
+    /// The cycle from the start of each frame to the next's, less what the harness did between
+    /// them (the look at a stop).
+    cycles: Vec<f64>,
     sleep_over_ms: Vec<f64>,
     soft_misses: Series,
     /// The update of each frame that had one: its time, bytes and copies.
@@ -1146,6 +1164,8 @@ struct Capture {
     lengthen_ms_max: f64,
     grow_ms_max: f64,
     worst: Worst,
+    /// The frames with the longest turn.
+    longest_turns: Worst,
     /// The frames over the limit, by place, as far as the report keeps them.
     over_limit_at: Vec<usize>,
     /// The updates with the most bytes.
@@ -1171,6 +1191,7 @@ impl Capture {
             lengthen_ms_max: 0.0,
             grow_ms_max: 0.0,
             worst: Worst::new(),
+            longest_turns: Worst::by(|f| f.before_ms + f.cycle_ms),
             over_limit_at: Vec::new(),
             largest: Worst::by(|f| f.upload_bytes as f64),
             lags: Vec::new(),
@@ -1180,6 +1201,7 @@ impl Capture {
             frame_ms: Vec::new(),
             cpu_ms: Vec::new(),
             started: Vec::new(),
+            cycles: Vec::new(),
             sleep_over_ms: Vec::new(),
             soft_misses: Series::default(),
             update_ms: Vec::new(),
@@ -1217,11 +1239,17 @@ impl Capture {
             ..frame.parts
         };
         self.worst.offer(slow);
+        self.longest_turns.offer(slow);
         if frame.parts.update != "none" {
             self.largest.offer(slow);
         }
         self.frame_ms.push(frame.time_ms);
         self.cpu_ms.push(frame.cpu_ms);
+        if let Some(before) = self.started.last() {
+            // The harness's own look between frames is not the frame's pacing.
+            let turn = frame.began.duration_since(*before).as_secs_f64() * 1e3;
+            self.cycles.push((turn - frame.parts.harness_ms).max(0.0));
+        }
         self.started.push(frame.began);
         if frame.parts.sleep_asked_ms > 0.0 {
             self.sleep_over_ms.push(frame.parts.sleep_over_ms);
@@ -1269,17 +1297,12 @@ impl Capture {
                 .unwrap_or_else(|| self.began.elapsed().as_secs_f64()),
             frame_time: Spread::of(&self.frame_ms),
             frame_cpu: Spread::of(&self.cpu_ms),
-            frame_cycle: Spread::of(
-                &self
-                    .started
-                    .windows(2)
-                    .map(|pair| (pair[1] - pair[0]).as_secs_f64() * 1e3)
-                    .collect::<Vec<_>>(),
-            ),
+            frame_cycle: Spread::of(&self.cycles),
             sleep_overshoot: Spread::of(&self.sleep_over_ms),
             frames_over_limit: self.over_limit,
             frames_over_limit_by_update: self.over_by_update,
             slowest: self.worst.sorted(),
+            slowest_cycles: self.longest_turns.sorted(),
             over_limit_at: self.over_limit_at,
             largest_updates: self.largest.sorted(),
             scene_lag_voxels_max: lag_max,
@@ -1385,6 +1408,8 @@ struct Session<'a> {
     limit_ms: f64,
     /// How long working out the camera of the next frame took (a flight reads the store).
     camera_wait: Duration,
+    /// What the harness did between frames (a look), which the next frame says.
+    harness_wait: Duration,
     /// When the frame before ended, its sleep done (none before the first).
     last_ended: Option<Instant>,
 }
@@ -1412,6 +1437,7 @@ impl<'a> Session<'a> {
             gpu,
             limit_ms,
             camera_wait: Duration::ZERO,
+            harness_wait: Duration::ZERO,
             last_ended: None,
             step: "starting".to_string(),
             work_before,
@@ -1431,6 +1457,7 @@ impl<'a> Session<'a> {
     /// game's is, if `lead`), what the scene thread made is taken, copied to the GPU and drawn.
     fn frame(&mut self, camera: &Camera, lead: bool) -> Result<Frame, Box<dyn Error>> {
         let camera_wait = std::mem::take(&mut self.camera_wait);
+        let harness_wait = std::mem::take(&mut self.harness_wait);
         let began = Instant::now();
         let before = self
             .last_ended
@@ -1452,7 +1479,7 @@ impl<'a> Session<'a> {
             .frame(camera, self.world.scene(), update.as_ref())?;
         let looking = looking || self.world.looking_for_holes();
         let time = began.elapsed();
-        self.look_at_memory();
+        let lock_wait = self.look_at_memory();
         let after = began.elapsed() - time;
         let (kind, upload_bytes, patch_bytes) = uploaded(self.world.scene(), update.as_ref());
         self.scene_host_peak_bytes = host_growth_peak(
@@ -1492,6 +1519,8 @@ impl<'a> Session<'a> {
                 .map(|t| ms(gpu.wait) - t),
             other_ms: ms(time.saturating_sub(followed + gpu.cpu() + gpu.wait)),
             after_ms: ms(after),
+            after_lock_ms: ms(lock_wait),
+            harness_ms: ms(harness_wait),
             before_ms: ms(before),
             sleep_asked_ms: 0.0,
             sleep_over_ms: 0.0,
@@ -1529,16 +1558,23 @@ impl<'a> Session<'a> {
         })
     }
 
-    fn look_at_memory(&mut self) {
+    /// Looks at the memory, and returns how long the store's read lock took to get (zero in a frame
+    /// that did not take it).
+    fn look_at_memory(&mut self) -> Duration {
+        let mut lock_wait = Duration::ZERO;
         self.scene_used_peak_bytes = self.scene_used_peak_bytes.max(self.world.used_bytes());
         self.scene_reserved_bytes = self.scene_reserved_bytes.max(self.world.reserved_bytes());
         self.frames += 1;
         if self.frames.is_multiple_of(STORE_EVERY) {
-            self.store_peak = self.store_peak.max(self.world.store().streamed_len());
+            let asked = Instant::now();
+            let store = self.world.store();
+            lock_wait = asked.elapsed();
+            self.store_peak = self.store_peak.max(store.streamed_len());
         }
         if self.frames.is_multiple_of(RESIDENT_EVERY) {
             self.look_at_resident_memory();
         }
+        lock_wait
     }
 
     fn look_at_resident_memory(&mut self) {
@@ -1612,6 +1648,9 @@ impl<'a> Session<'a> {
     ) -> Result<(ColdStart, PathReport), Box<dyn Error>> {
         self.step = "cold start".to_string();
         let began = Instant::now();
+        // A path's first frame follows the end look of the path before (about 0.3 s at full size),
+        // which is not a wait for a wake-up: its `before_ms` is 0.
+        self.last_ended = None;
         let mut capture = Capture::start("cold start", &self.world, self.limit_ms);
         let mut control = None;
         while !self.idle() || control.is_none() {
@@ -1647,6 +1686,9 @@ impl<'a> Session<'a> {
         mut at: impl FnMut(&World, f64) -> Camera,
     ) -> Result<PathReport, Box<dyn Error>> {
         self.step = name.to_string();
+        // A path's first frame follows the end look of the path before (about 0.3 s at full size),
+        // which is not a wait for a wake-up: its `before_ms` is 0.
+        self.last_ended = None;
         let mut capture = Capture::start(name, &self.world, self.limit_ms);
         let began = Instant::now();
         let camera = loop {
@@ -1680,6 +1722,9 @@ impl<'a> Session<'a> {
         script: &Script,
     ) -> Result<PathReport, Box<dyn Error>> {
         self.step = "stop after a flight".to_string();
+        // A path's first frame follows the end look of the path before (about 0.3 s at full size),
+        // which is not a wait for a wake-up: its `before_ms` is 0.
+        self.last_ended = None;
         let mut capture = Capture::start("stop after a flight", &self.world, self.limit_ms);
         let began = Instant::now();
         let camera = loop {
@@ -1693,7 +1738,11 @@ impl<'a> Session<'a> {
             }
         };
         let stopped = Instant::now();
+        // The harness's own look at the stop: a wait for the scene thread to count, and a copy of
+        // what that made to the GPU. It sits between two frames, and the next one says so
+        // (`harness_ms`), so it is not taken for a slow frame cycle.
         self.look(&camera, false)?;
+        self.harness_wait = stopped.elapsed();
         let settle = loop {
             let frame = self.frame(&camera, true)?;
             capture.add(&frame);
@@ -2024,6 +2073,7 @@ mod tests {
             frames_over_limit: 0,
             frames_over_limit_by_update: UpdateKinds::default(),
             slowest: vec![slow_frame(0, frame_p99 * 2.0)],
+            slowest_cycles: Vec::new(),
             over_limit_at: Vec::new(),
             largest_updates: Vec::new(),
             scene_lag_voxels_max: 0.0,
@@ -2065,6 +2115,8 @@ mod tests {
             wait_not_passes_ms: Some(time_ms - 1.8 - 1.6),
             other_ms: 0.0,
             after_ms: 0.0,
+            after_lock_ms: 0.0,
+            harness_ms: 0.0,
             before_ms: 0.1,
             sleep_asked_ms: 0.0,
             sleep_over_ms: 0.0,
@@ -2477,6 +2529,7 @@ mod tests {
                 "settle",
                 "sleep_overshoot",
                 "slowest",
+                "slowest_cycles",
                 "soft_misses",
                 "soft_misses_per_frame",
                 "upload"
@@ -2504,6 +2557,7 @@ mod tests {
         assert_eq!(
             keys(&json["runs"][0]["paths"][0]["slowest"][0]),
             [
+                "after_lock_ms",
                 "after_ms",
                 "at_ms",
                 "before_ms",
@@ -2516,6 +2570,7 @@ mod tests {
                 "gpu_upscale_ms",
                 "grow_ms",
                 "grown_bytes",
+                "harness_ms",
                 "hole_look",
                 "index",
                 "lengthen_ms",
@@ -2958,8 +3013,9 @@ mod tests {
     }
 
     /// The real-time mode on the test Planet, with real workers and a real scene thread and no GPU:
-    /// every path runs and the report has its fields. It asserts no time, only what was run: how long
-    /// anything took is not for a test to hold. It is in `.github/real-thread-tests.txt`, and does
+    /// every path runs and the report has its fields. It asserts no time bound, only what was run and
+    /// that the parts of a frame's cycle are inside it: how long anything took is not for a test
+    /// to hold. It is in `.github/real-thread-tests.txt`, and does
     /// not gate.
     #[test]
     fn the_real_time_run_on_the_test_planet_completes_with_every_path_and_field() {
@@ -2996,16 +3052,38 @@ mod tests {
             assert!(path.sleep_overshoot.samples <= path.frames);
             assert!(path.sleep_overshoot.worst_ms >= 0.0);
             for frame in &path.slowest {
-                // A frame's cycle is its time, the sleep it asked for and the sleep's overshoot
-                // (to a few microseconds of the harness's own work between them).
+                // A frame's cycle is at least its time, the look at the memory after it, the
+                // sleep it asked for and the sleep's overshoot, which are all inside it (it is
+                // more by the microseconds of the harness's own work between them: no upper
+                // bound is asserted, as how long anything took is not for a test to hold).
                 assert!(
                     frame.cycle_ms + 0.05
-                        >= frame.time_ms + frame.sleep_asked_ms + frame.sleep_over_ms
-                        && frame.cycle_ms
-                            <= frame.time_ms + frame.sleep_asked_ms + frame.sleep_over_ms + 2.0,
+                        >= frame.time_ms
+                            + frame.after_ms
+                            + frame.sleep_asked_ms
+                            + frame.sleep_over_ms,
                     "{}: {frame:?}",
                     path.name
                 );
+            }
+            // The longest turns are kept, longest first, and the parts of a turn are inside it: the
+            // lock is inside the look at the memory, the harness's look inside `before_ms`.
+            assert!(!path.slowest_cycles.is_empty(), "{}", path.name);
+            let turn = |f: &SlowFrame| f.before_ms + f.cycle_ms;
+            assert!(
+                path.slowest_cycles
+                    .windows(2)
+                    .all(|pair| turn(&pair[0]) >= turn(&pair[1])),
+                "{}",
+                path.name
+            );
+            for frame in path.slowest.iter().chain(&path.slowest_cycles) {
+                assert!(frame.after_lock_ms <= frame.after_ms + 0.05, "{frame:?}");
+                assert!(frame.harness_ms <= frame.before_ms + 0.05, "{frame:?}");
+                // Only the stop of a flight has a look between its frames.
+                if path.name != "stop after a flight" {
+                    assert_eq!(frame.harness_ms, 0.0, "{}", path.name);
+                }
             }
             assert_eq!(path.soft_misses.frames, path.frames);
             // Every path has a look at the holes: one is forced at its end.
