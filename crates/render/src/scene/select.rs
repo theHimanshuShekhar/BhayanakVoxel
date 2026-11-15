@@ -1007,11 +1007,15 @@ impl Selection {
     }
 
     /// Makes room for `nodes` nodes in the tree, `waiting` bricks waiting and `stuck` bricks
-    /// stuck, so that the tables do not double in the middle of a frame.
+    /// stuck (in all, with those it holds already), so that the tables do not double in the middle of a frame.
     pub fn reserve(&mut self, nodes: usize, waiting: usize, stuck: usize) {
-        self.nodes.reserve(nodes);
-        self.waiting.reserve(waiting);
-        self.stuck.reserve(stuck);
+        // Room for that many **in all**: `HashMap::reserve` is for that many *more*, which on a
+        // table that holds entries already (the selection a rebuild has just made) asks for room
+        // for the entries and the reservation both, and doubles the table.
+        self.nodes.reserve(nodes.saturating_sub(self.nodes.len()));
+        self.waiting
+            .reserve(waiting.saturating_sub(self.waiting.len()));
+        self.stuck.reserve(stuck.saturating_sub(self.stuck.len()));
     }
 
     /// The size of every table that [`Selection::reserve`] makes room in.
@@ -1811,6 +1815,28 @@ mod tests {
     }
 
     const D0: f64 = 32.0;
+
+    /// `reserve` is room for that many in all, not that many more (#167): reserving what the
+    /// table's room already is, on a selection that holds nodes, makes no new room (`HashMap::reserve`
+    /// would have asked for the nodes it holds and that many more, and doubled the table).
+    #[test]
+    fn reserving_room_on_a_selection_that_holds_nodes_is_for_that_many_in_all() {
+        let store = flat(8, 4);
+        let mut selection = select(&store, [0.0, 4.0, 0.0], D0);
+        let held = selection.nodes.len();
+        assert!(held > 100, "{held} nodes");
+        selection.reserve(held * 3, held, held);
+        let room = selection.nodes.capacity();
+        assert!(room >= held * 3);
+        // The same reservation again, and the room the table has: no growth.
+        selection.reserve(held * 3, held, held);
+        assert_eq!(selection.nodes.capacity(), room);
+        selection.reserve(room, 0, 0);
+        assert_eq!(selection.nodes.capacity(), room);
+        // More than it has is more room.
+        selection.reserve(room + 1, 0, 0);
+        assert!(selection.nodes.capacity() > room);
+    }
 
     fn select(store: &BrickStore, camera: [f64; 3], d0: f64) -> Selection {
         let top = top_level(store);

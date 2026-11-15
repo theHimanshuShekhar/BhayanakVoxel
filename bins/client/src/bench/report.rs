@@ -60,7 +60,17 @@ use super::stream::StreamReport;
 /// samples the run had at 0.1, 0.25, 0.5, 1 and 2 s and the FLIP of the image at each, and the time
 /// from the stop to the FLIP lines. `convergence/VIEW/` also has `still-NNNNms.png`. Nothing
 /// else is changed: the single-sample curve, the truths and every timed pass are as they were.
-pub const SCHEMA_VERSION: u32 = 18;
+///
+/// 19 added the frame's pacing to the real-time report (#167): each slow frame has `before_ms`,
+/// `sleep_asked_ms`, `sleep_over_ms` and `cycle_ms`, and each path `frame_cycle` and
+/// `sleep_overshoot`, so that a 30 ms frame says whether the frame thread woke late (the
+/// harness's) or did the work. A slow frame also says how much of `before_ms` was the harness's own
+/// look at a stop (`harness_ms`) and how much of `after_ms` was the store's lock
+/// (`after_lock_ms`), and `between_ms` is the harness's work between the look at the memory and the
+/// sleep, so that `time_ms`, `after_ms`, `between_ms`, `sleep_asked_ms` and `sleep_over_ms` add up
+/// to `cycle_ms`. Each path has `slowest_cycles`, its frames with the longest turn.
+/// Nothing else is changed.
+pub const SCHEMA_VERSION: u32 = 19;
 
 /// One timed thing (a pass, or the GPU total of a profiler frame) in one mode, against its
 /// budget. In reference mode a profiler frame is one sample, so the entries of that mode have
@@ -557,7 +567,7 @@ mod tests {
                 "streaming_real_time"
             ]
         );
-        assert_eq!(json["schema_version"], 18);
+        assert_eq!(json["schema_version"], 19);
         assert_eq!(json["convergence"], serde_json::Value::Null);
         assert_eq!(json["streaming"], serde_json::Value::Null);
         assert_eq!(json["streaming_real_time"], serde_json::Value::Null);

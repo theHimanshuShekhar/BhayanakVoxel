@@ -48,6 +48,13 @@ const RING: i32 = 160;
 /// The bands' `d0`, in Voxels. A small one makes a fill of a few hundred frames; the sizing
 /// constants are per `d0` squared, so they carry over to the game's.
 const D0: f64 = 64.0;
+/// Where the test Planet's Guard begins: the real Guard's first level less 3, since the test Planet
+/// is an eighth of the radius (`TEST_RADIUS`) and each level up has a quarter of the bricks. That is
+/// level 10: 0.64 million bricks, 55 MiB and 4.5 s on the 8-core dev box (#167), against the real
+/// Guard's 0.27 million, 45 MiB and 4 s (the test Planet's ground is as rough as the real one's, so
+/// it holds more bricks a level). The levels below it are the Ring's, as the real Planet's levels
+/// below 13 are, which is what the sizing constants are measured on.
+const TEST_GUARD_FIRST: usize = GUARD_FIRST - 3;
 /// A frame at 60 a second.
 const FRAME: Duration = Duration::from_micros(16_667);
 /// The most frames the fill takes before it is said not to fill.
@@ -751,7 +758,7 @@ pub(super) fn test_planet() -> TestPlanet {
     let planet = Planet::new(WorldMap::with_radius(crate::SEED, MAP_SIZE, TEST_RADIUS));
     let ground = planet.spawn(100);
     let mut store = planet.crust_around(ground, RING, LEVELS - 1);
-    hold_guard(&mut store, &planet, GUARD_FIRST);
+    hold_guard(&mut store, &planet, TEST_GUARD_FIRST);
     let spawn = crate::spawn_camera(ground);
     let bands = Bands::with_d0(D0);
     let mut scene = Scene::rings(
@@ -1037,7 +1044,7 @@ pub(super) fn percentile_99(values: &[u64]) -> u64 {
 
 /// The sizes that the constants are for, as the resident set of `world` is complete, which `start`
 /// was the spawn of and `streamed` the store's size then. The constants are per `d0` squared, so
-/// what does not scale with it is left out: the Guard's levels (from `GUARD_FIRST`, which hold what
+/// what does not scale with it is left out: the Guard's levels (from `TEST_GUARD_FIRST`, which hold what
 /// they hold whatever `d0` is), whose bricks and words are counted exactly and apart; and the store
 /// as it was at the spawn (see [`Start`]). The world's stats must be exact (words by level, see
 /// `World::count_exactly` and `World::count_once_exactly`).
@@ -1054,9 +1061,9 @@ pub(super) fn measure_sizes(
 ) -> Result<Measured, Box<dyn Error>> {
     let d0_squared = d0 * d0;
     let stats = world.stats();
-    let (ring, guard) = stats.level_bricks.split_at(GUARD_FIRST);
+    let (ring, guard) = stats.level_bricks.split_at(TEST_GUARD_FIRST);
     let (ring, guard) = (ring.iter().sum::<usize>(), guard.iter().sum::<usize>());
-    let (ring_words, guard_words) = stats.slow.words_by_level.split_at(GUARD_FIRST);
+    let (ring_words, guard_words) = stats.slow.words_by_level.split_at(TEST_GUARD_FIRST);
     let sum = |levels: &[(usize, usize)]| {
         levels
             .iter()

@@ -20,7 +20,7 @@ use planet_gen::planet::{Planet, tangents};
 use planet_gen::world_map::WorldMap;
 use render::lod::{Bands, LEVELS};
 use render::reference::{Ray, trace};
-use render::scene::{Bound, REGION_WORDS};
+use render::scene::{Bound, REGION_WORDS, Rebuild};
 use render::{Camera, Mode, RingsFull, Scene, SceneUpdate, camera};
 use sim::Predictor;
 
@@ -30,8 +30,10 @@ use crate::world::{STILL_FRAMES, SceneWork, Stillness, World, loading_paused_for
 const SEED: u64 = 0xB4A7_A9AC;
 const RING: i32 = 160;
 const D0: f64 = 64.0;
-/// Two levels above the real Guard's, so that a test's Guard is quick to make.
-const GUARD_FIRST: usize = crate::loader::GUARD_FIRST + 2;
+/// Two levels below the real Guard's (the test Planet is an eighth of the radius: level 11 holds a
+/// quarter of a million bricks here, as level 13 does at 320 km; the Guard was at level 11 before
+/// #167 raised the real one from 9 to 13, and the tests' sizes and budgets are made for it).
+const GUARD_FIRST: usize = crate::loader::GUARD_FIRST - 2;
 
 fn planet() -> &'static Planet {
     static PLANET: OnceLock<Planet> = OnceLock::new();
@@ -566,8 +568,8 @@ struct Tables {
     peak: HashMap<String, usize>,
     /// `(frame, table, was, is)` for each growth.
     grown: Vec<(usize, String, usize, usize)>,
-    /// The frames in which the scene was rebuilt.
-    rebuilt: Vec<usize>,
+    /// The frames in which the scene was rebuilt, and why.
+    rebuilt: Vec<(usize, Option<Rebuild>)>,
     frames: usize,
 }
 
@@ -598,7 +600,8 @@ impl Tables {
         }
         if rebuilt {
             // The scene made its tables again: they are the ones to compare with from now on.
-            self.rebuilt.push(self.frames);
+            self.rebuilt
+                .push((self.frames, world.scene().rebuild_reason()));
             self.highest_room = sizes;
         } else {
             self.highest_room = crate::growth::raised(&self.highest_room, sizes);
@@ -623,6 +626,24 @@ impl Tables {
                 room
             );
         }
+    }
+
+    /// Fails if a table grew since the first frame, or the scene was rebuilt for any reason but a
+    /// jump of the camera (a step that is over `JUMP` is one, and makes its tables again: what is
+    /// shown for a scene after it is not that a scene that is patched all the way does not grow).
+    fn assert_only_jumps_rebuilt(&self) {
+        assert!(
+            self.grown.is_empty(),
+            "tables grew in the middle of a frame, so their reservations are too small: {:?}",
+            self.grown
+        );
+        assert!(
+            self.rebuilt
+                .iter()
+                .all(|(_, why)| *why == Some(Rebuild::Jump)),
+            "the scene was rebuilt but not for a jump: {:?}",
+            self.rebuilt
+        );
     }
 
     /// Fails if a table grew or the scene was rebuilt since the first frame.
@@ -1022,6 +1043,21 @@ fn the_full_size_planet_streams_in_and_walking_over_it_does_not_stall() {
         tables.grown
     );
     HELD_FLIGHT.assert("the flight", &fly_work, &fly_updates);
+    // A look for holes at the end of the flight (#167): the scene thread's scan of every split
+    // brick, which the soft misses do not count. The scan only runs, and counts, with the hole
+    // count on (`measure_scene_thread`), so it is turned on for this one look and the look's own
+    // counts are what is asserted.
+    world.measure_scene_thread();
+    let before = world.stats().work;
+    world.look_now(true).unwrap();
+    let after = world.stats().work;
+    let (scans, holes) = (
+        after.hole_scans - before.hole_scans,
+        after.holes_found - before.holes_found,
+    );
+    eprintln!("holes after the 5 km flight: {holes} in {scans} scans");
+    assert!(scans >= 1, "no look for holes was made after the flight");
+    assert_eq!(holes, 0, "holes after the flight");
     // The host store stays within its budget and the overflow (#141): with the flight asking for
     // far more than the loader makes, the most it counted at the end of any frame is bounded by
     // the limit, not growing with the distance; and the scene, which the bands bound, does not
@@ -2460,7 +2496,7 @@ fn soft_misses_on_the_flight_take_off_and_standing_paths() {
     world.set_lead(prefetch);
     let spawn = loaded.camera;
     let began = Instant::now();
-    wait_idle(&mut world, spawn.position, Duration::from_secs(5400));
+    wait_idle(&mut world, spawn.position, Duration::from_secs(5400), None);
     // Counted from here: looking at every brick that waits slows a fill down.
     world.count_soft_misses();
     eprintln!("filled after {:.0?}", began.elapsed());
@@ -2484,17 +2520,17 @@ fn soft_misses_on_the_flight_take_off_and_standing_paths() {
         along(w, ahead, 50.0 * t, 0.0)
     }));
     eprintln!("{}", memory(&world, "after the flight at 2 m"));
-    wait_idle(&mut world, spawn.position, Duration::from_secs(1200));
+    wait_idle(&mut world, spawn.position, Duration::from_secs(1200), None);
     all.push(run_path(&mut world, "flight at 50 m", 10.0, |w, t| {
         along(w, right, 50.0 * t, 48.0 * VOXELS_PER_METRE)
     }));
     eprintln!("{}", memory(&world, "after the flight at 50 m"));
-    wait_idle(&mut world, spawn.position, Duration::from_secs(1200));
+    wait_idle(&mut world, spawn.position, Duration::from_secs(1200), None);
     all.push(run_path(&mut world, "vertical take-off", 6.0, |_, t| {
         std::array::from_fn(|a| spawn.position[a] + up[a] * speed * t)
     }));
     eprintln!("{}", memory(&world, "after the take-off"));
-    wait_idle(&mut world, spawn.position, Duration::from_secs(1200));
+    wait_idle(&mut world, spawn.position, Duration::from_secs(1200), None);
     all.push(run_path(&mut world, "standing still", 2.0, |_, _| {
         spawn.position
     }));
@@ -2509,7 +2545,7 @@ fn soft_misses_on_the_flight_take_off_and_standing_paths() {
 }
 
 /// #146, in the real client at full size: what is drawn and held with the camera still at 2 m,
-/// 50 m, 500 m and 5 km over the spawn, each with the loader's work done (the camera is put there,
+/// 50 m, 500 m, 2 km and 5 km over the spawn (#167 added 2 km, the holes, the rays and the table check), each with the loader's work done (the camera is put there,
 /// and the scene follows it). Per height it prints the bricks drawn and the scene's MiB, the bricks
 /// the store counts and holds, and the process's size. With the horizon cap the drawn scene is
 /// the horizon's, and without it (`FULLSIZE_HORIZON=0`) it is the whole Planet's. A few minutes at
@@ -2517,30 +2553,70 @@ fn soft_misses_on_the_flight_take_off_and_standing_paths() {
 /// `[FULLSIZE_HORIZON=0] cargo test --release -p client -- --ignored --nocapture resident_set_at`.
 #[test]
 #[ignore = "generates the full-size world map"]
-fn the_resident_set_at_2_m_50_m_500_m_and_5_km_over_the_spawn() {
+fn the_resident_set_at_2_m_50_m_500_m_2_km_and_5_km_over_the_spawn() {
     let loaded = crate::load_planet();
     let (client, _server) = loopback();
     let mut world =
         World::new(loaded.scene, Predictor::new(loaded.store), client).with_loader(loaded.loader);
     let spawn = loaded.camera;
+    // The scene thread counts the holes its looks find (and times its rounds).
+    world.measure_scene_thread();
+    // Every table, from the first frame to the 5 km height: none may grow (#167).
+    let mut tables = Tables::new(&world);
     let began = Instant::now();
-    wait_idle(&mut world, spawn.position, Duration::from_secs(5400));
+    wait_idle(
+        &mut world,
+        spawn.position,
+        Duration::from_secs(5400),
+        Some(&mut tables),
+    );
     eprintln!("filled after {:.0?}", began.elapsed());
     let up = spawn.horizon_up;
-    for metres in [2.0_f64, 50.0, 500.0, 5000.0] {
+    for metres in [2.0_f64, 50.0, 500.0, 2000.0, 5000.0] {
         // 2 m is the spawn; the others are that much higher over it.
         let camera: [f64; 3] = std::array::from_fn(|a| {
             spawn.position[a] + up[a] * (metres - 2.0).max(0.0) * VOXELS_PER_METRE
         });
         let from = Instant::now();
-        wait_idle(&mut world, camera, Duration::from_secs(5400));
+        wait_idle(
+            &mut world,
+            camera,
+            Duration::from_secs(5400),
+            Some(&mut tables),
+        );
+        // A look of the scene thread at every split brick for a hole (#167: none at the spawn, and
+        // none from 2 km up, where the sea's horizon is about 36 km away and what is past it is
+        // the Guard's and the cap's coarse bricks).
+        let before = world.stats().work;
+        world.look_now(true).unwrap();
+        let after = world.stats().work;
+        let (looked, holes) = (
+            after.hole_scans - before.hole_scans,
+            after.holes_found - before.holes_found,
+        );
+        assert!(looked >= 1, "AT {metres} m: no look for holes was made");
+        assert_eq!(holes, 0, "AT {metres} m: {holes} holes");
+        if metres >= 500.0 {
+            let (hit, rays, farthest) = rays_at_the_horizon(world.scene(), camera, up);
+            let r = camera.iter().map(|c| c * c).sum::<f64>().sqrt();
+            let sea = f64::from(planet_gen::world_map::WORLD_RADIUS);
+            eprintln!(
+                "AT {metres} m: {hit} of {rays} rays just under the horizon hit, the farthest {:.1} km out (the sea's horizon is {:.1} km)",
+                farthest / VOXELS_PER_METRE / 1000.0,
+                (r * r - sea * sea).max(0.0).sqrt() / VOXELS_PER_METRE / 1000.0
+            );
+            assert_eq!(
+                hit, rays,
+                "AT {metres} m: a ray under the horizon sees the sky"
+            );
+        }
         let by_level: Vec<usize> = (0..LEVELS).map(|l| world.level_bricks(l)).collect();
         let store = world.store();
         let held: usize = (0..store.level_count())
             .map(|l| store.level(l).map_or(0, |l| l.len()))
             .sum();
         eprintln!(
-            "AT {metres} m: drawn {} bricks (per level {by_level:?}), scene {:.1} MiB used; store \
+            "AT {metres} m: {holes} holes; drawn {} bricks (per level {by_level:?}), scene {:.1} MiB used; store \
              counts {} streamed and holds {held}; {} waiting; reached in {:.0?}; {}",
             by_level.iter().sum::<usize>(),
             world.used_bytes() as f64 / (1024.0 * 1024.0),
@@ -2550,11 +2626,136 @@ fn the_resident_set_at_2_m_50_m_500_m_and_5_km_over_the_spawn() {
             memory(&world, "then"),
         );
     }
+    tables.report();
+    // Each height is a step over `JUMP`, so it is a jump and makes its tables again: this shows the
+    // reservations hold for each of those scenes. The climb that does not jump is the next test's.
+    tables.assert_only_jumps_rebuilt();
 }
 
-/// Streams with the camera at `camera` until the loader has nothing left (or `cap` is over). A
+/// The climb from the spawn to 5 km that is **one path**, in steps of a frame (0.8 m at 48 m/s,
+/// far under `JUMP`'s 103 m): the scene is patched all the way, with the gaps in its buffers and the
+/// deleted entries in its tables that a patched scene has and a fresh one has not (#167: the
+/// resident-set test's heights are each a jump, and a scene after a jump is a fresh one). Every table is looked at
+/// after every frame; none may grow and the scene may not be rebuilt. `CLIMB_M_PER_S` sets the
+/// speed (48 m/s, as the flight and the take-off). A few minutes at full size:
+/// `cargo test --release -p client -- --ignored --nocapture a_continuous_climb`.
+#[test]
+#[ignore = "generates the full-size world map"]
+fn a_continuous_climb_from_2_m_to_5_km_grows_no_table_and_no_buffer() {
+    let loaded = crate::load_planet();
+    let (client, _server) = loopback();
+    let mut world =
+        World::new(loaded.scene, Predictor::new(loaded.store), client).with_loader(loaded.loader);
+    let spawn = loaded.camera;
+    world.measure_scene_thread();
+    let mut tables = Tables::new(&world);
+    let began = Instant::now();
+    wait_idle(
+        &mut world,
+        spawn.position,
+        Duration::from_secs(5400),
+        Some(&mut tables),
+    );
+    eprintln!("filled after {:.0?}", began.elapsed());
+    let speed: f64 = std::env::var("CLIMB_M_PER_S")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(48.0);
+    let up = spawn.horizon_up;
+    let at = |metres: f64| -> [f64; 3] {
+        std::array::from_fn(|a| spawn.position[a] + up[a] * metres * VOXELS_PER_METRE)
+    };
+    let step = speed / 60.0;
+    assert!(
+        step * VOXELS_PER_METRE < render::scene::JUMP * world.bands().unwrap().d0(),
+        "a step of the climb is a jump"
+    );
+    let velocity: [f64; 3] = std::array::from_fn(|a| up[a] * speed * VOXELS_PER_METRE);
+    let frame = Duration::from_micros(16_667);
+    let (mut frames, mut peak_used) = (0_u32, 0_u64);
+    let climbing = Instant::now();
+    while f64::from(frames) * step < 5000.0 {
+        let tick = Instant::now();
+        frames += 1;
+        let camera = at(f64::from(frames) * step);
+        let moved = world.recentre_moving(camera, velocity).unwrap();
+        let rebuilt = matches!(moved, Some(SceneUpdate::Rebuilt));
+        tables.after_frame(&world, rebuilt);
+        peak_used = peak_used.max(world.used_bytes());
+        if frames % 1250 == 0 {
+            eprintln!(
+                "  {:.0} m after {:.0?}: {:.0} MiB used, {} waiting, {} pending, lag {:.0} Voxels",
+                f64::from(frames) * step,
+                climbing.elapsed(),
+                world.used_bytes() as f64 / (1024.0 * 1024.0),
+                world.waiting(),
+                world.loader().unwrap().pending,
+                world.lag(camera)
+            );
+        }
+        std::thread::sleep(frame.saturating_sub(tick.elapsed()));
+    }
+    eprintln!(
+        "climbed 5 km at {speed} m/s in {frames} frames ({:.0?}); scene at most {:.1} MiB used",
+        climbing.elapsed(),
+        peak_used as f64 / (1024.0 * 1024.0)
+    );
+    wait_idle(
+        &mut world,
+        at(5000.0),
+        Duration::from_secs(5400),
+        Some(&mut tables),
+    );
+    eprintln!(
+        "at 5 km, settled: scene {:.1} MiB used; {}",
+        world.used_bytes() as f64 / (1024.0 * 1024.0),
+        memory(&world, "then")
+    );
+    tables.report();
+    tables.assert_none_grew();
+}
+
+/// Rays from `at` all round, 0.05, 0.1, 0.3, 1 and 3 degrees under the horizon of the sea (the
+/// Planet's sphere: a ray above it escapes to the sky, and one under it must meet the ground or
+/// the sea): how many hit, how many there are, and the farthest hit in Voxels. **What they cover:** the sea's surface from
+/// the foot of the camera out to a little short of the horizon (from 2 km up, 0.3 degrees under
+/// meets the sea about 26 km out, and the farthest hit is printed against the horizon's 36 km);
+/// what is past the horizon (terrain over the sea, which a ray at grazing angles may or may not
+/// hit, and which is the sky if it does not) is not asserted: the scene thread's hole scan, made
+/// before the rays, covers every split brick there. A hole shows as a ray that sees the sky.
+fn rays_at_the_horizon(scene: &Scene, at: [f64; 3], up: [f64; 3]) -> (usize, usize, f64) {
+    let radius = |p: [f64; 3]| p.iter().map(|c| c * c).sum::<f64>().sqrt();
+    // The horizon's dip from the camera's height over the sea: acos(R / r).
+    let sea = f64::from(planet_gen::world_map::WORLD_RADIUS);
+    let dip = (sea / radius(at)).min(1.0).acos();
+    let (ahead, right) = tangents(up);
+    let (cell, origin) = camera::split(at);
+    let mut rays = 0;
+    let mut hit = 0;
+    let mut farthest = 0.0_f64;
+    for turn in 0..24 {
+        let angle = f64::from(turn) * std::f64::consts::TAU / 24.0;
+        let along: [f64; 3] =
+            std::array::from_fn(|a| angle.cos() * ahead[a] + angle.sin() * right[a]);
+        for extra in [0.05_f64, 0.1, 0.3, 1.0, 3.0] {
+            let under = dip + extra.to_radians();
+            let dir: [f32; 3] =
+                std::array::from_fn(|a| (under.cos() * along[a] - under.sin() * up[a]) as f32);
+            rays += 1;
+            if let Some(found) = trace(scene, &Ray { cell, origin, dir }) {
+                hit += 1;
+                farthest = farthest.max(f64::from(found.t));
+            }
+        }
+    }
+    (hit, rays, farthest)
+}
+
+/// Streams with the camera at `camera` until the loader has nothing left (or `cap` is over), with
+/// the tables looked at after every frame if `watch` is given (a climb asks for far more than a
+/// walk, and its peaks are in the frames, not at the end). A
 /// jump back to a camera that no path counts, when it is not already there.
-fn wait_idle(world: &mut World, camera: [f64; 3], cap: Duration) {
+fn wait_idle(world: &mut World, camera: [f64; 3], cap: Duration, mut watch: Option<&mut Tables>) {
     let began = Instant::now();
     let mut last = Instant::now();
     // A camera that has only just moved is not seen by the scene thread yet, and what it asks for
@@ -2562,8 +2763,17 @@ fn wait_idle(world: &mut World, camera: [f64; 3], cap: Duration) {
     // for a few seconds.
     let mut idle_since: Option<Instant> = None;
     loop {
-        world.recentre_moving(camera, [0.0; 3]).unwrap();
-        world.stream::<RingsFull>(camera, |_, _| Ok(())).unwrap();
+        let moved = world.recentre_moving(camera, [0.0; 3]).unwrap();
+        let mut rebuilt = matches!(moved, Some(SceneUpdate::Rebuilt));
+        world
+            .stream::<RingsFull>(camera, |_, update| {
+                rebuilt |= matches!(update, SceneUpdate::Rebuilt);
+                Ok(())
+            })
+            .unwrap();
+        if let Some(tables) = watch.as_deref_mut() {
+            tables.after_frame(world, rebuilt);
+        }
         if idle(world) && world.lag(camera) < 1.0 {
             if idle_since.get_or_insert_with(Instant::now).elapsed() > Duration::from_secs(3) {
                 return;

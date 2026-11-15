@@ -21,7 +21,8 @@ pub struct Key(u128);
 
 impl Key {
     pub fn new(level: usize, coord: BrickCoord) -> Self {
-        debug_assert!(level < 16);
+        // The level has the 32 bits above the coordinates; the pyramid has 18 levels (#167).
+        debug_assert!(level < 64);
         let packed = coord.0.iter().fold(0u128, |acc, &c| {
             acc << BITS | u128::from((c as u32) ^ (1 << (BITS - 1)))
         });

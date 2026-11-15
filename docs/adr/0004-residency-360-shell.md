@@ -1,6 +1,6 @@
 # Residency is a complete 360° shell with an always-resident guard
 
-The client keeps a complete shell of LOD rings around the camera, in every azimuth, rather than a frustum-shaped set in front of it. The view direction orders work and sets refinement priority; it does not decide what is resident. A coarse guard (levels 9–13 at 5 cm Voxels and a 16 km radius; about four levels coarser for the same bytes at 320 km, ADR 0008) is always resident, so a late fine brick becomes a coarser frame rather than a hole.
+The client keeps a complete shell of LOD rings around the camera, in every azimuth, rather than a frustum-shaped set in front of it. The view direction orders work and sets refinement priority; it does not decide what is resident. A coarse guard (levels 9–13 at 5 cm Voxels and a 16 km radius; levels 13–17 at 320 km, ADR 0008: 274 thousand bricks, 45 MiB and 4 to 7 s on eight cores by the load, measured in #167) is always resident, so a late fine brick becomes a coarser frame rather than a hole.
 
 We chose this because turning, not flying, is the hard case: a fast turn sweeps the horizon many times faster than flight does, and no prefetcher can guarantee a frustum-shaped set in time. Without a guard that shows holes, and with one it shows visible coarse pops. The shell and the guard are small against the ~2 GB budget.
 
