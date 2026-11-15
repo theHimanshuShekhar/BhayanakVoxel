@@ -3140,7 +3140,7 @@ fn a_50_m_s_flight_over_the_ground_leaves_no_hole_with_the_horizon_cap_and_the_m
         world,
         camera,
         None,
-        360,
+        180,
         true,
         Duration::ZERO,
         move |store, _| {
@@ -3156,8 +3156,10 @@ fn a_50_m_s_flight_over_the_ground_leaves_no_hole_with_the_horizon_cap_and_the_m
 
 #[test]
 fn a_50_m_s_vertical_take_off_leaves_no_hole_with_the_horizon_cap_and_the_margins() {
-    // The horizon moves out a hundred metres for each metre the camera climbs, and the cap comes
-    // on and goes off over the sea: 6 s up from the spawn, to 300 m.
+    // The horizon moves out a hundred metres for each metre the camera climbs: 6 s up from the
+    // spawn, to 300 m. The spawn is on land and the camera only climbs, so the cap is on all the
+    // way; what is covered is the resident set that the horizon opens ahead of the camera (the
+    // cap's coming on and going off at sea level is `the_update_where_the_cap_goes_off…`).
     let flown = fly_capped(360, |spawn, up, frame| {
         std::array::from_fn(|a| spawn[a] + up[a] * FIFTY_METRES_A_SECOND * frame as f64)
     });
