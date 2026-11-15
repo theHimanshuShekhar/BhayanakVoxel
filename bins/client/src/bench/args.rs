@@ -47,6 +47,11 @@ Options:
                    convergence.csv and a convergence/ folder of pictures and truths. It takes
                    about 45 s at the default 1024 on the 4090, and says so in the block as
                    `wall_s`. With --short it is a tiny run with no FLIP
+  --flip-gamma-2-2 With the convergence phase's FLIP, also score every image as the old gamma-2.2
+                   curve would have drawn it (#188), from the same samples: the report's
+                   `flip_mean_gamma22` columns. They separate what the true sRGB curve moved from
+                   what the estimator moved, in one run. Adds about as much time as the FLIP
+                   it repeats
   --truth-spp N    Samples of each of the convergence phase's two truths [default: 1024]; ADR
                    0005's 8192 makes each truth eight times as long (the phase takes about 5
                    minutes on the 4090). At least 1024, the last checkpoint
@@ -92,6 +97,8 @@ pub struct Args {
     /// if `--truth-spp` said.
     pub convergence: bool,
     pub truth_spp: Option<u32>,
+    /// `--flip-gamma-2-2`: the convergence phase also scores the old curve's images (#188).
+    pub flip_gamma22: bool,
     pub size: Option<(u32, u32)>,
     pub bias: f64,
     pub diag: Diag,
@@ -119,6 +126,7 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Parsed, String> {
         no_fail: false,
         convergence: true,
         truth_spp: None,
+        flip_gamma22: false,
         size: None,
         bias: 1.0,
         diag: Diag::default(),
@@ -138,6 +146,7 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Parsed, String> {
             }
             "--no-fail" => parsed.no_fail = true,
             "--no-convergence" => parsed.convergence = false,
+            "--flip-gamma-2-2" => parsed.flip_gamma22 = true,
             "--truth-spp" => parsed.truth_spp = Some(truth_spp(&value("--truth-spp")?)?),
             "--out" => parsed.out = value("--out")?.into(),
             "--budgets" => parsed.budgets = Some(value("--budgets")?.into()),
@@ -156,6 +165,13 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Parsed, String> {
     if parsed.truth_spp.is_some() && !parsed.convergence {
         return Err(
             "--truth-spp is for the convergence phase, which --no-convergence leaves out".into(),
+        );
+    }
+    if parsed.flip_gamma22 && (!parsed.convergence || parsed.short) {
+        return Err(
+            "--flip-gamma-2-2 is for the convergence phase's FLIP, which --no-convergence leaves \
+             out and --short does not run"
+                .into(),
         );
     }
     // `--diag` says that the budgets are not checked, and the real-time mode's gates are checked
@@ -254,6 +270,7 @@ mod tests {
                 no_fail: false,
                 convergence: true,
                 truth_spp: None,
+                flip_gamma22: false,
                 size: None,
                 bias: 1.0,
                 diag: Diag::default()
@@ -319,6 +336,19 @@ mod tests {
             &["--truth-spp", "1023"],
             &["--truth-spp", "0"],
             &["--truth-spp", "lots"],
+        ] {
+            assert!(parse_all(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn the_old_curve_is_scored_only_when_asked_and_only_with_the_phases_flip() {
+        assert!(!run(&[]).flip_gamma22);
+        assert!(run(&["--flip-gamma-2-2"]).flip_gamma22);
+        assert!(run(&["--flip-gamma-2-2", "--truth-spp", "8192"]).flip_gamma22);
+        for bad in [
+            &["--flip-gamma-2-2", "--no-convergence"][..],
+            &["--flip-gamma-2-2", "--short"],
         ] {
             assert!(parse_all(bad).is_err(), "{bad:?}");
         }

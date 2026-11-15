@@ -109,6 +109,196 @@ mod tests {
         assert!(TRACE.contains(&line), "trace.wgsl lacks {line:?}");
     }
 
+    // -----------------------------------------------------------------------------------------
+    // The contract's table of lighting features (ADR 0005, "Lighting features").
+    //
+    // How features are listed: a line of a view's shader that reads a source of light carries
+    // (or follows, in its comment block) a `// lighting: <feature>` comment, naming the feature
+    // by its row in the ADR's table. This checks both ways: every feature a shader names has a
+    // row, and every source of light that the shader reads, which `READS` lists by the identifier
+    // that reads it, is named by such a comment. So a PR that adds a lighting feature to Primary
+    // has to say what it is in the shader, and the test then asks for its row in the ADR: it adds
+    // the row and the feature to the Reference view, or marks it absent with a reason. A feature
+    // that reads a new kind of source adds it to `READS` here (a shader that uses an identifier
+    // that is not in the list and is not marked is the one thing this cannot see; review is
+    // what is left for it).
+
+    const ADR: &str = include_str!("../../../docs/adr/0005-reference-view-contract.md");
+
+    /// The lighting features of the ADR's table, lower-cased, with their states.
+    fn table_rows() -> Vec<(String, String)> {
+        let table = ADR
+            .split("### Lighting features")
+            .nth(1)
+            .expect("the ADR has a lighting features section")
+            .split("\n### ")
+            .next()
+            .unwrap();
+        table
+            .lines()
+            .filter(|l| l.starts_with('|'))
+            .skip(2) // the header and its rule
+            .map(|l| {
+                let cells: Vec<&str> = l.trim_matches('|').split('|').map(str::trim).collect();
+                (cells[0].to_lowercase(), cells[1].to_lowercase())
+            })
+            .collect()
+    }
+
+    /// What reads a source of light, and the feature it is: an identifier of the shaders.
+    const READS: [(&str, &str); 5] = [
+        ("frame.sun", "sun and shadows"),
+        ("sky(", "sky and atmosphere"),
+        ("emission(", "emissive voxels"),
+        ("surface_albedo(", "per-voxel colour variation"),
+        ("varied_albedo(", "per-voxel colour variation"),
+    ];
+
+    /// The problems with `source` against `rows`: a feature it names that has no row, and a
+    /// source of light it reads that it does not name.
+    fn lighting_problems(source: &str, rows: &[(String, String)]) -> Vec<String> {
+        let mut problems = Vec::new();
+        let mut named = Vec::new();
+        for line in source.lines() {
+            if let Some(feature) = line.trim().strip_prefix("// lighting:") {
+                let feature = feature.trim().to_lowercase();
+                if !rows.iter().any(|(row, _)| *row == feature) {
+                    problems.push(format!("`{feature}` has no row in ADR 0005's table"));
+                }
+                named.push(feature);
+            }
+        }
+        for (identifier, feature) in READS {
+            let reads = source.lines().any(|l| {
+                let code = l.trim();
+                !code.starts_with("//") && code.contains(identifier) && !code.starts_with("fn ")
+            });
+            if reads && !named.iter().any(|n| n == feature) {
+                problems.push(format!(
+                    "reads `{identifier}` and does not say `// lighting: {feature}`"
+                ));
+            }
+        }
+        problems
+    }
+
+    #[test]
+    fn the_adrs_table_has_the_rows_the_views_are_held_to() {
+        let rows = table_rows();
+        assert!(rows.len() >= 10, "{rows:?}");
+        for (_, feature) in READS {
+            assert!(
+                rows.iter().any(|(row, _)| row == feature),
+                "no row for {feature}"
+            );
+        }
+        for (feature, state) in &rows {
+            assert!(
+                ["exact", "approximate, shared model", "shared", "absent"]
+                    .contains(&state.as_str()),
+                "{feature}: state {state:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_lighting_feature_in_primary_and_the_reference_has_a_row_in_the_adrs_table() {
+        let rows = table_rows();
+        for (name, source) in [
+            ("primary.wgsl", include_str!("shaders/primary.wgsl")),
+            ("pathtrace.wgsl", include_str!("shaders/pathtrace.wgsl")),
+        ] {
+            let problems = lighting_problems(source, &rows);
+            assert!(problems.is_empty(), "{name}: {problems:?}");
+        }
+        // And Primary really names some: the check is not passing on an empty shader.
+        let named = include_str!("shaders/primary.wgsl")
+            .matches("// lighting:")
+            .count();
+        assert!(named >= 4, "{named}");
+    }
+
+    #[test]
+    fn a_feature_primary_has_is_in_the_reference_unless_the_table_says_it_is_shared() {
+        // The table's rule for how a feature enters: in the same PR, the Reference view gets it, or
+        // the table marks it absent (and then Primary may not have it either, until it is
+        // exact or approximate with a shared model).
+        let named = |source: &str| -> Vec<String> {
+            source
+                .lines()
+                .filter_map(|l| l.trim().strip_prefix("// lighting:"))
+                .map(|f| f.trim().to_lowercase())
+                .collect()
+        };
+        let reference = named(include_str!("shaders/pathtrace.wgsl"));
+        for feature in named(include_str!("shaders/primary.wgsl")) {
+            let state = table_rows()
+                .into_iter()
+                .find(|(row, _)| *row == feature)
+                .map(|(_, state)| state)
+                .unwrap_or_else(|| panic!("`{feature}` has no row"));
+            assert_ne!(
+                state, "absent",
+                "Primary has `{feature}`, which the table calls absent"
+            );
+            assert!(
+                state == "shared" || reference.contains(&feature),
+                "Primary has `{feature}` ({state}) and the Reference view does not"
+            );
+        }
+    }
+
+    #[test]
+    fn a_lighting_feature_with_no_row_fails_the_check() {
+        let rows = table_rows();
+        // A feature that Primary's shader names and the table does not have.
+        let ambient = "// lighting: Ambient occlusion\nlet ao = 1.0;";
+        assert_eq!(
+            lighting_problems(ambient, &rows),
+            ["`ambient occlusion` has no row in ADR 0005's table"]
+        );
+        // A source of light that is read and not named.
+        let unmarked = "fn shade() {\n    return sky(dir);\n}";
+        assert_eq!(
+            lighting_problems(unmarked, &rows),
+            ["reads `sky(` and does not say `// lighting: sky and atmosphere`"]
+        );
+        // The same with the name: it passes.
+        let marked = "// lighting: Sky and atmosphere\nreturn sky(dir);";
+        assert!(lighting_problems(marked, &rows).is_empty());
+    }
+
+    #[test]
+    fn primary_and_the_reference_take_their_colours_from_the_one_function() {
+        // Neither view has a colour function of its own: both call `surface_albedo`, which is
+        // defined once, in the code they share, and which is the only caller of `varied_albedo`.
+        let common = include_str!("shaders/common.wgsl");
+        assert_eq!(common.matches("fn surface_albedo(").count(), 1);
+        assert_eq!(common.matches("fn varied_albedo(").count(), 1);
+        for (name, source) in [
+            ("primary.wgsl", include_str!("shaders/primary.wgsl")),
+            ("pathtrace.wgsl", include_str!("shaders/pathtrace.wgsl")),
+        ] {
+            assert!(
+                source.contains("surface_albedo("),
+                "{name} does not call it"
+            );
+            assert!(
+                !source.contains("fn surface_albedo("),
+                "{name} defines its own"
+            );
+            assert!(
+                !source.contains("varied_albedo("),
+                "{name} has its own colours"
+            );
+            assert!(
+                !source.contains("albedo(hit.material"),
+                "{name} reads a base colour"
+            );
+        }
+        assert_eq!(common.matches("varied_albedo(hit.material").count(), 1);
+    }
+
     #[test]
     fn trace_is_defined_exactly_once() {
         assert_eq!(TRACE.matches("fn trace(").count(), 1);

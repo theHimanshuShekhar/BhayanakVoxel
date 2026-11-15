@@ -7,7 +7,7 @@ use crate::reference::{Hit, Ray};
 use crate::scene::{Scene, SceneUpdate};
 use crate::sun::Sun;
 use crate::timing::Timings;
-use crate::tracer::{Plane, Target, Tracer};
+use crate::tracer::{Plane, ReferenceOptions, Target, Tracer};
 use crate::upscale::Resolution;
 use crate::{Result, finish_and_read, request_gpu, shared_instance, staging_buffer};
 
@@ -165,7 +165,26 @@ impl Offscreen {
         Self::create(Resolution::native(width, height), scene, false)
     }
 
+    /// Like [`Offscreen::new`], with the Material table `table` in place of the shipped one: for
+    /// tests of lighting that need Materials of an albedo or an emission it does not have.
+    pub fn with_materials(
+        resolution: Resolution,
+        scene: &Scene,
+        table: &materials::MaterialTable,
+    ) -> Result<Self> {
+        Self::build(resolution, scene, true, Some(table))
+    }
+
     fn create(resolution: Resolution, scene: &Scene, timers: bool) -> Result<Self> {
+        Self::build(resolution, scene, timers, None)
+    }
+
+    fn build(
+        resolution: Resolution,
+        scene: &Scene,
+        timers: bool,
+        table: Option<&materials::MaterialTable>,
+    ) -> Result<Self> {
         let (adapter, device, queue) = request_gpu(shared_instance(), None, timers)?;
         let info = adapter.get_info();
         let info = GpuInfo {
@@ -175,7 +194,10 @@ impl Offscreen {
             driver_info: info.driver_info,
             backend: format!("{:?}", info.backend),
         };
-        let tracer = Tracer::new(&device, scene)?;
+        let tracer = match table {
+            Some(table) => Tracer::with_materials(&device, scene, table)?,
+            None => Tracer::new(&device, scene)?,
+        };
         let profiler = Profiler::new(&device, &queue);
         let target = Target::new(&device, resolution);
         Ok(Self {
@@ -503,6 +525,12 @@ impl Offscreen {
     /// image of the same view, with the same expected value.
     pub fn set_reference_seed(&mut self, seed: u32) {
         self.tracer.set_seed(seed);
+    }
+
+    /// Builds the Reference view with `options` and starts its image over. For tests; the
+    /// default is the player's.
+    pub fn set_reference_options(&mut self, options: ReferenceOptions) {
+        self.tracer.set_reference_options(&self.device, options);
     }
 
     /// Samples in the reference image so far.

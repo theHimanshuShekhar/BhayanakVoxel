@@ -17,7 +17,7 @@ use crate::sun::{Sun, SunUniform};
 use crate::upscale::{History, Resolution, UpscalePass};
 use crate::{Result, shaders};
 
-/// Format of the traced image: sRGB-encoded values in a plain unorm texture.
+/// Format of the traced image: values encoded with the true sRGB curve, in a plain unorm texture.
 pub const IMAGE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 
 /// Format of the G-buffer: two words a pixel, written in one store (see `primary.wgsl`). The
@@ -85,6 +85,54 @@ impl SceneHeader {
 /// Seeds the reference path tracer's random numbers: a given view, sun and sample count always
 /// give the same image.
 pub const RNG_SEED: u32 = 0xB4A7_A9AC;
+
+/// How the Reference view is built. The default is the player's: Owen-scrambled Sobol sample
+/// positions, the colour variation Primary has, and the estimator of ADR 0005. A test that needs
+/// something else builds the pipeline with it (see [`Tracer::set_reference_options`]); nothing
+/// else does, and the shader the player runs has no branch for any of it, because they are
+/// pipeline constants.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ReferenceOptions {
+    /// Every Voxel has its Material's base colour, with none of the variation Primary draws, so
+    /// that a scene has an answer worked out from the Material table alone.
+    pub flat_colours: bool,
+    /// Hashed random numbers for the sample positions, in every dimension: white noise, the plain
+    /// Monte Carlo baseline.
+    pub white_noise: bool,
+    /// A fault put into the estimator, to show that a test of it can fail.
+    pub fault: Fault,
+}
+
+/// A fault that a test puts into the Reference view's estimator, to show that the tests that
+/// guard it fail when it is wrong. The player's view has none.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Fault {
+    #[default]
+    None,
+    /// The estimator that ADR 0005 replaced: no roulette, and a path stops after its fifth
+    /// surface (the fixed 4-bounce cut).
+    FourBounceCut,
+    /// The roulette without the rescale of the paths that go on.
+    NoRescale,
+}
+
+impl ReferenceOptions {
+    /// The pipeline constants these are, as `pathtrace.wgsl` declares them.
+    fn constants(self) -> [(&'static str, f64); 3] {
+        [
+            ("FLAT_COLOURS", f64::from(u8::from(self.flat_colours))),
+            ("WHITE_NOISE", f64::from(u8::from(self.white_noise))),
+            (
+                "FAULT",
+                match self.fault {
+                    Fault::None => 0.0,
+                    Fault::FourBounceCut => 1.0,
+                    Fault::NoRescale => 2.0,
+                },
+            ),
+        ]
+    }
+}
 
 /// `Frame` in `common.wgsl`.
 #[repr(C)]
@@ -254,6 +302,7 @@ pub struct Tracer {
     accumulator: Accumulator<View>,
     /// The reference's random seed: [`RNG_SEED`] unless [`Tracer::set_seed`] changed it.
     seed: u32,
+    options: ReferenceOptions,
     debug_view: DebugView,
     /// Bytes of the Planet that have been written to the GPU, creating its buffers included.
     uploaded: u64,
@@ -308,6 +357,7 @@ fn compute_pipeline(
     entry_point: &str,
     group_1: &wgpu::BindGroupLayout,
     group_0: &wgpu::BindGroupLayout,
+    constants: &[(&str, f64)],
 ) -> wgpu::ComputePipeline {
     let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some(label),
@@ -323,7 +373,10 @@ fn compute_pipeline(
         layout: Some(&layout),
         module: &module,
         entry_point: Some(entry_point),
-        compilation_options: Default::default(),
+        compilation_options: wgpu::PipelineCompilationOptions {
+            constants,
+            ..Default::default()
+        },
         cache: None,
     })
 }
@@ -609,6 +662,16 @@ impl SceneBuffers {
 impl Tracer {
     /// Uploads `scene` and the built-in Material table, and builds the pipelines.
     pub fn new(device: &wgpu::Device, scene: &Scene) -> Result<Self> {
+        Self::with_materials(device, scene, MaterialTable::built_in())
+    }
+
+    /// Like [`Tracer::new`], with the Material table `table`: for tests of lighting that need
+    /// Materials of an albedo or an emission that the shipped table does not have.
+    pub fn with_materials(
+        device: &wgpu::Device,
+        scene: &Scene,
+        table: &MaterialTable,
+    ) -> Result<Self> {
         let scene_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("scene"),
             entries: &[
@@ -639,7 +702,7 @@ impl Tracer {
         });
         let materials = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("materials"),
-            contents: bytemuck::cast_slice(&gpu_materials::pack(MaterialTable::built_in())),
+            contents: bytemuck::cast_slice(&gpu_materials::pack(table)),
             usage: wgpu::BufferUsages::STORAGE,
         });
         let camera_buffer = device.create_buffer(&wgpu::BufferDescriptor {
@@ -661,6 +724,7 @@ impl Tracer {
             "primary",
             &camera_layout,
             &scene_layout,
+            &[],
         );
         let reference = compute_pipeline(
             device,
@@ -669,6 +733,7 @@ impl Tracer {
             "reference",
             &camera_layout,
             &scene_layout,
+            &ReferenceOptions::default().constants(),
         );
         Ok(Self {
             scene: scene_buffers,
@@ -683,6 +748,7 @@ impl Tracer {
             history: History::default(),
             accumulator: Accumulator::new(),
             seed: RNG_SEED,
+            options: ReferenceOptions::default(),
             debug_view: DebugView::default(),
             uploaded: scene_bytes,
             last_writes: 0,
@@ -972,6 +1038,22 @@ impl Tracer {
         self.accumulator.reset();
     }
 
+    /// Builds the reference pipeline with `options` (see [`ReferenceOptions`]) and starts its
+    /// image over. For tests.
+    pub fn set_reference_options(&mut self, device: &wgpu::Device, options: ReferenceOptions) {
+        self.reference = compute_pipeline(
+            device,
+            "reference",
+            shaders::PATHTRACE,
+            "reference",
+            &self.camera_layout,
+            &self.scene_layout,
+            &options.constants(),
+        );
+        self.options = options;
+        self.accumulator.reset();
+    }
+
     /// Samples in the reference image so far.
     pub fn samples(&self) -> u32 {
         self.accumulator.samples()
@@ -1111,6 +1193,7 @@ impl Tracer {
             "probe",
             &probe_layout,
             &self.scene_layout,
+            &[],
         );
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
         {

@@ -88,6 +88,18 @@ fn varied_albedo(material: u32, voxel: vec3<i32>) -> vec3<f32> {
     return max(turned, vec3<f32>(0.0)) * (1.0 + value * params.z);
 }
 
+// The colour of the Voxel's surface before it is lit: the one function that both views take
+// their colours from. Voxels are never more than about a pixel across (the LOD bands, see lod.rs),
+// so the Voxel's own colour variation is drawn at every distance, with no blending towards a
+// plain colour. `flat_colours` is for tests with an answer that is known exactly (the Reference
+// view's FLAT_COLOURS): the Material's base colour, with no variation. Primary passes false.
+fn surface_albedo(hit: Hit, flat_colours: bool) -> vec3<f32> {
+    if flat_colours {
+        return albedo(hit.material);
+    }
+    return varied_albedo(hit.material, hit.voxel);
+}
+
 // A simple gradient from the horizon to the zenith, until the atmosphere replaces it. It uses
 // the world's y axis as up, which is right near the +y pole and nowhere else.
 fn sky(dir: vec3<f32>) -> vec3<f32> {
@@ -107,10 +119,13 @@ fn camera_ray(pixel: vec2<u32>, size: vec2<u32>, offset: vec2<f32>) -> Ray {
     return ray;
 }
 
-// Linear colour to the image's sRGB-encoded values, which a plain unorm texture then clamps to
-// 0..1.
+// Linear colour to the image's sRGB-encoded values, with the true sRGB curve (IEC 61966-2-1: a
+// straight line near black, then 1.055 * x^(1/2.4) - 0.055), in the Reference and Primary views
+// alike. The result is clamped to 0..1, as the plain unorm texture it is stored in would. It is
+// a plain clamp and no tone mapping: light brighter than 1 is white.
 fn encode(linear: vec3<f32>) -> vec3<f32> {
-    return pow(linear, vec3<f32>(1.0 / 2.2));
+    let c = clamp(linear, vec3<f32>(0.0), vec3<f32>(1.0));
+    return select(1.055 * pow(c, vec3<f32>(1.0 / 2.4)) - 0.055, 12.92 * c, c <= vec3<f32>(0.0031308));
 }
 
 // What the debug views show, as the values written to the image (already encoded). `view` is

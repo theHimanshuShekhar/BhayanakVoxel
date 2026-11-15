@@ -75,7 +75,7 @@ fn normals_show_the_face_the_floor_presents_and_the_sky_is_black() {
 #[test]
 fn albedo_shows_the_material_without_light_or_shade() {
     let image = gpu(DebugView::Albedo).render(&overhead());
-    let encoded = STONE_ALBEDO.map(|c| c.powf(1.0 / 2.2) * 255.0);
+    let encoded = STONE_ALBEDO.map(|c| f64::from(render::srgb_encode(c as f32)) * 255.0);
     assert!(
         all_pixels(&image).all(|p| (0..3).all(|c| (f64::from(p[c]) - encoded[c]).abs() <= 2.0))
     );
@@ -144,7 +144,7 @@ fn of_floor(name: &str, view: DebugView) -> Image {
 
 /// A display value as the linear light it encodes.
 fn linear(value: u8) -> f64 {
-    (f64::from(value) / 255.0).powf(2.2)
+    f64::from(render::srgb_decode(f32::from(value) / 255.0))
 }
 
 #[test]
@@ -152,7 +152,7 @@ fn albedo_comes_from_the_material_table() {
     for name in ["water", "marble", "blue light", "copper", "obsidian"] {
         let colour = MaterialTable::built_in().by_name(name).unwrap().colour;
         let image = of_floor(name, DebugView::Albedo);
-        let encoded = colour.map(|c| f64::from(c).powf(1.0 / 2.2) * 255.0);
+        let encoded = colour.map(|c| f64::from(render::srgb_encode(c)) * 255.0);
         assert!(
             all_pixels(&image).all(|p| (0..3).all(|c| (f64::from(p[c]) - encoded[c]).abs() <= 2.0)),
             "{name}"

@@ -170,7 +170,7 @@ pub enum HudEvent {
 
 /// A colour of the Material table (linear RGB) as the screen shows it.
 pub fn swatch(linear: [f32; 3]) -> Color32 {
-    let [r, g, b] = linear.map(|c| (c.clamp(0.0, 1.0).powf(1.0 / 2.2) * 255.0).round() as u8);
+    let [r, g, b] = linear.map(|c| (crate::srgb_encode(c.clamp(0.0, 1.0)) * 255.0).round() as u8);
     Color32::from_rgb(r, g, b)
 }
 

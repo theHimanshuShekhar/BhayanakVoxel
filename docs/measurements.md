@@ -330,3 +330,25 @@ Measured on the RTX 4090 on 2026-11-01 ([#99](https://github.com/theHimanshuShek
   - **The pit's 0.02 line does not count:** 0.02 is under 4 × the pit's floor of 0.0092 (`min_line_over_floor`), so the 329.5 spp is shown and not used. The rule works as designed.
   - **Cost of the phase:** about 5 minutes on each run at `--truth-spp 8192`. At the default `--truth-spp 1024` the phase's `wall_s` is **44.0 s** for both views together (4090 at `d68cbb0`, 1 run, both clocks locked), so about 45 s; the block's `wall_s` has the phase's wall-clock time.
 - **On lavapipe (this box)**, at 96 by 54 with FLIP, the phase gives sensible curves and a floor under them; the numbers are of no use as timings. FLIP at 2560x1440 took 0.25 s an image (0.47 s with its statistics) on this box's CPU.
+
+### The Reference view's estimator (#188)
+
+#188 replaced the Reference view's estimator (ADR 0005): Owen-scrambled Sobol instead of white noise, bounce light followed with Russian roulette from the third surface (cap 256) instead of cut at 4 bounces, Primary's per-Voxel colours instead of flat ones, and the true sRGB curve in both views instead of gamma 2.2. The 4090 numbers below are the orchestrator's to fill in; **nothing here has been measured on the 4090 yet.**
+
+**Runs** (RTX 4090, both clocks locked, 3 runs each, the same `--truth-spp` in both):
+
+| | commit | invocation |
+|---|---|---|
+| before | main at `cc82b02` (#187's phase) | `client.exe bench --truth-spp 8192 --out bench-before` |
+| after | the head of PR #188 | `client.exe bench --truth-spp 8192 --flip-gamma-2-2 --out bench-after` |
+
+`--flip-gamma-2-2` scores the head's samples a second time with the old gamma-2.2 curve (`flip_mean_gamma22`), so three curves exist per view: before (old estimator, old curve: main's `flip_mean`), after on the old curve (new estimator, `flip_mean_gamma22`: the estimator's effect alone) and after (`flip_mean`: the estimator and the sRGB curve). Per-sample cost is `ms_per_mpix_per_sample` and `reference.mean_ms`. A pit that is brighter in the head is read from `views[pit].converged.mean_luminance`; main's report has no such field, so work it out from main's `convergence/pit/truth-a.f32` (little-endian RGB `f32`, linear): the mean of each channel, then `0.2126 R + 0.7152 G + 0.0722 B`.
+
+**What the issue expects:** the new curve at or below the old one from 4 samples in the open view; the pit's converged image brighter by about what `docs/research/reference-estimator.md` predicts (the 4-bounce cut lost light in the pit); a rise in the pit's per-sample cost (more bounces), stated.
+
+| view | per-sample ms, before / after | ms per Mpix per sample, before / after | converged luminance, before / after | FLIP at 4 spp, before / after (old curve) / after | FLIP at 64 spp, same three | spp to FLIP ≤ 0.05, before / after | floor FLIP, before / after |
+|---|---|---|---|---|---|---|---|
+| golden | _4090_ | _4090_ | _4090_ | _4090_ | _4090_ | _4090_ | _4090_ |
+| pit | _4090_ | _4090_ | _4090_ | _4090_ | _4090_ | _4090_ | _4090_ |
+
+On lavapipe (in CI), the closed-box tests (`crates/render/tests/estimator.rs`) hold the estimator's answer: exact to the ledger bound at albedo 0.9 and 0.98, off by more than the bound with the 4-bounce cut put back, and off with the `/(1 − q)` rescale dropped.

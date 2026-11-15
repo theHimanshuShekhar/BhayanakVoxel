@@ -151,7 +151,7 @@ fn check_convergence(convergence: &Value, out: &Path) {
 }
 
 fn check_schema(report: &Value, out: &Path) {
-    assert_eq!(report["schema_version"], 16);
+    assert_eq!(report["schema_version"], 17);
     // The Edit stress is of the whole Planet, which the patch is not.
     assert!(report["edits"].is_null());
     // The streaming mode is asked for (see its own test); the other tests do not. The real-time

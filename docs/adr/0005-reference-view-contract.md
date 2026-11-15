@@ -35,13 +35,13 @@ One row per lighting feature. **Exact** means unbiased. **Approximate, shared mo
 
 ### How a feature enters
 
-A PR that adds a lighting feature to Primary must, in the same PR, either add it to the reference or mark it absent in this table with a written reason, and take the views that show it out of the Primary-against-reference gate. A CI test fails when Primary's shader has a lighting feature with no row in this table.
+A PR that adds a lighting feature to Primary must, in the same PR, either add it to the reference or mark it absent in this table with a written reason, and take the views that show it out of the Primary-against-reference gate. A CI test fails when Primary's shader has a lighting feature with no row in this table. Features are listed in the shaders: each place in `primary.wgsl` or `pathtrace.wgsl` that lights a surface carries a `// lighting: <Feature>` comment with the feature's name as in the first column, and `crates/render/src/shaders.rs` lists the sources of light the shaders read (`READS`: the sun, the sky, a Material's emission, the Voxel's colour variation). The test fails on a comment whose feature has no row, on an identifier in `READS` that a shader reads without the comment, and on a feature that Primary has and the reference lacks unless its row says it is shared.
 
 ### Bias ledger
 
 | Approximation | Bound | Why it is accepted | Test |
 |---|---|---|---|
-| Path depth capped at 256 | at most 0.57 % (snow, albedo 0.98); about 0 elsewhere | A path among Materials of albedo 1 would never end. | The closed-box test with a known answer, in CI (#188). |
+| Path depth capped at 256 | at most 0.57 % (snow, albedo 0.98); about 0 elsewhere | A path among Materials of albedo 1 would never end. | The closed-box test with a known answer, in CI (#188): `crates/render/tests/estimator.rs`. |
 | No haze on bounce rays (after #53) | to be shown under 1 % by #53, or haze is added to bounce rays | Bounce rays near the ground are short against the scale of the air. | Set by #53. |
 
 ## Estimator

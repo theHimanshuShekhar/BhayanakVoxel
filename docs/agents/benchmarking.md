@@ -61,6 +61,7 @@ release: a debug build's CPU side is slow enough to distort the frame times.
 | `--streaming` | Also runs the streaming mode (below): the test Planet streamed in, stepped, on a fixed frame schedule, with counts that are the same on every run. The report's `streaming` is null without it. |
 | `--real-time` | With `--streaming`, also runs the real-time mode (below): the full-size Planet with the real loader workers and scene thread, on the machine's clock, along paths of 50 m/s flights, a take-off, a turn, a stop and a cold start. It takes tens of minutes and is not deterministic. With `--short` it runs on the test Planet, as a smoke test. The report's `streaming_real_time` is null without it. |
 | `--runs N` | With `--real-time`, how many times to run the paths in this process. Default 3. The report keeps each run and the least and the most of every number over them; the gates use the worst. |
+| `--flip-gamma-2-2` | Also score each checkpoint with the old gamma-2.2 curve (#188), from the same samples, to tell the sRGB move from the estimator's effect. Not with `--no-convergence` or `--short`. |
 | `--no-convergence` | Leave out the convergence phase (below), which otherwise runs after the caves. |
 | `--truth-spp N` | Samples of each of the convergence phase's two truths. Default 1024; ADR 0005's is 8192, which takes eight times as long (`client.exe bench --truth-spp 8192` is the 4090 baseline). At least 1024, the last checkpoint. |
 | `--no-fail` | Exit with status 0 even if a pass is over budget, a frame of the streaming mode has a hole, or a gate of the real-time mode is over. |
@@ -951,14 +952,26 @@ own: with the same seed the first samples would be the truth's and every error w
 
 - `flip_mean` and `flip_p99`: LDR-FLIP of `flip-rs` (`=0.1.2`, pinned in `bins/client/Cargo.toml`
   and as `FLIP_VERSION` next to the seeds, and a test holds the two together), ppd 67.02, on the 8-bit
-  image that the Reference view shows (what `render_reference` reads back: the mean encoded with a gamma
-  of 2.2 and clamped, which is what the player sees today; ADR 0005's "true sRGB curve" is for when
-  the shader's `encode` changes, and the phase scores whatever it shows). `flip_p99` is the
+  image that the Reference view shows (what `render_reference` reads back: the mean encoded with the
+  true sRGB curve, since #188; before it the curve was a gamma of 2.2, which `--flip-gamma-2-2` scores
+  again, see below). `flip_p99` is the
   error-weighted 99th percentile, a guard against speckles.
 - `mse_linear`: the mean squared difference per channel of the `f32` accumulations, in linear light.
   `mse_linear_run_only` is that less half the floor's, which is the truth's own share, so it is the
   run's noise alone and falls as 1/N.
 - `gpu_s`: the GPU seconds of the run's first N samples, as timed (null without timers).
+
+- `flip_mean_gamma22` (only with `--flip-gamma-2-2`; null otherwise): the same FLIP mean on the same
+  samples, with the mean encoded by the old gamma-2.2 curve on the CPU. #188 moved the Reference and
+  Primary to the true sRGB curve, which shifts FLIP a little against #187's baseline whatever the
+  estimator does; this column is the new estimator on the old curve, so the two effects separate:
+  `flip_mean_gamma22` against #187's `flip_mean` is the estimator, `flip_mean` against
+  `flip_mean_gamma22` is the curve.
+
+`converged` is how bright the view's truth A is (`mean_linear`: the mean of each channel, linear;
+`mean_luminance`: Rec. 709 luminance of that mean; `mean_luminance_b`: the same for truth B). #188
+reads the pit's converged brightness off it: the estimator's bounce light shows as a brighter pit,
+and a truth from before #188 is compared by the same mean of its `truth-a.f32`.
 
 `floor` is truth B against truth A in the same three: the metric's noise in this view. `lines` has,
 for FLIP 0.05 and 0.02, the samples at which the curve gets there (`samples`; null if it never does),
@@ -973,7 +986,8 @@ the checkpoints), so the number is an estimate to look into, not one to quote.
 
 **The files.** `convergence.csv` has the curve for plotting: `view`, `samples`, `gpu_s`,
 `flip_mean`, `flip_p99`, `mse_linear`, `mse_linear_run_only`, and the view's floor
-(`floor_flip_mean`, `floor_mse_linear`) on every row. `convergence/VIEW/` has `sppNNNN.png` for each
+(`floor_flip_mean`, `floor_mse_linear`) on every row, then `flip_mean_gamma22` and
+`floor_flip_mean_gamma22` (empty without `--flip-gamma-2-2`). `convergence/VIEW/` has `sppNNNN.png` for each
 checkpoint and, for each truth, `truth-a|b.png`, `.f32` (little-endian RGB floats, linear, rows from
 the top) and `.json`, its inputs (the view, camera, sun, seed, samples, size, generator version, GPU,
 driver and build). **A truth is kept for looking at and for working out what a number was made of. It
@@ -1002,7 +1016,7 @@ their errors (the floor), and that a seed gives the same image every time.
 
 ```
 {
-  "schema_version": 16,
+  "schema_version": 17,
   "build":   { "version", "commit" },          // commit: CI builds only, else null; on a PR
                                                // build it is GitHub's merge commit, not the head
   "machine": { "gpu", "device_type", "driver", "driver_info", "backend", "os", "arch",
@@ -1025,7 +1039,7 @@ their errors (the floor), and that a seed gives the same image every time.
   "convergence": { "width", "height", "scene", "checkpoints", "truth_spp", "seeds", "flip",
                    "lines", "min_line_over_floor", "folder", "csv", "wall_s",
                    "views": [ { "name", ...the view's camera and sun, "reference": STATS,
-                                "gpu_total": STATS, "ms_per_mpix_per_sample", "floor",
+                                "gpu_total": STATS, "ms_per_mpix_per_sample", "converged", "floor",
                                 "curve": [...], "lines": [...], "files": [...] }... ] } | null,
                                       // null with --no-convergence or if the phase failed;
                                       // see its section
