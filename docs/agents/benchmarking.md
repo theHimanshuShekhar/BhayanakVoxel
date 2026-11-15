@@ -146,7 +146,7 @@ The schedule is fixed by frame index (`bins/client/src/bench/stream.rs`): the ca
 until the resident set is complete (**fill**); then 60 frames standing (**steady**) and 180 frames
 walking at 24 m/s along three segments (**moving**), with an Edit at frame 150 of them and the
 store held to 102% of the complete set so that the walk evicts. The bands have a `d0` of 64
-Voxels, so that the fill is a few seconds, and the Guard is the game's (levels 9 to 13).
+Voxels, so that the fill is a few seconds, and the Guard is the game's three levels lower (levels 10 to 17: the test Planet is an eighth of the radius, so level 10 holds about what level 13 does at 320 km, #167).
 Everything in `streaming` is made by that mode and is the same on every run and every machine,
 except `timing`.
 
@@ -162,7 +162,7 @@ except `timing`.
   constants). It is the one number to compare: `bins/client/src/bench/streaming-counts.golden` has the committed value, a unit
   test (`the_counts_are_the_committed_ones`, which runs on Linux and on Windows, since it needs no
   GPU) and `tests/bench.rs` check it. When a change to the streaming code moves the counts on
-  purpose, the test prints the new hash; put it in the file and say why in the PR. It is `38b58d66b96791af` since #146: the stepped scene has the horizon cap, so the drawn bricks of the Guard's levels went from 9 536 to 8 482, the rings' and a follow step's counts and the upload (64.30 to 64.80 MB, 6 439 to 6 986 copies) moved with them; what is streamed, arrived and evicted did not (`docs/measurements.md`).
+  purpose, the test prints the new hash; put it in the file and say why in the PR. It is `2466f0700e79713a` since #167 (18 levels and the test Planet's Guard from level 10: the pyramid is deeper, so the rings and the soft-miss levels are 18, not 14; `38b58d66b96791af` from #146 before it): the stepped scene has the horizon cap, so the drawn bricks of the Guard's levels went from 9 536 to 8 482, the rings' and a follow step's counts and the upload (64.30 to 64.80 MB, 6 439 to 6 986 copies) moved with them; what is streamed, arrived and evicted did not (`docs/measurements.md`).
 - `upload`: bytes written to the GPU per frame (`bytes`: `total`, `max`, frames and frames with
   any) and the belt copies per frame (`writes`, the same, each a copy with a barrier of
   its own: neighbouring ranges of a patch are joined into one when they are within `COPY_GAP`
@@ -281,7 +281,7 @@ Voxels) with the **real loader workers and the real scene thread**, on the machi
 frame at 60 a second, drawn on the GPU. What the threads have done by a frame depends on what the
 operating system let them do, so **everything in `streaming_real_time` is not deterministic**, is
 made by this mode only, and is not in the counts hash. The stepped test Planet mode and its hash
-(`38b58d66b96791af` since #146, which put the horizon cap in it; `e621feef18ef1801` from #145, which added the `upload` writes and budget counts, until #166's terrain) still run first.
+(`2466f0700e79713a` since #167, which made the pyramid 18 levels; `38b58d66b96791af` from #146, which put the horizon cap in it; `e621feef18ef1801` from #145, which added the `upload` writes and budget counts, until #166's terrain) still run first.
 
 It runs after the stepped mode, and takes tens of minutes at full size: each run generates the
 world map (about 25 s), loads, fills (a few minutes) and flies the paths, with the loader caught
@@ -359,8 +359,29 @@ is made there (below): the run's **Edit latency**. Its frames are not those of a
     starts (it reads the store for the ground, and takes its read lock, so it can wait for a lock
     that a look for holes or an eviction holds; it delays the frame's start and is not in its time),
     and the frame's look at the memory after its time was taken (the store's lock again, every 6
-    frames). Both are reported for a slow frame as `camera_ms` and `after_ms`. The pacing sleep is
-    in neither.
+    frames, and the harness's read of the process's resident memory, every 30). Both are reported
+    for a slow frame as `camera_ms` and `after_ms`, and `after_lock_ms` says how much of `after_ms`
+    was the wait for the store's lock (the rest is the resident read and bookkeeping, which the
+    game does not do). The pacing sleep is in neither.
+  - `frame_cycle` and `sleep_overshoot` (schema 19, #167): `samples`, `mean_ms`, `p99_ms`,
+    `worst_ms` of the **pacing** that `frame_time` leaves out. `frame_cycle` is the time from the
+    start of a frame to the start of the next (the path's last frame has none), **less what the
+    harness itself does between two frames** (`harness_ms` below: the look at the stop of a flight):
+    with the pacing sleep it is 16.7 ms when the frames are short, and a cycle that is longer than
+    the frame and its sleep need is the frame thread waking late or the store's lock. Not gated:
+    `slowest_cycles` (the five frames with the longest turn, in the form of `slowest`) says which
+    part of a long cycle it was, and `frame_cycle.worst_ms` is the number to read against it. A
+    gate on the worst cycle would be on one frame of a thousand, which a Windows scheduler tick
+    can make 30 ms, and the p99 of a paced cycle is 17.3 ms whatever the work, so a gate on that
+    would hold nothing either. **`harness_ms` is more than the wait for the scene thread:** the
+    look at the stop also draws a frame on the GPU with the update that the look made, which the game
+    would make in its next frame, so a stop's `harness_ms` is the wait plus one frame's copy and
+    draw, and not all of it is work the game would not do. It is left out of the cycle as the bench's
+    own call, not as time the game does not spend.
+    `sleep_overshoot` is by how much each pacing sleep ran **over what it asked for** (the frames
+    that slept; a frame that was already over 16.667 ms does not). On Windows a `thread::sleep` is
+    rounded up to the timer's tick (up to 15.6 ms unless the process raised the resolution) and
+    waits for the scheduler, so a sleep that is 10 to 30 ms over is the host's. Not gated.
   - `frames_over_limit`, `frames_over_limit_by_update` and `slowest`: **where the time of a slow
     frame went**. `frames_over_limit` is the number of frames of the path whose time was over the
     frame-time limit (the gate's `frame_time_p99_ms`; the gate itself is unchanged and still on the
@@ -373,6 +394,27 @@ is made there (below): the run's **Edit latency**. Its frames are not those of a
     allocation, and a path with fewer frames has fewer), each with:
     - `index` (the frame's place in the path, from 0) and `at_ms` (from the path's start to the
       frame's start), `time_ms` and `cpu_ms`;
+    - **the frame's pacing** (schema 19, #167), outside `time_ms`: `before_ms` (from the end of the
+      frame before, its sleep done, to this frame's start: working out the camera and the
+      harness's own bookkeeping; 0 for a path's first frame, since the end look of the path before
+      it, about 0.3 s at full size, is not a wait for a wake-up), `sleep_asked_ms` (the sleep that
+      fills the frame to 16.667 ms; 0 if it was longer), `sleep_over_ms` (by how much the sleep ran
+      over that), `between_ms` (the harness's bookkeeping between the look at the memory and the sleep; `time_ms`,
+      `after_ms`, `between_ms`, `sleep_asked_ms` and `sleep_over_ms` add up to `cycle_ms`, which a
+      test of the report holds to 0.05 ms) and `cycle_ms` (from the frame's start to the end of its sleep; the cycle to the
+      next frame's start is `cycle_ms` plus the next frame's `before_ms`), and `harness_ms` (of
+      `before_ms`, the look the harness makes at the stop of a flight: it waits for the scene
+      thread to finish a round and counts the soft misses, then copies what that made to the GPU;
+      a player's frame does not do it). **How to read a 30 ms frame** (the 180° turn's waits, #166 and #167): if `cpu_ms` is normal and `wait_ms` is long
+      with `gpu_total_ms` short (`wait_not_passes_ms` large), the wait was **not our passes**: the
+      frame thread woke late from the device poll or was not scheduled, or the GPU was busy with
+      other queue work or the compositor. That is not work of ours, but this field alone does not
+      say which of those it was (a late wake-up has a `sleep_overshoot` and a `before_ms` of the
+      same kind elsewhere in the run; other GPU work does not). If `recentre_ms`, `update_ms` or
+      `encode_ms` is long, it is our work. If the frame is normal and the `sleep_over_ms` of the
+      frame before it (look at index − 1 in `slowest` of the same path only if that was slow too,
+      else `sleep_overshoot` says how often it happens) is long, the harness's sleep woke late and
+      the frame started late, which `time_ms` does not count;
     - the parts, in milliseconds, in the order the frame does them: `recentre_ms` (`World::recentre`:
       telling the scene thread the camera and taking what it published), `update_ms` (the copy of
       the update to the GPU: `update_write_ms`, the copies written to the staging belt (and, if a
@@ -1080,7 +1122,7 @@ still-view phase, at full size with batching, is the player's number.
 
 ```
 {
-  "schema_version": 18,
+  "schema_version": 19,
   "build":   { "version", "commit" },          // commit: CI builds only, else null; on a PR
                                                // build it is GitHub's merge commit, not the head
   "machine": { "gpu", "device_type", "driver", "driver_info", "backend", "os", "arch",
