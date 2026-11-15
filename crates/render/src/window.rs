@@ -63,8 +63,8 @@ impl Renderer {
         let mut config = surface
             .get_default_config(&adapter, width.max(1), height.max(1))
             .ok_or("surface is not supported by the adapter")?;
-        // The traced image already holds sRGB-encoded values, so present it to a surface that
-        // does not encode them a second time.
+        // The traced image already holds sRGB-encoded values (the true curve, in both views), so
+        // present it to a surface that does not encode them a second time.
         let formats = surface.get_capabilities(&adapter).formats;
         if let Some(format) = formats.iter().copied().find(|f| !f.is_srgb()) {
             config.format = format;

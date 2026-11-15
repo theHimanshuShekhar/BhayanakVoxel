@@ -46,7 +46,14 @@ use super::stream::StreamReport;
 ///
 /// 16 added `convergence` (#187): the convergence phase's curve, floor and lines for two views,
 /// null with `--no-convergence` or when the phase fails. Nothing else is changed.
-pub const SCHEMA_VERSION: u32 = 16;
+///
+/// 17 (#188) added to each convergence view `converged` (the mean brightness of the converged image:
+/// per channel and as luminance, of both truths) and `flip_mean_gamma22` to the floor and to each
+/// point of the curve (null unless `--flip-gamma-2-2`), and `flip_gamma22` to the block. The
+/// images the phase scores are drawn with the true sRGB curve from this version on, where they
+/// were drawn with a gamma of 2.2, so a FLIP number is not comparable with one of schema 16 or
+/// before except through `flip_mean_gamma22`. Nothing else is changed.
+pub const SCHEMA_VERSION: u32 = 17;
 
 /// One timed thing (a pass, or the GPU total of a profiler frame) in one mode, against its
 /// budget. In reference mode a profiler frame is one sample, so the entries of that mode have
@@ -543,7 +550,7 @@ mod tests {
                 "streaming_real_time"
             ]
         );
-        assert_eq!(json["schema_version"], 16);
+        assert_eq!(json["schema_version"], 17);
         assert_eq!(json["convergence"], serde_json::Value::Null);
         assert_eq!(json["streaming"], serde_json::Value::Null);
         assert_eq!(json["streaming_real_time"], serde_json::Value::Null);

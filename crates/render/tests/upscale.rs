@@ -157,7 +157,7 @@ fn primary_visibility_writes_the_distance_the_normal_and_the_albedo_of_the_first
         g.depth[middle]
     );
     assert_eq!(g.normal[middle], [0.0, 1.0, 0.0]);
-    let encoded = STONE_ALBEDO.map(|c| c.powf(1.0 / 2.2) * 255.0);
+    let encoded = STONE_ALBEDO.map(|c| f64::from(render::srgb_encode(c as f32)) * 255.0);
     for c in 0..3 {
         // Stone's colour varies a little from Voxel to Voxel.
         let got = f64::from(g.albedo[middle * 4 + c]);
@@ -320,7 +320,7 @@ fn history_that_no_longer_matches_is_thrown_away_and_the_new_colour_wins_at_once
     // And the first frame already shows the new colour, to within the variation of a Voxel's
     // colour: nothing of the old shows through.
     let soil = frame_after_the_change(DebugView::Lit);
-    let encoded = |c: [f64; 3]| c.map(|c| c.powf(1.0 / 2.2) * 255.0);
+    let encoded = |c: [f64; 3]| c.map(|c| f64::from(render::srgb_encode(c as f32)) * 255.0);
     let (new, old) = (encoded([0.3, 0.5, 0.2]), encoded(STONE_ALBEDO));
     let off =
         |p: [u8; 3], to: [f64; 3]| (0..3).map(|c| (f64::from(p[c]) - to[c]).abs()).sum::<f64>();

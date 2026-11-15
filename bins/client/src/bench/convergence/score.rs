@@ -55,6 +55,17 @@ pub fn mse(a: &[f32], b: &[f32]) -> f64 {
     sum / a.len() as f64
 }
 
+/// The 8-bit RGB image that the old display curve, a gamma of 2.2, drew from this accumulation
+/// (linear light, RGB a pixel): until #188 the player saw this, and the true sRGB curve replaced
+/// it. Rounded to the nearest level, as the unorm texture the shader writes to does. It is only
+/// for scoring the old curve beside the new one in the same run (`--flip-gamma-2-2`).
+pub fn gamma22_rgb(linear: &[f32]) -> Vec<u8> {
+    linear
+        .iter()
+        .map(|&v| (v.clamp(0.0, 1.0).powf(1.0 / 2.2) * 255.0).round() as u8)
+        .collect()
+}
+
 /// RGB bytes of an RGBA image, which is what FLIP reads.
 pub fn rgb_of_rgba(rgba: &[u8]) -> Vec<u8> {
     rgba.as_chunks::<4>()
@@ -130,6 +141,15 @@ mod tests {
         assert_eq!(mse(&[1.0, 2.0, 3.0, 4.0], &[1.0, 2.0, 3.0, 4.0]), 0.0);
         // Differences of 1 and 3 over four floats: (1 + 9) / 4.
         assert_eq!(mse(&[0.0, 0.0, 0.0, 0.0], &[1.0, 0.0, 3.0, 0.0]), 2.5);
+    }
+
+    #[test]
+    fn the_old_curve_is_a_gamma_of_2_2_clamped_and_rounded() {
+        // 0.5 ^ (1 / 2.2) = 0.7297, and the true sRGB curve gives 0.7354 there.
+        assert_eq!(
+            gamma22_rgb(&[0.0, 0.5, 1.0, 7.0, -1.0, 0.18]),
+            [0, 186, 255, 255, 0, 117]
+        );
     }
 
     #[test]

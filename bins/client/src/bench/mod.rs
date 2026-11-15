@@ -274,7 +274,7 @@ fn run(args: &Args) -> Result<u8, Box<dyn Error>> {
         let settings = if plan.patch {
             convergence::Settings::short(traced, args.truth_spp)
         } else {
-            convergence::Settings::full(traced, args.truth_spp)
+            convergence::Settings::full(traced, args.truth_spp, args.flip_gamma22)
         };
         // It is not budgeted, so a phase that fails must not take the timed results with it: not
         // by an error, and not by a panic either (the readback's `expect`s, wgpu's uncaptured-error

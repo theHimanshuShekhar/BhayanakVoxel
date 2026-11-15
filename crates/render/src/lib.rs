@@ -48,6 +48,7 @@ pub use scene::{
 };
 pub use sun::Sun;
 pub use timing::Timings;
+pub use tracer::{Fault, ReferenceOptions};
 pub use upscale::Resolution;
 pub use window::{Mode, Renderer};
 
@@ -158,6 +159,26 @@ fn read_buffer(
     let staging = staging_buffer(device, size);
     encoder.copy_buffer_to_buffer(buffer, 0, &staging, 0, size);
     finish_and_read(device, queue, encoder, &staging, size)
+}
+
+/// A linear colour component (0 is black, 1 is white) as the 8-bit image holds it, with the true
+/// sRGB curve (IEC 61966-2-1), as 0 to 1: the function `encode` in `common.wgsl` computes, for
+/// both views. Not clamped above 1, which the 8-bit image does.
+pub fn srgb_encode(linear: f32) -> f32 {
+    if linear <= 0.003_130_8 {
+        12.92 * linear
+    } else {
+        1.055 * linear.powf(1.0 / 2.4) - 0.055
+    }
+}
+
+/// The linear component of an sRGB-encoded one (0 to 1): the inverse of [`srgb_encode`].
+pub fn srgb_decode(encoded: f32) -> f32 {
+    if encoded <= 0.040_45 {
+        encoded / 12.92
+    } else {
+        ((encoded + 0.055) / 1.055).powf(2.4)
+    }
 }
 
 #[cfg(test)]
