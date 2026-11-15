@@ -11,6 +11,13 @@
 // A path that escapes collects the sky. The sun is not part of the sky, so it is never counted
 // twice. Every ray goes through trace(), the only thing that knows about the Planet's storage.
 //
+// The first surface of a path (the one the camera sees) is shaded with the smooth computed normal
+// of #202 where the Material has one (`shading_normal`, common.wgsl): the sun's cosine and the
+// bounce's cosine-weighted direction use it, while the shadow ray, and a bounce that would go
+// below the face, use the face's geometric normal, so no ray starts inside the surface. Later
+// surfaces use face normals. The camera ray's first hit is seen through the haze, which fades
+// its light, and only its light, to the horizon's colour.
+//
 // There is no fixed number of bounces. From the third surface on, a path ends by chance with
 // probability 1 - (the brightest channel of its throughput), and a path that goes on is scaled
 // up by 1 / (1 - that probability), so the expected light is exactly what it would have been
@@ -72,9 +79,8 @@ const ROULETTE_FROM = 2u;
 // The roulette's coins are hashed random numbers of their own, from here: no other dimension is.
 const ROULETTE_COIN_DIM = 0x10000000u;
 // The sun's light on a surface facing it head on, as a multiple of albedo (its irradiance
-// divided by pi): a Lambertian surface at angle theta to the sun reflects albedo * cos(theta)
-// times this.
-const SUN_RADIANCE = vec3<f32>(1.6, 1.5, 1.35);
+// divided by pi), is `frame.sun_radiance` (look.rs): a Lambertian surface at angle theta to the
+// sun reflects albedo * cos(theta) times it.
 // How far a ray starts inside the empty Voxel in front of the face it leaves, in Voxels. It
 // only has to beat the rounding of the hit position, so a ray cannot hit its own face.
 const NUDGE = 1e-3;
@@ -102,6 +108,8 @@ fn radiance(first: Ray, pixel_seed: u32, sample: u32, first_group: vec4<f32>) ->
     // The sun's samples of this surface are slots 2 and 3 of group `depth`; the bounce's of the
     // surface before are slots 0 and 1 of the same group, so one group serves both.
     var group = first_group;
+    // The distance to the camera ray's first hit, for the haze; negative if it hit nothing.
+    var first_t = -1.0;
     var max_depth = MAX_DEPTH;
     if FAULT == FAULT_FOUR_BOUNCE_CUT {
         max_depth = FAULT_CUT_SURFACES;
@@ -117,6 +125,14 @@ fn radiance(first: Ray, pixel_seed: u32, sample: u32, first_group: vec4<f32>) ->
             light += throughput * sky(ray.dir);
             break;
         }
+        if depth == 0u {
+            first_t = hit.t;
+        }
+        // The normal the surface is shaded with: smooth for the camera's first hit, else the face's.
+        var normal = hit.normal;
+        if depth == 0u {
+            normal = shading_normal(hit);
+        }
         // lighting: Per-Voxel colour variation
         let colour = surface_albedo(hit, FLAT_COLOURS);
         // lighting: Emissive Voxels
@@ -127,11 +143,11 @@ fn radiance(first: Ray, pixel_seed: u32, sample: u32, first_group: vec4<f32>) ->
         // sun's light exactly, not 0.04 % short of it. Facing away it is zero, as it was.
         // lighting: Sun and shadows
         let to_sun = sample_cone(frame.sun.xyz, frame.sun.w, group.zw);
-        let facing = dot(hit.normal, to_sun);
+        let facing = dot(normal, to_sun);
         // lighting: Sun and shadows
-        if facing > 0.0 && !trace(leave(ray, hit, to_sun)).hit {
+        if facing > 0.0 && dot(hit.normal, to_sun) > 0.0 && !trace(leave(ray, hit, to_sun)).hit {
             // lighting: Sun and shadows
-            light += throughput * colour * SUN_RADIANCE * (facing / (0.5 * (1.0 + frame.sun.w)));
+            light += throughput * colour * frame.sun_radiance.xyz * (facing / (0.5 * (1.0 + frame.sun.w)));
         }
 
         throughput *= colour;
@@ -150,8 +166,18 @@ fn radiance(first: Ray, pixel_seed: u32, sample: u32, first_group: vec4<f32>) ->
             break;
         }
         group = sample_group(pixel_seed, sample, depth + 1u, WHITE_NOISE);
-        let bounce_dir = cosine_hemisphere(hit.normal, group.xy);
+        var bounce_dir = cosine_hemisphere(normal, group.xy);
+        // A smooth normal tilts the hemisphere, so a direction can point below the face: mirror it
+        // about the face, which keeps it cosine-weighted about the face's side.
+        let below = dot(bounce_dir, hit.normal);
+        if below < 0.0 {
+            bounce_dir -= 2.0 * below * hit.normal;
+        }
         ray = leave(ray, hit, bounce_dir);
+    }
+    if first_t >= 0.0 {
+        // lighting: Sky and atmosphere
+        light = hazed(light, first_t);
     }
     return light;
 }
@@ -196,9 +222,10 @@ fn reference(@builtin(global_invocation_id) id: vec3<u32>) {
         }
     }
     accum[at] = vec4<f32>(mean, 1.0);
-    var shown = encode(mean);
+    // The light of the mean, linear: post.wgsl exposes and tones it.
+    var shown = mean;
     // A debug view replaces what is shown, not what is accumulated, so switching back to the
-    // lit image loses no samples.
+    // lit image loses no samples. Its colours are encoded already, and post.wgsl copies them.
     if frame.params.z != 0u {
         let first = camera_ray(id.xy, size, vec2<f32>(0.5));
         // lighting: Geometry (LOD and what is loaded)

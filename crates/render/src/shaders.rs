@@ -7,7 +7,7 @@
 #[cfg(test)]
 const TRACE: &str = include_str!("shaders/trace.wgsl");
 
-/// Primary visibility: the compute kernel that shades one ray per pixel.
+/// Primary visibility: the compute kernel that casts one ray per pixel and writes the G-buffer.
 pub const PRIMARY: &str = concat!(
     include_str!("shaders/trace.wgsl"),
     "\n",
@@ -15,6 +15,20 @@ pub const PRIMARY: &str = concat!(
     "\n",
     include_str!("shaders/primary.wgsl")
 );
+
+/// Primary's light: the kernels that compute the smooth normals (#202) and then shade the lit image
+/// from the G-buffer, as linear light.
+pub const SHADE: &str = concat!(
+    include_str!("shaders/trace.wgsl"),
+    "\n",
+    include_str!("shaders/common.wgsl"),
+    "\n",
+    include_str!("shaders/shade.wgsl")
+);
+
+/// The display transform (#202): auto-exposure, bloom and the tone curve, on either view's linear
+/// image. It reads no Planet and no light of its own, so it is a module of its own.
+pub const POST: &str = include_str!("shaders/post.wgsl");
 
 /// The reference path tracer: the compute kernel that adds one sample per pixel.
 pub const PATHTRACE: &str = concat!(
@@ -66,6 +80,32 @@ mod tests {
         assert_eq!(entry_points(PRIMARY), ["primary"]);
         assert!(PRIMARY.contains("fn trace(ray: Ray) -> Hit"));
         assert!(PRIMARY.contains("trace(ray)"));
+    }
+
+    #[test]
+    fn the_shade_kernels_are_valid_wgsl_and_cast_no_ray() {
+        assert_eq!(entry_points(SHADE), ["normals", "shade_pass"]);
+        // The smooth normal reads the Planet through `solid_at` of trace.wgsl, and the light is
+        // drawn from what primary visibility found: no ray of its own.
+        assert!(!include_str!("shaders/shade.wgsl").contains("trace("));
+    }
+
+    #[test]
+    fn the_post_module_is_valid_wgsl_and_touches_neither_the_planet_nor_the_accumulation() {
+        assert_eq!(
+            entry_points(POST),
+            [
+                "exposure",
+                "exposure_adapt",
+                "bloom_down",
+                "bloom_h",
+                "bloom_v",
+                "tone"
+            ]
+        );
+        for storage in ["trace(", "scene.", "bricks[", "accum", "frame."] {
+            assert!(!POST.contains(storage), "post.wgsl reads {storage}");
+        }
     }
 
     #[test]
@@ -165,7 +205,7 @@ mod tests {
 
     /// The bindings the shaders have, none of which is a source of light that has no row. A new
     /// one fails the check until it is added here with a decision.
-    const BINDINGS: [&str; 12] = [
+    const BINDINGS: [&str; 15] = [
         "scene",
         "table",
         "regions",
@@ -177,16 +217,21 @@ mod tests {
         "materials",
         "accum",
         "gbuffer",
+        "surface",
+        "shading_normals_out",
+        "shading_normals",
         "probe_rays",
     ];
 
     /// The shader files, all of them known: a new one is neither of a view nor checked until it is
     /// listed here.
-    const FILES: [&str; 8] = [
+    const FILES: [&str; 10] = [
         "trace.wgsl",
         "common.wgsl",
         "sampling.wgsl",
         "primary.wgsl",
+        "shade.wgsl",
+        "post.wgsl",
         "pathtrace.wgsl",
         "probe.wgsl",
         "upscale.wgsl",
@@ -212,6 +257,11 @@ mod tests {
         ("trace.wgsl", include_str!("shaders/trace.wgsl")),
         ("common.wgsl", include_str!("shaders/common.wgsl")),
         ("primary.wgsl", include_str!("shaders/primary.wgsl")),
+    ];
+    const SHADE_FILES: [(&str, &str); 3] = [
+        ("trace.wgsl", include_str!("shaders/trace.wgsl")),
+        ("common.wgsl", include_str!("shaders/common.wgsl")),
+        ("shade.wgsl", include_str!("shaders/shade.wgsl")),
     ];
     const PATHTRACE_FILES: [(&str, &str); 4] = [
         ("trace.wgsl", include_str!("shaders/trace.wgsl")),
@@ -315,6 +365,7 @@ mod tests {
         let join =
             |files: &[(&str, &str)]| files.iter().map(|(_, s)| *s).collect::<Vec<_>>().join("\n");
         assert_eq!(join(&PRIMARY_FILES), PRIMARY);
+        assert_eq!(join(&SHADE_FILES), SHADE);
         assert_eq!(join(&PATHTRACE_FILES), PATHTRACE);
     }
 
@@ -348,13 +399,14 @@ mod tests {
         let rows = table_rows();
         for (name, files) in [
             ("Primary", &PRIMARY_FILES[..]),
+            ("Primary's light", &SHADE_FILES[..]),
             ("the Reference", &PATHTRACE_FILES[..]),
         ] {
             let problems = lighting_problems(files, &rows);
             assert!(problems.is_empty(), "{name}: {problems:#?}");
         }
         // And both really name some: the check is not passing on an empty shader.
-        for source in [PRIMARY, PATHTRACE] {
+        for source in [PRIMARY, SHADE, PATHTRACE] {
             assert!(source.matches("// lighting:").count() >= 4);
         }
     }
@@ -388,7 +440,12 @@ mod tests {
         // The kernels' own files, not `common.wgsl`, which both are joined from: a feature marked
         // there would count for the Reference whichever kernel it was for.
         let reference = named(include_str!("shaders/pathtrace.wgsl"));
-        for feature in named(include_str!("shaders/primary.wgsl")) {
+        let primary = [
+            named(include_str!("shaders/primary.wgsl")),
+            named(include_str!("shaders/shade.wgsl")),
+        ]
+        .concat();
+        for feature in primary {
             let state = table_rows()
                 .into_iter()
                 .find(|(row, _)| *row == feature)
@@ -490,6 +547,7 @@ mod tests {
         assert_eq!(common.matches("fn varied_albedo(").count(), 1);
         for (name, source) in [
             ("primary.wgsl", include_str!("shaders/primary.wgsl")),
+            ("shade.wgsl", include_str!("shaders/shade.wgsl")),
             ("pathtrace.wgsl", include_str!("shaders/pathtrace.wgsl")),
         ] {
             assert!(
@@ -520,6 +578,8 @@ mod tests {
             include_str!("shaders/sampling.wgsl"),
             include_str!("shaders/pathtrace.wgsl"),
             include_str!("shaders/primary.wgsl"),
+            include_str!("shaders/shade.wgsl"),
+            include_str!("shaders/post.wgsl"),
             include_str!("shaders/probe.wgsl"),
             UPSCALE,
             BLIT,

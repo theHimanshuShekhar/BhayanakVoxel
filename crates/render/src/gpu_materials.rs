@@ -9,13 +9,13 @@
 //! | 0    | base colour (linear RGB)        | roughness        |
 //! | 1    | noise scale (Voxels), hue jitter (radians), value jitter | metalness |
 //! | 2    | emitted light: colour times intensity | unused     |
-//! | 3    | transparency, IOR, `defined` (1 if the table has the id) | unused |
+//! | 3    | transparency, IOR, `defined` (1 if the table has the id) | `smooth` (1 if the surface is shaded with smooth computed normals: every Material that is not a Building one, #202) |
 //!
 //! The ids are 16 bits, so the table is at most 64 Ki records of 64 bytes. Hardness, density and
 //! the Fluid kind are for the simulation, not the shaders, so they are not here. Keep the layout
 //! in step with `materials` in `common.wgsl`.
 
-use materials::MaterialTable;
+use materials::{Category, MaterialTable};
 
 /// `vec4<f32>`s per Material record.
 pub const RECORD_VEC4S: usize = 4;
@@ -36,7 +36,14 @@ pub fn pack(table: &MaterialTable) -> Vec<[f32; 4]> {
                 d.metalness,
             ],
             [er, eg, eb, 0.0],
-            [d.transparency, d.ior, 1.0, 0.0],
+            [
+                d.transparency,
+                d.ior,
+                1.0,
+                // Built Materials keep their face normals: a wall is flat, and its edges are meant to
+                // be hard. The rest (the ground, rock, crystals) are shaded smooth.
+                f32::from(d.category != Category::Building),
+            ],
         ]);
     }
     packed
@@ -72,7 +79,34 @@ mod tests {
         assert_eq!(r[1][2], lava.value_jitter);
         // Emitted light is colour times intensity.
         assert_eq!(r[2][0], lava.emissive[0] * lava.emissive_intensity);
-        assert_eq!(r[3], [lava.transparency, lava.ior, 1.0, 0.0]);
+        assert_eq!(r[3], [lava.transparency, lava.ior, 1.0, 1.0]);
+    }
+
+    #[test]
+    fn only_built_materials_keep_their_face_normals() {
+        let table = MaterialTable::built_in();
+        let packed = pack(table);
+        for d in table.defs() {
+            let smooth = record(&packed, d.id)[3][3];
+            assert_eq!(
+                smooth,
+                f32::from(d.category != Category::Building),
+                "{}",
+                d.name
+            );
+        }
+        assert!(
+            table
+                .defs()
+                .iter()
+                .any(|d| record(&packed, d.id)[3][3] == 0.0)
+        );
+        assert!(
+            table
+                .defs()
+                .iter()
+                .any(|d| record(&packed, d.id)[3][3] == 1.0)
+        );
     }
 
     #[test]

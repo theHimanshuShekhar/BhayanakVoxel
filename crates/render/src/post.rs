@@ -1,0 +1,518 @@
+//! The art direction's display transform (#202, the owner's picks of #148): auto-exposure, bloom
+//! and the tone curve, run on the linear HDR image of a view. The CPU side of
+//! `shaders/post.wgsl`, which says what each pass does.
+//!
+//! It runs on both views' images (ADR 0005): Primary's lit image before the upscaler, and the
+//! Reference view's mean (as a copy of it, never the accumulation itself) before the copy to the
+//! window. It lights nothing and changes nothing a view accumulates, and each stage can be
+//! switched off ([`Stages`]), so that the dev can see what it does.
+//!
+//! The numbers are the prototype's, as rendered (#200, `bench/lookdev/post.rs`):
+//! - **Tone curve:** Khronos PBR Neutral, then the sRGB curve of the image.
+//! - **Auto-exposure:** the scene's log-average luminance to middle grey 0.18, within 0.125 to 32
+//!   (-3 to +5 stops), adapting in stops with `k = 1 - e^(-dt / tau)`, tau 2.5 s. The Reference
+//!   view's still frames use the settled exposure (`k = 1`).
+//! - **Bloom:** 0.05 of the mean of the exposed image blurred at three scales. The Gaussians'
+//!   standard deviations are `[2.5, 7, 18] * width / 640` pixels of the image they are of: 5, 14 and
+//!   36 px of a 1280-wide image and 10, 28 and 72 px of a 2560-wide one (the prototype scaled them
+//!   by `width / 640`, and its sheet was 1280 wide). The blurs are made at a quarter of the size,
+//!   so that the widest costs 109 taps and not 433.
+
+use bytemuck::{Pod, Zeroable};
+
+use crate::profiler::Profiler;
+use crate::shaders;
+use crate::tracer::{
+    Plane, buffer_binding, buffer_entry, layout_entry, plane_entry, storage_texture,
+};
+
+/// Format of the linear HDR images that the kernels draw and this transform reads.
+pub const HDR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
+
+/// How much of the bloom is added to the exposed image.
+pub const BLOOM_STRENGTH: f32 = 0.05;
+/// The bloom's three Gaussians, as standard deviations in pixels of an image 640 wide.
+pub const BLOOM_SIGMAS: [f32; 3] = [2.5, 7.0, 18.0];
+/// The width that [`BLOOM_SIGMAS`] are for.
+pub const BLOOM_WIDTH: f32 = 640.0;
+/// How much smaller than the image the blurs are made, along each axis.
+const BLOOM_DOWN: u32 = 4;
+
+/// The grey that auto-exposure puts the scene's mean at.
+pub const MIDDLE_GREY: f32 = 0.18;
+/// The exposures auto-exposure may reach: -3 and +5 stops.
+pub const EXPOSURE_RANGE: (f32, f32) = (0.125, 32.0);
+/// The time constant of the exposure's adaptation, in seconds.
+pub const ADAPTATION_TAU: f32 = 2.5;
+
+/// The workgroup size of the exposure's first pass, in each direction (`exposure` in `post.wgsl`).
+const EXPOSURE_TILE: u32 = 16;
+
+/// The stages of the art direction that can be switched off, for comparison. All on is the game.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Stages {
+    /// The Khronos PBR Neutral tone curve. Off, light above 1 is white, as before #202.
+    pub tone: bool,
+    /// Auto-exposure. Off, the exposure is 1.
+    pub exposure: bool,
+    pub bloom: bool,
+    /// Smooth computed normals on natural Materials. Off, every hit has its face's normal.
+    pub smooth_normals: bool,
+}
+
+impl Stages {
+    /// Every stage off: what the renderer drew before #202, bar the light's palette.
+    pub const NONE: Stages = Stages {
+        tone: false,
+        exposure: false,
+        bloom: false,
+        smooth_normals: false,
+    };
+}
+
+impl Default for Stages {
+    fn default() -> Self {
+        Self {
+            tone: true,
+            exposure: true,
+            bloom: true,
+            smooth_normals: true,
+        }
+    }
+}
+
+/// The standard deviations, in pixels of an image `width` wide, of the bloom's three blurs.
+pub fn bloom_sigmas(width: u32) -> [f32; 3] {
+    BLOOM_SIGMAS.map(|s| s * width as f32 / BLOOM_WIDTH)
+}
+
+/// The exposure that puts a scene whose mean log luminance (natural log) is `mean_log_luminance`
+/// at middle grey, within [`EXPOSURE_RANGE`]: the settled exposure.
+pub fn settled_exposure(mean_log_luminance: f32) -> f32 {
+    (MIDDLE_GREY / mean_log_luminance.exp()).clamp(EXPOSURE_RANGE.0, EXPOSURE_RANGE.1)
+}
+
+/// The share of the way to the settled exposure that `dt` seconds covers: `1 - e^(-dt / tau)`.
+pub fn adaptation_rate(dt: f32) -> f32 {
+    1.0 - (-dt.max(0.0) / ADAPTATION_TAU).exp()
+}
+
+/// The Khronos PBR Neutral tone mapper on one linear colour: the CPU twin of `neutral` in
+/// `post.wgsl`, for tests.
+pub fn neutral(colour: [f32; 3]) -> [f32; 3] {
+    const START_COMPRESSION: f32 = 0.8 - 0.04;
+    const DESATURATION: f32 = 0.15;
+    let lowest = colour[0].min(colour[1]).min(colour[2]);
+    let offset = if lowest < 0.08 {
+        lowest - 6.25 * lowest * lowest
+    } else {
+        0.04
+    };
+    let c = colour.map(|x| x - offset);
+    let peak = c[0].max(c[1]).max(c[2]);
+    if peak < START_COMPRESSION {
+        return c;
+    }
+    let d = 1.0 - START_COMPRESSION;
+    let new_peak = 1.0 - d * d / (peak + d - START_COMPRESSION);
+    let c = c.map(|x| x * new_peak / peak);
+    let g = 1.0 - 1.0 / (DESATURATION * (peak - new_peak) + 1.0);
+    c.map(|x| x + (new_peak - x) * g)
+}
+
+/// The time between frames that have no clock of their own (the bench's flight, the tests): a
+/// 60 Hz frame, so that what they draw does not depend on how fast the machine is.
+pub const NOMINAL_FRAME: f32 = 1.0 / 60.0;
+
+/// `Post` in `post.wgsl`.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct PostUniform {
+    sizes: [u32; 4],
+    stages: [u32; 4],
+    params: [f32; 4],
+    sigmas: [f32; 4],
+    counts: [u32; 4],
+}
+
+/// The images of the passes at one size, which a view of that size owns: the exposure's partial
+/// sums, and the bloom's quarter-size images.
+pub(crate) struct Scratch {
+    size: (u32, u32),
+    quarter: (u32, u32),
+    /// One partial sum for each workgroup of the exposure's first pass.
+    partials: wgpu::Buffer,
+    partial_count: u32,
+    down: Plane,
+    blurred: [Plane; 3],
+    bloom: Plane,
+}
+
+impl Scratch {
+    pub fn new(device: &wgpu::Device, size: (u32, u32)) -> Self {
+        let quarter = (
+            size.0.div_ceil(BLOOM_DOWN).max(1),
+            size.1.div_ceil(BLOOM_DOWN).max(1),
+        );
+        let partial_count = size.0.div_ceil(EXPOSURE_TILE) * size.1.div_ceil(EXPOSURE_TILE);
+        let plane = |label: &str| Plane::new(device, label, quarter, HDR_FORMAT);
+        Self {
+            size,
+            quarter,
+            partials: device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("exposure partial sums"),
+                size: u64::from(partial_count.max(1)) * 4,
+                usage: wgpu::BufferUsages::STORAGE,
+                mapped_at_creation: false,
+            }),
+            partial_count,
+            down: plane("bloom down"),
+            blurred: [
+                plane("bloom blur 0"),
+                plane("bloom blur 1"),
+                plane("bloom blur 2"),
+            ],
+            bloom: plane("bloom"),
+        }
+    }
+}
+
+/// The passes, and the exposure they keep from frame to frame. Views share one, so that the
+/// exposure carries from Primary to the Reference view and back.
+pub(crate) struct Post {
+    uniform: wgpu::Buffer,
+    /// The exposure's state (`exposure_state` in `post.wgsl`): in stops, as an exposure, and
+    /// whether it has been set.
+    state: wgpu::Buffer,
+    sampler: wgpu::Sampler,
+    exposure: Pipeline,
+    adapt: Pipeline,
+    down: Pipeline,
+    blur_h: Pipeline,
+    blur_v: Pipeline,
+    tone: Pipeline,
+}
+
+/// A compute pipeline and the layout of its one bind group.
+struct Pipeline {
+    pipeline: wgpu::ComputePipeline,
+    layout: wgpu::BindGroupLayout,
+}
+
+impl Post {
+    pub fn new(device: &wgpu::Device) -> Self {
+        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("post"),
+            source: wgpu::ShaderSource::Wgsl(shaders::POST.into()),
+        });
+        let uniform = layout_entry(0, buffer_binding(wgpu::BufferBindingType::Uniform));
+        let texture = |binding, filterable| {
+            layout_entry(
+                binding,
+                wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+            )
+        };
+        let storage = |binding, format| layout_entry(binding, storage_texture(format));
+        let buffer = |binding| {
+            layout_entry(
+                binding,
+                buffer_binding(wgpu::BufferBindingType::Storage { read_only: false }),
+            )
+        };
+        let pipeline = |name: &str, entries: &[wgpu::BindGroupLayoutEntry]| {
+            let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some(name),
+                entries,
+            });
+            let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some(name),
+                bind_group_layouts: &[Some(&layout)],
+                immediate_size: 0,
+            });
+            let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some(name),
+                layout: Some(&pipeline_layout),
+                module: &module,
+                entry_point: Some(name),
+                compilation_options: Default::default(),
+                cache: None,
+            });
+            Pipeline { pipeline, layout }
+        };
+        let hdr = HDR_FORMAT;
+        Self {
+            uniform: device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("post"),
+                size: size_of::<PostUniform>() as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }),
+            state: device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("exposure state"),
+                size: 16,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            }),
+            sampler: device.create_sampler(&wgpu::SamplerDescriptor {
+                label: Some("bloom"),
+                mag_filter: wgpu::FilterMode::Linear,
+                min_filter: wgpu::FilterMode::Linear,
+                ..Default::default()
+            }),
+            exposure: pipeline("exposure", &[uniform, texture(1, false), buffer(2)]),
+            adapt: pipeline("exposure_adapt", &[uniform, buffer(2), buffer(3)]),
+            down: pipeline("bloom_down", &[uniform, texture(1, false), storage(4, hdr)]),
+            blur_h: pipeline(
+                "bloom_h",
+                &[
+                    uniform,
+                    texture(5, false),
+                    storage(6, hdr),
+                    storage(7, hdr),
+                    storage(8, hdr),
+                ],
+            ),
+            blur_v: pipeline(
+                "bloom_v",
+                &[
+                    uniform,
+                    texture(9, false),
+                    texture(10, false),
+                    texture(11, false),
+                    storage(12, hdr),
+                ],
+            ),
+            tone: pipeline(
+                "tone",
+                &[
+                    uniform,
+                    texture(1, false),
+                    buffer(3),
+                    texture(13, true),
+                    layout_entry(
+                        14,
+                        wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    ),
+                    storage(15, wgpu::TextureFormat::Rgba8Unorm),
+                ],
+            ),
+        }
+    }
+
+    /// Records the passes that turn the linear image `hdr` (of the size `scratch` is for) into the
+    /// 8-bit image `shown`, each timed by `profiler`.
+    ///
+    /// `passthrough` says that `hdr` holds a debug view's colours (already encoded): they are
+    /// copied as they are. `rate` is how far the exposure moves to its settled value this frame
+    /// ([`adaptation_rate`]; 1 settles it at once). The uniforms are written when this is called.
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        profiler: &mut Profiler,
+        encoder: &mut wgpu::CommandEncoder,
+        hdr: &Plane,
+        scratch: &Scratch,
+        shown: &Plane,
+        stages: Stages,
+        passthrough: bool,
+        rate: f32,
+    ) {
+        let (width, height) = scratch.size;
+        let sigmas = bloom_sigmas(width).map(|s| s / BLOOM_DOWN as f32);
+        queue.write_buffer(
+            &self.uniform,
+            0,
+            bytemuck::bytes_of(&PostUniform {
+                sizes: [width, height, scratch.quarter.0, scratch.quarter.1],
+                stages: [
+                    u32::from(stages.tone),
+                    u32::from(stages.exposure),
+                    u32::from(stages.bloom),
+                    u32::from(passthrough),
+                ],
+                params: [BLOOM_STRENGTH, rate.clamp(0.0, 1.0), 0.0, 0.0],
+                sigmas: [sigmas[0], sigmas[1], sigmas[2], 0.0],
+                counts: [scratch.partial_count, 0, 0, 0],
+            }),
+        );
+        let group = |pipeline: &Pipeline, entries: &[wgpu::BindGroupEntry<'_>]| {
+            device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("post"),
+                layout: &pipeline.layout,
+                entries,
+            })
+        };
+        let buffer = buffer_entry;
+        let view = plane_entry;
+        let uniform = buffer(0, &self.uniform);
+        let mut run = |name: &str,
+                       pipeline: &Pipeline,
+                       group: wgpu::BindGroup,
+                       size: (u32, u32),
+                       tile: u32| {
+            let mut pass = profiler.compute_pass(encoder, name);
+            pass.set_pipeline(&pipeline.pipeline);
+            pass.set_bind_group(0, &group, &[]);
+            pass.dispatch_workgroups(size.0.div_ceil(tile), size.1.div_ceil(tile), 1);
+        };
+        // A debug view's colours are what they are: nothing to expose or blur.
+        if !passthrough {
+            if stages.exposure {
+                run(
+                    "exposure",
+                    &self.exposure,
+                    group(
+                        &self.exposure,
+                        &[uniform.clone(), view(1, hdr), buffer(2, &scratch.partials)],
+                    ),
+                    scratch.size,
+                    EXPOSURE_TILE,
+                );
+                // One workgroup, which sums the partial sums.
+                run(
+                    "exposure_adapt",
+                    &self.adapt,
+                    group(
+                        &self.adapt,
+                        &[
+                            uniform.clone(),
+                            buffer(2, &scratch.partials),
+                            buffer(3, &self.state),
+                        ],
+                    ),
+                    (256, 1),
+                    256,
+                );
+            }
+            if stages.bloom {
+                run(
+                    "bloom_down",
+                    &self.down,
+                    group(
+                        &self.down,
+                        &[uniform.clone(), view(1, hdr), view(4, &scratch.down)],
+                    ),
+                    scratch.quarter,
+                    8,
+                );
+                run(
+                    "bloom_h",
+                    &self.blur_h,
+                    group(
+                        &self.blur_h,
+                        &[
+                            uniform.clone(),
+                            view(5, &scratch.down),
+                            view(6, &scratch.blurred[0]),
+                            view(7, &scratch.blurred[1]),
+                            view(8, &scratch.blurred[2]),
+                        ],
+                    ),
+                    scratch.quarter,
+                    8,
+                );
+                run(
+                    "bloom_v",
+                    &self.blur_v,
+                    group(
+                        &self.blur_v,
+                        &[
+                            uniform.clone(),
+                            view(9, &scratch.blurred[0]),
+                            view(10, &scratch.blurred[1]),
+                            view(11, &scratch.blurred[2]),
+                            view(12, &scratch.bloom),
+                        ],
+                    ),
+                    scratch.quarter,
+                    8,
+                );
+            }
+        }
+        run(
+            "tone",
+            &self.tone,
+            group(
+                &self.tone,
+                &[
+                    uniform,
+                    view(1, hdr),
+                    buffer(3, &self.state),
+                    view(13, &scratch.bloom),
+                    wgpu::BindGroupEntry {
+                        binding: 14,
+                        resource: wgpu::BindingResource::Sampler(&self.sampler),
+                    },
+                    view(15, shown),
+                ],
+            ),
+            scratch.size,
+            8,
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_bloom_sigmas_are_the_prototypes_scaled_by_the_width_over_640() {
+        // The source is the prototype's `width / 640`; the owner picked from a 1280-wide sheet.
+        assert_eq!(bloom_sigmas(640), [2.5, 7.0, 18.0]);
+        assert_eq!(bloom_sigmas(1280), [5.0, 14.0, 36.0]);
+        assert_eq!(bloom_sigmas(2560), [10.0, 28.0, 72.0]);
+    }
+
+    #[test]
+    fn the_exposure_puts_the_mean_at_middle_grey_within_minus_three_and_plus_five_stops() {
+        // A scene whose log-average luminance is 0.36 is brought down by a stop.
+        assert!((settled_exposure(0.36f32.ln()) - 0.5).abs() < 1e-6);
+        assert_eq!(
+            settled_exposure(1e-6f32.ln()),
+            32.0,
+            "a dark scene: +5 stops"
+        );
+        assert_eq!(
+            settled_exposure(1e3f32.ln()),
+            0.125,
+            "a bright one: -3 stops"
+        );
+    }
+
+    #[test]
+    fn the_exposure_adapts_by_one_minus_e_to_the_minus_dt_over_tau() {
+        assert_eq!(adaptation_rate(0.0), 0.0);
+        assert!((adaptation_rate(ADAPTATION_TAU) - (1.0 - (-1.0f32).exp())).abs() < 1e-6);
+        assert!(adaptation_rate(1.0 / 60.0) < adaptation_rate(1.0 / 30.0));
+        assert!(adaptation_rate(1e6) > 0.999_999);
+        assert_eq!(adaptation_rate(-1.0), 0.0, "time does not run backwards");
+    }
+
+    #[test]
+    fn the_tone_curve_is_the_identity_less_its_toe_until_it_rolls_off_towards_one() {
+        // Khronos PBR Neutral: below the start of the shoulder, the colour less the toe's offset.
+        let c = neutral([0.3, 0.3, 0.3]);
+        assert!(c.iter().all(|&x| (x - 0.26).abs() < 1e-6), "{c:?}");
+        // Black stays black.
+        assert_eq!(neutral([0.0; 3]), [0.0; 3]);
+        // Monotone, and never over 1, however bright.
+        let mut last = 0.0;
+        for i in 0..200 {
+            let v = neutral([i as f32 * 0.5; 3])[0];
+            assert!(v >= last && v <= 1.0, "{i}: {v}");
+            last = v;
+        }
+        assert!(neutral([1000.0; 3])[0] > 0.99);
+        // Very bright colours desaturate towards white.
+        let hot = neutral([40.0, 10.0, 2.0]);
+        let cool = neutral([4.0, 1.0, 0.2]);
+        assert!(hot[2] / hot[0] > cool[2] / cool[0]);
+    }
+}

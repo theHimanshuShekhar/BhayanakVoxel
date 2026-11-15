@@ -99,6 +99,7 @@ fn box_estimate(albedo: f32, fault: Fault, size: u32, samples: u32) -> (f64, f64
         &table(albedo, emission, 1.0, 0.0),
     )
     .unwrap();
+    offscreen.use_legacy_light();
     offscreen.set_reference_options(ReferenceOptions {
         flat_colours: true,
         fault,
@@ -235,6 +236,7 @@ fn the_suns_light_is_its_radiance_with_the_cones_cosine_factor_divided_out() {
     let image = |sun: Sun| {
         let mut offscreen =
             Offscreen::with_materials(Resolution::native(SIZE, SIZE), &scene, &table).unwrap();
+        offscreen.use_legacy_light();
         offscreen.set_reference_options(ReferenceOptions {
             flat_colours: true,
             ..Default::default()
@@ -296,6 +298,7 @@ fn share_that_follow_primarys_colours(flat_colours: bool) -> f64 {
     let size = 64;
     let mut offscreen =
         Offscreen::with_materials(Resolution::native(size, size), &scene, &table).unwrap();
+    offscreen.use_legacy_light();
     offscreen.set_reference_options(ReferenceOptions {
         flat_colours,
         ..Default::default()

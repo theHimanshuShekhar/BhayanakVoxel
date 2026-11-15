@@ -22,16 +22,20 @@ pub enum DebugView {
     /// (just one: a new camera, or history that the clamp threw away) to yellow (16, the most).
     /// In the reference image it is the sample count.
     HistoryLength,
+    /// The normal the first hit is shaded with, as `(n + 1) / 2` in RGB: the smooth computed normal
+    /// (#202) for natural Materials where that stage is on, the face's otherwise. The sky is black.
+    ShadingNormals,
 }
 
 impl DebugView {
-    pub const ALL: [DebugView; 6] = [
+    pub const ALL: [DebugView; 7] = [
         Self::Lit,
         Self::Normals,
         Self::Albedo,
         Self::Depth,
         Self::SampleCount,
         Self::HistoryLength,
+        Self::ShadingNormals,
     ];
 
     /// The number the shaders switch on.
@@ -47,6 +51,7 @@ impl DebugView {
             Self::Depth => "Depth",
             Self::SampleCount => "Sample count",
             Self::HistoryLength => "History length",
+            Self::ShadingNormals => "Shading normals",
         }
     }
 

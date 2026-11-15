@@ -293,6 +293,26 @@ impl Offscreen {
         self.sun = sun;
     }
 
+    /// Sets the light's palette (see [`Look`](crate::Look)): hero light B by default.
+    pub fn set_look(&mut self, look: crate::look::Look) {
+        self.tracer.set_look(look);
+    }
+
+    /// Switches the stages of the art direction (see [`Stages`](crate::Stages)); all on by default.
+    pub fn set_stages(&mut self, stages: crate::post::Stages) {
+        self.tracer.set_stages(stages);
+    }
+
+    /// The light and display the renderer had before #202: [`Look::LEGACY`](crate::Look::LEGACY)
+    /// and no stage of the art direction ([`Stages::NONE`](crate::Stages::NONE)), so that the lit
+    /// image is the sRGB encoding of the light of the old constants. For the tests whose answers
+    /// are worked out from those constants, and the bench's convergence phase, whose numbers are
+    /// compared from report to report.
+    pub fn use_legacy_light(&mut self) {
+        self.set_look(crate::look::Look::LEGACY);
+        self.set_stages(crate::post::Stages::NONE);
+    }
+
     /// Chooses what is drawn: the lit image, or one of the debug views.
     pub fn set_debug_view(&mut self, view: DebugView) {
         self.tracer.set_debug_view(view);

@@ -950,11 +950,8 @@ impl App {
     fn set_sun(&mut self, azimuth: f32, elevation: f32) {
         self.sun = normalize_sun(azimuth, elevation);
         if let Some(renderer) = &mut self.renderer {
-            renderer.set_sun(Sun::from_angles(
-                self.sun.0,
-                self.sun.1,
-                Sun::default().angular_radius(),
-            ));
+            // In the camera's local frame, so the sun keeps its height over the whole Planet.
+            renderer.set_local_sun(self.sun.0, self.sun.1, Sun::default().angular_radius());
         }
     }
 
@@ -1006,6 +1003,7 @@ impl App {
             mode: renderer.mode(),
             debug_view: renderer.debug_view(),
             sun: self.sun,
+            stages: renderer.stages(),
             bias: self.bias,
         };
         let mut controls = before;
@@ -1068,6 +1066,9 @@ impl App {
         }
         if controls.debug_view != before.debug_view {
             renderer.set_debug_view(controls.debug_view);
+        }
+        if controls.stages != before.stages {
+            renderer.set_stages(controls.stages);
         }
         if controls.sun != before.sun {
             self.set_sun(controls.sun.0, controls.sun.1);

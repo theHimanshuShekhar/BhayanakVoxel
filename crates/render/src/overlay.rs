@@ -7,6 +7,7 @@ use materials::MaterialTable;
 
 use crate::cpu::{CpuBreakdown, Row};
 use crate::debug_view::DebugView;
+use crate::post::Stages;
 use crate::timing::{Series, Timings};
 use crate::window::Mode;
 
@@ -18,6 +19,8 @@ pub struct Controls {
     pub debug_view: DebugView,
     /// The sun's azimuth and elevation in radians (see [`Sun::from_angles`](crate::Sun)).
     pub sun: (f32, f32),
+    /// Which stages of the art direction are on (see [`Stages`]).
+    pub stages: Stages,
     /// The LOD bias: output pixels one Voxel may cover (see [`Bands`](crate::lod::Bands)). It
     /// changes when the slider is let go, not while it is dragged, since selecting the bricks
     /// again takes a moment.
@@ -349,6 +352,13 @@ pub fn show(ctx: &Context, info: &Info, controls: &mut Controls) {
             {
                 controls.sun.1 = degrees[1].to_radians();
             }
+            ui.label("Art direction");
+            ui.horizontal_wrapped(|ui| {
+                ui.checkbox(&mut controls.stages.tone, "tone curve");
+                ui.checkbox(&mut controls.stages.exposure, "exposure");
+                ui.checkbox(&mut controls.stages.bloom, "bloom");
+                ui.checkbox(&mut controls.stages.smooth_normals, "smooth normals");
+            });
             ui.weak("N: walk / noclip, arrows: sun, V: view, F1: hide, Esc: free the mouse");
             ui.weak(TOOL_HELP);
         });
@@ -385,6 +395,7 @@ mod tests {
             mode: Mode::Primary,
             debug_view: DebugView::Lit,
             sun: (0.5, 0.8),
+            stages: Stages::default(),
             bias: 1.0,
         }
     }
@@ -587,6 +598,7 @@ mod tests {
             mode: Mode::Reference,
             debug_view: DebugView::Depth,
             sun: (0.5, 0.8),
+            stages: Stages::default(),
             bias: 1.0,
         };
         let before = controls;

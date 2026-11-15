@@ -1210,6 +1210,32 @@ pass is named by the string given to `Profiler::compute_pass`). `reference` has 
 its 3.0 ms (a sample, pass and total) catches a gross regression, set from the first real run on the
 4090, which measured a mean of 1.10 ms.
 
+## The art direction's passes (#202)
+
+The exposure, bloom, tone curve and smooth normals are passes of their own, so each has a line in
+`passes[]` with its own timing (the bench reports every pass generically; there is no schema
+change). Names, in the order they run in a Primary frame:
+
+| Pass | What it is | Budget |
+| --- | --- | --- |
+| `primary` | primary visibility and the G-buffer (it no longer lights) | 1.0 (existing) |
+| `normals` | the smooth normal of every hit (the cost of the smooth normals, alone) | none yet |
+| `shade` | the lit image, as linear light, from the G-buffer | none yet |
+| `exposure`, `exposure_adapt` | the log-average luminance and the adapted exposure | none yet |
+| `bloom_down`, `bloom_h`, `bloom_v` | the bloom, at a quarter of the size | none yet |
+| `tone` | exposure, bloom and tone curve into the encoded image | none yet |
+| `upscale` | the TAAU pass | 0.5 (existing) |
+
+The Reference view runs the same passes after `reference` (not `normals` or `shade`: it smooths and
+lights inside its own pass). **`primary` now excludes the lighting and the smooth normals that it
+used to include**, so its line and the budget on it are not comparable with an earlier report's:
+add `normals` and `shade` to it. #10 gave the whole of tone, exposure and bloom ("post") 0.5 ms
+and `gpu_total.primary` 8.6 ms; the new passes have no budget of their own yet, because the first
+number comes from the 4090: set them from that run (uncomment or add them in
+`bins/client/bench-budgets.toml`, named as above). The convergence phase runs on the old light with
+every stage off (`Offscreen::use_legacy_light`), so its numbers are comparable with reports before
+#202.
+
 ## The look-dev shot list
 
 `bins/client/src/bench/lookdev.rs` (#148) is a recorded camera path for judging the art direction
