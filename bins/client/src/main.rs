@@ -1015,6 +1015,7 @@ impl App {
             present_mode: renderer.present_mode(),
             timers_supported: renderer.timers_supported(),
             samples: renderer.samples(),
+            samples_per_frame: renderer.samples_per_frame(),
             // Only said while there is something that waits.
             loading_paused: self
                 .world

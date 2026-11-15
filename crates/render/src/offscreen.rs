@@ -1,10 +1,12 @@
 //! Rendering without a window, into a texture that is read back: for tests and tools.
 
 use crate::camera::Camera;
+use crate::composite::Composite;
 use crate::debug_view::DebugView;
 use crate::profiler::Profiler;
 use crate::reference::{Hit, Ray};
 use crate::scene::{Scene, SceneUpdate};
+use crate::still::Plan;
 use crate::sun::Sun;
 use crate::timing::Timings;
 use crate::tracer::{Plane, ReferenceOptions, Target, Tracer};
@@ -132,6 +134,28 @@ pub struct DrawTimes {
     pub gpu: Option<GpuPasses>,
 }
 
+/// What [`Offscreen::draw_frame`] drew.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FrameDrawn {
+    /// What the still-frame policy said: Primary, or a batch of the Reference view and how far its
+    /// fade is.
+    pub plan: Plan,
+    /// Samples in the reference image after the frame (0 after a Primary frame).
+    pub samples: u32,
+    /// The GPU's time for the Reference pass of this frame, in milliseconds: the whole batch.
+    /// None for a Primary frame, or where the time did not come in or the device has no timers.
+    pub reference_ms: Option<f64>,
+    /// How long the frame took from the start of its encoding until the GPU was done, wall clock.
+    pub wall: std::time::Duration,
+}
+
+/// The copy that a window does, to a texture that can be read back: see [`Offscreen::shown`].
+struct Presenter {
+    composite: Composite,
+    texture: wgpu::Texture,
+    group: wgpu::BindGroup,
+}
+
 /// The renderer with an image of its own instead of a window.
 pub struct Offscreen {
     info: GpuInfo,
@@ -145,6 +169,7 @@ pub struct Offscreen {
     flush_scene_updates: bool,
     last_update: UpdateTimes,
     last_draw: DrawTimes,
+    presenter: Option<Presenter>,
 }
 
 impl Offscreen {
@@ -157,6 +182,13 @@ impl Offscreen {
     /// Traces at `resolution.internal` and presents at `resolution.output`.
     pub fn with_resolution(resolution: Resolution, scene: &Scene) -> Result<Self> {
         Self::create(resolution, scene, true)
+    }
+
+    /// Like [`Offscreen::with_resolution`], with the Reference view traced at the **output**
+    /// resolution whatever Primary's scale is, as a window does (ADR 0005). The other
+    /// constructors trace it at the traced resolution, which is what the bench's flight times.
+    pub fn with_full_reference(resolution: Resolution, scene: &Scene) -> Result<Self> {
+        Self::build(resolution, scene, true, None, true)
     }
 
     /// Like [`Offscreen::new`], on a device without timestamp queries, as on a GPU that lacks
@@ -172,11 +204,11 @@ impl Offscreen {
         scene: &Scene,
         table: &materials::MaterialTable,
     ) -> Result<Self> {
-        Self::build(resolution, scene, true, Some(table))
+        Self::build(resolution, scene, true, Some(table), false)
     }
 
     fn create(resolution: Resolution, scene: &Scene, timers: bool) -> Result<Self> {
-        Self::build(resolution, scene, timers, None)
+        Self::build(resolution, scene, timers, None, false)
     }
 
     fn build(
@@ -184,6 +216,7 @@ impl Offscreen {
         scene: &Scene,
         timers: bool,
         table: Option<&materials::MaterialTable>,
+        full_reference: bool,
     ) -> Result<Self> {
         let (adapter, device, queue) = request_gpu(shared_instance(), None, timers)?;
         let info = adapter.get_info();
@@ -199,7 +232,11 @@ impl Offscreen {
             None => Tracer::new(&device, scene)?,
         };
         let profiler = Profiler::new(&device, &queue);
-        let target = Target::new(&device, resolution);
+        let target = if full_reference {
+            Target::with_full_reference(&device, resolution)
+        } else {
+            Target::new(&device, resolution)
+        };
         Ok(Self {
             info,
             device,
@@ -211,6 +248,7 @@ impl Offscreen {
             flush_scene_updates: true,
             last_update: UpdateTimes::default(),
             last_draw: DrawTimes::default(),
+            presenter: None,
         })
     }
 
@@ -489,8 +527,8 @@ impl Offscreen {
         for _ in 0..samples {
             self.reference_sample(camera);
         }
-        let size = self.target.resolution().internal;
-        let texture = self.target.lit().texture.clone();
+        let size = self.target.reference_size();
+        let texture = self.target.reference().texture.clone();
         let encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
@@ -520,6 +558,175 @@ impl Offscreen {
         self.profiler.collect(&self.device, true);
     }
 
+    /// Adds `samples` samples of the reference path tracer in **one dispatch**, without reading
+    /// anything back, and waits until the GPU has done it. The accumulation is that of the same
+    /// number of [`Offscreen::reference_sample`]s, bit for bit. Returns the samples taken, which
+    /// is `samples` up to the cap ([`crate::batch::MAX_BATCH_SAMPLES`]).
+    pub fn reference_batch(&mut self, camera: &Camera, samples: u32) -> u32 {
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        self.profiler.begin_frame();
+        let taken = self.tracer.encode_reference_batch(
+            &self.device,
+            &self.queue,
+            &mut self.profiler,
+            &mut encoder,
+            camera,
+            &self.sun,
+            &self.target,
+            samples,
+        );
+        self.profiler.resolve(&mut encoder);
+        self.queue.submit([encoder.finish()]);
+        self.profiler.collect(&self.device, true);
+        taken
+    }
+
+    /// Draws one frame as a window in Reference mode (`reference`) or Primary mode does, by the
+    /// still-frame policy of ADR 0005 (see [`Tracer::encode_frame`]): Primary until the view has
+    /// been still for 2 frames, then a batch of the Reference view, which starts over from sample
+    /// 0 whenever the camera, the sun, the size or the Planet change. `now` is the time of the
+    /// frame on any one clock (it runs the fade). Nothing is read back; the frame is over when
+    /// this returns, and its GPU time is in the result.
+    pub fn draw_frame(
+        &mut self,
+        camera: &Camera,
+        reference: bool,
+        now: std::time::Duration,
+    ) -> FrameDrawn {
+        let began = std::time::Instant::now();
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        self.profiler.begin_frame();
+        let plan = self.tracer.encode_frame(
+            &self.device,
+            &self.queue,
+            &mut self.profiler,
+            &mut encoder,
+            camera,
+            &self.sun,
+            &self.target,
+            reference,
+            now,
+        );
+        // The copy to the "window", timed as the window's is, so that a frame costs what it
+        // costs there.
+        self.present(&mut encoder, plan.fade());
+        self.profiler.resolve(&mut encoder);
+        self.queue.submit([encoder.finish()]);
+        self.profiler.collect(&self.device, true);
+        // Without timers `collect` does not wait, and the frame is not over until it has.
+        self.device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .expect("device poll failed");
+        let wall = began.elapsed();
+        let reference_ms = self.profiler.times_of_this_frame().and_then(|frame| {
+            let timings = self.profiler.timings();
+            frame
+                .passes
+                .iter()
+                .find(|&&(pass, _)| timings.passes()[pass].name == "reference")
+                .map(|&(_, ms)| ms)
+        });
+        FrameDrawn {
+            plan,
+            samples: self.tracer.samples(),
+            reference_ms,
+            wall,
+        }
+    }
+
+    /// Records the copy that a window does after the passes of a frame, to a texture of its own:
+    /// Primary's image, the Reference view's, or the one fading in over the other by `fade`. It
+    /// reads the images and writes none of them, so it never changes the accumulation.
+    fn present(&mut self, encoder: &mut wgpu::CommandEncoder, fade: f32) {
+        let (width, height) = self.target.resolution().output;
+        if self.presenter.is_none() {
+            let composite = Composite::new(&self.device, crate::tracer::IMAGE_FORMAT);
+            let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("shown"),
+                size: wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: crate::tracer::IMAGE_FORMAT,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+                view_formats: &[],
+            });
+            let group = composite.group(&self.device, self.target.image(), self.target.reference());
+            self.presenter = Some(Presenter {
+                composite,
+                texture,
+                group,
+            });
+        }
+        let presenter = self.presenter.as_ref().expect("made above");
+        presenter.composite.set_fade(&self.queue, fade);
+        let view = presenter
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        let mut pass = self.profiler.render_pass(
+            encoder,
+            "blit",
+            &[Some(wgpu::RenderPassColorAttachment {
+                view: &view,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+        );
+        presenter.composite.draw(&mut pass, &presenter.group);
+    }
+
+    /// What the window would show for the last [`Offscreen::draw_frame`], at the output
+    /// resolution: Primary's image, the Reference view's, or the one fading in over the other.
+    ///
+    /// # Panics
+    /// If no frame has been drawn.
+    pub fn shown(&mut self) -> Image {
+        let size = self.target.resolution().output;
+        let texture = self
+            .presenter
+            .as_ref()
+            .expect("no frame has been drawn")
+            .texture
+            .clone();
+        let encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        let rgba = read_texture(&self.device, &self.queue, encoder, &texture, size, 4);
+        Image {
+            width: size.0,
+            height: size.1,
+            rgba,
+        }
+    }
+
+    /// The image that Primary's last frame left for the copy pass (the upscaled image), at the
+    /// output resolution.
+    pub fn primary_image(&mut self) -> Image {
+        let size = self.target.resolution().output;
+        let texture = self.target.image().texture.clone();
+        let encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        let rgba = read_texture(&self.device, &self.queue, encoder, &texture, size, 4);
+        Image {
+            width: size.0,
+            height: size.1,
+            rgba,
+        }
+    }
+
     /// Sets the seed of the reference's random numbers (the default is
     /// [`crate::tracer::RNG_SEED`]) and starts its image over. Another seed gives an independent
     /// image of the same view, with the same expected value.
@@ -542,7 +749,7 @@ impl Offscreen {
     /// the display encoding and the clamp to 0..1: RGB for each pixel of the traced image, rows
     /// from the top (`3 * width * height` floats).
     pub fn read_accumulation(&mut self) -> Vec<f32> {
-        let (width, height) = self.target.resolution().internal;
+        let (width, height) = self.target.reference_size();
         let size = u64::from(width) * u64::from(height) * 16;
         let encoder = self
             .device

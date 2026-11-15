@@ -1014,11 +1014,60 @@ averaged with the cosine weight)`) falls as 1/N from 1 to 256 samples, with N ti
 the variance of one sample worked out from the sky's gradient, that two seeds differ by the sum of
 their errors (the floor), and that a seed gives the same image every time.
 
+**The still view** (#189, `report.convergence.views[].still`). After the single-sample run (which is
+unchanged, as are the truths and every timed pass) each view runs the **still-frame policy** from the
+stop: frames at 60 Hz drawn by `Offscreen::draw_frame`, which is the window's Reference mode without
+the window (`Tracer::encode_frame`: the same state machine, the same budget, the same fade pass).
+The first two frames after the stop are Primary, then each frame takes a batch of the Reference view
+(1 on the first, then as many as fit in 12 ms, rising by one after 4 frames that fit) and fades it in over the last
+Primary image. A frame that takes longer than 16.7 ms waits for the next vsync, as a window does. The
+clock is the wall clock from the stop. It is the only part of the phase that is timed by wall clock
+and the only part that batches; the curve above is single samples, always (batching is inert when the
+sample count is fixed: the goldens, the curve, and every number `reference` has had).
+
+- `frame`: the work of a frame that took a batch, in ms (encoding until the GPU is done, the copy to the
+  window included), with `mean_ms`, `p95_ms`, **`p99_ms`** and `max_ms`; `frames_over` counts the ones
+  over 16.7 ms and `frame_p99_within_target` is #189's frame-time acceptance (p99 at most 16.7 ms).
+- `gpu_batch`: the GPU's time for a batch; `batch_first`, `batch_last`, `batch_max` the sizes;
+  `samples_per_s` the samples a second over the frames that took one.
+- `marks[]`: at 0.1, 0.25, 0.5, 1 and 2 s after the stop, the samples the run had, and the FLIP (mean,
+  p99) and linear MSE of the image of that many samples against **the same truth A as the curve**. The
+  image is drawn after the run from single samples of the same seed, which is bit for bit what the
+  batches added up to (`batching_bit_exact` says it held on this GPU, and a test holds it on
+  lavapipe), so the run is never paused to read 59 MB back. `flip_within_target` is the FLIP
+  acceptance: at most 0.05 at the 0.25 s mark.
+- `to_line[]`: for FLIP 0.05 and 0.02, the samples the curve needs (as `lines`) and the seconds from the
+  stop until the run had that many, with `counts` as in `lines`. A line that does not count in the view
+  is shown and not used. It is null where the run ended first.
+- The run's images at the marks are in `convergence/VIEW/still-NNNNms.png`.
+- `--short` runs 0.3 s, no FLIP; the smoke test only checks the shape.
+
+**For the 4090** (#189's acceptance, which is the orchestrator's to run, at 1440p in both views; the same
+command as the baseline above, because the still view is part of the phase):
+
+```
+client.exe bench --truth-spp 8192 --out bench-out
+```
+
+and the numbers are `report.convergence.views[].still` (`frame.p99_ms`, `marks[]` at 0.25 s,
+`to_line[]` for 0.02), with the printed lines `still view, golden|pit, ...` and `acceptance: ...` on
+stderr. Run it with both clocks locked as for the other 4090 numbers, 3 times; the policy's batch sizes
+come from the GPU's own timers, so they vary a little from run to run. The phase's wall-clock time rose
+by 2 s a view plus the single-sample images of the marks (a few seconds), so it is about 20 s longer.
+Nothing in `bench-budgets.toml` moved: `reference` is still one sample.
+
+**The policy's constants** are all in `crates/render/src/batch.rs` (`BATCH_BUDGET_MS` 12,
+`MAX_BATCH_SAMPLES` 16, `RECENT_BATCHES` 16, `RISE_AFTER_FRAMES` 4) and `crates/render/src/still.rs`
+(`STILL_FRAMES` 2, `FADE` 150 ms). The cap is 16 because 16 samples of the slowest sample measured on the
+4090 at 1440p (7.92 ms, #99's pit), three times over for a snow cave, is 0.38 s: a fifth of Windows'
+default 2 s timeout (TDR), and a test holds it under a quarter. The budget, not the cap, sets the size
+at 1440p (1 to 4 samples); the cap is for timers that lie.
+
 ## Reading the report
 
 ```
 {
-  "schema_version": 17,
+  "schema_version": 18,
   "build":   { "version", "commit" },          // commit: CI builds only, else null; on a PR
                                                // build it is GitHub's merge commit, not the head
   "machine": { "gpu", "device_type", "driver", "driver_info", "backend", "os", "arch",
@@ -1043,7 +1092,8 @@ their errors (the floor), and that a seed gives the same image every time.
                    "lines", "min_line_over_floor", "folder", "csv", "wall_s",
                    "views": [ { "name", ...the view's camera and sun, "reference": STATS,
                                 "gpu_total": STATS, "ms_per_mpix_per_sample", "converged", "floor",
-                                "curve": [...], "lines": [...], "files": [...] }... ] } | null,
+                                "curve": [...], "lines": [...], "files": [...],
+                                "still": STILL }... ] } | null,
                                       // null with --no-convergence or if the phase failed;
                                       // see its section
   "streaming": { "deterministic": true, "schedule", "counts_hash", "upload", "soft_misses",

@@ -69,6 +69,7 @@ The check reads the whole source of each kernel, `common.wgsl` and `sampling.wgs
 - **Still** means the camera, the sun and the window size have not changed for 2 frames and no Edit has happened. The world is frozen while the Reference view accumulates (#94, 2026-11-04).
 - **On a change** the screen cuts to the Primary view at once, with no blend, and the Reference view starts again from sample 0. An Edit resets the whole image; there is no partial reset.
 - **Each Still frame takes as many samples as fit in 12 ms**, judged from the slowest recent samples of that view, and 1 on the first frame of a new view. The screen keeps presenting at 60 Hz. If even 1 sample does not fit, the frame rate drops and the quality does not.
+  - The batch rises by one after 4 frames that fit, drops at once to what fits when a batch overruns, and is never more than 16 samples: 16 of the slowest sample measured at 1440p on the 4090 (7.92 ms), three times over for a snow cave, is 0.38 s, a fifth of Windows' 2 s timeout. The constants are in `crates/render/src/batch.rs`.
 - **The Reference view fades in over about 150 ms** from its first batch. The fade is for display only and is never stored.
 - **No adaptive sampling.** Every pixel gets the same number of samples. Stopping on what the samples show bends the result, which the bias rule forbids without a bound.
 - **The target:** FLIP ≤ 0.05 within 0.25 s of stopping, on the 4090 at 1440p, in both bench views. The time to FLIP ≤ 0.02 is reported, not promised.

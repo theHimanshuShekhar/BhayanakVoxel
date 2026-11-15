@@ -32,12 +32,20 @@ impl<K: Clone + PartialEq> Accumulator<K> {
     /// what seeds the sample's random numbers, so that a given view and sample count always
     /// give the same image.
     pub fn begin_sample(&mut self, key: &K) -> u32 {
+        self.begin_batch(key, 1)
+    }
+
+    /// Starts taking `count` more samples of `key` in one dispatch, and returns the index of the
+    /// first: the batch is the samples with that index and the `count - 1` after it, which seed
+    /// their random numbers as the same samples taken one at a time would. 0 for the first after a
+    /// reset, as for [`Accumulator::begin_sample`].
+    pub fn begin_batch(&mut self, key: &K, count: u32) -> u32 {
         if self.key.as_ref() != Some(key) {
             self.key = Some(key.clone());
             self.samples = 0;
         }
         let index = self.samples;
-        self.samples = self.samples.saturating_add(1);
+        self.samples = self.samples.saturating_add(count);
         index
     }
 
@@ -68,6 +76,19 @@ mod tests {
         let mut accumulator = Accumulator::new();
         let indices: Vec<u32> = (0..4).map(|_| accumulator.begin_sample(&"view")).collect();
         assert_eq!(indices, [0, 1, 2, 3]);
+        assert_eq!(accumulator.samples(), 4);
+    }
+
+    #[test]
+    fn a_batch_counts_as_the_samples_in_it_and_the_next_starts_after_them() {
+        let mut accumulator = Accumulator::new();
+        assert_eq!(accumulator.begin_batch(&"view", 3), 0);
+        assert_eq!(accumulator.begin_batch(&"view", 3), 3);
+        assert_eq!(accumulator.samples(), 6);
+        // The same indices as single samples would have had.
+        assert_eq!(accumulator.begin_sample(&"view"), 6);
+        // A new view starts a batch from sample 0 too.
+        assert_eq!(accumulator.begin_batch(&"other", 4), 0);
         assert_eq!(accumulator.samples(), 4);
     }
 

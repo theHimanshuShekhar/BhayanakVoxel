@@ -18,7 +18,9 @@
 //! one input of the shading at a time.
 
 pub mod accumulation;
+pub mod batch;
 pub mod camera;
+mod composite;
 pub mod cpu;
 mod debug_view;
 mod gpu_materials;
@@ -31,6 +33,7 @@ pub mod reference;
 mod sampling_tests;
 pub mod scene;
 mod shaders;
+pub mod still;
 pub mod sun;
 pub mod timing;
 pub mod tracer;
@@ -41,7 +44,7 @@ use std::error::Error;
 
 pub use camera::Camera;
 pub use debug_view::DebugView;
-pub use offscreen::{DrawTimes, GpuInfo, GpuPasses, Image, Offscreen, UpdateTimes};
+pub use offscreen::{DrawTimes, FrameDrawn, GpuInfo, GpuPasses, Image, Offscreen, UpdateTimes};
 pub use profiler::Profiler;
 pub use scene::{
     Lengths, PatchCopy, Rebuild, RingPatch, RingsFull, Room, Scene, SceneUpdate, UploadCost,

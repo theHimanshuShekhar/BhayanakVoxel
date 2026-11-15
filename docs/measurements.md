@@ -410,3 +410,18 @@ That is within the research's ρ⁵ bound for rock, soil and grass (1.3 to 3.1 %
 **Cost of the phase:** 146 s a run at `--truth-spp 8192` (it was about 5 minutes). The default `--truth-spp 1024` was not measured again: about 45 s, measured before #188.
 
 **The closed box, on lavapipe in CI** (64×64 pixels, 256 samples; 11 s at albedo 0.9 and 15 s at 0.98 on this box in a debug build): 1.00085 of the answer at 0.9 (error 0.00091) and 0.99384 at 0.98 against 0.99433 expected with the cap (error 0.00095), so five errors are 0.46 %, under the ledger's 0.57 %. The 4-bounce cut, a dropped `/(1 − q)` and a depth cap of 190 each fail it.
+
+### The Reference view's still-frame policy (#189)
+
+#189 gave the Reference view its still-frame policy (ADR 0005): it traces at full output resolution whatever Primary's render scale is, takes as many samples in one dispatch as fit in 12 ms (1 on the first frame of a view, rising by one after 4 frames that fit, dropping at once on an overrun, 16 at most), cuts to Primary on any change and starts again from sample 0, and fades in over the last Primary image in 150 ms for display only. The bench's single-sample curve, the truths and every timed pass are unchanged; its still-view part (`client bench`, the `still` block of each convergence view; `docs/agents/benchmarking.md`) measures the policy from the stop, in wall-clock time at 60 Hz, scored against the same truths.
+
+**The 4090 numbers are not in yet.** They are the orchestrator's to run (`client.exe bench --truth-spp 8192`, 3 runs, both clocks locked, 1440p) and to post here and on #189. The table to fill in:
+
+| view | batch (first / last / most) | frame work, mean / p95 / p99 ms | frames over 16.7 ms | samples a second | FLIP at 0.25 s (target ≤ 0.05) | seconds to FLIP ≤ 0.02 (counts?) |
+|---|---|---|---|---|---|---|
+| golden | | | | | | |
+| pit | | | | | | |
+
+- **The acceptance:** FLIP ≤ 0.05 within 0.25 s of stopping; frame time p99 ≤ 16.7 ms while accumulating in the open view; the time to FLIP ≤ 0.02 reported.
+- **What was verified without the 4090** (lavapipe, this box): two batches of 3 samples are 6 single samples bit for bit, whatever the split; a change of the camera, the sun, the window's size or an Edit cuts to Primary at once and the Reference view starts from sample 0; the accumulation after a fade, a cut or a restart equals that of plain samples bit for bit, so it never holds a Primary or a faded pixel; the goldens are unchanged. The phase's code ran at 96 by 54 with FLIP (`the_phase_with_flip`): not a timing.
+- **The cap:** 16 samples of the slowest sample measured on the 4090 at 1440p (7.92 ms, #99's pit p95), three times over for a snow cave (ADR 0005), is 0.38 s, a fifth of Windows' 2 s timeout (TDR); a test holds it under a quarter. At 1440p the budget sets the size (1 to 4 samples: 2.5 to 7.9 ms a sample), so the cap never limits the quality there.

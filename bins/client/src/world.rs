@@ -17,8 +17,9 @@ use crate::scene_worker::{LoaderStats, SceneWorker, Spent, Stats};
 use crate::tool::{Tool, rotation_for};
 
 /// How many frames in a row the view must be unchanged before the reference image is taken to be
-/// accumulating it, and loading pauses for it.
-pub const STILL_FRAMES: u32 = 2;
+/// accumulating it, and loading pauses for it: the renderer's own count, which shows the Reference
+/// view from the same frame (#189).
+pub const STILL_FRAMES: u32 = render::still::STILL_FRAMES;
 
 /// Whether loading pauses, given the mode and how many frames in a row the view (camera, sun,
 /// size and LOD bias) has been unchanged: only while the reference accumulates a still view.
