@@ -48,5 +48,8 @@ bench::realtime::tests::a_run_that_stops_names_the_step_it_was_at
 # A loader worker that panics.
 loader::tests::a_worker_that_panics_panics_the_frame_thread_instead_of_loading_stopping_silently
 
+# A loader's workers waiting for the frame thread (real threads, and the time they waited).
+loader::tests::a_stepped_loader_is_never_backed_up_and_a_threaded_one_is_at_its_most_ahead
+
 # bins/client/src/priority.rs: spawns a thread to lower its priority (Linux only).
 priority::tests::

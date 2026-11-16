@@ -84,7 +84,9 @@ use super::stream::StreamReport;
 /// opening), to each path `camera_soft_miss_frames` (frames whose ground below the frame's camera
 /// was drawn coarser than the bands ask), `generated_bricks` and `arrived_bricks` (what the loader
 /// did in the path), `loader_queue_max` and `loader_queue_mean` (the bricks asked for and not yet
-/// taken in, at each frame), to each `scene_thread` `reband_ms` (the change of the bands for the
+/// taken in, at each frame), `loader_generating_s`, `loader_held_back_s`, `stream_calls` and
+/// `stream_slices_used` (what the loader's workers did with their time, and how often the scene
+/// thread took in and used up its slice), to the `config` `stream_slice_ms`, to each `scene_thread` `reband_ms` (the change of the bands for the
 /// camera's speed, which is not in `follow_ms`), to the stop's `settle` `walk_s`, `reband_s` and
 /// `fill_s` (its three parts, which add up to `seconds`), and to its gates `camera_soft_miss_frames`, `scene_soft_miss_frames` (reported),
 /// `scene_lag_d0_max`, `spawn_ring_s`, `time_to_control_s` and `settle_s` (`over` may now also name
@@ -341,6 +343,10 @@ pub struct Config {
     pub keyframes: usize,
     /// The LOD bias: output pixels one Voxel may cover (`--bias`).
     pub bias: f64,
+    /// How long the scene thread takes in what the loader made for in a round while the loader's
+    /// workers are as far ahead as they may be, in milliseconds: the client's
+    /// (`scene_worker::BACKED_UP_SLICE`) unless `--stream-slice-ms` said (the real-time mode).
+    pub stream_slice_ms: f64,
     /// The `--diag` switches that were on, as spelled there. Empty for a measurement; a report
     /// that has any is not one, and its budgets are not checked.
     pub diag: Vec<String>,
@@ -542,6 +548,7 @@ mod tests {
                 path: "flyover".into(),
                 keyframes: 3,
                 bias: 1.0,
+                stream_slice_ms: 32.0,
                 diag: Vec::new(),
             },
             modes: modes(0.5),

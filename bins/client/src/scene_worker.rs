@@ -54,6 +54,22 @@ use crate::loader::{Arrival, Loader};
 /// asked of it (a new camera, an Edit) and publishes what it has done.
 const SLICE: Duration = Duration::from_millis(2);
 
+/// The time [`Engine::stream`] takes in bricks for while the loader's workers are as far ahead as
+/// they may be ([`Loader::backed_up`]), in place of [`SLICE`]: with the camera followed and the
+/// bands changed first in a round, a 2 ms slice was 7% of a flight's scene thread, which took in
+/// 920 bricks' children a second while the workers spent 85% of their time held back and the
+/// queue held 40 000 (measured on the dev box, #168). 32 ms took in nine times as many, and the
+/// camera was over soft misses on 63 frames of 590 in place of 387. It is cut short by an Edit
+/// (see [`Engine::stream`]), so that it is not a delay on one. `client bench --stream-slice-ms`
+/// measures others.
+pub const BACKED_UP_SLICE: Duration = Duration::from_millis(32);
+
+/// The slice of one [`Engine::stream`]: `SLICE`, or `backed_up` if the loader's workers are as far
+/// ahead as they may be.
+fn stream_slice(backed_up: bool, longer: Duration) -> Duration {
+    if backed_up { longer.max(SLICE) } else { SLICE }
+}
+
 /// How much the scene thread lets wait for the frame thread to upload (#145): it stops following the
 /// camera and taking in what the loader made while what it has published and not had taken, and
 /// what it has packed since, comes to this much, and goes on when the frame thread has taken it.
@@ -270,6 +286,13 @@ fn batch_size(left: Duration, cost: Duration) -> Option<usize> {
     Some(most as usize)
 }
 
+/// Whether a [`stream`](Engine::stream) that has gone on for `spent` of its `slice` stops for a job
+/// of the frame thread's (an Edit): only one that is longer than [`SLICE`] does, and not before
+/// the time of an ordinary slice, which is what it always had. `job_waiting` is asked only then.
+fn gives_way(spent: Duration, slice: Duration, job_waiting: impl FnOnce() -> bool) -> bool {
+    spent >= SLICE && slice > SLICE && job_waiting()
+}
+
 /// What the loader is doing, as of a [`Ready`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct LoaderStats {
@@ -277,6 +300,11 @@ pub struct LoaderStats {
     pub pending: usize,
     /// Bricks the workers have asked the generator for, since the start.
     pub generated: u64,
+    /// What the workers have done with their time since the start, summed over them, in
+    /// microseconds: generating, and waiting with jobs queued because they were as far ahead as
+    /// they may be (see [`Loader::busy`]).
+    pub generating_us: u64,
+    pub held_back_us: u64,
     /// Jobs the workers have taken that have not been taken in.
     #[cfg(test)]
     pub ahead: usize,
@@ -295,9 +323,12 @@ impl LoaderStats {
     fn of(loader: &Loader) -> Self {
         #[cfg(test)]
         let (queued, cancelled) = loader.queue_sizes();
+        let (generating, held_back) = loader.busy();
         Self {
             pending: loader.pending(),
             generated: loader.generated(),
+            generating_us: (generating * 1e6) as u64,
+            held_back_us: (held_back * 1e6) as u64,
             #[cfg(test)]
             ahead: loader.ahead(),
             #[cfg(test)]
@@ -383,6 +414,11 @@ pub struct Done {
     pub pack_bricks: u64,
     /// Bricks the loader's arrivals held in the store, which the packing is for.
     pub arrived_bricks: u64,
+    /// Times the thread took in what the loader made (a call of [`Engine::stream`]), and in how
+    /// many of them it stopped because its slice was used up, with more to take in, and not
+    /// because the loader had no more or the upload budget was reached.
+    pub stream_calls: u64,
+    pub stream_slices_used: u64,
     /// Rounds in which eviction was going on, the units it took, and the bricks they held.
     pub evict_steps: u64,
     pub evicted_units: u64,
@@ -668,6 +704,9 @@ struct Shared {
     no_speed_scale: AtomicBool,
     /// The most words a buffer of the scene may have (see [`SceneWorker::set_buffer_limit`]).
     buffer_limit: AtomicUsize,
+    /// [`BACKED_UP_SLICE`], in microseconds, or what the bench was told (see
+    /// [`SceneWorker::set_backed_up_slice`]).
+    backed_up_slice_us: AtomicU64,
 }
 
 /// What the frame thread has no more use for, which it hands back for the scene thread to use
@@ -791,6 +830,7 @@ impl SceneWorker {
             #[cfg(test)]
             no_speed_scale: AtomicBool::new(false),
             buffer_limit: AtomicUsize::new(usize::MAX),
+            backed_up_slice_us: AtomicU64::new(BACKED_UP_SLICE.as_micros() as u64),
         });
         let (garbage, graveyard) = mpsc::channel();
         let user_bands = scene.bands();
@@ -868,6 +908,15 @@ impl SceneWorker {
     /// it from its next round.
     pub fn set_buffer_limit(&self, words: usize) {
         self.shared.buffer_limit.store(words, Ordering::Relaxed);
+    }
+
+    /// Changes the time that taking in what the loader made goes on for while its workers are as
+    /// far ahead as they may be ([`BACKED_UP_SLICE`]): for the bench to measure what another does.
+    pub fn set_backed_up_slice(&self, slice: Duration) {
+        let micros = u64::try_from(slice.as_micros()).unwrap_or(u64::MAX);
+        self.shared
+            .backed_up_slice_us
+            .store(micros, Ordering::Relaxed);
     }
 
     /// Changes the upload budget (see [`UPLOAD_BUDGET`]), for a test or the bench to see what a
@@ -2246,6 +2295,9 @@ impl Engine {
         // moves so that following alone comes to the budget every round would be followed and no
         // arrival would ever be taken in, with the bricks that are asked for waiting behind it.
         let mut guaranteed = self.outbox_is_empty();
+        let longer = Duration::from_micros(self.shared.backed_up_slice_us.load(Ordering::Relaxed));
+        let mut slice_used = false;
+        self.work.stream_calls += 1;
         loop {
             // What the loader made waits in its queue, in the order it made it, while the frame
             // thread has more to upload than the budget.
@@ -2254,8 +2306,17 @@ impl Engine {
                 self.throttled = true;
                 break;
             }
-            let left = SLICE.saturating_sub(self.clock.since(started));
+            let slice = stream_slice(self.loader.backed_up(), longer);
+            let spent = self.clock.since(started);
+            // A slice that is longer than [`SLICE`] gives way to what the frame thread has asked
+            // of the thread (an Edit, a new camera's jobs): they are done at the start of a round.
+            if gives_way(spent, slice, || self.job_waiting()) {
+                slice_used = true;
+                break;
+            }
+            let left = slice.saturating_sub(spent);
             let Some(most) = batch_size(left, self.arrival_cost) else {
+                slice_used = true;
                 break;
             };
             let batch_started = self.clock.now();
@@ -2306,6 +2367,7 @@ impl Engine {
             self.note(update);
             worst = worst.max(self.clock.since(batch_started) / resident.len() as u32);
         }
+        self.work.stream_slices_used += u64::from(slice_used);
         // What the next slice expects one to cost: a running mean of the worst batch of each
         // slice, and never more than [`MOST_ARRIVAL_COST`].
         if !worst.is_zero() {
@@ -2313,6 +2375,11 @@ impl Engine {
                 (self.arrival_cost.mul_f64(0.8) + worst.mul_f64(0.2)).min(MOST_ARRIVAL_COST);
         }
         Ok(took)
+    }
+
+    /// Whether the frame thread has given the thread a job that waits for its next round.
+    fn job_waiting(&self) -> bool {
+        !lock(&self.shared.inbox).jobs.is_empty()
     }
 
     /// Takes the children of bricks out of the store while it holds more than its budget. Whether it
@@ -2849,6 +2916,27 @@ mod tests {
         assert_eq!((share as f64 / FOLLOW_MIN_COST.0) as u64, 64);
         let writes = u64::from(UPLOAD_BUDGET.writes) * FOLLOW_SHARE.0 / FOLLOW_SHARE.1;
         assert_eq!((writes as f64 / FOLLOW_MIN_COST.1) as u64, 256);
+    }
+
+    #[test]
+    fn the_longer_slice_is_for_a_loader_that_is_backed_up_and_never_less_than_the_ordinary_one() {
+        let longer = Duration::from_millis(32);
+        assert_eq!(stream_slice(false, longer), SLICE);
+        assert_eq!(stream_slice(true, longer), longer);
+        // Whatever the bench asks for, a backed-up loader's slice is at least the ordinary.
+        assert_eq!(stream_slice(true, Duration::from_millis(1)), SLICE);
+        assert_eq!(stream_slice(false, Duration::from_millis(1)), SLICE);
+        assert_eq!(BACKED_UP_SLICE, Duration::from_millis(32));
+    }
+
+    #[test]
+    fn a_longer_slice_gives_way_to_a_job_after_an_ordinary_slice_and_an_ordinary_one_never_asks() {
+        let ms = Duration::from_millis;
+        let never = || panic!("asked");
+        assert!(!gives_way(ms(50), SLICE, never));
+        assert!(!gives_way(ms(1), ms(32), never));
+        assert!(gives_way(ms(2), ms(32), || true));
+        assert!(!gives_way(ms(31), ms(32), || false));
     }
 
     #[test]

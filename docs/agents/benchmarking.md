@@ -60,6 +60,7 @@ release: a debug build's CPU side is slow enough to distort the frame times.
 | `--short` | A tiny run (160x90, a handful of frames, a patch of the Planet): the CI smoke test. |
 | `--streaming` | Also runs the streaming mode (below): the test Planet streamed in, stepped, on a fixed frame schedule, with counts that are the same on every run. The report's `streaming` is null without it. |
 | `--real-time` | With `--streaming`, also runs the real-time mode (below): the full-size Planet with the real loader workers and scene thread, on the machine's clock, along paths of 50 m/s flights, a take-off, a turn, a stop and a cold start. It takes tens of minutes and is not deterministic. With `--short` it runs on the test Planet, as a smoke test. The report's `streaming_real_time` is null without it. |
+| `--stream-slice-ms N` | With `--real-time`, how long the scene thread takes in what the loader made for in a round while the loader's workers are as far ahead as they may be (`scene_worker::BACKED_UP_SLICE`, default 32). For measuring what another slice does to the flights' camera soft misses, the settle and the frame times (#168); the report's `config.stream_slice_ms` says what it was. |
 | `--runs N` | With `--real-time`, how many times to run the paths in this process. Default 3. The report keeps each run and the least and the most of every number over them; the gates use the worst. |
 | `--flip-gamma-2-2` | Also score each checkpoint with the old gamma-2.2 curve (#188), from the same samples, to tell the sRGB move from the estimator's effect. Not with `--no-convergence` or `--short`. |
 | `--no-convergence` | Leave out the convergence phase (below), which otherwise runs after the caves. |
@@ -517,6 +518,13 @@ is made there (below): the run's **Edit latency**. Its frames are not those of a
     queue, the bricks asked for and not yet taken in (`LoaderStats::pending`), as of each frame,
     its most and its mean. They are for reading a flight as limited by the generator (a long
     queue, few arrived) or not; reported, not gated.
+  - `loader_generating_s`, `loader_held_back_s`, `stream_calls` and `stream_slices_used` (#168):
+    what the loader's workers did with their time in the path, summed over them (the paths'
+    seconds times the workers is what there is): generating, and waiting **with jobs queued**
+    because they were `MAX_AHEAD` jobs ahead of what the scene thread had taken in. Held back
+    most of the time with the queue long means the scene thread's taking in limits the loader, not
+    the generator. And how many times the scene thread took in (its time is `scene_thread.pack_ms`)
+    and in how many of them it stopped because its slice was used up. Reported, not gated.
   - `hole_looks`, `holes` and `holes_per_frame`: **holes are sampled, not counted for every
     frame** (see "What the holes gate can and cannot catch"). Looking at every split brick takes
     0.3 s at full size with the store's read lock held, so the scene thread does it every 5 s

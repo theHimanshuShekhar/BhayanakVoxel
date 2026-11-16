@@ -462,6 +462,14 @@ impl World {
         }
     }
 
+    /// Tells the scene thread how long to take in what the loader made for while the loader's
+    /// workers are as far ahead as they may be (see [`SceneWorker::set_backed_up_slice`]).
+    pub fn set_backed_up_slice(&self, slice: std::time::Duration) {
+        if let Some(worker) = &self.worker {
+            worker.set_backed_up_slice(slice);
+        }
+    }
+
     /// Has the scene thread count the soft misses (by level) and the holes for every publish, so
     /// that the stats the world has are exact for each frame (see [`SceneWorker::count_exactly`]).
     pub fn count_exactly(&self) {

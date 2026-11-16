@@ -150,6 +150,11 @@ struct Shared {
     ahead: AtomicUsize,
     /// Jobs a worker has taken and not yet sent the arrival of: the ones that are in flight.
     working: AtomicUsize,
+    /// Nanoseconds the workers have spent generating (summed over them), and waiting with jobs
+    /// queued because they were [`MAX_AHEAD`] ahead: how much of their time the frame thread's
+    /// taking in is what limits (see [`Loader::busy`]).
+    generating_ns: AtomicU64,
+    held_back_ns: AtomicU64,
 }
 
 impl Shared {
@@ -276,6 +281,8 @@ impl Loader {
             source,
             generated: AtomicU64::new(0),
             ahead: AtomicUsize::new(0),
+            generating_ns: AtomicU64::new(0),
+            held_back_ns: AtomicU64::new(0),
             working: AtomicUsize::new(0),
         });
         let (sender, arrivals) = mpsc::channel();
@@ -503,6 +510,23 @@ impl Loader {
         self.shared.generated.load(Atomic::Relaxed)
     }
 
+    /// Whether the workers are as far ahead as they may be ([`MAX_AHEAD`]): they wait for the frame
+    /// thread to take in what they made. Never for a stepped loader, which has no workers to wait.
+    pub fn backed_up(&self) -> bool {
+        !self.workers.is_empty() && self.shared.ahead.load(Atomic::Relaxed) >= MAX_AHEAD
+    }
+
+    /// What the workers have done with their time since the start, summed over them: seconds
+    /// spent generating, and seconds spent waiting with jobs queued because they were
+    /// [`MAX_AHEAD`] ahead, which is the frame thread's taking in being what limits the loader.
+    pub fn busy(&self) -> (f64, f64) {
+        let seconds = |ns: &AtomicU64| ns.load(Atomic::Relaxed) as f64 * 1e-9;
+        (
+            seconds(&self.shared.generating_ns),
+            seconds(&self.shared.held_back_ns),
+        )
+    }
+
     /// Jobs that the workers have taken and the frame thread has not taken in.
     #[cfg(test)]
     pub fn ahead(&self) -> usize {
@@ -648,6 +672,11 @@ fn complete(
     sent.is_ok()
 }
 
+/// Nanoseconds since `began`.
+fn nanos(began: std::time::Instant) -> u64 {
+    u64::try_from(began.elapsed().as_nanos()).unwrap_or(u64::MAX)
+}
+
 /// A worker: takes the nearest job when the frame thread is not too far behind, drops it if the
 /// camera has gone from it, and generates it.
 fn work(shared: &Shared, arrivals: &Sender<(u64, Arrival)>) {
@@ -660,15 +689,25 @@ fn work(shared: &Shared, arrivals: &Sender<(u64, Arrival)>) {
                     Next::Job(job, camera, bands, reach) => break (job, camera, bands, reach),
                     Next::Shutdown => return,
                     Next::Idle(idle) => {
+                        // Waiting with jobs queued is waiting for the frame thread to take in.
+                        let held_back = !idle.queue.is_empty();
+                        let began = std::time::Instant::now();
                         state = shared
                             .wake
                             .wait(idle)
                             .expect("a ring loader thread panicked");
+                        if held_back {
+                            shared.held_back_ns.fetch_add(nanos(began), Atomic::Relaxed);
+                        }
                     }
                 }
             }
         };
+        let began = std::time::Instant::now();
         let arrival = generate(shared, &job, camera, bands, reach);
+        shared
+            .generating_ns
+            .fetch_add(nanos(began), Atomic::Relaxed);
         if !complete(shared, arrivals, job.ticket, arrival) {
             return;
         }
@@ -880,6 +919,51 @@ mod tests {
         run_ahead(&mut loader, MAX_AHEAD);
         assert_eq!(loader.ahead(), MAX_AHEAD);
         assert_eq!(source.made.load(Atomic::Relaxed), (MAX_AHEAD + 100) * 8);
+    }
+
+    #[test]
+    fn a_stepped_loader_is_never_backed_up_and_a_threaded_one_is_at_its_most_ahead() {
+        // Stepped: as far ahead as it may be, and still no workers to wait.
+        let source = Arc::new(Counting::default());
+        let mut loader = new_loader(source.clone());
+        loader.request(
+            &BrickStore::new(),
+            near_the_origin().iter().copied(),
+            [0.0; 3],
+        );
+        run_ahead(&mut loader, MAX_AHEAD);
+        assert_eq!(loader.ahead(), MAX_AHEAD);
+        assert!(!loader.backed_up());
+        // Threaded: held back once MAX_AHEAD are taken and none received, and let go by receiving.
+        let mut loader = Loader::new(source, [0.0; 3], bands(), 2);
+        assert!(!loader.backed_up());
+        loader.request(
+            &BrickStore::new(),
+            near_the_origin().iter().copied(),
+            [0.0; 3],
+        );
+        loader.sync([0.0; 3], bands());
+        let mut waited = 0;
+        while !loader.backed_up() {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            waited += 1;
+            assert!(waited < 10_000, "never backed up: {}", loader.ahead());
+        }
+        // The workers waited with jobs queued, and what they waited is counted when they are
+        // woken, which taking in does.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        assert!(loader.busy().0 > 0.0, "nothing was generated");
+        assert_eq!(loader.busy().1, 0.0, "counted before they were woken");
+        assert!(
+            !loader.receive(MAX_AHEAD).is_empty(),
+            "nothing came to be received"
+        );
+        let mut waited = 0;
+        while loader.busy().1 == 0.0 {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            waited += 1;
+            assert!(waited < 10_000, "the wait was never counted");
+        }
     }
 
     #[test]

@@ -88,6 +88,10 @@ pub struct Script {
     /// The most that the cold start and the catching up between paths wait for the loader.
     pub fill_cap: Duration,
     pub between_cap: Duration,
+    /// How long the scene thread takes in what the loader made for while the loader's workers are
+    /// as far ahead as they may be ([`crate::scene_worker::BACKED_UP_SLICE`], or what
+    /// `--stream-slice-ms` said).
+    pub stream_slice: Duration,
 }
 
 impl Script {
@@ -101,6 +105,7 @@ impl Script {
             settle_cap: Duration::from_secs(120),
             fill_cap: Duration::from_secs(5400),
             between_cap: Duration::from_secs(1200),
+            stream_slice: crate::scene_worker::BACKED_UP_SLICE,
         }
     }
 
@@ -114,6 +119,7 @@ impl Script {
             settle_cap: Duration::from_secs(20),
             fill_cap: Duration::from_secs(600),
             between_cap: Duration::from_secs(300),
+            stream_slice: crate::scene_worker::BACKED_UP_SLICE,
         }
     }
 }
@@ -672,6 +678,15 @@ pub struct PathReport {
     pub arrived_bricks: u64,
     pub loader_queue_max: usize,
     pub loader_queue_mean: f64,
+    /// What the loader's workers did with their time in the path, summed over them, in seconds:
+    /// generating, and waiting with jobs queued because they were as far ahead as they may be (the
+    /// scene thread's taking in is what limits the loader when this is most of it, #168); and how
+    /// many times the scene thread took in what the loader made (the time of that is
+    /// `scene_thread.pack_ms`), and in how many it stopped because its slice was used up.
+    pub loader_generating_s: f64,
+    pub loader_held_back_s: f64,
+    pub stream_calls: u64,
+    pub stream_slices_used: u64,
     /// Looks of the scene thread at every split brick (every few seconds, and one forced at the end
     /// of the path), the holes they found in all, and those per frame of the path. Never 0 looks.
     pub hole_looks: u64,
@@ -1274,6 +1289,10 @@ struct Capture {
     /// when the path began.
     generated: u64,
     arrived: u64,
+    /// The loader's workers' time (generating, held back, in microseconds) and the scene thread's
+    /// calls to take in, when the path began.
+    busy: (u64, u64),
+    streams: (u64, u64),
     /// The loader's queue at each frame: the most and the sum, for the mean.
     queue_max: usize,
     queue_sum: u64,
@@ -1344,6 +1363,11 @@ impl Capture {
             holes: work.holes_found,
             generated: world.stats().loader.generated,
             arrived: work.arrived_bricks,
+            busy: (
+                world.stats().loader.generating_us,
+                world.stats().loader.held_back_us,
+            ),
+            streams: (work.stream_calls, work.stream_slices_used),
             queue_max: 0,
             queue_sum: 0,
             frame_ms: Vec::new(),
@@ -1488,6 +1512,20 @@ impl Capture {
             arrived_bricks: work.arrived_bricks - self.arrived,
             loader_queue_max: self.queue_max,
             loader_queue_mean: self.queue_sum as f64 / frames.max(1) as f64,
+            loader_generating_s: world
+                .stats()
+                .loader
+                .generating_us
+                .saturating_sub(self.busy.0) as f64
+                * 1e-6,
+            loader_held_back_s: world
+                .stats()
+                .loader
+                .held_back_us
+                .saturating_sub(self.busy.1) as f64
+                * 1e-6,
+            stream_calls: work.stream_calls - self.streams.0,
+            stream_slices_used: work.stream_slices_used - self.streams.1,
             hole_looks: work.hole_scans - self.scans,
             holes,
             holes_per_frame: per_frame(holes),
@@ -2157,6 +2195,7 @@ fn one_run(
     limit_ms: f64,
 ) -> Result<RunReport, Stopped> {
     let Built { world, setup, .. } = built;
+    world.set_backed_up_slice(script.stream_slice);
     world.count_soft_misses();
     world.measure_scene_thread();
     // The work the scene thread had done before it was told to measure is the run's baseline.
@@ -2242,12 +2281,16 @@ pub fn run(
     runs: u32,
     resolution: Resolution,
     budgets: &StreamingBudgets,
+    stream_slice: Option<Duration>,
 ) -> RealTimeReport {
-    let script = if full {
+    let mut script = if full {
         Script::full()
     } else {
         Script::short()
     };
+    if let Some(slice) = stream_slice {
+        script.stream_slice = slice;
+    }
     let mut reports = Vec::new();
     let mut d0 = 0.0;
     let mut failure = None;
@@ -2340,6 +2383,10 @@ mod tests {
             arrived_bricks: 0,
             loader_queue_max: 0,
             loader_queue_mean: 0.0,
+            loader_generating_s: 0.0,
+            loader_held_back_s: 0.0,
+            stream_calls: 0,
+            stream_slices_used: 0,
             hole_looks: 2,
             holes,
             holes_per_frame: 0.0,
@@ -2885,6 +2932,8 @@ mod tests {
                 "holes",
                 "holes_per_frame",
                 "largest_updates",
+                "loader_generating_s",
+                "loader_held_back_s",
                 "loader_queue_max",
                 "loader_queue_mean",
                 "name",
@@ -2901,6 +2950,8 @@ mod tests {
                 "slowest_cycles",
                 "soft_misses",
                 "soft_misses_per_frame",
+                "stream_calls",
+                "stream_slices_used",
                 "upload"
             ]
         );
@@ -3556,29 +3607,35 @@ mod tests {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(1);
+        // `STREAM_SLICE_MS`: another slice for taking in while the loader is backed up.
+        let mut script = Script::full();
+        if let Some(ms) = std::env::var("STREAM_SLICE_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+        {
+            script.stream_slice = Duration::from_millis(ms);
+        }
         for run in 1..=runs {
             let built = build_full().expect("the full-size Planet builds");
-            let report = one_run(
-                built,
-                &mut NoGpu,
-                &Script::full(),
-                BUDGETS.frame_time_p99_ms,
-            )
-            .unwrap_or_else(|stopped| {
-                panic!("the run stopped at {}: {}", stopped.step, stopped.error)
-            });
+            let report = one_run(built, &mut NoGpu, &script, BUDGETS.frame_time_p99_ms)
+                .unwrap_or_else(|stopped| {
+                    panic!("the run stopped at {}: {}", stopped.step, stopped.error)
+                });
             eprintln!(
-                "RUN {run}: load {:.1} s, level 0 under the camera {:.1} s, fill {:.0} s, holes {}",
+                "RUN {run}: stream slice {:?}, load {:.1} s, level 0 under the camera {:.1} s, fill {:.0} s, holes {}, edit {:?}",
+                script.stream_slice,
                 report.cold_start.load_s,
                 report.cold_start.time_to_level_0_under_camera_s,
                 report.cold_start.fill_s,
-                report.holes
+                report.holes,
+                report.edit_latency,
             );
             for path in &report.paths {
                 eprintln!(
                     "  {:>20}: {:>5} frames, soft misses/frame {:>9.0} (frames with {:>5}, max {:>7}; under the camera {:>4}), lag max {:>5.2} d0, \
                      cpu p99 {:>5.2} ms, scene follow {:>7.0} ms pack {:>7.0} ms reband {:>7.0} ms, generated {:>9} arrived {:>9} \
-                     loader queue max {:>8} mean {:>9.0}, settle (s, walk, reband, fill, settled) {:?}",
+                     loader queue max {:>8} mean {:>9.0}, loader generating {:>6.1} s held back {:>6.1} s, \
+                     stream calls {:>6} slices used up {:>6}, settle (s, walk, reband, fill, settled) {:?}",
                     path.name,
                     path.frames,
                     path.soft_misses_per_frame,
@@ -3594,6 +3651,10 @@ mod tests {
                     path.arrived_bricks,
                     path.loader_queue_max,
                     path.loader_queue_mean,
+                    path.loader_generating_s,
+                    path.loader_held_back_s,
+                    path.stream_calls,
+                    path.stream_slices_used,
                     path.settle
                         .map(|s| (s.seconds, s.walk_s, s.reband_s, s.fill_s, s.settled)),
                 );

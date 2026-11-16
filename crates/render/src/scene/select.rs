@@ -1230,9 +1230,13 @@ impl Selection {
     /// [`Selection::relook_some`] looks at them, a few at a time, and says what changed.
     ///
     /// **Coarser** bands (a smaller `d0`) bring a split node's merge nearer, and a whole node's
-    /// split further, so the nodes to look at are the split ones, and the whole ones that hold a
-    /// margin request (which may be let go): coarsest first, as a merge takes what is under it with
-    /// it. **Finer** bands bring a whole node's split nearer, and a split node's merge further: the
+    /// split further, so the nodes to look at are the split ones: coarsest first, as a merge takes
+    /// what is under it with it. A whole node that holds a margin request is not one: its entry is
+    /// for a split nearer than the new bands' (it comes due early, and the node is watched again),
+    /// and the margin that the node may now let go is let go then. Listed, it was parked, and a
+    /// parked node is watched by nothing: a margin node that the camera came to before the relook
+    /// (590 thousand nodes behind, in a flight) was not split though its children were resident,
+    /// and was the soft miss under the camera for 45 frames at a time. **Finer** bands bring a whole node's split nearer, and a split node's merge further: the
     /// whole nodes of level 1 and up, nearest the camera first (level 0 cannot split).
     pub fn set_bands(&mut self, bands: Bands) {
         if self.bands == bands {
@@ -1284,9 +1288,7 @@ impl Selection {
         if coarser {
             let mut by_level: [Vec<Key>; LEVELS] = std::array::from_fn(|_| Vec::new());
             for (&key, node) in &self.nodes {
-                if (node.state == State::Split || node.margin || pending.contains(&key))
-                    && !valid(node)
-                {
+                if (node.state == State::Split || pending.contains(&key)) && !valid(node) {
                     by_level[key.0].push(key);
                 }
             }
@@ -2650,6 +2652,51 @@ mod tests {
         selection.update(&store, c);
         is_a_cut(&selection);
         is_as_the_rule_says(&selection, "after three changes");
+    }
+
+    /// A margin node (whole, its children resident for the camera that comes) is not listed by a
+    /// change to coarser bands, so it is not parked: a camera that comes to it before the relook has
+    /// reached the rest has it split by the rule (#168: 59 of the 71 soft misses under the camera
+    /// at frames 245 to 289 of the 50 m flight were margin nodes parked by a change of bands, with
+    /// their children resident).
+    #[test]
+    fn a_margin_node_is_split_by_a_camera_that_comes_to_it_before_a_coarser_change_is_looked_at() {
+        let store = flat(64, 4);
+        let camera = [0.5, 20.0, 0.5];
+        let top = top_level(&store);
+        let roots = top_bricks(&store, top, None);
+        let reach = Reach {
+            margins: MARGINS,
+            ..Reach::NONE
+        };
+        let (mut selection, _) =
+            Selection::new_reached(&store, camera, Bands::with_d0(D0), top, roots, None, reach);
+        let margins = selection.nodes.values().filter(|n| n.margin).count();
+        assert!(margins > 10, "{margins} margin nodes");
+        selection.set_bands(at_speed(1.5));
+        assert!(selection.relooking() > 0);
+        for (key, node) in &selection.nodes {
+            assert!(
+                !node.margin || watched(node.stamp),
+                "{key:?} is a margin node and parked"
+            );
+        }
+        // A camera that walks on with nothing of the relook done: a whole node that is watched is
+        // not one that the bands split.
+        for n in 1..=40 {
+            selection.update(
+                &store,
+                [camera[0] + 4.0 * f64::from(n), camera[1], camera[2]],
+            );
+            for (&key, node) in &selection.nodes {
+                assert!(
+                    node.state == State::Split
+                        || node.stamp == 0
+                        || !selection.drawn_split(key, Some(false)),
+                    "step {n}: {key:?} is whole, watched and split by the rule"
+                );
+            }
+        }
     }
 
     /// Bands that go to and fro, a flight's every change, do not make the hot list and the queue

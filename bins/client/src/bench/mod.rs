@@ -303,10 +303,17 @@ fn run(args: &Args) -> Result<u8, Box<dyn Error>> {
     // The real-time mode runs after the stepped one, for the same reason: its own world and GPU. If
     // a run of it stops on an error, the report still has everything that was done before, and the
     // error: tens of minutes of the 4090's time are not thrown away for the last run's.
+    let stream_slice = args
+        .stream_slice_ms
+        .map(|ms| std::time::Duration::from_millis(u64::from(ms)));
     let streaming_real_time = match real_time_budgets {
-        Some(budgets) if args.real_time => {
-            Some(realtime::run(!plan.patch, args.runs, resolution, &budgets))
-        }
+        Some(budgets) if args.real_time => Some(realtime::run(
+            !plan.patch,
+            args.runs,
+            resolution,
+            &budgets,
+            stream_slice,
+        )),
         _ => None,
     };
 
@@ -335,6 +342,10 @@ fn run(args: &Args) -> Result<u8, Box<dyn Error>> {
             path: plan.path_name.to_string(),
             keyframes: plan.path.keyframes(),
             bias: args.bias,
+            stream_slice_ms: stream_slice
+                .unwrap_or(crate::scene_worker::BACKED_UP_SLICE)
+                .as_secs_f64()
+                * 1e3,
             diag: args.diag.switches(),
         },
         altitudes,

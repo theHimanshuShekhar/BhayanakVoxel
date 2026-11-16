@@ -222,6 +222,8 @@ fn check_schema(report: &Value, out: &Path) {
     assert!(config["keyframes"].as_u64().unwrap() >= 2);
     // The LOD bias is recorded (1 unless asked).
     assert_eq!(config["bias"], 1.0);
+    // The scene thread's slice for taking in while the loader is backed up is recorded.
+    assert_eq!(config["stream_slice_ms"], 32.0);
 
     check_convergence(&report["convergence"], out);
 
