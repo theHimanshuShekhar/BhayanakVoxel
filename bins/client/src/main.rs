@@ -928,9 +928,10 @@ impl App {
         let (Some(world), Some(renderer)) = (&mut self.world, &mut self.renderer) else {
             return Ok(());
         };
-        // Every arrival is a scene update, which restarts the reference image: so arrivals are
-        // held back while it accumulates a view that is still, and taken in the frame that
-        // anything changes.
+        // Every scene update restarts the reference image: so while it accumulates a view that is
+        // still, the scene thread takes in no arrival, does not move the scene to the camera and
+        // takes no step of coarsening (an Edit still goes through), and does all of that in the
+        // frame that anything changes (#94, #217).
         let still_frames = self.still.observe((renderer.view(&self.camera), self.bias));
         world.pause_loading(world::loading_paused_for(renderer.mode(), still_frames));
         let (cpu, growth) = (&mut self.cpu, &mut self.growth);

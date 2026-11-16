@@ -528,9 +528,12 @@ impl World {
         self.scene.reserved_bytes()
     }
 
-    /// Holds back (or lets go of) what the loader generates: while paused, nothing it generated
-    /// is taken in, so the scene stays as it is and the reference image can accumulate. The
-    /// loader's threads stop at [`crate::loader::MAX_AHEAD`] jobs ahead, so what waits is bounded.
+    /// Holds back (or lets go of) what changes the scene while the view is Still (#94, #217): while
+    /// paused, nothing the loader generated is taken in, the scene is not moved to the camera and
+    /// coarsening takes no step, so the scene stays as it is and the reference image can
+    /// accumulate. An Edit still goes through. The loader's threads stop at
+    /// [`crate::loader::MAX_AHEAD`] jobs ahead, so what waits is bounded, and what the scene thread
+    /// held back is done in the rounds after the pause ends.
     pub fn pause_loading(&mut self, paused: bool) {
         self.loading_paused = paused;
         if let Some(worker) = &self.worker {

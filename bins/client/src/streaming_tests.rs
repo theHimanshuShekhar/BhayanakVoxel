@@ -2277,6 +2277,57 @@ fn coarsening_stands_while_what_is_wanted_does_not_fit_and_is_taken_back_when_it
     assert!(!world.store().over_limit());
 }
 
+/// The steps of coarsening are held back while the view is Still, like following the camera (#217):
+/// each is a rebuild of the scene, which would restart the Reference view. They are taken the
+/// frame the view stops being Still.
+#[test]
+fn coarsening_steps_are_not_taken_back_while_the_view_is_still_and_are_when_it_is_not() {
+    let (mut full, _s, camera) = margined_world(Run::Stepped, None);
+    fill(&mut full, camera.position);
+    full.sync().unwrap();
+    let complete = full.store().streamed_len();
+    drop(full);
+    let budget = |share: usize| brick_store::Budget {
+        bricks: complete * share / 100,
+        overflow: 0.02,
+    };
+    let (mut world, _server, camera) = margined_world(Run::Stepped, Some(budget(90)));
+    let mut patience = Patience::new(Duration::from_secs(240));
+    loop {
+        stream(&mut world, camera.position);
+        world.sync().unwrap();
+        if idle(&world) && world.stats().coarsening > 0 && !world.store().over_limit() {
+            break;
+        }
+        patience.wait(&world, || "does not coarsen".into());
+    }
+    let steps = world.stats().coarsening;
+    // Room for the steps to be taken back, and the view Still: for many holds nothing is taken
+    // back and no update is taken in.
+    world.set_budget(budget(140));
+    let mut still = Stillness::default();
+    let before = world.still_cuts();
+    for _ in 0..30 {
+        pace(&world, Duration::from_millis(100));
+        let updates = frame(&mut world, &mut still, Mode::Reference, camera.position);
+        world.sync().unwrap();
+        assert!(updates.is_empty() || !world.loading_paused());
+    }
+    assert!(world.loading_paused());
+    assert_eq!(world.stats().coarsening, steps, "a step was taken back");
+    assert!(world.still_cuts().since(before).cuts <= 1);
+    // The view changes: the steps are taken back, one each hold, as they are for any view.
+    let mut patience = Patience::new(Duration::from_secs(60));
+    let mut at = camera.position;
+    while world.stats().coarsening > 0 {
+        at = std::array::from_fn(|a| at[a] + 1e-3);
+        frame(&mut world, &mut still, Mode::Reference, at);
+        patience.wait(&world, || {
+            format!("the steps are not taken back: {}", world.stats().coarsening)
+        });
+    }
+}
+
 /// A scene thread that is parked (nothing asked of it, the camera exactly still) wakes by itself
 /// when a coarsening hold is over, and takes the steps back: that is the thread's wait, which a
 /// stepped scene thread does not have, so this one runs with real threads.
@@ -4217,33 +4268,138 @@ fn after_a_flight_the_scene_cannot_keep_up_with(
     (world, server, camera, at)
 }
 
-/// Frames of `at`, held Still the way the game holds a Reference view (loading pauses once the camera
-/// has stood for [`STILL_FRAMES`] frames): what the world counted as cuts meanwhile.
+/// A frame of the game's, in `mode`, for the camera at `at`, and the updates it took.
+/// (See [`frame`]: loading pauses once the view has been Still for [`STILL_FRAMES`] frames.)
+fn held(
+    world: &mut World,
+    still: &mut Stillness<[f64; 3]>,
+    mode: Mode,
+    at: [f64; 3],
+) -> Vec<SceneUpdate> {
+    let updates = frame(world, still, mode, at);
+    pace(world, FRAME);
+    updates
+}
+
+/// The cuts that [`render::still::Cuts`] would count for a view held Still: the updates taken in the
+/// frames in which loading was paused (the Reference view is shown from the same frame).
 fn hold_still(world: &mut World, at: [f64; 3], frames: usize) -> crate::world::StillCuts {
     let mut still = Stillness::default();
     let before = world.still_cuts();
     for _ in 0..frames {
-        world.pause_loading(loading_paused_for(Mode::Reference, still.observe(at)));
-        stream(world, at);
-        pace(world, FRAME);
+        held(world, &mut still, Mode::Reference, at);
     }
     world.still_cuts().since(before)
 }
 
 #[test]
-fn the_cuts_of_a_still_view_are_counted_and_the_scene_threads_follow_is_what_made_them() {
-    use crate::scene_worker::Cause;
-    let (mut world, _server, _camera, at) = after_a_flight_the_scene_cannot_keep_up_with(120);
+fn a_still_view_held_after_a_flight_gets_at_most_one_cut_from_scene_patches() {
+    // The scene is 2 000 Voxels and more behind the camera when it stops, and following it would
+    // go on for hundreds of frames: 118 cuts in the 120 frames of a held view before #217, all of
+    // them the scene thread following the camera.
+    let (mut world, _server, _camera, at) = after_a_flight_the_scene_cannot_keep_up_with(40);
+    let lag = world.lag(at);
     let cuts = hold_still(&mut world, at, 120);
-    eprintln!("cuts while Still after the flight: {cuts:?}");
-    // Every update that was taken while the view was Still is a cut, and what made it is known.
-    assert!(cuts.cuts > 0, "{cuts:?}");
-    assert!(cuts.of(Cause::Follow) > 0, "{cuts:?}");
-    assert!(
-        cuts.of(Cause::Edit) == 0 && cuts.of(Cause::Bands) == 0,
-        "{cuts:?}"
-    );
     assert!(cuts.frames >= 100, "the frames that were Still: {cuts:?}");
+    assert!(cuts.cuts <= 1, "{cuts:?}");
+    // The patches were held back, not made and not sent: the scene stands where it was.
+    assert!(
+        world.lag(at) >= lag - 100.0,
+        "{} then {}",
+        lag,
+        world.lag(at)
+    );
+}
+
+#[test]
+fn leaving_still_after_a_held_flight_catches_up_with_no_hole_and_the_scene_a_view_that_never_held_has()
+ {
+    use crate::scene_worker::Cause;
+    // The same flight twice: one world is held Still after it, the other never is.
+    let (mut never, _s1, _c1, at) = after_a_flight_the_scene_cannot_keep_up_with(40);
+    let (mut after, _s2, _c2, at_2) = after_a_flight_the_scene_cannot_keep_up_with(40);
+    assert_eq!(at, at_2);
+    never.count_exactly();
+    after.count_exactly();
+    let mut copy = GpuCopy::of(after.scene());
+    let mut frames = 0;
+    let mut write = |world: &mut World, copy: &mut GpuCopy, updates: Vec<SceneUpdate>| {
+        for update in updates {
+            copy.write(world.scene(), &update);
+        }
+        copy.assert_is(world.scene(), frames);
+        assert_eq!(world.stats().holes, 0, "frame {frames}: a hole");
+        frames += 1;
+    };
+
+    // Held: nothing is taken in, and nothing is a hole.
+    let mut still = Stillness::default();
+    for _ in 0..90 {
+        let updates = held(&mut after, &mut still, Mode::Reference, at);
+        write(&mut after, &mut copy, updates);
+    }
+    assert!(after.loading_paused());
+    assert!(after.lag(at) > 1000.0, "the scene was not followed");
+    // The view changes (an Edit, the sun: here the camera does, by a Voxel, as the player's mouse
+    // would): from that frame the scene catches up, in the steps and with the budget of any other.
+    let mut at_now = at;
+    let mut patience = Patience::new(Duration::from_secs(120));
+    let mut updates_taken = 0;
+    loop {
+        at_now = std::array::from_fn(|a| at_now[a] + 1e-3 * (a as f64 + 1.0));
+        let updates = held(&mut after, &mut still, Mode::Reference, at_now);
+        assert!(!after.loading_paused());
+        updates_taken += updates.len();
+        write(&mut after, &mut copy, updates);
+        if idle(&after) && !after.stats().throttled && after.lag(at_now) < 1.0 {
+            break;
+        }
+        patience.wait(&after, || {
+            format!("does not catch up: lag {:.0}", after.lag(at_now))
+        });
+    }
+    assert!(updates_taken > 0, "what was held back was done");
+    assert_eq!(after.stats().soft_misses, 0);
+    assert_eq!(after.stats().holes, 0);
+
+    // The control never held: it follows as it always did, and ends where the held one does.
+    let mut patience = Patience::new(Duration::from_secs(120));
+    loop {
+        stream(&mut never, at_now);
+        if idle(&never) && !never.stats().throttled && never.lag(at_now) < 1.0 {
+            break;
+        }
+        patience.wait(&never, || "the control does not settle".into());
+    }
+    // The bricks drawn at each level are those of the control, but for the few at the edge of a
+    // ring that the order of the loader's arrivals decides (the two ended on different histories).
+    for level in 0..LEVELS {
+        let (held, control) = (after.level_bricks(level), never.level_bricks(level));
+        assert!(
+            held.abs_diff(control) <= 4.max(control / 100),
+            "level {level}: {held} bricks drawn, {control} for the control"
+        );
+    }
+    assert_eq!(after.waiting(), never.waiting());
+    // The held view's cuts were all while it was held; after it, none is counted.
+    assert!(after.still_cuts().of(Cause::Follow) <= 1);
+}
+
+#[test]
+fn primary_mode_keeps_following_the_camera_after_a_flight_and_is_never_held() {
+    let (mut world, _server, _camera, at) = after_a_flight_the_scene_cannot_keep_up_with(40);
+    let lag = world.lag(at);
+    let mut still = Stillness::default();
+    let mut updates = 0;
+    for _ in 0..120 {
+        updates += held(&mut world, &mut still, Mode::Primary, at).len();
+        assert!(!world.loading_paused());
+    }
+    // Every frame, nearly, brings a step of the walk to the camera, as it did before.
+    assert!(updates >= 100, "{updates} updates in 120 frames");
+    assert!(world.lag(at) < lag - 100.0, "{lag} then {}", world.lag(at));
+    // And nothing is counted: the view is never Still.
+    assert_eq!(world.still_cuts(), crate::world::StillCuts::default());
 }
 
 #[test]

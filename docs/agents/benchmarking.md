@@ -334,7 +334,8 @@ is made there (below): the run's **Edit latency**. Its frames are not those of a
 5 s of the flight of `stop after a flight`, then the camera stands for 3 s (1 s with `--short`) with the
 game's policy for a Reference view: once it has stood for 2 frames, loading is paused
 (`loading_paused_for(Mode::Reference, ..)`, the same call the client makes) and the scene thread is
-told. What the frame thread takes in meanwhile is the cuts of the Reference view, counted by cause
+told; **the scene thread then holds back moving the scene to the camera and the steps of coarsening**
+(#217, ADR 0005, "Still frames") and takes in no arrivals. What the frame thread takes in meanwhile is the cuts of the Reference view, counted by cause
 (`cuts`, as `still_cuts` above) in `hold_s` seconds of frames. **The acceptance of #217 is at most 1
 cut here from scene patches** (the Planet has no Edit in this run). Then the view changes (loading goes
 on) and `catch_up` is the time to the first frame with no soft misses and nothing waiting, and
@@ -534,8 +535,10 @@ on) and `catch_up` is the time to the first frame with no soft misses and nothin
     coarsening, or one taken back). A cut that was made of several kinds of work counts under each,
     so the causes add up to at least `cuts`. In **this** path nothing is held back (it measures the
     settle time, which needs the loader to go on), so this is what a Still view would get if the
-    scene thread worked as it does for the Primary view: the "before" of #217. The held view is
-    `still_after_flight` of the run.
+    scene thread worked as it does for the Primary view. The held view is `still_after_flight` of the
+    run. A stepped test (`a_still_view_held_after_a_flight_gets_at_most_one_cut_from_scene_patches`)
+    holds the number on the test Planet: 118 cuts in 120 held frames before #217, all of them
+    `follow`, and at most 1 after.
   - `settle`, for `stop after a flight` only (null for the others): `seconds` from the frame the
     camera stopped in to the first frame with no soft misses, or the cap, and `settled`. Not gated.
     The scene thread's count of soft misses can be from before the stop (it counts a few times a

@@ -637,7 +637,9 @@ struct Shared {
     outbox: Mutex<Outbox>,
     /// The frame thread waits here, for a job.
     finished: Condvar,
-    /// Whether taking in what the loader generated is held back.
+    /// Whether the view is Still, and the scene is held as it is (#217): what the loader generated
+    /// is not taken in, the scene is not moved to the camera and coarsening takes no step. An Edit
+    /// and the coarse levels over it go through.
     paused: AtomicBool,
     /// Whether [`Stats::soft_misses`] is counted, which looks at every brick that waits (a
     /// diagnostic: see [`SceneWorker::count_soft_misses`]).
@@ -805,6 +807,7 @@ impl SceneWorker {
             shared: Arc::clone(&shared),
             camera: Some(camera),
             paused: false,
+            held_at: None,
             arrival_cost: ARRIVAL_COST,
             changes: Changes::None,
             causes: Causes::default(),
@@ -1287,6 +1290,10 @@ struct Engine {
     /// The camera the scene was last moved to.
     camera: Option<[f64; 3]>,
     paused: bool,
+    /// The camera that following was held back for while the view is Still (#217), if there was
+    /// something to follow: the thread has nothing to do for it until the pause ends, so it sleeps
+    /// as it does for a camera it has followed to (see [`Engine::await_work`]).
+    held_at: Option<[f64; 3]>,
     /// What taking in one brick's children is expected to cost.
     arrival_cost: Duration,
     changes: Changes,
@@ -1529,14 +1536,15 @@ impl Engine {
         }
         if self.idle
             && inbox.jobs.is_empty()
-            && Some(inbox.camera) == self.camera
+            && [self.camera, self.held_at].contains(&Some(inbox.camera))
             && inbox.velocity == self.velocity
         {
             let shared = Arc::clone(&self.shared);
-            let (camera, paused, moving) = (self.camera, self.paused, self.velocity);
+            let (cameras, paused, moving) =
+                ([self.camera, self.held_at], self.paused, self.velocity);
             let quiet = |inbox: &mut Inbox| {
                 inbox.jobs.is_empty()
-                    && Some(inbox.camera) == camera
+                    && cameras.contains(&Some(inbox.camera))
                     && inbox.velocity == moving
                     && !inbox.shutdown
                     && shared.paused.load(Ordering::Acquire) == paused
@@ -1661,12 +1669,23 @@ impl Engine {
             }
             self.publish(Some(ticket));
         }
+        // While the view is Still the Reference view accumulates the scene as it is, and every
+        // patch restarts it (#217, ADR 0005): the scene is frozen, but for what is needed for it to
+        // be right, which is an Edit (its job, above, and the coarse levels over it, here). Moving
+        // the scene to the camera and the steps of coarsening wait until the view is not Still:
+        // loading is held back for the same reason (`stream`, below), and what was held is done in
+        // the rounds after, as it is for any other camera.
+        let frozen = self.paused;
+        self.held_at = (frozen && self.has_to_follow(camera)).then_some(camera);
         let began = self.began();
         let remade = self.remake_coarse();
         self.spend(Part::Coarse, began);
         let outcome = remade
             .and_then(|remade| {
                 worked |= remade;
+                if frozen {
+                    return Ok(false);
+                }
                 let began = self.began();
                 let moved = self.follow(camera);
                 self.spend(Part::Follow, began);
@@ -1691,8 +1710,10 @@ impl Engine {
         self.spend(Part::Evict, began);
         self.work.evict_steps += u64::from(evicting);
         worked |= evicting;
-        self.coarsen_more();
-        self.relax();
+        if !frozen {
+            self.coarsen_more();
+            self.relax();
+        }
         self.work.budget_cuts += u64::from(self.throttled);
         // A sync is done when the coarse levels over the Edits before it are made, too.
         let busy = !self.coarse.is_empty();
@@ -1904,6 +1925,12 @@ impl Engine {
         Ok(true)
     }
 
+    /// Whether [`Engine::follow`] has anything to do for `camera`: the scene is not there, or a
+    /// brick that the loader gave up on is to be asked for again.
+    fn has_to_follow(&self, camera: [f64; 3]) -> bool {
+        self.camera != Some(camera) || self.scene.rewanted()
+    }
+
     /// Moves the scene to `camera`, if it is not there, in steps that each cost a share of the
     /// budget ([`FOLLOW_SHARE`]) when it is further than one: each step is packed and noted in
     /// its turn, and the steps go on while what waits is under the budget and the slice (the
@@ -1913,7 +1940,7 @@ impl Engine {
     /// was *put* further than a jump ([`Engine::teleported`]) does that. Whether it was moved.
     fn follow(&mut self, camera: [f64; 3]) -> Result<bool, RingsFull> {
         // A camera that has not moved is looked at again for a brick that the loader gave up on.
-        if self.camera == Some(camera) && !self.scene.rewanted() {
+        if !self.has_to_follow(camera) {
             return Ok(false);
         }
         // The camera is followed when the frame thread has taken what waits, from where the scene is:
