@@ -8,7 +8,7 @@ use std::time::Duration;
 use brick_store::{Brick, BrickCoord, BrickStore, Material, VoxelCoord};
 use render::batch::MAX_BATCH_SAMPLES;
 use render::scene::{Core, SceneUpdate};
-use render::still::{FADE, Plan};
+use render::still::{Cuts, FADE, Plan};
 use render::{Camera, Image, Offscreen, Resolution, Scene, Sun};
 
 const STONE: Material = Material(1);
@@ -304,6 +304,40 @@ fn a_change_cuts_to_primary_and_restarts_from_sample_zero() {
              the old view's, of Primary or of a fade"
         );
     }
+}
+
+/// The cuts of a Still view are counted, by what changed (#217): only a change to a view that was
+/// showing the Reference view is a cut, and the count says whether it was the view or the Planet.
+#[test]
+fn the_cuts_of_a_still_view_are_counted_by_what_changed() {
+    let mut gpu = new_gpu();
+    let mut store = store();
+    let mut scene = Scene::new(&store, Some(CORE));
+    // A view that is not Still yet is not cut: its first frames are Primary whatever happens.
+    frames(&mut gpu, &camera(), 0, 1);
+    frames(&mut gpu, &other_camera(), 1, 1);
+    assert_eq!(gpu.still_cuts(), Cuts::default());
+    // Still, and showing the Reference view; then the camera moves: one cut, of the view.
+    frames(&mut gpu, &other_camera(), 2, 6);
+    assert!(gpu.reference_samples() > 0);
+    frames(&mut gpu, &camera(), 8, 1);
+    assert_eq!(gpu.still_cuts(), Cuts { view: 1, scene: 0 });
+    // Still again, and a patch to the Planet: one cut, of the scene. The camera has not moved.
+    frames(&mut gpu, &camera(), 9, 6);
+    let changed = dig(&mut store, [0, 98, 0], 14);
+    let update = scene.update(&store, &changed).unwrap();
+    gpu.update_scene(&scene, &update).unwrap();
+    frames(&mut gpu, &camera(), 15, 1);
+    assert_eq!(gpu.still_cuts(), Cuts { view: 1, scene: 1 });
+    // A patch while the view is only on its way to Still is not a cut: the Reference view was not
+    // shown.
+    gpu.update_scene(&scene, &update).unwrap();
+    frames(&mut gpu, &camera(), 16, 1);
+    assert_eq!(gpu.still_cuts().total(), 2);
+    // Leaving Reference mode is the player's doing, not a cut.
+    frames(&mut gpu, &camera(), 17, 6);
+    gpu.draw_frame(&camera(), false, FRAME * 23);
+    assert_eq!(gpu.still_cuts().total(), 2);
 }
 
 /// Leaving Reference mode and coming back with nothing else changed (the same camera, the same
