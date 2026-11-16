@@ -633,9 +633,9 @@ struct App {
     sun: (f32, f32),
     /// The LOD bias in use: output pixels one Voxel may cover. The overlay changes it.
     bias: f32,
-    /// How long the view the reference image is of (and the bias) has been still: see
-    /// [`world::loading_paused_for`].
-    still: Stillness<(View, f32)>,
+    /// How long the view the reference image is of (and the bias) has been still, and with no
+    /// Edit made: see [`world::loading_paused_for`].
+    still: Stillness<(View, f32, u64)>,
     /// The title last set, so that it is only set when it changes.
     title: String,
     grabbed: bool,
@@ -928,12 +928,17 @@ impl App {
         let (Some(world), Some(renderer)) = (&mut self.world, &mut self.renderer) else {
             return Ok(());
         };
-        // Every scene update restarts the reference image: so while it accumulates a view that is
-        // still, the scene thread takes in no arrival, does not move the scene to the camera and
-        // takes no step of coarsening (an Edit still goes through), and does all of that in the
-        // frame that anything changes (#94, #217).
-        let still_frames = self.still.observe((renderer.view(&self.camera), self.bias));
-        world.pause_loading(world::loading_paused_for(renderer.mode(), still_frames));
+        // Every scene update restarts the reference image, so a view that goes Still first has the
+        // scene catch up with the camera, with loading going on and Primary drawn, and then the
+        // scene thread takes in no arrival, does not move the scene to the camera and takes no
+        // step of coarsening (an Edit still goes through) for as long as the reference image
+        // accumulates, and does all of that in the frame that anything changes (#94, #217). An
+        // Edit ends Still (CONTEXT.md): it is part of what must not change.
+        let still_frames =
+            self.still
+                .observe((renderer.view(&self.camera), self.bias, world.edits_made()));
+        let hold = world.hold_still(renderer.mode(), still_frames, self.camera.position);
+        renderer.set_reference_wait(hold == world::Hold::CatchingUp);
         let (cpu, growth) = (&mut self.cpu, &mut self.growth);
         world.stream(self.camera.position, |scene, update| {
             upload(growth, cpu, renderer, scene, update)

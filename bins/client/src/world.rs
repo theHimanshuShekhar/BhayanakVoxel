@@ -28,6 +28,106 @@ pub fn loading_paused_for(mode: Mode, still_frames: u32) -> bool {
     mode == Mode::Reference && still_frames >= STILL_FRAMES
 }
 
+/// The longest a Still view waits for the scene to reach the camera before it holds the scene
+/// where it is (#217): 5 s. A Reference view that starts later costs nothing but the wait, and the
+/// Primary view is drawn meanwhile; one that starts on a scene that is behind the camera
+/// converges on ground coarser than Primary's, for as long as the camera stands. So the cap is
+/// for a scene that cannot get there (the loader far behind, say), not a time to be reached in
+/// the usual way: the bench reports a hold that began at the cap ([`HoldBegan::capped`]).
+pub const CATCH_UP_CAP: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How far the scene may be behind the camera, in Voxels, for it to have caught up (#217): one
+/// (5 cm). The scene thread follows the camera to the exact place, and a still camera is the
+/// same place for every round, so a scene that has reached it is 0 behind; a Voxel is below
+/// anything the selection's bands tell apart (they are `d0` wide at the narrowest, which is
+/// hundreds of Voxels), so it only lets floating point and a lag that was last published a
+/// round early not hold the Reference view back.
+pub const CAUGHT_UP_LAG: f64 = 1.0;
+
+/// What a Still view does about the scene, from frame to frame (#94, #217).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Hold {
+    /// The view is not Still (or the mode is Primary): the scene follows the camera and takes in
+    /// what the loader makes, and Primary is shown.
+    Open,
+    /// The view is Still and the scene is behind the camera: loading goes on, and Primary is shown
+    /// (the Reference view does not start) until the scene has reached the camera, or
+    /// [`CATCH_UP_CAP`] has gone by.
+    CatchingUp,
+    /// The view is Still and the scene is where the camera is: loading is paused, and the Reference
+    /// view accumulates the scene as it is.
+    Held,
+}
+
+/// Decides the [`Hold`] of every frame: when a view goes Still the scene is first caught up with
+/// the camera, and then held. A Reference view of a scene that is behind the camera is a view of
+/// ground coarser than the Primary view would have drawn there (about 4 times coarser at 4 `d0`
+/// behind), converged on, so what the owner chose is to catch up first (#217). The world still
+/// freezes only while the Reference view accumulates (#94): it starts later after a fast flight.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct StillHold {
+    /// When the view went Still, and how far the scene was behind the camera then, while it is.
+    since: Option<(std::time::Instant, f64)>,
+    /// How the hold began, once it has.
+    began: Option<HoldBegan>,
+}
+
+/// How a hold began: what the catch-up before it was.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct HoldBegan {
+    /// The scene's lag behind the camera, in Voxels, when the view went Still and when the hold
+    /// began.
+    pub lag_when_still: f64,
+    pub lag_when_held: f64,
+    /// From the frame that the view went Still to the one the hold began in.
+    pub waited: std::time::Duration,
+    /// The cap ran out before the scene reached the camera.
+    pub capped: bool,
+}
+
+impl StillHold {
+    /// The hold for a frame at `now`, `mode` being how the window is drawn, `still_frames` how many
+    /// frames in a row the view has been unchanged, `caught_up` whether the scene has reached the
+    /// camera and nothing else is going to move it ([`World::caught_up`]) and `lag` how far behind
+    /// it is. A hold that has begun lasts as long as the view is Still: the scene does not move,
+    /// so it stays caught up.
+    pub fn step(
+        &mut self,
+        mode: Mode,
+        still_frames: u32,
+        caught_up: bool,
+        lag: f64,
+        now: std::time::Instant,
+    ) -> Hold {
+        if !loading_paused_for(mode, still_frames) {
+            *self = Self::default();
+            return Hold::Open;
+        }
+        let (since, lag_when_still) = *self.since.get_or_insert((now, lag));
+        if self.began.is_none() {
+            let waited = now.saturating_duration_since(since);
+            if caught_up || waited >= CATCH_UP_CAP {
+                self.began = Some(HoldBegan {
+                    lag_when_still,
+                    lag_when_held: lag,
+                    waited,
+                    capped: !caught_up,
+                });
+            }
+        }
+        if self.began.is_some() {
+            Hold::Held
+        } else {
+            Hold::CatchingUp
+        }
+    }
+
+    /// How the hold began, once it has: None while the view is not Still or is still catching up.
+    pub fn began(&self) -> Option<HoldBegan> {
+        self.began
+    }
+}
+
 /// How long what is compared has been the same, frame by frame: the view the reference image is
 /// of, held still (the scene is not part of it, as arrivals from the loader that this decides
 /// about change it).
@@ -57,6 +157,41 @@ impl<K: PartialEq> Stillness<K> {
             self.frames = 0;
         }
         self.frames
+    }
+}
+
+/// When an update is a cut, by the frames the renderer has had (`render::still::Still::plan`): the
+/// Reference view is shown in a frame after [`STILL_FRAMES`] frames in a row with the same view and
+/// no update (an update is part of the key, as the scene's epoch), so an update restarts something
+/// only if the view was Still in the frame before it and the last update was [`STILL_FRAMES`]
+/// frames or more before that. An update sooner than that came while the view was Primary still
+/// (the renderer had not shown the Reference view), and is none of the Reference view's to lose.
+#[derive(Clone, Copy, Debug, Default)]
+struct StillClock {
+    /// Whether the frame before was Still (loading paused, or marked).
+    was_still: bool,
+    /// Frames since an update was taken, as of the start of the frame that is being looked at: the
+    /// frames in between, not counting that one.
+    since_update: u32,
+    /// Whether an update in this frame is a cut, from the two above.
+    cut_ready: bool,
+}
+
+impl StillClock {
+    /// A frame begins, in which the view is Still or is not.
+    fn begin_frame(&mut self, still: bool) {
+        self.cut_ready = still && self.was_still && self.since_update >= STILL_FRAMES;
+        self.was_still = still;
+        self.since_update = self.since_update.saturating_add(1);
+    }
+
+    /// An update made of `causes` is taken in: counted in `cuts` if the view is Still and it
+    /// cut the Reference view.
+    fn update(&mut self, still: bool, cuts: &mut StillCuts, causes: Causes) {
+        if still && std::mem::take(&mut self.cut_ready) {
+            cuts.count(causes);
+        }
+        self.since_update = 0;
     }
 }
 
@@ -202,6 +337,11 @@ pub struct World {
     /// ([`World::mark_still`]): cuts are counted in it as when loading is paused.
     still_view: bool,
     still_cuts: StillCuts,
+    /// What a cut is counted by, as the renderer's own count of Still frames has it (see
+    /// [`World::begin_still_frame`]).
+    still_clock: StillClock,
+    /// Where a Still view is in catching up and holding: see [`World::hold_still`].
+    still_hold: StillHold,
     /// What the next click would change, while there is something under the cursor to apply the
     /// tool to. Made again when the Edit it is of changes, or a brick it reads does.
     ghost: Option<Ghost>,
@@ -313,6 +453,8 @@ impl World {
             loading_paused: false,
             still_view: false,
             still_cuts: StillCuts::default(),
+            still_clock: StillClock::default(),
+            still_hold: StillHold::default(),
             ghost: None,
             ghost_next: None,
             resim: std::time::Duration::ZERO,
@@ -533,12 +675,35 @@ impl World {
     /// coarsening takes no step, so the scene stays as it is and the reference image can
     /// accumulate. An Edit still goes through. The loader's threads stop at
     /// [`crate::loader::MAX_AHEAD`] jobs ahead, so what waits is bounded, and what the scene thread
-    /// held back is done in the rounds after the pause ends.
+    /// held back is done in the rounds after the pause ends. The game and the bench pause through
+    /// [`World::hold_still`], which has the scene catch up with the camera first.
     pub fn pause_loading(&mut self, paused: bool) {
         self.loading_paused = paused;
         if let Some(worker) = &self.worker {
             worker.pause(paused);
         }
+    }
+
+    /// What a Still view does about the scene in this frame (#94, #217): when the view goes Still
+    /// the scene first catches up with the camera, with loading going on and Primary drawn, and
+    /// then loading is paused and the Reference view accumulates the scene as it is. `mode` is how
+    /// the window is drawn and `still_frames` how long the view has been unchanged
+    /// ([`Stillness`]); `camera` is where the frame thread's camera is. Returns the [`Hold`] for
+    /// the frame, which the caller shows the Reference view by (only in [`Hold::Held`]).
+    pub fn hold_still(&mut self, mode: Mode, still_frames: u32, camera: [f64; 3]) -> Hold {
+        let caught_up = self.caught_up(camera);
+        let lag = self.lag(camera);
+        let now = self.clock.now();
+        let hold = self
+            .still_hold
+            .step(mode, still_frames, caught_up, lag, now);
+        self.pause_loading(hold == Hold::Held);
+        hold
+    }
+
+    /// Where the Still view is: see [`StillHold::began`].
+    pub fn still_hold(&self) -> &StillHold {
+        &self.still_hold
     }
 
     /// Says the view is Still (or not) without pausing anything, for the bench's baseline: updates
@@ -689,7 +854,7 @@ impl World {
         camera: [f64; 3],
         velocity: [f64; 3],
     ) -> Result<Option<SceneUpdate>, RingsFull> {
-        self.still_cuts.frames += u64::from(self.cutting_still());
+        self.begin_still_frame();
         match &self.worker {
             Some(worker) => {
                 worker.follow_moving(camera, velocity);
@@ -748,17 +913,33 @@ impl World {
     /// Voxels: the distance from `camera`, the frame thread's, to where the scene thread had moved
     /// the rings to when it made what the world has taken.
     ///
-    /// The scene thread publishes a round that moved the scene and changed nothing, and no count,
-    /// only with the next publish (a stats-only publish would make the outbox look untaken, which
-    /// the budget reads), so after such steps this is more than it was by at most the Voxels they
-    /// moved it (a follow step is at most 64 at the default budget; a round that changed anything,
-    /// as every one of a flight's does, publishes).
+    /// The scene thread tells the frame thread where it has moved the scene with every publish. A
+    /// round that moved it and changed nothing publishes nothing, so the lag can be more than it
+    /// is by the Voxels of such steps (a follow step is at most 64 at the default budget), until
+    /// the camera has stood for two rounds with the scene at it, when that is published (see
+    /// `Engine::arrived_unsaid`): a flight's rounds nearly all change something, and publish.
     pub fn lag(&self, camera: [f64; 3]) -> f64 {
         let shown = self.stats.camera.unwrap_or(camera);
         (0..3)
             .map(|a| (camera[a] - shown[a]).powi(2))
             .sum::<f64>()
             .sqrt()
+    }
+
+    /// Whether the scene has reached `camera` and nothing else is going to move it, for a Still
+    /// view to be held (see [`StillHold`]): the drawn scene's lag is under [`CAUGHT_UP_LAG`], and
+    /// no reband is pending ([`World::reband_pending`]). A world with no scene thread has nothing
+    /// to follow.
+    pub fn caught_up(&self, camera: [f64; 3]) -> bool {
+        self.lag(camera) < CAUGHT_UP_LAG && !self.reband_pending()
+    }
+
+    /// Whether the bands are about to change (a reband), which moves what every ring selects and
+    /// so is not a scene to hold. Never yet: #168 (the reband after a change of `d0` or the
+    /// level count) makes this true while one is pending, and must read it here, so that a Still
+    /// view waits for it as it waits for the camera.
+    fn reband_pending(&self) -> bool {
+        false
     }
 
     /// An Edit that changes nothing: how long it takes the scene thread to come to it, and to
@@ -786,11 +967,20 @@ impl World {
         self.worker.as_ref().expect("the world streams")
     }
 
-    /// An update that was made of `causes` is about to be drawn: a cut if the view is Still.
+    /// The look at the scene that a frame begins with: counts the frame if the view is Still, and
+    /// says whether an update taken in it is a cut (see [`StillClock`]).
+    fn begin_still_frame(&mut self) {
+        let still = self.cutting_still();
+        self.still_cuts.frames += u64::from(still);
+        self.still_clock.begin_frame(still);
+    }
+
+    /// An update that was made of `causes` is about to be drawn: a cut if the Reference view was
+    /// being shown (see [`StillClock`]).
     fn count_cut(&mut self, causes: Causes) {
-        if self.cutting_still() {
-            self.still_cuts.count(causes);
-        }
+        let cutting = self.cutting_still();
+        self.still_clock
+            .update(cutting, &mut self.still_cuts, causes);
     }
 
     /// Takes what the scene thread has made, and brings the copy of the scene that is drawn up to
@@ -804,9 +994,10 @@ impl World {
         if let Some(published) = ready.published_at {
             self.outbox_wait = self.outbox_wait.max(self.clock.since(published));
         }
-        let changed = ready.mirror.is_some() || ready.patch.is_some();
-        if changed && (self.loading_paused || self.still_view) {
-            self.still_cuts.count(ready.causes);
+        if ready.mirror.is_some() || ready.patch.is_some() {
+            let cutting = self.loading_paused || self.still_view;
+            self.still_clock
+                .update(cutting, &mut self.still_cuts, ready.causes);
         }
         let update = if let Some(mirror) = ready.mirror {
             // The old copy is freed by the thread that made the new one.
@@ -1556,6 +1747,116 @@ mod tests {
             Some(4072),
             "the new Voxels are not clipped away"
         );
+    }
+
+    #[test]
+    fn a_view_that_goes_still_catches_the_scene_up_and_then_holds_it_and_the_cap_ends_the_wait() {
+        use std::time::{Duration, Instant};
+        let now = Instant::now();
+        let at = |s: u64| now + Duration::from_secs(s);
+        let mut hold = StillHold::default();
+        // Not Still: open, whatever the scene is doing.
+        assert_eq!(
+            hold.step(Mode::Reference, 0, false, 900.0, at(0)),
+            Hold::Open
+        );
+        assert_eq!(hold.step(Mode::Reference, 1, true, 0.0, at(0)), Hold::Open);
+        // Primary mode is never held.
+        assert_eq!(hold.step(Mode::Primary, 99, true, 0.0, at(0)), Hold::Open);
+        // Still, with the scene behind the camera: loading goes on, and Primary is drawn.
+        assert_eq!(
+            hold.step(Mode::Reference, 2, false, 900.0, at(1)),
+            Hold::CatchingUp
+        );
+        assert_eq!(
+            hold.step(Mode::Reference, 3, false, 400.0, at(2)),
+            Hold::CatchingUp
+        );
+        assert_eq!(hold.began(), None);
+        // The scene reaches the camera: held, and how the wait went is kept.
+        assert_eq!(hold.step(Mode::Reference, 4, true, 0.5, at(3)), Hold::Held);
+        let began = hold.began().expect("the hold has begun");
+        assert_eq!(began.lag_when_still, 900.0);
+        assert_eq!(began.lag_when_held, 0.5);
+        assert_eq!(began.waited, Duration::from_secs(2));
+        assert!(!began.capped);
+        // Held for as long as the view is Still, though what says "caught up" does not.
+        assert_eq!(hold.step(Mode::Reference, 5, false, 3.0, at(4)), Hold::Held);
+        assert_eq!(hold.began(), Some(began));
+        // Anything that changes the view opens it, and the next Still view waits again.
+        assert_eq!(hold.step(Mode::Reference, 0, true, 0.0, at(5)), Hold::Open);
+        assert_eq!(hold.began(), None);
+        assert_eq!(
+            hold.step(Mode::Reference, 2, false, 70.0, at(6)),
+            Hold::CatchingUp
+        );
+
+        // A scene that does not get there is held at the cap, and it is said that it was.
+        let late = now + Duration::from_secs(6) + CATCH_UP_CAP;
+        assert_eq!(
+            hold.step(
+                Mode::Reference,
+                9,
+                false,
+                60.0,
+                late - Duration::from_millis(1)
+            ),
+            Hold::CatchingUp
+        );
+        assert_eq!(
+            hold.step(Mode::Reference, 10, false, 55.0, late),
+            Hold::Held
+        );
+        let began = hold.began().expect("the hold has begun");
+        assert!(began.capped);
+        assert_eq!(began.waited, CATCH_UP_CAP);
+        assert_eq!(began.lag_when_still, 70.0);
+        assert_eq!(began.lag_when_held, 55.0);
+    }
+
+    #[test]
+    fn an_update_is_a_cut_only_if_the_reference_view_was_being_shown_as_the_renderer_counts() {
+        // Frames of a view that is Still from frame 0, as `Still::plan` sees them: the Reference
+        // view is shown in a frame after STILL_FRAMES frames in a row with the same view and no
+        // update, and an update in a frame is part of that frame's key.
+        let run = |updates_in: &[usize], frames: usize| -> Vec<usize> {
+            let mut clock = StillClock::default();
+            let mut cuts = StillCuts::default();
+            let mut cut_in = Vec::new();
+            for frame in 0..frames {
+                clock.begin_frame(true);
+                if updates_in.contains(&frame) {
+                    let before = cuts.cuts;
+                    clock.update(true, &mut cuts, Causes::default().with(Cause::Follow));
+                    if cuts.cuts > before {
+                        cut_in.push(frame);
+                    }
+                }
+            }
+            cut_in
+        };
+        // Updates in every frame never show the Reference view: no cuts.
+        assert_eq!(run(&[0, 1, 2, 3, 4, 5, 6], 7), Vec::<usize>::new());
+        // Nothing in frames 0 and 1 shows the Reference view in frame 2, and an update in frame 3
+        // cuts it; an update in frame 1 would have kept it from showing, and is no cut.
+        assert_eq!(run(&[3], 8), vec![3]);
+        assert_eq!(run(&[1], 8), Vec::<usize>::new());
+        // After the cut at 3 the view shows again from frame 5: an update in 6 cuts it, one in 4
+        // or 5 (the frames before) does not.
+        assert_eq!(run(&[3, 6], 8), vec![3, 6]);
+        assert_eq!(run(&[3, 5], 8), vec![3]);
+        assert_eq!(run(&[3, 4], 8), vec![3]);
+        // A cut restarts it: the next update has to follow STILL_FRAMES quiet frames too.
+        assert_eq!(run(&[3, 6, 8, 9, 12], 14), vec![3, 6, 12]);
+        // A view that was not Still the frame before has no Reference view to cut.
+        let mut clock = StillClock::default();
+        let mut cuts = StillCuts::default();
+        for _ in 0..10 {
+            clock.begin_frame(false);
+        }
+        clock.begin_frame(true);
+        clock.update(true, &mut cuts, Causes::default());
+        assert_eq!(cuts.cuts, 0);
     }
 
     #[test]

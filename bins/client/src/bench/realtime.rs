@@ -59,7 +59,7 @@ use super::stream::{
 use crate::loader::{Loader, workers_for};
 use crate::scene_worker::{Cause, Done, Spent, UPLOAD_BUDGET};
 use crate::tool::Tool;
-use crate::world::{STILL_FRAMES, StillCuts, Stillness, World, loading_paused_for};
+use crate::world::{Hold, STILL_FRAMES, StillCuts, Stillness, World};
 
 /// A frame at 60 a second.
 const FRAME: Duration = Duration::from_micros(16_667);
@@ -628,12 +628,32 @@ impl From<StillCuts> for StillCutsReport {
     }
 }
 
-/// The view held Still after a flight, with the game's policy (loading paused once the camera has
-/// stood for [`STILL_FRAMES`] frames, as `Mode::Reference` does), and then let go (#217): the cuts
+/// What the scene did between the view going Still and the hold beginning (#217): the game
+/// catches the scene up with the camera first, with loading going on and Primary drawn, and
+/// holds it then ([`World::hold_still`]).
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+pub struct BeforeHold {
+    /// How far the scene was behind the camera, in Voxels, when the view went Still: what a hold
+    /// at once (the first form of #217) would have held it at, and the Reference view converged on.
+    pub lag_when_still_voxels: f64,
+    /// And when the hold began: under [`crate::world::CAUGHT_UP_LAG`] unless the cap ended the wait.
+    pub lag_when_held_voxels: f64,
+    /// From the view going Still to the hold beginning: how long the Reference view started
+    /// later than it would have.
+    pub waited_s: f64,
+    /// The wait ran to [`crate::world::CATCH_UP_CAP`] and the hold began with the scene still behind the camera.
+    /// **Expected false:** a cap that is hit means the Reference view starts on a lagging scene.
+    pub hit_cap: bool,
+}
+
+/// The view held Still after a flight, with the game's policy (the scene catches up with the
+/// camera, then loading is paused, as `Mode::Reference` does), and then let go (#217): the cuts
 /// that the scene thread made while it was held, and the catch-up after.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize)]
 pub struct StillAfterFlight {
-    /// How long the camera was held, in seconds.
+    /// The catch-up of the scene before the hold began.
+    pub before_hold: BeforeHold,
+    /// How long the camera was held after the hold began, in seconds.
     pub hold_s: f64,
     /// The cuts while it was held. **The acceptance of #217 is at most 1 cut here**, from scene
     /// patches (the Planet has no Edit in this run).
@@ -1853,13 +1873,14 @@ impl<'a> Session<'a> {
         self.end_path(capture, &camera, Some(settle), Some(still_cuts))
     }
 
-    /// A flight, and then the camera held where it stopped for [`Script::still_hold`] with the
-    /// game's policy for a Still view in Reference mode (#217): loading is paused once the camera has
-    /// stood for [`STILL_FRAMES`] frames, as `Main::stream` does; and the scene thread holds
-    /// back what it may. The updates the frame thread takes while it is held are the cuts of the
-    /// Reference view, counted by their cause. Then the view changes: loading goes on, and the
-    /// time to catch up (no soft misses, nothing waiting) and the holes the look finds after it
-    /// are reported. The frames are not those of a path.
+    /// A flight, and then the camera held where it stopped with the game's policy for a Still view
+    /// in Reference mode (#217): once the camera has stood for [`STILL_FRAMES`] frames the scene
+    /// catches up with the camera (loading goes on), and then loading is paused for
+    /// [`Script::still_hold`], as `Main::stream` does through [`World::hold_still`]; and the scene
+    /// thread holds back what it may. The updates the frame thread takes while it is held are the
+    /// cuts of the Reference view, counted by their cause. Then the view changes: loading goes on,
+    /// and the time to catch up (no soft misses, nothing waiting, the scene at the camera) and the
+    /// holes the look finds after it are reported. The frames are not those of a path.
     fn still_after_a_flight(
         &mut self,
         course: &Course,
@@ -1880,24 +1901,43 @@ impl<'a> Session<'a> {
         self.look(&camera, false)?;
         self.harness_wait = Duration::ZERO;
         let mut stillness = Stillness::default();
+        // The wait for the scene to reach the camera is the world's (it ends at the cap at the
+        // latest); the frames in it are Primary's, with loading going on.
+        let hold_began = loop {
+            let standing = stillness.observe(camera);
+            let hold = self
+                .world
+                .hold_still(Mode::Reference, standing, camera.position);
+            self.frame(&camera, true)?;
+            if hold == Hold::Held {
+                break self
+                    .world
+                    .still_hold()
+                    .began()
+                    .expect("a hold that has begun says how");
+            }
+        };
         let before = self.world.still_cuts();
         let held = Instant::now();
         while held.elapsed() < script.still_hold {
             let standing = stillness.observe(camera);
             self.world
-                .pause_loading(loading_paused_for(Mode::Reference, standing));
+                .hold_still(Mode::Reference, standing, camera.position);
             self.frame(&camera, true)?;
         }
         let hold_s = held.elapsed().as_secs_f64();
         let cuts = StillCutsReport::from(self.world.still_cuts().since(before));
         // The view changes (the player moves the mouse): loading goes on, and what was held back
         // is caught up.
-        self.world.pause_loading(false);
+        self.world.hold_still(Mode::Reference, 0, camera.position);
         let holes_before = self.world.stats().work.holes_found;
         let left = Instant::now();
         let catch_up = loop {
             let frame = self.frame(&camera, false)?;
-            if frame.soft_misses == 0 && self.world.waiting() == 0 {
+            if frame.soft_misses == 0
+                && self.world.waiting() == 0
+                && self.world.caught_up(camera.position)
+            {
                 break Settle {
                     seconds: left.elapsed().as_secs_f64(),
                     settled: true,
@@ -1912,6 +1952,12 @@ impl<'a> Session<'a> {
         };
         self.look(&camera, true)?;
         Ok(StillAfterFlight {
+            before_hold: BeforeHold {
+                lag_when_still_voxels: hold_began.lag_when_still,
+                lag_when_held_voxels: hold_began.lag_when_held,
+                waited_s: hold_began.waited.as_secs_f64(),
+                hit_cap: hold_began.capped,
+            },
             hold_s,
             cuts,
             catch_up,
@@ -2349,6 +2395,12 @@ mod tests {
             },
             sizing: Sizing::check(measured(), &Constants::of_the_client()),
             still_after_flight: StillAfterFlight {
+                before_hold: BeforeHold {
+                    lag_when_still_voxels: 0.0,
+                    lag_when_held_voxels: 0.0,
+                    waited_s: 0.0,
+                    hit_cap: false,
+                },
                 hold_s: 3.0,
                 cuts: StillCutsReport::default(),
                 catch_up: Settle {
@@ -3221,6 +3273,14 @@ mod tests {
         assert!(still.cuts.still_frames > 0, "{still:?}");
         assert!(still.catch_up.settled, "{still:?}");
         assert_eq!(still.holes_after_catch_up, 0, "{still:?}");
+        // The hold began with the scene at the camera (the test Planet's scene keeps up), and the
+        // wait for it is reported.
+        assert!(!still.before_hold.hit_cap, "{still:?}");
+        assert!(
+            still.before_hold.lag_when_held_voxels < crate::world::CAUGHT_UP_LAG,
+            "{still:?}"
+        );
+        assert!(still.before_hold.waited_s < crate::world::CATCH_UP_CAP.as_secs_f64());
         let stop = run.paths.last().unwrap();
         assert!(stop.still_cuts.is_some());
         assert!(run.paths[..5].iter().all(|p| p.still_cuts.is_none()));

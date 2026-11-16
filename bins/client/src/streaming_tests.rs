@@ -245,6 +245,34 @@ fn a_round_that_changes_nothing_is_not_published_in_the_games_mode_but_is_when_c
 }
 
 #[test]
+fn a_scene_that_followed_the_camera_in_steps_that_changed_nothing_says_so_once_the_camera_stands() {
+    use crate::world::CAUGHT_UP_LAG;
+    let (mut world, _server, camera) = spawned_world(Run::Stepped);
+    fill(&mut world, camera.position);
+    pace(&world, Duration::from_secs(1));
+    for _ in 0..5 {
+        stream(&mut world, camera.position);
+        pace(&world, FRAME);
+    }
+    // A creep that the scene follows without changing (the test above): 20 steps of a tenth of a
+    // Voxel, none of them published, so the frame thread has the scene 2 Voxels behind.
+    let mut at = camera.position;
+    for _ in 0..20 {
+        at[0] += 0.1;
+        assert!(stream(&mut world, at).is_empty());
+        pace(&world, FRAME);
+    }
+    // The camera stands: the scene thread has long been at it, and the next frames are told so,
+    // which a Still view waits for (`World::caught_up`).
+    for _ in 0..3 {
+        stream(&mut world, at);
+        pace(&world, FRAME);
+    }
+    assert!(world.lag(at) < CAUGHT_UP_LAG, "{}", world.lag(at));
+    assert!(world.caught_up(at));
+}
+
+#[test]
 fn a_brick_the_camera_has_left_has_its_children_dropped_not_generated() {
     let store = spawned_store();
     let camera = crate::spawn_camera(ground()).position;
@@ -1291,10 +1319,23 @@ fn flying_far_while_loading_is_paused_does_not_grow_the_queue_without_bound() {
     }
 }
 
-/// One frame of the App's, with no GPU: loading pauses as [`loading_paused_for`] says for how
-/// long the view (here the camera, which is all that moves) has been still, and what the
-/// loader has generated is taken in, or not.
+/// One frame of the App's, with no GPU: the world holds the scene as [`World::hold_still`] says for
+/// how long the view (here the camera, which is all that moves) has been still: first catching up
+/// with the camera, then with loading paused; and what the loader has generated is taken in, or
+/// not.
 fn frame(
+    world: &mut World,
+    still: &mut Stillness<[f64; 3]>,
+    mode: Mode,
+    camera: [f64; 3],
+) -> Vec<SceneUpdate> {
+    world.hold_still(mode, still.observe(camera), camera);
+    stream(world, camera)
+}
+
+/// One frame of the App's with no catching up: loading pauses at once, as [`loading_paused_for`]
+/// says, which is what a hold that began at the cap (the scene still behind the camera) does.
+fn frame_held_at_once(
     world: &mut World,
     still: &mut Stillness<[f64; 3]>,
     mode: Mode,
@@ -4268,15 +4309,26 @@ fn after_a_flight_the_scene_cannot_keep_up_with(
     (world, server, camera, at)
 }
 
-/// A frame of the game's, in `mode`, for the camera at `at`, and the updates it took.
-/// (See [`frame`]: loading pauses once the view has been Still for [`STILL_FRAMES`] frames.)
+/// A frame of the game's, in `mode`, for the camera at `at`, and the updates it took, with loading
+/// paused at once (see [`frame_held_at_once`]).
 fn held(
     world: &mut World,
     still: &mut Stillness<[f64; 3]>,
     mode: Mode,
     at: [f64; 3],
 ) -> Vec<SceneUpdate> {
-    let updates = frame(world, still, mode, at);
+    let updates = frame_held_at_once(world, still, mode, at);
+    pace(world, FRAME);
+    updates
+}
+
+/// A frame of the game's, with the scene caught up first (see [`frame`]), and a frame's time gone.
+fn caught_up_then_held(
+    world: &mut World,
+    still: &mut Stillness<[f64; 3]>,
+    at: [f64; 3],
+) -> Vec<SceneUpdate> {
+    let updates = frame(world, still, Mode::Reference, at);
     pace(world, FRAME);
     updates
 }
@@ -4386,6 +4438,95 @@ fn leaving_still_after_a_held_flight_catches_up_with_no_hole_and_the_scene_a_vie
 }
 
 #[test]
+fn a_view_that_goes_still_after_a_flight_catches_up_with_the_camera_before_it_is_held() {
+    use crate::world::CAUGHT_UP_LAG;
+    let (mut world, _server, _camera, at) = after_a_flight_the_scene_cannot_keep_up_with(40);
+    let lag = world.lag(at);
+    assert!(!world.caught_up(at));
+    // A budget that follows the camera in tens of frames, a lag that is under the cap: the flight's
+    // was a slow one, to leave the scene behind.
+    world.worker().set_upload_budget(render::UploadCost {
+        bytes: 256 << 10,
+        writes: 32,
+    });
+    let mut still = Stillness::default();
+    let mut frames = 0;
+    let (mut catching_up, mut updates) = (0, 0);
+    let before = world.still_cuts();
+    while world.still_hold().began().is_none() {
+        let taken = caught_up_then_held(&mut world, &mut still, at);
+        // The Reference view is not shown yet, so the scene thread loads and follows as it does
+        // for any view that moves, and what it makes is no cut of anything.
+        if world.still_hold().began().is_none() {
+            catching_up += 1;
+            updates += taken.len();
+            assert!(!world.loading_paused());
+        }
+        frames += 1;
+        assert!(frames < 250, "does not catch up: lag {:.0}", world.lag(at));
+    }
+    let cuts_while_catching_up = world.still_cuts().since(before).cuts;
+    assert!(catching_up > 10, "{catching_up} frames of catching up");
+    assert!(updates > 10, "{updates} updates while catching up");
+    assert_eq!(cuts_while_catching_up, 0);
+    // The hold began with the scene at the camera, after a wait that was not the cap.
+    assert!(world.loading_paused());
+    assert!(world.lag(at) < CAUGHT_UP_LAG, "{}", world.lag(at));
+    let began = world.still_hold().began().expect("the hold has begun");
+    assert!(!began.capped, "{began:?}");
+    assert!(began.lag_when_still > 1000.0 && (began.lag_when_still - lag).abs() < 200.0);
+    assert!(began.lag_when_held < CAUGHT_UP_LAG, "{began:?}");
+    // And now the Reference view has a scene that stays: at most the cut that its start can be
+    // (an update that was in flight), not the 47 of a scene that follows.
+    let cuts = hold_still_catching_up(&mut world, &mut still, at, 180);
+    assert!(cuts.frames >= 150, "{cuts:?}");
+    assert!(cuts.cuts <= 1, "{cuts:?}");
+}
+
+/// Frames of the game's with the scene caught up first, from where `still` is, and the cuts in them.
+fn hold_still_catching_up(
+    world: &mut World,
+    still: &mut Stillness<[f64; 3]>,
+    at: [f64; 3],
+    frames: usize,
+) -> crate::world::StillCuts {
+    let before = world.still_cuts();
+    for _ in 0..frames {
+        caught_up_then_held(world, still, at);
+    }
+    world.still_cuts().since(before)
+}
+
+#[test]
+fn a_scene_that_cannot_catch_up_is_held_at_the_cap_and_the_hold_says_so() {
+    use crate::world::{CATCH_UP_CAP, CAUGHT_UP_LAG, Hold};
+    let (mut world, _server, _camera, at) = after_a_flight_the_scene_cannot_keep_up_with(40);
+    let mut still = Stillness::default();
+    // A second to a frame: the cap goes by in a few frames, and the scene has not moved much.
+    let second = Duration::from_secs(1);
+    let mut waited = Duration::ZERO;
+    let hold = loop {
+        let hold = world.hold_still(Mode::Reference, still.observe(at), at);
+        stream(&mut world, at);
+        if hold == Hold::Held {
+            break hold;
+        }
+        pace(&world, second);
+        waited += second;
+        assert!(waited < CATCH_UP_CAP * 3, "never held");
+    };
+    assert_eq!(hold, Hold::Held);
+    let began = world.still_hold().began().expect("the hold has begun");
+    assert!(began.capped, "{began:?}");
+    assert!(began.waited >= CATCH_UP_CAP, "{began:?}");
+    assert!(began.lag_when_held >= CAUGHT_UP_LAG, "{began:?}");
+    assert!(world.loading_paused());
+    // Held, the scene stays where it is: no cut after the start.
+    let cuts = hold_still_catching_up(&mut world, &mut still, at, 100);
+    assert!(cuts.cuts <= 1, "{cuts:?}");
+}
+
+#[test]
 fn primary_mode_keeps_following_the_camera_after_a_flight_and_is_never_held() {
     let (mut world, _server, _camera, at) = after_a_flight_the_scene_cannot_keep_up_with(40);
     let lag = world.lag(at);
@@ -4400,6 +4541,44 @@ fn primary_mode_keeps_following_the_camera_after_a_flight_and_is_never_held() {
     assert!(world.lag(at) < lag - 100.0, "{lag} then {}", world.lag(at));
     // And nothing is counted: the view is never Still.
     assert_eq!(world.still_cuts(), crate::world::StillCuts::default());
+}
+
+#[test]
+fn an_edit_ends_the_still_view_and_the_hold_with_it() {
+    use crate::world::Hold;
+    let (mut world, _server, camera) = spawned_world(Run::Stepped);
+    fill(&mut world, camera.position);
+    let aim = up_close(&mut world, &camera);
+    world.sync().unwrap();
+    let at = aim.position;
+    // What the client keeps still: the view and the number of Edits made (CONTEXT.md: Still means
+    // that no Edit has happened).
+    let mut still = Stillness::default();
+    let mut frame = |world: &mut World| {
+        let frames = still.observe((at, world.edits_made()));
+        let hold = world.hold_still(Mode::Reference, frames, at);
+        stream(world, at);
+        pace(world, FRAME);
+        hold
+    };
+    for _ in 0..=STILL_FRAMES {
+        frame(&mut world);
+    }
+    assert_eq!(frame(&mut world), Hold::Held);
+    assert!(world.loading_paused());
+
+    let made = world.edits_made();
+    world.edit(&aim, &crate::tool::Tool::default()).unwrap();
+    assert_eq!(world.edits_made(), made + 1, "the Edit was made");
+    // The frame after the Edit: the view is not Still, so the scene is not held and the hold has to
+    // begin again, with the scene caught up first.
+    assert_eq!(frame(&mut world), Hold::Open);
+    assert!(!world.loading_paused());
+    assert!(world.still_hold().began().is_none());
+    for _ in 0..=STILL_FRAMES {
+        frame(&mut world);
+    }
+    assert!(world.loading_paused(), "the hold begins again");
 }
 
 #[test]

@@ -330,16 +330,19 @@ camera back there and the loader caught up. The camera's speed and shape are tho
 After the last path the camera is back at the Spawn and the loader has caught up, and **one dig**
 is made there (below): the run's **Edit latency**. Its frames are not those of a path.
 
-**The still hold** (#217, the run's `still_after_flight`; not a path, so no gate sees its frames):
-5 s of the flight of `stop after a flight`, then the camera stands for 3 s (1 s with `--short`) with the
-game's policy for a Reference view: once it has stood for 2 frames, loading is paused
-(`loading_paused_for(Mode::Reference, ..)`, the same call the client makes) and the scene thread is
-told; **the scene thread then holds back moving the scene to the camera and the steps of coarsening**
-(#217, ADR 0005, "Still frames") and takes in no arrivals. What the frame thread takes in meanwhile is the cuts of the Reference view, counted by cause
-(`cuts`, as `still_cuts` above) in `hold_s` seconds of frames. **The acceptance of #217 is at most 1
-cut here from scene patches** (the Planet has no Edit in this run). Then the view changes (loading goes
-on) and `catch_up` is the time to the first frame with no soft misses and nothing waiting, and
-`holes_after_catch_up` the holes the look after it found, which must be 0. Reported, not gated.
+**The still hold** (#217, the run's `still_after_flight`, described under "The fields"; not a path, so no
+gate sees its frames): 5 s of the flight of `stop after a flight`, then the camera stands with the game's
+policy for a Reference view, which is **catch up first, then hold** (`World::hold_still`, the call the
+client makes): once the camera has stood for 2 frames the scene thread goes on loading and following the
+camera, with Primary drawn, until the scene has reached the camera (`World::caught_up`: its lag under 1
+Voxel, and, after #168, no reband pending) or `CATCH_UP_CAP` (5 s) has gone by. Then loading is paused and
+the scene thread is told; **it holds back moving the scene to the camera and the steps of coarsening**
+(#217, ADR 0005, "Still frames") and takes in no arrivals. The camera stands for 3 s (1 s with `--short`)
+from then. What the frame thread takes in meanwhile is the cuts of the Reference view, counted by cause
+(`cuts`, as `still_cuts` below, under the paths) over the held frames. **The acceptance of #217 is at most 1 cut here from
+scene patches** (the Planet has no Edit in this run). Then the view changes (loading goes on) and
+`catch_up` is the time to the first frame with no soft misses, nothing waiting and the scene at the
+camera, and `holes_after_catch_up` the holes the look after it found, which must be 0. Reported, not gated.
 
 ### The fields
 
@@ -355,6 +358,19 @@ on) and `catch_up` is the time to the first frame with no soft misses and nothin
   ring of 20 m is there before the first frame and the spec's condition would read the load time
   too; the time that streaming adds to it is `fill_s` minus this. The ray is cheap, and a ring of
   rays at 20 m could not be tried at full size without the 4090.
+- `still_after_flight` (#217, schema 22; a run's, not a path's): the view held Still after a flight, with
+  the game's policy ("The still hold", above):
+  - `before_hold`: the catch-up before the hold. `lag_when_still_voxels` is how far the scene was behind
+    the camera when the view went Still (what a hold at once would have held it at), `lag_when_held_voxels`
+    how far when the hold began (under 1 unless the cap ended the wait), `waited_s` from the view going
+    Still to the hold beginning (how much later the Reference view started), and **`hit_cap`**, true if the
+    wait ran to the cap and the Reference view started on a scene still behind the camera. Expected false.
+  - `hold_s`: how long the camera stood after the hold began.
+  - `cuts`: `still_frames`, `cuts` and `by_cause`, as `still_cuts` under the paths, over the held frames
+    only. **At most 1 is the acceptance of #217.**
+  - `catch_up`: `seconds` and `settled`, from the frame that ended the hold to the first frame with no soft
+    misses, nothing waiting and the scene at the camera (or the cap).
+  - `holes_after_catch_up`: the holes the look after it found. Must be 0.
 - `paths[]`: `name`, `frames`, `seconds` and, for each path:
   - `frame_time`: `samples`, `mean_ms`, **`p99_ms`** (nearest rank) and **`worst_ms`**. A frame is
     the frame thread's work in the game's order: `World::recentre`, the copy of what the scene
@@ -526,9 +542,11 @@ on) and `catch_up` is the time to the first frame with no soft misses and nothin
     (the scan itself), in milliseconds. It is made after the frames, so it is in no frame's time.
   - `still_cuts`, for `stop after a flight` only (null for the others; #217, schema 22):
     `still_frames`, `cuts` and `by_cause` (`edit`, `bands`, `coarse`, `follow`, `arrival`, `coarsen`).
-    A **cut** is an update that the frame thread took in a frame in which the view was Still (the
-    camera had stood for 2 frames, `STILL_FRAMES`): the update goes to the GPU, which restarts the
-    Reference view (a cut to Primary for 2 frames and a fade, from sample 0). Its cause is what the
+    A **cut** is an update that the frame thread took in while the view was Still and the Reference view
+    was being shown: the camera had stood for 2 frames (`STILL_FRAMES`) and the frame before had no
+    update either, as `render::still::Still::plan` counts (an update in the 2 frames after another is
+    in Primary frames, and is no cut). The update goes to the GPU, which restarts the Reference view (a
+    cut to Primary for 2 frames and a fade, from sample 0). The count matches the renderer's. Its cause is what the
     scene thread was doing when it made the patch: `edit` (an Edit's bricks), `bands` (a new LOD
     bias), `coarse` (the coarse levels remade after an Edit), `follow` (the scene moving to the
     camera), `arrival` (bricks the loader made, taken in) and `coarsen` (a step of the memory cap's

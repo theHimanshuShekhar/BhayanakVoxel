@@ -808,6 +808,8 @@ impl SceneWorker {
             camera: Some(camera),
             paused: false,
             held_at: None,
+            told: None,
+            at_standing_camera: false,
             arrival_cost: ARRIVAL_COST,
             changes: Changes::None,
             causes: Causes::default(),
@@ -1294,6 +1296,11 @@ struct Engine {
     /// something to follow: the thread has nothing to do for it until the pause ends, so it sleeps
     /// as it does for a camera it has followed to (see [`Engine::await_work`]).
     held_at: Option<[f64; 3]>,
+    /// The camera that the last round was told, for [`Engine::at_a_standing_camera`].
+    told: Option<[f64; 3]>,
+    /// The scene is at a camera that has been the same for two rounds (see
+    /// [`Engine::at_a_standing_camera`]), as of this round's last step.
+    at_standing_camera: bool,
     /// What taking in one brick's children is expected to cost.
     arrival_cost: Duration,
     changes: Changes,
@@ -1602,6 +1609,9 @@ impl Engine {
             self.teleported = true;
         }
         self.shared.taken.store(false, Ordering::Release);
+        let standing = self.told == Some(camera);
+        self.told = Some(camera);
+        self.at_standing_camera = false;
         // The places looked ahead to are from where the scene is to be after this round's first
         // step, which is the camera if it keeps up: not from the camera, which is as far as the
         // scene is behind it ahead of where the scene's step goes, and a selection that counts
@@ -1723,6 +1733,9 @@ impl Engine {
         } else {
             synced.or(self.sync_waiting.take())
         };
+        // The scene is where the camera is, and the camera has not moved since the round before:
+        // a Still view is waiting for this (see `Engine::at_a_standing_camera`).
+        self.at_standing_camera = standing && !self.has_to_follow(camera);
         self.publish(synced);
         self.idle = !worked && !busy && !self.throttled;
         true
@@ -2534,6 +2547,17 @@ impl Engine {
         self.spend(Part::HoleScan, began);
     }
 
+    /// Whether the scene is at a camera that has not moved for two rounds, and the last publish
+    /// did not say so: the frame thread reads where the scene is from what is published, and a
+    /// last step of following that changed nothing publishes nothing, which would leave it
+    /// believing that the scene is short of the camera by that step (a Still view waits for
+    /// [`crate::world::World::caught_up`], and would wait out its cap). A camera that moves every
+    /// round (a creep, a flight) is not this: its rounds that change nothing stay unpublished
+    /// (#181).
+    fn arrived_unsaid(&self, stats: &Stats) -> bool {
+        self.at_standing_camera && stats.camera != self.published.camera
+    }
+
     fn publish_changes(&mut self, job: Option<u64>) {
         let exactly = self.shared.count_exactly.load(Ordering::Relaxed);
         if self.clock.since(self.slow_at) >= TABLES_EVERY {
@@ -2597,6 +2621,7 @@ impl Engine {
         let causes = std::mem::take(&mut self.causes);
         if matches!(changes, Changes::None)
             && stats.same_counts(&self.published, exactly)
+            && !self.arrived_unsaid(&stats)
             && job.is_none()
         {
             return;
