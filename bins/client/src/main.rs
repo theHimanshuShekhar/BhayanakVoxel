@@ -912,6 +912,23 @@ impl App {
         Ok(())
     }
 
+    /// What the scene does about a Still view in this frame, decided before the frame takes in
+    /// anything the scene thread made: every scene update restarts the reference image, so a view
+    /// that goes Still first has the scene catch up with the camera, with loading going on and
+    /// Primary drawn, and then the scene thread takes in no arrival, does not move the scene to the
+    /// camera and takes no step of coarsening (an Edit still goes through) for as long as the
+    /// reference image accumulates, and does all of that in the frame that anything changes (#94,
+    /// #217). An Edit ends Still (CONTEXT.md): it is part of the key ([`World::still_key`]).
+    fn hold_still(&mut self) {
+        let (Some(world), Some(renderer)) = (&mut self.world, &mut self.renderer) else {
+            return;
+        };
+        let key = world.still_key(renderer.view(&self.camera), self.bias);
+        let still_frames = self.still.observe(key);
+        let hold = world.hold_still(renderer.mode(), still_frames, self.camera.position);
+        renderer.set_reference_wait(hold == world::Hold::CatchingUp);
+    }
+
     /// Moves the rings of the Planet to the camera, and copies what that changed to the GPU.
     fn recentre(&mut self) -> Result<(), Box<dyn Error>> {
         let Some(world) = &mut self.world else {
@@ -928,17 +945,6 @@ impl App {
         let (Some(world), Some(renderer)) = (&mut self.world, &mut self.renderer) else {
             return Ok(());
         };
-        // Every scene update restarts the reference image, so a view that goes Still first has the
-        // scene catch up with the camera, with loading going on and Primary drawn, and then the
-        // scene thread takes in no arrival, does not move the scene to the camera and takes no
-        // step of coarsening (an Edit still goes through) for as long as the reference image
-        // accumulates, and does all of that in the frame that anything changes (#94, #217). An
-        // Edit ends Still (CONTEXT.md): it is part of what must not change.
-        let still_frames =
-            self.still
-                .observe((renderer.view(&self.camera), self.bias, world.edits_made()));
-        let hold = world.hold_still(renderer.mode(), still_frames, self.camera.position);
-        renderer.set_reference_wait(hold == world::Hold::CatchingUp);
         let (cpu, growth) = (&mut self.cpu, &mut self.growth);
         world.stream(self.camera.position, |scene, update| {
             upload(growth, cpu, renderer, scene, update)
@@ -1369,6 +1375,7 @@ impl ApplicationHandler for App {
                 self.cpu.finish(Row::Egui, span, 0.0);
                 let scene_started = Instant::now();
                 let span = self.cpu.start();
+                self.hold_still();
                 let recentred = self.recentre();
                 self.cpu.finish(Row::Recentre, span, 0.0);
                 let span = self.cpu.start();

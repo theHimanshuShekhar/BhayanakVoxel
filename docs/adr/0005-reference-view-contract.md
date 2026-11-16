@@ -80,7 +80,7 @@ The exposure, the bloom and the tone curve of #202 (`post.wgsl`) run on **both v
   - The batch rises by one after 4 timed batches that fit (the GPU's times arrive one to three frames late, so a rise can come a little sooner than 4 frames at the new size), drops at once to what fits when a batch overruns, and is never more than 16 samples at 1440p (fewer on a bigger image: the work in a dispatch is capped, not the count). The worst sample known at 1440p is 10.98 ms (#99's pit maximum, before #188); 16 of it is 0.18 s, and 0.53 s with the snow cave's factor of 3 (26 % of Windows' 2 s timeout), and the 4090 never needs more than 4. A time of 0, or implausibly small, is no data: the size is held. The constants are in `crates/render/src/batch.rs`.
 - **The Reference view fades in over about 150 ms** from its first batch. The fade is for display only and is never stored.
 - **No adaptive sampling.** Every pixel gets the same number of samples. Stopping on what the samples show bends the result, which the bias rule forbids without a bound.
-- **The target:** FLIP ≤ 0.05 within 0.25 s of stopping, on the 4090 at 1440p, in both bench views. The time to FLIP ≤ 0.02 is reported, not promised.
+- **The target:** FLIP ≤ 0.05 within 0.25 s of the hold beginning (the view Still with the scene caught up with the camera, #217; Primary is drawn until then, so after a fast flight this is later than the stop), on the 4090 at 1440p, in both bench views. The time to FLIP ≤ 0.02 is reported, not promised.
 
 ## Convergence metric
 

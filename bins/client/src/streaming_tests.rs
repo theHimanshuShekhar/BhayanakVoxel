@@ -4551,11 +4551,11 @@ fn an_edit_ends_the_still_view_and_the_hold_with_it() {
     let aim = up_close(&mut world, &camera);
     world.sync().unwrap();
     let at = aim.position;
-    // What the client keeps still: the view and the number of Edits made (CONTEXT.md: Still means
-    // that no Edit has happened).
+    // What the client keeps still, the key it makes itself (CONTEXT.md: Still means that no Edit has
+    // happened).
     let mut still = Stillness::default();
     let mut frame = |world: &mut World| {
-        let frames = still.observe((at, world.edits_made()));
+        let frames = still.observe(world.still_key(at, 0.0));
         let hold = world.hold_still(Mode::Reference, frames, at);
         stream(world, at);
         pace(world, FRAME);
@@ -4579,6 +4579,95 @@ fn an_edit_ends_the_still_view_and_the_hold_with_it() {
         frame(&mut world);
     }
     assert!(world.loading_paused(), "the hold begins again");
+}
+
+#[test]
+fn an_update_in_the_first_frames_of_a_hold_is_no_cut_and_one_after_a_quiet_while_is() {
+    // The Reference view is shown from the frame after two frames of the same view and no update,
+    // as `Still::plan` has it: so an update in the first frame of a hold, or fewer than 3 frames after
+    // another, restarts nothing; one after a quiet while does.
+    let (mut world, _server, camera) = spawned_world(Run::Stepped);
+    fill(&mut world, camera.position);
+    let aim = up_close(&mut world, &camera);
+    world.sync().unwrap();
+    let at = aim.position;
+    let tool = crate::tool::Tool::default();
+    // The frames in which an update was taken, by number.
+    let mut arrivals: Vec<usize> = Vec::new();
+    let mut frames = 0usize;
+    macro_rules! frame {
+        ($held:expr) => {{
+            world.pause_loading($held);
+            if !stream(&mut world, at).is_empty() {
+                arrivals.push(frames);
+            }
+            pace(&world, FRAME);
+            frames += 1;
+        }};
+    }
+    // A quiet scene, then a dig: its patch is taken in a frame that is not paused, and the hold
+    // begins in the next, with what the Edit made after that (the coarse levels are remade a step
+    // at a time) still to come in the first frames of it.
+    for _ in 0..10 {
+        frame!(false);
+    }
+    assert!(arrivals.is_empty(), "the scene was quiet: {arrivals:?}");
+    world.edit(&aim, &tool).unwrap();
+    while arrivals.is_empty() {
+        frame!(false);
+        assert!(frames < 50, "the Edit was never taken in");
+    }
+    let began = arrivals[0] + 1;
+    let before = world.still_cuts();
+    // A second dig as the hold begins, taken in its first frame, and a third in the frame after,
+    // taken in its second.
+    let dig = |world: &mut World, wider: u16| {
+        let made = world.edits_made();
+        let tool = crate::tool::Tool {
+            radius: tool.radius + wider,
+            ..tool
+        };
+        world.edit(&aim, &tool).unwrap();
+        assert_eq!(world.edits_made(), made + 1, "the Edit was made");
+    };
+    dig(&mut world, 4);
+    frame!(true);
+    dig(&mut world, 8);
+    for _ in 0..40 {
+        frame!(true);
+    }
+    let counted = world.still_cuts().since(before).cuts;
+    assert!(
+        arrivals.contains(&began) && arrivals.contains(&(began + 1)),
+        "the Edits were taken in the first and the second frame of the hold: {arrivals:?}, from frame {began}"
+    );
+    // By the rule: an update after the first frame of the hold, 3 frames or more after the one
+    // before it (the unpaused one that began it is the first). The first two of the hold are not.
+    let mut expected = 0;
+    for pair in arrivals.windows(2) {
+        if pair[1] > began && pair[1] - pair[0] >= 3 {
+            expected += 1;
+        }
+    }
+    assert_eq!(
+        counted, expected,
+        "updates in frames {arrivals:?}, the hold from frame {began}"
+    );
+
+    // A quiet while later, a fourth dig is a cut.
+    let last = *arrivals.last().unwrap();
+    assert!(frames - last > 3, "the hold has been quiet: {arrivals:?}");
+    let before = world.still_cuts();
+    dig(&mut world, 12);
+    let taken = arrivals.len();
+    while arrivals.len() == taken {
+        frame!(true);
+        assert!(frames < 200, "the fourth Edit was never taken in");
+    }
+    assert!(
+        world.still_cuts().since(before).cuts >= 1,
+        "an update after a quiet while is a cut: {arrivals:?}"
+    );
 }
 
 #[test]

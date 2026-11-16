@@ -677,11 +677,15 @@ impl World {
     /// [`crate::loader::MAX_AHEAD`] jobs ahead, so what waits is bounded, and what the scene thread
     /// held back is done in the rounds after the pause ends. The game and the bench pause through
     /// [`World::hold_still`], which has the scene catch up with the camera first.
+    ///
+    /// Called once a frame, before the frame takes in what the scene thread made: it is also where
+    /// the frame's cuts begin to be counted ([`World::still_cuts`]).
     pub fn pause_loading(&mut self, paused: bool) {
         self.loading_paused = paused;
         if let Some(worker) = &self.worker {
             worker.pause(paused);
         }
+        self.begin_still_frame();
     }
 
     /// What a Still view does about the scene in this frame (#94, #217): when the view goes Still
@@ -701,6 +705,13 @@ impl World {
         hold
     }
 
+    /// Everything that must not change for the view to be Still (CONTEXT.md): `view` (the camera, the
+    /// sun and the window, whatever the caller calls that) and `bias`, and that no Edit has been
+    /// made. Put it to a [`Stillness`] once a frame, and what that says to [`World::hold_still`].
+    pub fn still_key<V>(&self, view: V, bias: f32) -> (V, f32, u64) {
+        (view, bias, self.edits_made)
+    }
+
     /// Where the Still view is: see [`StillHold::began`].
     pub fn still_hold(&self) -> &StillHold {
         &self.still_hold
@@ -708,9 +719,11 @@ impl World {
 
     /// Says the view is Still (or not) without pausing anything, for the bench's baseline: updates
     /// that are taken meanwhile are counted as cuts ([`World::still_cuts`]), as they are while
-    /// loading is paused, which is how the game says the same thing.
+    /// loading is paused, which is how the game says the same thing. Called once a frame, before
+    /// the frame takes in what the scene thread made, as [`World::pause_loading`] is.
     pub fn mark_still(&mut self, still: bool) {
         self.still_view = still;
+        self.begin_still_frame();
     }
 
     /// The cuts counted so far, while loading was paused or the view marked Still.
@@ -854,7 +867,6 @@ impl World {
         camera: [f64; 3],
         velocity: [f64; 3],
     ) -> Result<Option<SceneUpdate>, RingsFull> {
-        self.begin_still_frame();
         match &self.worker {
             Some(worker) => {
                 worker.follow_moving(camera, velocity);
@@ -967,8 +979,9 @@ impl World {
         self.worker.as_ref().expect("the world streams")
     }
 
-    /// The look at the scene that a frame begins with: counts the frame if the view is Still, and
-    /// says whether an update taken in it is a cut (see [`StillClock`]).
+    /// A frame begins, as the one call a frame of [`World::pause_loading`] or [`World::mark_still`]
+    /// says (not a look at the scene: the game looks twice in a frame): counts the frame if the view
+    /// is Still, and says whether an update taken in it is a cut (see [`StillClock`]).
     fn begin_still_frame(&mut self) {
         let still = self.cutting_still();
         self.still_cuts.frames += u64::from(still);
