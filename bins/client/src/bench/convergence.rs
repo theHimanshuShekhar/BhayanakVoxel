@@ -360,6 +360,11 @@ fn run_view(view: View, settings: &Settings, out: &Path) -> Result<ViewReport, B
     let resolution = Resolution::native(settings.size.0, settings.size.1);
     let mut gpu = Offscreen::with_resolution(resolution, &view.scene)?;
     gpu.set_sun(view.sun);
+    // The light and display of before #202 (the old sun and sky, no exposure, bloom or tone
+    // curve): the phase's numbers are compared from report to report, and a change of look would
+    // move every one of them with no change in the estimator. The art direction's cost is in the
+    // flight's passes; its look is the goldens'.
+    gpu.use_legacy_light();
     gpu.set_keep_history(true);
     let info = gpu.gpu_info().clone();
     let folder = out.join(FOLDER).join(name);

@@ -11,6 +11,8 @@ use crate::batch::max_samples;
 use crate::camera::{Camera, CameraUniform};
 use crate::debug_view::DebugView;
 use crate::gpu_materials;
+use crate::look::{Look, LookUniform};
+use crate::post::{self, Exposed, HDR_FORMAT, Metering, Post, Scratch, Stages};
 use crate::profiler::Profiler;
 use crate::reference::{Hit, Ray};
 use crate::scene::{MAX_LEVELS, Part, REGION_WORDS, Scene, SceneUpdate, UploadCost, spare_words};
@@ -19,7 +21,10 @@ use crate::sun::{Sun, SunUniform};
 use crate::upscale::{History, Resolution, UpscalePass};
 use crate::{Result, shaders};
 
-/// Format of the traced image: values encoded with the true sRGB curve, in a plain unorm texture.
+/// Format of the traced image that the upscaler and the copy to the window read: display-encoded
+/// values (AgX-like by default; the true sRGB curve for Neutral and with the transform off), in a
+/// plain unorm texture. The kernels draw linear light in [`HDR_FORMAT`]
+/// images, and the display transform (`post.wgsl`) turns those into this.
 pub const IMAGE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 
 /// Format of the G-buffer: two words a pixel, written in one store (see `primary.wgsl`). The
@@ -28,6 +33,13 @@ pub const IMAGE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 /// that was hit in the last (0 for no hit, else 1 + 2 * axis + 1 if it points along the positive
 /// direction). The normals are along the axes, so a byte holds them exactly.
 pub const GBUFFER_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rg32Uint;
+
+/// Format of what primary visibility writes beside the G-buffer: the absolute Voxel that was hit
+/// (three i32s as bits) and its Material, four words a pixel, zeros where nothing was hit.
+pub const SURFACE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba32Uint;
+
+/// Format of the smooth normals (`shade.wgsl`): a unit vector, and 1 in w where there is one.
+pub const NORMALS_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 
 /// Format of the upscaler's history: encoded colour, and in alpha the frames it has been through.
 pub const HISTORY_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
@@ -149,6 +161,14 @@ struct FrameUniform {
     params: [u32; 4],
     /// Where in its pixel primary visibility traces, then two unused.
     jitter: [f32; 4],
+    /// The local up of the camera (its `horizon_up`), that the sky is a gradient along, then one
+    /// unused.
+    look_up: [f32; 4],
+    /// The light's palette (see [`Look`]).
+    look: LookUniform,
+    /// 1 if natural Materials are shaded with smooth computed normals; the end of the smooth range
+    /// in Voxels and the face normal's weight in it (both an f32's bits); one unused.
+    flags: [u32; 4],
 }
 
 /// Where primary visibility traces when nothing moves it: the centre of the pixel.
@@ -162,7 +182,7 @@ pub struct Plane {
 
 impl Plane {
     /// A 2D texture of `format` that kernels can write and read, and that can be copied from.
-    fn new(
+    pub(crate) fn new(
         device: &wgpu::Device,
         label: &str,
         (width, height): (u32, u32),
@@ -189,6 +209,22 @@ impl Plane {
     }
 }
 
+/// A bind group entry for the whole of `plane`.
+pub(crate) fn plane_entry(binding: u32, plane: &Plane) -> wgpu::BindGroupEntry<'_> {
+    wgpu::BindGroupEntry {
+        binding,
+        resource: wgpu::BindingResource::TextureView(&plane.view),
+    }
+}
+
+/// A bind group entry for the whole of `buffer`.
+pub(crate) fn buffer_entry(binding: u32, buffer: &wgpu::Buffer) -> wgpu::BindGroupEntry<'_> {
+    wgpu::BindGroupEntry {
+        binding,
+        resource: buffer.as_entire_binding(),
+    }
+}
+
 /// A texture of `format` that a kernel writes.
 pub(crate) fn storage_texture(format: wgpu::TextureFormat) -> wgpu::BindingType {
     wgpu::BindingType::StorageTexture {
@@ -200,8 +236,10 @@ pub(crate) fn storage_texture(format: wgpu::TextureFormat) -> wgpu::BindingType 
 
 /// What the kernels draw into.
 ///
-/// At the traced (internal) resolution, primary visibility draws the lit image and, beside it, the
-/// G-buffer for the passes after it: the distance to the hit, its face normal and its albedo.
+/// At the traced (internal) resolution, primary visibility writes the G-buffer for the passes after
+/// it (the distance to the hit, its face normal and its albedo) and the hit's Voxel and Material;
+/// the smooth normals and the lit image, as linear light, are drawn from those; and the display
+/// transform (`post.wgsl`) makes the encoded lit image, which the upscaler reads.
 ///
 /// The reference path tracer draws an image of its own, with the float buffer that holds its
 /// running mean, one `vec4<f32>` per pixel. Where that is traced is the target's *reference
@@ -215,9 +253,17 @@ pub(crate) fn storage_texture(format: wgpu::TextureFormat) -> wgpu::BindingType 
 /// lit image and from its own history (two images, which take turns).
 pub struct Target {
     resolution: Resolution,
+    /// The lit image as linear light, and the display transform's images for it.
+    lit_hdr: Plane,
+    lit_scratch: Scratch,
     lit: Plane,
     gbuffer: Plane,
+    surface: Plane,
+    normals: Plane,
     reference_size: (u32, u32),
+    /// The reference path tracer's mean as linear light, and the display transform's images for it.
+    reference_hdr: Plane,
+    reference_scratch: Scratch,
     reference: Plane,
     accum: wgpu::Buffer,
     image: Plane,
@@ -246,9 +292,20 @@ impl Target {
         });
         Self {
             resolution,
+            lit_hdr: Plane::new(device, "lit image (linear)", internal, HDR_FORMAT),
+            lit_scratch: Scratch::new(device, internal),
             lit: Plane::new(device, "lit image", internal, IMAGE_FORMAT),
             gbuffer: Plane::new(device, "G-buffer", internal, GBUFFER_FORMAT),
+            surface: Plane::new(device, "surface", internal, SURFACE_FORMAT),
+            normals: Plane::new(device, "smooth normals", internal, NORMALS_FORMAT),
             reference_size,
+            reference_hdr: Plane::new(
+                device,
+                "reference image (linear)",
+                reference_size,
+                HDR_FORMAT,
+            ),
+            reference_scratch: Scratch::new(device, reference_size),
             reference: Plane::new(device, "reference image", reference_size, IMAGE_FORMAT),
             accum,
             image: Plane::new(device, "upscaled image", output, IMAGE_FORMAT),
@@ -261,13 +318,20 @@ impl Target {
         self.resolution
     }
 
-    /// The lit image that primary visibility draws, at the internal resolution.
+    /// The lit image, drawn by primary visibility and the passes after it and encoded for display
+    /// by the display transform, at the internal resolution.
     pub fn lit(&self) -> &Plane {
         &self.lit
     }
 
-    /// The image that the reference path tracer draws: the mean so far, encoded for display, at
-    /// [`Target::reference_size`].
+    /// Primary's lit image as linear light, before the display transform (`Rgba16Float`), and the
+    /// bloom that the transform made of it, at a quarter of the size. For tests.
+    pub(crate) fn lit_hdr_and_bloom(&self) -> (&Plane, (&Plane, (u32, u32))) {
+        (&self.lit_hdr, self.lit_scratch.bloom())
+    }
+
+    /// The image of the reference path tracer: the mean so far, through the display transform and
+    /// encoded for display, at [`Target::reference_size`].
     pub fn reference(&self) -> &Plane {
         &self.reference
     }
@@ -337,6 +401,21 @@ pub struct Tracer {
     camera_layout: wgpu::BindGroupLayout,
     primary: wgpu::ComputePipeline,
     reference: wgpu::ComputePipeline,
+    /// The smooth normals, and the lit image drawn from the G-buffer and them (`shade.wgsl`), each
+    /// with the layout of its own bind group.
+    normals_layout: wgpu::BindGroupLayout,
+    normals: wgpu::ComputePipeline,
+    shade_layout: wgpu::BindGroupLayout,
+    shade: wgpu::ComputePipeline,
+    /// The display transform and the exposure it keeps from frame to frame.
+    post: Post,
+    /// The light's palette, and which stages of the art direction are on.
+    look: Look,
+    stages: Stages,
+    /// The time of the last frame of [`Tracer::encode_frame`], for how far the exposure adapts.
+    last_frame_at: Option<std::time::Duration>,
+    /// Where the smooth normals end, in Voxels from the camera ([`smooth_end`]).
+    smooth_end: f32,
     upscale: UpscalePass,
     /// Decides what each frame of [`Tracer::encode_frame`] draws.
     still: Still<(View, u64)>,
@@ -733,7 +812,7 @@ impl Tracer {
             label: Some("camera, image, accumulation, materials and G-buffer"),
             entries: &[
                 layout_entry(0, buffer_binding(wgpu::BufferBindingType::Uniform)),
-                layout_entry(1, storage_texture(IMAGE_FORMAT)),
+                layout_entry(1, storage_texture(HDR_FORMAT)),
                 layout_entry(2, buffer_binding(wgpu::BufferBindingType::Uniform)),
                 layout_entry(
                     3,
@@ -741,6 +820,40 @@ impl Tracer {
                 ),
                 layout_entry(4, buffer_binding(STORAGE_READ)),
                 layout_entry(5, storage_texture(GBUFFER_FORMAT)),
+                layout_entry(6, storage_texture(SURFACE_FORMAT)),
+            ],
+        });
+        let texture = |binding, sample_type| {
+            layout_entry(
+                binding,
+                wgpu::BindingType::Texture {
+                    sample_type,
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+            )
+        };
+        let uint = wgpu::TextureSampleType::Uint;
+        let normals_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("smooth normals"),
+            entries: &[
+                layout_entry(2, buffer_binding(wgpu::BufferBindingType::Uniform)),
+                layout_entry(4, buffer_binding(STORAGE_READ)),
+                texture(5, uint),
+                texture(6, uint),
+                layout_entry(7, storage_texture(NORMALS_FORMAT)),
+            ],
+        });
+        let shade_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("shade"),
+            entries: &[
+                layout_entry(0, buffer_binding(wgpu::BufferBindingType::Uniform)),
+                layout_entry(1, storage_texture(HDR_FORMAT)),
+                layout_entry(2, buffer_binding(wgpu::BufferBindingType::Uniform)),
+                layout_entry(4, buffer_binding(STORAGE_READ)),
+                texture(5, uint),
+                texture(6, uint),
+                texture(8, wgpu::TextureSampleType::Float { filterable: false }),
             ],
         });
         let materials = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -778,6 +891,24 @@ impl Tracer {
             &scene_layout,
             &ReferenceOptions::default().constants(),
         );
+        let normals = compute_pipeline(
+            device,
+            "normals",
+            shaders::SHADE,
+            "normals",
+            &normals_layout,
+            &scene_layout,
+            &[],
+        );
+        let shade = compute_pipeline(
+            device,
+            "shade",
+            shaders::SHADE,
+            "shade_pass",
+            &shade_layout,
+            &scene_layout,
+            &[],
+        );
         Ok(Self {
             scene: scene_buffers,
             scene_layout,
@@ -787,6 +918,15 @@ impl Tracer {
             camera_layout,
             primary,
             reference,
+            normals_layout,
+            normals,
+            shade_layout,
+            shade,
+            post: Post::new(device),
+            look: Look::default(),
+            stages: Stages::default(),
+            last_frame_at: None,
+            smooth_end: smooth_end(scene),
             upscale: UpscalePass::new(device),
             still: Still::new(),
             scene_epoch: 0,
@@ -806,7 +946,7 @@ impl Tracer {
 
     /// Records the primary visibility pass: one ray per pixel of the lit image of `target`, through
     /// the centre of the pixel, from `camera`, lit by `sun`. Nothing carries over from one call
-    /// to the next. The pass is timed by `profiler`.
+    /// to the next. The passes are timed by `profiler`.
     #[allow(clippy::too_many_arguments)]
     pub fn encode_primary(
         &self,
@@ -819,7 +959,9 @@ impl Tracer {
         target: &Target,
     ) {
         self.write_uniforms(queue, camera, sun, 0, CENTRE, 0);
-        self.dispatch_primary(device, profiler, encoder, target);
+        // Nothing carries over from one call to the next, the exposure included: it settles at
+        // once, on this image.
+        self.dispatch_primary(device, queue, profiler, encoder, target, 1.0);
     }
 
     /// Records a frame of primary visibility from `camera`, lit by `sun`: the primary pass, one ray
@@ -845,11 +987,28 @@ impl Tracer {
         sun: &Sun,
         target: &Target,
     ) {
+        let rate = post::adaptation_rate(post::NOMINAL_FRAME);
+        self.encode_upscaled_adapting(device, queue, profiler, encoder, camera, sun, target, rate);
+    }
+
+    /// [`Tracer::encode_upscaled`], with the exposure moving `rate` of the way to its settled value.
+    #[allow(clippy::too_many_arguments)]
+    fn encode_upscaled_adapting(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        profiler: &mut Profiler,
+        encoder: &mut wgpu::CommandEncoder,
+        camera: &Camera,
+        sun: &Sun,
+        target: &Target,
+        rate: f32,
+    ) {
         let frame = self
             .history
             .begin(target.resolution(), camera, self.debug_view);
         self.write_uniforms(queue, camera, sun, 0, frame.jitter(), 0);
-        self.dispatch_primary(device, profiler, encoder, target);
+        self.dispatch_primary(device, queue, profiler, encoder, target, rate);
         self.upscale
             .encode(device, queue, profiler, encoder, &frame, target);
     }
@@ -904,10 +1063,46 @@ impl Tracer {
             "reference",
             &self.reference,
             target.reference_size,
-            &target.reference.view,
+            &target.reference_hdr.view,
             target,
         );
+        self.encode_reference_post(device, queue, profiler, encoder, target, first);
         samples
+    }
+
+    /// The Reference view's mean through the display transform, with an exposure of its own. A still
+    /// view has nothing to adapt to, so the exposure is set at once to what the mean's boxes
+    /// meter, until the view has enough samples for that to be steady (`first` is the index of the
+    /// batch's first sample); from then on it is held, and the image converges at one brightness
+    /// (the issue: Reference frames use the settled exposure). The accumulation is read, never
+    /// written, so this can be run again on the same mean, under other [`Stages`].
+    pub fn encode_reference_post(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        profiler: &mut Profiler,
+        encoder: &mut wgpu::CommandEncoder,
+        target: &Target,
+        first: u32,
+    ) {
+        let metering = if first < post::REFERENCE_METERED_UP_TO {
+            Metering::Adapt(1.0)
+        } else {
+            Metering::Hold
+        };
+        self.post.encode(
+            device,
+            queue,
+            profiler,
+            encoder,
+            &target.reference_hdr,
+            &target.reference_scratch,
+            &target.reference,
+            self.stages,
+            self.debug_view != DebugView::Lit,
+            Exposed::Reference,
+            metering,
+        );
     }
 
     /// Records a frame of a window: the still-frame policy of ADR 0005 (see [`Still`]).
@@ -941,13 +1136,27 @@ impl Tracer {
         for (tag, ms) in profiler.take_tagged("reference") {
             self.still.timed(tag, ms);
         }
+        // How far the exposure adapts this frame: by the time since the last one.
+        let dt = self.last_frame_at.map_or(post::NOMINAL_FRAME, |last| {
+            now.saturating_sub(last).as_secs_f32().min(1.0)
+        });
+        self.last_frame_at = Some(now);
         let key = (View::new(camera, sun, target), self.scene_epoch);
         let plan = self
             .still
             .plan(&key, reference, now, pixels(target.reference_size));
         match plan {
             Plan::Primary => {
-                self.encode_upscaled(device, queue, profiler, encoder, camera, sun, target);
+                self.encode_upscaled_adapting(
+                    device,
+                    queue,
+                    profiler,
+                    encoder,
+                    camera,
+                    sun,
+                    target,
+                    post::adaptation_rate(dt),
+                );
                 // Whatever the Reference view had is of a view that has gone: it starts again
                 // from sample 0 when the view is next still, not from where it was.
                 self.accumulator.reset();
@@ -973,6 +1182,7 @@ impl Tracer {
         update: &SceneUpdate,
     ) -> Result<()> {
         self.restart_reference();
+        self.smooth_end = smooth_end(scene);
         // Counted where each write is made, not summed from the patch's cost: [`upload_cost`] is
         // the other count, and the two are compared. Both go over `RingPatch::copies()`, so the
         // comparison does not check that list (the stepped tests' `GpuCopy::assert_is` does).
@@ -1152,6 +1362,44 @@ impl Tracer {
         self.debug_view = view;
     }
 
+    /// The buffer that holds the exposure of `view`: see [`Post::state`].
+    pub(crate) fn exposure_state(&self, view: Exposed) -> &wgpu::Buffer {
+        self.post.state(view)
+    }
+
+    pub fn look(&self) -> Look {
+        self.look
+    }
+
+    /// Sets the light's palette (see [`Look`]). The sun's and the sky's light are part of what the
+    /// views estimate, so the reference image starts over, and the upscaler's history with it.
+    pub fn set_look(&mut self, look: Look) {
+        if look != self.look {
+            self.look = look;
+            self.restart_reference();
+            self.history.reset();
+        }
+    }
+
+    pub fn stages(&self) -> Stages {
+        self.stages
+    }
+
+    /// Switches the stages of the art direction (see [`Stages`]). The smooth normals are part of
+    /// what is lit, so the reference image starts over when they change; the exposure, bloom and
+    /// the tone curve only change how it is shown, which the accumulation never holds.
+    pub fn set_stages(&mut self, stages: Stages) {
+        if stages != self.stages {
+            if stages.smooth_normals != self.stages.smooth_normals
+                || stages.normal_bias != self.stages.normal_bias
+            {
+                self.restart_reference();
+            }
+            self.stages = stages;
+            self.history.reset();
+        }
+    }
+
     /// Sets the seed of the reference's random numbers (the default is [`RNG_SEED`]) and starts
     /// its image over: the same view, sample count and seed give the same image, and another seed
     /// gives an independent one of the same expected value.
@@ -1206,18 +1454,34 @@ impl Tracer {
             sun: sun.uniform(),
             params: [sample_index, self.seed, self.debug_view.index(), batch],
             jitter: [jitter[0], jitter[1], 0.0, 0.0],
+            look_up: {
+                let [x, y, z] = camera.horizon_up;
+                [x as f32, y as f32, z as f32, 0.0]
+            },
+            look: self.look.uniform(),
+            flags: [
+                u32::from(self.stages.smooth_normals),
+                self.smooth_end.to_bits(),
+                self.stages.normal_bias.weight().to_bits(),
+                0,
+            ],
         };
         queue.write_buffer(&self.frame_buffer, 0, bytemuck::bytes_of(&frame));
     }
 
-    /// Primary visibility over every pixel of the lit image of `target`, at the internal
-    /// resolution.
+    /// Primary's frame over every pixel of the lit image of `target`, at the internal resolution:
+    /// primary visibility, then the smooth normals and the lit image drawn from what it found, then
+    /// the display transform, which makes the encoded lit image. A debug view is drawn by primary
+    /// visibility itself (the upscaler draws the history length one), and passes through the
+    /// display transform as it is.
     fn dispatch_primary(
         &self,
         device: &wgpu::Device,
+        queue: &wgpu::Queue,
         profiler: &mut Profiler,
         encoder: &mut wgpu::CommandEncoder,
         target: &Target,
+        rate: f32,
     ) {
         self.dispatch(
             device,
@@ -1226,9 +1490,103 @@ impl Tracer {
             "primary",
             &self.primary,
             target.resolution.internal,
-            &target.lit.view,
+            &target.lit_hdr.view,
             target,
         );
+        let debug = !matches!(self.debug_view, DebugView::Lit | DebugView::HistoryLength);
+        if !debug {
+            if self.stages.smooth_normals {
+                self.dispatch_normals(device, profiler, encoder, target);
+            }
+            self.dispatch_shade(device, profiler, encoder, target);
+        }
+        self.post.encode(
+            device,
+            queue,
+            profiler,
+            encoder,
+            &target.lit_hdr,
+            &target.lit_scratch,
+            &target.lit,
+            self.stages,
+            debug,
+            Exposed::Primary,
+            Metering::Adapt(rate),
+        );
+    }
+
+    /// The smooth normal of every hit of the G-buffer (`normals` in `shade.wgsl`).
+    fn dispatch_normals(
+        &self,
+        device: &wgpu::Device,
+        profiler: &mut Profiler,
+        encoder: &mut wgpu::CommandEncoder,
+        target: &Target,
+    ) {
+        let view = plane_entry;
+        let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("smooth normals"),
+            layout: &self.normals_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: self.frame_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: self.materials.as_entire_binding(),
+                },
+                view(5, &target.gbuffer),
+                view(6, &target.surface),
+                view(7, &target.normals),
+            ],
+        });
+        let (width, height) = target.resolution.internal;
+        let mut pass = profiler.compute_pass(encoder, "normals");
+        pass.set_pipeline(&self.normals);
+        pass.set_bind_group(0, &self.scene.group, &[]);
+        pass.set_bind_group(1, &group, &[]);
+        pass.dispatch_workgroups(width.div_ceil(8), height.div_ceil(8), 1);
+    }
+
+    /// The lit image as linear light, from the G-buffer and the smooth normals (`shade_pass` in
+    /// `shade.wgsl`).
+    fn dispatch_shade(
+        &self,
+        device: &wgpu::Device,
+        profiler: &mut Profiler,
+        encoder: &mut wgpu::CommandEncoder,
+        target: &Target,
+    ) {
+        let view = plane_entry;
+        let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("shade"),
+            layout: &self.shade_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: self.camera_buffer.as_entire_binding(),
+                },
+                view(1, &target.lit_hdr),
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: self.frame_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: self.materials.as_entire_binding(),
+                },
+                view(5, &target.gbuffer),
+                view(6, &target.surface),
+                view(8, &target.normals),
+            ],
+        });
+        let (width, height) = target.resolution.internal;
+        let mut pass = profiler.compute_pass(encoder, "shade");
+        pass.set_pipeline(&self.shade);
+        pass.set_bind_group(0, &self.scene.group, &[]);
+        pass.set_bind_group(1, &group, &[]);
+        pass.dispatch_workgroups(width.div_ceil(8), height.div_ceil(8), 1);
     }
 
     /// Runs `pipeline` over every pixel of an image `size` big, drawing to `image`.
@@ -1271,6 +1629,10 @@ impl Tracer {
                 wgpu::BindGroupEntry {
                     binding: 5,
                     resource: wgpu::BindingResource::TextureView(&target.gbuffer.view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: wgpu::BindingResource::TextureView(&target.surface.view),
                 },
             ],
         });
@@ -1378,6 +1740,26 @@ impl Tracer {
 /// The pixels in an image of `size`.
 fn pixels(size: (u32, u32)) -> u64 {
     u64::from(size.0) * u64::from(size.1)
+}
+
+/// How far from the camera the smooth normals reach, in Voxels: 30 m, the prototype's, and no
+/// further than level 0 does.
+pub const SMOOTH_UP_TO: f32 = 600.0;
+
+/// A smoothed hit looks at the Voxels of a cube of 5 round the one in front of its face: its far
+/// corner is at most `|(4, 3, 3)|`, under 6 Voxels, from the point that was hit.
+const SMOOTH_REACH: f32 = 6.0;
+
+/// Where the smooth normals end for `scene`, in Voxels from the camera: [`SMOOTH_UP_TO`], or
+/// where that is more than level 0 holds, the distance that a brick is certain to be level 0's up
+/// to (a level 1 brick is only split while it is nearer than its boundary less the hysteresis,
+/// [`crate::lod::HYSTERESIS`]) less the reach of the window. A scene that is not made of rings has
+/// one level, and no end but 30 m.
+fn smooth_end(scene: &Scene) -> f32 {
+    scene.bands().map_or(SMOOTH_UP_TO, |bands| {
+        let level_0 = bands.floor(1) * (1.0 - crate::lod::HYSTERESIS);
+        SMOOTH_UP_TO.min(level_0 as f32 - SMOOTH_REACH).max(1.0)
+    })
 }
 
 /// The samples one dispatch takes when `samples` are asked for on an image of `size`: at least 1,

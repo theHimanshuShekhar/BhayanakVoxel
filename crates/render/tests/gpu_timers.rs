@@ -47,8 +47,24 @@ fn the_primary_pass_is_timed_or_listed_as_unavailable() {
         assert!(average >= 0.0 && average.is_finite(), "{average}");
         assert!(primary.active);
         assert_eq!(primary.times.count(), 1);
-        // One pass, so the whole frame is that pass.
-        assert_eq!(timings.total().last(), primary.times.last());
+        // The frame is primary visibility and the passes after it (#202: the smooth normals, the
+        // light, the display transform), each timed on its own, so the frame is at least it.
+        assert!(timings.total().last() >= primary.times.last());
+        for pass in [
+            "normals",
+            "shade",
+            "exposure",
+            "exposure_adapt",
+            "bloom_down",
+            "bloom_h",
+            "bloom_v",
+            "tone",
+        ] {
+            assert!(
+                timings.pass(pass).is_some(),
+                "{pass} has no line of its own"
+            );
+        }
     } else {
         assert_eq!(primary.times.average(), None);
         assert_eq!(primary.times.max(), None);
@@ -63,15 +79,43 @@ fn passes_register_in_the_order_they_first_run_and_only_the_latest_is_active() {
     gpu.render_reference(&overhead(), 3);
 
     let names: Vec<_> = gpu.timings().passes().iter().map(|p| &*p.name).collect();
-    assert_eq!(names, ["primary", "reference"]);
+    // The passes of the display transform are shared by both views, so the Reference view adds
+    // only its own.
+    assert_eq!(
+        names,
+        [
+            "primary",
+            "normals",
+            "shade",
+            "exposure",
+            "exposure_adapt",
+            "bloom_down",
+            "bloom_h",
+            "bloom_v",
+            "tone",
+            "reference"
+        ]
+    );
     let active: Vec<_> = gpu.timings().passes().iter().map(|p| p.active).collect();
     if gpu.timers_supported() {
-        assert_eq!(active, [false, true]);
+        // The latest frame ran the Reference view and the display transform after it.
+        let ran = [
+            "exposure",
+            "exposure_adapt",
+            "bloom_down",
+            "bloom_h",
+            "bloom_v",
+            "tone",
+            "reference",
+        ];
+        for (name, active) in names.iter().zip(&active) {
+            assert_eq!(*active, ran.contains(name), "{name}");
+        }
         let reference = gpu.timings().pass("reference").unwrap();
         assert_eq!(reference.times.count(), 3);
         assert_eq!(gpu.timings().pass("primary").unwrap().times.count(), 1);
     } else {
-        assert_eq!(active, [false, false]);
+        assert!(active.iter().all(|a| !a));
     }
 }
 

@@ -35,6 +35,10 @@ fn overhead() -> Camera {
 /// The Reference view with flat colours, which is what the answers below are worked out for: the
 /// Voxels' colour variation would add structure to the image that samples do not average away.
 fn flat_colours(offscreen: &mut Offscreen) {
+    // The answers are worked out from the sun's and the sky's colours before #202 (`Look::LEGACY`).
+    offscreen.use_legacy_light();
+    // The answers are worked out from the sun's and the sky's colours before #202 (`Look::LEGACY`).
+    offscreen.use_legacy_light();
     offscreen.set_reference_options(ReferenceOptions {
         flat_colours: true,
         ..Default::default()

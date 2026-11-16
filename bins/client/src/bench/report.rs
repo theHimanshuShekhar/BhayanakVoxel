@@ -71,7 +71,14 @@ use super::stream::StreamReport;
 /// to `cycle_ms`. Each path has `slowest_cycles`, its frames with the longest turn.
 /// Nothing else is changed.
 ///
-/// 21 (#168; 20 is #202's, which is open: the number is the later of the two) added to the real-time
+/// 20 (#202) moved the lighting out of `primary`: `primary` excludes `normals` and `shade`; new
+/// pass lines `normals`, `shade`, `exposure`, `exposure_adapt`, `bloom_down`, `bloom_h`, `bloom_v`
+/// and `tone` are in `passes[]` (the report lists passes generically, so they need no field of
+/// their own). So `passes[primary]`, the cave-still `primary` and the real-time `gpu_primary_ms`
+/// no longer include the lighting: a number of schema 19 or before is not comparable with them
+/// except as `primary` + `normals` + `shade`. Nothing else is changed.
+///
+/// 21 (#168) added to the real-time
 /// report's cold start `spawn_ring_s` (the 20 m spawn ring), `guard_s` (the Guard that the window
 /// waits for as well) and `time_to_control_s` (from the world map being ready to the window
 /// opening), to each path `camera_soft_miss_frames` (frames whose ground below the frame's camera

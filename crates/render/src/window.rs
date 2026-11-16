@@ -6,6 +6,8 @@ use crate::camera::Camera;
 use crate::composite::Composite;
 use crate::cpu::RenderCpu;
 use crate::debug_view::DebugView;
+use crate::look::Look;
+use crate::post::Stages;
 use crate::profiler::Profiler;
 use crate::scene::{Scene, SceneUpdate};
 use crate::still::Plan;
@@ -46,6 +48,9 @@ pub struct Renderer {
     scale: f32,
     mode: Mode,
     sun: Sun,
+    /// If set, the sun is at these angles (azimuth, elevation, angular radius) in the camera's local
+    /// frame, so it follows the Planet's up (see [`Sun::local`]); `sun` is then not used.
+    local_sun: Option<(f32, f32, f32)>,
     /// Copies the images to the surface, mixing the Reference view over Primary's as it fades in.
     composite: Composite,
     /// What `composite` reads: the upscaled image and the reference image.
@@ -70,8 +75,9 @@ impl Renderer {
         let mut config = surface
             .get_default_config(&adapter, width.max(1), height.max(1))
             .ok_or("surface is not supported by the adapter")?;
-        // The traced image already holds sRGB-encoded values (the true curve, in both views), so
-        // present it to a surface that does not encode them a second time.
+        // The traced image already holds display-encoded values (AgX-like by default; the true sRGB
+        // curve for Neutral and with the transform off), so present it to a surface that does not
+        // encode them a second time.
         let formats = surface.get_capabilities(&adapter).formats;
         if let Some(format) = formats.iter().copied().find(|f| !f.is_srgb()) {
             config.format = format;
@@ -100,6 +106,11 @@ impl Renderer {
             scale: DEFAULT_SCALE,
             mode: Mode::default(),
             sun: Sun::default(),
+            local_sun: Some((
+                crate::sun::DEFAULT_AZIMUTH,
+                crate::sun::DEFAULT_ELEVATION,
+                crate::sun::DEFAULT_ANGULAR_RADIUS,
+            )),
             composite,
             composite_group,
             began: Instant::now(),
@@ -208,6 +219,36 @@ impl Renderer {
     /// Changes the sun. In reference mode this starts the image over.
     pub fn set_sun(&mut self, sun: Sun) {
         self.sun = sun;
+        self.local_sun = None;
+    }
+
+    /// Puts the sun at `azimuth` and `elevation` radians in the camera's local frame, `radius`
+    /// radians wide: it follows the local up, so it stays at the same height in the sky over the
+    /// whole Planet ([`Sun::local`]). In reference mode this starts the image over when it moves.
+    pub fn set_local_sun(&mut self, azimuth: f32, elevation: f32, radius: f32) {
+        self.local_sun = Some((azimuth, elevation, radius));
+    }
+
+    /// The sun for a frame seen from `camera`.
+    fn sun_for(&self, camera: &Camera) -> Sun {
+        match self.local_sun {
+            Some((azimuth, elevation, radius)) => Sun::local(camera, azimuth, elevation, radius),
+            None => self.sun,
+        }
+    }
+
+    /// Sets the light's palette (see [`Look`]).
+    pub fn set_look(&mut self, look: Look) {
+        self.tracer.set_look(look);
+    }
+
+    /// Switches the stages of the art direction (see [`Stages`]).
+    pub fn set_stages(&mut self, stages: Stages) {
+        self.tracer.set_stages(stages);
+    }
+
+    pub fn stages(&self) -> Stages {
+        self.tracer.stages()
     }
 
     /// Samples in the reference image so far, to show on screen.
@@ -224,7 +265,7 @@ impl Renderer {
     /// What the reference image would be of with the view from `camera`: it starts over when this
     /// changes (see [`View`]), so comparing it from frame to frame tells whether the view is still.
     pub fn view(&self, camera: &Camera) -> View {
-        View::new(camera, &self.sun, &self.target)
+        View::new(camera, &self.sun_for(camera), &self.target)
     }
 
     /// Reconfigures the surface and the images. Zero-sized windows (minimised) are ignored.
@@ -309,13 +350,14 @@ impl Renderer {
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
         self.profiler.begin_frame();
+        let sun = self.sun_for(camera);
         self.plan = self.tracer.encode_frame(
             &self.device,
             &self.queue,
             &mut self.profiler,
             &mut encoder,
             camera,
-            &self.sun,
+            &sun,
             &self.target,
             self.mode == Mode::Reference,
             self.began.elapsed(),

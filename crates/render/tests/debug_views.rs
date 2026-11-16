@@ -38,6 +38,7 @@ fn skyward() -> Camera {
 
 fn gpu(view: DebugView) -> Offscreen {
     let mut gpu = Offscreen::new(SIZE, SIZE, &floor()).unwrap();
+    gpu.use_legacy_light();
     gpu.set_debug_view(view);
     gpu
 }
@@ -138,6 +139,7 @@ fn material_id(name: &str) -> Material {
 /// A `name` floor seen from `overhead()` in the given view.
 fn of_floor(name: &str, view: DebugView) -> Image {
     let mut gpu = Offscreen::new(SIZE, SIZE, &floor_of(material_id(name))).unwrap();
+    gpu.use_legacy_light();
     gpu.set_debug_view(view);
     gpu.render(&overhead())
 }
@@ -205,6 +207,7 @@ fn the_variation_follows_the_voxel_not_the_view() {
     // camera 3 Voxels along x must then move every Voxel's colour 3 pixels along the row.
     let height = 16.0 / (70f64.to_radians() / 2.0).tan();
     let mut gpu = Offscreen::new(SIZE, SIZE, &floor()).unwrap();
+    gpu.use_legacy_light();
     let mut from = |x: f64| gpu.render(&Camera::looking_at([x, height, 16.0], [x, 0.0, 16.0]));
     let (a, b) = (from(16.0), from(19.0));
 
@@ -249,6 +252,7 @@ fn an_emissive_material_adds_its_light_to_the_lit_image() {
     // is above that is the emitted light.
     let lit_red = |name: &str| {
         let mut gpu = Offscreen::new(SIZE, SIZE, &floor_of(material_id(name))).unwrap();
+        gpu.use_legacy_light();
         gpu.set_sun(Sun::from_angles(0.0, -0.5, 0.04));
         linear(pixel(&gpu.render(&overhead()), 16, 16)[0])
     };

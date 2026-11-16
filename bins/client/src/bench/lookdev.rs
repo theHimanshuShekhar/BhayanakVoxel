@@ -14,21 +14,29 @@
 //! [`RECORDED_FOR`]: when the generator changes the places move, a test says so, and the finder
 //! is run again.
 //!
-//! **No stamp code lives here.** Where M1b's content does not exist yet (crystals, vegetation),
-//! a shot names the [`Place`]s for hand-placed stamps: what kind, and the empty Voxel that touches
-//! a surface and the way that surface faces. What a stamp is made of is for whoever places one.
+//! Where M1b's content does not exist yet (crystals, vegetation), a shot names the [`Place`]s for
+//! hand-placed stamps: what kind, and the empty Voxel that touches a surface and the way that
+//! surface faces. `client lookdev --out DIR` ([`run`]) renders the shots with the real pipeline and
+//! writes a contact sheet; the stamps it places are its own ([`stamps`], ported from the look-dev
+//! prototype, #148), and nothing outside it uses them. It is not a `client bench` mode and nothing
+//! in it is timed.
 
 use super::path::{CameraPath, Keyframe};
 
 #[cfg(test)]
 mod finder;
-// Nothing but the tests reads the shot list until the look-dev prototype and M1b do, so outside
-// the tests the items below are dead; each says so on itself rather than the module hiding it.
+mod run;
+// The record of which generator and Planet the places are for is read by the tests that say when
+// they have moved, and by nothing else.
 #[cfg_attr(not(test), allow(dead_code))]
 mod shots;
+mod stamps;
 
-#[cfg_attr(not(test), allow(unused_imports))]
-pub use shots::{RECORDED_FOR, RECORDED_RADIUS, RECORDED_SEED, SHOTS};
+pub use run::main;
+
+pub use shots::SHOTS;
+#[cfg(test)]
+pub use shots::{RECORDED_FOR, RECORDED_RADIUS, RECORDED_SEED};
 
 /// The crystal Materials' hues (#135): six to eight opaque, glossy, emissive crystals. All eight
 /// are here, although the shot list uses some of them.
