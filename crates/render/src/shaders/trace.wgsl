@@ -383,3 +383,75 @@ fn trace(ray: Ray) -> Hit {
     }
     return nearest;
 }
+
+// Whether the Voxel of level 0 at the absolute coordinate `voxel` is solid, as the scene holds it:
+// a Voxel in a brick that is not listed is air. A brick of the Planet that is not listed is air or
+// buried (solid, with solid bricks round it); a buried brick shares a face with no air brick, but
+// it may touch one along an edge or at a corner, and can hold air there, so a Voxel counted as air
+// in an unlisted brick may be solid. Next to a surface that is off by a few Voxels of the window
+// at a concave notch, which tilts the normal there by up to about 7 degrees (ADR 0005's ledger).
+// Level 0 only reaches so far: the shading stops before its end (`smooth_limit`, tracer.rs), where
+// the bricks past it are another level's and read as air here. For the shading, which asks about
+// the Voxels round one that was hit: it is not part of the walk. The last brick looked up is kept
+// in `cache`, because the Voxels asked about one after another are mostly in the same brick.
+struct BrickCache {
+    brick: vec3<i32>,
+    // The brick's entry in `brick_refs`: SOLID_FLAG and its Material if it is one, else the word of
+    // `bricks` that its occupancy bits start at.
+    entry: u32,
+    held: bool,
+}
+
+fn new_brick_cache() -> BrickCache {
+    var cache: BrickCache;
+    cache.brick = vec3<i32>(0x7fffffff);
+    cache.held = false;
+    return cache;
+}
+
+fn look_up_brick(cache: ptr<function, BrickCache>, brick: vec3<i32>) {
+    (*cache).brick = brick;
+    (*cache).held = false;
+    // Regions are 8 x 8 x 8 bricks.
+    let rc = brick >> vec3<u32>(3u);
+    let region = find_region(0u, rc);
+    if region < 0 {
+        return;
+    }
+    let base = u32(region) * REGION_WORDS;
+    let first_ref = regions[base + 16u];
+    if (first_ref & SOLID_FLAG) != 0u {
+        (*cache).entry = first_ref;
+        (*cache).held = true;
+        return;
+    }
+    let local = vec3<u32>(brick - rc * 8);
+    let bit = local.x | (local.y << 3u) | (local.z << 6u);
+    let word = regions[base + (bit >> 5u)];
+    if ((word >> (bit & 31u)) & 1u) == 0u {
+        return;
+    }
+    var rank = countOneBits(word & ((1u << (bit & 31u)) - 1u));
+    for (var j = 0u; j < (bit >> 5u); j++) {
+        rank += countOneBits(regions[base + j]);
+    }
+    (*cache).entry = brick_refs[first_ref + rank];
+    (*cache).held = true;
+}
+
+fn solid_at(voxel: vec3<i32>, cache: ptr<function, BrickCache>) -> bool {
+    let brick = voxel >> vec3<u32>(3u);
+    if any(brick != (*cache).brick) {
+        look_up_brick(cache, brick);
+    }
+    if !(*cache).held {
+        return false;
+    }
+    let entry = (*cache).entry;
+    if (entry & SOLID_FLAG) != 0u {
+        return true;
+    }
+    let local = vec3<u32>(voxel - brick * 8);
+    let bit = local.x | (local.y << 3u) | (local.z << 6u);
+    return ((bricks[entry + (bit >> 5u)] >> (bit & 31u)) & 1u) != 0u;
+}

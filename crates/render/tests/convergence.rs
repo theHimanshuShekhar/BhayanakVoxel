@@ -46,6 +46,7 @@ fn sun() -> Sun {
 /// Material table; the Voxels' colour variation is not in it) and `white_noise` or not.
 fn offscreen_with(white_noise: bool) -> Offscreen {
     let mut offscreen = Offscreen::new(SIZE, SIZE, &floor()).unwrap();
+    offscreen.use_legacy_light();
     offscreen.set_reference_options(ReferenceOptions {
         flat_colours: true,
         white_noise,

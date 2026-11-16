@@ -179,12 +179,17 @@ fn render(planet: &Planet) -> Vec<(&'static str, Image)> {
         };
         fill(&mut current, &mut store, key.position).unwrap();
         let camera = CameraPath::new(vec![key, key]).radial().camera_at(0, 1);
-        images.push((
-            name,
-            Offscreen::new(WIDTH, HEIGHT, &current)
-                .unwrap()
-                .render(&camera),
-        ));
+        // The sun, sky and display of before #202: this is a check of the terrain at three
+        // distances, and the hero light's haze (1/300 per metre) turns the 20 km view into the
+        // horizon's one colour, and its low sun leaves the ground nothing to show its relief with.
+        let mut gpu = Offscreen::new(WIDTH, HEIGHT, &current).unwrap();
+        gpu.use_legacy_light();
+        // Primary's own sun before #202 was a flat 0.75 (use_legacy_light's is the Reference's 1.6).
+        gpu.set_look(render::Look {
+            sun: [0.75; 3],
+            ..render::Look::LEGACY
+        });
+        images.push((name, gpu.render(&camera)));
         scene = Some(current);
     }
     images

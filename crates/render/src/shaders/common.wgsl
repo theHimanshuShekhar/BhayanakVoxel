@@ -22,10 +22,26 @@ struct Frame {
     params: vec4<u32>,
     // Where in its pixel primary visibility traces its ray, (0, 0) to (1, 1), then two unused.
     jitter: vec4<f32>,
+    // The local up (a unit vector, the camera's `horizon_up`) that the sky is a gradient along,
+    // then one unused.
+    look_up: vec4<f32>,
+    // The sun's radiance on a surface that faces it: a multiple of the surface's colour (look.rs).
+    sun_radiance: vec4<f32>,
+    // The sky at the zenith, then one unused.
+    zenith: vec4<f32>,
+    // The sky at the horizon and below, then the haze per Voxel along the camera ray.
+    horizon: vec4<f32>,
+    // 1 if natural Materials are shaded with smooth computed normals (0: face normals); the end of
+    // the smooth range in Voxels (an f32's bits); the weight of the face's normal that the smooth
+    // normal is kept to the face's side with (an f32's bits); one unused.
+    flags: vec4<u32>,
 }
 
 @group(1) @binding(0) var<uniform> camera: Camera;
-@group(1) @binding(1) var output: texture_storage_2d<rgba8unorm, write>;
+// What a kernel draws: the linear light of the pixel, as 16-bit floats, for the exposure, bloom and
+// tone curve (post.wgsl) to turn into the image; or, for a debug view, the view's colours, which
+// are already encoded and which that pass copies as they are.
+@group(1) @binding(1) var output: texture_storage_2d<rgba16float, write>;
 @group(1) @binding(2) var<uniform> frame: Frame;
 
 // The Material table (materials.toml), one record per id. Four vec4s each; keep this in step
@@ -33,7 +49,7 @@ struct Frame {
 //   0: base colour, roughness
 //   1: noise scale (Voxels), hue jitter (radians), value jitter, metalness
 //   2: emitted light (colour times intensity)
-//   3: transparency, IOR, 1 if the table defines the id, unused
+//   3: transparency, IOR, 1 if the table defines the id, 1 if hits are shaded with smooth normals
 @group(1) @binding(4) var<storage, read> materials: array<vec4<f32>>;
 
 const RECORD_VEC4S = 4u;
@@ -104,10 +120,82 @@ fn surface_albedo(hit: Hit, flat_colours: bool) -> vec3<f32> {
     return varied_albedo(hit.material, hit.voxel);
 }
 
-// A simple gradient from the horizon to the zenith, until the atmosphere replaces it. It uses
-// the world's y axis as up, which is right near the +y pole and nowhere else.
+// Whether a hit of `material` is shaded with smooth computed normals: every Natural Material (see
+// gpu_materials.rs). Built walls and Lights keep their hard edges.
+fn is_smooth(material: u32) -> bool {
+    let at = material * RECORD_VEC4S;
+    return at + 3u < arrayLength(&materials) && materials[at + 3u].w != 0.0;
+}
+
+// A simple gradient from the horizon to the zenith, until the atmosphere replaces it: along the
+// local up (`look_up`, the Planet's radial up), not the world's y.
 fn sky(dir: vec3<f32>) -> vec3<f32> {
-    return mix(vec3<f32>(0.75, 0.82, 0.92), vec3<f32>(0.25, 0.45, 0.85), clamp(dir.y, 0.0, 1.0));
+    // lighting: Sky and atmosphere
+    let height = clamp(dot(dir, frame.look_up.xyz), 0.0, 1.0);
+    // lighting: Sky and atmosphere
+    return mix(frame.horizon.xyz, frame.zenith.xyz, height);
+}
+
+// The light of a hit `t` Voxels from the camera as the camera sees it through the haze: the horizon's
+// colour fades in as `1 - exp(-haze * t)`. Only for the first hit of the camera ray; the sky itself
+// is not hazed.
+fn hazed(light: vec3<f32>, t: f32) -> vec3<f32> {
+    // lighting: Sky and atmosphere
+    return mix(frame.horizon.xyz, light, exp(-frame.horizon.w * t));
+}
+
+// Hits keep their face normals from `smooth_end()` on, which is 30 m (600 Voxels) or, where level 0
+// ends sooner, a little before that (see `smooth_limit` in tracer.rs), and the smooth normal is
+// faded in over the last fifth of the way to it: the window is over level 0's bricks, and past
+// level 0 it would count the coarser level's bricks (not listed in level 0) as air.
+const SMOOTH_BLEND_FROM = 0.8;
+// The smoothing looks at the Voxels of a cube of 5 round the empty Voxel in front of the face.
+const SMOOTH_WINDOW = 2;
+// How much the solid Voxels at each squared distance (0 to 12 Voxels, in a cube of 5) count:
+// exp(-d2 / (2 * 1.4^2)).
+const SMOOTH_WEIGHTS = array<f32, 13>(
+    1.0, 0.774837429, 0.600373041, 0.465191504, 0.360447789, 0.279288438, 0.216403135,
+    0.167677249, 0.129922608, 0.100668900, 0.078002031, 0.060438894, 0.046830317,
+);
+
+// The surface's normal at the Voxel `voxel`, which a ray entered through the face with unit normal
+// `face`: the direction away from the solid Voxels round the empty one in front of that face, each
+// weighted by how near it is (a Gaussian of 1.4 Voxels), kept to the face's side by adding a
+// quarter of the face's normal (the weight in `flags.z`: 0.25, the owner's pick of 2026-11-16; 0
+// for look-dev). On a stair-step slope that is the slope's normal; on a flat face, the face's;
+// where there is no solid round it, the face's. The prototype's, as rendered (#148).
+fn smooth_normal(voxel: vec3<i32>, face: vec3<f32>) -> vec3<f32> {
+    let front = voxel + vec3<i32>(face);
+    var cache = new_brick_cache();
+    var sum = vec3<f32>(0.0);
+    for (var dz = -SMOOTH_WINDOW; dz <= SMOOTH_WINDOW; dz++) {
+        for (var dy = -SMOOTH_WINDOW; dy <= SMOOTH_WINDOW; dy++) {
+            for (var dx = -SMOOTH_WINDOW; dx <= SMOOTH_WINDOW; dx++) {
+                let d = vec3<i32>(dx, dy, dz);
+                if solid_at(front + d, &cache) {
+                    sum += vec3<f32>(d) * SMOOTH_WEIGHTS[u32(dx * dx + dy * dy + dz * dz)];
+                }
+            }
+        }
+    }
+    if dot(sum, sum) < 1e-6 {
+        return face;
+    }
+    return normalize(normalize(-sum) + bitcast<f32>(frame.flags.z) * face);
+}
+
+// The normal that `hit` is shaded with: smooth, for a natural Material in range when the stage is
+// on, else the face's; in between (the last fifth of the range), the two mixed.
+fn shading_normal(hit: Hit) -> vec3<f32> {
+    let end = bitcast<f32>(frame.flags.y);
+    if frame.flags.x == 0u || hit.t >= end || !is_smooth(hit.material) {
+        return hit.normal;
+    }
+    // Over 24 to 30 m the face's normal gives way to the smooth one, so that the change at 30 m is
+    // not a ring on the ground.
+    let weight = clamp((end - hit.t) / (end * (1.0 - SMOOTH_BLEND_FROM)), 0.0, 1.0);
+    let smoothed = smooth_normal(hit.voxel, hit.normal);
+    return normalize(mix(hit.normal, smoothed, weight) + 1e-6 * hit.normal);
 }
 
 // The ray from the camera through `pixel` of an image `size` pixels across. `offset` says where
@@ -142,6 +230,8 @@ const VIEW_SAMPLE_COUNT = 4u;
 // Drawn by the upscaler (upscale.wgsl) in primary mode; in the reference image the history is its
 // samples.
 const VIEW_HISTORY_LENGTH = 5u;
+// The normal that the hit is shaded with, as `(n + 1) / 2`: the smooth one, or the face's.
+const VIEW_SHADING_NORMALS = 6u;
 // Voxels at which the depth view is half as bright as at the camera.
 const DEPTH_HALF = 64.0;
 // The sample count at which the sample count view reaches its brightest colour.
@@ -157,6 +247,7 @@ fn debug_colour(view: u32, hit: Hit, sample_index: u32) -> vec3<f32> {
     }
     switch view {
         case VIEW_NORMALS: { return hit.normal * 0.5 + 0.5; }
+        case VIEW_SHADING_NORMALS: { return shading_normal(hit) * 0.5 + 0.5; }
         case VIEW_ALBEDO: { return encode(albedo(hit.material)); }
         case VIEW_DEPTH: { return vec3<f32>(DEPTH_HALF / (DEPTH_HALF + hit.t)); }
         default: { return vec3<f32>(1.0, 0.0, 1.0); }

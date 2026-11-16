@@ -428,7 +428,9 @@ is made there (below): the run's **Edit latency**. Its frames are not those of a
       (`time_ms` less all of those: what none of them says);
     - **the GPU's own time for the frame's passes**, from the timestamps the passes wrote (the
       device's clock, not wall time; they are GPU timestamps, not what the CPU waited):
-      `gpu_primary_ms`, `gpu_upscale_ms`, and `gpu_total_ms` (from the start of the frame's first
+      `gpu_primary_ms` (**from schema 20 it excludes `normals` and `shade`**, which have lines of
+      their own: add them for what schema 19 called `primary`), `gpu_upscale_ms`, and
+      `gpu_total_ms` (from the start of the frame's first
       pass to the end of its last, gaps between them included), and `wait_not_passes_ms`, which is
       `wait_ms` less `gpu_total_ms`: what the wait was that was not our passes (the update's copies,
       which are queued ahead of them, driver work, other GPU clients, wgpu's cleanup in the poll).
@@ -1122,7 +1124,7 @@ still-view phase, at full size with batching, is the player's number.
 
 ```
 {
-  "schema_version": 19,
+  "schema_version": 20,
   "build":   { "version", "commit" },          // commit: CI builds only, else null; on a PR
                                                // build it is GitHub's merge commit, not the head
   "machine": { "gpu", "device_type", "driver", "driver_info", "backend", "os", "arch",
@@ -1251,6 +1253,34 @@ are in the file as comments: **whoever adds a pass uncomments its budget and nam
 pass is named by the string given to `Profiler::compute_pass`). `reference` has no budget in #10;
 its 3.0 ms (a sample, pass and total) catches a gross regression, set from the first real run on the
 4090, which measured a mean of 1.10 ms.
+
+## The art direction's passes (#202)
+
+The exposure, bloom, tone curve and smooth normals are passes of their own, so each has a line in
+`passes[]` with its own timing (the bench reports every pass generically, so the new lines need no
+field), and `primary` no longer includes the lighting, which is **schema 20**. Names, in the order
+they run in a Primary frame:
+
+| Pass | What it is | Budget |
+| --- | --- | --- |
+| `primary` | primary visibility and the G-buffer (it no longer lights) | 1.0 (existing) |
+| `normals` | the smooth normal of every hit (the cost of the smooth normals, alone) | none yet |
+| `shade` | the lit image, as linear light, from the G-buffer | none yet |
+| `exposure`, `exposure_adapt` | the log-average luminance and the adapted exposure | none yet |
+| `bloom_down`, `bloom_h`, `bloom_v` | the bloom, at a quarter of the size | none yet |
+| `tone` | exposure, bloom and tone curve into the encoded image | none yet |
+| `upscale` | the TAAU pass | 0.5 (existing) |
+
+The Reference view runs the same passes after `reference` (not `normals` or `shade`: it smooths and
+lights inside its own pass). **`primary` now excludes `normals` and `shade`** (the lighting and the
+smooth normals that it used to include), so `passes[primary]`, the cave-still `primary` and the
+real-time `gpu_primary_ms` are not comparable with a report of schema 19 or before, nor is the
+budget on them: add `normals` and `shade` to it (schema 20). #10 gave the whole of tone,
+exposure and bloom ("post") 0.5 ms and `gpu_total.primary` 8.6 ms; the new passes have no budget of their own yet, because the first
+number comes from the 4090: set them from that run (uncomment or add them in
+`bins/client/bench-budgets.toml`, named as above). The convergence phase runs on the old light with
+every stage off (`Offscreen::use_legacy_light`), so its numbers are comparable with reports before
+#202.
 
 ## The look-dev shot list
 

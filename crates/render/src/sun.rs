@@ -2,9 +2,20 @@
 
 use bytemuck::{Pod, Zeroable};
 
-/// A little over 2 degrees, several times the real sun's 0.27, so that penumbrae are wide enough
-/// to see at Voxel scale.
-pub const DEFAULT_ANGULAR_RADIUS: f32 = 0.04;
+use crate::camera::Camera;
+
+/// About 6.9 degrees, 25 times the real sun's 0.27: wide penumbrae that read at Voxel scale. The
+/// owner's pick of #148 (0.12 rad, over 0.01 and the 0.04 this was), judged without GI or a
+/// denoiser: it is to be checked again once #54 and #55 exist.
+pub const DEFAULT_ANGULAR_RADIUS: f32 = 0.12;
+
+/// The default sun's elevation: 8 degrees above the horizon (hero light B, #148).
+pub const DEFAULT_ELEVATION: f32 = 8.0 * std::f32::consts::PI / 180.0;
+
+/// The default sun's azimuth, from the direction opposite to where a camera with no yaw looks
+/// towards the camera's side: 110 degrees, which is across the view and a little towards it, as
+/// the look-dev contact sheet's was.
+pub const DEFAULT_AZIMUTH: f32 = 110.0 * std::f32::consts::PI / 180.0;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Sun {
@@ -45,6 +56,26 @@ impl Sun {
             .expect("finite angles give a direction")
     }
 
+    /// A sun `elevation` radians above the horizon of `camera`, at `azimuth` radians from its
+    /// `back` towards its side: the angles of [`Sun::from_angles`] in the camera's own frame
+    /// (its `horizon_up`, which is the Planet's radial up over a Planet). The sun follows the
+    /// local up, so it is at the same height in the sky wherever on the Planet the camera is. For
+    /// a camera that has not been carried (up +y, back +z) this is `from_angles` exactly.
+    pub fn local(camera: &Camera, azimuth: f32, elevation: f32, angular_radius: f32) -> Self {
+        let (up, back) = (camera.horizon_up, camera.back);
+        let side = [
+            up[1] * back[2] - up[2] * back[1],
+            up[2] * back[0] - up[0] * back[2],
+            up[0] * back[1] - up[1] * back[0],
+        ];
+        let (sin_az, cos_az) = f64::from(azimuth).sin_cos();
+        let (sin_el, cos_el) = f64::from(elevation).sin_cos();
+        let direction = std::array::from_fn(|a| {
+            (up[a] * sin_el + (back[a] * cos_az + side[a] * sin_az) * cos_el) as f32
+        });
+        Self::new(direction, angular_radius).expect("a camera's frame and finite angles")
+    }
+
     /// The azimuth and elevation that `from_angles` takes.
     pub fn angles(&self) -> (f32, f32) {
         let [x, y, z] = self.direction;
@@ -68,9 +99,9 @@ impl Sun {
 }
 
 impl Default for Sun {
-    /// The direction the primary-visibility shading has always used, high in the sky.
+    /// Hero light B's sun: low in the sky ([`DEFAULT_ELEVATION`]) and wide ([`DEFAULT_ANGULAR_RADIUS`]).
     fn default() -> Self {
-        Self::new([0.5, 0.8, 0.3], DEFAULT_ANGULAR_RADIUS).expect("a valid direction")
+        Self::from_angles(DEFAULT_AZIMUTH, DEFAULT_ELEVATION, DEFAULT_ANGULAR_RADIUS)
     }
 }
 
@@ -134,6 +165,33 @@ mod tests {
         assert!(
             (0..3).all(|i| (again.direction()[i] - Sun::default().direction()[i]).abs() < 1e-6)
         );
+    }
+
+    #[test]
+    fn a_local_sun_of_an_uncarried_camera_is_the_world_one_and_follows_the_up_of_a_carried_one() {
+        let near = |a: [f32; 3], b: [f32; 3]| (0..3).all(|i| (a[i] - b[i]).abs() < 1e-6);
+        let camera = Camera::looking_at([0.0, 5.0, 0.0], [0.0; 3]);
+        let local = Sun::local(&camera, 0.7, 0.3, 0.1);
+        assert!(near(
+            local.direction(),
+            Sun::from_angles(0.7, 0.3, 0.1).direction()
+        ));
+        // Carried to the +x side of a Planet, the up is +x: the sun is 0.3 rad above that horizon.
+        let mut elsewhere = camera;
+        elsewhere.position = [100.0, 0.0, 0.0];
+        elsewhere.carry_up([1.0, 0.0, 0.0]);
+        let sun = Sun::local(&elsewhere, 2.0, 0.3, 0.1);
+        let height: f32 = sun.direction()[0];
+        assert!((height - 0.3f32.sin()).abs() < 1e-6, "{height}");
+        assert!((sun.angular_radius() - 0.1).abs() < 1e-9);
+    }
+
+    #[test]
+    fn the_default_sun_is_the_owners_pick_low_and_wide() {
+        let sun = Sun::default();
+        assert_eq!(sun.angular_radius(), 0.12);
+        let (_, elevation) = sun.angles();
+        assert!((elevation.to_degrees() - 8.0).abs() < 1e-4, "{elevation}");
     }
 
     #[test]

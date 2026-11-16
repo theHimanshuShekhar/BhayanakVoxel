@@ -13,6 +13,18 @@ use crate::tracer::{Plane, ReferenceOptions, Target, Tracer};
 use crate::upscale::Resolution;
 use crate::{Result, finish_and_read, request_gpu, shared_instance, staging_buffer};
 
+/// A half-precision float's value.
+fn half_to_f32(bits: u16) -> f32 {
+    let sign = if bits & 0x8000 != 0 { -1.0 } else { 1.0 };
+    let (exponent, fraction) = (i32::from((bits >> 10) & 0x1f), f32::from(bits & 0x3ff));
+    match exponent {
+        0 => sign * fraction * 2f32.powi(-24),
+        31 if fraction == 0.0 => sign * f32::INFINITY,
+        31 => f32::NAN,
+        _ => sign * (1.0 + fraction / 1024.0) * 2f32.powi(exponent - 15),
+    }
+}
+
 /// Copies a `width` x `height` texture of `bytes` per texel to the CPU after the work in
 /// `encoder`, tightly packed, rows from the top.
 fn read_texture(
@@ -293,6 +305,28 @@ impl Offscreen {
         self.sun = sun;
     }
 
+    /// Sets the light's palette (see [`Look`](crate::Look)): hero light B by default.
+    pub fn set_look(&mut self, look: crate::look::Look) {
+        self.tracer.set_look(look);
+    }
+
+    /// Switches the stages of the art direction (see [`Stages`](crate::Stages)); all on by default.
+    pub fn set_stages(&mut self, stages: crate::post::Stages) {
+        self.tracer.set_stages(stages);
+    }
+
+    /// The light and display the renderer had before #202: [`Look::LEGACY`](crate::Look::LEGACY),
+    /// no stage of the art direction ([`Stages::NONE`](crate::Stages::NONE)) and the old default
+    /// sun (high, 0.04 rad), so that the lit image is the sRGB encoding of the light of the old
+    /// constants. For the tests whose answers are worked out from those constants, and the bench's
+    /// convergence phase, whose numbers are compared from report to report. A sun set afterwards
+    /// with [`Offscreen::set_sun`] replaces the old one.
+    pub fn use_legacy_light(&mut self) {
+        self.set_look(crate::look::Look::LEGACY);
+        self.set_stages(crate::post::Stages::NONE);
+        self.set_sun(Sun::new([0.5, 0.8, 0.3], 0.04).expect("a direction"));
+    }
+
     /// Chooses what is drawn: the lit image, or one of the debug views.
     pub fn set_debug_view(&mut self, view: DebugView) {
         self.tracer.set_debug_view(view);
@@ -364,6 +398,56 @@ impl Offscreen {
     /// Whether the device can time passes.
     pub fn timers_supported(&self) -> bool {
         self.profiler.supported()
+    }
+
+    /// The exposure, in stops (log2), that the display transform has kept for the Reference view
+    /// (`reference`) or for Primary, or `None` if it has not metered one. For tests.
+    pub fn exposure_stops(&mut self, reference: bool) -> Option<f32> {
+        let view = if reference {
+            crate::post::Exposed::Reference
+        } else {
+            crate::post::Exposed::Primary
+        };
+        let encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        let bytes = crate::read_buffer(
+            &self.device,
+            &self.queue,
+            encoder,
+            self.tracer.exposure_state(view),
+            16,
+        );
+        let word = |i: usize| f32::from_le_bytes(bytes[i * 4..i * 4 + 4].try_into().unwrap());
+        (word(2) != 0.0).then(|| word(0))
+    }
+
+    /// Primary's last frame as linear light before the display transform, and the bloom the
+    /// transform made of it at a quarter of the size: both as RGB, rows from the top, with their
+    /// sizes. For tests of the bloom, which the 8-bit image shows only coarsely.
+    #[allow(clippy::type_complexity)]
+    pub fn read_hdr_and_bloom(&mut self) -> ((u32, u32, Vec<[f32; 3]>), (u32, u32, Vec<[f32; 3]>)) {
+        let size = self.target.resolution().internal;
+        let (hdr, (bloom, bloom_size)) = self.target.lit_hdr_and_bloom();
+        let (hdr, bloom) = (hdr.texture.clone(), bloom.texture.clone());
+        let read = |texture: &wgpu::Texture, size: (u32, u32)| {
+            let encoder = self
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+            let bytes = read_texture(&self.device, &self.queue, encoder, texture, size, 8);
+            let pixels = bytes
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .map(|texel| {
+                    std::array::from_fn(|c| {
+                        half_to_f32(u16::from_le_bytes([texel[2 * c], texel[2 * c + 1]]))
+                    })
+                })
+                .collect();
+            (size.0, size.1, pixels)
+        };
+        (read(&hdr, size), read(&bloom, bloom_size))
     }
 
     /// Keeps every pass time from now on, for a report over many frames.
@@ -556,6 +640,38 @@ impl Offscreen {
         // The uniforms of the next sample are written over these.
         self.queue.submit([encoder.finish()]);
         self.profiler.collect(&self.device, true);
+    }
+
+    /// Shows the Reference view's mean so far again, under the current [`Stages`](crate::Stages)
+    /// and with the exposure it has (held, not metered again), and reads it back. The mean is not
+    /// touched: the tone curve is only a way of showing it, so one accumulation can be seen
+    /// through every curve. `None` if the view has no samples (it has just started over), whose
+    /// mean is not an image of this view.
+    pub fn reshow_reference(&mut self) -> Option<Image> {
+        if self.reference_samples() == 0 {
+            return None;
+        }
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        self.profiler.begin_frame();
+        self.tracer.encode_reference_post(
+            &self.device,
+            &self.queue,
+            &mut self.profiler,
+            &mut encoder,
+            &self.target,
+            crate::post::REFERENCE_METERED_UP_TO,
+        );
+        self.profiler.resolve(&mut encoder);
+        self.queue.submit([encoder.finish()]);
+        self.profiler.collect(&self.device, true);
+        let size = self.target.reference_size();
+        let texture = self.target.reference().texture.clone();
+        let encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        Some(self.read_image(encoder, &texture, size))
     }
 
     /// The most samples one dispatch of the Reference view may take at the size it is traced at
