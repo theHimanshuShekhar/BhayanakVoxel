@@ -73,11 +73,11 @@ The real-time view of the world that a player plays in.
 _Avoid_: Real-time view, game view
 
 **Reference view**:
-The unbiased view of the same world that the Primary view is measured against. It is shown when the view is Still and gets cleaner the longer it stays so.
+The unbiased view of the same world that the Primary view is measured against. It is shown when the view is Still and the scene has caught up with the camera (or the catch-up cap has passed, ADR 0005), and gets cleaner the longer it stays so.
 _Avoid_: Ground truth, path-traced mode, reference mode
 
 **Still**:
-The camera, the sun and the window have not changed for 2 frames and no Edit has happened. The Reference view is shown only while the view is Still; any change cuts to the Primary view at once and the Reference view starts again from sample 0.
+The camera, the sun and the window have not changed for 2 frames and no Edit has happened. The Reference view is shown only while the view is Still, and after a flight only once the scene has caught up with the camera; any change cuts to the Primary view at once and the Reference view starts again from sample 0.
 _Avoid_: Idle, paused
 
 ### Walking

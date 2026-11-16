@@ -546,3 +546,22 @@ That is within the research's ρ⁵ bound for rock, soil and grass (1.3 to 3.1 %
 - **The acceptance** (met, above): FLIP ≤ 0.05 within 0.25 s of stopping; frame time p99 ≤ 16.7 ms while accumulating in the open view; the time to FLIP ≤ 0.02 reported.
 - **What was verified without the 4090** (lavapipe, this box): two batches of 3 samples are 6 single samples bit for bit, whatever the split; a change of the camera, the sun, the window's size or an Edit cuts to Primary at once and the Reference view starts from sample 0; the accumulation after a fade, a cut or a restart equals that of plain samples bit for bit, so it never holds a Primary or a faded pixel; the goldens are unchanged. The phase's code ran at 96 by 54 with FLIP (`the_phase_with_flip`): not a timing.
 - **The cap** is on the work in a dispatch, samples times pixels: 16 samples at 1440p (3.69 Mpix), and the same work at any size (7 at 4K, 1 at 8K). The worst sample known at 1440p is 10.98 ms (#99's pit, the maximum of 1 024 samples, before #188; its mean was 6.15 ms and p95 7.92 ms, and after #188 the pit's mean is 4.38 ms), so a capped batch of it is 16 × 10.98 = 176 ms, 9 % of Windows' 2 s timeout (TDR), and 0.53 s (26 %) with the snow cave's factor of 3 (ADR 0005). A GPU would have to be 11 times slower than the 4090 on that sample, or 3.8 times with the snow cave, before a capped batch reached the timeout. The 4090 never gets near the cap: it takes at most 4 samples (above). The cap is for what the budget cannot see, timers that lie and a view that costs under 0.75 ms a sample. A time of 0, or under 0.05 ms a Mpix a sample (under 0.18 ms at 1440p), is not a measurement: it is left out and the size is held, not raised.
+
+### Scene patches while the view is Still (ADR 0005, #217, 2026-11-16)
+
+The scene thread's patches (following the camera, arrivals, steps of coarsening) restart the Reference view, so a Still view that the player did not touch could keep flashing noisy after a flight. The bench counts the cuts (`docs/agents/benchmarking.md`, "The still hold").
+
+**Measured on the 4090** (the orchestrator's runs, posted on #221: RTX 4090, driver 621.24, idle GPU, full-size Planet, `client bench --streaming --real-time`, gated, both runs exit 0). "Before" is `152715c`, the counting only (built through the bench-only draft #222); "after" is `d255edc`, which holds the scene **at once** when the view goes Still. This is the first form of #217: the owner's decision (below) replaced it before merge, and these numbers are the case for deciding so, not those of the policy that merged.
+
+| | before `152715c` | after `d255edc` (hold at once) |
+|---|---|---|
+| `still_after_flight`: cuts in 175 Still frames (3.0 s hold) | **47**, all `follow` | **1** (`follow`) |
+| catch-up after leaving Still | 18.5 s, settled | 21.2 s, settled |
+| holes after the catch-up | 0 | 0 |
+| `stop after a flight`: settle | 47.8 s | 47.6 s |
+| `stop after a flight`: scene lag, max | 3.92 `d0` | 3.92 `d0` |
+| cold start: load / fill | 7.03 s / 214 s | 7.02 s / 207 s |
+
+- **Primary is unchanged.** The stop path's counted cuts are 1 550 before and 1 555 after, but that path is not Still-paused. The normal bench at `d255edc` (3 runs): Primary `gpu_total` 0.674 / 0.679 / 0.680 ms, Reference 1.223 ms, all budgets OK.
+- **What the hold at once left wrong.** The stop after a flight starts 3.92 `d0` behind the camera, so freezing the scene the moment the view goes Still holds it there, and the Reference view converges on ground about 4 times coarser than the Primary view would draw. **The owner's decision (2026-11-16) is catch up first, then hold** (ADR 0005): Primary is drawn and the scene follows the camera until it is under a Voxel behind (or 5 s have gone by), and then the Reference view starts and the scene is held. The bench's `still_after_flight.before_hold` reports the lag when the view went Still and when the hold began, how long the wait was and whether it ran to the cap; **those numbers are the 4090's to add** and are not here yet.
+- **On the dev box** (stepped test Planet, lavapipe): 118 cuts in 120 held frames before #217, all `follow`; with a hold at once at most 1. With the catch-up first the same flight is caught up in 59 frames (0.95 s of the stepped clock) at a 256 KiB / 32 copy budget, and the 180 held frames after it have at most 1 cut (`a_view_that_goes_still_after_a_flight_catches_up_with_the_camera_before_it_is_held`).

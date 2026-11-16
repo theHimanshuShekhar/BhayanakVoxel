@@ -23,6 +23,24 @@ pub const STILL_FRAMES: u32 = 2;
 /// How long the Reference view takes to fade in over the Primary image: about 150 ms.
 pub const FADE: Duration = Duration::from_millis(150);
 
+/// The cuts of a Still view (#217): frames where the Reference view was being shown and the next
+/// frame was Primary, by what changed. The bench counts them to say how often a view that the
+/// player did not touch flashes noisy again.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Cuts {
+    /// The camera, the sun or the window's size changed.
+    pub view: u32,
+    /// The view was the same and the Planet or the pipeline changed (a scene patch, an Edit, a new
+    /// seed): the epoch moved.
+    pub scene: u32,
+}
+
+impl Cuts {
+    pub fn total(self) -> u32 {
+        self.view + self.scene
+    }
+}
+
 /// What a frame draws.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Plan {

@@ -78,7 +78,15 @@ use super::stream::StreamReport;
 /// no longer include the lighting: a number of schema 19 or before is not comparable with them
 /// except as `primary` + `normals` + `shade`. Nothing else is changed.
 ///
-/// 21 (#168) added to the real-time
+/// 21 is not used: #168 (PR #219) took 23, as #217 landed first.
+///
+/// 22 (#217) counts the cuts of a Still view: each convergence view's `still` has `cuts` (`total`,
+/// `view`, `scene`); each real-time run has `still_after_flight` (the view held Still after a
+/// flight with the game's loading pause: `hold_s`, the cuts by cause, the catch-up and the holes
+/// after it); and the real-time stop after a flight has `still_cuts` (null in the other paths).
+/// Nothing else is changed.
+///
+/// 23 (#168) added to the real-time
 /// report's cold start `spawn_ring_s` (the 20 m spawn ring), `guard_s` (the Guard that the window
 /// waits for as well) and `time_to_control_s` (from the world map being ready to the window
 /// opening), to each path `camera_soft_miss_frames` (frames whose ground below the frame's camera
@@ -93,7 +101,7 @@ use super::stream::StreamReport;
 /// `soft_misses`, `scene_lag`, `spawn_ring`, `time_to_control` and `settle`). The budgets file has
 /// the keys `camera_soft_miss_frames`, `scene_lag_d0_max`, `spawn_ring_s`, `time_to_control_s` and
 /// `settle_s`, in `[streaming]`. Nothing else is changed.
-pub const SCHEMA_VERSION: u32 = 21;
+pub const SCHEMA_VERSION: u32 = 23;
 
 /// One timed thing (a pass, or the GPU total of a profiler frame) in one mode, against its
 /// budget. In reference mode a profiler frame is one sample, so the entries of that mode have
@@ -595,7 +603,7 @@ mod tests {
                 "streaming_real_time"
             ]
         );
-        assert_eq!(json["schema_version"], 21);
+        assert_eq!(json["schema_version"], 23);
         assert_eq!(json["convergence"], serde_json::Value::Null);
         assert_eq!(json["streaming"], serde_json::Value::Null);
         assert_eq!(json["streaming_real_time"], serde_json::Value::Null);

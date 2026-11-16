@@ -202,6 +202,9 @@ pub struct Loader {
     /// The bands and reach that jobs are classed by (the workers' are in their state).
     bands: Bands,
     reach: Reach,
+    /// A test says the loader is backed up whatever its workers are doing (a stepped one has none).
+    #[cfg(test)]
+    pretend_backed_up: bool,
 }
 
 /// Workers for `cores` cores: two fewer, so that the simulation and the frame thread always have
@@ -306,6 +309,8 @@ impl Loader {
             next_ticket: 0,
             bands,
             reach: Reach::NONE,
+            #[cfg(test)]
+            pretend_backed_up: false,
         }
     }
 
@@ -513,7 +518,17 @@ impl Loader {
     /// Whether the workers are as far ahead as they may be ([`MAX_AHEAD`]): they wait for the frame
     /// thread to take in what they made. Never for a stepped loader, which has no workers to wait.
     pub fn backed_up(&self) -> bool {
+        #[cfg(test)]
+        if self.pretend_backed_up {
+            return true;
+        }
         !self.workers.is_empty() && self.shared.ahead.load(Atomic::Relaxed) >= MAX_AHEAD
+    }
+
+    /// Has [`Loader::backed_up`] say yes, for a test of what the scene thread does while it is.
+    #[cfg(test)]
+    pub fn pretend_backed_up(&mut self, backed_up: bool) {
+        self.pretend_backed_up = backed_up;
     }
 
     /// What the workers have done with their time since the start, summed over them: seconds

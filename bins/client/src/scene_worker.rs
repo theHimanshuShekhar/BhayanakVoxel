@@ -352,6 +352,10 @@ pub struct Stats {
     /// Nodes that a change of the bands for the camera's speed has yet to look at again (see
     /// [`Scene::rebanding`]).
     pub rebanding: usize,
+    /// Whether the speed scale has a step to give back that it has not yet (see
+    /// [`SpeedScale::releasing`]): the camera has slowed, and the bands will be listed again for
+    /// it when the hold of the release is over. A reband that is on its way.
+    pub speed_releasing: bool,
     /// Bricks drawn at each level (see [`Scene::level_bricks`]).
     pub level_bricks: [usize; LEVELS],
     pub bands: Option<Bands>,
@@ -510,6 +514,8 @@ impl Stats {
     fn same_counts(&self, other: &Stats, exactly: bool) -> bool {
         self.waiting == other.waiting
             && self.soft_misses == other.soft_misses
+            && (self.rebanding > 0) == (other.rebanding > 0)
+            && self.speed_releasing == other.speed_releasing
             && self.coarsening == other.coarsening
             && self.throttled == other.throttled
             && self.loader == other.loader
@@ -531,6 +537,7 @@ fn stats_of(scene: &Scene, loader: &Loader, slow: &Arc<Slow>, eviction: Eviction
     Stats {
         waiting: scene.waiting(),
         rebanding: scene.rebanding(),
+        speed_releasing: false,
         level_bricks,
         bands: scene.bands(),
         coarsening: 0,
@@ -571,6 +578,62 @@ fn slow_of(scene: &Scene, loader: &Loader, exactly: bool) -> Arc<Slow> {
     })
 }
 
+/// What made a change to the scene (#217): the work of the scene thread that a patch came from. A
+/// patch that the frame thread copies to the GPU restarts the Reference view, so the bench counts
+/// the cuts of a Still view by these.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Cause {
+    /// An Edit's level-0 bricks, packed at once.
+    Edit,
+    /// A new LOD bias (the user's bands).
+    Bands,
+    /// The coarse levels over an Edit, remade after it.
+    Coarse,
+    /// The scene moved to the camera.
+    Follow,
+    /// Bricks the loader generated, taken in and split.
+    Arrival,
+    /// A step of the memory cap's coarsening, or one taken back.
+    Coarsen,
+    /// Nodes looked at again for a change of the bands for the camera's speed (#168): the work of
+    /// [`Engine::reband_more`]. (`Engine::rescale`, which lists them, makes no patch.)
+    Reband,
+}
+
+impl Cause {
+    pub const ALL: [Cause; 7] = [
+        Cause::Edit,
+        Cause::Bands,
+        Cause::Coarse,
+        Cause::Follow,
+        Cause::Arrival,
+        Cause::Coarsen,
+        Cause::Reband,
+    ];
+}
+
+/// A set of [`Cause`]s: what a published patch was made of, merged over the rounds that made it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Causes(u8);
+
+impl Causes {
+    pub fn with(self, cause: Cause) -> Self {
+        Self(self.0 | 1 << cause as u8)
+    }
+
+    pub fn merge(&mut self, other: Causes) {
+        self.0 |= other.0;
+    }
+
+    pub fn has(self, cause: Cause) -> bool {
+        self.0 & (1 << cause as u8) != 0
+    }
+
+    pub fn iter(self) -> impl Iterator<Item = Cause> {
+        Cause::ALL.into_iter().filter(move |&c| self.has(c))
+    }
+}
+
 /// What this thread has made since the frame thread last took: the frame thread's copy of the
 /// scene is made, from [`Ready::mirror`], if it is there, else brought up to date with
 /// [`Ready::patch`].
@@ -589,6 +652,8 @@ pub struct Ready {
     /// When the oldest of what this holds was published, if the counts are exact (see
     /// [`SceneWorker::count_exactly`]); else not stamped, since reading the clock is not free.
     pub published_at: Option<Instant>,
+    /// What the changes in `mirror` or `patch` were made of (#217); empty if there are none.
+    pub causes: Causes,
 }
 
 /// A job for the thread that is not following the camera.
@@ -663,7 +728,9 @@ struct Shared {
     outbox: Mutex<Outbox>,
     /// The frame thread waits here, for a job.
     finished: Condvar,
-    /// Whether taking in what the loader generated is held back.
+    /// Whether the view is Still, and the scene is held as it is (#217): what the loader generated
+    /// is not taken in, the scene is not moved to the camera and coarsening takes no step. An Edit
+    /// and the coarse levels over it go through.
     paused: AtomicBool,
     /// Whether [`Stats::soft_misses`] is counted, which looks at every brick that waits (a
     /// diagnostic: see [`SceneWorker::count_soft_misses`]).
@@ -841,8 +908,12 @@ impl SceneWorker {
             shared: Arc::clone(&shared),
             camera: Some(camera),
             paused: false,
+            held_at: None,
+            told: None,
+            at_standing_camera: false,
             arrival_cost: ARRIVAL_COST,
             changes: Changes::None,
+            causes: Causes::default(),
             published: stats.clone(),
             graveyard,
             spare: Vec::new(),
@@ -883,6 +954,10 @@ impl SceneWorker {
             clock,
             #[cfg(test)]
             coarse_sleep: Duration::ZERO,
+            #[cfg(test)]
+            arrival_sleep: Duration::ZERO,
+            #[cfg(test)]
+            job_after: None,
             #[cfg(test)]
             excess_ops: UploadCost::default(),
             #[cfg(test)]
@@ -990,6 +1065,22 @@ impl SceneWorker {
             }
             engine.step();
         }
+    }
+
+    /// For a test of the slice of the loader's arrivals that a stepped thread takes in: the loader
+    /// says it is backed up, each batch takes `arrival` of the thread's clock, and `job_after`
+    /// batches into a round a job is waiting in the inbox, as one from the frame thread would be.
+    #[cfg(test)]
+    pub fn back_up_arrivals(&self, arrival: Duration, job_after: Option<u32>) {
+        let mut engine = self
+            .stepped
+            .as_ref()
+            .expect("only a stepped thread is backed up")
+            .lock()
+            .expect("the engine is not poisoned");
+        engine.loader.pretend_backed_up(true);
+        engine.arrival_sleep = arrival;
+        engine.job_after = job_after;
     }
 
     /// Has a stepped thread busy for `time` of its clock from now, as the camera or the arrivals
@@ -1361,9 +1452,20 @@ struct Engine {
     /// The camera the scene was last moved to.
     camera: Option<[f64; 3]>,
     paused: bool,
+    /// The camera that following was held back for while the view is Still (#217), if there was
+    /// something to follow: the thread has nothing to do for it until the pause ends, so it sleeps
+    /// as it does for a camera it has followed to (see [`Engine::await_work`]).
+    held_at: Option<[f64; 3]>,
+    /// The camera that the last round was told, for [`Engine::at_a_standing_camera`].
+    told: Option<[f64; 3]>,
+    /// The scene is at a camera that has been the same for two rounds (see
+    /// [`Engine::at_a_standing_camera`]), as of this round's last step.
+    at_standing_camera: bool,
     /// What taking in one brick's children is expected to cost.
     arrival_cost: Duration,
     changes: Changes,
+    /// What `changes` was made of, until it is published.
+    causes: Causes,
     /// What the frame thread handed back, and the copies of it to use again.
     graveyard: Receiver<Garbage>,
     spare: Vec<PatchCopy>,
@@ -1446,6 +1548,13 @@ struct Engine {
     clock: Clock,
     #[cfg(test)]
     coarse_sleep: Duration,
+    /// For a test of the slice of `stream`: time that goes by in each batch of arrivals (the clock
+    /// of a stepped thread does not move by itself), and the number of batches after which a job
+    /// from the frame thread is waiting in the inbox, as one that came in meanwhile would be.
+    #[cfg(test)]
+    arrival_sleep: Duration,
+    #[cfg(test)]
+    job_after: Option<u32>,
     /// See [`Stats::excess_ops`].
     #[cfg(test)]
     excess_ops: UploadCost,
@@ -1610,16 +1719,20 @@ impl Engine {
         }
         if self.idle
             && inbox.jobs.is_empty()
-            && Some(inbox.camera) == self.camera
+            && [self.camera, self.held_at].contains(&Some(inbox.camera))
             && inbox.velocity == self.velocity
             && inbox.speed == self.speed_in
         {
             let shared = Arc::clone(&self.shared);
-            let (camera, paused, moving, speed) =
-                (self.camera, self.paused, self.velocity, self.speed_in);
+            let (cameras, paused, moving, speed) = (
+                [self.camera, self.held_at],
+                self.paused,
+                self.velocity,
+                self.speed_in,
+            );
             let quiet = |inbox: &mut Inbox| {
                 inbox.jobs.is_empty()
-                    && Some(inbox.camera) == camera
+                    && cameras.contains(&Some(inbox.camera))
                     && inbox.velocity == moving
                     && inbox.speed == speed
                     && !inbox.shutdown
@@ -1689,6 +1802,9 @@ impl Engine {
             self.teleported = true;
         }
         self.shared.taken.store(false, Ordering::Release);
+        let standing = self.told == Some(camera);
+        self.told = Some(camera);
+        self.at_standing_camera = false;
         // The places looked ahead to are from where the scene is to be after this round's first
         // step, which is the camera if it keeps up: not from the camera, which is as far as the
         // scene is behind it ahead of where the scene's step goes, and a selection that counts
@@ -1710,6 +1826,8 @@ impl Engine {
             self.next_place(camera)
         };
         self.look_ahead(place, velocity);
+        // Read before the speed scale looks at the speed: a Still view holds that too.
+        self.paused = self.shared.paused.load(Ordering::Acquire);
         let rescaled = match self.rescale(camera) {
             Ok(rescaled) => rescaled,
             Err(full) => {
@@ -1717,7 +1835,6 @@ impl Engine {
                 return false;
             }
         };
-        self.paused = self.shared.paused.load(Ordering::Acquire);
         self.scene
             .set_buffer_limit(self.shared.buffer_limit.load(Ordering::Relaxed));
         self.throttled = false;
@@ -1763,12 +1880,23 @@ impl Engine {
             }
             self.publish(Some(ticket));
         }
+        // While the view is Still the Reference view accumulates the scene as it is, and every
+        // patch restarts it (#217, ADR 0005): the scene is frozen, but for what is needed for it to
+        // be right, which is an Edit (its job, above, and the coarse levels over it, here). Moving
+        // the scene to the camera and the steps of coarsening wait until the view is not Still:
+        // loading is held back for the same reason (`stream`, below), and what was held is done in
+        // the rounds after, as it is for any other camera.
+        let frozen = self.paused;
+        self.held_at = (frozen && self.has_to_follow(camera)).then_some(camera);
         let began = self.began();
         let remade = self.remake_coarse();
         self.spend(Part::Coarse, began);
         let outcome = remade
             .and_then(|remade| {
                 worked |= remade;
+                if frozen {
+                    return Ok(false);
+                }
                 let began = self.began();
                 let moved = self.follow(camera);
                 self.spend(Part::Follow, began);
@@ -1776,6 +1904,13 @@ impl Engine {
             })
             .and_then(|moved| {
                 worked |= moved;
+                // The nodes that a change of the bands listed are looked at when the view is not
+                // Still, like the scene's move to the camera: a patch of them restarts the Reference
+                // view too. They stay listed (`World::reband_pending` says so) and are looked at in
+                // the rounds after the pause ends.
+                if frozen {
+                    return Ok(false);
+                }
                 let more = self.reband_more();
                 worked |= self.scene.rebanding() > 0;
                 more
@@ -1799,8 +1934,10 @@ impl Engine {
         self.spend(Part::Evict, began);
         self.work.evict_steps += u64::from(evicting);
         worked |= evicting;
-        self.coarsen_more();
-        self.relax();
+        if !frozen {
+            self.coarsen_more();
+            self.relax();
+        }
         self.work.budget_cuts += u64::from(self.throttled);
         // A sync is done when the coarse levels over the Edits before it are made, too.
         let busy = !self.coarse.is_empty();
@@ -1810,6 +1947,9 @@ impl Engine {
         } else {
             synced.or(self.sync_waiting.take())
         };
+        // The scene is where the camera is, and the camera has not moved since the round before:
+        // a Still view is waiting for this (see `Engine::at_a_standing_camera`).
+        self.at_standing_camera = standing && !self.has_to_follow(camera);
         self.publish(synced);
         self.idle = !worked && !busy && !self.throttled;
         true
@@ -1903,7 +2043,10 @@ impl Engine {
         self.shared.finished.notify_all();
     }
 
-    fn note(&mut self, update: Option<SceneUpdate>) {
+    fn note(&mut self, cause: Cause, update: Option<SceneUpdate>) {
+        if update.is_some() {
+            self.causes = self.causes.with(cause);
+        }
         match update {
             None => {}
             Some(SceneUpdate::Rings(patch)) => {
@@ -1953,6 +2096,14 @@ impl Engine {
             return Ok(false);
         }
         if self.user_bands.is_none() {
+            return Ok(false);
+        }
+        // A change of the bands moves what every ring selects, and every patch of it restarts the
+        // Reference view (#217): while the view is Still the speed is not looked at, as the camera
+        // is not followed. A camera that has stopped is waited for to give its depth back before
+        // the hold (see [`Stats::speed_releasing`]); leaving Still looks at it again, and does what
+        // it held.
+        if self.paused {
             return Ok(false);
         }
         let jumping = self.jumping(camera);
@@ -2028,7 +2179,7 @@ impl Engine {
                     self.largest_follow.writes = self.largest_follow.writes.max(cost.writes);
                 }
             }
-            self.note(update);
+            self.note(Cause::Reband, update);
             if self.clock.since(started) >= REBAND_SLICE {
                 break;
             }
@@ -2039,6 +2190,10 @@ impl Engine {
 
     fn run_job(&mut self, job: Job) -> Result<(), RingsFull> {
         let store = self.store.read().expect("the store's lock is not poisoned");
+        let cause = match job {
+            Job::Bands(_) => Cause::Bands,
+            _ => Cause::Edit,
+        };
         let update = match job {
             // The bricks of level 0 are packed at once, with the coarse levels as they were, which
             // is what is drawn near the camera and is published for the frame thread to wait for.
@@ -2063,7 +2218,7 @@ impl Engine {
             }
         };
         drop(store);
-        self.note(update);
+        self.note(cause, update);
         Ok(())
     }
 
@@ -2104,7 +2259,7 @@ impl Engine {
             let store = self.store.read().expect("the store's lock is not poisoned");
             let update = self.scene.update(&store, &finished.changed)?;
             drop(store);
-            self.note(Some(update));
+            self.note(Cause::Coarse, Some(update));
         } else {
             // Long enough for a reader that waits for the lock to take it.
             self.clock.pause(COARSE_PAUSE);
@@ -2131,6 +2286,12 @@ impl Engine {
             }
     }
 
+    /// Whether [`Engine::follow`] has anything to do for `camera`: the scene is not there, or a
+    /// brick that the loader gave up on is to be asked for again.
+    fn has_to_follow(&self, camera: [f64; 3]) -> bool {
+        self.camera != Some(camera) || self.scene.rewanted()
+    }
+
     /// Moves the scene to `camera`, if it is not there, in steps that each cost a share of the
     /// budget ([`FOLLOW_SHARE`]) when it is further than one: each step is packed and noted in
     /// its turn, and the steps go on while what waits is under the budget and the slice (the
@@ -2140,7 +2301,7 @@ impl Engine {
     /// was *put* further than a jump ([`Engine::teleported`]) does that. Whether it was moved.
     fn follow(&mut self, camera: [f64; 3]) -> Result<bool, RingsFull> {
         // A camera that has not moved is looked at again for a brick that the loader gave up on.
-        if self.camera == Some(camera) && !self.scene.rewanted() {
+        if !self.has_to_follow(camera) {
             return Ok(false);
         }
         // The camera is followed when the frame thread has taken what waits, from where the scene is:
@@ -2190,7 +2351,7 @@ impl Engine {
             if target != camera && !teleported {
                 self.resize_follow_step(distance, cost);
             }
-            self.note(update);
+            self.note(Cause::Follow, update);
             if self.camera == Some(camera) {
                 break;
             }
@@ -2325,6 +2486,17 @@ impl Engine {
             if arrivals.is_empty() {
                 break;
             }
+            #[cfg(test)]
+            {
+                self.clock.pause(self.arrival_sleep);
+                if let Some(batches) = &mut self.job_after {
+                    *batches = batches.saturating_sub(1);
+                    if *batches == 0 {
+                        self.job_after = None;
+                        lock(&self.shared.inbox).jobs.push_back((0, Job::Sync));
+                    }
+                }
+            }
             {
                 let mut store = self
                     .store
@@ -2364,7 +2536,7 @@ impl Engine {
             }
             self.work.pack_steps += 1;
             self.work.pack_bricks += self.scene.bricks_changed() - before;
-            self.note(update);
+            self.note(Cause::Arrival, update);
             worst = worst.max(self.clock.since(batch_started) / resident.len() as u32);
         }
         self.work.stream_slices_used += u64::from(slice_used);
@@ -2512,7 +2684,7 @@ impl Engine {
             Ok(update) => {
                 self.coarsening = step;
                 self.coarsened_at = self.clock.now();
-                self.note(update);
+                self.note(Cause::Coarsen, update);
                 true
             }
             // The scene is not to be used again, which the next job finds. It is not selected
@@ -2753,6 +2925,17 @@ impl Engine {
         self.spend(Part::HoleScan, began);
     }
 
+    /// Whether the scene is at a camera that has not moved for two rounds, and the last publish
+    /// did not say so: the frame thread reads where the scene is from what is published, and a
+    /// last step of following that changed nothing publishes nothing, which would leave it
+    /// believing that the scene is short of the camera by that step (a Still view waits for
+    /// [`crate::world::World::caught_up`], and would wait out its cap). A camera that moves every
+    /// round (a creep, a flight) is not this: its rounds that change nothing stay unpublished
+    /// (#181).
+    fn arrived_unsaid(&self, stats: &Stats) -> bool {
+        self.at_standing_camera && stats.camera != self.published.camera
+    }
+
     fn publish_changes(&mut self, job: Option<u64>) {
         let exactly = self.shared.count_exactly.load(Ordering::Relaxed);
         if self.clock.since(self.slow_at) >= TABLES_EVERY {
@@ -2777,6 +2960,7 @@ impl Engine {
         }
         let mut stats = stats_of(&self.scene, &self.loader, &self.slow, self.eviction);
         stats.coarsening = self.coarsening;
+        stats.speed_releasing = self.speed.releasing();
         stats.work = self.work;
         stats.throttled = self.throttled;
         #[cfg(test)]
@@ -2813,8 +2997,10 @@ impl Engine {
             stats.holes = self.holes;
         }
         let changes = std::mem::replace(&mut self.changes, Changes::None);
+        let causes = std::mem::take(&mut self.causes);
         if matches!(changes, Changes::None)
             && stats.same_counts(&self.published, exactly)
+            && !self.arrived_unsaid(&stats)
             && job.is_none()
         {
             return;
@@ -2846,6 +3032,7 @@ impl Engine {
             }
             (Changes::None | Changes::Rebuilt, None) => {}
         }
+        outbox.ready.causes.merge(causes);
         outbox.ready.stats = Some(stats.clone());
         if exactly {
             outbox.ready.published_at.get_or_insert(self.clock.now());

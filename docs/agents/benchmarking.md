@@ -331,6 +331,22 @@ camera back there and the loader caught up. The camera's speed and shape are tho
 After the last path the camera is back at the Spawn and the loader has caught up, and **one dig**
 is made there (below): the run's **Edit latency**. Its frames are not those of a path.
 
+**The still hold** (#217, the run's `still_after_flight`, described under "The fields"; not a path, so no
+gate sees its frames): 5 s of the flight of `stop after a flight`, then the camera stands with the game's
+policy for a Reference view, which is **catch up first, then hold** (`World::hold_still`, the call the
+client makes): once the camera has stood for 2 frames the scene thread goes on loading and following the
+camera, with Primary drawn, until the scene has reached the camera (`World::caught_up`: its lag under 1
+Voxel, and no reband pending, #168: the nodes that a change of the bands listed are looked at, and the
+speed scale has no step still to give back, `World::reband_pending`) or `CATCH_UP_CAP` (5 s) has gone by. Then loading is paused and
+the scene thread is told; **it holds back moving the scene to the camera, the steps of coarsening and, since #168, the
+reband** (the speed scale is not looked at and what a change of the bands listed is not looked at;
+leaving Still does both) (#217, ADR 0005, "Still frames") and takes in no arrivals. The camera stands for 3 s (1 s with `--short`)
+from then. What the frame thread takes in meanwhile is the cuts of the Reference view, counted by cause
+(`cuts`, as `still_cuts` below, under the paths) over the held frames. **The acceptance of #217 is at most 1 cut here from
+scene patches** (the Planet has no Edit in this run). Then the view changes (loading goes on) and
+`catch_up` is the time to the first frame with no soft misses, nothing waiting and the scene at the
+camera, and `holes_after_catch_up` the holes the look after it found, which must be 0. Reported, not gated.
+
 ### The fields
 
 `streaming_real_time.runs[]` (and `min` and `max` of the same shape), each made by this mode:
@@ -350,6 +366,19 @@ is made there (below): the run's **Edit latency**. Its frames are not those of a
   time, held at what it measures now plus a margin (10 s; 4.3 s on the 4090, 7 s on the loaded dev
   box). **"Control in 2 s with nothing beyond the ring sky" is not met**: it is #220, a
   background Guard.
+- `still_after_flight` (#217, schema 22; a run's, not a path's): the view held Still after a flight, with
+  the game's policy ("The still hold", above):
+  - `before_hold`: the catch-up before the hold. `lag_when_still_voxels` is how far the scene was behind
+    the camera when the view went Still (what a hold at once would have held it at), `lag_when_held_voxels`
+    how far when the hold began (under 1 unless the cap ended the wait), `waited_s` from the view going
+    Still to the hold beginning (how much later the Reference view started), and **`hit_cap`**, true if the
+    wait ran to the cap and the Reference view started on a scene still behind the camera. Expected false. After #168 the wait also covers a reband (the depth of a flight is given back half a second after the stop, and what it lists is looked at: 50 s or more at full size on the dev box), so a **`hit_cap` of true is expected after a flight at speed** until the reband is quick enough: the 5 s cap is kept (owner, 2026-11-16) and `hit_cap` and `lag_when_held_voxels` say what it held.
+  - `hold_s`: how long the camera stood after the hold began.
+  - `cuts`: `still_frames`, `cuts` and `by_cause`, as `still_cuts` under the paths, over the held frames
+    only. **At most 1 is the acceptance of #217.**
+  - `catch_up`: `seconds` and `settled`, from the frame that ended the hold to the first frame with no soft
+    misses, nothing waiting and the scene at the camera (or the cap).
+  - `holes_after_catch_up`: the holes the look after it found. Must be 0.
 - `paths[]`: `name`, `frames`, `seconds` and, for each path:
   - `frame_time`: `samples`, `mean_ms`, **`p99_ms`** (nearest rank) and **`worst_ms`**. A frame is
     the frame thread's work in the game's order: `World::recentre`, the copy of what the scene
@@ -548,6 +577,24 @@ is made there (below): the run's **Edit latency**. Its frames are not those of a
     the forced ones too.
   - `end_look_ms`: what the look that is forced at the end of the path took in the scene thread
     (the scan itself), in milliseconds. It is made after the frames, so it is in no frame's time.
+  - `still_cuts`, for `stop after a flight` only (null for the others; #217, schema 22):
+    `still_frames`, `cuts` and `by_cause` (`edit`, `bands`, `coarse`, `follow`, `arrival`, `coarsen`, `reband`).
+    A **cut** is an update that the frame thread took in while the view was Still and the Reference view
+    was being shown: the camera had stood for 2 frames (`STILL_FRAMES`) and the frame before had no
+    update either, as `render::still::Still::plan` counts (an update in the 2 frames after another is
+    in Primary frames, and is no cut). The update goes to the GPU, which restarts the Reference view (a
+    cut to Primary for 2 frames and a fade, from sample 0). The count matches the renderer's. Its cause is what the
+    scene thread was doing when it made the patch: `edit` (an Edit's bricks), `bands` (a new LOD
+    bias), `coarse` (the coarse levels remade after an Edit), `follow` (the scene moving to the
+    camera), `arrival` (bricks the loader made, taken in) and `coarsen` (a step of the memory cap's
+    coarsening, or one taken back) and `reband` (#168: nodes looked at again for a change of the bands for
+    the camera's speed). A cut that was made of several kinds of work counts under each,
+    so the causes add up to at least `cuts`. In **this** path nothing is held back (it measures the
+    settle time, which needs the loader to go on), so this is what a Still view would get if the
+    scene thread worked as it does for the Primary view. The held view is `still_after_flight` of the
+    run. A stepped test (`a_still_view_held_after_a_flight_gets_at_most_one_cut_from_scene_patches`)
+    holds the number on the test Planet: 118 cuts in 120 held frames before #217, all of them
+    `follow`, and at most 1 after.
   - `settle`, for `stop after a flight` only (null for the others): `seconds` from the frame the
     camera stopped in to the first frame in which the scene is at the camera (the drawn scene's camera is
     the frame's), has no soft misses and nothing left to look at again for the bands
@@ -1123,6 +1170,13 @@ sample count is fixed: the goldens, the curve, and every number `reference` has 
   batches added up to (`batching_bit_exact` says it held on this GPU, and a test holds it on
   lavapipe), so the run is never paused to read 59 MB back. `flip_within_target` is the FLIP
   acceptance: at most 0.05 at the 0.25 s mark.
+- `cuts` (#217, schema 22): `total`, `view` and `scene`: the **cuts** the view had while it was Still
+  (`Tracer::cuts`: a frame that showed the Reference view and was followed by a Primary one), by what
+  changed, the camera, sun or window (`view`) or the Planet (`scene`). A cut is 2 Primary frames, a
+  fade and a restart from sample 0. The run holds the camera and the Planet still, so this is **0 in
+  both views**; it says the renderer's own count works and is where a phase that patches the Planet
+  would show them. The scene thread's patches are measured where there is a scene thread: the
+  streaming mode's `still_after_flight` (below).
 - `to_line[]`: for FLIP 0.05 and 0.02, the samples the curve needs (as `lines`) and the seconds from the
   stop until the run had that many, with `counts` as in `lines`. A line that does not count in the view
   is shown and not used. It is null where the run ended first.
@@ -1167,7 +1221,7 @@ still-view phase, at full size with batching, is the player's number.
 
 ```
 {
-  "schema_version": 21,
+  "schema_version": 23,
   "build":   { "version", "commit" },          // commit: CI builds only, else null; on a PR
                                                // build it is GitHub's merge commit, not the head
   "machine": { "gpu", "device_type", "driver", "driver_info", "backend", "os", "arch",

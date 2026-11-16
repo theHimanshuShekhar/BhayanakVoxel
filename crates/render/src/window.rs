@@ -47,6 +47,8 @@ pub struct Renderer {
     /// The share of the window's width and height that primary visibility traces.
     scale: f32,
     mode: Mode,
+    /// Primary is drawn though the mode is Reference: see [`Renderer::set_reference_wait`].
+    reference_wait: bool,
     sun: Sun,
     /// If set, the sun is at these angles (azimuth, elevation, angular radius) in the camera's local
     /// frame, so it follows the Planet's up (see [`Sun::local`]); `sun` is then not used.
@@ -105,6 +107,7 @@ impl Renderer {
             target,
             scale: DEFAULT_SCALE,
             mode: Mode::default(),
+            reference_wait: false,
             sun: Sun::default(),
             local_sun: Some((
                 crate::sun::DEFAULT_AZIMUTH,
@@ -155,6 +158,13 @@ impl Renderer {
     /// Switches how the Planet is drawn.
     pub fn set_mode(&mut self, mode: Mode) {
         self.mode = mode;
+    }
+
+    /// Holds the Reference view back (or lets it start) in Reference mode: while the client waits
+    /// for the scene to reach a camera that has stopped (#217), what is drawn is Primary, and the
+    /// Reference view starts, from sample 0, in the frame after this is false.
+    pub fn set_reference_wait(&mut self, wait: bool) {
+        self.reference_wait = wait;
     }
 
     pub fn debug_view(&self) -> DebugView {
@@ -359,7 +369,7 @@ impl Renderer {
             camera,
             &sun,
             &self.target,
-            self.mode == Mode::Reference,
+            self.mode == Mode::Reference && !self.reference_wait,
             self.began.elapsed(),
         );
         self.composite.set_fade(&self.queue, self.plan.fade());

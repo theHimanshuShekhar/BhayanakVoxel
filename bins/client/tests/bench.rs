@@ -138,6 +138,10 @@ fn check_convergence(convergence: &Value, out: &Path) {
         assert!(still["frame"]["samples"].as_u64().unwrap() >= 3);
         assert!(still["flip_within_target"].is_null(), "no FLIP: {name}");
         assert!(still["frame_p99_within_target"].is_boolean());
+        // The cuts while the view is Still (#217): the run holds the camera and the Planet still.
+        assert_eq!(still["cuts"]["total"], 0, "{name}");
+        assert_eq!(still["cuts"]["view"], 0, "{name}");
+        assert_eq!(still["cuts"]["scene"], 0, "{name}");
         for mark in still["marks"].as_array().unwrap() {
             assert!(mark["flip_mean"].is_null());
             assert!(mark["samples"].as_u64().unwrap() >= 1);
@@ -178,7 +182,7 @@ fn check_convergence(convergence: &Value, out: &Path) {
 }
 
 fn check_schema(report: &Value, out: &Path) {
-    assert_eq!(report["schema_version"], 21);
+    assert_eq!(report["schema_version"], 23);
     // The Edit stress is of the whole Planet, which the patch is not.
     assert!(report["edits"].is_null());
     // The streaming mode is asked for (see its own test); the other tests do not. The real-time
