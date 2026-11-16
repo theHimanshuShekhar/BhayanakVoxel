@@ -77,7 +77,15 @@ use super::stream::StreamReport;
 /// their own). So `passes[primary]`, the cave-still `primary` and the real-time `gpu_primary_ms`
 /// no longer include the lighting: a number of schema 19 or before is not comparable with them
 /// except as `primary` + `normals` + `shade`. Nothing else is changed.
-pub const SCHEMA_VERSION: u32 = 20;
+///
+/// 21 is taken by #168 (PR #219).
+///
+/// 22 (#217) counts the cuts of a Still view: each convergence view's `still` has `cuts` (`total`,
+/// `view`, `scene`); each real-time run has `still_after_flight` (the view held Still after a
+/// flight with the game's loading pause: `hold_s`, the cuts by cause, the catch-up and the holes
+/// after it); and the real-time stop after a flight has `still_cuts` (null in the other paths).
+/// Nothing else is changed.
+pub const SCHEMA_VERSION: u32 = 22;
 
 /// One timed thing (a pass, or the GPU total of a profiler frame) in one mode, against its
 /// budget. In reference mode a profiler frame is one sample, so the entries of that mode have
@@ -574,7 +582,7 @@ mod tests {
                 "streaming_real_time"
             ]
         );
-        assert_eq!(json["schema_version"], 20);
+        assert_eq!(json["schema_version"], 22);
         assert_eq!(json["convergence"], serde_json::Value::Null);
         assert_eq!(json["streaming"], serde_json::Value::Null);
         assert_eq!(json["streaming_real_time"], serde_json::Value::Null);

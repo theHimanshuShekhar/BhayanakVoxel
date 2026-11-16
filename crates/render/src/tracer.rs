@@ -16,7 +16,7 @@ use crate::post::{self, Exposed, HDR_FORMAT, Metering, Post, Scratch, Stages};
 use crate::profiler::Profiler;
 use crate::reference::{Hit, Ray};
 use crate::scene::{MAX_LEVELS, Part, REGION_WORDS, Scene, SceneUpdate, UploadCost, spare_words};
-use crate::still::{Plan, Still};
+use crate::still::{Cuts, Plan, Still};
 use crate::sun::{Sun, SunUniform};
 use crate::upscale::{History, Resolution, UpscalePass};
 use crate::{Result, shaders};
@@ -421,6 +421,10 @@ pub struct Tracer {
     still: Still<(View, u64)>,
     /// Counts what changes the Planet or the images, which the key of `still` cannot see.
     scene_epoch: u64,
+    /// The cuts of Still views so far (#217), and the last frame's view and epoch, to tell what a
+    /// cut was of.
+    cuts: Cuts,
+    last_key: Option<(View, u64)>,
     history: History,
     accumulator: Accumulator<View>,
     /// The reference's random seed: [`RNG_SEED`] unless [`Tracer::set_seed`] changed it.
@@ -930,6 +934,8 @@ impl Tracer {
             upscale: UpscalePass::new(device),
             still: Still::new(),
             scene_epoch: 0,
+            cuts: Cuts::default(),
+            last_key: None,
             history: History::default(),
             accumulator: Accumulator::new(),
             seed: RNG_SEED,
@@ -1142,9 +1148,19 @@ impl Tracer {
         });
         self.last_frame_at = Some(now);
         let key = (View::new(camera, sun, target), self.scene_epoch);
+        let was_showing = matches!(self.still.last_plan(), Plan::Reference { .. });
         let plan = self
             .still
             .plan(&key, reference, now, pixels(target.reference_size));
+        if was_showing && reference && matches!(plan, Plan::Primary) {
+            // A cut, by what changed since the frame before: the view first, so that a camera
+            // that moved in the frame of a patch is not counted against the patch.
+            match &self.last_key {
+                Some((view, _)) if *view != key.0 => self.cuts.view += 1,
+                _ => self.cuts.scene += 1,
+            }
+        }
+        self.last_key = Some(key);
         match plan {
             Plan::Primary => {
                 self.encode_upscaled_adapting(
@@ -1429,6 +1445,12 @@ impl Tracer {
     fn restart_reference(&mut self) {
         self.accumulator.reset();
         self.scene_epoch += 1;
+    }
+
+    /// The cuts of Still views since the tracer was made, by cause (see [`Cuts`]). A frame that
+    /// leaves Reference mode is not counted: the player did that.
+    pub fn cuts(&self) -> Cuts {
+        self.cuts
     }
 
     /// Samples in the reference image so far.

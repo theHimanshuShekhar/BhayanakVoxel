@@ -781,6 +781,7 @@ mod tests {
             flip_within_target: None,
             frame_p99_within_target: Some(true),
             to_line: Vec::new(),
+            cuts: still::CutsReport::default(),
         }
     }
 

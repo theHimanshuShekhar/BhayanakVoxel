@@ -494,6 +494,58 @@ fn slow_of(scene: &Scene, loader: &Loader, exactly: bool) -> Arc<Slow> {
     })
 }
 
+/// What made a change to the scene (#217): the work of the scene thread that a patch came from. A
+/// patch that the frame thread copies to the GPU restarts the Reference view, so the bench counts
+/// the cuts of a Still view by these.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Cause {
+    /// An Edit's level-0 bricks, packed at once.
+    Edit,
+    /// A new LOD bias (the user's bands).
+    Bands,
+    /// The coarse levels over an Edit, remade after it.
+    Coarse,
+    /// The scene moved to the camera.
+    Follow,
+    /// Bricks the loader generated, taken in and split.
+    Arrival,
+    /// A step of the memory cap's coarsening, or one taken back.
+    Coarsen,
+}
+
+impl Cause {
+    pub const ALL: [Cause; 6] = [
+        Cause::Edit,
+        Cause::Bands,
+        Cause::Coarse,
+        Cause::Follow,
+        Cause::Arrival,
+        Cause::Coarsen,
+    ];
+}
+
+/// A set of [`Cause`]s: what a published patch was made of, merged over the rounds that made it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Causes(u8);
+
+impl Causes {
+    pub fn with(self, cause: Cause) -> Self {
+        Self(self.0 | 1 << cause as u8)
+    }
+
+    pub fn merge(&mut self, other: Causes) {
+        self.0 |= other.0;
+    }
+
+    pub fn has(self, cause: Cause) -> bool {
+        self.0 & (1 << cause as u8) != 0
+    }
+
+    pub fn iter(self) -> impl Iterator<Item = Cause> {
+        Cause::ALL.into_iter().filter(move |&c| self.has(c))
+    }
+}
+
 /// What this thread has made since the frame thread last took: the frame thread's copy of the
 /// scene is made, from [`Ready::mirror`], if it is there, else brought up to date with
 /// [`Ready::patch`].
@@ -512,6 +564,8 @@ pub struct Ready {
     /// When the oldest of what this holds was published, if the counts are exact (see
     /// [`SceneWorker::count_exactly`]); else not stamped, since reading the clock is not free.
     pub published_at: Option<Instant>,
+    /// What the changes in `mirror` or `patch` were made of (#217); empty if there are none.
+    pub causes: Causes,
 }
 
 /// A job for the thread that is not following the camera.
@@ -753,6 +807,7 @@ impl SceneWorker {
             paused: false,
             arrival_cost: ARRIVAL_COST,
             changes: Changes::None,
+            causes: Causes::default(),
             published: stats.clone(),
             graveyard,
             spare: Vec::new(),
@@ -1235,6 +1290,8 @@ struct Engine {
     /// What taking in one brick's children is expected to cost.
     arrival_cost: Duration,
     changes: Changes,
+    /// What `changes` was made of, until it is published.
+    causes: Causes,
     /// What the frame thread handed back, and the copies of it to use again.
     graveyard: Receiver<Garbage>,
     spare: Vec<PatchCopy>,
@@ -1738,7 +1795,10 @@ impl Engine {
         self.shared.finished.notify_all();
     }
 
-    fn note(&mut self, update: Option<SceneUpdate>) {
+    fn note(&mut self, cause: Cause, update: Option<SceneUpdate>) {
+        if update.is_some() {
+            self.causes = self.causes.with(cause);
+        }
         match update {
             None => {}
             Some(SceneUpdate::Rings(patch)) => {
@@ -1767,6 +1827,10 @@ impl Engine {
 
     fn run_job(&mut self, job: Job) -> Result<(), RingsFull> {
         let store = self.store.read().expect("the store's lock is not poisoned");
+        let cause = match job {
+            Job::Bands(_) => Cause::Bands,
+            _ => Cause::Edit,
+        };
         let update = match job {
             // The bricks of level 0 are packed at once, with the coarse levels as they were, which
             // is what is drawn near the camera and is published for the frame thread to wait for.
@@ -1791,7 +1855,7 @@ impl Engine {
             }
         };
         drop(store);
-        self.note(update);
+        self.note(cause, update);
         Ok(())
     }
 
@@ -1832,7 +1896,7 @@ impl Engine {
             let store = self.store.read().expect("the store's lock is not poisoned");
             let update = self.scene.update(&store, &finished.changed)?;
             drop(store);
-            self.note(Some(update));
+            self.note(Cause::Coarse, Some(update));
         } else {
             // Long enough for a reader that waits for the lock to take it.
             self.clock.pause(COARSE_PAUSE);
@@ -1902,7 +1966,7 @@ impl Engine {
             if target != camera && !teleported {
                 self.resize_follow_step(distance, cost);
             }
-            self.note(update);
+            self.note(Cause::Follow, update);
             if self.camera == Some(camera) {
                 break;
             }
@@ -2061,7 +2125,7 @@ impl Engine {
             }
             self.work.pack_steps += 1;
             self.work.pack_bricks += self.scene.bricks_changed() - before;
-            self.note(update);
+            self.note(Cause::Arrival, update);
             worst = worst.max(self.clock.since(batch_started) / resident.len() as u32);
         }
         // What the next slice expects one to cost: a running mean of the worst batch of each
@@ -2203,7 +2267,7 @@ impl Engine {
             Ok(update) => {
                 self.coarsening = step;
                 self.coarsened_at = self.clock.now();
-                self.note(update);
+                self.note(Cause::Coarsen, update);
                 true
             }
             // The scene is not to be used again, which the next job finds. It is not selected
@@ -2503,6 +2567,7 @@ impl Engine {
             stats.holes = self.holes;
         }
         let changes = std::mem::replace(&mut self.changes, Changes::None);
+        let causes = std::mem::take(&mut self.causes);
         if matches!(changes, Changes::None)
             && stats.same_counts(&self.published, exactly)
             && job.is_none()
@@ -2536,6 +2601,7 @@ impl Engine {
             }
             (Changes::None | Changes::Rebuilt, None) => {}
         }
+        outbox.ready.causes.merge(causes);
         outbox.ready.stats = Some(stats.clone());
         if exactly {
             outbox.ready.published_at.get_or_insert(self.clock.now());

@@ -862,6 +862,12 @@ impl Offscreen {
         self.tracer.set_reference_options(&self.device, options);
     }
 
+    /// The cuts of Still views since the renderer was made, by cause (#217): see
+    /// [`crate::tracer::Tracer::cuts`].
+    pub fn still_cuts(&self) -> crate::still::Cuts {
+        self.tracer.cuts()
+    }
+
     /// Samples in the reference image so far.
     pub fn reference_samples(&self) -> u32 {
         self.tracer.samples()

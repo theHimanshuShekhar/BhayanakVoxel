@@ -13,7 +13,7 @@ use sim::{Predictor, dig_seconds, target_hardness};
 use crate::clock::Clock;
 use crate::ghost::Ghost;
 use crate::loader::Loader;
-use crate::scene_worker::{LoaderStats, SceneWorker, Spent, Stats};
+use crate::scene_worker::{Cause, Causes, LoaderStats, SceneWorker, Spent, Stats};
 use crate::tool::{Tool, rotation_for};
 
 /// How many frames in a row the view must be unchanged before the reference image is taken to be
@@ -57,6 +57,44 @@ impl<K: PartialEq> Stillness<K> {
             self.frames = 0;
         }
         self.frames
+    }
+}
+
+/// The cuts of a Still view that the scene thread's patches made (#217): updates that the frame
+/// thread took in while the view was Still, each of which restarts the Reference view from sample
+/// 0 (the renderer's epoch moves with every update). Counted here, and not in the renderer, because
+/// only the world knows what an update was made of.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StillCuts {
+    /// Frames the view was Still for, when the world was asked to look at the scene.
+    pub frames: u64,
+    /// Updates taken in those frames (or by a look of the harness's between them).
+    pub cuts: u64,
+    /// Cuts that an [`Cause`] was part of, in the order of [`Cause::ALL`]. A cut that several
+    /// kinds of work made counts under each, so these add up to at least `cuts`.
+    pub by_cause: [u64; Cause::ALL.len()],
+}
+
+impl StillCuts {
+    fn count(&mut self, causes: Causes) {
+        self.cuts += 1;
+        for cause in causes.iter() {
+            self.by_cause[cause as usize] += 1;
+        }
+    }
+
+    /// What was counted since `before`, an earlier reading.
+    pub fn since(self, before: StillCuts) -> StillCuts {
+        StillCuts {
+            frames: self.frames - before.frames,
+            cuts: self.cuts - before.cuts,
+            by_cause: std::array::from_fn(|i| self.by_cause[i] - before.by_cause[i]),
+        }
+    }
+
+    /// Cuts that `cause` was part of.
+    pub fn of(self, cause: Cause) -> u64 {
+        self.by_cause[cause as usize]
     }
 }
 
@@ -160,6 +198,10 @@ pub struct World {
     /// Whether [`World::stream`] leaves what the loader has generated where it is: see
     /// [`World::pause_loading`].
     loading_paused: bool,
+    /// The view is Still by the frame policy, said by a harness that does not pause loading
+    /// ([`World::mark_still`]): cuts are counted in it as when loading is paused.
+    still_view: bool,
+    still_cuts: StillCuts,
     /// What the next click would change, while there is something under the cursor to apply the
     /// tool to. Made again when the Edit it is of changes, or a brick it reads does.
     ghost: Option<Ghost>,
@@ -269,6 +311,8 @@ impl World {
             worker: None,
             stats: Stats::default(),
             loading_paused: false,
+            still_view: false,
+            still_cuts: StillCuts::default(),
             ghost: None,
             ghost_next: None,
             resim: std::time::Duration::ZERO,
@@ -494,6 +538,22 @@ impl World {
         }
     }
 
+    /// Says the view is Still (or not) without pausing anything, for the bench's baseline: updates
+    /// that are taken meanwhile are counted as cuts ([`World::still_cuts`]), as they are while
+    /// loading is paused, which is how the game says the same thing.
+    pub fn mark_still(&mut self, still: bool) {
+        self.still_view = still;
+    }
+
+    /// The cuts counted so far, while loading was paused or the view marked Still.
+    pub fn still_cuts(&self) -> StillCuts {
+        self.still_cuts
+    }
+
+    fn cutting_still(&self) -> bool {
+        self.loading_paused || self.still_view
+    }
+
     /// Whether there is a loader and it is paused: see [`World::pause_loading`].
     pub fn loading_paused(&self) -> bool {
         self.loading_paused && self.worker.is_some()
@@ -626,6 +686,7 @@ impl World {
         camera: [f64; 3],
         velocity: [f64; 3],
     ) -> Result<Option<SceneUpdate>, RingsFull> {
+        self.still_cuts.frames += u64::from(self.cutting_still());
         match &self.worker {
             Some(worker) => {
                 worker.follow_moving(camera, velocity);
@@ -634,7 +695,13 @@ impl World {
                 let wait = self.edit_due()?;
                 self.take_ready(wait)
             }
-            None => self.scene.recentre(&self.predictor.store(), camera),
+            None => {
+                let update = self.scene.recentre(&self.predictor.store(), camera)?;
+                if update.is_some() {
+                    self.count_cut(Causes::default().with(Cause::Follow));
+                }
+                Ok(update)
+            }
         }
     }
 
@@ -716,6 +783,13 @@ impl World {
         self.worker.as_ref().expect("the world streams")
     }
 
+    /// An update that was made of `causes` is about to be drawn: a cut if the view is Still.
+    fn count_cut(&mut self, causes: Causes) {
+        if self.cutting_still() {
+            self.still_cuts.count(causes);
+        }
+    }
+
     /// Takes what the scene thread has made, and brings the copy of the scene that is drawn up to
     /// date with it. Returns how it changed, for copying to the GPU.
     fn take_ready(&mut self, wait: bool) -> Result<Option<SceneUpdate>, RingsFull> {
@@ -726,6 +800,10 @@ impl World {
         self.taken_done = self.taken_done.max(ready.done);
         if let Some(published) = ready.published_at {
             self.outbox_wait = self.outbox_wait.max(self.clock.since(published));
+        }
+        let changed = ready.mirror.is_some() || ready.patch.is_some();
+        if changed && (self.loading_paused || self.still_view) {
+            self.still_cuts.count(ready.causes);
         }
         let update = if let Some(mirror) = ready.mirror {
             // The old copy is freed by the thread that made the new one.

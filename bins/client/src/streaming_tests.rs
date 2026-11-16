@@ -4186,3 +4186,109 @@ fn after_one_batch_over_the_budget_further_batches_are_taken_again_once_the_back
         "{batches} batches in {frames} frames: one a round, as if the budget were still over"
     );
 }
+
+/// An upload budget that a flight at 40 Voxels a frame cannot be followed within: the scene thread
+/// falls behind the camera and walks to it in small steps (#217).
+const SLOW_FOLLOW_BUDGET: render::UploadCost = render::UploadCost {
+    bytes: 64 << 10,
+    writes: 8,
+};
+
+/// A world that a flight of `frames` frames at 40 Voxels a frame has left with the scene behind
+/// the camera, which is where the flight stopped (the camera is `at`, and still).
+fn after_a_flight_the_scene_cannot_keep_up_with(
+    frames: usize,
+) -> (World, ServerEnd, Camera, [f64; 3]) {
+    let (mut world, server, camera) = spawned_world(Run::Stepped);
+    fill(&mut world, camera.position);
+    world.worker().set_upload_budget(SLOW_FOLLOW_BUDGET);
+    let (ahead, _) = tangents(camera.horizon_up);
+    let velocity: [f64; 3] = std::array::from_fn(|a| ahead[a] * 40.0 * 60.0);
+    let mut at = camera.position;
+    for _ in 0..frames {
+        at = over_the_ground(
+            &world.store(),
+            std::array::from_fn(|a| at[a] + ahead[a] * 40.0),
+        );
+        world.recentre_moving(at, velocity).unwrap();
+        pace(&world, FRAME);
+    }
+    assert!(world.lag(at) > 1000.0, "the scene is far behind the camera");
+    (world, server, camera, at)
+}
+
+/// Frames of `at`, held Still the way the game holds a Reference view (loading pauses once the camera
+/// has stood for [`STILL_FRAMES`] frames): what the world counted as cuts meanwhile.
+fn hold_still(world: &mut World, at: [f64; 3], frames: usize) -> crate::world::StillCuts {
+    let mut still = Stillness::default();
+    let before = world.still_cuts();
+    for _ in 0..frames {
+        world.pause_loading(loading_paused_for(Mode::Reference, still.observe(at)));
+        stream(world, at);
+        pace(world, FRAME);
+    }
+    world.still_cuts().since(before)
+}
+
+#[test]
+fn the_cuts_of_a_still_view_are_counted_and_the_scene_threads_follow_is_what_made_them() {
+    use crate::scene_worker::Cause;
+    let (mut world, _server, _camera, at) = after_a_flight_the_scene_cannot_keep_up_with(120);
+    let cuts = hold_still(&mut world, at, 120);
+    eprintln!("cuts while Still after the flight: {cuts:?}");
+    // Every update that was taken while the view was Still is a cut, and what made it is known.
+    assert!(cuts.cuts > 0, "{cuts:?}");
+    assert!(cuts.of(Cause::Follow) > 0, "{cuts:?}");
+    assert!(
+        cuts.of(Cause::Edit) == 0 && cuts.of(Cause::Bands) == 0,
+        "{cuts:?}"
+    );
+    assert!(cuts.frames >= 100, "the frames that were Still: {cuts:?}");
+}
+
+#[test]
+fn updates_that_are_taken_while_the_view_is_not_still_are_not_cuts_and_an_edit_that_is_is_counted_by_its_cause()
+ {
+    use crate::scene_worker::Cause;
+    let (mut world, _server, camera) = spawned_world(Run::Stepped);
+    fill(&mut world, camera.position);
+    let aim = up_close(&mut world, &camera);
+    world.sync().unwrap();
+    // A view that is not Still: the camera moves in every frame, and the world is not told it is.
+    let (ahead, _) = tangents(camera.horizon_up);
+    let mut at = aim.position;
+    for _ in 0..30 {
+        at = std::array::from_fn(|a| at[a] + 0.5 * ahead[a]);
+        world.recentre(at).unwrap();
+        pace(&world, FRAME);
+    }
+    assert_eq!(world.still_cuts(), crate::world::StillCuts::default());
+
+    // Still: the camera stands, and a click digs. The Edit's patch is taken as a cut of Edit; the
+    // coarse levels that are remade after it are cuts of Coarse (counted under the same cut if it
+    // was taken together with the packing).
+    let aim = Camera {
+        position: at,
+        ..aim
+    };
+    let mut still = Stillness::default();
+    for _ in 0..=STILL_FRAMES {
+        world.pause_loading(loading_paused_for(Mode::Reference, still.observe(at)));
+        stream(&mut world, at);
+    }
+    assert!(world.loading_paused());
+    let before = world.still_cuts();
+    world.edit(&aim, &crate::tool::Tool::default()).unwrap();
+    for _ in 0..60 {
+        world.pause_loading(loading_paused_for(Mode::Reference, still.observe(at)));
+        stream(&mut world, at);
+        pace(&world, FRAME);
+    }
+    let cuts = world.still_cuts().since(before);
+    assert!(cuts.cuts >= 1, "{cuts:?}");
+    assert!(cuts.of(Cause::Edit) >= 1, "{cuts:?}");
+    assert!(
+        cuts.of(Cause::Coarse) >= 1,
+        "the coarse levels were remade: {cuts:?}"
+    );
+}

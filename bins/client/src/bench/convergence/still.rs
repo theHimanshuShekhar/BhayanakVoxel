@@ -102,6 +102,8 @@ pub struct Run {
     pub marks: Vec<(f64, usize)>,
     /// The images, one for each distinct sample count, in order of samples.
     pub captures: Vec<Capture>,
+    /// The cuts the run had while the view was Still, by cause (#217).
+    pub cuts: render::still::Cuts,
 }
 
 /// Waits until `until` on the clock that began at `start`, sleeping most of the way and spinning
@@ -155,6 +157,7 @@ pub fn run(gpu: &mut Offscreen, camera: &Camera, elsewhere: &Camera, settings: &
     // The run's own seed, the one the single-sample curve is drawn with: the same samples, so the
     // curve's FLIP at a count is the FLIP of this run at that count.
     gpu.set_reference_seed(RUN_SEED);
+    let mut cuts_before = None;
     let period = Duration::from_secs_f64(1.0 / f64::from(HZ));
     let limit = Duration::from_secs_f64(settings.seconds);
     let start = Instant::now();
@@ -170,6 +173,9 @@ pub fn run(gpu: &mut Offscreen, camera: &Camera, elsewhere: &Camera, settings: &
             break;
         }
         let drawn = gpu.draw_frame(camera, true, began);
+        // The first frame is the stop: the camera moves to this view from the warm-up's, which cuts
+        // the warm-up's Reference view and is not a cut of this one.
+        cuts_before.get_or_insert_with(|| gpu.still_cuts());
         let done = start.elapsed();
         frames.push(Frame {
             began_ms: began.as_secs_f64() * 1e3,
@@ -184,6 +190,13 @@ pub fn run(gpu: &mut Offscreen, camera: &Camera, elsewhere: &Camera, settings: &
         next = Duration::from_secs_f64(vsyncs * period.as_secs_f64());
     }
 
+    let cuts = {
+        let (after, before) = (gpu.still_cuts(), cuts_before.unwrap_or_default());
+        render::still::Cuts {
+            view: after.view - before.view,
+            scene: after.scene - before.scene,
+        }
+    };
     // The pictures: the samples the run had at each mark, drawn one at a time from the same seed.
     let counts: Vec<(f64, u32)> = settings
         .marks_s
@@ -207,6 +220,7 @@ pub fn run(gpu: &mut Offscreen, camera: &Camera, elsewhere: &Camera, settings: &
         frames,
         marks,
         captures,
+        cuts,
     }
 }
 
@@ -300,6 +314,29 @@ pub struct StillReport {
     pub frame_p99_within_target: Option<bool>,
     /// The time from the stop to each FLIP line.
     pub to_line: Vec<ToLine>,
+    /// The cuts the view had while it was Still (#217: frames that showed the Reference view and
+    /// were followed by a Primary frame), by what changed. The run holds the camera and the Planet
+    /// still, so both are 0 here; the streaming mode's `still_after_a_flight` is where a Planet
+    /// that is still being patched shows them.
+    pub cuts: CutsReport,
+}
+
+/// The cuts of a Still view by cause (see [`render::still::Cuts`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct CutsReport {
+    pub total: u32,
+    pub view: u32,
+    pub scene: u32,
+}
+
+impl From<render::still::Cuts> for CutsReport {
+    fn from(cuts: render::still::Cuts) -> Self {
+        Self {
+            total: cuts.total(),
+            view: cuts.view,
+            scene: cuts.scene,
+        }
+    }
 }
 
 /// The run's image at a mark, scored against truth A.
@@ -401,6 +438,7 @@ pub fn report(
                 counts: line.counts,
             })
             .collect(),
+        cuts: run.cuts.into(),
     }
 }
 
@@ -447,6 +485,10 @@ pub fn print(name: &str, s: &StillReport) {
             m.mse_linear
         );
     }
+    eprintln!(
+        "    cuts while Still: {} (view {}, scene {})",
+        s.cuts.total, s.cuts.view, s.cuts.scene
+    );
     for l in &s.to_line {
         let note = if l.counts {
             String::new()
@@ -528,6 +570,7 @@ mod tests {
             frames,
             marks: Vec::new(),
             captures: Vec::new(),
+            cuts: render::still::Cuts::default(),
         };
         let report = report(true, 16, &Settings::short(), &run, &[], &[], &[]);
         assert_eq!((report.frames, report.accumulating_frames), (7, 5));
