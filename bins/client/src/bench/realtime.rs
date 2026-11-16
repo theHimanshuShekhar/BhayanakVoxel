@@ -748,6 +748,24 @@ pub struct PathReport {
     pub scene_lag_d0_max: f64,
     pub scene_lag_voxels_p99: f64,
     pub scene_lag_d0_p99: f64,
+    /// The mean of the drawn scene's lag over the frames of the path, in `d0` (#168: how far
+    /// behind the camera the scene is for most of a flight, which the maximum and the 99th
+    /// percentile do not say), and the most the scene's buffers in use were in the path, in MiB
+    /// (`Scene::used_bytes`, as the scene thread says it every 250 ms; the run's
+    /// `memory.scene_used_peak_mib` is the most of these). Reported, not gated.
+    pub scene_lag_d0_mean: f64,
+    pub scene_used_peak_mib: f64,
+    /// Rounds in which the scene thread moved the scene to the camera, and in which it held work
+    /// back for the upload budget (`Done::follow_steps` and `budget_cuts`), and the frames that
+    /// scored a camera soft miss in each second of the path (the flights only; empty for the
+    /// others): whether they are at the start of a flight, or all along it.
+    pub scene_follow_steps: u64,
+    pub scene_budget_cuts: u64,
+    pub camera_soft_miss_per_second: Vec<u32>,
+    /// The scene's buffers in use and the bricks drawn at each level when the path ended (to be
+    /// read against `scene_used_peak_mib`: a peak over it is a transient).
+    pub scene_used_end_mib: f64,
+    pub scene_level_bricks_end: Vec<usize>,
     /// What the frames' uploads came to, and how often the budget cut them.
     pub upload: PathUpload,
     /// Soft misses a frame reported (counted by the scene thread a few times a second, so a frame
@@ -827,7 +845,7 @@ pub struct ColdStart {
 }
 
 /// What the run held, at the most.
-#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct Memory {
     /// The largest resident set of the samples taken during the run, where the system says: the
     /// working set on Windows, `VmRSS` on Linux. A sample is taken every 30 frames of the paths and
@@ -844,6 +862,11 @@ pub struct Memory {
     /// which it works out every 250 ms: not a value per frame. **The memory gate is on this**, not
     /// on what the GPU reserves.
     pub scene_used_peak_mib: f64,
+    /// What the run was doing when `scene_used_peak_mib` was reached (a path's name, or the wait
+    /// between paths, "the loader's catch-up after ..."; #168). Reported.
+    pub scene_used_peak_in: String,
+    /// The bricks drawn at each level when `scene_used_peak_mib` was reached.
+    pub scene_used_peak_level_bricks: Vec<usize>,
     /// The scene's buffers as the GPU reserves them, used or not (`Scene::reserved_bytes`): this
     /// is the VRAM the scene takes, after its growths (a buffer that fills grows, #145: the most
     /// of the frames' is given). Reported; not gated.
@@ -1365,6 +1388,8 @@ struct Frame {
     /// The bricks the loader had been asked for and not yet taken in, as of the frame's look at the
     /// scene (the loader's queue and what its workers have, see [`PathReport::loader_queue_max`]).
     loader_queue: usize,
+    /// The scene's buffers in use, in bytes (see [`PathReport::scene_used_peak_mib`]).
+    scene_used: u64,
     /// The drawn scene's lag behind the camera in Voxels (see [`PathReport::scene_lag_voxels_max`]).
     lag: f64,
     /// Whether the look at the scene in this frame has the newest Edit in it (from this frame or an
@@ -1394,6 +1419,12 @@ struct Capture {
     /// The loader's queue at each frame: the most and the sum, for the mean.
     queue_max: usize,
     queue_sum: u64,
+    /// The most the scene's buffers in use were, in bytes.
+    used_max: u64,
+    /// The scene thread's follow rounds and budget cuts when the path began.
+    follow: (u64, u64),
+    /// Frames with a camera soft miss, by second of the path.
+    miss_seconds: Vec<u32>,
     /// What the scene thread had spent when the path's frames were done, before the forced look.
     frames_done: Option<Spent>,
     frame_ms: Vec<f64>,
@@ -1468,6 +1499,9 @@ impl Capture {
             streams: (work.stream_calls, work.stream_slices_used),
             queue_max: 0,
             queue_sum: 0,
+            used_max: 0,
+            follow: (work.follow_steps, work.budget_cuts),
+            miss_seconds: Vec::new(),
             frame_ms: Vec::new(),
             cpu_ms: Vec::new(),
             started: Vec::new(),
@@ -1495,6 +1529,7 @@ impl Capture {
         self.lags.push(frame.lag);
         self.queue_max = self.queue_max.max(frame.loader_queue);
         self.queue_sum += frame.loader_queue as u64;
+        self.used_max = self.used_max.max(frame.scene_used);
         self.over_budget.add(frame.parts.over_budget);
         if frame.parts.grown_bytes > 0 {
             self.growth_frames += 1;
@@ -1529,6 +1564,13 @@ impl Capture {
         }
         self.soft_misses.add(frame.soft_misses as u64);
         self.camera_soft_miss_frames += usize::from(frame.camera_soft_miss);
+        if frame.camera_soft_miss {
+            let second = frame.began.saturating_duration_since(self.began).as_secs() as usize;
+            if self.miss_seconds.len() <= second {
+                self.miss_seconds.resize(second + 1, 0);
+            }
+            self.miss_seconds[second] += 1;
+        }
         if frame.parts.update != "none" {
             self.update_ms.push(frame.parts.update_ms);
             self.update_bytes.push(frame.parts.upload_bytes);
@@ -1588,6 +1630,17 @@ impl Capture {
             scene_lag_d0_max: d0.map_or(0.0, |d0| lag_max / d0),
             scene_lag_voxels_p99: lag_p99,
             scene_lag_d0_p99: d0.map_or(0.0, |d0| lag_p99 / d0),
+            scene_lag_d0_mean: d0.map_or(0.0, |d0| {
+                self.lags.iter().sum::<f64>() / self.lags.len().max(1) as f64 / d0
+            }),
+            scene_used_peak_mib: self.used_max as f64 / MIB,
+            scene_follow_steps: work.follow_steps - self.follow.0,
+            scene_budget_cuts: work.budget_cuts - self.follow.1,
+            camera_soft_miss_per_second: self.miss_seconds.clone(),
+            scene_used_end_mib: world.used_bytes() as f64 / MIB,
+            scene_level_bricks_end: (0..render::lod::LEVELS)
+                .map(|l| world.level_bricks(l))
+                .collect(),
             upload: PathUpload {
                 updates: self.update_ms.len(),
                 time: Spread::of(&self.update_ms),
@@ -1743,6 +1796,9 @@ struct Session<'a> {
     /// What the scene thread had done when the measuring began.
     work_before: Done,
     scene_used_peak_bytes: u64,
+    /// What the run was doing when that was reached.
+    scene_used_peak_in: String,
+    scene_used_peak_levels: Vec<usize>,
     scene_reserved_bytes: u64,
     /// The most the frame thread's copy of the scene reserved, with the old words of a buffer
     /// that grew in that frame added (see [`Memory::scene_host_peak_growth_mib`]).
@@ -1790,6 +1846,8 @@ impl<'a> Session<'a> {
             work_before,
             score_camera: false,
             scene_used_peak_bytes: 0,
+            scene_used_peak_in: String::new(),
+            scene_used_peak_levels: Vec::new(),
             scene_reserved_bytes: 0,
             scene_host_peak_bytes: 0,
             resident_peak: None,
@@ -1907,6 +1965,7 @@ impl<'a> Session<'a> {
             at_camera: self.world.lag(camera.position) == 0.0,
             throttled: self.world.stats().throttled,
             loader_queue: self.world.stats().loader.pending,
+            scene_used: self.world.used_bytes(),
             lag: self.world.lag(camera.position),
             edit_taken,
             taken_at,
@@ -1917,7 +1976,14 @@ impl<'a> Session<'a> {
     /// that did not take it).
     fn look_at_memory(&mut self) -> Duration {
         let mut lock_wait = Duration::ZERO;
-        self.scene_used_peak_bytes = self.scene_used_peak_bytes.max(self.world.used_bytes());
+        let used = self.world.used_bytes();
+        if used > self.scene_used_peak_bytes {
+            self.scene_used_peak_bytes = used;
+            self.scene_used_peak_in.clone_from(&self.step);
+            self.scene_used_peak_levels = (0..render::lod::LEVELS)
+                .map(|l| self.world.level_bricks(l))
+                .collect();
+        }
         self.scene_reserved_bytes = self.scene_reserved_bytes.max(self.world.reserved_bytes());
         self.frames += 1;
         if self.frames.is_multiple_of(STORE_EVERY) {
@@ -2367,6 +2433,8 @@ impl<'a> Session<'a> {
             resident_peak_mib: self.resident_peak.map(mib),
             whole_process_peak_mib: self.whole_process_peak.map(mib),
             scene_used_peak_mib: mib(self.scene_used_peak_bytes),
+            scene_used_peak_in: self.scene_used_peak_in.clone(),
+            scene_used_peak_level_bricks: self.scene_used_peak_levels.clone(),
             scene_reserved_mib: mib(self.scene_reserved_bytes),
             scene_gpu_peak_growth_mib: mib(self.gpu.peak_growth_bytes()),
             scene_gpu_peak_rebuild_mib: mib(self.gpu.peak_rebuild_bytes()),
@@ -2583,6 +2651,13 @@ mod tests {
             scene_lag_d0_max: 0.0,
             scene_lag_voxels_p99: 0.0,
             scene_lag_d0_p99: 0.0,
+            scene_lag_d0_mean: 0.0,
+            scene_used_peak_mib: 0.0,
+            scene_follow_steps: 0,
+            scene_budget_cuts: 0,
+            camera_soft_miss_per_second: Vec::new(),
+            scene_used_end_mib: 0.0,
+            scene_level_bricks_end: Vec::new(),
             upload: PathUpload::default(),
             soft_misses: Series::default(),
             soft_misses_per_frame: 0.0,
@@ -2695,6 +2770,8 @@ mod tests {
                 resident_peak_mib: Some(8000.0),
                 whole_process_peak_mib: Some(9000.0),
                 scene_used_peak_mib: 474.0,
+                scene_used_peak_in: String::new(),
+                scene_used_peak_level_bricks: Vec::new(),
                 scene_reserved_mib: 560.0,
                 scene_gpu_peak_growth_mib: 600.0,
                 scene_gpu_peak_rebuild_mib: 0.0,
@@ -3134,6 +3211,8 @@ mod tests {
                 "scene_gpu_peak_rebuild_mib",
                 "scene_host_peak_growth_mib",
                 "scene_reserved_mib",
+                "scene_used_peak_in",
+                "scene_used_peak_level_bricks",
                 "scene_used_peak_mib",
                 "store_limit_bricks",
                 "store_peak_bricks",
@@ -3145,6 +3224,7 @@ mod tests {
             [
                 "arrived_bricks",
                 "camera_soft_miss_frames",
+                "camera_soft_miss_per_second",
                 "end_look_ms",
                 "frame_cpu",
                 "frame_cycle",
@@ -3163,11 +3243,17 @@ mod tests {
                 "loader_queue_mean",
                 "name",
                 "over_limit_at",
+                "scene_budget_cuts",
+                "scene_follow_steps",
                 "scene_lag_d0_max",
+                "scene_lag_d0_mean",
                 "scene_lag_d0_p99",
                 "scene_lag_voxels_max",
                 "scene_lag_voxels_p99",
+                "scene_level_bricks_end",
                 "scene_thread",
+                "scene_used_end_mib",
+                "scene_used_peak_mib",
                 "seconds",
                 "settle",
                 "sleep_overshoot",
@@ -3876,7 +3962,7 @@ mod tests {
             );
             for path in &report.paths {
                 eprintln!(
-                    "  {:>20}: {:>5} frames, soft misses/frame {:>9.0} (frames with {:>5}, max {:>7}; under the camera {:>4}), lag max {:>5.2} d0, \
+                    "  {:>20}: {:>5} frames, soft misses/frame {:>9.0} (frames with {:>5}, max {:>7}; under the camera {:>4}), lag max {:>5.2} d0 mean {:>5.2}, scene used {:>6.1} MiB, \
                      cpu p99 {:>5.2} ms, scene follow {:>7.0} ms pack {:>7.0} ms reband {:>7.0} ms, generated {:>9} arrived {:>9} \
                      loader queue max {:>8} mean {:>9.0}, loader generating {:>6.1} s held back {:>6.1} s, \
                      stream calls {:>6} slices used up {:>6}, settle (s, walk, reband, fill, settled) {:?}",
@@ -3887,6 +3973,8 @@ mod tests {
                     path.soft_misses.max,
                     path.camera_soft_miss_frames,
                     path.scene_lag_d0_max,
+                    path.scene_lag_d0_mean,
+                    path.scene_used_peak_mib,
                     path.frame_cpu.p99_ms,
                     path.scene_thread.follow_ms,
                     path.scene_thread.pack_ms,
@@ -3903,9 +3991,29 @@ mod tests {
                         .map(|s| (s.seconds, s.walk_s, s.reband_s, s.fill_s, s.settled)),
                 );
             }
+            for path in &report.paths {
+                eprintln!(
+                    "  {:>20}: scene used peak {:.1} MiB, at the end {:.1} MiB, bricks at each level at the end {:?}",
+                    path.name,
+                    path.scene_used_peak_mib,
+                    path.scene_used_end_mib,
+                    path.scene_level_bricks_end,
+                );
+                if path.camera_soft_miss_frames > 0 {
+                    eprintln!(
+                        "  {:>20}: camera misses by second {:?}, follow rounds {}, budget cuts {}",
+                        path.name,
+                        path.camera_soft_miss_per_second,
+                        path.scene_follow_steps,
+                        path.scene_budget_cuts,
+                    );
+                }
+            }
             eprintln!(
-                "  scene used peak {:.1} MiB",
-                report.memory.scene_used_peak_mib
+                "  scene used peak {:.1} MiB in {:?}, bricks at each level then {:?}",
+                report.memory.scene_used_peak_mib,
+                report.memory.scene_used_peak_in,
+                report.memory.scene_used_peak_level_bricks
             );
         }
     }

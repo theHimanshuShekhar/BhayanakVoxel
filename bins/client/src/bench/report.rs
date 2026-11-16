@@ -94,7 +94,8 @@ use super::stream::StreamReport;
 /// did in the path), `loader_queue_max` and `loader_queue_mean` (the bricks asked for and not yet
 /// taken in, at each frame), `loader_generating_s`, `loader_held_back_s`, `stream_calls` and
 /// `stream_slices_used` (what the loader's workers did with their time, and how often the scene
-/// thread took in and used up its slice), to the `config` `stream_slice_ms`, to each `scene_thread` `reband_ms` (the change of the bands for the
+/// thread took in and used up its slice), `scene_lag_d0_mean`, `scene_used_peak_mib`, `scene_follow_steps`, `scene_budget_cuts` and `camera_soft_miss_per_second` (to find where a path's misses and
+/// memory come from), to `memory` `scene_used_peak_in` and `scene_used_peak_level_bricks`, to the `config` `stream_slice_ms`, to each `scene_thread` `reband_ms` (the change of the bands for the
 /// camera's speed, which is not in `follow_ms`), to the stop's `settle` `walk_s`, `reband_s` and
 /// `fill_s` (its three parts, which add up to `seconds`), and to its gates `camera_soft_miss_frames`, `scene_soft_miss_frames` (reported),
 /// `scene_lag_d0_max`, `spawn_ring_s`, `time_to_control_s` and `settle_s` (`over` may now also name

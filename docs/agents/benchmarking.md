@@ -554,6 +554,13 @@ camera, and `holes_after_catch_up` the holes the look after it found, which must
     most of the time with the queue long means the scene thread's taking in limits the loader, not
     the generator. And how many times the scene thread took in (its time is `scene_thread.pack_ms`)
     and in how many of them it stopped because its slice was used up. Reported, not gated.
+  - `scene_lag_d0_mean`, `scene_follow_steps`, `scene_budget_cuts`, `camera_soft_miss_per_second` and
+    `scene_used_peak_mib` (#168; the last two lines of the 4090 sweep of the slice ask for them): the
+    mean of the drawn scene's lag over the path's frames, in `d0` (the maximum and the 99th percentile
+    do not say how long the scene is behind), the rounds in which the scene moved to the camera and
+    those in which it held work back for the upload budget, the frames with a camera soft miss in
+    each second of the path (a flight only: at the start of it or all along it), and the most that the
+    scene's buffers in use were in the path. Reported, not gated.
   - `hole_looks`, `holes` and `holes_per_frame`: **holes are sampled, not counted for every
     frame** (see "What the holes gate can and cannot catch"). Looking at every split brick takes
     0.3 s at full size with the store's read lock held, so the scene thread does it every 5 s
@@ -633,6 +640,10 @@ camera, and `holes_after_catch_up` the holes the look after it found, which must
     set, which cannot be reset; Linux's `VmHWM`) since it began. It includes the normal bench's
     generation of the full Planet and every earlier run, so it is an upper bound of the run's, and
     only grows over the runs. Null where the system does not say (as `resident_peak_mib`).
+  - `scene_used_peak_in` and `scene_used_peak_level_bricks` (#168): what the run was doing when
+    `scene_used_peak_mib` was reached (a path's name, or "the loader's catch-up after ...", which
+    is time that is in no path), and the bricks drawn at each level then. The run's peak is of
+    every frame, those between paths included; a path's is `scene_used_peak_mib` under it.
   - `scene_used_peak_mib`: the scene's buffers **in use** (`Scene::used_bytes`), at the most of
     what the scene thread said: it works the figure out every 250 ms (`TABLES_EVERY`), so this is
     the most of those, not of every frame. **The memory gate is on this**, against the full-size
