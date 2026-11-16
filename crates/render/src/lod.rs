@@ -279,8 +279,9 @@ pub const DEPTH_STEP: f64 = 0.5;
 pub const RELEASE: f64 = 1.1;
 
 /// How long the camera's speed must stay under the release point before a step is given back, in
-/// seconds: a single sample of a speed that fell (the velocity is reset to zero on a hitch, see
-/// `Motion` in the client's world) does not give back the depth the flight is drawn at.
+/// seconds, from the first sample that was under it: a single sample of a speed that fell (the
+/// velocity is reset to zero on a hitch, see `Motion` in the client's world) does not give back
+/// the depth the flight is drawn at, as a sample above the release point starts the time again.
 pub const RELEASE_HOLD: f64 = 0.5;
 
 /// The depth, in levels coarser than at rest, that a speed asks for before the steps and the
@@ -310,8 +311,9 @@ pub struct SpeedScale {
     step: u32,
     /// The depth the ramp ends at: [`MOST_DEPTH`].
     most: f64,
-    /// How long, in seconds, the speed has been under the release point of the step.
-    calm: f64,
+    /// When the speed first fell under the release point of the step, in the caller's seconds
+    /// (see [`SpeedScale::observe`]), while it has stayed under.
+    calm_since: Option<f64>,
 }
 
 impl Default for SpeedScale {
@@ -325,7 +327,7 @@ impl SpeedScale {
     pub const AT_REST: SpeedScale = SpeedScale {
         step: 0,
         most: MOST_DEPTH,
-        calm: 0.0,
+        calm_since: None,
     };
 
     /// A camera at rest whose ramp ends at `most` levels instead of [`MOST_DEPTH`]: for measuring
@@ -335,7 +337,7 @@ impl SpeedScale {
         Self {
             step: 0,
             most,
-            calm: 0.0,
+            calm_since: None,
         }
     }
 
@@ -347,38 +349,49 @@ impl SpeedScale {
     /// Whether a step is to be given back if the speed stays where it is: the thread keeps
     /// looking at the clock while it is.
     pub fn releasing(&self) -> bool {
-        self.calm > 0.0
+        self.calm_since.is_some()
     }
 
-    /// Shows the camera's `speed`, in Voxels a second, as it was for the last `dt` seconds. Returns
-    /// whether the depth changed. A deeper step is taken at once; a step is given back only when
-    /// the speed has been [`RELEASE`] under what it asks for for [`RELEASE_HOLD`]. The Zoom's hook:
-    /// the speed it is given is the camera's along the Zoom (#58), the same rule.
-    pub fn observe(&mut self, speed: f64, dt: f64) -> bool {
-        let most = self.most;
-        let steps = |speed: f64| {
-            (depth_up_to(speed, most) / DEPTH_STEP - 1e-9)
-                .ceil()
-                .max(0.0) as u32
-        };
-        let (up, down) = (steps(speed), steps(speed * RELEASE));
+    /// Shows the camera's `speed`, in Voxels a second, as it is at `now`, in seconds from any
+    /// origin that does not change. Returns whether the depth changed. A deeper step is taken at
+    /// once; a step is given back only when the speed has been [`RELEASE`] under what it asks for
+    /// since [`RELEASE_HOLD`] before `now`: the time is from when the speed first fell under, and
+    /// a sample above the release point starts it again. The Zoom's hook: the speed it is given is
+    /// the camera's along the Zoom (#58), the same rule.
+    pub fn observe(&mut self, speed: f64, now: f64) -> bool {
+        let (up, down) = (self.steps(speed), self.steps(speed * RELEASE));
         let step = if up > self.step {
-            self.calm = 0.0;
+            self.calm_since = None;
             up
         } else if down < self.step {
-            self.calm += dt.max(0.0);
-            if self.calm >= RELEASE_HOLD {
-                self.calm = 0.0;
+            let since = *self.calm_since.get_or_insert(now);
+            if now - since >= RELEASE_HOLD {
+                self.calm_since = None;
                 down
             } else {
-                self.calm = self.calm.max(f64::MIN_POSITIVE);
                 self.step
             }
         } else {
-            self.calm = 0.0;
+            self.calm_since = None;
             self.step
         };
         std::mem::replace(&mut self.step, step) != step
+    }
+
+    /// The depth for a camera that was **put** at the speed `speed` (a teleport is no flight): the
+    /// step the speed asks for, both ways, with no hold, and any release that was pending ended.
+    /// Returns whether the depth changed.
+    pub fn settle_to(&mut self, speed: f64) -> bool {
+        self.calm_since = None;
+        let step = self.steps(speed);
+        std::mem::replace(&mut self.step, step) != step
+    }
+
+    /// The step a speed asks for, rounded up.
+    fn steps(&self, speed: f64) -> u32 {
+        (depth_up_to(speed, self.most) / DEPTH_STEP - 1e-9)
+            .ceil()
+            .max(0.0) as u32
     }
 }
 
@@ -1317,19 +1330,49 @@ mod tests {
     /// A frame's time, in seconds.
     const DT: f64 = 1.0 / 60.0;
 
-    /// Shows `scale` the speed `metres` m/s for `seconds`, a frame at a time. Whether it changed.
-    fn hold(scale: &mut SpeedScale, speed: f64, seconds: f64) -> bool {
-        let frames = (seconds / DT).round() as usize;
-        (0..frames)
-            .map(|_| scale.observe(metres(speed), DT))
-            .fold(false, |any, changed| any | changed)
+    /// A speed scale and the clock it is shown speeds by, in seconds.
+    struct Timed {
+        scale: SpeedScale,
+        now: f64,
+    }
+
+    impl Timed {
+        fn at_rest() -> Self {
+            Self {
+                scale: SpeedScale::AT_REST,
+                now: 0.0,
+            }
+        }
+
+        /// One sample of `speed` m/s, a frame after the last. Whether the depth changed.
+        fn observe(&mut self, speed: f64) -> bool {
+            self.now += DT;
+            self.scale.observe(metres(speed), self.now)
+        }
+
+        /// Samples of `speed` m/s for `seconds`, a frame at a time. Whether any changed the depth.
+        fn hold(&mut self, speed: f64, seconds: f64) -> bool {
+            let frames = (seconds / DT).round() as usize;
+            (0..frames)
+                .map(|_| self.observe(speed))
+                .fold(false, |any, changed| any | changed)
+        }
+
+        /// No sample for `seconds`: the thread was busy, or the camera did not move.
+        fn wait(&mut self, seconds: f64) {
+            self.now += seconds;
+        }
+
+        fn depth(&self) -> f64 {
+            self.scale.depth()
+        }
     }
 
     #[test]
     fn a_camera_under_ten_metres_a_second_is_at_full_detail_and_the_bands_are_the_plain_ones() {
-        let mut scale = SpeedScale::AT_REST;
+        let mut scale = Timed::at_rest();
         for speed in [0.0, 1.0, 5.0, 9.0, 10.0] {
-            assert!(!scale.observe(metres(speed), DT), "{speed} m/s");
+            assert!(!scale.observe(speed), "{speed} m/s");
             assert_eq!(scale.depth(), 0.0);
         }
         // Not a rounding of the bands: the same bands, bit for bit.
@@ -1344,8 +1387,8 @@ mod tests {
         assert!((depth_for(metres(30.0)) - 0.75).abs() < 1e-12);
         assert!((depth_for(metres(50.0)) - 1.5).abs() < 1e-12);
         assert_eq!(depth_for(metres(400.0)), 1.5);
-        let mut scale = SpeedScale::AT_REST;
-        assert!(scale.observe(metres(50.0), DT));
+        let mut scale = Timed::at_rest();
+        assert!(scale.observe(50.0));
         assert_eq!(scale.depth(), 1.5);
         let bands = Bands::with_d0(1000.0).speed_scaled(scale.depth());
         // Every level starts where the level a level and a half finer did: 2^-1.5 of the distance.
@@ -1360,22 +1403,22 @@ mod tests {
 
     #[test]
     fn a_camera_coarsens_at_once_and_refines_only_when_it_has_slowed() {
-        let mut scale = SpeedScale::AT_REST;
+        let mut scale = Timed::at_rest();
         // At once, to the step that holds the speed (rounded up).
-        assert!(scale.observe(metres(50.0), DT));
+        assert!(scale.observe(50.0));
         assert_eq!(scale.depth(), 1.5);
         // Slower, but within what the step holds and its release: no change, however long.
-        assert!(!hold(&mut scale, 40.0, 2.0));
-        assert!(!hold(&mut scale, 35.0, 2.0));
+        assert!(!scale.hold(40.0, 2.0));
+        assert!(!scale.hold(35.0, 2.0));
         assert_eq!(scale.depth(), 1.5);
         // Well under it, for as long as the hold: the step is given back, to the step the speed
         // holds.
-        assert!(hold(&mut scale, 30.0, RELEASE_HOLD + 0.1));
+        assert!(scale.hold(30.0, RELEASE_HOLD + 0.1));
         assert_eq!(scale.depth(), 1.0);
-        assert!(hold(&mut scale, 15.0, RELEASE_HOLD + 0.1));
+        assert!(scale.hold(15.0, RELEASE_HOLD + 0.1));
         assert_eq!(scale.depth(), 0.5);
         // Stopped: full detail.
-        assert!(hold(&mut scale, 0.0, RELEASE_HOLD + 0.1));
+        assert!(scale.hold(0.0, RELEASE_HOLD + 0.1));
         assert_eq!(scale.depth(), 0.0);
     }
 
@@ -1383,19 +1426,52 @@ mod tests {
     fn one_slow_sample_in_a_flight_does_not_give_back_the_depth() {
         // The camera's velocity is reset to zero on a hitch (a frame over a quarter of a second):
         // one such sample, mid-flight, gave back every step at once.
-        let mut scale = SpeedScale::AT_REST;
-        scale.observe(metres(50.0), DT);
+        let mut scale = Timed::at_rest();
+        scale.observe(50.0);
         assert_eq!(scale.depth(), 1.5);
-        assert!(!scale.observe(0.0, DT));
-        assert!(!scale.observe(0.0, 0.25));
+        assert!(!scale.observe(0.0));
+        scale.wait(0.25);
+        assert!(!scale.observe(0.0));
         assert_eq!(scale.depth(), 1.5);
         // The flight goes on at its speed: the hold starts again after.
-        assert!(!hold(&mut scale, 50.0, 0.3));
-        assert!(!scale.observe(0.0, 0.25));
+        assert!(!scale.hold(50.0, 0.3));
+        scale.wait(0.25);
+        assert!(!scale.observe(0.0));
         assert_eq!(scale.depth(), 1.5);
         // Calm for the hold is a stop.
-        assert!(hold(&mut scale, 0.0, RELEASE_HOLD + 0.1));
+        assert!(scale.hold(0.0, RELEASE_HOLD + 0.1));
         assert_eq!(scale.depth(), 0.0);
+    }
+
+    #[test]
+    fn the_hold_is_from_when_the_speed_first_fell_whatever_the_samples_between() {
+        // A busy thread looks seldom: the hold is a time, not a count of looks or of the time
+        // each look saw.
+        let mut scale = Timed::at_rest();
+        scale.observe(50.0);
+        assert!(!scale.observe(0.0));
+        scale.wait(RELEASE_HOLD - 0.1);
+        assert!(!scale.observe(0.0), "under the hold");
+        scale.wait(0.2);
+        assert!(scale.observe(0.0), "over it");
+        assert_eq!(scale.depth(), 0.0);
+        assert!(!scale.scale.releasing());
+    }
+
+    #[test]
+    fn a_camera_that_was_put_somewhere_has_the_depth_of_its_speed_with_no_hold() {
+        let mut scale = Timed::at_rest();
+        scale.observe(50.0);
+        scale.hold(0.0, RELEASE_HOLD / 2.0);
+        assert!(scale.scale.releasing());
+        // A teleport: the release that was pending is over, and the depth is the speed's.
+        assert!(scale.scale.settle_to(0.0));
+        assert_eq!(scale.depth(), 0.0);
+        assert!(!scale.scale.releasing());
+        // And the other way: a camera put at speed takes its step.
+        assert!(scale.scale.settle_to(metres(30.0)));
+        assert_eq!(scale.depth(), 1.0);
+        assert!(!scale.scale.settle_to(metres(30.0)));
     }
 
     #[test]
@@ -1404,14 +1480,14 @@ mod tests {
         // running mean over a tenth of a second is steadier than that), however it began.
         for tenth in 10..600 {
             let speed = f64::from(tenth) / 10.0;
-            let mut scale = SpeedScale::AT_REST;
-            scale.observe(metres(speed), DT);
+            let mut scale = Timed::at_rest();
+            scale.observe(speed);
             let first = scale.depth();
             let mut changes = 0;
             for n in 0..200 {
                 // A fixed pseudo-random wobble in [-4%, +4%].
                 let wobble = ((n * 7919 % 17) as f64 / 16.0 - 0.5) * 0.08;
-                changes += usize::from(scale.observe(metres(speed * (1.0 + wobble)), DT));
+                changes += usize::from(scale.observe(speed * (1.0 + wobble)));
             }
             // The wobble may take the one step up at a boundary that it straddles (the speed is
             // held to a step that the top of the noise needs), and then it stays there.

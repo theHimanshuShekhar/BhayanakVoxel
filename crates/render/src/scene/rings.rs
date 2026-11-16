@@ -1195,6 +1195,23 @@ impl Scene {
         self.show_diff(store, &diff)
     }
 
+    /// The scene made again at `camera`, in place, with `bands`: what a camera that was put far
+    /// from the scene asks for ([`Scene::recentre`] does it past a jump), with the bands that the
+    /// camera's speed asks for where it is now, so that the nodes of the scene that is gone are
+    /// not looked at for the bands it had. Reported as [`SceneUpdate::Rebuilt`].
+    pub fn jump_to(
+        &mut self,
+        store: &BrickStore,
+        camera: [f64; 3],
+        bands: Bands,
+    ) -> Result<Option<SceneUpdate>, RingsFull> {
+        if self.rings.is_none() {
+            return Ok(None);
+        }
+        self.rebuilt_at(store, camera, bands, Rebuild::Jump)
+            .map(Some)
+    }
+
     /// Packs again the regions that `diff` (what the selection changed) touches. Returns what
     /// changed, or `None` if nothing did; the buffer that is full grows if the regions do not fit.
     fn show_diff(

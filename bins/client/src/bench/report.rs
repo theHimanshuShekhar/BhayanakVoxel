@@ -82,8 +82,11 @@ use super::stream::StreamReport;
 /// report's cold start `spawn_ring_s` (the 20 m spawn ring), `guard_s` (the Guard that the window
 /// waits for as well) and `time_to_control_s` (from the world map being ready to the window
 /// opening), to each path `camera_soft_miss_frames` (frames whose ground below the frame's camera
-/// was drawn coarser than the bands ask), to the stop's `settle` `walk_s` and `fill_s` (its two
-/// parts), and to its gates `camera_soft_miss_frames`, `scene_soft_miss_frames` (reported),
+/// was drawn coarser than the bands ask), `generated_bricks` and `arrived_bricks` (what the loader
+/// did in the path), `loader_queue_max` and `loader_queue_mean` (the bricks asked for and not yet
+/// taken in, at each frame), to each `scene_thread` `reband_ms` (the change of the bands for the
+/// camera's speed, which is not in `follow_ms`), to the stop's `settle` `walk_s`, `reband_s` and
+/// `fill_s` (its three parts, which add up to `seconds`), and to its gates `camera_soft_miss_frames`, `scene_soft_miss_frames` (reported),
 /// `scene_lag_d0_max`, `spawn_ring_s`, `time_to_control_s` and `settle_s` (`over` may now also name
 /// `soft_misses`, `scene_lag`, `spawn_ring`, `time_to_control` and `settle`). The budgets file has
 /// the keys `camera_soft_miss_frames`, `scene_lag_d0_max`, `spawn_ring_s`, `time_to_control_s` and

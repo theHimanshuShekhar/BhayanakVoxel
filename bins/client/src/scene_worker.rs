@@ -318,6 +318,9 @@ impl LoaderStats {
 pub struct Stats {
     /// Bricks that wait for the bricks under them to be resident.
     pub waiting: usize,
+    /// Nodes that a change of the bands for the camera's speed has yet to look at again (see
+    /// [`Scene::rebanding`]).
+    pub rebanding: usize,
     /// Bricks drawn at each level (see [`Scene::level_bricks`]).
     pub level_bricks: [usize; LEVELS],
     pub bands: Option<Bands>,
@@ -411,9 +414,12 @@ enum Part {
     Coarse,
     /// Looking at every split brick for a hole (see [`HOLES_EVERY`]).
     HoleScan,
+    /// Looking again at the nodes that a change of the speed scale listed, and packing what that
+    /// changed (see [`Engine::reband_more`]): charged to no follow step.
+    Reband,
 }
 
-const PARTS: usize = 6;
+const PARTS: usize = 7;
 
 /// How long the scene thread spent on each part of its rounds since timing was turned on
 /// ([`SceneWorker::time_work`]): the real-time bench's scene-thread time by category (#162).
@@ -425,6 +431,7 @@ pub struct Spent {
     pub evict: Duration,
     pub coarse: Duration,
     pub hole_scan: Duration,
+    pub reband: Duration,
 }
 
 /// What eviction has done and what it cost the other threads, since the start.
@@ -487,6 +494,7 @@ fn stats_of(scene: &Scene, loader: &Loader, slow: &Arc<Slow>, eviction: Eviction
     }
     Stats {
         waiting: scene.waiting(),
+        rebanding: scene.rebanding(),
         level_bricks,
         bands: scene.bands(),
         coarsening: 0,
@@ -824,7 +832,7 @@ impl SceneWorker {
             ahead: [None; AHEAD],
             velocity: [0.0; 3],
             speed_in: 0.0,
-            speed_at: None,
+            speed_epoch: clock.now(),
             idle: false,
             throttled: false,
             pending: UploadCost::default(),
@@ -899,6 +907,13 @@ impl SceneWorker {
             .expect("the engine is not poisoned")
             .scene
             .nodes()
+    }
+
+    /// The speed that a stepped thread has looked at last, for the bands (see [`Engine::rescale`]).
+    #[cfg(test)]
+    pub fn speed_looked_at(&self) -> f64 {
+        let engine = self.stepped.as_ref().expect("only a stepped thread");
+        engine.lock().expect("the engine is not poisoned").speed_in
     }
 
     /// How many waits for the frame thread to take what was published the scene thread began, and
@@ -1016,6 +1031,7 @@ impl SceneWorker {
             evict: part(Part::Evict),
             coarse: part(Part::Coarse),
             hole_scan: part(Part::HoleScan),
+            reband: part(Part::Reband),
         }
     }
 
@@ -1354,9 +1370,10 @@ struct Engine {
     /// camera that was looked at last.
     ahead: [Option<[f64; 3]>; AHEAD],
     velocity: [f64; 3],
-    /// The camera's speed for the bands that was looked at last, and when.
+    /// The camera's speed for the bands that was looked at last, and the time the speed's release
+    /// hold is told in seconds from.
     speed_in: f64,
-    speed_at: Option<Instant>,
+    speed_epoch: Instant,
     /// The last round did nothing, so a thread waits to be told (see [`Engine::await_work`]).
     idle: bool,
     /// The last round held work back for the upload budget (see [`Engine::over_budget`]), so the
@@ -1644,7 +1661,7 @@ impl Engine {
             self.next_place(camera)
         };
         self.look_ahead(place, velocity);
-        let rescaled = match self.rescale() {
+        let rescaled = match self.rescale(camera) {
             Ok(rescaled) => rescaled,
             Err(full) => {
                 self.fail(full);
@@ -1876,7 +1893,12 @@ impl Engine {
     /// Shows the speed of the camera to the bands' scale (ADR 0009, #168): when it takes a step,
     /// the scene is selected in place for the new `d0` (a coarser one at once, a finer one when
     /// the speed has fallen), and what that changed is packed and noted like a follow step.
-    fn rescale(&mut self) -> Result<bool, RingsFull> {
+    fn rescale(&mut self, camera: [f64; 3]) -> Result<bool, RingsFull> {
+        // The speed that was looked at is noted first, whatever follows: a thread that is idle
+        // waits for the inbox's speed to differ from it, so one that is not noted (no bands, or the
+        // scale off) would find it different and not wait.
+        let speed = lock(&self.shared.inbox).speed;
+        self.speed_in = speed;
         #[cfg(test)]
         if self.shared.no_speed_scale.load(Ordering::Acquire) {
             return Ok(false);
@@ -1884,20 +1906,31 @@ impl Engine {
         if self.user_bands.is_none() {
             return Ok(false);
         }
-        let speed = lock(&self.shared.inbox).speed;
-        self.speed_in = speed;
-        // How long that speed has been what the camera does, for the hold before a step is given
-        // back: no more than a quarter of a second for one look, whatever the thread was doing.
-        let now = self.clock.now();
-        let dt = self
-            .speed_at
-            .replace(now)
-            .map_or(0.0, |at| self.clock.since(at).as_secs_f64().min(0.25));
-        if !self.speed.observe(speed, dt) {
+        let jumping = self.jumping(camera);
+        let changed = if jumping {
+            // A camera that was put somewhere is no flight: the depth is its speed's, at once. A
+            // release that was pending is over, so that it does not come after the scene is made
+            // again there and list the whole of it to look at.
+            self.speed.settle_to(speed)
+        } else {
+            // The hold of a release is from when the speed first fell, by the clock: not from the
+            // time that each look saw, which a busy thread makes too short.
+            let now = self.clock.since(self.speed_epoch).as_secs_f64();
+            self.speed.observe(speed, now)
+        };
+        if !changed {
             return Ok(false);
         }
+        if jumping {
+            // The scene is made again for these bands by [`Engine::follow`], at the camera: there
+            // is nothing in this one to list, and the walk over it would be for nothing.
+            self.work.speed_changes += 1;
+            return Ok(true);
+        }
         // Only the listing is done here: what changes is looked at by [`Engine::reband_more`], a
-        // few at a time and inside the budget, as the follow steps are.
+        // few at a time and inside the budget, as the follow steps are. (A scene that is made
+        // again at once, for a camera that was put, is selected by these bands, and has nothing
+        // listed.)
         self.scene.reband(self.bands_at(self.coarsening));
         self.work.speed_changes += 1;
         self.reband_bricks = REBAND_FIRST;
@@ -1951,7 +1984,7 @@ impl Engine {
                 break;
             }
         }
-        self.spend(Part::Follow, began);
+        self.spend(Part::Reband, began);
         Ok(looked)
     }
 
@@ -2030,6 +2063,25 @@ impl Engine {
         Ok(true)
     }
 
+    /// Whether the scene is to be made again at `camera`, not walked to: it was put (see
+    /// [`Engine::teleported`]) further than [`render::scene::JUMP`] of `d0` from where the scene is,
+    /// which is where `Scene::recentre` makes it again too: one that ended within a jump of the
+    /// scene would be patched in one operation of up to two `d0`, outside the budget, so it is
+    /// walked to.
+    fn jumping(&self, camera: [f64; 3]) -> bool {
+        self.teleported
+            && match (self.scene.camera(), self.scene.bands()) {
+                (Some(from), Some(bands)) => {
+                    (0..3)
+                        .map(|a| (camera[a] - from[a]).powi(2))
+                        .sum::<f64>()
+                        .sqrt()
+                        > render::scene::JUMP * bands.d0()
+                }
+                _ => true,
+            }
+    }
+
     /// Moves the scene to `camera`, if it is not there, in steps that each cost a share of the
     /// budget ([`FOLLOW_SHARE`]) when it is further than one: each step is packed and noted in
     /// its turn, and the steps go on while what waits is under the budget and the slice (the
@@ -2049,19 +2101,9 @@ impl Engine {
             return Ok(false);
         }
         // A teleport is jumped to (the scene is made again) only if the camera is past what
-        // `Scene::recentre` makes again for: one that ended within a jump of the scene would be
-        // patched in one operation of up to two `d0`, outside the budget, so it is walked to.
-        let teleported = std::mem::take(&mut self.teleported)
-            && match (self.scene.camera(), self.scene.bands()) {
-                (Some(from), Some(bands)) => {
-                    (0..3)
-                        .map(|a| (camera[a] - from[a]).powi(2))
-                        .sum::<f64>()
-                        .sqrt()
-                        > render::scene::JUMP * bands.d0()
-                }
-                _ => true,
-            };
+        // `Scene::recentre` makes again for.
+        let teleported = self.jumping(camera);
+        self.teleported = false;
         let started = self.clock.now();
         loop {
             let target = if teleported {
@@ -2072,7 +2114,14 @@ impl Engine {
             let store = self.store.read().expect("the store's lock is not poisoned");
             let before = self.scene.bricks_changed();
             let from = self.scene.camera().unwrap_or(camera);
-            let update = self.scene.recentre(&store, target)?;
+            // A scene made again is made for the bands of the camera's speed now (a release that was
+            // pending when it was put is over, see [`Engine::rescale`]).
+            let update = if teleported && self.user_bands.is_some() {
+                self.scene
+                    .jump_to(&store, target, self.bands_at(self.coarsening))?
+            } else {
+                self.scene.recentre(&store, target)?
+            };
             drop(store);
             self.work.follow_bricks += self.scene.bricks_changed() - before;
             self.camera = Some(target);

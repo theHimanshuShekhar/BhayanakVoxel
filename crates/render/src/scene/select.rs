@@ -108,9 +108,33 @@ struct Node {
     stamp: u64,
 }
 
+/// Set on the stamp of a node that [`Selection::set_bands`] parked: the rest is the stamp its
+/// entries in the hot list and the queue have, which are kept for it (and are live again if the
+/// bands go back to those they were made for before an update drops them, see
+/// [`Selection::set_bands`]), though a parked node is not watched: no entry that has the stamp
+/// without the bit is live. Stamps are far under it. A parked node whose entries an update has
+/// dropped has the bit alone ([`LOST`]).
+const PARKED: u64 = 1 << 63;
+
+/// The stamp of a parked node whose entries were dropped: there is nothing to restore.
+const LOST: u64 = PARKED;
+
+/// Whether a node with `stamp` is watched by an entry: not unwatched (0), and not parked.
+fn watched(stamp: u64) -> bool {
+    stamp != 0 && stamp & PARKED == 0
+}
+
+/// Whether a node with `stamp` is parked and its entries are still there.
+fn kept(stamp: u64) -> bool {
+    stamp & PARKED != 0 && stamp != LOST
+}
+
 /// What looking at an entry that was due in the queue came to.
 #[cfg_attr(test, derive(Debug, PartialEq))]
 enum Due {
+    /// The node is parked with the entry's stamp: the entry is dropped, and the node's stamp is
+    /// [`LOST`].
+    Parked,
     /// The node is gone, or has been queued again since: the entry is stale.
     Stale,
     /// The node changes now.
@@ -180,6 +204,9 @@ fn look_at_due_by(
         let Some(node) = nodes.get(&key) else {
             return Due::Stale;
         };
+        if node.stamp == stamp | PARKED {
+            return Due::Parked;
+        }
         if node.stamp != stamp {
             return Due::Stale;
         }
@@ -661,6 +688,12 @@ pub struct Selection {
     /// The nodes still to be looked at again for other bands ([`Selection::set_bands`]), the next
     /// at the end: [`Selection::relook_some`] takes them a few at a time.
     relook: Vec<Key>,
+    /// The bands that the entries of the parked nodes in `relook` were made for, if they are all of
+    /// the same: a change back to them restores those nodes' stamps instead of looking at them.
+    parked_for: Option<Bands>,
+    /// The stamps given out when those nodes were parked: an entry with a stamp over it was made
+    /// for other bands, since.
+    park_mark: u64,
     /// The stamps given out so far.
     stamps: u64,
     /// Bricks drawn at each level.
@@ -745,6 +778,8 @@ impl Selection {
             queue: BTreeMap::new(),
             hot: Vec::new(),
             relook: Vec::new(),
+            parked_for: None,
+            park_mark: 0,
             stamps: 0,
             drawn: [0; LEVELS],
             stuck: HashSet::default(),
@@ -1138,7 +1173,7 @@ impl Selection {
         if self.waiting.remove(&key)
             && let Some(node) = self.nodes.get_mut(&key)
             && node.state == State::Whole
-            && (node.stamp == 0 || node.margin)
+            && (!watched(node.stamp) || node.margin)
         {
             // It is watched again, so that the bands (or the margin) ask for its children again if
             // they want it split. One that was in the margin is looked at by the next update, not
@@ -1204,6 +1239,7 @@ impl Selection {
             return;
         }
         let coarser = bands.scaled_d0() < self.bands.scaled_d0();
+        let old = self.bands;
         self.bands = bands;
         // The bound on how near a stuck brick is was made for the old bands' clear radii.
         self.bound = [None; LEVELS];
@@ -1214,11 +1250,43 @@ impl Selection {
         // this), so it is looked at for these bands too, whatever they are: a flight's first
         // second changes the bands three times, and a node dropped from the list would be watched
         // by nothing.
-        let pending: HashSet<Key> = std::mem::take(&mut self.relook).into_iter().collect();
+        let pending = std::mem::take(&mut self.relook);
+        // A change back to the bands that the parked nodes' entries were made for (a depth given
+        // back before the nodes it listed were looked at) is a change of nothing for them: their
+        // stamps are restored, and the entries are live again, instead of each being looked at and
+        // given a new entry beside the old. What has entries made since (the nodes looked at for
+        // the other bands, and what the camera's move built or looked at again) is the list.
+        let back = self.parked_for == Some(bands);
+        let mark = self.park_mark;
+        let mut restored: HashSet<Key> = HashSet::default();
+        for &key in &pending {
+            if let Some(node) = self.nodes.get_mut(&key)
+                && kept(node.stamp)
+            {
+                if back {
+                    node.stamp &= !PARKED;
+                    restored.insert(key);
+                } else {
+                    // Its entries are for older bands than the ones that are left now: lost.
+                    node.stamp = LOST;
+                }
+            }
+        }
+        let pending: HashSet<Key> = pending
+            .into_iter()
+            .filter(|key| !restored.contains(key))
+            .collect();
+        // Whether a node's entry is for the bands that these are a return to (restored, or not
+        // looked at since): it is not on the list.
+        let valid = |node: &Node| back && watched(node.stamp) && node.stamp <= mark;
+        self.parked_for = Some(old);
+        self.park_mark = self.stamps;
         if coarser {
             let mut by_level: [Vec<Key>; LEVELS] = std::array::from_fn(|_| Vec::new());
             for (&key, node) in &self.nodes {
-                if node.state == State::Split || node.margin || pending.contains(&key) {
+                if (node.state == State::Split || node.margin || pending.contains(&key))
+                    && !valid(node)
+                {
                     by_level[key.0].push(key);
                 }
             }
@@ -1227,7 +1295,9 @@ impl Selection {
             // About 64 buckets of distance, a doubling in two: nearest at the end, with no sort.
             let mut by_distance: Vec<Vec<Key>> = vec![Vec::new(); 64];
             for (&key, node) in &self.nodes {
-                if (node.state == State::Whole && key.0 >= 1) || pending.contains(&key) {
+                if ((node.state == State::Whole && key.0 >= 1) || pending.contains(&key))
+                    && !valid(node)
+                {
                     let d = brick_distance(self.camera, key.0, key.1).max(1.0);
                     by_distance[((2.0 * d.log2()) as usize).min(63)].push(key);
                 }
@@ -1243,10 +1313,15 @@ impl Selection {
     /// bands for the camera's move and change them all at once, outside the budget (3.3 million
     /// bricks in one follow step, 7 s at full size). `relook_some` gives each a new stamp and its
     /// place.
+    ///
+    /// The stamp is not lost: it is kept under [`PARKED`], with its entries (which `update` leaves
+    /// where they are), for a change back to the bands they were made for.
     fn park_relook(&mut self) {
         for key in &self.relook {
-            if let Some(node) = self.nodes.get_mut(key) {
-                node.stamp = 0;
+            if let Some(node) = self.nodes.get_mut(key)
+                && node.stamp != 0
+            {
+                node.stamp |= PARKED;
             }
         }
     }
@@ -1277,7 +1352,30 @@ impl Selection {
                 self.watch(key, stamp, split, margin, slack);
             }
         }
+        // Each node looked at left its old entries stale where they were, and they are only
+        // dropped when the camera has gone as far as they are due, which a camera that stays does
+        // not: they are dropped when the last node is looked at, or if they come to more than twice
+        // the nodes, so that bands that go to and fro do not grow the lists.
+        if self.relook.is_empty() || self.queued() > 2 * self.nodes.len().max(1) {
+            self.compact();
+        }
         diff
+    }
+
+    /// Drops the entries of the hot list and the queue that are stale: for a node that has gone or
+    /// was looked at again since. What is kept for a parked node is not stale.
+    fn compact(&mut self) {
+        let nodes = &self.nodes;
+        let live = |stamp: u64, key: &Key| {
+            nodes
+                .get(key)
+                .is_some_and(|n| n.stamp == stamp || n.stamp == stamp | PARKED)
+        };
+        self.hot.retain(|entry| live(entry.stamp, &entry.key));
+        self.queue.retain(|_, entries| {
+            entries.retain(|(stamp, key)| live(*stamp, key));
+            !entries.is_empty()
+        });
     }
 
     /// The horizon cap that was asked for, which [`Selection::reach`] has while it is on.
@@ -1319,6 +1417,7 @@ impl Selection {
     fn reconsider_all(&mut self) {
         self.rewanted = true;
         self.relook.clear();
+        self.parked_for = None;
         self.queue.clear();
         self.hot.clear();
         for (&key, node) in &mut self.nodes {
@@ -1383,7 +1482,7 @@ impl Selection {
         let at = self.placed;
         for key in keys {
             self.settle_margin(store, at, key);
-            if self.nodes.get(&key).is_some_and(|node| node.stamp != 0) {
+            if self.nodes.get(&key).is_some_and(|node| watched(node.stamp)) {
                 let distance = brick_distance(self.camera, key.0, key.1);
                 self.queue_node(key, distance, false);
             }
@@ -1735,17 +1834,20 @@ impl Selection {
             node_slack(bands, reach, key, distance, split, margin)
         };
         let mut changing: Vec<(u64, Key)> = Vec::new();
+        let mut lost: Vec<Key> = Vec::new();
         let hot = std::mem::take(&mut self.hot);
         let mut stay = Vec::with_capacity(hot.len());
         let mut cooled = Vec::new();
         for entry in hot {
-            // An entry for a node that was looked at again since is stale: it has a newer one.
-            if self
-                .nodes
-                .get(&entry.key)
-                .is_none_or(|n| n.stamp != entry.stamp)
-            {
-                continue;
+            // An entry for a node that was looked at again since is stale: it has a newer one. A
+            // parked node's is kept, for the bands it was made for.
+            match self.nodes.get(&entry.key) {
+                Some(n) if n.stamp == entry.stamp => {}
+                Some(n) if n.stamp == entry.stamp | PARKED => {
+                    lost.push(entry.key);
+                    continue;
+                }
+                _ => continue,
             }
             let distance = brick_distance(camera, entry.key.0, entry.key.1);
             if changes(entry.key, distance, entry.split, entry.margin) {
@@ -1767,12 +1869,18 @@ impl Selection {
         for ((stamp, key), looked) in popped.into_iter().zip(looked) {
             match looked {
                 Due::Stale => {}
+                Due::Parked => lost.push(key),
                 Due::Changes => changing.push((stamp, key)),
                 Due::Later {
                     split,
                     margin,
                     slack,
                 } => self.watch(key, stamp, split, margin, slack),
+            }
+        }
+        for key in lost {
+            if let Some(node) = self.nodes.get_mut(&key) {
+                node.stamp = LOST;
             }
         }
         for (stamp, key) in changing {
@@ -1836,7 +1944,7 @@ impl Selection {
                 let distance = brick_distance(self.camera, level, coord);
                 if self.bands.split(level, distance, Some(false)) {
                     self.revisit(store, key, diff);
-                } else if self.nodes.get(&key).is_some_and(|n| n.stamp == 0) {
+                } else if self.nodes.get(&key).is_some_and(|n| !watched(n.stamp)) {
                     // Left unwatched while it could not be split, and outside the band now, so
                     // nothing else will look at it when the camera comes back.
                     self.queue_node(key, distance, false);
@@ -2496,6 +2604,94 @@ mod tests {
         is_as_the_rule_says(&selection, "after a second change of bands");
     }
 
+    /// A change back to the bands that the nodes of the last change were parked for, before they
+    /// are looked at, has them back as they were, with their entries (#168): there is hardly
+    /// anything to look at, and what is drawn is what it was.
+    #[test]
+    fn a_change_back_to_the_bands_before_the_relook_has_the_parked_nodes_as_they_were() {
+        let store = flat(64, 4);
+        let camera = [0.5, 20.0, 0.5];
+        let mut selection = select(&store, camera, D0);
+        let before: BTreeSet<Key> = selection.bricks().collect();
+        // A far-off camera move builds nothing: the entries are in the queue, with a slack.
+        selection.set_bands(at_speed(1.5));
+        let listed = selection.relooking();
+        assert!(listed > 50, "{listed}");
+        selection.set_bands(Bands::with_d0(D0));
+        let left = selection.relooking();
+        assert!(left < listed / 4, "{left} of {listed} are looked at again");
+        while selection.relooking() > 0 {
+            let diff = selection.relook_some(&store, 1_000, usize::MAX);
+            assert!(diff.added.is_empty() && diff.removed.is_empty());
+        }
+        selection.update(&store, camera);
+        assert_eq!(selection.bricks().collect::<BTreeSet<Key>>(), before);
+        is_a_cut(&selection);
+        is_as_the_rule_says(&selection, "after a change and back");
+        // The camera moves on and the cut is what the rule asks: nothing was lost.
+        for n in 1..=40 {
+            selection.update(
+                &store,
+                [camera[0] + 0.5 * f64::from(n), camera[1], camera[2]],
+            );
+        }
+        is_a_cut(&selection);
+        is_as_the_rule_says(&selection, "after moving");
+        // A change that is not back (to a third) leaves them to be looked at.
+        selection.set_bands(at_speed(1.0));
+        selection.set_bands(at_speed(1.5));
+        let third = selection.relooking();
+        selection.set_bands(at_speed(0.5));
+        assert!(selection.relooking() >= third / 2);
+        while selection.relooking() > 0 {
+            selection.relook_some(&store, 1_000, usize::MAX);
+        }
+        let c = [camera[0] + 20.0, camera[1], camera[2]];
+        selection.update(&store, c);
+        is_a_cut(&selection);
+        is_as_the_rule_says(&selection, "after three changes");
+    }
+
+    /// Bands that go to and fro, a flight's every change, do not make the hot list and the queue
+    /// grow: what was made stale is dropped when the nodes have been looked at (#168).
+    #[test]
+    fn the_queue_stays_bounded_over_repeated_coarse_and_fine_pairs() {
+        let store = flat(64, 4);
+        let camera = [0.5, 20.0, 0.5];
+        let mut selection = select(&store, camera, D0);
+        let nodes = selection.nodes();
+        let at_first = selection.queued();
+        for n in 0..12u32 {
+            for bands in [at_speed(1.5), Bands::with_d0(D0)] {
+                selection.set_bands(bands);
+                while selection.relooking() > 0 {
+                    selection.relook_some(&store, 64, usize::MAX);
+                }
+                // The camera is not still: a little each time.
+                selection.update(
+                    &store,
+                    [camera[0] + 0.25 * f64::from(n), camera[1], camera[2]],
+                );
+                assert!(
+                    selection.queued() <= 3 * selection.nodes(),
+                    "{} entries for {} nodes after {n} pairs",
+                    selection.queued(),
+                    selection.nodes()
+                );
+            }
+        }
+        assert!(
+            selection.nodes() <= 2 * nodes,
+            "{} nodes",
+            selection.nodes()
+        );
+        assert!(
+            selection.queued() <= at_first.max(nodes) * 3,
+            "{} entries, {at_first} at first",
+            selection.queued()
+        );
+    }
+
     /// No level flips back and forth at a steady speed (#168): a camera that flies straight at a
     /// speed right on the edge between two steps of the curve (36.7 m/s: the step to 1.5 levels is
     /// asked for from 36.67), which the scene thread is told with noise of 4% on it (the velocity
@@ -2523,7 +2719,7 @@ mod tests {
                 } else {
                     ((n * 7919) % 17) as f64 / 16.0 - 0.5
                 };
-                if scale.observe(speed * (1.0 + wobble * 2.0 * noise), frame) {
+                if scale.observe(speed * (1.0 + wobble * 2.0 * noise), n as f64 * frame) {
                     rebands += 1;
                     reband(&mut selection, &store, at_speed(scale.depth()));
                 }

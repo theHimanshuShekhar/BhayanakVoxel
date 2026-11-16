@@ -3697,6 +3697,87 @@ fn a_reband_in_a_flight_at_fifty_metres_a_second_has_no_hole_and_uploads_inside_
     assert_eq!(on.follow_steps, frames as u64, "{on:?}");
 }
 
+/// A camera that is put somewhere is not at a speed (#168): after a flight at 50 m/s, a teleport
+/// makes the scene again for the depth of the speed it has now (none), and the release of the
+/// depth the flight had does not come half a second later and list the whole of the new scene to
+/// look at again.
+#[test]
+fn a_teleport_after_a_flight_has_the_depth_of_its_speed_at_once_and_no_release_after_it() {
+    let (mut world, _server, camera) = spawned_world(Run::Stepped);
+    world.worker().speed_scale(true);
+    world.count_exactly();
+    fill(&mut world, camera.position);
+    let (ahead, _) = tangents(camera.horizon_up);
+    let step = 50.0 * brick_store::VOXELS_PER_METRE / 60.0;
+    let mut moved = camera.position;
+    for _ in 0..240 {
+        moved = std::array::from_fn(|a| moved[a] + ahead[a] * step);
+        let at = over_the_ground(&world.store(), moved);
+        world.recentre(at).unwrap();
+        pace(&world, FRAME);
+    }
+    let bands = world.stats().bands.expect("a scene with bands");
+    assert!(
+        bands.scale() < 0.5,
+        "the flight is at depth: {}",
+        bands.scale()
+    );
+    // Put the camera far away, and keep it there for a second and a half, a frame at a time.
+    let there = over_the_ground(
+        &world.store(),
+        std::array::from_fn(|a| camera.position[a] - ahead[a] * 4.0 * render::scene::JUMP * D0),
+    );
+    let before = world.stats().work;
+    let mut rebuilds = 0;
+    let mut listed_after = 0;
+    for frame in 0..90 {
+        let update = world.recentre(there).unwrap();
+        rebuilds += usize::from(matches!(update, Some(SceneUpdate::Rebuilt)));
+        if frame > 0 {
+            listed_after = listed_after.max(world.rebanding());
+        }
+        pace(&world, FRAME);
+    }
+    let after = world.stats().work;
+    assert_eq!(rebuilds, 1, "the scene was made again once");
+    let bands = world.stats().bands.expect("a scene with bands");
+    assert_eq!(
+        bands.scale(),
+        1.0,
+        "the depth is the speed's, which is none"
+    );
+    assert_eq!(
+        listed_after, 0,
+        "nothing is listed to look at after the jump"
+    );
+    assert_eq!(
+        after.speed_bricks - before.speed_bricks,
+        0,
+        "no node was looked at again for the bands"
+    );
+    assert!(
+        after.speed_changes - before.speed_changes <= 1,
+        "one change of depth, at the jump: {}",
+        after.speed_changes - before.speed_changes
+    );
+}
+
+/// The scene thread notes the speed it was given whether or not it draws for it (the scale off, or
+/// no bands): a thread that is idle waits while the inbox has what it looked at, so a speed that it
+/// did not note would find the inbox different on every wake and the thread would never sleep.
+#[test]
+fn the_scene_thread_notes_the_speed_it_was_given_with_the_scale_off() {
+    let (mut world, _server, camera) = spawned_world(Run::Stepped);
+    world.worker().speed_scale(false);
+    let speed = 50.0 * brick_store::VOXELS_PER_METRE;
+    world.recentre_at(camera.position, [0.0; 3], speed).unwrap();
+    assert_eq!(world.worker().speed_looked_at(), speed);
+    // And with it on, as before.
+    world.worker().speed_scale(true);
+    world.recentre_at(camera.position, [0.0; 3], 0.0).unwrap();
+    assert_eq!(world.worker().speed_looked_at(), 0.0);
+}
+
 /// What `follow_with_an_outbox_that_is_not_taken` saw.
 #[derive(Debug)]
 struct Unseen {

@@ -854,6 +854,18 @@ fn print_real_time(r: &realtime::RealTimeReport) {
                     }
                 ))
             );
+            eprintln!(
+                "        loader: {} bricks generated, {} arrived, queue max {} mean {:.0}; scene thread reband {:.0} ms{}",
+                p.generated_bricks,
+                p.arrived_bricks,
+                p.loader_queue_max,
+                p.loader_queue_mean,
+                p.scene_thread.reband_ms,
+                p.settle.map_or(String::new(), |s| format!(
+                    "; settle: walk {:.1} s, reband {:.1} s, fill {:.1} s",
+                    s.walk_s, s.reband_s, s.fill_s
+                ))
+            );
             // Where the time of the slowest frames went, when there were frames over the limit.
             if p.frames_over_limit > 0 {
                 for f in p.slowest.iter().take(3) {
@@ -884,8 +896,9 @@ fn print_real_time(r: &realtime::RealTimeReport) {
         }
         let t = &run.scene_thread;
         eprintln!(
-            "    scene thread: follow {:.0}, pack {:.0}, upload {:.0}, eviction {:.0}, coarse {:.0}, hole looks {:.0} ms; scene used peak {:.0} MiB (reserved {:.0} MiB), store peak {} of {} bricks, resident peak {} MiB (whole process {} MiB); {} looks, {} holes in the run; {}",
+            "    scene thread: follow {:.0}, reband {:.0}, pack {:.0}, upload {:.0}, eviction {:.0}, coarse {:.0}, hole looks {:.0} ms; scene used peak {:.0} MiB (reserved {:.0} MiB), store peak {} of {} bricks, resident peak {} MiB (whole process {} MiB); {} looks, {} holes in the run; {}",
             t.follow_ms,
+            t.reband_ms,
             t.pack_ms,
             t.upload_ms,
             t.evict_ms,

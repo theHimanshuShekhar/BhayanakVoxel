@@ -202,7 +202,7 @@ struct Motion {
     /// The speed the bands are drawn for (ADR 0009), in Voxels a second: a running mean as the
     /// velocity is, but not cut at [`MOST_LEAD_SPEED`], since a Zoom's flight that fast is a camera
     /// to draw coarse, though it is not one to look ahead along; a single frame's jump (a
-    /// teleport) is not a speed, and is left out.
+    /// teleport) is not a speed: it is 0 for it, and the speed is what the camera does after.
     speed: f64,
     /// Frames in a row that were over [`MOST_LEAD_SPEED`].
     fast: u32,
@@ -233,9 +233,10 @@ impl Motion {
         } else if speed > MOST_LEAD_SPEED {
             self.fast += 1;
             // The second frame in a row is a flight, not a jump: at once the speed of the flight.
-            if self.fast >= 2 {
-                self.speed = speed;
-            }
+            // The first is a jump (a teleport) and no speed: the speed the camera had before it
+            // would be given back a frame at a time after it, long after the scene has been made
+            // again at the camera's new place.
+            self.speed = if self.fast >= 2 { speed } else { 0.0 };
         } else {
             self.fast = 0;
             self.speed += (speed - self.speed) * alpha;
@@ -529,6 +530,12 @@ impl World {
     /// the loader, once the resident set is complete for the bands.
     pub fn waiting(&self) -> usize {
         self.of_scene(|s| s.waiting, Scene::waiting)
+    }
+
+    /// Nodes that the scene thread has yet to look at again for a change of the bands (ADR 0009):
+    /// zero once the scene is drawn as the speed's bands ask. (Also in [`World::waiting`].)
+    pub fn rebanding(&self) -> usize {
+        self.of_scene(|s| s.rebanding, Scene::rebanding)
     }
 
     pub fn scene(&self) -> &Scene {
@@ -1107,11 +1114,14 @@ mod tests {
             "{}",
             world.motion.speed()
         );
-        // A single jump in a flight is a teleport, not a speed.
+        // A single jump in a flight is a teleport, not a speed: it is no speed (so that the depth
+        // the flight had is not given back a frame at a time after the scene is made again at the
+        // camera's new place; the bands hold a depth over a single sample of a lower speed), and
+        // a flight that goes on after it is a flight at once.
         let (mut world, _server) = world_with_flight(base);
-        let before = world.motion.speed();
+        assert!((world.motion.speed() - 150.0).abs() < 1.0);
         world.lead_velocity([1.0e9, 0.0, 0.0], frames(base, 203));
-        assert_eq!(world.motion.speed(), before);
+        assert_eq!(world.motion.speed(), 0.0);
     }
 
     #[test]

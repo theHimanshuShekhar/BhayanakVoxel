@@ -360,7 +360,9 @@ fn over_budget_cause(
 /// How long the scene thread spent on each part of its rounds, in milliseconds, over a path or a
 /// run (`Spent`): following the camera (selecting again and packing what changed), packing what the
 /// loader made, publishing (copying what changed out for the frame thread, which copies it to the
-/// GPU: the upload), eviction, remaking the coarse levels over an Edit, and the looks for holes.
+/// GPU: the upload), eviction, remaking the coarse levels over an Edit, the looks for holes, and
+/// the change of the bands for the camera's speed (`reband_ms`: looking again at the nodes that a
+/// change of depth listed, which is not part of `follow_ms`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize)]
 pub struct SceneThread {
     pub follow_ms: f64,
@@ -369,6 +371,7 @@ pub struct SceneThread {
     pub evict_ms: f64,
     pub coarse_ms: f64,
     pub hole_scan_ms: f64,
+    pub reband_ms: f64,
     /// The looks for holes' share of the scene thread's **busy** time above (0 to 1): the sum of
     /// the parts, not wall time, so a thread that is idle most of the time can still read high. A
     /// path's figure is of its frames only: the look that is forced after them is not in it (see
@@ -387,6 +390,7 @@ impl SceneThread {
             evict_ms: ms(now.evict, then.evict),
             coarse_ms: ms(now.coarse, then.coarse),
             hole_scan_ms: ms(now.hole_scan, then.hole_scan),
+            reband_ms: ms(now.reband, then.reband),
             hole_scan_share: 0.0,
         };
         let all = parts.follow_ms
@@ -394,7 +398,8 @@ impl SceneThread {
             + parts.upload_ms
             + parts.evict_ms
             + parts.coarse_ms
-            + parts.hole_scan_ms;
+            + parts.hole_scan_ms
+            + parts.reband_ms;
         Self {
             hole_scan_share: if all > 0.0 {
                 parts.hole_scan_ms / all
@@ -580,15 +585,20 @@ const OVER_LIMIT_INDEXES: usize = 200;
 pub struct Settle {
     /// From the frame the camera stopped in, to the first frame in which the scene is at the
     /// camera (the drawn scene's camera is the frame's) and has no soft misses and nothing waiting:
-    /// or to the cap, if it was not. `walk_s` and `fill_s` are its two parts.
+    /// or to the cap, if it was not. `walk_s`, `reband_s` and `fill_s` are its three parts and add
+    /// up to it.
     pub seconds: f64,
     pub settled: bool,
     /// The first part: from the stop to the scene's camera being the frame's (the scene thread
     /// walking to where the camera stopped, with the bands as they are then). The whole of
     /// `seconds` if it never was.
     pub walk_s: f64,
-    /// The second part: from there to settled (the scene thread making what the bands ask for
-    /// round the camera, which the loader's bricks are waited for in).
+    /// The second part: from there until the scene thread has looked at every node that the
+    /// change of the bands for the stop listed (the finer bands' bricks being made round the
+    /// stop: the scene thread's own work, `SceneThread::reband_ms`), 0 if it was done by then.
+    pub reband_s: f64,
+    /// The third part: from there to settled (what is left is the loader's bricks being waited
+    /// for, and made into the scene).
     pub fill_s: f64,
 }
 
@@ -653,6 +663,15 @@ pub struct PathReport {
     /// scene's camera, which lags the frame's) does not say. **This is what is gated**, on the
     /// flights (ADR 0009, #168).
     pub camera_soft_miss_frames: usize,
+    /// What the loader did in the path (and in the forced look after its frames): the bricks the
+    /// generator was asked for, and the bricks of the arrivals that the scene thread took in, so
+    /// that a flight that falls short can be read as limited by the generator (few generated, many
+    /// waiting) or not. And the loader's queue (the bricks asked for and not yet taken in, as of
+    /// each frame): its most and its mean over the frames.
+    pub generated_bricks: u64,
+    pub arrived_bricks: u64,
+    pub loader_queue_max: usize,
+    pub loader_queue_mean: f64,
     /// Looks of the scene thread at every split brick (every few seconds, and one forced at the end
     /// of the path), the holes they found in all, and those per frame of the path. Never 0 looks.
     pub hole_looks: u64,
@@ -1230,6 +1249,9 @@ struct Frame {
     at_camera: bool,
     /// Whether the scene thread held work back in this frame for the upload budget.
     throttled: bool,
+    /// The bricks the loader had been asked for and not yet taken in, as of the frame's look at the
+    /// scene (the loader's queue and what its workers have, see [`PathReport::loader_queue_max`]).
+    loader_queue: usize,
     /// The drawn scene's lag behind the camera in Voxels (see [`PathReport::scene_lag_voxels_max`]).
     lag: f64,
     /// Whether the look at the scene in this frame has the newest Edit in it (from this frame or an
@@ -1248,6 +1270,13 @@ struct Capture {
     spent: Spent,
     scans: u64,
     holes: u64,
+    /// The bricks the generator had been asked for and the arrivals the scene thread had taken in
+    /// when the path began.
+    generated: u64,
+    arrived: u64,
+    /// The loader's queue at each frame: the most and the sum, for the mean.
+    queue_max: usize,
+    queue_sum: u64,
     /// What the scene thread had spent when the path's frames were done, before the forced look.
     frames_done: Option<Spent>,
     frame_ms: Vec<f64>,
@@ -1313,6 +1342,10 @@ impl Capture {
             spent: world.scene_thread_time(),
             scans: work.hole_scans,
             holes: work.holes_found,
+            generated: world.stats().loader.generated,
+            arrived: work.arrived_bricks,
+            queue_max: 0,
+            queue_sum: 0,
             frame_ms: Vec::new(),
             cpu_ms: Vec::new(),
             started: Vec::new(),
@@ -1338,6 +1371,8 @@ impl Capture {
             self.over_by_update.add(frame.parts.update);
         }
         self.lags.push(frame.lag);
+        self.queue_max = self.queue_max.max(frame.loader_queue);
+        self.queue_sum += frame.loader_queue as u64;
         self.over_budget.add(frame.parts.over_budget);
         if frame.parts.grown_bytes > 0 {
             self.growth_frames += 1;
@@ -1445,6 +1480,14 @@ impl Capture {
             soft_misses_per_frame: per_frame(self.soft_misses.total),
             soft_misses: self.soft_misses,
             camera_soft_miss_frames: self.camera_soft_miss_frames,
+            generated_bricks: world
+                .stats()
+                .loader
+                .generated
+                .saturating_sub(self.generated),
+            arrived_bricks: work.arrived_bricks - self.arrived,
+            loader_queue_max: self.queue_max,
+            loader_queue_mean: self.queue_sum as f64 / frames.max(1) as f64,
             hole_looks: work.hole_scans - self.scans,
             holes,
             holes_per_frame: per_frame(holes),
@@ -1721,6 +1764,7 @@ impl<'a> Session<'a> {
                 && soft_miss_under(self.world.scene(), camera, self.world.bands()),
             at_camera: self.world.lag(camera.position) == 0.0,
             throttled: self.world.stats().throttled,
+            loader_queue: self.world.stats().loader.pending,
             lag: self.world.lag(camera.position),
             edit_taken,
             taken_at,
@@ -1783,10 +1827,20 @@ impl<'a> Session<'a> {
         self.world.waiting() == 0 && self.world.loader().is_some_and(|l| l.pending == 0)
     }
 
-    /// Frames at `camera`, not recorded, until the loader has caught up, and then a look at every
-    /// split brick: whatever the scene thread found between paths is in the run's holes. The
-    /// camera's jump to it is not a flight: the scene thread is told it is not moving. `after`
-    /// names what came before, for an error.
+    /// Whether the resident set is complete and the drawn scene is at `camera`.
+    fn at_rest_at(&self, camera: &Camera) -> bool {
+        self.idle() && self.world.lag(camera.position) == 0.0
+    }
+
+    /// Frames at `camera`, not recorded, until the loader has caught up **and the scene is at the
+    /// camera**, and then a look at every split brick: whatever the scene thread found between
+    /// paths is in the run's holes. The camera's jump to it is not a flight: the scene thread is
+    /// told it is not moving. `after` names what came before, for an error.
+    ///
+    /// The scene's camera is read as well as `idle`, which reads the stats of the last publish: the
+    /// scene thread has not learnt that the camera is back at the Spawn until a frame has been run
+    /// at it, so `idle` can be true from the stats of the path before (the 180 degree turn was
+    /// left about 300 m up).
     fn settle(
         &mut self,
         camera: &Camera,
@@ -1795,8 +1849,12 @@ impl<'a> Session<'a> {
     ) -> Result<(), Box<dyn Error>> {
         self.step = format!("the loader's catch-up after {after}");
         let began = Instant::now();
-        while !self.idle() {
+        // At least one frame, at the target camera, before the stats are believed.
+        loop {
             self.frame(camera, false)?;
+            if self.at_rest_at(camera) {
+                break;
+            }
             if began.elapsed() > cap {
                 return Err(format!(
                     "the loader has not caught up after {:.0?}: {} bricks wait",
@@ -1920,21 +1978,31 @@ impl<'a> Session<'a> {
         // The scene has to be at the camera too: a count made while it is still walking to where the
         // camera stopped, with the bands as they were for the flight, is a count for another place.
         let mut walked = None;
+        let mut rebanded = None;
         let settle = loop {
             let frame = self.frame(&camera, true)?;
             capture.add(&frame);
             if frame.at_camera && walked.is_none() {
                 walked = Some(stopped.elapsed().as_secs_f64());
             }
+            // The last frame that still has nodes to look at for the bands (the release of the depth
+            // comes half a second after the stop, so the first frames have none yet).
+            if walked.is_some() && self.world.rebanding() > 0 {
+                rebanded = Some(stopped.elapsed().as_secs_f64());
+            }
             let seconds = stopped.elapsed().as_secs_f64();
             let settled = frame.at_camera && frame.soft_misses == 0 && self.world.waiting() == 0;
             if settled || stopped.elapsed() >= script.settle_cap {
                 let walk_s = walked.unwrap_or(seconds);
+                let reband_s = (rebanded.unwrap_or(walk_s) - walk_s)
+                    .max(0.0)
+                    .min(seconds - walk_s);
                 break Settle {
                     seconds,
                     settled,
                     walk_s,
-                    fill_s: seconds - walk_s,
+                    reband_s,
+                    fill_s: seconds - walk_s - reband_s,
                 };
             }
         };
@@ -2268,6 +2336,10 @@ mod tests {
             soft_misses: Series::default(),
             soft_misses_per_frame: 0.0,
             camera_soft_miss_frames: 0,
+            generated_bricks: 0,
+            arrived_bricks: 0,
+            loader_queue_max: 0,
+            loader_queue_mean: 0.0,
             hole_looks: 2,
             holes,
             holes_per_frame: 0.0,
@@ -2604,8 +2676,9 @@ mod tests {
                 flight.settle = Some(Settle {
                     seconds,
                     settled,
-                    walk_s: seconds / 2.0,
-                    fill_s: seconds / 2.0,
+                    walk_s: seconds / 3.0,
+                    reband_s: seconds / 3.0,
+                    fill_s: seconds / 3.0,
                 });
             })
         };
@@ -2798,6 +2871,7 @@ mod tests {
         assert_eq!(
             keys(&json["runs"][0]["paths"][0]),
             [
+                "arrived_bricks",
                 "camera_soft_miss_frames",
                 "end_look_ms",
                 "frame_cpu",
@@ -2806,10 +2880,13 @@ mod tests {
                 "frames",
                 "frames_over_limit",
                 "frames_over_limit_by_update",
+                "generated_bricks",
                 "hole_looks",
                 "holes",
                 "holes_per_frame",
                 "largest_updates",
+                "loader_queue_max",
+                "loader_queue_mean",
                 "name",
                 "over_limit_at",
                 "scene_lag_d0_max",
@@ -2902,6 +2979,7 @@ mod tests {
                 "hole_scan_ms",
                 "hole_scan_share",
                 "pack_ms",
+                "reband_ms",
                 "upload_ms"
             ]
         );
@@ -3314,6 +3392,36 @@ mod tests {
         assert_eq!(Spread::of(&[3.0]).p99_ms, 3.0);
     }
 
+    /// The catch-up between paths ends with the scene at the camera: the scene thread has not
+    /// learnt that the camera is back until a frame has run at it, so stats from the path before
+    /// say "idle" while the scene is still where that path left it (the 180 degree turn was left
+    /// about 300 m up).
+    #[test]
+    fn the_catch_up_between_paths_ends_with_the_scene_at_the_camera() {
+        let built = build_test().expect("the test Planet builds");
+        let Built { world, setup, .. } = built;
+        let mut gpu = NoGpu;
+        let mut session = Session::new(world, &mut gpu, BUDGETS.frame_time_p99_ms);
+        let spawn = setup.spawn;
+        let cap = Duration::from_secs(120);
+        session.settle(&spawn, cap, "the start").expect("settles");
+        // The camera goes up and the scene follows it there and goes idle.
+        let mut away = spawn;
+        for a in 0..3 {
+            away.position[a] += spawn.horizon_up[a] * 300.0;
+        }
+        let began = Instant::now();
+        while session.world.lag(away.position) != 0.0 || !session.idle() {
+            session.frame(&away, false).expect("a frame");
+            assert!(began.elapsed() < cap, "the scene did not follow the camera");
+        }
+        assert!(session.world.lag(spawn.position) > 0.0);
+        // The catch-up at the Spawn does not return on the stats of the place it came from.
+        session.settle(&spawn, cap, "the flight").expect("settles");
+        assert_eq!(session.world.lag(spawn.position), 0.0);
+        assert!(session.idle());
+    }
+
     /// The real-time mode on the test Planet, with real workers and a real scene thread and no GPU:
     /// every path runs and the report has its fields. It asserts no time bound, only what was run and
     /// that the parts of a frame's cycle are inside it: how long anything took is not for a test
@@ -3469,7 +3577,8 @@ mod tests {
             for path in &report.paths {
                 eprintln!(
                     "  {:>20}: {:>5} frames, soft misses/frame {:>9.0} (frames with {:>5}, max {:>7}; under the camera {:>4}), lag max {:>5.2} d0, \
-                     cpu p99 {:>5.2} ms, scene follow {:>7.0} ms pack {:>7.0} ms, settle {:?}",
+                     cpu p99 {:>5.2} ms, scene follow {:>7.0} ms pack {:>7.0} ms reband {:>7.0} ms, generated {:>9} arrived {:>9} \
+                     loader queue max {:>8} mean {:>9.0}, settle (s, walk, reband, fill, settled) {:?}",
                     path.name,
                     path.frames,
                     path.soft_misses_per_frame,
@@ -3480,8 +3589,13 @@ mod tests {
                     path.frame_cpu.p99_ms,
                     path.scene_thread.follow_ms,
                     path.scene_thread.pack_ms,
+                    path.scene_thread.reband_ms,
+                    path.generated_bricks,
+                    path.arrived_bricks,
+                    path.loader_queue_max,
+                    path.loader_queue_mean,
                     path.settle
-                        .map(|s| (s.seconds, s.walk_s, s.fill_s, s.settled)),
+                        .map(|s| (s.seconds, s.walk_s, s.reband_s, s.fill_s, s.settled)),
                 );
             }
             eprintln!(

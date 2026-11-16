@@ -511,6 +511,12 @@ is made there (below): the run's **Edit latency**. Its frames are not those of a
     (`scene_lag_d0_max`, 8.0): main's 7.81 `d0` on the 4090 at 50 m plus a margin, for now. **The
     limit tightens to about 2 `d0` once the follow fixes land**; it is not a statement of what the
     lag should be.
+  - `generated_bricks`, `arrived_bricks`, `loader_queue_max` and `loader_queue_mean` (#168): what
+    the loader did in the path (and in the forced look after it): the bricks the generator was
+    asked for, and the bricks of the arrivals that the scene thread took in; and the loader's
+    queue, the bricks asked for and not yet taken in (`LoaderStats::pending`), as of each frame,
+    its most and its mean. They are for reading a flight as limited by the generator (a long
+    queue, few arrived) or not; reported, not gated.
   - `hole_looks`, `holes` and `holes_per_frame`: **holes are sampled, not counted for every
     frame** (see "What the holes gate can and cannot catch"). Looking at every split brick takes
     0.3 s at full size with the store's read lock held, so the scene thread does it every 5 s
@@ -521,7 +527,9 @@ is made there (below): the run's **Edit latency**. Its frames are not those of a
     for a new camera and packing what changed), `pack` (asking the loader, taking in what it made
     and packing it), `upload` (publishing: copying what changed out for the frame thread, which
     copies it to the GPU), `evict` (eviction), `coarse` (the coarse levels over an Edit) and
-    `hole_scan` (the looks for holes), and **`hole_scan_share`**: the looks' share of the scene
+    `hole_scan` (the looks for holes), `reband` (looking again at the nodes that a change of the
+    bands for the camera's speed listed, and packing what changed: **not in `follow`**; ADR 0009),
+    and **`hole_scan_share`**: the looks' share of the scene
     thread's **busy** time, which is the sum of the parts above and not wall time (a thread that is
     idle most of the time can still read high). **A path's figures are those of its frames: the look
     that is forced after the last frame is not in them**, so a path in which no look came due reads
@@ -536,8 +544,10 @@ is made there (below): the run's **Edit latency**. Its frames are not those of a
     camera stopped in to the first frame in which the scene is at the camera (the drawn scene's camera is
     the frame's), has no soft misses and nothing left to look at again for the bands
     (`Scene::waiting` counts both), or the cap, and `settled`; `walk_s` is the first part (the
-    scene walking to where the camera stopped) and `fill_s` the rest (the scene thread making what
-    the bands ask for, and waiting for the loader's bricks). **Gated** (#168), `settle_s`, 55 s:
+    scene walking to where the camera stopped), `reband_s` the second (until the scene thread has
+    looked at every node that the change of the bands for the stop listed: 0 if it had by then)
+    and `fill_s` the rest (waiting for the loader's bricks, and making them into the scene); the
+    three add up to `seconds`. **Gated** (#168), `settle_s`, 55 s:
     main's 47.8 s on the 4090 plus 15%. Over if it is over the limit or did not settle.
     The scene thread's count of soft misses can be from before the stop (it counts a few times a
     second, and not at all while it sleeps), so a stale 0 would read as settled at once. So the
