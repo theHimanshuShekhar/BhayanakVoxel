@@ -530,7 +530,9 @@ fn combinations(
         for (n, curve) in CURVES.into_iter().enumerate() {
             if n > 0 {
                 gpu.set_stages(normals.stages(curve));
-                image = gpu.reshow_reference();
+                image = gpu
+                    .reshow_reference()
+                    .expect("the accumulation has its samples");
             }
             let file = format!("{dir}/reference-{}-{}.png", curve.slug(), normals.slug());
             write_png(&options.out.join(&file), &image)?;

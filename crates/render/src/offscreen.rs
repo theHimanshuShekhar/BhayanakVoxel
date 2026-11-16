@@ -645,8 +645,12 @@ impl Offscreen {
     /// Shows the Reference view's mean so far again, under the current [`Stages`](crate::Stages)
     /// and with the exposure it has (held, not metered again), and reads it back. The mean is not
     /// touched: the tone curve is only a way of showing it, so one accumulation can be seen
-    /// through every curve.
-    pub fn reshow_reference(&mut self) -> Image {
+    /// through every curve. `None` if the view has no samples (it has just started over), whose
+    /// mean is not an image of this view.
+    pub fn reshow_reference(&mut self) -> Option<Image> {
+        if self.reference_samples() == 0 {
+            return None;
+        }
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
@@ -667,7 +671,7 @@ impl Offscreen {
         let encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
-        self.read_image(encoder, &texture, size)
+        Some(self.read_image(encoder, &texture, size))
     }
 
     /// The most samples one dispatch of the Reference view may take at the size it is traced at

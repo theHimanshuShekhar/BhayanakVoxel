@@ -12,8 +12,9 @@
 //   bloom_h         that blurred along x at three scales, one image each;
 //   bloom_v         those blurred along y and averaged: the bloom, at a quarter of the size;
 //   tone            the image, plus `bloom_strength` of the bloom, times the exposure, through the
-//                   tone curve and the sRGB encoding, as the 8-bit image the upscaler and the
-//                   copy to the window read.
+//                   tone curve (the AgX-like one is the encoded image itself; Neutral is followed
+//                   by the sRGB encoding), as the 8-bit image the upscaler and the copy to the
+//                   window read.
 // Bloom is linear, so it is blurred before the exposure and added in the same light: it commutes
 // with exposure, and the exposure of the frame need not be known when it is blurred.
 

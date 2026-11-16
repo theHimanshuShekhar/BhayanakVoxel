@@ -124,12 +124,11 @@ impl ToneCurve {
     /// `post.wgsl`), as 0..1 encoded values.
     pub fn apply(self, colour: [f32; 3]) -> [f32; 3] {
         let colour = colour.map(|x| x.max(0.0));
+        let encode = |x: f32| crate::srgb_encode(x.clamp(0.0, 1.0));
         match self {
-            ToneCurve::Neutral => neutral(colour).map(srgb_encode),
+            ToneCurve::Neutral => neutral(colour).map(encode),
             ToneCurve::Agx => agx(colour),
-            ToneCurve::NeutralDesat => {
-                desaturate(neutral(colour), NEUTRAL_DESAT_KEPT).map(srgb_encode)
-            }
+            ToneCurve::NeutralDesat => desaturate(neutral(colour), NEUTRAL_DESAT_KEPT).map(encode),
         }
     }
 }
@@ -167,16 +166,6 @@ impl NormalBias {
             NormalBias::Face => 0.25,
             NormalBias::None => 0.0,
         }
-    }
-}
-
-/// The true sRGB encoding of one linear value, clamped to 0..1.
-pub fn srgb_encode(linear: f32) -> f32 {
-    let c = linear.clamp(0.0, 1.0);
-    if c <= 0.003_130_8 {
-        12.92 * c
-    } else {
-        1.055 * c.powf(1.0 / 2.4) - 0.055
     }
 }
 
@@ -767,7 +756,8 @@ mod tests {
         let plain = ToneCurve::Neutral.apply([0.9, 0.4, 0.1]);
         assert!(shown[0] - shown[2] < plain[0] - plain[2]);
         assert!(shown[0] > shown[1] && shown[1] > shown[2]);
-        let want = desaturate(neutral([0.9, 0.4, 0.1]), NEUTRAL_DESAT_KEPT).map(srgb_encode);
+        let want = desaturate(neutral([0.9, 0.4, 0.1]), NEUTRAL_DESAT_KEPT)
+            .map(|x| crate::srgb_encode(x.clamp(0.0, 1.0)));
         assert_eq!(shown, want);
     }
 

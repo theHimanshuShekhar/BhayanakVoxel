@@ -161,8 +161,9 @@ const SMOOTH_WEIGHTS = array<f32, 13>(
 // The surface's normal at the Voxel `voxel`, which a ray entered through the face with unit normal
 // `face`: the direction away from the solid Voxels round the empty one in front of that face, each
 // weighted by how near it is (a Gaussian of 1.4 Voxels), kept to the face's side by adding a
-// quarter of the face's normal (`flags.z`: the owner may pick none, #202). On a stair-step slope that is the slope's normal; on a flat face,
-// the face's; where there is no solid round it, the face's. The prototype's, as rendered (#148).
+// quarter of the face's normal (the weight in `flags.z`: 0.25, the owner's pick of 2026-11-16; 0
+// for look-dev). On a stair-step slope that is the slope's normal; on a flat face, the face's;
+// where there is no solid round it, the face's. The prototype's, as rendered (#148).
 fn smooth_normal(voxel: vec3<i32>, face: vec3<f32>) -> vec3<f32> {
     let front = voxel + vec3<i32>(face);
     var cache = new_brick_cache();

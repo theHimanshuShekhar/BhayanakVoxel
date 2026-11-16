@@ -786,48 +786,70 @@ fn the_reference_view_meters_afresh_after_a_debug_view_instead_of_holding_a_stal
     );
 }
 
-/// A floor under hero light B, its colour as the sky and sun make it, shown under `curve`.
-fn floor_under(curve: render::ToneCurve) -> Image {
+/// The floor under hero light B with its sun's radiance as `sun`, shown under each tone curve with
+/// the exposure off: for each curve, the pixel at the middle of the image, and the linear light
+/// that the pixel was shown from (read from the lit image before the transform).
+fn floor_under_each_curve(sun: [f32; 3]) -> Vec<(render::ToneCurve, [f32; 3], [f32; 3])> {
     let mut gpu = Offscreen::new(SIZE, SIZE, &floor_of(material("grassy soil"))).unwrap();
-    gpu.set_stages(Stages {
-        tone: true,
-        curve,
-        ..OFF
+    gpu.set_look(Look {
+        sun,
+        ..Look::HERO_B
     });
     gpu.set_sun(Sun::new([0.3, 0.8, 0.5], 0.12).unwrap());
-    gpu.render(&overhead())
+    render::ToneCurve::ALL
+        .into_iter()
+        .map(|curve| {
+            gpu.set_stages(Stages {
+                tone: true,
+                curve,
+                ..OFF
+            });
+            let image = gpu.render(&overhead());
+            let at = ((16 * image.width + 16) * 4) as usize;
+            let shown = [0, 1, 2].map(|c| f32::from(image.rgba[at + c]) / 255.0);
+            let ((width, _, light), _) = gpu.read_hdr_and_bloom();
+            (curve, shown, light[(16 * width + 16) as usize])
+        })
+        .collect()
 }
 
 #[test]
-fn each_tone_curve_shows_the_light_the_way_its_cpu_twin_says() {
-    let plain = {
-        let mut gpu = Offscreen::new(SIZE, SIZE, &floor_of(material("grassy soil"))).unwrap();
-        gpu.set_stages(OFF);
-        gpu.set_sun(Sun::new([0.3, 0.8, 0.5], 0.12).unwrap());
-        gpu.render(&overhead())
-    };
-    let light = linear(&plain, 16, 16).map(|c| c as f32);
-    let mut shown = Vec::new();
-    for curve in render::ToneCurve::ALL {
-        let image = floor_under(curve);
-        let at = ((16 * image.width + 16) * 4) as usize;
-        let got = [0, 1, 2].map(|c| f32::from(image.rgba[at + c]) / 255.0);
-        let want = curve.apply(light);
-        for c in 0..3 {
-            assert!(
-                (got[c] - want[c]).abs() < 0.012,
-                "{curve:?} channel {c}: {} is not {} (light {light:?})",
-                got[c],
-                want[c]
-            );
+fn each_tone_curve_shows_the_light_the_way_its_cpu_twin_says_from_the_toe_to_the_shoulder() {
+    // A dim sun, and one so bright that the floor's light is far past 1, where the curves roll off.
+    let mut brightest = 0.0f32;
+    for sun in [[0.5, 0.3, 0.1], [60.0, 20.0, 8.0]] {
+        let shown = floor_under_each_curve(sun);
+        for &(curve, got, light) in &shown {
+            brightest = brightest.max(light[0]);
+            let want = curve.apply(light);
+            for c in 0..3 {
+                assert!(
+                    (got[c] - want[c]).abs() < 0.012,
+                    "{curve:?} channel {c}: {} is not {} (light {light:?})",
+                    got[c],
+                    want[c]
+                );
+            }
         }
-        shown.push(got);
+        // The three are three different pictures: AgX is not Neutral, and the desaturated one is
+        // less colourful than Neutral.
+        let spread = |c: [f32; 3]| c[0].max(c[1]).max(c[2]) - c[0].min(c[1]).min(c[2]);
+        let by = |curve| shown.iter().find(|s| s.0 == curve).unwrap().1;
+        let (neutral, agx, desat) = (
+            by(render::ToneCurve::Neutral),
+            by(render::ToneCurve::Agx),
+            by(render::ToneCurve::NeutralDesat),
+        );
+        let apart = (0..3)
+            .map(|c| (neutral[c] - agx[c]).abs())
+            .fold(0.0, f32::max);
+        assert!(apart > 0.02, "{shown:?}");
+        assert!(spread(desat) < spread(neutral), "{shown:?}");
     }
-    // The three are three different pictures: AgX is not Neutral, and the desaturated one is
-    // less colourful than Neutral.
-    let spread = |c: [f32; 3]| c[0].max(c[1]).max(c[2]) - c[0].min(c[1]).min(c[2]);
-    assert!((shown[0][0] - shown[1][0]).abs() > 0.02, "{shown:?}");
-    assert!(spread(shown[2]) < spread(shown[0]), "{shown:?}");
+    assert!(
+        brightest > 8.0,
+        "the bright case reaches the shoulder: {brightest}"
+    );
 }
 
 #[test]
@@ -889,13 +911,20 @@ fn the_reference_mean_can_be_shown_again_under_another_curve_without_taking_a_sa
         curve: render::ToneCurve::Neutral,
         ..Stages::default()
     });
-    let neutral = gpu.reshow_reference();
+    let neutral = gpu.reshow_reference().unwrap();
     assert_eq!(gpu.reference_samples(), 4);
     assert_ne!(first.rgba, neutral.rgba);
     gpu.set_stages(Stages::default());
-    let again = gpu.reshow_reference();
+    let again = gpu.reshow_reference().unwrap();
     assert_eq!(
         first.rgba, again.rgba,
         "the same mean, curve and exposure give the same image"
     );
+    // After a restart there is no mean to show: not the old one.
+    gpu.set_stages(Stages {
+        normal_bias: render::NormalBias::None,
+        ..Stages::default()
+    });
+    assert_eq!(gpu.reference_samples(), 0);
+    assert!(gpu.reshow_reference().is_none());
 }

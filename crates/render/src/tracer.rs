@@ -21,8 +21,9 @@ use crate::sun::{Sun, SunUniform};
 use crate::upscale::{History, Resolution, UpscalePass};
 use crate::{Result, shaders};
 
-/// Format of the traced image that the upscaler and the copy to the window read: values encoded with
-/// the true sRGB curve, in a plain unorm texture. The kernels draw linear light in [`HDR_FORMAT`]
+/// Format of the traced image that the upscaler and the copy to the window read: display-encoded
+/// values (AgX-like by default; the true sRGB curve for Neutral and with the transform off), in a
+/// plain unorm texture. The kernels draw linear light in [`HDR_FORMAT`]
 /// images, and the display transform (`post.wgsl`) turns those into this.
 pub const IMAGE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 
