@@ -824,7 +824,7 @@ fn print_real_time(r: &realtime::RealTimeReport) {
             n + 1,
             c.time_to_level_0_under_camera_s,
             c.load_s,
-            c.ring_s,
+            c.spawn_ring_s,
             c.guard_s,
             c.fill_s
         );
@@ -929,9 +929,11 @@ fn print_real_time(r: &realtime::RealTimeReport) {
         ("holes", g.holes),
         ("scene (MiB)", g.scene_mib),
         ("store (bricks)", g.store_bricks),
-        ("soft-miss frames, flights", g.soft_miss_frames),
+        ("soft-miss frames, flights", g.camera_soft_miss_frames),
+        ("scene lag, flights (d0)", g.scene_lag_d0_max),
+        ("spawn ring (s)", g.spawn_ring_s),
         ("time to control (s)", g.time_to_control_s),
-        ("settle (s, proposed)", g.settle_s),
+        ("settle (s)", g.settle_s),
     ] {
         eprintln!(
             "  gate {name:<20} worst {:>12.2} limit {:>12.2}{}",

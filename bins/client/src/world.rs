@@ -199,6 +199,13 @@ pub struct World {
 struct Motion {
     last: Option<(std::time::Instant, [f64; 3])>,
     velocity: [f64; 3],
+    /// The speed the bands are drawn for (ADR 0009), in Voxels a second: a running mean as the
+    /// velocity is, but not cut at [`MOST_LEAD_SPEED`], since a Zoom's flight that fast is a camera
+    /// to draw coarse, though it is not one to look ahead along; a single frame's jump (a
+    /// teleport) is not a speed, and is left out.
+    speed: f64,
+    /// Frames in a row that were over [`MOST_LEAD_SPEED`].
+    fast: u32,
 }
 
 /// Faster than this, in Voxels a second (400 m/s, several times the flight speed), the camera
@@ -206,7 +213,8 @@ struct Motion {
 const MOST_LEAD_SPEED: f64 = 400.0 * brick_store::VOXELS_PER_METRE;
 
 impl Motion {
-    /// The velocity after the camera was seen at `camera` at `now`.
+    /// The velocity after the camera was seen at `camera` at `now`. [`Motion::speed`] is the
+    /// bands' own.
     fn observe(&mut self, camera: [f64; 3], now: std::time::Instant) -> [f64; 3] {
         let before = self.last.replace((now, camera));
         let Some((then, from)) = before else {
@@ -218,14 +226,32 @@ impl Motion {
         }
         let raw: [f64; 3] = std::array::from_fn(|a| (camera[a] - from[a]) / dt);
         let speed = raw.iter().map(|v| v * v).sum::<f64>().sqrt();
+        let alpha = (dt / 0.1).min(1.0);
+        if dt > 0.25 {
+            self.speed = 0.0;
+            self.fast = 0;
+        } else if speed > MOST_LEAD_SPEED {
+            self.fast += 1;
+            // The second frame in a row is a flight, not a jump: at once the speed of the flight.
+            if self.fast >= 2 {
+                self.speed = speed;
+            }
+        } else {
+            self.fast = 0;
+            self.speed += (speed - self.speed) * alpha;
+        }
         if dt > 0.25 || speed > MOST_LEAD_SPEED {
             self.velocity = [0.0; 3];
             return self.velocity;
         }
-        let alpha = (dt / 0.1).min(1.0);
         self.velocity =
             std::array::from_fn(|a| self.velocity[a] + (raw[a] - self.velocity[a]) * alpha);
         self.velocity
+    }
+
+    /// The speed the bands are drawn for, as of the last sighting.
+    fn speed(&self) -> f64 {
+        self.speed
     }
 }
 
@@ -606,17 +632,16 @@ impl World {
     /// the rings are never half moved.
     pub fn recentre(&mut self, camera: [f64; 3]) -> Result<Option<SceneUpdate>, RingsFull> {
         let velocity = self.lead_velocity(camera, self.clock.now());
-        self.recentre_moving(camera, velocity)
+        // The bands' speed is the camera's own, whether or not it is looked ahead along.
+        let speed = self.motion.speed();
+        self.recentre_at(camera, velocity, speed)
     }
 
     /// The velocity [`World::recentre`] hands to the scene thread for the camera seen at `camera`
     /// at `now`: the measured one, or none if the lead is off.
     fn lead_velocity(&mut self, camera: [f64; 3], now: std::time::Instant) -> [f64; 3] {
-        if self.lead {
-            self.motion.observe(camera, now)
-        } else {
-            [0.0; 3]
-        }
+        let velocity = self.motion.observe(camera, now);
+        if self.lead { velocity } else { [0.0; 3] }
     }
 
     /// [`World::recentre`] with the camera's `velocity` given, in Voxels a second, for the lead
@@ -626,9 +651,22 @@ impl World {
         camera: [f64; 3],
         velocity: [f64; 3],
     ) -> Result<Option<SceneUpdate>, RingsFull> {
+        let speed = velocity.iter().map(|v| v * v).sum::<f64>().sqrt();
+        self.recentre_at(camera, velocity, speed)
+    }
+
+    /// [`World::recentre_moving`] with the `speed` the bands are drawn for given too (Voxels a
+    /// second), which is the camera's whether or not it has a lead: a Zoom (#58) is drawn for its
+    /// speed, along which prefetch does not look.
+    pub fn recentre_at(
+        &mut self,
+        camera: [f64; 3],
+        velocity: [f64; 3],
+        speed: f64,
+    ) -> Result<Option<SceneUpdate>, RingsFull> {
         match &self.worker {
             Some(worker) => {
-                worker.follow_moving(camera, velocity);
+                worker.follow_at(camera, velocity, speed);
                 // A stepped scene thread does its round now, with the camera it was just told.
                 worker.step();
                 let wait = self.edit_due()?;
@@ -983,6 +1021,15 @@ mod tests {
         (World::new(scene, Predictor::new(store), client), server)
     }
 
+    /// A world whose camera has been going 150 Voxels a second for 200 frames.
+    fn world_with_flight(base: std::time::Instant) -> (World, ServerEnd) {
+        let (mut world, server) = world();
+        for n in 0..=200 {
+            world.lead_velocity([0.75 * f64::from(n), 0.0, 0.0], frames(base, n));
+        }
+        (world, server)
+    }
+
     /// `n` frames of 5 ms after `base`.
     fn frames(base: std::time::Instant, n: u32) -> std::time::Instant {
         base + std::time::Duration::from_millis(5) * n
@@ -1029,6 +1076,42 @@ mod tests {
         world.set_lead(false);
         let off = world.lead_velocity([151.5, 0.0, 0.0], frames(base, 202));
         assert_eq!(off, [0.0; 3]);
+    }
+
+    #[test]
+    fn the_bands_get_the_cameras_speed_whether_or_not_there_is_a_lead_and_however_fast() {
+        let base = std::time::Instant::now();
+        let (mut world, _server) = world();
+        world.set_lead(false);
+        for n in 0..=200 {
+            let lead = world.lead_velocity([0.75 * f64::from(n), 0.0, 0.0], frames(base, n));
+            assert_eq!(lead, [0.0; 3]);
+        }
+        // No lead, and the bands still have the speed (150 Voxels a second).
+        assert!(
+            (world.motion.speed() - 150.0).abs() < 1.0,
+            "{}",
+            world.motion.speed()
+        );
+        // A Zoom faster than the lead is cut at: no lead (it is a jump), and the speed of a flight
+        // once it is two frames in, so that it is not drawn at full detail.
+        let step = MOST_LEAD_SPEED * 0.005 * 2.0;
+        let mut at = 150.0;
+        for n in 201..=205 {
+            at += step;
+            let lead = world.lead_velocity([at, 0.0, 0.0], frames(base, n));
+            assert_eq!(lead, [0.0; 3]);
+        }
+        assert!(
+            world.motion.speed() > MOST_LEAD_SPEED,
+            "{}",
+            world.motion.speed()
+        );
+        // A single jump in a flight is a teleport, not a speed.
+        let (mut world, _server) = world_with_flight(base);
+        let before = world.motion.speed();
+        world.lead_velocity([1.0e9, 0.0, 0.0], frames(base, 203));
+        assert_eq!(world.motion.speed(), before);
     }
 
     #[test]

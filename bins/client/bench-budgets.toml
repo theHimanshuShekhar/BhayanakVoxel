@@ -54,7 +54,6 @@ edit_frame_thread = 4.0
 # The gates of the real-time streaming mode (`--streaming --real-time`, #162): the full-size Planet
 # with the real loader workers and scene thread, on the 4090. Each is held to the worst of the runs
 # (three by default), and a run over any of them fails with exit status 2. Every key is needed.
-# Soft misses, time to control and settle time are reported, not gated (#168 turns them on).
 [streaming]
 # Frame time, p99 of the frames of each path: a 60 Hz frame (spec: "Generation and streaming").
 frame_time_p99_ms = 16.7
@@ -67,17 +66,28 @@ holes = 0
 # The store's budget is not here: the store holds its own (`STREAMED_PER_D0_SQUARED`, with the
 # overflow), and the report's peak is held to that limit.
 scene_mib = 512.0
-# Soft misses at the speed-scaled level (ADR 0009, #168): the frames with a soft miss, summed over
-# the flight at 2 m, the flight at 50 m, the vertical take-off and the 180 degree turn: none.
-soft_miss_frames = 0
-# Time to control (#168): seconds from the world map being ready to the 20 m spawn ring being made.
-time_to_control_s = 2.0
-# Settle time (#168): seconds from the camera stopping after a flight at 50 m/s to a scene with no
-# soft miss and nothing left to look at again for the bands. PROPOSED, not agreed: the worst
-# measured on the dev box (67 to 80 s with the curve, 97 s on a loaded box; 52 s with none) plus about 15% (see the PR of #168); the owner
-# decides it, and this is the one number to change. A run that has not settled at the cap (120 s)
-# is over whatever this is.
-settle_s = 110.0
+# Soft misses under the camera (ADR 0009, #168): the frames in which the ground straight below the
+# frame's camera is drawn coarser than the speed-scaled bands ask at its distance, summed over the
+# flight at 2 m, the flight at 50 m, the vertical take-off and the 180 degree turn: none. (The scene
+# thread's own count, against the scene's lagging camera, is reported and not gated.)
+camera_soft_miss_frames = 0
+# How far behind the camera the drawn scene is, in d0, at the most over those four flights. Main's
+# value on the 4090 is 7.81 d0 at 50 m: this is that plus a margin, FOR NOW. It tightens to about
+# 2 d0 once the follow fixes land (docs/agents/benchmarking.md).
+scene_lag_d0_max = 8.0
+# The spawn ring (#168): seconds to make the 20 m of full detail round the Spawn, where the player
+# has control (ADR 0009).
+spawn_ring_s = 2.0
+# Time to control as the player sees it: seconds from the world map being ready to the window
+# opening, the ring and the Guard both (the window waits for the Guard so that nothing past the ring
+# is sky). "Control in 2 s with no sky" is NOT met: it is #220 (a background Guard). Held at what it
+# measures now (4.3 s on the 4090, 7 s on the loaded dev box) plus a margin.
+time_to_control_s = 10.0
+# Settle time (#168): seconds from the camera stopping after a flight at 50 m/s to a scene that is at
+# the camera, has no soft miss and has nothing left to look at again for the bands. Main's value on
+# the 4090 is 47.8 s; this is that plus 15%. A run that has not settled at the cap (120 s) is over
+# whatever this is.
+settle_s = 55.0
 
 # The GPU time of one profiler frame, by mode: from the start of its first pass to the end of
 # its last. In primary mode that is one frame of the path. In reference mode every sample is a

@@ -72,10 +72,15 @@ use super::stream::StreamReport;
 /// Nothing else is changed.
 ///
 /// 21 (#168; 20 is #202's, which is open: the number is the later of the two) added to the real-time
-/// report's cold start `ring_s` and `guard_s` (the 20 m spawn ring, and the Guard that the window
-/// waits for as well), and to its gates `soft_miss_frames`, `time_to_control_s` and `settle_s`
-/// (`over` may now also name `soft_misses`, `time_to_control` and `settle`). The budgets file has
-/// the three keys, in `[streaming]`. Nothing else is changed.
+/// report's cold start `spawn_ring_s` (the 20 m spawn ring), `guard_s` (the Guard that the window
+/// waits for as well) and `time_to_control_s` (from the world map being ready to the window
+/// opening), to each path `camera_soft_miss_frames` (frames whose ground below the frame's camera
+/// was drawn coarser than the bands ask), to the stop's `settle` `walk_s` and `fill_s` (its two
+/// parts), and to its gates `camera_soft_miss_frames`, `scene_soft_miss_frames` (reported),
+/// `scene_lag_d0_max`, `spawn_ring_s`, `time_to_control_s` and `settle_s` (`over` may now also name
+/// `soft_misses`, `scene_lag`, `spawn_ring`, `time_to_control` and `settle`). The budgets file has
+/// the keys `camera_soft_miss_frames`, `scene_lag_d0_max`, `spawn_ring_s`, `time_to_control_s` and
+/// `settle_s`, in `[streaming]`. Nothing else is changed.
 pub const SCHEMA_VERSION: u32 = 21;
 
 /// One timed thing (a pass, or the GPU total of a profiler frame) in one mode, against its

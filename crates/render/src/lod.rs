@@ -179,10 +179,13 @@ impl Bands {
         if level == 0 {
             return 0.0;
         }
-        let floor = self.scaled_d0() * (1u64 << level) as f64;
+        let base = self.d0 * (1u64 << level) as f64;
         match self.coarsening {
-            Some(c) if level >= c.from => floor / c.factor,
-            _ => floor,
+            // The coarser of the two wins: the speed's factor and the memory cap's do not multiply
+            // (a camera fast enough to be drawn coarser already has the fewer bricks the cap is
+            // after, and both at once was 4 times fewer than either asked for).
+            Some(c) if level >= c.from && self.scale * c.factor > 1.0 => base / c.factor,
+            _ => base * self.scale,
         }
     }
 
@@ -275,6 +278,11 @@ pub const DEPTH_STEP: f64 = 0.5;
 /// a step's speed does not flip it.
 pub const RELEASE: f64 = 1.1;
 
+/// How long the camera's speed must stay under the release point before a step is given back, in
+/// seconds: a single sample of a speed that fell (the velocity is reset to zero on a hitch, see
+/// `Motion` in the client's world) does not give back the depth the flight is drawn at.
+pub const RELEASE_HOLD: f64 = 0.5;
+
 /// The depth, in levels coarser than at rest, that a speed asks for before the steps and the
 /// hysteresis: nothing up to [`FULL_DETAIL_UP_TO`], a ramp to [`MOST_DEPTH`] at [`FLIGHT_SPEED`].
 /// `speed` is in Voxels a second.
@@ -302,6 +310,8 @@ pub struct SpeedScale {
     step: u32,
     /// The depth the ramp ends at: [`MOST_DEPTH`].
     most: f64,
+    /// How long, in seconds, the speed has been under the release point of the step.
+    calm: f64,
 }
 
 impl Default for SpeedScale {
@@ -315,13 +325,18 @@ impl SpeedScale {
     pub const AT_REST: SpeedScale = SpeedScale {
         step: 0,
         most: MOST_DEPTH,
+        calm: 0.0,
     };
 
     /// A camera at rest whose ramp ends at `most` levels instead of [`MOST_DEPTH`]: for measuring
     /// other curves. 0 is no speed scaling at all.
     pub fn at_rest_up_to(most: f64) -> Self {
         assert!(most >= 0.0 && most.is_finite(), "most is {most}");
-        Self { step: 0, most }
+        Self {
+            step: 0,
+            most,
+            calm: 0.0,
+        }
     }
 
     /// The depth now, in levels coarser than at rest.
@@ -329,9 +344,17 @@ impl SpeedScale {
         f64::from(self.step) * DEPTH_STEP
     }
 
-    /// Shows the camera's `speed`, in Voxels a second. Returns whether the depth changed. The
-    /// Zoom's hook: the speed it is given is the camera's along the Zoom (#58), the same rule.
-    pub fn observe(&mut self, speed: f64) -> bool {
+    /// Whether a step is to be given back if the speed stays where it is: the thread keeps
+    /// looking at the clock while it is.
+    pub fn releasing(&self) -> bool {
+        self.calm > 0.0
+    }
+
+    /// Shows the camera's `speed`, in Voxels a second, as it was for the last `dt` seconds. Returns
+    /// whether the depth changed. A deeper step is taken at once; a step is given back only when
+    /// the speed has been [`RELEASE`] under what it asks for for [`RELEASE_HOLD`]. The Zoom's hook:
+    /// the speed it is given is the camera's along the Zoom (#58), the same rule.
+    pub fn observe(&mut self, speed: f64, dt: f64) -> bool {
         let most = self.most;
         let steps = |speed: f64| {
             (depth_up_to(speed, most) / DEPTH_STEP - 1e-9)
@@ -340,10 +363,19 @@ impl SpeedScale {
         };
         let (up, down) = (steps(speed), steps(speed * RELEASE));
         let step = if up > self.step {
+            self.calm = 0.0;
             up
         } else if down < self.step {
-            down
+            self.calm += dt.max(0.0);
+            if self.calm >= RELEASE_HOLD {
+                self.calm = 0.0;
+                down
+            } else {
+                self.calm = self.calm.max(f64::MIN_POSITIVE);
+                self.step
+            }
         } else {
+            self.calm = 0.0;
             self.step
         };
         std::mem::replace(&mut self.step, step) != step
@@ -1282,11 +1314,22 @@ mod tests {
         speed * VOXELS_PER_METRE
     }
 
+    /// A frame's time, in seconds.
+    const DT: f64 = 1.0 / 60.0;
+
+    /// Shows `scale` the speed `metres` m/s for `seconds`, a frame at a time. Whether it changed.
+    fn hold(scale: &mut SpeedScale, speed: f64, seconds: f64) -> bool {
+        let frames = (seconds / DT).round() as usize;
+        (0..frames)
+            .map(|_| scale.observe(metres(speed), DT))
+            .fold(false, |any, changed| any | changed)
+    }
+
     #[test]
     fn a_camera_under_ten_metres_a_second_is_at_full_detail_and_the_bands_are_the_plain_ones() {
         let mut scale = SpeedScale::AT_REST;
         for speed in [0.0, 1.0, 5.0, 9.0, 10.0] {
-            assert!(!scale.observe(metres(speed)), "{speed} m/s");
+            assert!(!scale.observe(metres(speed), DT), "{speed} m/s");
             assert_eq!(scale.depth(), 0.0);
         }
         // Not a rounding of the bands: the same bands, bit for bit.
@@ -1302,7 +1345,7 @@ mod tests {
         assert!((depth_for(metres(50.0)) - 1.5).abs() < 1e-12);
         assert_eq!(depth_for(metres(400.0)), 1.5);
         let mut scale = SpeedScale::AT_REST;
-        assert!(scale.observe(metres(50.0)));
+        assert!(scale.observe(metres(50.0), DT));
         assert_eq!(scale.depth(), 1.5);
         let bands = Bands::with_d0(1000.0).speed_scaled(scale.depth());
         // Every level starts where the level a level and a half finer did: 2^-1.5 of the distance.
@@ -1319,19 +1362,39 @@ mod tests {
     fn a_camera_coarsens_at_once_and_refines_only_when_it_has_slowed() {
         let mut scale = SpeedScale::AT_REST;
         // At once, to the step that holds the speed (rounded up).
-        assert!(scale.observe(metres(50.0)));
+        assert!(scale.observe(metres(50.0), DT));
         assert_eq!(scale.depth(), 1.5);
-        // Slower, but within what the step holds and its release: no change.
-        assert!(!scale.observe(metres(40.0)));
-        assert!(!scale.observe(metres(35.0)));
+        // Slower, but within what the step holds and its release: no change, however long.
+        assert!(!hold(&mut scale, 40.0, 2.0));
+        assert!(!hold(&mut scale, 35.0, 2.0));
         assert_eq!(scale.depth(), 1.5);
-        // Well under it: the step is given back, to the step the speed holds.
-        assert!(scale.observe(metres(30.0)));
+        // Well under it, for as long as the hold: the step is given back, to the step the speed
+        // holds.
+        assert!(hold(&mut scale, 30.0, RELEASE_HOLD + 0.1));
         assert_eq!(scale.depth(), 1.0);
-        assert!(scale.observe(metres(15.0)));
+        assert!(hold(&mut scale, 15.0, RELEASE_HOLD + 0.1));
         assert_eq!(scale.depth(), 0.5);
         // Stopped: full detail.
-        assert!(scale.observe(0.0));
+        assert!(hold(&mut scale, 0.0, RELEASE_HOLD + 0.1));
+        assert_eq!(scale.depth(), 0.0);
+    }
+
+    #[test]
+    fn one_slow_sample_in_a_flight_does_not_give_back_the_depth() {
+        // The camera's velocity is reset to zero on a hitch (a frame over a quarter of a second):
+        // one such sample, mid-flight, gave back every step at once.
+        let mut scale = SpeedScale::AT_REST;
+        scale.observe(metres(50.0), DT);
+        assert_eq!(scale.depth(), 1.5);
+        assert!(!scale.observe(0.0, DT));
+        assert!(!scale.observe(0.0, 0.25));
+        assert_eq!(scale.depth(), 1.5);
+        // The flight goes on at its speed: the hold starts again after.
+        assert!(!hold(&mut scale, 50.0, 0.3));
+        assert!(!scale.observe(0.0, 0.25));
+        assert_eq!(scale.depth(), 1.5);
+        // Calm for the hold is a stop.
+        assert!(hold(&mut scale, 0.0, RELEASE_HOLD + 0.1));
         assert_eq!(scale.depth(), 0.0);
     }
 
@@ -1342,13 +1405,13 @@ mod tests {
         for tenth in 10..600 {
             let speed = f64::from(tenth) / 10.0;
             let mut scale = SpeedScale::AT_REST;
-            scale.observe(metres(speed));
+            scale.observe(metres(speed), DT);
             let first = scale.depth();
             let mut changes = 0;
             for n in 0..200 {
                 // A fixed pseudo-random wobble in [-4%, +4%].
                 let wobble = ((n * 7919 % 17) as f64 / 16.0 - 0.5) * 0.08;
-                changes += usize::from(scale.observe(metres(speed * (1.0 + wobble))));
+                changes += usize::from(scale.observe(metres(speed * (1.0 + wobble)), DT));
             }
             // The wobble may take the one step up at a boundary that it straddles (the speed is
             // held to a step that the top of the noise needs), and then it stays there.
@@ -1357,18 +1420,37 @@ mod tests {
     }
 
     #[test]
-    fn speed_scaling_and_the_memory_coarsening_multiply_and_the_bands_stay_in_order() {
-        let both = Bands::with_d0(1000.0).speed_scaled(1.0).coarsened(3, 1.5);
+    fn of_speed_scaling_and_the_memory_coarsening_the_coarser_wins_and_the_bands_stay_in_order() {
         let plain = Bands::with_d0(1000.0);
+        // The speed's factor 0.5 is coarser than the cap's 1/1.5: it alone.
+        let speed = Bands::with_d0(1000.0).speed_scaled(1.0);
+        let both = speed.coarsened(3, 1.5);
         for level in 1..12 {
-            let factor = if level >= 3 { 1.5 } else { 1.0 };
-            let want = plain.floor(level) * 0.5 / factor;
-            assert!((both.floor(level) - want).abs() < 1e-9, "{level}");
+            assert_eq!(both.floor(level), speed.floor(level), "{level}");
+            assert!((both.floor(level) - plain.floor(level) * 0.5).abs() < 1e-9);
             assert!(both.floor(level + 1) > both.floor(level));
         }
-        // The weight is of the shape of the bands, not of how near they are: a camera at speed
-        // wants the same share of what it holds as one at rest (the coarsening's relaxation reads
-        // it as a ratio).
-        assert!((both.weight() - Bands::with_d0(1000.0).coarsened(3, 1.5).weight()).abs() < 1e-9);
+        // A slight speed factor (0.7) against the cap's 1/1.5 = 0.67: the cap's, from level 3.
+        let slight = Bands::with_d0(1000.0).speed_scaled(0.5).coarsened(3, 1.5);
+        let speed = Bands::with_d0(1000.0).speed_scaled(0.5);
+        for level in 1..12 {
+            let want = if level >= 3 {
+                plain.floor(level) / 1.5
+            } else {
+                speed.floor(level)
+            };
+            assert!((slight.floor(level) - want).abs() < 1e-9, "{level}");
+            assert!(slight.floor(level + 1) > slight.floor(level));
+        }
+        // At rest the cap alone, bit for bit what it was.
+        let rest = Bands::with_d0(1000.0).coarsened(3, 1.5);
+        for level in 1..12 {
+            let want = if level >= 3 {
+                plain.floor(level) / 1.5
+            } else {
+                plain.floor(level)
+            };
+            assert_eq!(rest.floor(level), want, "{level}");
+        }
     }
 }

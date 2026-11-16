@@ -340,11 +340,15 @@ is made there (below): the run's **Edit latency**. Its frames are not those of a
   ground at level 0) and `fill_s` (from the start of the load to the resident set being complete).
   `time_to_level_0_under_camera_s` is not gated, and **is not the spec's "time to control"**: the
   field is named for the ray that it uses, and the window waits for the Guard too, so it reads the
-  load time. **`ring_s` and `guard_s`** (#168) are the two parts of the load, from `crate::load`:
-  the 20 m spawn ring (`SPAWN_REACH`), which is the player's control (ADR 0009: the character
-  stands in it, and the bench has no server), and the Guard after it. **`ring_s` is gated**
-  (`time_to_control_s`, 2 s): the worst over the runs. The Guard is not in it, and the window
-  waits for it so that nothing past the ring is sky (see the PR of #168 for that conflict).
+  load time. **`spawn_ring_s`, `guard_s` and `time_to_control_s`** (#168) are the parts of the load,
+  from `crate::load`: the 20 m spawn ring (`SPAWN_REACH`), which is the player's control (ADR
+  0009: the character stands in it, and the bench has no server), the Guard after it, and the real
+  time from the world map being ready to the window opening (the ring, the Guard and the first
+  scene: the window waits for the Guard so that nothing past the ring is sky). **Two gates**, each
+  the worst over the runs: `spawn_ring_s` (2 s) on the ring, and `time_to_control_s` on the real
+  time, held at what it measures now plus a margin (10 s; 4.3 s on the 4090, 7 s on the loaded dev
+  box). **"Control in 2 s with nothing beyond the ring sky" is not met**: it is #220, a
+  background Guard.
 - `paths[]`: `name`, `frames`, `seconds` and, for each path:
   - `frame_time`: `samples`, `mean_ms`, **`p99_ms`** (nearest rank) and **`worst_ms`**. A frame is
     the frame thread's work in the game's order: `World::recentre`, the copy of what the scene
@@ -489,12 +493,22 @@ is made there (below): the run's **Edit latency**. Its frames are not those of a
     the same per frame). Nothing here is gated.
   - `soft_misses` (a `Series` of what each frame reported: frames, total, max, frames with any) and
     `soft_misses_per_frame`. The scene thread counts them a few times a second, so a frame
-    reports the last count, and the count stays within about 100 ms of the truth. **Gated on the
-    flights** (#168): the frames with any soft miss on the flights at 2 m and 50 m, the take-off
-    and the turn, summed, at the most of the runs, must be 0 (`soft_miss_frames`). The cold start
-    and the stop are not flights: they fill and refine, and have many. A soft miss is counted by
-    the scene thread against **its own** camera, which lags the frame thread's (see
-    `scene_lag_*`): 0 is the scene's, not the camera's.
+    reports the last count, and the count stays within about 100 ms of the truth. The scene thread's own soft misses are **reported and not gated**: it counts
+    them against **its own** camera, which lags the frame thread's (see `scene_lag_*`), so 0 is the
+    scene's, not the camera's (`gates.scene_soft_miss_frames` is the flights' frames with any).
+  - `camera_soft_miss_frames`: the frames of the path in which **one ray straight down from the
+    frame's camera** hits ground drawn coarser than the (speed-scaled) bands ask at its distance,
+    less the bands' 5% hysteresis (scored on the flights only). **Gated** (#168): on the flights at
+    2 m and 50 m, the take-off and the turn, summed, at the most of the runs, must be 0
+    (`camera_soft_miss_frames`). It is the soft miss of what the player stands on, at the camera
+    that is drawn from, which the scene's own count is not. The alternative, scoring every brick
+    at the frame camera, was not taken: it is a pass over every node a frame, for the same answer
+    where the player looks. The cold start and the stop are not flights: they fill and refine,
+    and have many.
+  - `scene_lag_d0_max` and the others: **the max over the four flights is gated**
+    (`scene_lag_d0_max`, 8.0): main's 7.81 `d0` on the 4090 at 50 m plus a margin, for now. **The
+    limit tightens to about 2 `d0` once the follow fixes land**; it is not a statement of what the
+    lag should be.
   - `hole_looks`, `holes` and `holes_per_frame`: **holes are sampled, not counted for every
     frame** (see "What the holes gate can and cannot catch"). Looking at every split brick takes
     0.3 s at full size with the store's read lock held, so the scene thread does it every 5 s
@@ -517,9 +531,12 @@ is made there (below): the run's **Edit latency**. Its frames are not those of a
   - `end_look_ms`: what the look that is forced at the end of the path took in the scene thread
     (the scan itself), in milliseconds. It is made after the frames, so it is in no frame's time.
   - `settle`, for `stop after a flight` only (null for the others): `seconds` from the frame the
-    camera stopped in to the first frame with no soft misses and nothing left to look at again for
-    the bands (`Scene::waiting` counts both), or the cap, and `settled`. **Gated** (#168), the
-    limit `settle_s` **proposed and not agreed**: over if it is over the limit or did not settle.
+    camera stopped in to the first frame in which the scene is at the camera (the drawn scene's camera is
+    the frame's), has no soft misses and nothing left to look at again for the bands
+    (`Scene::waiting` counts both), or the cap, and `settled`; `walk_s` is the first part (the
+    scene walking to where the camera stopped) and `fill_s` the rest (the scene thread making what
+    the bands ask for, and waiting for the loader's bricks). **Gated** (#168), `settle_s`, 55 s:
+    main's 47.8 s on the 4090 plus 15%. Over if it is over the limit or did not settle.
     The scene thread's count of soft misses can be from before the stop (it counts a few times a
     second, and not at all while it sleeps), so a stale 0 would read as settled at once. So the
     stop is followed by **a count made after it** (`SceneWorker::look_now(false)`, the count and no
@@ -586,8 +603,8 @@ is made there (below): the run's **Edit latency**. Its frames are not those of a
   `docs/measurements.md` are measured again.
 
 `gates` holds, for each measure, the `worst` over every run (and path) and the `limit`, and `over`
-lists the gates that are over: `frame_time`, `frame_cpu`, `holes`, `memory`, `soft_misses`,
-`time_to_control`, `settle`. For the holes it also
+lists the gates that are over: `frame_time`, `frame_cpu`, `holes`, `memory`, `soft_misses`
+(under the camera), `scene_lag`, `spawn_ring`, `time_to_control`, `settle`. For the holes it also
 has `hole_looks_fewest_in_a_run` and `hole_looks_fewest_in_a_path`.
 
 **Edit latency is measured in this mode**, as ADR 0006's bound needs the real scene thread and the

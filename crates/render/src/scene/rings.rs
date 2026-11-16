@@ -1014,20 +1014,36 @@ impl Scene {
             .map(Some)
     }
 
-    /// Draws by other `bands` for the camera where it is, patching what changes level instead of
-    /// making the scene again (see [`Selection::set_bands`]): what the camera's speed asks of the
-    /// bands (ADR 0009, #168), which changes a few times in a flight. A scene that is not rings
-    /// has no bands, and changes nothing. Returns what changed, as [`Scene::recentre`] does.
-    pub fn reband(
+    /// Draws by other `bands`, patching what changes level instead of making the scene again (see
+    /// [`Selection::set_bands`]): what the camera's speed asks of the bands (ADR 0009, #168), which
+    /// changes a few times in a flight. Nothing is drawn differently until [`Scene::reband_some`]
+    /// has looked at the nodes. A scene that is not rings has no bands, and changes nothing.
+    pub fn reband(&mut self, bands: Bands) {
+        if let Some(rings) = &mut self.rings {
+            rings.selection.set_bands(bands);
+        }
+    }
+
+    /// Looks again at some of the nodes that [`Scene::reband`] listed (see
+    /// [`Selection::relook_some`]), up to `nodes` of them and about `bricks` changed, and packs what
+    /// changed. Returns what changed, as [`Scene::recentre`] does. Its own call, with its own
+    /// size: it is not a step of following the camera.
+    pub fn reband_some(
         &mut self,
         store: &BrickStore,
-        bands: Bands,
+        nodes: usize,
+        bricks: usize,
     ) -> Result<Option<SceneUpdate>, RingsFull> {
         let Some(rings) = &mut self.rings else {
             return Ok(None);
         };
-        let diff = rings.selection.set_bands(store, bands);
+        let diff = rings.selection.relook_some(store, nodes, bricks);
         self.show_diff(store, &diff)
+    }
+
+    /// How many nodes [`Scene::reband_some`] has yet to look at.
+    pub fn rebanding(&self) -> usize {
+        self.rings.as_ref().map_or(0, |r| r.selection.relooking())
     }
 
     /// The scene made again for `camera` and `bands`, in place, from nothing: what a jump of the

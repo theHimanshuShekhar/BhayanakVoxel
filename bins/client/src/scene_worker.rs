@@ -122,6 +122,22 @@ const FOLLOW_SHARE: (u64, u64) = (1, 4);
 /// first 4090 run).
 const FOLLOW_MIN_COST: (f64, f64) = (32.0 * 1024.0, 2.0);
 
+/// Nodes that one look at the nodes a change of the speed scale listed takes
+/// ([`Engine::reband_more`]), and the bricks it changes at the most to begin with, the least and
+/// the most it is sized to after (from the upload budget, as a follow step is).
+/// How long one [`Engine::reband_more`] goes on for at the most: more than a follow step's
+/// [`SLICE`], since the camera is followed first in the round and this is what is left of it.
+const REBAND_SLICE: Duration = Duration::from_millis(5);
+
+/// How often the thread looks at the clock while a step of the speed scale waits to be given back
+/// ([`Engine::await_work`]).
+const RELEASE_TICK: Duration = Duration::from_millis(100);
+
+const REBAND_NODES: usize = 2048;
+const REBAND_FIRST: usize = 512;
+const REBAND_LEAST: usize = 32;
+const REBAND_MOST: usize = 16 * 1024;
+
 /// How much a follow step's length changes by after one step, at the most, up and down: a step
 /// that cost half of what it may goes on twice as far, and one that cost over twice goes half.
 const FOLLOW_STEP_CHANGE: (f64, f64) = (0.5, 2.0);
@@ -573,6 +589,9 @@ struct Inbox {
     /// The camera's velocity, in Voxels a second, as the frame thread has seen it move: what the
     /// lead looks ahead along (zero for no lead).
     velocity: [f64; 3],
+    /// The camera's speed as the bands are drawn for it (ADR 0009), in Voxels a second: not the
+    /// lead's, which is none with the lead off and is cut at a jump.
+    speed: f64,
     /// Jobs that the frame thread waits for, with the number each is to be told done by.
     jobs: VecDeque<(u64, Job)>,
     issued: u64,
@@ -731,6 +750,7 @@ impl SceneWorker {
             inbox: Mutex::new(Inbox {
                 camera,
                 velocity: [0.0; 3],
+                speed: 0.0,
                 jobs: VecDeque::new(),
                 issued: 0,
                 shutdown: false,
@@ -803,11 +823,14 @@ impl SceneWorker {
             work: Done::default(),
             ahead: [None; AHEAD],
             velocity: [0.0; 3],
+            speed_in: 0.0,
+            speed_at: None,
             idle: false,
             throttled: false,
             pending: UploadCost::default(),
             batch_cost: UploadCost::default(),
             follow_step: None,
+            reband_bricks: REBAND_FIRST,
             teleported: false,
             clock,
             #[cfg(test)]
@@ -929,9 +952,18 @@ impl SceneWorker {
     /// thread is at the camera at this moment, it is told the next time.
     /// A `velocity` for the camera, in Voxels a second, makes the thread look ahead along it for
     /// prefetch (zero for none).
+    #[cfg(test)]
     pub fn follow_moving(&self, camera: [f64; 3], velocity: [f64; 3]) {
+        let speed = velocity.iter().map(|v| v * v).sum::<f64>().sqrt();
+        self.follow_at(camera, velocity, speed);
+    }
+
+    /// [`SceneWorker::follow_moving`] with the `speed` the bands are drawn for given, in Voxels a
+    /// second: the camera's own, which a lead of none (`velocity` zero) or a jump does not cut
+    /// (ADR 0009: a fast Zoom is drawn coarse).
+    pub fn follow_at(&self, camera: [f64; 3], velocity: [f64; 3], speed: f64) {
         if let Ok(mut inbox) = self.shared.inbox.try_lock()
-            && (inbox.camera != camera || inbox.velocity != velocity)
+            && (inbox.camera != camera || inbox.velocity != velocity || inbox.speed != speed)
         {
             let moved = (0..3)
                 .map(|a| (camera[a] - inbox.camera[a]).powi(2))
@@ -940,6 +972,7 @@ impl SceneWorker {
             inbox.moved = inbox.moved.max(moved);
             inbox.camera = camera;
             inbox.velocity = velocity;
+            inbox.speed = speed;
             self.shared.wake.notify_one();
         }
     }
@@ -1321,6 +1354,9 @@ struct Engine {
     /// camera that was looked at last.
     ahead: [Option<[f64; 3]>; AHEAD],
     velocity: [f64; 3],
+    /// The camera's speed for the bands that was looked at last, and when.
+    speed_in: f64,
+    speed_at: Option<Instant>,
     /// The last round did nothing, so a thread waits to be told (see [`Engine::await_work`]).
     idle: bool,
     /// The last round held work back for the upload budget (see [`Engine::over_budget`]), so the
@@ -1335,6 +1371,8 @@ struct Engine {
     /// How long the next step of following the camera is (None before the first), from how the
     /// steps so far cost (see [`Engine::follow`]).
     follow_step: Option<FollowStep>,
+    /// The bricks that the next [`Engine::reband_more`] changes at the most.
+    reband_bricks: usize,
     /// The camera was put somewhere far, further than the scene follows by patching (a
     /// teleport), since the last follow: the scene is made again there, not walked to.
     teleported: bool,
@@ -1508,13 +1546,16 @@ impl Engine {
             && inbox.jobs.is_empty()
             && Some(inbox.camera) == self.camera
             && inbox.velocity == self.velocity
+            && inbox.speed == self.speed_in
         {
             let shared = Arc::clone(&self.shared);
-            let (camera, paused, moving) = (self.camera, self.paused, self.velocity);
+            let (camera, paused, moving, speed) =
+                (self.camera, self.paused, self.velocity, self.speed_in);
             let quiet = |inbox: &mut Inbox| {
                 inbox.jobs.is_empty()
                     && Some(inbox.camera) == camera
                     && inbox.velocity == moving
+                    && inbox.speed == speed
                     && !inbox.shutdown
                     && shared.paused.load(Ordering::Acquire) == paused
             };
@@ -1528,6 +1569,17 @@ impl Engine {
                 }
             } else {
                 Duration::ZERO
+            };
+            // A step of the speed scale that is to be given back when the camera has been slow for
+            // a time (see [`SpeedScale::observe`]) needs the clock looked at as well.
+            let held = if self.speed.releasing() {
+                if held.is_zero() {
+                    RELEASE_TICK
+                } else {
+                    held.min(RELEASE_TICK)
+                }
+            } else {
+                held
             };
             inbox = if self.published.loader.pending == 0 && !self.over_the_cap {
                 // Nothing is on its way: only the frame thread can give it something to do.
@@ -1592,7 +1644,7 @@ impl Engine {
             self.next_place(camera)
         };
         self.look_ahead(place, velocity);
-        let rescaled = match self.rescale(velocity) {
+        let rescaled = match self.rescale() {
             Ok(rescaled) => rescaled,
             Err(full) => {
                 self.fail(full);
@@ -1658,6 +1710,12 @@ impl Engine {
             })
             .and_then(|moved| {
                 worked |= moved;
+                let more = self.reband_more();
+                worked |= self.scene.rebanding() > 0;
+                more
+            })
+            .and_then(|more| {
+                worked |= more;
                 let began = self.began();
                 let took = self.stream(camera);
                 self.spend(Part::Pack, began);
@@ -1818,7 +1876,7 @@ impl Engine {
     /// Shows the speed of the camera to the bands' scale (ADR 0009, #168): when it takes a step,
     /// the scene is selected in place for the new `d0` (a coarser one at once, a finer one when
     /// the speed has fallen), and what that changed is packed and noted like a follow step.
-    fn rescale(&mut self, velocity: [f64; 3]) -> Result<bool, RingsFull> {
+    fn rescale(&mut self) -> Result<bool, RingsFull> {
         #[cfg(test)]
         if self.shared.no_speed_scale.load(Ordering::Acquire) {
             return Ok(false);
@@ -1826,20 +1884,75 @@ impl Engine {
         if self.user_bands.is_none() {
             return Ok(false);
         }
-        let speed = velocity.iter().map(|v| v * v).sum::<f64>().sqrt();
-        if !self.speed.observe(speed) {
+        let speed = lock(&self.shared.inbox).speed;
+        self.speed_in = speed;
+        // How long that speed has been what the camera does, for the hold before a step is given
+        // back: no more than a quarter of a second for one look, whatever the thread was doing.
+        let now = self.clock.now();
+        let dt = self
+            .speed_at
+            .replace(now)
+            .map_or(0.0, |at| self.clock.since(at).as_secs_f64().min(0.25));
+        if !self.speed.observe(speed, dt) {
             return Ok(false);
         }
-        let began = self.began();
-        let store = self.store.read().expect("the store's lock is not poisoned");
-        let before = self.scene.bricks_changed();
-        let update = self.scene.reband(&store, self.bands_at(self.coarsening))?;
-        drop(store);
+        // Only the listing is done here: what changes is looked at by [`Engine::reband_more`], a
+        // few at a time and inside the budget, as the follow steps are.
+        self.scene.reband(self.bands_at(self.coarsening));
         self.work.speed_changes += 1;
-        self.work.speed_bricks += self.scene.bricks_changed() - before;
-        self.note(update);
-        self.spend(Part::Follow, began);
+        self.reband_bricks = REBAND_FIRST;
         Ok(true)
+    }
+
+    /// Looks at some more of the nodes that the last change of the speed scale listed
+    /// ([`Engine::rescale`]) and packs what changed, as many as fit [`SLICE`] and the upload
+    /// budget: this is its own work, charged to no follow step. Each call is sized from how much
+    /// the last cost against [`Engine::follow_target`], so that a change of millions of bricks is
+    /// a few hundred at a time and the frame thread's uploads stay inside the budget. Whether any
+    /// were looked at.
+    fn reband_more(&mut self) -> Result<bool, RingsFull> {
+        if self.scene.rebanding() == 0 {
+            return Ok(false);
+        }
+        let started = self.clock.now();
+        let began = self.began();
+        let mut looked = false;
+        while self.scene.rebanding() > 0 {
+            if self.over_budget() {
+                self.throttled = true;
+                break;
+            }
+            let store = self.store.read().expect("the store's lock is not poisoned");
+            let before = self.scene.bricks_changed();
+            let update = self
+                .scene
+                .reband_some(&store, REBAND_NODES, self.reband_bricks)?;
+            drop(store);
+            let changed = self.scene.bricks_changed() - before;
+            self.work.speed_bricks += changed;
+            looked = true;
+            if let Some(SceneUpdate::Rings(patch)) = &update {
+                let cost = patch.cost();
+                let target = self.follow_target();
+                let room = |target: f64, cost: f64| if cost <= 0.0 { 2.0 } else { target / cost };
+                let scale = room(target.bytes as f64, cost.bytes as f64)
+                    .min(room(f64::from(target.writes), f64::from(cost.writes)))
+                    .clamp(0.5, 2.0);
+                self.reband_bricks =
+                    ((self.reband_bricks as f64 * scale) as usize).clamp(REBAND_LEAST, REBAND_MOST);
+                #[cfg(test)]
+                {
+                    self.largest_follow.bytes = self.largest_follow.bytes.max(cost.bytes);
+                    self.largest_follow.writes = self.largest_follow.writes.max(cost.writes);
+                }
+            }
+            self.note(update);
+            if self.clock.since(started) >= REBAND_SLICE {
+                break;
+            }
+        }
+        self.spend(Part::Follow, began);
+        Ok(looked)
     }
 
     fn run_job(&mut self, job: Job) -> Result<(), RingsFull> {
@@ -2006,11 +2119,14 @@ impl Engine {
 
     /// The longest that a step of following the camera is: a step that costs the least that a
     /// Voxel does ([`FOLLOW_MIN_COST`]) at [`Engine::follow_target`], and no more than half a
-    /// jump.
+    /// jump. A speed-scaled scene (ADR 0009) has coarser bands, and a Voxel of the camera's way
+    /// costs less in proportion (fewer, larger bricks change), so the least cost is multiplied by the
+    /// bands' scale (the limit is longer by its inverse); a jump is of the unscaled `d0`, which is what `d0` is here.
     fn follow_limit(&self, d0: f64) -> f64 {
         let target = self.follow_target();
-        (target.bytes as f64 / FOLLOW_MIN_COST.0)
-            .min(f64::from(target.writes) / FOLLOW_MIN_COST.1)
+        let scale = self.scene.bands().map_or(1.0, |bands| bands.scale());
+        (target.bytes as f64 / (FOLLOW_MIN_COST.0 * scale))
+            .min(f64::from(target.writes) / (FOLLOW_MIN_COST.1 * scale))
             .min(render::scene::JUMP * d0 / 2.0)
             .max(1.0)
     }
@@ -2241,7 +2357,10 @@ impl Engine {
     /// At the memory cap, takes the next step of [`COARSENING`] once the last has stood for
     /// [`COARSEN_HOLD`], and has eviction look again.
     fn coarsen_more(&mut self) {
-        if !self.over_the_cap || self.clock.since(self.coarsened_at) < COARSEN_HOLD {
+        if !self.over_the_cap
+            || self.scene.rebanding() > 0
+            || self.clock.since(self.coarsened_at) < COARSEN_HOLD
+        {
             return;
         }
         // What the store holds for each node, while all it holds is wanted: taken before the
@@ -2300,6 +2419,7 @@ impl Engine {
             return;
         };
         if self.coarsening == 0
+            || self.scene.rebanding() > 0
             || self.loader.pending() != 0
             || self.evicting.is_some()
             || self.clock.since(self.coarsened_at) < COARSEN_HOLD

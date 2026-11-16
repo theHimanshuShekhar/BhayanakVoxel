@@ -267,15 +267,10 @@ const BUCKET: f64 = 4.0;
 /// it is twice as far.
 const HOT: f64 = 8.0;
 
-/// Nodes that other bands have looked at again in one [`Selection::update`]: a few tens of
-/// milliseconds of the scene thread, which goes on following the camera between the batches.
-const RELOOK: usize = 16 * 1024;
-
-/// Bricks that the changes of one [`Selection::update`] come to before the rest are left for the
-/// next: a change of bands (ADR 0009) merges millions of bricks, which in one
-/// call is seconds in which the scene thread follows nothing. A step of the camera changes far
-/// fewer, so this does not meet it.
-const CHANGES: usize = 32 * 1024;
+/// The most nodes that one [`Selection::relook_some`] looks at again after a change of bands
+/// (ADR 0009, #168): a few tens of milliseconds of the scene thread, which goes on following the
+/// camera between the calls.
+pub const RELOOK: usize = 16 * 1024;
 
 /// What changed in what is drawn: the bricks that are drawn now and were not, and the bricks
 /// that were drawn and are not. A brick that came and went in the same change is in neither.
@@ -477,6 +472,29 @@ pub fn par_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec
     parts.into_iter().flat_map(|(_, part)| part).collect()
 }
 
+/// Whether a node `distance` from the camera changes: what is drawn, or (for a whole node) whether
+/// it is in reach of `reach` (`margin` says whether it is). Both are the bands' and the cap's.
+fn node_changes(
+    bands: Bands,
+    reach: Placed,
+    key: Key,
+    distance: f64,
+    split: bool,
+    margin: bool,
+) -> bool {
+    let (level, coord) = key;
+    if split {
+        !(bands.split(level, distance, Some(true)) && reach.in_cap_at(level, coord, distance, true))
+    } else {
+        (bands.split(level, distance, Some(false))
+            && reach.in_cap_at(level, coord, distance, false))
+            || (!reach.is_none()
+                && (bands.split(level, reach.distance(level, coord), Some(margin))
+                    && reach.in_cap_wanted(level, coord, margin))
+                    != margin)
+    }
+}
+
 /// How far the camera (and the places it looks ahead to) must go before the node `key`, `distance`
 /// from the camera, could change: what is drawn, or for a whole node whether it is in reach of
 /// `reach` (`margin` says whether it is). Both are the bands' and the horizon cap's.
@@ -640,11 +658,9 @@ pub struct Selection {
     queue: BTreeMap<u64, Vec<(u64, Key)>>,
     /// The nodes that could change within [`HOT`] travel of the camera.
     hot: Vec<Hot>,
-    /// The nodes still to be looked at again for other bands ([`Selection::set_bands`]), which
-    /// [`Selection::update`] puts on the hot list [`RELOOK`] at a time.
+    /// The nodes still to be looked at again for other bands ([`Selection::set_bands`]), the next
+    /// at the end: [`Selection::relook_some`] takes them a few at a time.
     relook: Vec<Key>,
-    /// Nodes that change and were left for the next [`Selection::update`] (see [`CHANGES`]).
-    behind: usize,
     /// The stamps given out so far.
     stamps: u64,
     /// Bricks drawn at each level.
@@ -729,7 +745,6 @@ impl Selection {
             queue: BTreeMap::new(),
             hot: Vec::new(),
             relook: Vec::new(),
-            behind: 0,
             stamps: 0,
             drawn: [0; LEVELS],
             stuck: HashSet::default(),
@@ -976,7 +991,7 @@ impl Selection {
 
     /// Nodes that other bands ([`Selection::set_bands`]) have yet to look at again.
     pub fn relooking(&self) -> usize {
-        self.relook.len() + self.behind
+        self.relook.len()
     }
 
     /// Nodes of the tree: the bricks drawn, those split, and air that may have something in it.
@@ -1173,32 +1188,96 @@ impl Selection {
         }
     }
 
-    /// Draws by other `bands` from where the camera is, **in place**: the tree is kept, not made
-    /// again (that is [`crate::Scene::set_bands`]'s: seconds at full size). It is the speed-scaled
-    /// `d0` of ADR 0009 (#168): the bands differ only in `d0`'s scale, a few times in a flight.
-    /// Every node is looked at again, [`RELOOK`] of them at each [`Selection::update`], the finest
-    /// (nearest) first, and what that changes is at most [`CHANGES`] bricks at each:
-    /// [`Selection::rewanted`] says there is more to do. Done at once, a coarser scale merged 3.3
-    /// million bricks in 6.5 s of the scene thread at full size, in which a camera at 50 m/s goes
-    /// 325 m and nothing follows it. A brick that the new bands split but whose children are not
-    /// resident waits for them, as any brick does. Returns what changed in what is drawn.
-    pub fn set_bands(&mut self, store: &BrickStore, bands: Bands) -> Diff {
+    /// Draws by other `bands`, **in place**: the tree is kept, not made again (that is
+    /// [`crate::Scene::set_bands`]'s, seconds at full size). It is the speed-scaled `d0` of ADR 0009
+    /// (#168): the bands differ only in `d0`'s scale, a few times in a flight. This only lists the
+    /// nodes whose slack the new bands change (nothing is drawn differently yet);
+    /// [`Selection::relook_some`] looks at them, a few at a time, and says what changed.
+    ///
+    /// **Coarser** bands (a smaller `d0`) bring a split node's merge nearer, and a whole node's
+    /// split further, so the nodes to look at are the split ones, and the whole ones that hold a
+    /// margin request (which may be let go): coarsest first, as a merge takes what is under it with
+    /// it. **Finer** bands bring a whole node's split nearer, and a split node's merge further: the
+    /// whole nodes of level 1 and up, nearest the camera first (level 0 cannot split).
+    pub fn set_bands(&mut self, bands: Bands) {
         if self.bands == bands {
-            return Diff::default();
+            return;
         }
+        let coarser = bands.scaled_d0() < self.bands.scaled_d0();
         self.bands = bands;
         // The bound on how near a stuck brick is was made for the old bands' clear radii.
         self.bound = [None; LEVELS];
         self.bound_at = None;
         self.scan = None;
         self.since.clear();
-        // The finest are taken first (the end of the list is), as they are the nearest.
-        let mut by_level: [Vec<Key>; LEVELS] = std::array::from_fn(|_| Vec::new());
-        for &key in self.nodes.keys() {
-            by_level[key.0].push(key);
+        // What the last change of bands has not looked at yet is parked (it is in no list but
+        // this), so it is looked at for these bands too, whatever they are: a flight's first
+        // second changes the bands three times, and a node dropped from the list would be watched
+        // by nothing.
+        let pending: HashSet<Key> = std::mem::take(&mut self.relook).into_iter().collect();
+        if coarser {
+            let mut by_level: [Vec<Key>; LEVELS] = std::array::from_fn(|_| Vec::new());
+            for (&key, node) in &self.nodes {
+                if node.state == State::Split || node.margin || pending.contains(&key) {
+                    by_level[key.0].push(key);
+                }
+            }
+            self.relook = by_level.into_iter().flatten().collect();
+        } else {
+            // About 64 buckets of distance, a doubling in two: nearest at the end, with no sort.
+            let mut by_distance: Vec<Vec<Key>> = vec![Vec::new(); 64];
+            for (&key, node) in &self.nodes {
+                if (node.state == State::Whole && key.0 >= 1) || pending.contains(&key) {
+                    let d = brick_distance(self.camera, key.0, key.1).max(1.0);
+                    by_distance[((2.0 * d.log2()) as usize).min(63)].push(key);
+                }
+            }
+            self.relook = by_distance.into_iter().rev().flatten().collect();
         }
-        self.relook = by_level.into_iter().rev().flatten().collect();
-        self.update(store, self.camera)
+        self.park_relook();
+    }
+
+    /// Takes the nodes that [`Selection::relook_some`] is to look at out of [`Selection::update`]'s
+    /// way: their stamp is voided, so that what the lists hold for them (the hot list and the
+    /// queue, made for the old bands' slack) is stale, and an update does not take a change of
+    /// bands for the camera's move and change them all at once, outside the budget (3.3 million
+    /// bricks in one follow step, 7 s at full size). `relook_some` gives each a new stamp and its
+    /// place.
+    fn park_relook(&mut self) {
+        for key in &self.relook {
+            if let Some(node) = self.nodes.get_mut(key) {
+                node.stamp = 0;
+            }
+        }
+    }
+
+    /// Looks again at up to `nodes` of the nodes that [`Selection::set_bands`] listed, stopping
+    /// early once the bricks that changed come to `bricks`, and puts each back to be looked at when
+    /// the camera has gone as far as the new bands ask. Returns what changed in what is drawn; what
+    /// is left is [`Selection::relooking`].
+    pub fn relook_some(&mut self, store: &BrickStore, nodes: usize, bricks: usize) -> Diff {
+        let mut diff = Diff::default();
+        let (bands, reach, camera) = (self.bands, self.placed, self.camera);
+        for _ in 0..nodes {
+            let Some(key) = self.relook.pop() else { break };
+            let Some(node) = self.nodes.get_mut(&key) else {
+                continue;
+            };
+            self.stamps += 1;
+            node.stamp = self.stamps;
+            let (stamp, split, margin) = (self.stamps, node.state == State::Split, node.margin);
+            let distance = brick_distance(camera, key.0, key.1);
+            if node_changes(bands, reach, key, distance, split, margin) {
+                self.revisit(store, key, &mut diff);
+                if diff.added.len() + diff.removed.len() >= bricks {
+                    break;
+                }
+            } else {
+                let slack = node_slack(bands, reach, key, distance, split, margin);
+                self.watch(key, stamp, split, margin, slack);
+            }
+        }
+        diff
     }
 
     /// The horizon cap that was asked for, which [`Selection::reach`] has while it is on.
@@ -1252,26 +1331,6 @@ impl Selection {
                 margin: node.margin,
             });
         }
-    }
-
-    /// Puts the next [`RELOOK`] of the nodes that other bands are to look at again on the hot list.
-    /// A queue entry that a node had is stale from now (its stamp is another).
-    fn take_relook(&mut self) {
-        for _ in 0..RELOOK {
-            let Some(key) = self.relook.pop() else { break };
-            let Some(node) = self.nodes.get_mut(&key) else {
-                continue;
-            };
-            self.stamps += 1;
-            node.stamp = self.stamps;
-            self.hot.push(Hot {
-                key,
-                stamp: self.stamps,
-                split: node.state == State::Split,
-                margin: node.margin,
-            });
-        }
-        self.rewanted |= !self.relook.is_empty();
     }
 
     /// Whether the bands split the brick `key`, as `was` says it is (see [`Bands::split`]), and the
@@ -1653,7 +1712,6 @@ impl Selection {
             self.reconsider_all();
         }
         self.rewanted = false;
-        self.take_relook();
         let mut diff = Diff::default();
         // The nodes that may have become hot are taken out first, and each is either hot now,
         // changes, or is queued again for when it may be: what is queued again is looked at after
@@ -1671,18 +1729,7 @@ impl Selection {
         // Whether a node `distance` from the camera changes: what is drawn, or (for a whole node)
         // whether it is in reach.
         let changes = |key: Key, distance: f64, split: bool, margin: bool| {
-            let (level, coord) = key;
-            if split {
-                !(bands.split(level, distance, Some(true))
-                    && reach.in_cap_at(level, coord, distance, true))
-            } else {
-                (bands.split(level, distance, Some(false))
-                    && reach.in_cap_at(level, coord, distance, false))
-                    || (!reach.is_none()
-                        && (bands.split(level, reach.distance(level, coord), Some(margin))
-                            && reach.in_cap_wanted(level, coord, margin))
-                            != margin)
-            }
+            node_changes(bands, reach, key, distance, split, margin)
         };
         let slack = |key: Key, distance: f64, split: bool, margin: bool| {
             node_slack(bands, reach, key, distance, split, margin)
@@ -1692,6 +1739,14 @@ impl Selection {
         let mut stay = Vec::with_capacity(hot.len());
         let mut cooled = Vec::new();
         for entry in hot {
+            // An entry for a node that was looked at again since is stale: it has a newer one.
+            if self
+                .nodes
+                .get(&entry.key)
+                .is_none_or(|n| n.stamp != entry.stamp)
+            {
+                continue;
+            }
             let distance = brick_distance(camera, entry.key.0, entry.key.1);
             if changes(entry.key, distance, entry.split, entry.margin) {
                 changing.push((entry.stamp, entry.key));
@@ -1720,32 +1775,11 @@ impl Selection {
                 } => self.watch(key, stamp, split, margin, slack),
             }
         }
-        // The coarsest first: a node that merges takes the merges of what is under it with it, and
-        // one that splits is split before what is to be under it.
-        changing.sort_unstable_by_key(|&(_, key)| std::cmp::Reverse(key.0));
-        let mut left = changing.into_iter();
-        for (stamp, key) in left.by_ref() {
+        for (stamp, key) in changing {
             if self.nodes.get(&key).is_some_and(|n| n.stamp == stamp) {
                 self.revisit(store, key, &mut diff);
-                if diff.added.len() + diff.removed.len() >= CHANGES {
-                    break;
-                }
             }
         }
-        // What is left is hot, and changes at the next call, as it does now.
-        self.behind = 0;
-        for (stamp, key) in left {
-            if let Some(node) = self.nodes.get(&key).filter(|n| n.stamp == stamp) {
-                self.hot.push(Hot {
-                    key,
-                    stamp,
-                    split: node.state == State::Split,
-                    margin: node.margin,
-                });
-                self.behind += 1;
-            }
-        }
-        self.rewanted |= self.behind > 0;
         diff
     }
 
@@ -2343,6 +2377,17 @@ mod tests {
         Bands::with_d0(D0).speed_scaled(depth)
     }
 
+    /// Takes `selection` to `bands` as the scene thread does, a few nodes at a time, and gives
+    /// what each look changed.
+    fn reband(selection: &mut Selection, store: &BrickStore, bands: Bands) -> Vec<Diff> {
+        selection.set_bands(bands);
+        let mut diffs = Vec::new();
+        while selection.relooking() > 0 {
+            diffs.push(selection.relook_some(store, 300, 200));
+        }
+        diffs
+    }
+
     #[test]
     fn rebanding_in_place_draws_what_a_fresh_selection_for_the_new_bands_does_up_to_the_hysteresis()
     {
@@ -2353,20 +2398,15 @@ mod tests {
             let mut drawn: BTreeSet<Key> = selection.bricks().collect();
             // Coarser, and then finer again, from where it is.
             for bands in [at_speed(depth), Bands::with_d0(D0)] {
-                let mut diff = selection.set_bands(&store, bands);
-                assert_eq!(selection.bands(), bands);
-                loop {
+                for diff in reband(&mut selection, &store, bands) {
                     for key in &diff.removed {
                         assert!(drawn.remove(key), "removed {key:?} which was not drawn");
                     }
                     for key in &diff.added {
                         assert!(drawn.insert(*key), "added {key:?} which was drawn");
                     }
-                    if !selection.rewanted() {
-                        break;
-                    }
-                    diff = selection.update(&store, camera);
                 }
+                assert_eq!(selection.bands(), bands);
                 assert_eq!(selection.relooking(), 0);
                 assert_eq!(drawn, selection.bricks().collect::<BTreeSet<_>>());
                 for x in (-500..500).step_by(31) {
@@ -2395,7 +2435,7 @@ mod tests {
         }
         // The same bands again change nothing.
         let mut selection = select(&store, camera, D0);
-        assert!(selection.set_bands(&store, Bands::with_d0(D0)).is_empty());
+        assert!(reband(&mut selection, &store, Bands::with_d0(D0)).is_empty());
     }
 
     #[test]
@@ -2406,10 +2446,7 @@ mod tests {
         let mut counts = Vec::new();
         for depth in [0.0, 0.5, 1.0, 1.5] {
             let mut fast = select(&store, camera, D0);
-            fast.set_bands(&store, at_speed(depth));
-            while fast.rewanted() {
-                fast.update(&store, camera);
-            }
+            reband(&mut fast, &store, at_speed(depth));
             counts.push(fast.bricks().count());
             for (level, coord) in fast.bricks() {
                 // Whatever the fast camera draws, the slow one draws at that level or finer.
@@ -2427,19 +2464,51 @@ mod tests {
         assert!(counts[3] < counts[0], "{counts:?}");
     }
 
-    /// No level flips back and forth at a steady speed (#168): a camera that flies straight at a
-    /// steady speed, which the scene thread is told with noise on it (the velocity is a mean over
-    /// a tenth of a second of frames, and a frame's time is not exact), draws exactly what the
-    /// camera does that is told the exact speed, at every frame: the noise moves the bands no
-    /// more than once, to the step the speed holds, and never again.
     #[test]
-    fn no_level_flips_at_a_steady_speed() {
+    fn a_change_of_bands_leaves_each_node_on_the_hot_list_once_and_a_second_change_mid_way_loses_none()
+     {
+        let store = flat(64, 4);
+        let camera = [0.5, 20.0, 0.5];
+        let mut selection = select(&store, camera, D0);
+        for bands in [at_speed(1.0), at_speed(1.5), Bands::with_d0(D0)] {
+            reband(&mut selection, &store, bands);
+            selection.update(&store, [camera[0] + 1.0, camera[1], camera[2]]);
+            let mut seen = HashSet::default();
+            for entry in &selection.hot {
+                if selection
+                    .nodes
+                    .get(&entry.key)
+                    .is_some_and(|n| n.stamp == entry.stamp)
+                {
+                    assert!(seen.insert(entry.key), "{:?} is hot twice", entry.key);
+                }
+            }
+        }
+        // The bands change again before the nodes the first change listed are looked at: what is
+        // left of that list is looked at for the new bands, and the cut is as the rule says.
+        let mut selection = select(&store, camera, D0);
+        selection.set_bands(at_speed(1.5));
+        selection.relook_some(&store, 50, 50);
+        assert!(selection.relooking() > 0);
+        let bands = at_speed(0.5);
+        reband(&mut selection, &store, bands);
+        is_a_cut(&selection);
+        is_as_the_rule_says(&selection, "after a second change of bands");
+    }
+
+    /// No level flips back and forth at a steady speed (#168): a camera that flies straight at a
+    /// speed right on the edge between two steps of the curve (36.7 m/s: the step to 1.5 levels is
+    /// asked for from 36.67), which the scene thread is told with noise of 4% on it (the velocity
+    /// is a mean over a tenth of a second of frames, and a frame's time is not exact), draws
+    /// exactly what the camera does that is told the exact speed, at every frame: the bands move
+    /// once and never again. Without the release hysteresis the noise would flip the step.
+    #[test]
+    fn no_level_flips_at_a_steady_speed_on_the_edge_of_a_step() {
         let store = flat(64, 4);
         let start = [0.5, 20.0, 0.5];
-        // 30 m/s, in a straight line along x at 100 frames a second: in the middle of a step of
-        // the curve (the steps change at 23 and 37 m/s), where noise of 4% is not the step's.
-        let speed = 30.0 * brick_store::VOXELS_PER_METRE;
+        let speed = 36.7 * brick_store::VOXELS_PER_METRE;
         let step = speed / 100.0;
+        let frame = 0.01;
         let run = |wobble: f64| {
             let mut scale = crate::lod::SpeedScale::AT_REST;
             let mut selection = select(&store, start, D0);
@@ -2448,10 +2517,15 @@ mod tests {
             let mut rebands = 0;
             for n in 0..400u64 {
                 camera[0] += step;
-                let noise = ((n * 7919) % 17) as f64 / 16.0 - 0.5;
-                if scale.observe(speed * (1.0 + wobble * 2.0 * noise)) {
+                // The first sample is exact: the flight is told its speed, then the noise.
+                let noise = if n == 0 {
+                    0.0
+                } else {
+                    ((n * 7919) % 17) as f64 / 16.0 - 0.5
+                };
+                if scale.observe(speed * (1.0 + wobble * 2.0 * noise), frame) {
                     rebands += 1;
-                    selection.set_bands(&store, at_speed(scale.depth()));
+                    reband(&mut selection, &store, at_speed(scale.depth()));
                 }
                 selection.update(&store, camera);
                 while selection.rewanted() {
@@ -2463,13 +2537,25 @@ mod tests {
         };
         let (exact, exact_rebands, depth) = run(0.0);
         let (noisy, noisy_rebands, noisy_depth) = run(0.04);
-        // One step, taken at the first frame (30 m/s is 0.75 levels, and the step above it is 1).
+        // One reband, at the first frame, to the 1.5 levels that 36.7 m/s holds.
         assert_eq!((exact_rebands, noisy_rebands), (1, 1));
-        assert_eq!((depth, noisy_depth), (1.0, 1.0));
+        assert_eq!((depth, noisy_depth), (1.5, 1.5));
         assert!(exact[0].len() > 100);
         for (n, (a, b)) in exact.iter().zip(&noisy).enumerate() {
             assert_eq!(a, b, "frame {n}");
         }
+        // A scale with no hysteresis (the step the speed asks for, as it is told) flips on the
+        // same noise: this test is about the hysteresis.
+        let naive_steps = (0..400u64)
+            .map(|n| {
+                let noise = ((n * 7919) % 17) as f64 / 16.0 - 0.5;
+                (crate::lod::depth_for(speed * (1.0 + 0.04 * 2.0 * noise)) / crate::lod::DEPTH_STEP
+                    - 1e-9)
+                    .ceil() as u32
+            })
+            .collect::<Vec<_>>();
+        let flips = naive_steps.windows(2).filter(|w| w[0] != w[1]).count();
+        assert!(flips > 20, "{flips}");
         // And along the flight no brick is drawn more than twice, once while the camera is
         // coming to it and once when it has gone by: a flip would draw it again.
         let mut draws: HashMap<Key, usize> = HashMap::default();

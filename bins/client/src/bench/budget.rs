@@ -43,16 +43,27 @@ pub struct StreamingBudgets {
     pub holes: u64,
     /// The scene the client draws from, at its most: MiB of its buffers in use.
     pub scene_mib: f64,
-    /// Soft misses at the speed-scaled level (ADR 0009, #168): the frames with a soft miss, summed
-    /// over the flight at 2 m, the flight at 50 m, the vertical take-off and the 180 degree turn:
-    /// none.
-    pub soft_miss_frames: u64,
-    /// Time to control: seconds from the world map being ready to the spawn ring being made, the
-    /// 20 m of full detail that the player has control in (#168: 2 s).
+    /// Soft misses under the camera (ADR 0009, #168): the frames, summed over the flight at 2 m,
+    /// the flight at 50 m, the vertical take-off and the 180 degree turn, in which the ground
+    /// straight below **the frame's camera** is drawn coarser than the speed-scaled bands ask at
+    /// its distance: none. (The scene thread's own count, against the scene's lagging camera, is
+    /// reported and not gated.)
+    pub camera_soft_miss_frames: u64,
+    /// How far behind the camera the scene that is drawn is, in `d0`, at the most over the four
+    /// flights. **The limit is main's** (7.81 `d0` on the 4090 at 50 m) plus a margin, for now: it
+    /// is to tighten to about 2 once the follow fixes land (see `docs/agents/benchmarking.md`).
+    pub scene_lag_d0_max: f64,
+    /// The spawn ring: seconds to make the 20 m of full detail round the Spawn (#168: 2 s), which
+    /// is where the player has control (ADR 0009).
+    pub spawn_ring_s: f64,
+    /// Time to control as the player sees it: seconds from the world map being ready to the window
+    /// opening, which is the spawn ring and the Guard, since the window waits for both so that
+    /// nothing past the ring is sky. "Control in 2 s with nothing sky" is not met yet (#220, a
+    /// background Guard); this is held at what it measures, plus a margin.
     pub time_to_control_s: f64,
-    /// Settle time: seconds from the camera stopping after a flight of 50 m/s to a scene with no
-    /// soft miss. **Proposed by #168, not agreed**: it is measured plus a margin, and the owner
-    /// decides it.
+    /// Settle time: seconds from the camera stopping after a flight of 50 m/s to a scene that is
+    /// at the camera, has no soft miss and nothing left to look at again for the bands: main's
+    /// 47.8 s on the 4090 plus 15%.
     pub settle_s: f64,
 }
 
@@ -64,6 +75,8 @@ impl Budgets {
                 ("frame_time_p99_ms", s.frame_time_p99_ms),
                 ("frame_cpu_p99_ms", s.frame_cpu_p99_ms),
                 ("scene_mib", s.scene_mib),
+                ("scene_lag_d0_max", s.scene_lag_d0_max),
+                ("spawn_ring_s", s.spawn_ring_s),
                 ("time_to_control_s", s.time_to_control_s),
                 ("settle_s", s.settle_s),
             ] {
@@ -218,9 +231,11 @@ mod tests {
                 frame_cpu_p99_ms: 8.0,
                 holes: 0,
                 scene_mib: 512.0,
-                soft_miss_frames: 0,
-                time_to_control_s: 2.0,
-                settle_s: 110.0,
+                camera_soft_miss_frames: 0,
+                scene_lag_d0_max: 8.0,
+                spawn_ring_s: 2.0,
+                time_to_control_s: 10.0,
+                settle_s: 55.0,
             })
         );
     }
@@ -228,7 +243,7 @@ mod tests {
     #[test]
     fn the_streaming_table_needs_every_key_and_positive_numbers_and_is_optional() {
         let table = |body: &str| format!("[streaming]\n{body}");
-        let all = "frame_time_p99_ms = 16.7\nframe_cpu_p99_ms = 8\nholes = 0\nscene_mib = 512\nsoft_miss_frames = 0\ntime_to_control_s = 2\nsettle_s = 30\n";
+        let all = "frame_time_p99_ms = 16.7\nframe_cpu_p99_ms = 8\nholes = 0\nscene_mib = 512\ncamera_soft_miss_frames = 0\nscene_lag_d0_max = 8\nspawn_ring_s = 2\ntime_to_control_s = 10\nsettle_s = 30\n";
         let parsed = Budgets::parse(&table(all)).unwrap().streaming.unwrap();
         assert_eq!((parsed.frame_cpu_p99_ms, parsed.holes), (8.0, 0));
         // Without the table there is no gate to hold, which the real-time mode refuses to run on.
@@ -239,7 +254,9 @@ mod tests {
             "frame_cpu_p99_ms",
             "holes",
             "scene_mib",
-            "soft_miss_frames",
+            "camera_soft_miss_frames",
+            "scene_lag_d0_max",
+            "spawn_ring_s",
             "time_to_control_s",
             "settle_s",
         ] {

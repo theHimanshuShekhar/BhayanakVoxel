@@ -3208,6 +3208,9 @@ struct Flown {
     /// The most that the scene (as of the last update taken) was from the camera, in Voxels, in a
     /// frame of the flight.
     max_lag: f64,
+    /// Changes of the bands' speed scale in the flight, and the bricks they changed.
+    speed_changes: u64,
+    speed_bricks: u64,
 }
 
 /// The camera flown `frames` frames of `step` Voxels along the ground from the spawn, in a stepped
@@ -3314,6 +3317,8 @@ fn fly_counting_world(
     flown.follow_steps = after.follow_steps - before.follow_steps;
     flown.pack_steps = after.pack_steps - before.pack_steps;
     flown.arrived_bricks = after.arrived_bricks - before.arrived_bricks;
+    flown.speed_changes = after.speed_changes - before.speed_changes;
+    flown.speed_bricks = after.speed_bricks - before.speed_bricks;
     let mut patience = Patience::new(Duration::from_secs(180));
     loop {
         let cut = take(&mut world, position, &mut flown);
@@ -3638,6 +3643,58 @@ fn a_flight_over_ground_that_is_still_loading_has_follow_steps_within_the_budget
             "the throttled flight's update {frame}: {gaps} bytes between copies"
         );
     }
+}
+
+/// A flight at 50 m/s with the speed scale on (ADR 0009, #168), which coarsens the bands by a
+/// level and a half on the way: **a reband in a flight is inside the budget**. The camera goes
+/// from the spawn at 50 m/s (16.7 Voxels a frame) in a world that has filled in, so that the
+/// scene is to be selected again for the new `d0` while it follows. There is no hole, no jump, no
+/// update that is more than the budget and the operations that crossed it (the bound of
+/// `a_flight_over_ground_that_is_still_loading…`), and the scene follows the camera in every frame
+/// (the lag that a reband adds is the real-time bench's, `scene_lag_d0_max`).
+#[test]
+fn a_reband_in_a_flight_at_fifty_metres_a_second_has_no_hole_and_uploads_inside_the_budget() {
+    let (step, frames) = (50.0 * brick_store::VOXELS_PER_METRE / 60.0, 300);
+    let fly = |scale: bool| {
+        let (world, _server, camera) = spawned_world(Run::Stepped);
+        world.worker().speed_scale(scale);
+        let (ahead, _) = tangents(camera.horizon_up);
+        let mut moved = camera.position;
+        fly_counting_world(
+            world,
+            camera,
+            None,
+            frames,
+            true,
+            Duration::ZERO,
+            move |store, _| {
+                moved = std::array::from_fn(|a| moved[a] + ahead[a] * step);
+                over_the_ground(store, moved)
+            },
+        )
+    };
+    let off = fly(false);
+    let on = fly(true);
+    eprintln!("off {off:?}\non {on:?}");
+    assert_eq!(off.speed_changes, 0);
+    assert!(on.speed_changes >= 1, "the scale never changed: {on:?}");
+    assert!(on.speed_bricks > 0, "the reband changed nothing: {on:?}");
+    assert_eq!((on.rebuilds, on.holes), (0, 0), "{on:?}");
+    let budget = crate::scene_worker::UPLOAD_BUDGET;
+    // The budget, the operation that took what waits over it, and the first batch of the round.
+    let bound = (
+        budget.bytes + 2 * on.largest_batch.bytes.max(budget.bytes / 4),
+        budget.writes + 2 * on.largest_batch.writes.max(budget.writes / 4),
+    );
+    for (frame, &(listed, writes, _)) in on.uploads.0.iter().enumerate() {
+        assert!(
+            listed <= bound.0 && writes <= bound.1,
+            "update {frame}: {listed} bytes, {writes} copies, over {bound:?}"
+        );
+    }
+    // A stepped scene thread is at the camera after every round, so what lag a reband adds is the
+    // real-time bench's to measure (`scene_lag_d0_max`); the scene walked every frame of it here.
+    assert_eq!(on.follow_steps, frames as u64, "{on:?}");
 }
 
 /// What `follow_with_an_outbox_that_is_not_taken` saw.

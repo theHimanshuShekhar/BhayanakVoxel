@@ -578,10 +578,18 @@ const OVER_LIMIT_INDEXES: usize = 200;
 /// How long the camera stood after a flight before the scene had no soft misses.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize)]
 pub struct Settle {
-    /// From the frame the camera stopped in, to the first frame with no soft misses: or to the cap,
-    /// if there were still some.
+    /// From the frame the camera stopped in, to the first frame in which the scene is at the
+    /// camera (the drawn scene's camera is the frame's) and has no soft misses and nothing waiting:
+    /// or to the cap, if it was not. `walk_s` and `fill_s` are its two parts.
     pub seconds: f64,
     pub settled: bool,
+    /// The first part: from the stop to the scene's camera being the frame's (the scene thread
+    /// walking to where the camera stopped, with the bands as they are then). The whole of
+    /// `seconds` if it never was.
+    pub walk_s: f64,
+    /// The second part: from there to settled (the scene thread making what the bands ask for
+    /// round the camera, which the loader's bricks are waited for in).
+    pub fill_s: f64,
 }
 
 /// One path of the camera, with what the frames of it cost.
@@ -639,6 +647,12 @@ pub struct PathReport {
     /// reports the last count).
     pub soft_misses: Series,
     pub soft_misses_per_frame: f64,
+    /// Frames in which the ground straight below **the frame's camera** (one ray down from it) was
+    /// drawn coarser than the bands ask at its distance, with the bands' hysteresis: the soft miss
+    /// of what the player sees, which the scene thread's own count (`soft_misses`, against the
+    /// scene's camera, which lags the frame's) does not say. **This is what is gated**, on the
+    /// flights (ADR 0009, #168).
+    pub camera_soft_miss_frames: usize,
     /// Looks of the scene thread at every split brick (every few seconds, and one forced at the end
     /// of the path), the holes they found in all, and those per frame of the path. Never 0 looks.
     pub hole_looks: u64,
@@ -664,9 +678,14 @@ pub struct ColdStart {
     pub load_s: f64,
     /// The spawn ring (20 m, #168), which is when the player has control (ADR 0009), and the Guard
     /// after it, which the window waits for as well so that nothing past the ring is sky. Both
-    /// are in `load_s`. **The time-to-control gate is on the ring.**
-    pub ring_s: f64,
+    /// are in `load_s`. **The `spawn_ring_s` gate is on the ring.**
+    pub spawn_ring_s: f64,
     pub guard_s: f64,
+    /// The real time to control: from the world map being ready to the window opening (`load`
+    /// returning: the ring and the Guard and the first scene, which is when `main` opens it).
+    /// "Control in 2 s with nothing sky" is not met: it is #220. **The `time_to_control_s` gate is
+    /// on this.**
+    pub time_to_control_s: f64,
     /// From the start of the load to the first frame with level 0 under the camera: one ray from
     /// the camera straight down hits the ground at level 0. This is **not** the spec's time to
     /// control (the ring of 20 m round the Spawn at full detail, and the character standing in it:
@@ -795,18 +814,27 @@ pub struct Gates {
     /// the store.
     pub scene_mib: Limit,
     pub store_bricks: Limit,
-    /// Frames with a soft miss on the flights (the flights at 2 m and 50 m, the take-off and the
-    /// turn: the speed-scaled level is not a soft miss, #168), at the most of a run.
-    pub soft_miss_frames: Limit,
-    /// The spawn ring's generation, which is the player's control (ADR 0009), at the most of the
-    /// runs. The Guard that the window waits for after it is not in it (`ColdStart::guard_s`).
+    /// Frames on the flights (the flights at 2 m and 50 m, the take-off and the turn) in which the
+    /// ground below the frame's camera was drawn coarser than the speed-scaled bands ask
+    /// ([`PathReport::camera_soft_miss_frames`]), at the most of a run. The speed-scaled level is
+    /// not a soft miss (#168).
+    pub camera_soft_miss_frames: Limit,
+    /// The scene thread's own soft-miss frames on the same flights (against the scene's camera,
+    /// which lags the frame's), at the most of a run: **reported, not gated**.
+    pub scene_soft_miss_frames: u64,
+    /// The drawn scene's lag behind the camera, in `d0`, at the most over the four flights of the
+    /// worst run. Main's value plus a margin for now; it tightens once the follow fixes land.
+    pub scene_lag_d0_max: Limit,
+    /// The spawn ring's generation (ADR 0009), at the most of the runs.
+    pub spawn_ring_s: Limit,
+    /// From the world map being ready to the window opening (the ring and the Guard), at the most
+    /// of the runs.
     pub time_to_control_s: Limit,
     /// The settle time after the stop, at the most of the runs (the cap's if one did not settle,
-    /// which is over whatever the limit).
-    /// **Proposed**: the limit is not agreed (`bench-budgets.toml`).
+    /// which is over whatever the limit): the scene at the camera, no soft miss, nothing waiting.
     pub settle_s: Limit,
     /// The gates that are over: `frame_time`, `frame_cpu`, `holes`, `memory`, `soft_misses`,
-    /// `time_to_control`, `settle`.
+    /// `scene_lag`, `spawn_ring`, `time_to_control`, `settle`.
     pub over: Vec<&'static str>,
 }
 
@@ -843,25 +871,41 @@ pub fn gates(runs: &[RunReport], budgets: &StreamingBudgets) -> Gates {
             .reduce(f64::min)
             .unwrap_or(0.0),
     };
-    // The paths that are flown at speed, whose scene is drawn at the level the speed asks for.
-    const FLIGHTS: [&str; 4] = [
-        "flight at 2 m",
-        "flight at 50 m",
-        "vertical take-off",
-        "180 degree turn",
-    ];
-    let soft_miss_frames = Limit {
+    let camera_soft_miss_frames = Limit {
         worst: worst(&mut runs.iter().map(|r| {
             r.paths
                 .iter()
                 .filter(|p| FLIGHTS.contains(&p.name))
-                .map(|p| p.soft_misses.frames_with as f64)
+                .map(|p| p.camera_soft_miss_frames as f64)
                 .sum::<f64>()
         })),
-        limit: budgets.soft_miss_frames as f64,
+        limit: budgets.camera_soft_miss_frames as f64,
+    };
+    let scene_soft_miss_frames = runs
+        .iter()
+        .map(|r| {
+            r.paths
+                .iter()
+                .filter(|p| FLIGHTS.contains(&p.name))
+                .map(|p| p.soft_misses.frames_with as u64)
+                .sum::<u64>()
+        })
+        .max()
+        .unwrap_or(0);
+    let scene_lag_d0_max = Limit {
+        worst: worst(
+            &mut paths()
+                .filter(|p| FLIGHTS.contains(&p.name))
+                .map(|p| p.scene_lag_d0_max),
+        ),
+        limit: budgets.scene_lag_d0_max,
+    };
+    let spawn_ring_s = Limit {
+        worst: worst(&mut runs.iter().map(|r| r.cold_start.spawn_ring_s)),
+        limit: budgets.spawn_ring_s,
     };
     let time_to_control_s = Limit {
-        worst: worst(&mut runs.iter().map(|r| r.cold_start.ring_s)),
+        worst: worst(&mut runs.iter().map(|r| r.cold_start.time_to_control_s)),
         limit: budgets.time_to_control_s,
     };
     let unsettled = paths().any(|p| p.settle.is_some_and(|s| !s.settled));
@@ -874,7 +918,9 @@ pub fn gates(runs: &[RunReport], budgets: &StreamingBudgets) -> Gates {
         ("frame_cpu", frame_cpu_p99_ms.over()),
         ("holes", holes.over() || !looked),
         ("memory", scene_mib.over() || store_bricks.over()),
-        ("soft_misses", soft_miss_frames.over()),
+        ("soft_misses", camera_soft_miss_frames.over()),
+        ("scene_lag", scene_lag_d0_max.over()),
+        ("spawn_ring", spawn_ring_s.over()),
         ("time_to_control", time_to_control_s.over()),
         // A run that was still unsettled at the cap is over, whatever the cap is.
         ("settle", settle_s.over() || unsettled),
@@ -890,7 +936,10 @@ pub fn gates(runs: &[RunReport], budgets: &StreamingBudgets) -> Gates {
         hole_looks_fewest_in_a_path,
         scene_mib,
         store_bricks,
-        soft_miss_frames,
+        camera_soft_miss_frames,
+        scene_soft_miss_frames,
+        scene_lag_d0_max,
+        spawn_ring_s,
         time_to_control_s,
         settle_s,
         over,
@@ -1174,6 +1223,11 @@ struct Frame {
     /// The parts of the frame; its `index` and `at_ms` are set by the path that takes it in.
     parts: SlowFrame,
     soft_misses: usize,
+    /// Whether the ground below the frame's camera is drawn coarser than the bands ask
+    /// ([`PathReport::camera_soft_miss_frames`]).
+    camera_soft_miss: bool,
+    /// Whether the scene the frame draws is at the frame's camera ([`Settle`]).
+    at_camera: bool,
     /// Whether the scene thread held work back in this frame for the upload budget.
     throttled: bool,
     /// The drawn scene's lag behind the camera in Voxels (see [`PathReport::scene_lag_voxels_max`]).
@@ -1205,6 +1259,7 @@ struct Capture {
     cycles: Vec<f64>,
     sleep_over_ms: Vec<f64>,
     soft_misses: Series,
+    camera_soft_miss_frames: usize,
     /// The update of each frame that had one: its time, bytes and copies.
     update_ms: Vec<f64>,
     update_bytes: Vec<u64>,
@@ -1264,6 +1319,7 @@ impl Capture {
             cycles: Vec::new(),
             sleep_over_ms: Vec::new(),
             soft_misses: Series::default(),
+            camera_soft_miss_frames: 0,
             update_ms: Vec::new(),
             update_bytes: Vec::new(),
             update_writes: Vec::new(),
@@ -1315,6 +1371,7 @@ impl Capture {
             self.sleep_over_ms.push(frame.parts.sleep_over_ms);
         }
         self.soft_misses.add(frame.soft_misses as u64);
+        self.camera_soft_miss_frames += usize::from(frame.camera_soft_miss);
         if frame.parts.update != "none" {
             self.update_ms.push(frame.parts.update_ms);
             self.update_bytes.push(frame.parts.upload_bytes);
@@ -1387,6 +1444,7 @@ impl Capture {
             },
             soft_misses_per_frame: per_frame(self.soft_misses.total),
             soft_misses: self.soft_misses,
+            camera_soft_miss_frames: self.camera_soft_miss_frames,
             hole_looks: work.hole_scans - self.scans,
             holes,
             holes_per_frame: per_frame(holes),
@@ -1447,12 +1505,56 @@ fn level_0_under(scene: &Scene, camera: &Camera) -> bool {
     trace(scene, &Ray { cell, origin, dir }).is_some_and(|hit| scene.level_at(hit.voxel) == Some(0))
 }
 
+// The paths that are flown at speed, whose scene is drawn at the level the speed asks for.
+pub const FLIGHTS: [&str; 4] = [
+    "flight at 2 m",
+    "flight at 50 m",
+    "vertical take-off",
+    "180 degree turn",
+];
+
+/// Whether the ground straight below `camera` is drawn coarser than `bands` ask for it: the brick
+/// that one ray down hits is of a level whose band has not begun at the brick's distance (less
+/// the hysteresis, which is how far in a brick is kept whole). This is a soft miss of what the
+/// frame shows, the speed-scaled level and the camera's own place in it: the scene thread counts
+/// against the scene's camera, which is behind the frame's when the scene lags.
+///
+/// The alternative, re-scoring every brick at the frame's camera, is the same count for what is
+/// under the player and a pass over every node a frame; a ray is the player's view of what they
+/// stand on, which is what the ticket's "no soft miss" is for.
+fn soft_miss_under(scene: &Scene, camera: &Camera, bands: Option<render::lod::Bands>) -> bool {
+    let Some(bands) = bands else {
+        return false;
+    };
+    let (cell, origin) = camera::split(camera.position);
+    let dir = camera.horizon_up.map(|c| -(c as f32));
+    let Some(hit) = trace(scene, &Ray { cell, origin, dir }) else {
+        return false;
+    };
+    let Some(level) = scene.level_at(hit.voxel) else {
+        return false;
+    };
+    let size = 8i64 << level;
+    let distance = (0..3)
+        .map(|a| {
+            let low = i64::from(hit.voxel[a]).div_euclid(size) * size;
+            let (c, low, high) = (camera.position[a], low as f64, (low + size) as f64);
+            (low - c).max(c - high).max(0.0).powi(2)
+        })
+        .sum::<f64>()
+        .sqrt();
+    level > 0 && distance < bands.floor(level) * (1.0 - render::lod::HYSTERESIS)
+}
+
 /// What the frame thread has on the world and the GPU, and the peaks over the frames.
 struct Session<'a> {
     world: World,
     gpu: &'a mut dyn Gpu,
     /// What the run was doing when it last started on something: for the error of a run that stops.
     step: String,
+    /// Whether [`Frame::camera_soft_miss`] is scored: on the flights, where the scene is drawn at
+    /// the speed-scaled level (a ray a frame, not worth it on a fill of 19 000 frames).
+    score_camera: bool,
     /// What the scene thread had done when the measuring began.
     work_before: Done,
     scene_used_peak_bytes: u64,
@@ -1501,6 +1603,7 @@ impl<'a> Session<'a> {
             last_ended: None,
             step: "starting".to_string(),
             work_before,
+            score_camera: false,
             scene_used_peak_bytes: 0,
             scene_reserved_bytes: 0,
             scene_host_peak_bytes: 0,
@@ -1614,6 +1717,9 @@ impl<'a> Session<'a> {
             cpu_ms: parts.cpu_ms,
             parts,
             soft_misses: self.world.stats().soft_misses,
+            camera_soft_miss: self.score_camera
+                && soft_miss_under(self.world.scene(), camera, self.world.bands()),
+            at_camera: self.world.lag(camera.position) == 0.0,
             throttled: self.world.stats().throttled,
             lag: self.world.lag(camera.position),
             edit_taken,
@@ -1733,8 +1839,9 @@ impl<'a> Session<'a> {
         let cold = ColdStart {
             world_map_s: setup.world_map_s,
             load_s: setup.load.as_secs_f64(),
-            ring_s: setup.ring.as_secs_f64(),
+            spawn_ring_s: setup.ring.as_secs_f64(),
             guard_s: setup.guard.as_secs_f64(),
+            time_to_control_s: setup.load.as_secs_f64(),
             time_to_level_0_under_camera_s: control
                 .expect("the loop ends with control")
                 .as_secs_f64(),
@@ -1756,6 +1863,7 @@ impl<'a> Session<'a> {
         self.last_ended = None;
         let mut capture = Capture::start(name, &self.world, self.limit_ms);
         let began = Instant::now();
+        self.score_camera = FLIGHTS.contains(&name);
         let camera = loop {
             let t = began.elapsed().as_secs_f64();
             let camera = at(&self.world, t);
@@ -1766,6 +1874,7 @@ impl<'a> Session<'a> {
                 break camera;
             }
         };
+        self.score_camera = false;
         self.end_path(capture, &camera, None)
     }
 
@@ -1808,19 +1917,24 @@ impl<'a> Session<'a> {
         // (`harness_ms`), so it is not taken for a slow frame cycle.
         self.look(&camera, false)?;
         self.harness_wait = stopped.elapsed();
+        // The scene has to be at the camera too: a count made while it is still walking to where the
+        // camera stopped, with the bands as they were for the flight, is a count for another place.
+        let mut walked = None;
         let settle = loop {
             let frame = self.frame(&camera, true)?;
             capture.add(&frame);
-            if frame.soft_misses == 0 && self.world.waiting() == 0 {
-                break Settle {
-                    seconds: stopped.elapsed().as_secs_f64(),
-                    settled: true,
-                };
+            if frame.at_camera && walked.is_none() {
+                walked = Some(stopped.elapsed().as_secs_f64());
             }
-            if stopped.elapsed() >= script.settle_cap {
+            let seconds = stopped.elapsed().as_secs_f64();
+            let settled = frame.at_camera && frame.soft_misses == 0 && self.world.waiting() == 0;
+            if settled || stopped.elapsed() >= script.settle_cap {
+                let walk_s = walked.unwrap_or(seconds);
                 break Settle {
-                    seconds: stopped.elapsed().as_secs_f64(),
-                    settled: false,
+                    seconds,
+                    settled,
+                    walk_s,
+                    fill_s: seconds - walk_s,
                 };
             }
         };
@@ -2114,8 +2228,10 @@ mod tests {
         frame_cpu_p99_ms: 8.0,
         holes: 0,
         scene_mib: 512.0,
-        soft_miss_frames: 0,
-        time_to_control_s: 2.0,
+        camera_soft_miss_frames: 0,
+        scene_lag_d0_max: 8.0,
+        spawn_ring_s: 2.0,
+        time_to_control_s: 10.0,
         settle_s: 30.0,
     };
 
@@ -2151,6 +2267,7 @@ mod tests {
             upload: PathUpload::default(),
             soft_misses: Series::default(),
             soft_misses_per_frame: 0.0,
+            camera_soft_miss_frames: 0,
             hole_looks: 2,
             holes,
             holes_per_frame: 0.0,
@@ -2226,9 +2343,10 @@ mod tests {
         let mut run = RunReport {
             cold_start: ColdStart {
                 world_map_s: Some(25.0),
-                load_s: 60.0,
-                ring_s: 1.0,
+                load_s: 6.0,
+                spawn_ring_s: 1.0,
                 guard_s: 4.0,
+                time_to_control_s: 6.0,
                 time_to_level_0_under_camera_s: 61.0,
                 fill_s: 200.0,
             },
@@ -2388,7 +2506,8 @@ mod tests {
         assert_eq!(gates.over, ["frame_time"]);
     }
 
-    /// A path of `name` with a soft miss in `frames` of its frames.
+    /// A path of `name` with a soft miss in `frames` of its frames: the scene thread's count, and
+    /// the camera's.
     fn soft_misses_in(run: &mut RunReport, name: &str, frames: usize) {
         let path = run.paths.iter_mut().find(|p| p.name == name).unwrap();
         path.soft_misses = Series {
@@ -2399,28 +2518,73 @@ mod tests {
         };
     }
 
+    fn camera_soft_misses_in(run: &mut RunReport, name: &str, frames: usize) {
+        let path = run.paths.iter_mut().find(|p| p.name == name).unwrap();
+        path.camera_soft_miss_frames = frames;
+    }
+
     #[test]
-    fn the_soft_miss_gate_fires_alone_for_one_frame_with_one_on_a_flight() {
-        let one = run_with(|r| soft_misses_in(r, "flight at 2 m", 1));
+    fn the_soft_miss_gate_fires_alone_for_one_frame_with_one_under_the_camera_on_a_flight() {
+        let one = run_with(|r| camera_soft_misses_in(r, "flight at 2 m", 1));
         assert_eq!(over(std::slice::from_ref(&one)), ["soft_misses"]);
         // Frames are summed over the flights, and the worst run is the one that counts.
         let report = RealTimeReport::new("test".into(), 64.0, vec![one], &BUDGETS);
-        assert_eq!(report.gates.soft_miss_frames.worst, 1.0);
+        assert_eq!(report.gates.camera_soft_miss_frames.worst, 1.0);
         assert_eq!(exit_code(&report, false), 2);
         // The cold start and the stop are not flights: they fill and refine, and have soft misses.
-        let cold = run_with(|r| soft_misses_in(r, "cold start", 9000));
+        let cold = run_with(|r| camera_soft_misses_in(r, "cold start", 9000));
         assert!(over(&[cold]).is_empty());
     }
 
     #[test]
-    fn the_time_to_control_gate_fires_alone_for_a_spawn_ring_over_its_limit() {
-        let slow = run_with(|r| r.cold_start.ring_s = 2.01);
+    fn the_scene_threads_own_soft_misses_are_reported_and_not_gated() {
+        let run = run_with(|r| soft_misses_in(r, "flight at 2 m", 482));
+        assert!(over(std::slice::from_ref(&run)).is_empty());
+        let report = RealTimeReport::new("test".into(), 64.0, vec![run], &BUDGETS);
+        assert_eq!(report.gates.scene_soft_miss_frames, 482);
+        assert_eq!(report.gates.camera_soft_miss_frames.worst, 0.0);
+        assert_eq!(exit_code(&report, false), 0);
+    }
+
+    #[test]
+    fn the_scene_lag_gate_fires_alone_for_a_flight_that_lags_over_its_limit() {
+        let lag = |name: &str, d0: f64| {
+            run_with(|r| {
+                let path = r.paths.iter_mut().find(|p| p.name == name).unwrap();
+                path.scene_lag_d0_max = d0;
+            })
+        };
+        assert_eq!(over(&[lag("flight at 2 m", 8.01)]), ["scene_lag"]);
+        assert!(over(&[lag("flight at 2 m", 8.0)]).is_empty());
+        // Not a flight: the cold start has no camera to lag.
+        assert!(over(&[lag("cold start", 50.0)]).is_empty());
+        let report = RealTimeReport::new(
+            "test".into(),
+            64.0,
+            vec![lag("flight at 2 m", 9.2)],
+            &BUDGETS,
+        );
+        assert_eq!(report.gates.scene_lag_d0_max.worst, 9.2);
+        assert_eq!(exit_code(&report, false), 2);
+    }
+
+    #[test]
+    fn the_spawn_ring_gate_fires_alone_for_a_ring_over_its_limit() {
+        let slow = run_with(|r| r.cold_start.spawn_ring_s = 2.01);
+        assert_eq!(over(std::slice::from_ref(&slow)), ["spawn_ring"]);
+        assert!(over(&[run_with(|r| r.cold_start.spawn_ring_s = 2.0)]).is_empty());
+        // The Guard after the ring is in the time to control, not in this.
+        assert!(over(&[run_with(|r| r.cold_start.guard_s = 6.0)]).is_empty());
+    }
+
+    #[test]
+    fn the_time_to_control_gate_fires_alone_for_a_load_to_the_window_over_its_limit() {
+        let slow = run_with(|r| r.cold_start.time_to_control_s = 10.01);
         assert_eq!(over(std::slice::from_ref(&slow)), ["time_to_control"]);
-        assert!(over(&[run_with(|r| r.cold_start.ring_s = 2.0)]).is_empty());
-        // The Guard after the ring, and the load as a whole, are reported and not gated.
+        assert!(over(&[run_with(|r| r.cold_start.time_to_control_s = 10.0)]).is_empty());
+        // The rest of the cold start is reported, not gated.
         assert!(
             over(&[run_with(|r| {
-                r.cold_start.guard_s = 60.0;
                 r.cold_start.load_s = 600.0;
                 r.cold_start.time_to_level_0_under_camera_s = 600.0;
             })])
@@ -2432,12 +2596,17 @@ mod tests {
     fn the_settle_gate_fires_alone_for_a_stop_that_takes_longer_than_its_limit_or_never_settles() {
         let settle = |seconds: f64, settled: bool| {
             run_with(|r| {
-                let stop = r
+                let flight = r
                     .paths
                     .iter_mut()
                     .find(|p| p.name == "flight at 2 m")
                     .unwrap();
-                stop.settle = Some(Settle { seconds, settled });
+                flight.settle = Some(Settle {
+                    seconds,
+                    settled,
+                    walk_s: seconds / 2.0,
+                    fill_s: seconds / 2.0,
+                });
             })
         };
         assert_eq!(over(&[settle(30.1, true)]), ["settle"]);
@@ -2629,6 +2798,7 @@ mod tests {
         assert_eq!(
             keys(&json["runs"][0]["paths"][0]),
             [
+                "camera_soft_miss_frames",
                 "end_look_ms",
                 "frame_cpu",
                 "frame_cycle",
@@ -2741,7 +2911,8 @@ mod tests {
                 "fill_s",
                 "guard_s",
                 "load_s",
-                "ring_s",
+                "spawn_ring_s",
+                "time_to_control_s",
                 "time_to_level_0_under_camera_s",
                 "world_map_s"
             ]
@@ -2749,15 +2920,18 @@ mod tests {
         assert_eq!(
             keys(&json["gates"]),
             [
+                "camera_soft_miss_frames",
                 "frame_cpu_p99_ms",
                 "frame_time_p99_ms",
                 "hole_looks_fewest_in_a_path",
                 "hole_looks_fewest_in_a_run",
                 "holes",
                 "over",
+                "scene_lag_d0_max",
                 "scene_mib",
+                "scene_soft_miss_frames",
                 "settle_s",
-                "soft_miss_frames",
+                "spawn_ring_s",
                 "store_bricks",
                 "time_to_control_s"
             ]
@@ -3294,18 +3468,20 @@ mod tests {
             );
             for path in &report.paths {
                 eprintln!(
-                    "  {:>20}: {:>5} frames, soft misses/frame {:>9.0} (frames with {:>5}, max {:>7}), lag max {:>5.2} d0, \
+                    "  {:>20}: {:>5} frames, soft misses/frame {:>9.0} (frames with {:>5}, max {:>7}; under the camera {:>4}), lag max {:>5.2} d0, \
                      cpu p99 {:>5.2} ms, scene follow {:>7.0} ms pack {:>7.0} ms, settle {:?}",
                     path.name,
                     path.frames,
                     path.soft_misses_per_frame,
                     path.soft_misses.frames_with,
                     path.soft_misses.max,
+                    path.camera_soft_miss_frames,
                     path.scene_lag_d0_max,
                     path.frame_cpu.p99_ms,
                     path.scene_thread.follow_ms,
                     path.scene_thread.pack_ms,
-                    path.settle.map(|s| (s.seconds, s.settled)),
+                    path.settle
+                        .map(|s| (s.seconds, s.walk_s, s.fill_s, s.settled)),
                 );
             }
             eprintln!(
