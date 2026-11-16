@@ -52,7 +52,7 @@ a smoke test on any device: client lookdev --out DIR --short";
 enum Normals {
     /// Smoothing off: every hit has its face's normal, as the prototype's hero frames did.
     Faces,
-    /// Smooth normals with a quarter of the face's normal added: what the game has.
+    /// Smooth normals with a quarter of the face's normal added: the owner's pick, what the game has.
     Biased,
     /// Smooth normals with no face bias.
     Smooth,
@@ -315,7 +315,7 @@ fn write_sheet(
          light) against three normal settings (face normals, as the prototype's hero frames; smooth normals with the game's \
          0.25 face bias; smooth normals with none). A Reference image takes {} samples a pixel ({}&times; that in the \
          caves), accumulated once for each normal setting and shown through each curve. The last column is Primary at the \
-         game's settings (Neutral, smooth normals with the bias), one frame, exposure settled at once; Primary has no sun \
+         game's settings (AgX-like, smooth normals with the bias), one frame, exposure settled at once; Primary has no sun \
          shadows yet (#52). Took {:.0} s.{}</p>",
         options.spp,
         CAVE_SPP_FACTOR,
@@ -703,7 +703,7 @@ mod tests {
     #[test]
     fn the_combinations_are_three_curves_against_three_normal_settings() {
         assert_eq!(columns().len(), 9);
-        let game = Normals::Biased.stages(ToneCurve::Neutral);
+        let game = Normals::Biased.stages(ToneCurve::Agx);
         assert_eq!(game, Stages::default());
         let faces = Normals::Faces.stages(ToneCurve::Agx);
         assert!(!faces.smooth_normals && faces.curve == ToneCurve::Agx);

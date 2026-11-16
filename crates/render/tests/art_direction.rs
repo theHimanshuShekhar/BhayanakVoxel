@@ -872,7 +872,7 @@ fn without_the_face_bias_the_smooth_normal_is_the_smooth_one_alone_and_the_image
     gpu.reference_batch(&camera, 4);
     assert_eq!(gpu.reference_samples(), 4);
     gpu.set_stages(Stages {
-        curve: render::ToneCurve::Agx,
+        curve: render::ToneCurve::Neutral,
         ..Stages::default()
     });
     assert_eq!(gpu.reference_samples(), 4);
@@ -886,12 +886,12 @@ fn the_reference_mean_can_be_shown_again_under_another_curve_without_taking_a_sa
     let camera = overhead();
     let first = gpu.render_reference(&camera, 4);
     gpu.set_stages(Stages {
-        curve: render::ToneCurve::Agx,
+        curve: render::ToneCurve::Neutral,
         ..Stages::default()
     });
-    let agx = gpu.reshow_reference();
+    let neutral = gpu.reshow_reference();
     assert_eq!(gpu.reference_samples(), 4);
-    assert_ne!(first.rgba, agx.rgba);
+    assert_ne!(first.rgba, neutral.rgba);
     gpu.set_stages(Stages::default());
     let again = gpu.reshow_reference();
     assert_eq!(

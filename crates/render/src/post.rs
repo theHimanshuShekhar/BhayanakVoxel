@@ -8,7 +8,10 @@
 //! switched off ([`Stages`]), so that the dev can see what it does.
 //!
 //! The numbers are the prototype's, as rendered (#200, `bench/lookdev/post.rs`):
-//! - **Tone curve:** Khronos PBR Neutral, then the sRGB curve of the image.
+//! - **Tone curve:** the AgX-like curve ([`ToneCurve::Agx`]), which is already display-encoded. The
+//!   owner chose it over Khronos PBR Neutral on 2026-11-16 from a combination sheet of the real
+//!   renderer, because the hero light B look they liked was rendered with it. Neutral (then the
+//!   sRGB curve) and a desaturated Neutral stay selectable, for look-dev.
 //! - **Auto-exposure:** the scene's log-average luminance to middle grey 0.18, within 0.125 to 32
 //!   (-3 to +5 stops), adapting in stops with `k = 1 - e^(-dt / tau)`, tau 2.5 s. Each view has an
 //!   exposure of its own. The Reference view's still frames use the settled one (`k = 1`), metered
@@ -54,7 +57,7 @@ const EXPOSURE_TILE: u32 = 16;
 pub struct Stages {
     /// The tone curve ([`Stages::curve`]). Off, light above 1 is white, as before #202.
     pub tone: bool,
-    /// Which tone curve, when the stage is on. Neutral is the game's until the owner picks.
+    /// Which tone curve, when the stage is on. AgX-like is the game's (the owner's pick, 2026-11-16).
     pub curve: ToneCurve,
     /// How the smooth normals are kept to the face's side. Face (0.25) is the game's.
     pub normal_bias: NormalBias,
@@ -81,7 +84,7 @@ impl Default for Stages {
     fn default() -> Self {
         Self {
             tone: true,
-            curve: ToneCurve::Neutral,
+            curve: ToneCurve::Agx,
             normal_bias: NormalBias::Face,
             exposure: true,
             bloom: true,
@@ -90,8 +93,8 @@ impl Default for Stages {
     }
 }
 
-/// The tone curves the look-dev sheet compares (the owner's pick of the combination is still to
-/// come, #202). The game's is [`ToneCurve::Neutral`].
+/// The tone curves the look-dev sheet compares. The game's is [`ToneCurve::Agx`]; the others are
+/// for look-dev.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ToneCurve {
     /// Khronos PBR Neutral, then the sRGB curve.
@@ -769,11 +772,11 @@ mod tests {
     }
 
     #[test]
-    fn the_default_stages_are_neutral_with_the_face_bias() {
+    fn the_default_stages_are_agx_like_with_smooth_normals_and_the_face_bias() {
         let stages = Stages::default();
         assert_eq!(
-            (stages.curve, stages.normal_bias),
-            (ToneCurve::Neutral, NormalBias::Face)
+            (stages.curve, stages.normal_bias, stages.smooth_normals),
+            (ToneCurve::Agx, NormalBias::Face, true)
         );
         assert_eq!(NormalBias::Face.weight(), 0.25);
         assert_eq!(NormalBias::None.weight(), 0.0);
