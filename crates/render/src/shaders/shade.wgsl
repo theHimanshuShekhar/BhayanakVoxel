@@ -1,6 +1,8 @@
-// Primary's light, drawn from what primary.wgsl wrote, in two kernels: `normals` (the smooth
-// computed normal of each hit, #202: its own pass, so that its cost has a line of its own) and
-// `shade_pass`, which draws the lit image as linear light for post.wgsl to expose and tone.
+// Primary's light, drawn from what primary.wgsl wrote, in three kernels: `normals` (the smooth
+// computed normal of each hit, #202: its own pass, so that its cost has a line of its own),
+// `shadows` (the sun's light at each hit, #52: one shadow ray a pixel, its own pass for the same
+// reason) and `shade_pass`, which draws the lit image as linear light for post.wgsl to expose and
+// tone.
 //
 // Every read of a source of light, every ray cast through the walk and every line of `shade` (the light), control
 // flow aside, needs a whole-line `// lighting: <feature>` comment on one of the two lines directly
@@ -14,6 +16,11 @@
 // The smooth normal of each hit, written by `normals`: a unit vector, and 1 in w where there is one.
 @group(1) @binding(7) var shading_normals_out: texture_storage_2d<rgba16float, write>;
 @group(1) @binding(8) var shading_normals: texture_2d<f32>;
+// The sun's light at each hit, written by `shadows`: the weight that multiplies the sun's radiance
+// and the surface's colour (0 in shadow, or where the sun is behind the surface), and read by
+// `shade_pass`.
+@group(1) @binding(9) var sun_weights_out: texture_storage_2d<r32float, write>;
+@group(1) @binding(10) var sun_weights: texture_2d<f32>;
 
 // The face's normal, from the face code of primary.wgsl (the inverse of its `face_code`).
 fn face_normal(code: u32) -> vec3<f32> {
@@ -25,7 +32,8 @@ fn face_normal(code: u32) -> vec3<f32> {
     return n;
 }
 
-// The hit that primary visibility found at `pixel`, as far as shading needs it.
+// The hit that primary visibility found at `pixel`, as far as shading needs it (not its
+// position: `shadows` finds that from the distance, as `trace()` does).
 fn load_hit(pixel: vec2<u32>) -> Hit {
     let g = textureLoad(gbuffer, pixel, 0);
     let s = textureLoad(surface, pixel, 0);
@@ -52,21 +60,72 @@ fn normals(@builtin(global_invocation_id) id: vec3<u32>) {
     textureStore(shading_normals_out, id.xy, normal);
 }
 
-// The light leaving the hit, towards the camera; `colour` is its surface_albedo and `normal` the
-// normal it is shaded with.
-fn shade(ray: Ray, hit: Hit, colour: vec3<f32>, normal: vec3<f32>) -> vec3<f32> {
+// The scramble of Primary's sun samples: a number of its own, so that they do not follow the
+// Reference's seed (`frame.params.y`).
+const SUN_SEED = 0x5AD00052u;
+
+// The two numbers in 0..1 that choose the pixel's point on the sun's disc this frame: the
+// Reference's own sequence (sampling.wgsl, Owen-scrambled Sobol), scrambled per pixel, with the
+// frame since the history was reset as the index. Nothing is read from an earlier frame: the same
+// frame number gives the same samples.
+fn sun_sample(pixel: vec2<u32>) -> vec2<f32> {
+    return sample_group(pixel_hash(pixel, SUN_SEED), frame.light.x, 0u, false).zw;
+}
+
+// The sun's light at the hit of each pixel (ADR 0005, "Sun and shadows"): the surface's cosine to
+// the sun's centre, as it was before shadows, times whether the sun can be seen from it. What can
+// be seen is one shadow ray, from the **geometric face**, towards one point of the sun's disc,
+// through trace(): the same disc as the Reference's, with one sample of it. A smooth normal shades
+// the hit but never moves the ray's origin. The ray is not cast where the sun is behind the
+// shading normal or the face: nothing would be lit. Nothing is carried over from another frame, so
+// a sun that has changed is right on the next one.
+//
+// The Reference weighs each sample by its own cosine over the mean cosine of the disc; Primary
+// weighs the one it has by the cosine at the disc's centre, so that a lit surface, the whole
+// picture but the penumbra, has no noise from the wide disc. The two agree in expectation where
+// the surface faces the sun, and differ by the change of the cosine over the disc where it does
+// not and where the sun is half hidden: the bench's shadow-edge error (#52) measures that.
+@compute @workgroup_size(8, 8)
+fn shadows(@builtin(global_invocation_id) id: vec3<u32>) {
+    let size = textureDimensions(gbuffer);
+    if id.x >= size.x || id.y >= size.y {
+        return;
+    }
+    let ray = camera_ray(id.xy, size, frame.jitter.xy);
+    var hit = load_hit(id.xy);
+    var weight = 0.0;
+    if hit.hit {
+        hit.position = ray.origin + ray.dir * hit.t;
+        var normal = hit.normal;
+        let smoothed = textureLoad(shading_normals, id.xy, 0);
+        if frame.flags.x != 0u && smoothed.w > 0.5 {
+            normal = smoothed.xyz;
+        }
+        // lighting: Sun and shadows
+        let diffuse = max(dot(normal, normalize(frame.sun.xyz)), 0.0);
+        // lighting: Sun and shadows
+        let to_sun = sample_cone(frame.sun.xyz, frame.sun.w, sun_sample(id.xy));
+        // lighting: Sun and shadows
+        if diffuse > 0.0 && dot(hit.normal, to_sun) > 0.0 && !trace(leave(ray, hit, to_sun)).hit {
+            weight = diffuse;
+        }
+    }
+    textureStore(sun_weights_out, id.xy, vec4<f32>(weight, 0.0, 0.0, 0.0));
+}
+
+// The light leaving the hit, towards the camera; `colour` is its surface_albedo and `sun` the
+// weight of the sun's light there (`shadows`).
+fn shade(ray: Ray, hit: Hit, colour: vec3<f32>, sun: f32) -> vec3<f32> {
     if !hit.hit {
         // lighting: Sky and atmosphere
         return sky(ray.dir);
     }
-    // lighting: Sun and shadows
-    let diffuse = max(dot(normal, normalize(frame.sun.xyz)), 0.0);
     // lighting: Ambient term
-    let ambient = 0.25;
+    let ambient = select(0.0, 0.25, frame.light.y != 0u);
     // lighting: Sun and shadows
-    let lit = colour * (ambient + frame.sun_radiance.xyz * diffuse);
+    let lit = colour * (ambient + frame.sun_radiance.xyz * sun);
     // lighting: Emissive Voxels
-    let light = lit + emission(hit.material);
+    let light = lit + emission(hit.material) * f32(frame.light.z);
     // lighting: Sky and atmosphere
     return hazed(light, hit.t);
 }
@@ -85,14 +144,11 @@ fn shade_pass(@builtin(global_invocation_id) id: vec3<u32>) {
     let ray = camera_ray(id.xy, size, frame.jitter.xy);
     let hit = load_hit(id.xy);
     var colour = vec3<f32>(0.0);
-    var normal = hit.normal;
+    var sun = 0.0;
     if hit.hit {
         // lighting: Per-Voxel colour variation
         colour = surface_albedo(hit, false);
-        let smoothed = textureLoad(shading_normals, id.xy, 0);
-        if frame.flags.x != 0u && smoothed.w > 0.5 {
-            normal = smoothed.xyz;
-        }
+        sun = textureLoad(sun_weights, id.xy, 0).x;
     }
-    textureStore(output, id.xy, vec4<f32>(shade(ray, hit, colour, normal), 1.0));
+    textureStore(output, id.xy, vec4<f32>(shade(ray, hit, colour, sun), 1.0));
 }

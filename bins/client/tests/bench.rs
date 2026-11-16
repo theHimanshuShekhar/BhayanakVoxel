@@ -179,10 +179,43 @@ fn check_convergence(convergence: &Value, out: &Path) {
     let csv = std::fs::read_to_string(out.join(string(&convergence["csv"]))).unwrap();
     assert_eq!(csv.lines().count(), 1 + 2 * 3, "{csv}");
     assert!(csv.starts_with("view,samples,gpu_s,flip_mean,"), "{csv}");
+
+    // The sun-and-sky view (#52): Primary's shadows against the Reference's direct-sun image.
+    let sun = &convergence["shadows"];
+    assert_eq!(string(&sun["name"]), "sun");
+    assert_eq!(sun["sun_and_sky_only"], true);
+    assert_eq!(sun["width"], convergence["width"]);
+    assert_eq!(sun["target_flip"], 0.05);
+    assert_eq!(sun["min_line_over_floor"], 4.0);
+    assert!(sun["flip"].is_null(), "--short runs no FLIP");
+    assert!(sun["floor"].is_null() && sun["meets_target"].is_null());
+    assert_eq!(sun["seeds"]["truth_a"], 1);
+    for score in ["first_frame", "settled"] {
+        assert!(sun[score]["flip"].is_null(), "{score}");
+        // The shadow-edge error is made without FLIP.
+        let edge = &sun[score]["edge"];
+        assert!(edge["edge_pixels"].is_u64(), "{score}: {edge}");
+        assert!(edge["other_mean"].is_null() || number(&edge["other_mean"]) >= 0.0);
+    }
+    assert!((0.0..=1.0).contains(&number(&sun["edge_share"])));
+    let folder = out.join(string(&convergence["folder"])).join("sun");
+    for file in [
+        "truth-a.png",
+        "unshadowed.png",
+        "primary-first.png",
+        "primary-settled.png",
+        "edges.png",
+    ] {
+        assert!(folder.join(file).is_file(), "sun/{file}");
+        assert!(
+            sun["files"].as_array().unwrap().iter().any(|f| f == file),
+            "{file}"
+        );
+    }
 }
 
 fn check_schema(report: &Value, out: &Path) {
-    assert_eq!(report["schema_version"], 22);
+    assert_eq!(report["schema_version"], 24);
     // The Edit stress is of the whole Planet, which the patch is not.
     assert!(report["edits"].is_null());
     // The streaming mode is asked for (see its own test); the other tests do not. The real-time

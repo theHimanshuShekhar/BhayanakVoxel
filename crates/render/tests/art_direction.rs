@@ -330,6 +330,7 @@ fn every_stage_has_a_pass_with_a_gpu_line_of_its_own() {
     gpu.draw_upscaled(&over_the_stairs(60.0));
     for pass in [
         "normals",
+        "shadows",
         "shade",
         "exposure",
         "exposure_adapt",

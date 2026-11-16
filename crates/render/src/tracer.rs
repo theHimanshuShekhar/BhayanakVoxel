@@ -41,6 +41,9 @@ pub const SURFACE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba32Uint;
 /// Format of the smooth normals (`shade.wgsl`): a unit vector, and 1 in w where there is one.
 pub const NORMALS_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 
+/// The format of the sun's light at each hit (`sun_weights` in `shade.wgsl`): one float a pixel.
+pub const SUN_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R32Float;
+
 /// Format of the upscaler's history: encoded colour, and in alpha the frames it has been through.
 pub const HISTORY_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 
@@ -115,6 +118,10 @@ pub struct ReferenceOptions {
     pub white_noise: bool,
     /// A fault put into the estimator, to show that a test of it can fail.
     pub fault: Fault,
+    /// The sun counts wherever it faces the surface, with no shadow ray: the estimator without
+    /// its visibility. The bench's sun-and-sky view runs it beside the real one to find which
+    /// pixels have a shadow's edge in them.
+    pub no_shadow_rays: bool,
 }
 
 /// A fault that a test puts into the Reference view's estimator, to show that the tests that
@@ -134,8 +141,9 @@ pub enum Fault {
 
 impl ReferenceOptions {
     /// The pipeline constants these are, as `pathtrace.wgsl` declares them.
-    fn constants(self) -> [(&'static str, f64); 3] {
+    fn constants(self) -> [(&'static str, f64); 4] {
         [
+            ("NO_SHADOW_RAYS", f64::from(u8::from(self.no_shadow_rays))),
             ("FLAT_COLOURS", f64::from(u8::from(self.flat_colours))),
             ("WHITE_NOISE", f64::from(u8::from(self.white_noise))),
             (
@@ -169,6 +177,9 @@ struct FrameUniform {
     /// 1 if natural Materials are shaded with smooth computed normals; the end of the smooth range
     /// in Voxels and the face normal's weight in it (both an f32's bits); one unused.
     flags: [u32; 4],
+    /// The frame of Primary's sun samples; 1 if the view has GI (the ambient term, for Primary);
+    /// 1 if it has emitted light; one unused.
+    light: [u32; 4],
 }
 
 /// Where primary visibility traces when nothing moves it: the centre of the pixel.
@@ -260,6 +271,8 @@ pub struct Target {
     gbuffer: Plane,
     surface: Plane,
     normals: Plane,
+    /// The sun's light at each hit (`shadows`), read by the lit image's pass.
+    sun_weights: Plane,
     reference_size: (u32, u32),
     /// The reference path tracer's mean as linear light, and the display transform's images for it.
     reference_hdr: Plane,
@@ -298,6 +311,7 @@ impl Target {
             gbuffer: Plane::new(device, "G-buffer", internal, GBUFFER_FORMAT),
             surface: Plane::new(device, "surface", internal, SURFACE_FORMAT),
             normals: Plane::new(device, "smooth normals", internal, NORMALS_FORMAT),
+            sun_weights: Plane::new(device, "sun weights", internal, SUN_FORMAT),
             reference_size,
             reference_hdr: Plane::new(
                 device,
@@ -405,10 +419,17 @@ pub struct Tracer {
     /// with the layout of its own bind group.
     normals_layout: wgpu::BindGroupLayout,
     normals: wgpu::ComputePipeline,
+    shadows_layout: wgpu::BindGroupLayout,
+    shadows: wgpu::ComputePipeline,
     shade_layout: wgpu::BindGroupLayout,
     shade: wgpu::ComputePipeline,
     /// The display transform and the exposure it keeps from frame to frame.
     post: Post,
+    /// The sun the last frame of Primary was lit by: a frame with another one starts the upscaler's
+    /// history over, so that no shadow of the old sun is carried into the new (#52).
+    last_sun: Option<Sun>,
+    /// Whether the view has neither GI nor emitters (see [`Tracer::set_sun_and_sky_only`]).
+    sun_and_sky_only: bool,
     /// The light's palette, and which stages of the art direction are on.
     look: Look,
     stages: Stages,
@@ -848,6 +869,18 @@ impl Tracer {
                 layout_entry(7, storage_texture(NORMALS_FORMAT)),
             ],
         });
+        let loaded = wgpu::TextureSampleType::Float { filterable: false };
+        let shadows_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("sun shadows"),
+            entries: &[
+                layout_entry(0, buffer_binding(wgpu::BufferBindingType::Uniform)),
+                layout_entry(2, buffer_binding(wgpu::BufferBindingType::Uniform)),
+                texture(5, uint),
+                texture(6, uint),
+                texture(8, loaded),
+                layout_entry(9, storage_texture(SUN_FORMAT)),
+            ],
+        });
         let shade_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("shade"),
             entries: &[
@@ -857,7 +890,7 @@ impl Tracer {
                 layout_entry(4, buffer_binding(STORAGE_READ)),
                 texture(5, uint),
                 texture(6, uint),
-                texture(8, wgpu::TextureSampleType::Float { filterable: false }),
+                texture(10, loaded),
             ],
         });
         let materials = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -904,6 +937,15 @@ impl Tracer {
             &scene_layout,
             &[],
         );
+        let shadows = compute_pipeline(
+            device,
+            "shadows",
+            shaders::SHADE,
+            "shadows",
+            &shadows_layout,
+            &scene_layout,
+            &[],
+        );
         let shade = compute_pipeline(
             device,
             "shade",
@@ -924,9 +966,13 @@ impl Tracer {
             reference,
             normals_layout,
             normals,
+            shadows_layout,
+            shadows,
             shade_layout,
             shade,
             post: Post::new(device),
+            last_sun: None,
+            sun_and_sky_only: false,
             look: Look::default(),
             stages: Stages::default(),
             last_frame_at: None,
@@ -964,7 +1010,7 @@ impl Tracer {
         sun: &Sun,
         target: &Target,
     ) {
-        self.write_uniforms(queue, camera, sun, 0, CENTRE, 0);
+        self.write_uniforms(queue, camera, sun, (0, CENTRE, 0), 0);
         // Nothing carries over from one call to the next, the exposure included: it settles at
         // once, on this image.
         self.dispatch_primary(device, queue, profiler, encoder, target, 1.0);
@@ -1010,10 +1056,22 @@ impl Tracer {
         target: &Target,
         rate: f32,
     ) {
+        // A new sun starts the history over, whatever else is the same: the lit image's shadows
+        // are the sun's, and nothing of the old sun's is to be carried into the new one.
+        if self.last_sun != Some(*sun) {
+            self.history.reset();
+            self.last_sun = Some(*sun);
+        }
         let frame = self
             .history
             .begin(target.resolution(), camera, self.debug_view);
-        self.write_uniforms(queue, camera, sun, 0, frame.jitter(), 0);
+        self.write_uniforms(
+            queue,
+            camera,
+            sun,
+            (0, frame.jitter(), 0),
+            frame.sun_sample(),
+        );
         self.dispatch_primary(device, queue, profiler, encoder, target, rate);
         self.upscale
             .encode(device, queue, profiler, encoder, &frame, target);
@@ -1061,7 +1119,7 @@ impl Tracer {
         let samples = batch_of(samples, target.reference_size);
         let view = View::new(camera, sun, target);
         let first = self.accumulator.begin_batch(&view, samples);
-        self.write_uniforms(queue, camera, sun, first, CENTRE, samples);
+        self.write_uniforms(queue, camera, sun, (first, CENTRE, samples), 0);
         self.dispatch(
             device,
             profiler,
@@ -1416,6 +1474,19 @@ impl Tracer {
         }
     }
 
+    /// Whether both views are of the sun and the sky alone, with no GI and no emitters: Primary has
+    /// no ambient term (the stand-in for GI, ADR 0005's table) and no emitted light, and the
+    /// Reference follows no path past its first surface and adds no emitted light. This is the
+    /// bench's shadows view (#52), where what is left to compare is the sun's light and the sky. The
+    /// Reference's image starts over, and the upscaler's history with it.
+    pub fn set_sun_and_sky_only(&mut self, only: bool) {
+        if only != self.sun_and_sky_only {
+            self.sun_and_sky_only = only;
+            self.restart_reference();
+            self.history.reset();
+        }
+    }
+
     /// Sets the seed of the reference's random numbers (the default is [`RNG_SEED`]) and starts
     /// its image over: the same view, sample count and seed give the same image, and another seed
     /// gives an independent one of the same expected value.
@@ -1458,14 +1529,16 @@ impl Tracer {
         self.accumulator.samples()
     }
 
+    /// Writes the camera and the frame's uniforms. `(sample_index, jitter, batch)` are the
+    /// Reference's sample (a batch's first), where Primary traces in its pixel, and the samples in
+    /// the batch; `sun_sample` is the frame that Primary's sun samples are of.
     fn write_uniforms(
         &self,
         queue: &wgpu::Queue,
         camera: &Camera,
         sun: &Sun,
-        sample_index: u32,
-        jitter: [f32; 2],
-        batch: u32,
+        (sample_index, jitter, batch): (u32, [f32; 2], u32),
+        sun_sample: u32,
     ) {
         queue.write_buffer(
             &self.camera_buffer,
@@ -1485,6 +1558,12 @@ impl Tracer {
                 u32::from(self.stages.smooth_normals),
                 self.smooth_end.to_bits(),
                 self.stages.normal_bias.weight().to_bits(),
+                0,
+            ],
+            light: [
+                sun_sample,
+                u32::from(!self.sun_and_sky_only),
+                u32::from(!self.sun_and_sky_only),
                 0,
             ],
         };
@@ -1520,6 +1599,7 @@ impl Tracer {
             if self.stages.smooth_normals {
                 self.dispatch_normals(device, profiler, encoder, target);
             }
+            self.dispatch_shadows(device, profiler, encoder, target);
             self.dispatch_shade(device, profiler, encoder, target);
         }
         self.post.encode(
@@ -1571,8 +1651,38 @@ impl Tracer {
         pass.dispatch_workgroups(width.div_ceil(8), height.div_ceil(8), 1);
     }
 
-    /// The lit image as linear light, from the G-buffer and the smooth normals (`shade_pass` in
-    /// `shade.wgsl`).
+    /// The sun's light at every hit of the G-buffer: one shadow ray a pixel (`shadows` in
+    /// `shade.wgsl`), from the geometric face, towards a point of the sun's disc.
+    fn dispatch_shadows(
+        &self,
+        device: &wgpu::Device,
+        profiler: &mut Profiler,
+        encoder: &mut wgpu::CommandEncoder,
+        target: &Target,
+    ) {
+        let view = plane_entry;
+        let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("sun shadows"),
+            layout: &self.shadows_layout,
+            entries: &[
+                buffer_entry(0, &self.camera_buffer),
+                buffer_entry(2, &self.frame_buffer),
+                view(5, &target.gbuffer),
+                view(6, &target.surface),
+                view(8, &target.normals),
+                view(9, &target.sun_weights),
+            ],
+        });
+        let (width, height) = target.resolution.internal;
+        let mut pass = profiler.compute_pass(encoder, "shadows");
+        pass.set_pipeline(&self.shadows);
+        pass.set_bind_group(0, &self.scene.group, &[]);
+        pass.set_bind_group(1, &group, &[]);
+        pass.dispatch_workgroups(width.div_ceil(8), height.div_ceil(8), 1);
+    }
+
+    /// The lit image as linear light, from the G-buffer and the sun's light at each hit
+    /// (`shade_pass` in `shade.wgsl`).
     fn dispatch_shade(
         &self,
         device: &wgpu::Device,
@@ -1600,7 +1710,7 @@ impl Tracer {
                 },
                 view(5, &target.gbuffer),
                 view(6, &target.surface),
-                view(8, &target.normals),
+                view(10, &target.sun_weights),
             ],
         });
         let (width, height) = target.resolution.internal;

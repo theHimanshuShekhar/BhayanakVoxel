@@ -32,6 +32,7 @@
 //! real GPU only, and by one ignored test.
 
 mod score;
+mod shadows;
 mod still;
 mod views;
 
@@ -90,6 +91,8 @@ pub struct Settings {
     /// The still-view part (#189): the Reference view with the still-frame policy on, from the
     /// stop.
     pub still: still::Settings,
+    /// The sun-and-sky view (#52): Primary's shadows against the Reference's.
+    pub shadows: shadows::Settings,
 }
 
 impl Settings {
@@ -103,6 +106,10 @@ impl Settings {
             flip: true,
             flip_gamma22,
             still: still::Settings::full(),
+            shadows: shadows::Settings::full(
+                (traced.0 * 2, traced.1 * 2),
+                truth_spp.unwrap_or(DEFAULT_TRUTH_SPP),
+            ),
         }
     }
 
@@ -116,6 +123,10 @@ impl Settings {
             flip: false,
             flip_gamma22: false,
             still: still::Settings::short(),
+            shadows: shadows::Settings::short(
+                ((traced.0 / 2).max(1), (traced.1 / 2).max(1)),
+                truth_spp.unwrap_or(16),
+            ),
         }
     }
 
@@ -151,6 +162,8 @@ pub struct ConvergenceReport {
     /// truths, the run, scoring and the files.
     pub wall_s: f64,
     pub views: Vec<ViewReport>,
+    /// The sun-and-sky view (#52): Primary's shadows against the Reference's direct-sun image.
+    pub shadows: shadows::ShadowsReport,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -304,6 +317,7 @@ pub fn run(settings: &Settings, out: &Path) -> Result<ConvergenceReport, Box<dyn
     for view in [views::golden(), views::pit()] {
         views.push(run_view(view, settings, out)?);
     }
+    let shadows = shadows::run(&settings.shadows, out)?;
     let mut report = ConvergenceReport {
         width,
         height,
@@ -327,6 +341,7 @@ pub fn run(settings: &Settings, out: &Path) -> Result<ConvergenceReport, Box<dyn
         csv: CSV_FILE,
         wall_s: 0.0,
         views,
+        shadows,
     };
     let csv = out.join(CSV_FILE);
     fs::write(&csv, csv_of(&report)).map_err(|e| format!("cannot write {}: {e}", csv.display()))?;
@@ -740,6 +755,7 @@ pub fn print_summary(report: &ConvergenceReport) {
             );
         }
     }
+    shadows::print_summary(&report.shadows);
 }
 
 #[cfg(test)]
@@ -833,6 +849,52 @@ mod tests {
             wall_s: 0.0,
             csv: CSV_FILE,
             views: vec![view("golden"), view("pit")],
+            shadows: shadows_report(flip),
+        }
+    }
+
+    fn shadows_report(flip: bool) -> shadows::ShadowsReport {
+        let score = |mean: f64| shadows::PrimaryScore {
+            flip: flip.then_some(shadows::Scores {
+                flip_mean: mean,
+                flip_p99: mean * 4.0,
+            }),
+            edge: shadows::EdgeError {
+                edge_pixels: 12,
+                edge_mean: Some(6.0),
+                edge_p99: Some(30.0),
+                other_mean: Some(1.0),
+            },
+        };
+        shadows::ShadowsReport {
+            name: "sun",
+            description: views_description(),
+            width: 64,
+            height: 36,
+            traced_width: 32,
+            traced_height: 18,
+            sun_and_sky_only: true,
+            truth_spp: 16,
+            unshadowed_spp: 16,
+            seeds: Seeds {
+                run: RUN_SEED,
+                truth_a: TRUTH_SEEDS[0],
+                truth_b: TRUTH_SEEDS[1],
+            },
+            flip: None,
+            floor: flip.then_some(shadows::Scores {
+                flip_mean: 0.002,
+                flip_p99: 0.01,
+            }),
+            target_flip: shadows::TARGET_FLIP,
+            min_line_over_floor: MIN_LINE_OVER_FLOOR,
+            target_counts: flip.then_some(true),
+            first_frame: score(0.04),
+            settled: score(0.02),
+            settle_frames: 4,
+            meets_target: flip.then_some(true),
+            edge_share: 0.05,
+            files: vec!["truth-a.png".into()],
         }
     }
 
@@ -933,6 +995,7 @@ mod tests {
                 marks_s: vec![0.1, 0.25],
                 seconds: 0.3,
             },
+            shadows: shadows::Settings::full(size, 64),
         };
         let out = std::env::temp_dir().join(format!("bhayanak-convergence-{}", std::process::id()));
         let _ = fs::remove_dir_all(&out);
@@ -993,6 +1056,25 @@ mod tests {
                 );
             }
         }
+        // The sun-and-sky view (#52): both of Primary's images are scored, and the edge is found.
+        let sun = &report.shadows;
+        let floor = sun.floor.expect("the floor");
+        for (what, p) in [("first frame", &sun.first_frame), ("settled", &sun.settled)] {
+            let flip = p.flip.unwrap_or_else(|| panic!("{what} has no FLIP"));
+            assert!(flip.flip_p99 >= flip.flip_mean, "{what}: {flip:?}");
+            assert!(p.edge.edge_pixels > 0, "{what}: no edge pixels");
+            assert!(p.edge.edge_mean.unwrap() >= 0.0);
+        }
+        assert!(
+            sun.edge_share > 0.0 && sun.edge_share < 0.5,
+            "{}",
+            sun.edge_share
+        );
+        assert!(floor.flip_mean < sun.first_frame.flip.unwrap().flip_mean);
+        assert_eq!(
+            sun.meets_target,
+            Some(sun.settled.flip.unwrap().flip_mean <= 0.05)
+        );
         let csv = fs::read_to_string(out.join(CSV_FILE)).unwrap();
         assert!(
             csv.lines()

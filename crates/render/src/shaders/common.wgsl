@@ -35,6 +35,12 @@ struct Frame {
     // the smooth range in Voxels (an f32's bits); the weight of the face's normal that the smooth
     // normal is kept to the face's side with (an f32's bits); one unused.
     flags: vec4<u32>,
+    // The frame that Primary's sun samples are of (0 on the first frame after the upscaler's
+    // history started over, a new view or a new sun, so that nothing before a frame decides its
+    // shadows), then 1 if the view has GI (Primary: its ambient term, the stand-in for it; the
+    // Reference: bounce light), then 1 if it has emitted light, then one unused. Both are 0 in
+    // the bench's sun-and-sky-only view, where neither view has GI or emitters.
+    light: vec4<u32>,
 }
 
 @group(1) @binding(0) var<uniform> camera: Camera;
@@ -196,6 +202,27 @@ fn shading_normal(hit: Hit) -> vec3<f32> {
     let weight = clamp((end - hit.t) / (end * (1.0 - SMOOTH_BLEND_FROM)), 0.0, 1.0);
     let smoothed = smooth_normal(hit.voxel, hit.normal);
     return normalize(mix(hit.normal, smoothed, weight) + 1e-6 * hit.normal);
+}
+
+// How far a ray starts inside the empty Voxel in front of the face it leaves, in Voxels. It
+// only has to beat the rounding of the hit position, so a ray cannot hit its own face.
+const NUDGE = 1e-3;
+
+// A ray leaving the face of `hit`, which `ray` found, along `dir`. It starts in the empty Voxel
+// in front of that face, a hair in from the face, rather than at a float computed from the
+// distance travelled: the Voxel is exact, so a ray cannot start behind the face it left. It
+// leaves the **geometric** face, whatever normal the surface is shaded with: both views' shadow
+// rays and the Reference's bounces are made with it (ADR 0005).
+fn leave(ray: Ray, hit: Hit, dir: vec3<f32>) -> Ray {
+    let n = hit.normal;
+    let corner = vec3<f32>(hit.voxel - ray.cell) + n;
+    // Along the face, where the hit is; across it, 0 or 1 in the new Voxel as n points.
+    let along = clamp(hit.position - corner, vec3<f32>(NUDGE), vec3<f32>(1.0 - NUDGE));
+    var next: Ray;
+    next.cell = hit.voxel + vec3<i32>(n);
+    next.origin = select(along, vec3<f32>(0.5) - n * (0.5 - NUDGE), n != vec3<f32>(0.0));
+    next.dir = dir;
+    return next;
 }
 
 // The ray from the camera through `pixel` of an image `size` pixels across. `offset` says where

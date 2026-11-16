@@ -1,6 +1,7 @@
 //! `client lookdev --out DIR`: renders the eight look-dev shots (#148) with the real pipeline, as
-//! the game draws them: the default Look (hero light B). For each shot, one Primary image at the
-//! game's settings, a **combination sheet** of Reference images (the tone curves against the
+//! the game draws them: the default Look (hero light B). For each shot, a Primary image at the
+//! game's settings (with the sun's shadows, #52: one frame, and the same view settled over frames of
+//! a still camera), a **combination sheet** of Reference images (the tone curves against the
 //! smooth-normal settings, for the owner to pick from, #202), and for the dark descent a Primary
 //! frame sequence on a 60 Hz clock, so that the exposure's adaptation (tau 2.5 s) shows. Written
 //! as PNGs, a folder for each shot, and an `index.html` contact sheet.
@@ -315,10 +316,13 @@ fn write_sheet(
          light) against three normal settings (face normals, as the prototype's hero frames; smooth normals with the game's \
          0.25 face bias; smooth normals with none). A Reference image takes {} samples a pixel ({}&times; that in the \
          caves), accumulated once for each normal setting and shown through each curve. The last column is Primary at the \
-         game's settings (AgX-like, smooth normals with the bias), one frame, exposure settled at once; Primary has no sun \
-         shadows yet (#52). Took {:.0} s.{}</p>",
+         game's settings (AgX-like, smooth normals with the bias), one frame, exposure settled at once, with the sun's \
+         shadows (one shadow ray a pixel towards a point of the sun's disc, #52), so its penumbra is noisy; the one after \
+         it is the same view after {} frames of a still camera, as the window shows a view that has stopped, \
+         with the upscaler's history having smoothed that noise. Took {:.0} s.{}</p>",
         options.spp,
         CAVE_SPP_FACTOR,
+        settle_frames(options),
         took.as_secs_f64(),
         if options.short {
             " <b>A smoke test: the test Planet, which the places are not on.</b>"
@@ -334,8 +338,8 @@ fn write_sheet(
     for column in columns() {
         let _ = write!(html, "<th>{column}</th>");
     }
-    html.push_str("<th>Primary, the game's settings</th></tr>");
-    let width = 1 + usize::from(compare) + NORMALS.len() * CURVES.len() + 1;
+    html.push_str("<th>Primary, the game's settings, one frame</th><th>Primary, settled</th></tr>");
+    let width = 1 + usize::from(compare) + NORMALS.len() * CURVES.len() + 2;
     for section in sections {
         let _ = write!(
             html,
@@ -471,7 +475,18 @@ fn still_camera(shot: &Shot) -> Camera {
     path.camera_at(still, shot.frames)
 }
 
-/// The shot's Primary image from its still camera, at the game's settings.
+/// Frames of a still camera that the settled Primary image has: twice the upscaler's 16-frame
+/// history, so that the history is full of the sun's samples.
+const SETTLE_FRAMES: u32 = 32;
+
+fn settle_frames(options: &Options) -> u32 {
+    if options.short { 2 } else { SETTLE_FRAMES }
+}
+
+/// The shot's Primary image from its still camera, at the game's settings: one frame, which has
+/// the sun's shadows from one sample of the disc a pixel (#52), and the same view after
+/// [`SETTLE_FRAMES`] frames of a camera that has not moved, which is what a window shows a view that
+/// has stopped.
 fn primary_still(
     gpu: &mut Offscreen,
     shot: &Shot,
@@ -485,6 +500,18 @@ fn primary_still(
     let primary = gpu.render(&camera);
     let file = format!("{dir}/primary.png");
     write_png(&options.out.join(&file), &primary)?;
+    section.stills.push(Figure {
+        path: file,
+        label: String::new(),
+    });
+    // The upscaler's history starts with the first of these frames: the sun is the shot's, and the
+    // camera does not move.
+    let mut settled = gpu.render_upscaled(&camera);
+    for _ in 1..settle_frames(options) {
+        settled = gpu.render_upscaled(&camera);
+    }
+    let file = format!("{dir}/primary-settled.png");
+    write_png(&options.out.join(&file), &settled)?;
     section.stills.push(Figure {
         path: file,
         label: String::new(),
@@ -678,9 +705,9 @@ mod tests {
             .skip(1)
             .map(|s| s.split('"').next().unwrap())
             .collect();
-        // Two shots, nine combinations and a Primary each, the descent's three frames, and the
+        // Two shots, nine combinations and two Primary stills each, the descent's three frames, and the
         // one old frame.
-        assert_eq!(images.len(), 2 * (9 + 1) + 3 + 1, "{images:?}");
+        assert_eq!(images.len(), 2 * (9 + 2) + 3 + 1, "{images:?}");
         for image in &images {
             let bytes = std::fs::read(new.join(image)).unwrap();
             let decoder = png::Decoder::new(std::io::Cursor::new(bytes));
@@ -699,6 +726,7 @@ mod tests {
         assert!(html.contains("no frame of the old sheet"));
         assert!(new.join("02-dark-descent/descent-02.png").exists());
         assert!(new.join("00-forest-floor/primary.png").exists());
+        assert!(new.join("00-forest-floor/primary-settled.png").exists());
         let _ = std::fs::remove_dir_all(&out);
     }
 

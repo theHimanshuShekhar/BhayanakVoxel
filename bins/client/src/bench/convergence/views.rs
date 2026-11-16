@@ -104,6 +104,22 @@ pub fn golden() -> View {
     }
 }
 
+/// The sun-and-sky view (#52): the golden view's camera and sun, drawn with the sun and the sky
+/// alone, no GI and no emitters, in both views. The terraces throw long shadows across each other
+/// there, with a penumbra of a few pixels, and it is the view that Primary's shadows are scored in.
+pub fn sun() -> View {
+    let golden = golden();
+    View {
+        name: "sun",
+        description: Description {
+            what: "the golden view with the sun and the sky alone (no GI, no emitters) in both \
+                   views: the terraces' shadows on each other",
+            ..golden.description.clone()
+        },
+        ..golden
+    }
+}
+
 /// The pit: a rectangle of the hillside dug out down to a flat floor, `depth` Voxels below the
 /// lowest ground on its rim. With the sun across it, one wall and the near part of the floor are
 /// lit, and the far wall and the far part of the floor are lit by what those reflect.

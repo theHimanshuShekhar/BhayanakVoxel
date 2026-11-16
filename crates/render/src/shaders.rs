@@ -16,12 +16,15 @@ pub const PRIMARY: &str = concat!(
     include_str!("shaders/primary.wgsl")
 );
 
-/// Primary's light: the kernels that compute the smooth normals (#202) and then shade the lit image
-/// from the G-buffer, as linear light.
+/// Primary's light: the kernels that compute the smooth normals (#202), cast the sun's shadow rays
+/// (#52) and then shade the lit image from the G-buffer, as linear light. It has the sampling
+/// module for the sun's samples, which are the Reference's sequence.
 pub const SHADE: &str = concat!(
     include_str!("shaders/trace.wgsl"),
     "\n",
     include_str!("shaders/common.wgsl"),
+    "\n",
+    include_str!("shaders/sampling.wgsl"),
     "\n",
     include_str!("shaders/shade.wgsl")
 );
@@ -83,11 +86,23 @@ mod tests {
     }
 
     #[test]
-    fn the_shade_kernels_are_valid_wgsl_and_cast_no_ray() {
-        assert_eq!(entry_points(SHADE), ["normals", "shade_pass"]);
+    fn the_shade_kernels_are_valid_wgsl_and_cast_one_ray_a_pixel_in_one_kernel() {
+        assert_eq!(entry_points(SHADE), ["normals", "shadows", "shade_pass"]);
         // The smooth normal reads the Planet through `solid_at` of trace.wgsl, and the light is
-        // drawn from what primary visibility found: no ray of its own.
-        assert!(!include_str!("shaders/shade.wgsl").contains("trace("));
+        // drawn from what primary visibility found: the one ray of Primary's light is the sun's
+        // shadow ray, in `shadows`, and nothing else casts one.
+        let kernel = include_str!("shaders/shade.wgsl");
+        let calls = kernel
+            .lines()
+            .filter(|l| !l.trim().starts_with("//") && l.contains("trace("))
+            .count();
+        assert_eq!(calls, 1);
+        let shadows = kernel
+            .split("fn shadows(")
+            .nth(1)
+            .and_then(|rest| rest.split("\nfn ").next())
+            .expect("a shadows kernel");
+        assert!(shadows.contains("trace(leave("));
     }
 
     #[test]
@@ -205,7 +220,7 @@ mod tests {
 
     /// The bindings the shaders have, none of which is a source of light that has no row. A new
     /// one fails the check until it is added here with a decision.
-    const BINDINGS: [&str; 15] = [
+    const BINDINGS: [&str; 17] = [
         "scene",
         "table",
         "regions",
@@ -220,6 +235,10 @@ mod tests {
         "surface",
         "shading_normals_out",
         "shading_normals",
+        // The sun's light at each hit (`shadows` writes it, `shade_pass` reads it): carries
+        // "Sun and shadows", whose row it is covered by.
+        "sun_weights_out",
+        "sun_weights",
         "probe_rays",
     ];
 
@@ -258,9 +277,10 @@ mod tests {
         ("common.wgsl", include_str!("shaders/common.wgsl")),
         ("primary.wgsl", include_str!("shaders/primary.wgsl")),
     ];
-    const SHADE_FILES: [(&str, &str); 3] = [
+    const SHADE_FILES: [(&str, &str); 4] = [
         ("trace.wgsl", include_str!("shaders/trace.wgsl")),
         ("common.wgsl", include_str!("shaders/common.wgsl")),
+        ("sampling.wgsl", include_str!("shaders/sampling.wgsl")),
         ("shade.wgsl", include_str!("shaders/shade.wgsl")),
     ];
     const PATHTRACE_FILES: [(&str, &str); 4] = [

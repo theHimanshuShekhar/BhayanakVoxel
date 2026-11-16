@@ -327,6 +327,14 @@ impl Offscreen {
         self.set_sun(Sun::new([0.5, 0.8, 0.3], 0.04).expect("a direction"));
     }
 
+    /// Draws the sun and the sky alone, in both views: no GI and no emitters. Primary has no
+    /// ambient term and no emitted light, and the Reference follows no path past its first
+    /// surface and adds no emitted light (see [`Tracer::set_sun_and_sky_only`]). The bench's
+    /// shadows view uses it (#52).
+    pub fn set_sun_and_sky_only(&mut self, only: bool) {
+        self.tracer.set_sun_and_sky_only(only);
+    }
+
     /// Chooses what is drawn: the lit image, or one of the debug views.
     pub fn set_debug_view(&mut self, view: DebugView) {
         self.tracer.set_debug_view(view);
