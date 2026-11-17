@@ -43,13 +43,17 @@ edit_frame_thread = 4.0
 # Sun shadows (#52): the `shadows` pass, two shadow rays a pixel from the G-buffer.
 shadows = 0.4
 
+# The atmosphere (#53): the `atmosphere` pass, the tables of Hillaire's atmosphere (the sky-view
+# table and the aerial-perspective volumes every frame; the transmittance, multiple-scattering and
+# sun-free tables only when the air or the sun's height changes).
+atmosphere = 0.3
+
 # M1 stages from #10, for when the passes exist (the names are suggestions):
 # gi           = 1.5   # GI bounce and radiance cache
 # reflections  = 0.7
 # glass        = 0.7
 # volumetrics  = 1.0
 # denoise      = 1.0
-# atmosphere   = 0.3
 # post         = 0.5   # post-processing and UI (the window's blit and overlay passes are not
 #                      # run by the offscreen bench)
 

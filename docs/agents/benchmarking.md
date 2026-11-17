@@ -1355,8 +1355,8 @@ a budget off.
 
 The numbers are the per-stage frame budget of the rendering decision (#10), on the RTX 4090 at 1440p
 output. Only `primary` (Primary visibility, 1.0 ms), `shadows` (the sun's shadow rays, two a pixel, 0.4 ms, #52),
-`upscale` (the TAAU pass, 0.5 ms) and the total (8.6 ms) are live today, as those are the passes that
-exist. The later stages (GI 1.5, reflections 0.7, glass 0.7, volumetrics 1.0, denoise 1.0, atmosphere 0.3, edits 1.0, post 0.5)
+`atmosphere` (the atmosphere's tables, 0.3 ms, #53), `upscale` (the TAAU pass, 0.5 ms) and the total (8.6 ms) are live today, as those are the passes that
+exist. The later stages (GI 1.5, reflections 0.7, glass 0.7, volumetrics 1.0, denoise 1.0, edits 1.0, post 0.5)
 are in the file as comments: **whoever adds a pass uncomments its budget and names it the same** (a
 pass is named by the string given to `Profiler::compute_pass`). `reference` has no budget in #10;
 its 3.0 ms (a sample, pass and total) catches a gross regression, set from the first real run on the
@@ -1373,6 +1373,7 @@ they run in a Primary frame:
 | --- | --- | --- |
 | `primary` | primary visibility and the G-buffer (it no longer lights) | 1.0 (existing) |
 | `normals` | the smooth normal of every hit (the cost of the smooth normals, alone) | none yet |
+| `atmosphere` | the tables of the atmosphere (#53): the sky-view table and the aerial-perspective volumes every frame, and the transmittance, multiple-scattering and sun-free tables only when the air or the sun's height changes. It runs first, in both views, and is a pass of its own, so it adds a line to `passes[]` and no field (no schema bump). The 0.3 ms budget is the issue's, **for the 4090**: the orchestrator measures it | 0.3 |
 | `shadows` | the sun's shadow: two shadow rays a pixel from the G-buffer (#52, **schema 24**; `--shadow-rays N` in the bench) | 0.4 |
 | `shade` | the lit image, as linear light, from the G-buffer and the shadows | none yet |
 | `exposure`, `exposure_adapt` | the log-average luminance and the adapted exposure | none yet |
@@ -1423,6 +1424,22 @@ the finder finds) and `the_recorded_shots_are_where_they_say` (every camera is i
 stamp place is air against rock, each cave shot is 20 m or more under the ground at every keyframe
 with rock straight overhead, and the dark descent ends 15 m or more under, roofed). Rock overhead
 says the chamber is roofed; it does not prove there is no sky from the side.
+
+### The atmosphere sheet (#53)
+
+`client lookdev --out DIR --atmosphere` renders every shot twice, in both views, with hero light B's
+**gradient and haze as they were before #53 and with the atmosphere**, and writes the pairs side by
+side to `DIR/index.html` and `DIR/<shot>/{primary,reference}-{gradient,atmosphere}.png`: the sheet
+for the owner to judge by eye that the atmosphere keeps the hero look (#148, #202). It needs the
+real Planet, so it makes the world map (25 s) per shot. On lavapipe (the dev box) a sheet at
+480x270 with 16 samples takes about 7 minutes:
+
+```
+cargo run --release -p client -- lookdev --out /tmp/lookdev-atmo --atmosphere --size 480x270 --spp 16
+```
+
+On the 4090 the same command at the default size and samples is the sheet. Each shot's camera sets
+the Planet's ground level (`set_ground_level`), which the atmosphere counts the camera's height from.
 
 ## Tests
 
