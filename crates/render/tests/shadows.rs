@@ -243,6 +243,9 @@ fn more_shadow_rays_are_a_finer_penumbra_and_the_default_is_two() {
     let mut gpu = gpu(SIZE, SIZE, wide);
     gpu.set_shadow_rays(0);
     assert_eq!(gpu.render(&camera).rgba, one.rgba);
+    let mut gpu = self::gpu(SIZE, SIZE, wide);
+    gpu.set_shadow_rays(render::MAX_SHADOW_RAYS + 1);
+    assert_eq!(gpu.render(&camera).rgba, nearly.rgba);
 }
 
 #[test]

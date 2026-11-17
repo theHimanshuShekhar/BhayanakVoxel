@@ -219,7 +219,8 @@ fn truth_spp(text: &str) -> Result<u32, String> {
         .ok_or_else(|| format!("`{text}` is not a number of samples of at least {least}"))
 }
 
-/// `--shadow-rays`: from 1 to the most the shader's loop is bound to.
+/// `--shadow-rays`: from 1 to `render::MAX_SHADOW_RAYS`, the cap of `Tracer::set_shadow_rays`
+/// (the shader's loop has none of its own).
 fn shadow_rays(text: &str) -> Result<u32, String> {
     text.parse::<u32>()
         .ok()

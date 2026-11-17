@@ -105,11 +105,14 @@ pub const RNG_SEED: u32 = 0xB4A7_A9AC;
 
 /// How many shadow rays a pixel of Primary casts towards the sun's disc by default (#52): the
 /// owner's choice after the 4090 measured one ray's noise in the wide penumbrae at FLIP 0.074
-/// against a target of 0.05. The bench's `--shadow-rays` and [`Tracer::set_shadow_rays`] change it.
+/// against a target of 0.05. Two rays measured 0.062 there: what is left of the miss is mostly the
+/// centre-cosine weight's bias, not noise (ADR 0005). The bench's `--shadow-rays` and
+/// [`Tracer::set_shadow_rays`] change it.
 pub const DEFAULT_SHADOW_RAYS: u32 = 2;
 
-/// The most shadow rays a pixel can be asked for: a bound on a loop in a kernel, for the bench's
-/// comparisons, not a setting for a game.
+/// The most shadow rays a pixel can be asked for, for the bench's comparisons and not a setting for
+/// a game. The shader's loop has no bound of its own: this is the clamp in
+/// [`Tracer::set_shadow_rays`], which cuts a count to 1 through this.
 pub const MAX_SHADOW_RAYS: u32 = 16;
 
 /// How the Reference view is built. The default is the player's: Owen-scrambled Sobol sample
@@ -1521,11 +1524,6 @@ impl Tracer {
             self.shadow_rays = rays;
             self.history.reset();
         }
-    }
-
-    /// How many shadow rays a pixel casts (see [`Tracer::set_shadow_rays`]).
-    pub fn shadow_rays(&self) -> u32 {
-        self.shadow_rays
     }
 
     /// Sets the seed of the reference's random numbers (the default is [`RNG_SEED`]) and starts

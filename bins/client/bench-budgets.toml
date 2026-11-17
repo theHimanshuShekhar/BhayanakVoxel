@@ -40,7 +40,7 @@ edits = 1.0
 # most that one Edit should take of it, with the largest cube planned and written in about 1 to 3.
 edit_frame_thread = 4.0
 
-# Sun shadows (#52): the `shadows` pass, one shadow ray a pixel from the G-buffer.
+# Sun shadows (#52): the `shadows` pass, two shadow rays a pixel from the G-buffer.
 shadows = 0.4
 
 # M1 stages from #10, for when the passes exist (the names are suggestions):
