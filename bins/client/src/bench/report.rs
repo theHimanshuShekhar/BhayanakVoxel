@@ -85,7 +85,19 @@ use super::stream::StreamReport;
 /// flight with the game's loading pause: `hold_s`, the cuts by cause, the catch-up and the holes
 /// after it); and the real-time stop after a flight has `still_cuts` (null in the other paths).
 /// Nothing else is changed.
-pub const SCHEMA_VERSION: u32 = 22;
+///
+/// 23 is taken by #168 (PR #219).
+///
+/// 24 (#52) adds the sun-and-sky view: `convergence.shadows`, Primary's shadows against the
+/// Reference's direct-sun image (the golden view's camera and sun, no GI and no emitters in both
+/// views; `shadow_rays` is how many rays a pixel of Primary cast, 2 unless `--shadow-rays` said
+/// another count): FLIP's floor in it, Primary's first frame and its settled image each with FLIP's mean
+/// and p99 and the shadow-edge error (`edge`: the pixels on an edge, the mean and 99th percentile of
+/// the luma difference over them, and the mean elsewhere), whether the target of FLIP 0.05 is met
+/// and counts, and the files in `convergence/sun/`. A new pass line `shadows` is in `passes[]`
+/// (the report lists passes generically), and `primary` is as it was in 22.
+/// Nothing else is changed.
+pub const SCHEMA_VERSION: u32 = 24;
 
 /// One timed thing (a pass, or the GPU total of a profiler frame) in one mode, against its
 /// budget. In reference mode a profiler frame is one sample, so the entries of that mode have
@@ -582,7 +594,7 @@ mod tests {
                 "streaming_real_time"
             ]
         );
-        assert_eq!(json["schema_version"], 22);
+        assert_eq!(json["schema_version"], 24);
         assert_eq!(json["convergence"], serde_json::Value::Null);
         assert_eq!(json["streaming"], serde_json::Value::Null);
         assert_eq!(json["streaming_real_time"], serde_json::Value::Null);

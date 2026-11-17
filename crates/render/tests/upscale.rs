@@ -364,6 +364,37 @@ fn history_length_shows_a_young_history_dark_and_an_old_one_bright() {
 }
 
 #[test]
+fn a_local_sun_that_follows_a_carried_camera_keeps_the_history_and_a_turned_one_ends_it() {
+    // The game's sun follows the camera's local up, so a camera carried over a Planet has a sun
+    // whose direction moves a little on every frame (`Sun::local`). That is not a change of the
+    // sun, and the upscaler's history must not start over for it (#52).
+    let mut gpu = gpu();
+    gpu.set_debug_view(DebugView::HistoryLength);
+    gpu.set_local_sun(1.9, 0.14, 0.12);
+    let at = (10, 48);
+    let mut camera = view();
+    let mut reds = Vec::new();
+    for n in 0..8 {
+        // A tilt of the local up a frame, as walking over a Planet makes.
+        camera.carry_up([0.0005 * f64::from(n), 1.0, 0.0]);
+        reds.push(pixel(&gpu.render_upscaled(&camera), at.0, at.1)[0]);
+    }
+    // Frame n has n + 1 frames of history: 25.5 + 229.5 n / 15 in red.
+    let expected: Vec<f64> = (0..8).map(|n| 25.5 + 229.5 * f64::from(n) / 15.0).collect();
+    for (got, want) in reds.iter().zip(&expected) {
+        assert!(
+            (f64::from(*got) - want).abs() <= 2.0,
+            "{reds:?} vs {expected:?}"
+        );
+    }
+    // The sun turned by the player starts it over: the next frame has one frame of history.
+    gpu.set_local_sun(2.0, 0.14, 0.12);
+    camera.carry_up([0.0005 * 8.0, 1.0, 0.0]);
+    let after = gpu.render_upscaled(&camera);
+    near(pixel(&after, at.0, at.1), [25.5, 0.0, 76.5]);
+}
+
+#[test]
 fn history_length_grows_by_a_frame_at_a_time() {
     let mut gpu = gpu();
     gpu.set_debug_view(DebugView::HistoryLength);
@@ -405,7 +436,7 @@ fn a_frame_runs_the_primary_pass_then_the_upscale_pass_and_times_both() {
     let names: Vec<_> = gpu.timings().passes().iter().map(|p| &*p.name).collect();
     // The light is drawn from the G-buffer by its own pass and the display transform makes the
     // image (#202); with its stages off (this test's light) only the tone pass's copy is left.
-    assert_eq!(names, ["primary", "shade", "tone", "upscale"]);
+    assert_eq!(names, ["primary", "shadows", "shade", "tone", "upscale"]);
     if gpu.timers_supported() {
         for pass in gpu.timings().passes() {
             assert!(

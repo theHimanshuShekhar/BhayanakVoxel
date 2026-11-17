@@ -114,6 +114,8 @@ pub(crate) struct History {
 /// One frame's share of the upscaler's inputs.
 pub(crate) struct Frame {
     uniform: UpscaleUniform,
+    /// Frames of the history before this one.
+    frames: u32,
     /// The history image to read, and the one to write: 0 or 1.
     read: usize,
     write: usize,
@@ -123,6 +125,13 @@ impl Frame {
     /// Where in its pixel the frame is traced.
     pub fn jitter(&self) -> [f32; 2] {
         [self.uniform.jitter[0], self.uniform.jitter[1]]
+    }
+
+    /// Which frame of the history this is, from 0 at its start: the index of Primary's sun
+    /// samples (#52), so that a frame after the history started over has the samples of a first
+    /// frame, whatever came before.
+    pub fn sun_sample(&self) -> u32 {
+        self.frames
     }
 }
 
@@ -140,6 +149,7 @@ impl History {
             std::array::from_fn(|a| (camera.position[a] - previous.position[a]) as f32);
         let [x, y] = jitter(self.frames);
         let frame = Frame {
+            frames: self.frames,
             uniform: UpscaleUniform {
                 camera: camera.uniform(),
                 previous: previous.uniform(),

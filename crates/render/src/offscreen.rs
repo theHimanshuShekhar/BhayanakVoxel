@@ -177,6 +177,9 @@ pub struct Offscreen {
     profiler: Profiler,
     target: Target,
     sun: Sun,
+    /// The sun's azimuth, elevation and radius in the camera's local frame, if it follows the
+    /// camera's up ([`Offscreen::set_local_sun`]); it replaces `sun` then.
+    local_sun: Option<(f32, f32, f32)>,
     /// Whether `update_scene` sends its writes at once; see `set_flush_scene_updates`.
     flush_scene_updates: bool,
     last_update: UpdateTimes,
@@ -257,6 +260,7 @@ impl Offscreen {
             profiler,
             target,
             sun: Sun::default(),
+            local_sun: None,
             flush_scene_updates: true,
             last_update: UpdateTimes::default(),
             last_draw: DrawTimes::default(),
@@ -302,7 +306,28 @@ impl Offscreen {
 
     /// Changes the sun that both ways of rendering light the Planet with.
     pub fn set_sun(&mut self, sun: Sun) {
+        if self.local_sun.is_some() || sun != self.sun {
+            self.tracer.sun_changed();
+        }
         self.sun = sun;
+        self.local_sun = None;
+    }
+
+    /// Puts the sun at `azimuth` and `elevation` radians in the camera's local frame, `radius`
+    /// radians wide, as the game's window does ([`Sun::local`]): it follows the local up, so a
+    /// camera that is carried over a Planet has a sun whose direction moves a little on every
+    /// frame. That is not a change of the sun, and keeps the upscaler's history.
+    pub fn set_local_sun(&mut self, azimuth: f32, elevation: f32, radius: f32) {
+        if self.local_sun != Some((azimuth, elevation, radius)) {
+            self.tracer.sun_changed();
+        }
+        self.local_sun = Some((azimuth, elevation, radius));
+    }
+
+    /// Starts the upscaler's history over, and the Reference's image: the next frame is the first
+    /// of a view, whatever came before it.
+    pub fn reset_accumulation(&mut self) {
+        self.tracer.reset_accumulation();
     }
 
     /// Sets the light's palette (see [`Look`](crate::Look)): hero light B by default.
@@ -324,7 +349,21 @@ impl Offscreen {
     pub fn use_legacy_light(&mut self) {
         self.set_look(crate::look::Look::LEGACY);
         self.set_stages(crate::post::Stages::NONE);
-        self.set_sun(Sun::new([0.5, 0.8, 0.3], 0.04).expect("a direction"));
+        self.set_sun(Sun::legacy());
+    }
+
+    /// Draws the sun and the sky alone, in both views: no GI and no emitters. Primary has no
+    /// ambient term and no emitted light, and the Reference follows no path past its first
+    /// surface and adds no emitted light (see [`Tracer::set_sun_and_sky_only`]). The bench's
+    /// shadows view uses it (#52).
+    pub fn set_sun_and_sky_only(&mut self, only: bool) {
+        self.tracer.set_sun_and_sky_only(only);
+    }
+
+    /// Sets how many shadow rays a pixel of Primary casts towards the sun's disc (see
+    /// [`Tracer::set_shadow_rays`]). The bench's `--shadow-rays` uses it (#52).
+    pub fn set_shadow_rays(&mut self, rays: u32) {
+        self.tracer.set_shadow_rays(rays);
     }
 
     /// Chooses what is drawn: the lit image, or one of the debug views.
@@ -469,7 +508,7 @@ impl Offscreen {
             &mut self.profiler,
             &mut encoder,
             camera,
-            &self.sun,
+            &sun_for(self.local_sun, self.sun, camera),
             &self.target,
         );
         let size = self.target.resolution().internal;
@@ -493,7 +532,7 @@ impl Offscreen {
             &mut self.profiler,
             &mut encoder,
             camera,
-            &self.sun,
+            &sun_for(self.local_sun, self.sun, camera),
             &self.target,
         );
         let size = self.target.resolution().output;
@@ -524,7 +563,7 @@ impl Offscreen {
             &mut self.profiler,
             &mut encoder,
             camera,
-            &self.sun,
+            &sun_for(self.local_sun, self.sun, camera),
             &self.target,
         );
         self.profiler.resolve(&mut encoder);
@@ -633,7 +672,7 @@ impl Offscreen {
             &mut self.profiler,
             &mut encoder,
             camera,
-            &self.sun,
+            &sun_for(self.local_sun, self.sun, camera),
             &self.target,
         );
         self.profiler.resolve(&mut encoder);
@@ -695,7 +734,7 @@ impl Offscreen {
             &mut self.profiler,
             &mut encoder,
             camera,
-            &self.sun,
+            &sun_for(self.local_sun, self.sun, camera),
             &self.target,
             samples,
         );
@@ -728,7 +767,7 @@ impl Offscreen {
             &mut self.profiler,
             &mut encoder,
             camera,
-            &self.sun,
+            &sun_for(self.local_sun, self.sun, camera),
             &self.target,
             reference,
             now,
@@ -926,5 +965,13 @@ impl Offscreen {
     /// Casts `rays` through the GPU `trace()` and returns the hits, in order.
     pub fn trace_rays(&self, rays: &[Ray]) -> Vec<Option<Hit>> {
         self.tracer.trace_rays(&self.device, &self.queue, rays)
+    }
+}
+
+/// The sun for a frame seen from `camera`: the local one if there is one.
+fn sun_for(local: Option<(f32, f32, f32)>, sun: Sun, camera: &Camera) -> Sun {
+    match local {
+        Some((azimuth, elevation, radius)) => Sun::local(camera, azimuth, elevation, radius),
+        None => sun,
     }
 }

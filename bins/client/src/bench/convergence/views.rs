@@ -104,6 +104,45 @@ pub fn golden() -> View {
     }
 }
 
+/// The sun-and-sky view (#52): the golden view's camera, with the **hero sun's** geometry (8
+/// degrees up, 0.12 radians wide, the game's `Sun::default()`) so that Primary's shadows are
+/// scored where the cosine at the disc's centre and the cosine of each sample differ most, and
+/// drawn with the sun and the sky alone, no GI and no emitters, in both views. The terraces throw
+/// long shadows across each other, with a wide penumbra. The legacy palette stays (see
+/// `run`), and the sun is set after it, so this is the sun that is drawn.
+pub fn sun() -> View {
+    let golden = golden();
+    let (azimuth, elevation, radius) = (
+        render::sun::DEFAULT_AZIMUTH,
+        render::sun::DEFAULT_ELEVATION,
+        render::sun::DEFAULT_ANGULAR_RADIUS,
+    );
+    View {
+        name: "sun",
+        sun: Sun::from_angles(azimuth, elevation, radius),
+        description: Description {
+            what: "the golden view's camera with the hero sun (8 degrees up, 0.12 radians wide) \
+                   and the sun and the sky alone (no GI, no emitters) in both views: the \
+                   terraces' shadows on each other",
+            sun_azimuth: azimuth,
+            sun_elevation: elevation,
+            sun_angular_radius: radius,
+            ..golden.description.clone()
+        },
+        ..golden
+    }
+}
+
+/// The description of a view that is drawn under [`Sun::legacy`], whatever sun it was made with:
+/// `use_legacy_light` replaces it, so the sun that the report names is the legacy one (#52).
+pub fn under_the_legacy_sun(mut description: Description) -> Description {
+    let (azimuth, elevation) = Sun::legacy().angles();
+    description.sun_azimuth = azimuth;
+    description.sun_elevation = elevation;
+    description.sun_angular_radius = Sun::legacy().angular_radius();
+    description
+}
+
 /// The pit: a rectangle of the hillside dug out down to a flat floor, `depth` Voxels below the
 /// lowest ground on its rim. With the sun across it, one wall and the near part of the floor are
 /// lit, and the far wall and the far part of the floor are lit by what those reflect.
@@ -190,6 +229,26 @@ pub fn pit() -> View {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_sun_view_has_the_hero_suns_geometry_and_the_others_are_named_for_the_legacy_sun() {
+        let sun = sun();
+        let (azimuth, elevation) = sun.sun.angles();
+        assert!((elevation - 8f32.to_radians()).abs() < 1e-5, "{elevation}");
+        assert_eq!(sun.sun.angular_radius(), 0.12);
+        assert_eq!(
+            sun.description.sun_elevation,
+            render::sun::DEFAULT_ELEVATION
+        );
+        assert!((azimuth - render::sun::DEFAULT_AZIMUTH).abs() < 1e-5);
+        // The golden and the pit are drawn under the legacy sun, and say so.
+        for view in [golden(), super::pit()] {
+            let said = under_the_legacy_sun(view.description);
+            assert_eq!(said.sun_angular_radius, 0.04);
+            assert!((said.sun_elevation - Sun::legacy().angles().1).abs() < 1e-6);
+            assert!(said.sun_elevation > 0.9, "about 54 degrees up");
+        }
+    }
 
     #[test]
     fn the_pit_is_the_one_on_99_and_its_floor_is_the_depth_below_the_lowest_rim_ground() {
