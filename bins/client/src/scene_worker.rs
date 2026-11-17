@@ -145,6 +145,13 @@ const FOLLOW_MIN_COST: (f64, f64) = (32.0 * 1024.0, 2.0);
 /// [`SLICE`], since the camera is followed first in the round and this is what is left of it.
 const REBAND_SLICE: Duration = Duration::from_millis(5);
 
+/// More nodes than this to look at again for a finer depth (the camera's speed fell) and the scene
+/// is made again at that depth instead ([`Rebuild::Release`], #168): the owner's trigger for it
+/// was a stop that relooks more than about 500 thousand nodes (a flight's release lists 1.2 to
+/// 4.2 million at full size), where the relook takes 40 s and keeps the scene finer than it ends
+/// up for as long.
+const RELEASE_REBUILD_OVER: usize = 500_000;
+
 /// How often the thread looks at the clock while a step of the speed scale waits to be given back
 /// ([`Engine::await_work`]).
 const RELEASE_TICK: Duration = Duration::from_millis(100);
@@ -286,11 +293,16 @@ fn batch_size(left: Duration, cost: Duration) -> Option<usize> {
     Some(most as usize)
 }
 
-/// Whether a [`stream`](Engine::stream) that has gone on for `spent` of its `slice` stops for a job
-/// of the frame thread's (an Edit): only one that is longer than [`SLICE`] does, and not before
-/// the time of an ordinary slice, which is what it always had. `job_waiting` is asked only then.
-fn gives_way(spent: Duration, slice: Duration, job_waiting: impl FnOnce() -> bool) -> bool {
-    spent >= SLICE && slice > SLICE && job_waiting()
+/// How far the camera has to be from the scene, as a fraction of the scaled `d0`, for a long slice
+/// of taking in to stop for it ([`Engine::frame_waiting`]).
+const GIVE_WAY_MOVE: f64 = 0.25;
+
+/// Whether a [`stream`](Engine::stream) that has gone on for `spent` of its `slice` stops for
+/// what the frame thread waits for (an Edit, a camera that has moved): only one that is longer
+/// than [`SLICE`] does, and not before the time of an ordinary slice, which is what it always had.
+/// `frame_waiting` is asked only then.
+fn gives_way(spent: Duration, slice: Duration, frame_waiting: impl FnOnce() -> bool) -> bool {
+    spent >= SLICE && slice > SLICE && frame_waiting()
 }
 
 /// What the loader is doing, as of a [`Ready`].
@@ -420,7 +432,8 @@ pub struct Done {
     pub arrived_bricks: u64,
     /// Times the thread took in what the loader made (a call of [`Engine::stream`]), and in how
     /// many of them it stopped because its slice was used up, with more to take in, and not
-    /// because the loader had no more or the upload budget was reached.
+    /// because the loader had no more, the upload budget was reached, or the loader stopped being
+    /// backed up in the middle of a long slice, which an ordinary one then ends.
     pub stream_calls: u64,
     pub stream_slices_used: u64,
     /// Rounds in which eviction was going on, the units it took, and the bricks they held.
@@ -437,6 +450,9 @@ pub struct Done {
     /// that changed in them, which came or went.
     pub speed_changes: u64,
     pub speed_bricks: u64,
+    /// Of those changes, the finer ones that made the scene again at the new depth, because
+    /// looking again at their nodes was more than [`RELEASE_REBUILD_OVER`].
+    pub release_rebuilds: u64,
 }
 
 /// The parts of a round that [`Spent`] times.
@@ -457,9 +473,13 @@ enum Part {
     /// Looking again at the nodes that a change of the speed scale listed, and packing what that
     /// changed (see [`Engine::reband_more`]): charged to no follow step.
     Reband,
+    /// Making the scene again at the depth that a finer step asked for ([`Engine::rescale`]): the
+    /// listing that was not looked at, and the selection and packing from nothing. The copy that
+    /// is made for the frame thread is [`Part::Publish`].
+    Release,
 }
 
-const PARTS: usize = 7;
+const PARTS: usize = 8;
 
 /// How long the scene thread spent on each part of its rounds since timing was turned on
 /// ([`SceneWorker::time_work`]): the real-time bench's scene-thread time by category (#162).
@@ -472,6 +492,10 @@ pub struct Spent {
     pub coarse: Duration,
     pub hole_scan: Duration,
     pub reband: Duration,
+    /// The scene thread's time making the scene again for a finer depth (the listing that it
+    /// would have looked at, and the selection and packing from nothing), not the copy for the
+    /// frame thread, which is in `publish`.
+    pub release: Duration,
 }
 
 /// What eviction has done and what it cost the other threads, since the start.
@@ -774,6 +798,9 @@ struct Shared {
     /// [`BACKED_UP_SLICE`], in microseconds, or what the bench was told (see
     /// [`SceneWorker::set_backed_up_slice`]).
     backed_up_slice_us: AtomicU64,
+    /// [`RELEASE_REBUILD_OVER`], or what a test or the bench was told (see
+    /// [`SceneWorker::set_release_rebuild_over`]).
+    release_rebuild_over: AtomicUsize,
 }
 
 /// What the frame thread has no more use for, which it hands back for the scene thread to use
@@ -898,6 +925,7 @@ impl SceneWorker {
             no_speed_scale: AtomicBool::new(false),
             buffer_limit: AtomicUsize::new(usize::MAX),
             backed_up_slice_us: AtomicU64::new(BACKED_UP_SLICE.as_micros() as u64),
+            release_rebuild_over: AtomicUsize::new(RELEASE_REBUILD_OVER),
         });
         let (garbage, graveyard) = mpsc::channel();
         let user_bands = scene.bands();
@@ -959,6 +987,10 @@ impl SceneWorker {
             #[cfg(test)]
             job_after: None,
             #[cfg(test)]
+            camera_after: None,
+            #[cfg(test)]
+            caught_up_after: None,
+            #[cfg(test)]
             excess_ops: UploadCost::default(),
             #[cfg(test)]
             largest_op: UploadCost::default(),
@@ -992,6 +1024,15 @@ impl SceneWorker {
         self.shared
             .backed_up_slice_us
             .store(micros, Ordering::Relaxed);
+    }
+
+    /// Changes how many nodes a finer depth may list before the scene is made again instead
+    /// ([`RELEASE_REBUILD_OVER`]): for a test, whose scenes are small, to see either.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn set_release_rebuild_over(&self, nodes: usize) {
+        self.shared
+            .release_rebuild_over
+            .store(nodes, Ordering::Relaxed);
     }
 
     /// Changes the upload budget (see [`UPLOAD_BUDGET`]), for a test or the bench to see what a
@@ -1083,6 +1124,31 @@ impl SceneWorker {
         engine.job_after = job_after;
     }
 
+    /// For a test of the slice's count: the loader is no longer backed up `batches` into a round.
+    #[cfg(test)]
+    pub fn catch_up_after(&self, batches: u32) {
+        let mut engine = self
+            .stepped
+            .as_ref()
+            .expect("only a stepped thread is backed up")
+            .lock()
+            .expect("the engine is not poisoned");
+        engine.caught_up_after = Some(batches);
+    }
+
+    /// For a test of the slice's giving way to the camera: `batches` into a round the frame thread's
+    /// camera is at `to`, as a moving camera would be, with no job.
+    #[cfg(test)]
+    pub fn move_camera_after(&self, batches: u32, to: [f64; 3]) {
+        let mut engine = self
+            .stepped
+            .as_ref()
+            .expect("only a stepped thread is backed up")
+            .lock()
+            .expect("the engine is not poisoned");
+        engine.camera_after = Some((batches, to));
+    }
+
     /// Has a stepped thread busy for `time` of its clock from now, as the camera or the arrivals
     /// keep a real one: it does nothing until then, the jobs it has included. A wait for a job with
     /// a timeout that is over before that gives up with the clock moved on to the timeout, and the
@@ -1172,6 +1238,7 @@ impl SceneWorker {
             coarse: part(Part::Coarse),
             hole_scan: part(Part::HoleScan),
             reband: part(Part::Reband),
+            release: part(Part::Release),
         }
     }
 
@@ -1555,6 +1622,12 @@ struct Engine {
     arrival_sleep: Duration,
     #[cfg(test)]
     job_after: Option<u32>,
+    /// Likewise a camera that the frame thread has moved to `.1` by then, with no job.
+    #[cfg(test)]
+    camera_after: Option<(u32, [f64; 3])>,
+    /// Likewise the loader that is no longer backed up.
+    #[cfg(test)]
+    caught_up_after: Option<u32>,
     /// See [`Stats::excess_ops`].
     #[cfg(test)]
     excess_ops: UploadCost,
@@ -2131,9 +2204,29 @@ impl Engine {
         // few at a time and inside the budget, as the follow steps are. (A scene that is made
         // again at once, for a camera that was put, is selected by these bands, and has nothing
         // listed.)
-        self.scene.reband(self.bands_at(self.coarsening));
+        let bands = self.bands_at(self.coarsening);
+        let began = self.began();
+        let before = self.scene.bands().map_or(0.0, |b| b.scaled_d0());
+        self.scene.reband(bands);
         self.work.speed_changes += 1;
         self.reband_bricks = REBAND_FIRST;
+        // A finer depth that lists more than the owner's 500 thousand nodes is not looked at
+        // again: the scene is made again at that depth, which has none of the stale nodes that
+        // the flight's coarser bands left (a stale split stays for the flight, and the nearest-
+        // first relook adds the new near ones before the far ones are merged: the memory peak).
+        // What waits to be looked at is gone with the old selection, so [`World::reband_pending`]
+        // (the stats of this publish, which carries the new scene) is false only once it is
+        // published.
+        let over = self.shared.release_rebuild_over.load(Ordering::Relaxed);
+        if bands.scaled_d0() > before && self.scene.rebanding() > over {
+            let store = self.store.read().expect("the store's lock is not poisoned");
+            let update = self.scene.rebuild_for(&store, camera, bands);
+            drop(store);
+            self.camera = Some(camera);
+            self.work.release_rebuilds += 1;
+            self.spend(Part::Release, began);
+            self.note(Cause::Reband, update?);
+        }
         Ok(true)
     }
 
@@ -2458,6 +2551,10 @@ impl Engine {
         let mut guaranteed = self.outbox_is_empty();
         let longer = Duration::from_micros(self.shared.backed_up_slice_us.load(Ordering::Relaxed));
         let mut slice_used = false;
+        // The slice the call began with: a loader that stops being backed up in the middle of it
+        // makes the slice an ordinary one, which is over though the long one was not used up, and
+        // that is not a slice that was used up.
+        let first = stream_slice(self.loader.backed_up(), longer);
         self.work.stream_calls += 1;
         loop {
             // What the loader made waits in its queue, in the order it made it, while the frame
@@ -2471,13 +2568,13 @@ impl Engine {
             let spent = self.clock.since(started);
             // A slice that is longer than [`SLICE`] gives way to what the frame thread has asked
             // of the thread (an Edit, a new camera's jobs): they are done at the start of a round.
-            if gives_way(spent, slice, || self.job_waiting()) {
+            if gives_way(spent, slice, || self.frame_waiting()) {
                 slice_used = true;
                 break;
             }
             let left = slice.saturating_sub(spent);
             let Some(most) = batch_size(left, self.arrival_cost) else {
-                slice_used = true;
+                slice_used = slice >= first;
                 break;
             };
             let batch_started = self.clock.now();
@@ -2494,6 +2591,21 @@ impl Engine {
                     if *batches == 0 {
                         self.job_after = None;
                         lock(&self.shared.inbox).jobs.push_back((0, Job::Sync));
+                    }
+                }
+                if let Some(batches) = &mut self.caught_up_after {
+                    *batches = batches.saturating_sub(1);
+                    if *batches == 0 {
+                        self.caught_up_after = None;
+                        self.loader.pretend_backed_up(false);
+                    }
+                }
+                if let Some((batches, to)) = &mut self.camera_after {
+                    *batches = batches.saturating_sub(1);
+                    if *batches == 0 {
+                        let to = *to;
+                        self.camera_after = None;
+                        lock(&self.shared.inbox).camera = to;
                     }
                 }
             }
@@ -2549,9 +2661,23 @@ impl Engine {
         Ok(took)
     }
 
-    /// Whether the frame thread has given the thread a job that waits for its next round.
-    fn job_waiting(&self) -> bool {
-        !lock(&self.shared.inbox).jobs.is_empty()
+    /// Whether the frame thread is waiting for the thread's next round: it has given it a job, or
+    /// its camera is more than [`GIVE_WAY_MOVE`] of the scaled `d0` from where the scene is. A
+    /// long slice that is taking in arrivals delays the round's following the camera, and the lag
+    /// rose with the slice (1.03, 1.16, 1.28, 1.31 `d0` at 2, 16, 32, 64 ms).
+    fn frame_waiting(&self) -> bool {
+        let inbox = lock(&self.shared.inbox);
+        if !inbox.jobs.is_empty() {
+            return true;
+        }
+        let (Some(at), Some(bands)) = (self.camera, self.scene.bands()) else {
+            return false;
+        };
+        let moved = (0..3)
+            .map(|a| (inbox.camera[a] - at[a]).powi(2))
+            .sum::<f64>()
+            .sqrt();
+        moved > bands.scaled_d0() * GIVE_WAY_MOVE
     }
 
     /// Takes the children of bricks out of the store while it holds more than its budget. Whether it

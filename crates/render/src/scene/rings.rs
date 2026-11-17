@@ -328,6 +328,10 @@ pub enum Rebuild {
     Bands,
     /// The camera jumped further than the rings follow: expected.
     Jump,
+    /// The camera's speed gave a depth back and the nodes that would be looked at again were more
+    /// than a rebuild costs (ADR 0009, #168): the scene is made again at the new depth, which
+    /// drops what the finer step would have kept as stale. Expected.
+    Release,
 }
 
 /// A [`RingPatch`] in the making.
@@ -1044,6 +1048,22 @@ impl Scene {
     /// How many nodes [`Scene::reband_some`] has yet to look at.
     pub fn rebanding(&self) -> usize {
         self.rings.as_ref().map_or(0, |r| r.selection.relooking())
+    }
+
+    /// Makes the scene again for `bands` at `camera`, in place, from nothing: what a change of the
+    /// speed's depth does when looking again at its nodes would cost more ([`Rebuild::Release`],
+    /// ADR 0009). Reported as [`SceneUpdate::Rebuilt`].
+    pub fn rebuild_for(
+        &mut self,
+        store: &BrickStore,
+        camera: [f64; 3],
+        bands: Bands,
+    ) -> Result<Option<SceneUpdate>, RingsFull> {
+        if self.rings.is_none() {
+            return Ok(None);
+        }
+        self.rebuilt_at(store, camera, bands, Rebuild::Release)
+            .map(Some)
     }
 
     /// The scene made again for `camera` and `bands`, in place, from nothing: what a jump of the

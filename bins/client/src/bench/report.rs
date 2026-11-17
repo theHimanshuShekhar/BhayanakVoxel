@@ -97,7 +97,7 @@ use super::stream::StreamReport;
 /// thread took in and used up its slice), `scene_lag_d0_mean`, `scene_used_peak_mib`, `scene_follow_steps`, `scene_budget_cuts` and `camera_soft_miss_per_second` (to find where a path's misses and
 /// memory come from), to `memory` `scene_used_peak_in` and `scene_used_peak_level_bricks`, to the `config` `stream_slice_ms`, to each `scene_thread` `reband_ms` (the change of the bands for the
 /// camera's speed, which is not in `follow_ms`), to the stop's `settle` `walk_s`, `reband_s` and
-/// `fill_s` (its three parts, which add up to `seconds`), and to its gates `camera_soft_miss_frames`, `scene_soft_miss_frames` (reported),
+/// `fill_s` (its three parts, which add up to `seconds`), to each path `camera_soft_miss_lag_side`, `camera_soft_miss_loader_side`, `lag_over_floor_frames`, `scene_release_rebuilds`, `release_frame_ms_max` and `release_update_ms_max`, to each `scene_thread` `release_ms`, to the cold start `edit_during_fill` and `edit_during_fill_pending`, and to its gates `camera_soft_miss_frames`, `scene_soft_miss_frames` (reported),
 /// `scene_lag_d0_max`, `spawn_ring_s`, `time_to_control_s` and `settle_s` (`over` may now also name
 /// `soft_misses`, `scene_lag`, `spawn_ring`, `time_to_control` and `settle`). The budgets file has
 /// the keys `camera_soft_miss_frames`, `scene_lag_d0_max`, `spawn_ring_s`, `time_to_control_s` and

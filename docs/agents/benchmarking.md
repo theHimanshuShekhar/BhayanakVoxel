@@ -163,7 +163,7 @@ except `timing`.
   constants). It is the one number to compare: `bins/client/src/bench/streaming-counts.golden` has the committed value, a unit
   test (`the_counts_are_the_committed_ones`, which runs on Linux and on Windows, since it needs no
   GPU) and `tests/bench.rs` check it. When a change to the streaming code moves the counts on
-  purpose, the test prints the new hash; put it in the file and say why in the PR. It is `2466f0700e79713a` since #167 (18 levels and the test Planet's Guard from level 10: the pyramid is deeper, so the rings and the soft-miss levels are 18, not 14; `38b58d66b96791af` from #146 before it): the stepped scene has the horizon cap, so the drawn bricks of the Guard's levels went from 9 536 to 8 482, the rings' and a follow step's counts and the upload (64.30 to 64.80 MB, 6 439 to 6 986 copies) moved with them; what is streamed, arrived and evicted did not (`docs/measurements.md`).
+  purpose, the test prints the new hash; put it in the file and say why in the PR. It is `2466f0700e79713a` since #167 (18 levels and the test Planet's Guard from level 10: the pyramid is deeper, so the rings and the soft-miss levels are 18, not 14; `38b58d66b96791af` from #146 before it): the stepped scene has the horizon cap, so the drawn bricks of the Guard's levels went from 9 536 to 8 482, the rings' and a follow step's counts and the upload (64.30 to 64.80 MB, 6 439 to 6 986 copies) moved with them; what is streamed, arrived and evicted did not (`docs/measurements.md`). **The committed hash is the stepped run with the speed scale on** (#168), which is not that one: `26a1ce75…` at the first push of #168, `bd99020be09af4ba` at `99b08c4` (the scene thread takes in for longer while the loader is backed up and a margin node is not parked by a coarser change), `485be9b0eb879d35` once a coarser change parks only the nodes on the hot list (`docs/measurements.md`). The run with the scale **off** is still `2466f0700e79713a` (`with_the_speed_scale_off_the_counts_are_those_the_run_had_before_it`).
 - `upload`: bytes written to the GPU per frame (`bytes`: `total`, `max`, frames and frames with
   any) and the belt copies per frame (`writes`, the same, each a copy with a barrier of
   its own: neighbouring ranges of a patch are joined into one when they are within `COPY_GAP`
@@ -561,6 +561,21 @@ camera, and `holes_after_catch_up` the holes the look after it found, which must
     those in which it held work back for the upload budget, the frames with a camera soft miss in
     each second of the path (a flight only: at the start of it or all along it), and the most that the
     scene's buffers in use were in the path. Reported, not gated.
+  - `camera_soft_miss_lag_side`, `camera_soft_miss_loader_side` and `lag_over_floor_frames` (#168,
+    the flights): the camera misses split by what can have caused them. The score asks for level 0
+    within `floor(1) * (1 - HYSTERESIS)` (about 0.67 `d0`) of the frame's camera, so a frame whose
+    drawn scene is further behind the camera than that is a miss by construction, whatever the loader
+    has made. `lag_over_floor_frames` counts those frames (misses or not); a miss in one is **lag
+    side** (the scene thread's following: the long slice's giving way to a camera that moves is
+    for it), a miss in any other is **loader side** (a brick that the bands ask for is not there:
+    the generator, or decision A's curve). The two add up to `camera_soft_miss_frames`.
+  - `scene_release_rebuilds`, `release_frame_ms_max` and `release_update_ms_max` (#168): how many
+    times a finer depth made the scene again (`Rebuild::Release`, `scene_worker.rs` `RELEASE_REBUILD_OVER`,
+    500 thousand nodes) instead of looking at its nodes again, and the frame thread's cost of the
+    one it took: the longest frame that had one and that frame's update (the copy to the GPU, which
+    is over the budget like a jump's and is counted under `over_budget.bands`). The scene thread's
+    time in it is `scene_thread.release_ms`, to be read against #217's 5 s `CATCH_UP_CAP` (the cap
+    is not changed). Reported, not gated.
   - `hole_looks`, `holes` and `holes_per_frame`: **holes are sampled, not counted for every
     frame** (see "What the holes gate can and cannot catch"). Looking at every split brick takes
     0.3 s at full size with the store's read lock held, so the scene thread does it every 5 s
@@ -571,7 +586,8 @@ camera, and `holes_after_catch_up` the holes the look after it found, which must
     for a new camera and packing what changed), `pack` (asking the loader, taking in what it made
     and packing it), `upload` (publishing: copying what changed out for the frame thread, which
     copies it to the GPU), `evict` (eviction), `coarse` (the coarse levels over an Edit) and
-    `hole_scan` (the looks for holes), `reband` (looking again at the nodes that a change of the
+    `hole_scan` (the looks for holes), `release` (making the scene again for a depth that was
+    given back, and the listing that was not looked at: `Rebuild::Release`), `reband` (looking again at the nodes that a change of the
     bands for the camera's speed listed, and packing what changed: **not in `follow`**; ADR 0009),
     and **`hole_scan_share`**: the looks' share of the scene
     thread's **busy** time, which is the sum of the parts above and not wall time (a thread that is

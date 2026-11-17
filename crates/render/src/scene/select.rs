@@ -683,6 +683,8 @@ pub struct Selection {
     /// looked at to see if they have become hot, with the stamp they were queued with (an entry for
     /// a node that was queued again since is stale).
     queue: BTreeMap<u64, Vec<(u64, Key)>>,
+    /// The entries in `queue`, kept as they come and go (it is asked for on every relook).
+    queued_entries: usize,
     /// The nodes that could change within [`HOT`] travel of the camera.
     hot: Vec<Hot>,
     /// The nodes still to be looked at again for other bands ([`Selection::set_bands`]), the next
@@ -776,6 +778,7 @@ impl Selection {
             rewanted: false,
             nodes: HashMap::default(),
             queue: BTreeMap::new(),
+            queued_entries: 0,
             hot: Vec::new(),
             relook: Vec::new(),
             parked_for: None,
@@ -1036,7 +1039,7 @@ impl Selection {
 
     /// Entries in the queue and among the hot nodes: the stale ones are counted too.
     pub fn queued(&self) -> usize {
-        self.queue.values().map(Vec::len).sum::<usize>() + self.hot.len()
+        self.queued_entries + self.hot.len()
     }
 
     /// Adds `key`, which is in the tree and whose parent is split (or is the top), and what is
@@ -1318,6 +1321,15 @@ impl Selection {
     ///
     /// The stamp is not lost: it is kept under [`PARKED`], with its entries (which `update` leaves
     /// where they are), for a change back to the bands they were made for.
+    ///
+    /// Every listed node is parked, for coarser bands too. Parking only the nodes on the hot list
+    /// was tried, so that a split node that is queued came due by the camera's travel and merged
+    /// late, with no relook (the splits from before a flight would not stay for it: 450 thousand
+    /// bricks of level 0 at full size): at a flight's speed the camera goes further than the old
+    /// slack of nearly all of them in a round or two, and they merge **in one update**, outside the
+    /// budget, which is what parking is for (the 3.3 million bricks of a 7 s follow step). The dev
+    /// box's flights went to a lag of 9 `d0` and 467 frames of camera soft misses (from about 30)
+    /// with it, and the test of an update's size below holds it.
     fn park_relook(&mut self) {
         for key in &self.relook {
             if let Some(node) = self.nodes.get_mut(key)
@@ -1374,10 +1386,13 @@ impl Selection {
                 .is_some_and(|n| n.stamp == stamp || n.stamp == stamp | PARKED)
         };
         self.hot.retain(|entry| live(entry.stamp, &entry.key));
+        let mut kept = 0;
         self.queue.retain(|_, entries| {
             entries.retain(|(stamp, key)| live(*stamp, key));
+            kept += entries.len();
             !entries.is_empty()
         });
+        self.queued_entries = kept;
     }
 
     /// The horizon cap that was asked for, which [`Selection::reach`] has while it is on.
@@ -1421,6 +1436,7 @@ impl Selection {
         self.relook.clear();
         self.parked_for = None;
         self.queue.clear();
+        self.queued_entries = 0;
         self.hot.clear();
         for (&key, node) in &mut self.nodes {
             self.stamps += 1;
@@ -1705,6 +1721,7 @@ impl Selection {
                 .entry((at / BUCKET) as u64)
                 .or_default()
                 .push((stamp, key));
+            self.queued_entries += 1;
         }
     }
 
@@ -1823,7 +1840,9 @@ impl Selection {
             if *entry.key() > now {
                 break;
             }
-            popped.extend(entry.remove());
+            let due = entry.remove();
+            self.queued_entries -= due.len();
+            popped.extend(due);
         }
         let (bands, camera) = (self.bands, self.camera);
         let reach = self.placed;
@@ -2227,6 +2246,14 @@ mod tests {
         }
     }
 
+    /// The running count of the queue's entries is the entries (#168: `queued` is not summed).
+    fn queue_is_counted(selection: &Selection) {
+        assert_eq!(
+            selection.queued_entries,
+            selection.queue.values().map(Vec::len).sum::<usize>()
+        );
+    }
+
     /// What the selection keeps true of every node: a split node is split by the rule and the cap,
     /// and a whole one that they split is unwatched (it is stuck or waits).
     fn is_as_the_rule_says(selection: &Selection, at: &str) {
@@ -2548,6 +2575,31 @@ mod tests {
         assert!(reband(&mut selection, &store, Bands::with_d0(D0)).is_empty());
     }
 
+    /// A change to coarser bands is not taken for the camera's move (#168): the camera goes on
+    /// at a flight's speed with nothing looked at again, and no update changes more than a few
+    /// nodes, though the bands ask for most of the tree to merge. (Parking only the nodes on the
+    /// hot list left the rest to come due by the camera's travel, and nearly all did in a round or
+    /// two: 900 of 1 180 nodes in one update here, 3.3 million bricks in a follow step at full
+    /// size.) What is looked at is the relook's, a few at a time.
+    #[test]
+    fn a_coarser_change_is_not_taken_for_the_cameras_move_by_an_update_at_a_flights_speed() {
+        let store = flat(64, 4);
+        let camera = [0.5, 20.0, 0.5];
+        let mut selection = select(&store, camera, D0);
+        let nodes = selection.nodes();
+        selection.set_bands(at_speed(1.5));
+        assert!(selection.relooking() > 50);
+        let mut at = camera;
+        let mut most = 0;
+        for _ in 0..100 {
+            at[0] += 4.0;
+            let diff = selection.update(&store, at);
+            most = most.max(diff.added.len() + diff.removed.len());
+        }
+        eprintln!("the largest update changed {most} bricks of {nodes} nodes");
+        assert!(most <= 64, "an update changed {most} bricks");
+    }
+
     #[test]
     fn a_coarser_depth_draws_fewer_bricks_and_each_is_no_finer_than_the_slow_camera_draws() {
         let store = flat(64, 4);
@@ -2604,6 +2656,7 @@ mod tests {
         reband(&mut selection, &store, bands);
         is_a_cut(&selection);
         is_as_the_rule_says(&selection, "after a second change of bands");
+        queue_is_counted(&selection);
     }
 
     /// A change back to the bands that the nodes of the last change were parked for, before they
@@ -2719,6 +2772,7 @@ mod tests {
                     &store,
                     [camera[0] + 0.25 * f64::from(n), camera[1], camera[2]],
                 );
+                queue_is_counted(&selection);
                 assert!(
                     selection.queued() <= 3 * selection.nodes(),
                     "{} entries for {} nodes after {n} pairs",
