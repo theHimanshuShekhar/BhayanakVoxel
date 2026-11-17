@@ -892,7 +892,26 @@ impl Scene {
             bound: self.bound,
             shown_coarsest: rings.selection.coarsest(),
             shown_rebuilt: rings.rebuilt,
+            shown_filled: Some(self.filled_words()),
             ..Scene::default()
+        }
+    }
+
+    /// How many words of `brick_refs` and `bricks` can hold anything: the buffers of rings are
+    /// made roomy, and the words after what the pools have in use are zero, which the GPU makes
+    /// itself (a rebuild writes only the words before). All of them for a scene that is not rings
+    /// and has no copy's count.
+    pub fn filled_words(&self) -> (usize, usize) {
+        match (&self.rings, self.shown_filled) {
+            (Some(rings), _) => (
+                rings.refs.used_end(self.brick_refs.len()),
+                rings.data.used_end(self.bricks.len()),
+            ),
+            (None, Some((refs, words))) => (
+                refs.min(self.brick_refs.len()),
+                words.min(self.bricks.len()),
+            ),
+            (None, None) => (self.brick_refs.len(), self.bricks.len()),
         }
     }
 
@@ -973,6 +992,11 @@ impl Scene {
                 buffer[range.clone()].copy_from_slice(&words[at..at + range.len()]);
                 at += range.len();
             }
+        }
+        if let Some((refs, words)) = &mut self.shown_filled {
+            let end = |ranges: &[Range<usize>]| ranges.iter().map(|r| r.end).max().unwrap_or(0);
+            *refs = (*refs).max(end(&patch.brick_refs));
+            *words = (*words).max(end(&patch.bricks));
         }
         self.levels.clone_from(&copy.levels);
         self.bound = copy.bound;
@@ -2208,6 +2232,23 @@ mod tests {
 
     fn rings_at(camera: [f64; 3]) -> Scene {
         Scene::rings(ground(), camera, bands(), bound()).unwrap()
+    }
+
+    #[test]
+    fn a_copys_filled_words_are_the_pools_and_a_paste_past_them_moves_them() {
+        let scene = rings_at(ABOVE);
+        let (refs, words) = scene.filled_words();
+        assert!(refs < scene.brick_refs.len() || words < scene.bricks.len());
+        let mut copy = scene.mirror();
+        assert_eq!(copy.filled_words(), (refs, words));
+        // Past what was in use: the tail of the buffer is words that a patch wrote since.
+        let at = words + 10;
+        let mut patch = PatchCopy::default();
+        patch.patch.bricks.push(at..at + 3);
+        patch.bricks = vec![7, 8, 9];
+        copy.paste(&patch);
+        assert_eq!(copy.filled_words(), (refs, at + 3));
+        assert_eq!(&copy.bricks[at..at + 3], &[7, 8, 9]);
     }
 
     #[test]

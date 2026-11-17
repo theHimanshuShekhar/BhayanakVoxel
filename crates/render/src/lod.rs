@@ -146,6 +146,24 @@ impl Bands {
         self.scale
     }
 
+    /// The speed's factor on the floor of `level`: [`Bands::scale`] for the near levels (0 to
+    /// [`NEAR_LEVELS`]), and for the levels past them no less than that of [`FAR_DEPTH`] levels.
+    #[inline]
+    fn scale_at(&self, level: usize) -> f64 {
+        if level > NEAR_LEVELS {
+            self.scale.max((-FAR_DEPTH).exp2())
+        } else {
+            self.scale
+        }
+    }
+
+    /// The factor on what a step of the camera costs to follow: the scale of the levels past the
+    /// near ones, which is no less than that of [`FAR_DEPTH`] levels (the near levels are much
+    /// cheaper when deep, and a step is as long as the far levels' cost lets it be).
+    pub fn cost_scale(&self) -> f64 {
+        self.scale.max((-FAR_DEPTH).exp2())
+    }
+
     /// `d0` as the bands use it, with the speed's factor: what a level-0 Voxel covering one pixel
     /// means for the camera as it moves.
     pub fn scaled_d0(&self) -> f64 {
@@ -180,12 +198,13 @@ impl Bands {
             return 0.0;
         }
         let base = self.d0 * (1u64 << level) as f64;
+        let scale = self.scale_at(level);
         match self.coarsening {
             // The coarser of the two wins: the speed's factor and the memory cap's do not multiply
             // (a camera fast enough to be drawn coarser already has the fewer bricks the cap is
             // after, and both at once was 4 times fewer than either asked for).
-            Some(c) if level >= c.from && self.scale * c.factor > 1.0 => base / c.factor,
-            _ => base * self.scale,
+            Some(c) if level >= c.from && scale * c.factor > 1.0 => base / c.factor,
+            _ => base * scale,
         }
     }
 
@@ -264,12 +283,22 @@ pub const FULL_DETAIL_UP_TO: f64 = 10.0;
 /// The speed, in metres a second, at which the bands are [`MOST_DEPTH`] coarser: the flight's.
 pub const FLIGHT_SPEED: f64 = 50.0;
 
-/// How many levels coarser than at rest the bands are at [`FLIGHT_SPEED`] and above (ADR 0009: "about
-/// one and a half").
-pub const MOST_DEPTH: f64 = 1.5;
+/// How many levels coarser than at rest the near levels' bands are at [`FLIGHT_SPEED`] and above
+/// (ADR 0009: three, from one and a half, #168: the 2 m flight's loader did not make the bricks of
+/// the level 0 it asked for at one and a half).
+pub const MOST_DEPTH: f64 = 3.0;
+
+/// The levels from 0 to this one have the whole depth ([`MOST_DEPTH`]); those past it have no more
+/// than [`FAR_DEPTH`]: what a flight makes at the near levels is what the loader is short of, and
+/// the far levels' bricks are few either way.
+pub const NEAR_LEVELS: usize = 4;
+
+/// The most levels coarser than at rest that a level past [`NEAR_LEVELS`] is drawn at: the first
+/// curve's, which the ADR kept for the far levels.
+pub const FAR_DEPTH: f64 = 1.5;
 
 /// The steps the depth moves in, in levels. A change of depth looks at every node of the
-/// selection once, so the curve is a few steps and not a slope: 0, 0.5, 1 and 1.5 levels.
+/// selection once, so the curve is a few steps and not a slope: 0, 0.5, 1 ... and 3 levels.
 pub const DEPTH_STEP: f64 = 0.5;
 
 /// How far under a step's speed the camera must fall before the step is given back, as a factor
@@ -1382,22 +1411,37 @@ mod tests {
     }
 
     #[test]
-    fn the_ramp_reaches_a_level_and_a_half_at_fifty_metres_a_second_and_stays() {
+    fn the_ramp_reaches_three_levels_at_fifty_metres_a_second_and_stays() {
         assert_eq!(depth_for(metres(10.0)), 0.0);
-        assert!((depth_for(metres(30.0)) - 0.75).abs() < 1e-12);
-        assert!((depth_for(metres(50.0)) - 1.5).abs() < 1e-12);
-        assert_eq!(depth_for(metres(400.0)), 1.5);
+        assert!((depth_for(metres(30.0)) - 1.5).abs() < 1e-12);
+        assert!((depth_for(metres(50.0)) - 3.0).abs() < 1e-12);
+        assert_eq!(depth_for(metres(400.0)), 3.0);
         let mut scale = Timed::at_rest();
         assert!(scale.observe(50.0));
-        assert_eq!(scale.depth(), 1.5);
+        assert_eq!(scale.depth(), 3.0);
         let bands = Bands::with_d0(1000.0).speed_scaled(scale.depth());
-        // Every level starts where the level a level and a half finer did: 2^-1.5 of the distance.
+        // The near levels start where the level three finer did: 2^-3 of the distance; the levels
+        // past them where the level a level and a half finer did.
         let plain = Bands::with_d0(1000.0);
-        for level in 1..10 {
+        for level in 1..12 {
             let ratio = bands.floor(level) / plain.floor(level);
+            let depth: f64 = if level <= NEAR_LEVELS { 3.0 } else { FAR_DEPTH };
+            assert!((ratio - (-depth).exp2()).abs() < 1e-12, "{level}: {ratio}");
+            assert!(
+                bands.floor(level) > bands.floor(level - 1),
+                "in order at {level}"
+            );
+        }
+        // At the first curve's depth every level is the same.
+        let half = Bands::with_d0(1000.0).speed_scaled(FAR_DEPTH);
+        for level in 1..12 {
+            let ratio = half.floor(level) / plain.floor(level);
             assert!((ratio - 2f64.powf(-1.5)).abs() < 1e-12, "{level}: {ratio}");
         }
-        // `d0` is the same for what is measured in it: a jump, a step, the room.
+        // What a step costs is by the far levels', and `d0` is the same for what is measured in
+        // it: a jump, a step, the room.
+        assert_eq!(bands.cost_scale(), 2f64.powf(-1.5));
+        assert_eq!(half.cost_scale(), half.scale());
         assert_eq!(bands.d0(), 1000.0);
     }
 
@@ -1406,15 +1450,15 @@ mod tests {
         let mut scale = Timed::at_rest();
         // At once, to the step that holds the speed (rounded up).
         assert!(scale.observe(50.0));
-        assert_eq!(scale.depth(), 1.5);
+        assert_eq!(scale.depth(), 3.0);
         // Slower, but within what the step holds and its release: no change, however long.
-        assert!(!scale.hold(40.0, 2.0));
-        assert!(!scale.hold(35.0, 2.0));
-        assert_eq!(scale.depth(), 1.5);
+        assert!(!scale.hold(47.0, 2.0));
+        assert!(!scale.hold(46.0, 2.0));
+        assert_eq!(scale.depth(), 3.0);
         // Well under it, for as long as the hold: the step is given back, to the step the speed
         // holds.
         assert!(scale.hold(30.0, RELEASE_HOLD + 0.1));
-        assert_eq!(scale.depth(), 1.0);
+        assert_eq!(scale.depth(), 2.0);
         assert!(scale.hold(15.0, RELEASE_HOLD + 0.1));
         assert_eq!(scale.depth(), 0.5);
         // Stopped: full detail.
@@ -1428,16 +1472,16 @@ mod tests {
         // one such sample, mid-flight, gave back every step at once.
         let mut scale = Timed::at_rest();
         scale.observe(50.0);
-        assert_eq!(scale.depth(), 1.5);
+        assert_eq!(scale.depth(), 3.0);
         assert!(!scale.observe(0.0));
         scale.wait(0.25);
         assert!(!scale.observe(0.0));
-        assert_eq!(scale.depth(), 1.5);
+        assert_eq!(scale.depth(), 3.0);
         // The flight goes on at its speed: the hold starts again after.
         assert!(!scale.hold(50.0, 0.3));
         scale.wait(0.25);
         assert!(!scale.observe(0.0));
-        assert_eq!(scale.depth(), 1.5);
+        assert_eq!(scale.depth(), 3.0);
         // Calm for the hold is a stop.
         assert!(scale.hold(0.0, RELEASE_HOLD + 0.1));
         assert_eq!(scale.depth(), 0.0);
@@ -1470,7 +1514,7 @@ mod tests {
         assert!(!scale.scale.releasing());
         // And the other way: a camera put at speed takes its step.
         assert!(scale.scale.settle_to(metres(30.0)));
-        assert_eq!(scale.depth(), 1.0);
+        assert_eq!(scale.depth(), 1.5);
         assert!(!scale.scale.settle_to(metres(30.0)));
     }
 

@@ -1453,6 +1453,8 @@ impl ApplicationHandler for App {
 }
 
 fn main() -> Result<ExitCode, Box<dyn Error>> {
+    // The threads that read and pack bricks for a scene made again run below the frame thread.
+    render::scene::select::set_worker_start(priority::lower_current_thread);
     let mut args = std::env::args().skip(1);
     match args.next().as_deref() {
         Some("bench") => return Ok(bench::main(args)),

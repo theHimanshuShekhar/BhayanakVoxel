@@ -395,6 +395,41 @@ fn moving_the_camera_writes_only_what_changes() {
     assert_eq!(gpu.render(&camera), fresh);
 }
 
+/// A rebuild writes only the words that the scene's pools have in use (the rest of the roomy
+/// buffers is zero, and the GPU clears it): the copy of a scene (`Scene::mirror`), which the frame
+/// thread uploads when the scene was made again, draws what the scene does, also after patches
+/// that were pasted into it (the count follows them: a unit test in `rings.rs`).
+#[test]
+fn a_rebuild_that_writes_only_the_used_words_draws_what_the_scene_does() {
+    let start = [0.0, 1548.0 + 2000.0, 200.0];
+    let end = [0.0, 1548.0 + 2000.0, 330.0];
+    let mut scene = rings_at(start);
+    let mut copy = scene.mirror();
+    let (refs, words) = copy.filled_words();
+    let long = Lengths::of(&copy);
+    assert!(
+        refs < long.brick_refs && words < long.bricks,
+        "roomy buffers: {refs} of {} refs and {words} of {} words",
+        long.brick_refs,
+        long.bricks
+    );
+    let mut to = end;
+    for step in 1..=8 {
+        if let Some(SceneUpdate::Rings(patch)) = scene.recentre(planet(), to).unwrap() {
+            copy.paste(&scene.copy_patch(patch));
+        }
+        to[2] += 90.0 * f64::from(step);
+    }
+    let after = copy.filled_words();
+    assert!(after.0 >= refs && after.1 >= words);
+    // A GPU that has another scene, and is given the copy as a rebuild.
+    let mut gpu = Offscreen::new(WIDTH, HEIGHT, &rings_at([0.0, 1548.0 + 2000.0, 900.0])).unwrap();
+    gpu.update_scene(&copy, &SceneUpdate::Rebuilt).unwrap();
+    let camera = Camera::looking_at(scene.camera().unwrap(), [0.0; 3]);
+    let mut whole = Offscreen::new(WIDTH, HEIGHT, &scene).unwrap();
+    assert_eq!(gpu.render(&camera), whole.render(&camera));
+}
+
 #[test]
 fn a_flight_from_the_surface_to_orbit_and_back_keeps_the_gpu_memory_bounded() {
     let (low, high) = ([0.0, 1548.0, 250.0], [0.0, 3600.0, 3000.0]);

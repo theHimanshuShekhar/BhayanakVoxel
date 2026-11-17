@@ -258,7 +258,7 @@ const LEAD: [f64; AHEAD] = [1.0, 2.0];
 const LEAD_FROM_SPEED: f64 = VOXELS_PER_METRE;
 
 /// The speed scale of a camera at rest. A test can measure another curve: `SPEED_DEPTH` is the
-/// depth in levels that the ramp ends at (1.5 is the curve, 0 is no speed scaling).
+/// depth in levels that the ramp ends at (3 is the curve, 0 is no speed scaling).
 fn speed_scale_at_rest() -> SpeedScale {
     #[cfg(test)]
     if let Some(most) = std::env::var("SPEED_DEPTH")
@@ -2476,7 +2476,7 @@ impl Engine {
     /// bands' scale (the limit is longer by its inverse); a jump is of the unscaled `d0`, which is what `d0` is here.
     fn follow_limit(&self, d0: f64) -> f64 {
         let target = self.follow_target();
-        let scale = self.scene.bands().map_or(1.0, |bands| bands.scale());
+        let scale = self.scene.bands().map_or(1.0, |bands| bands.cost_scale());
         (target.bytes as f64 / (FOLLOW_MIN_COST.0 * scale))
             .min(f64::from(target.writes) / (FOLLOW_MIN_COST.1 * scale))
             .min(render::scene::JUMP * d0 / 2.0)

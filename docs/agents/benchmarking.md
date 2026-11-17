@@ -568,14 +568,24 @@ camera, and `holes_after_catch_up` the holes the look after it found, which must
     has made. `lag_over_floor_frames` counts those frames (misses or not); a miss in one is **lag
     side** (the scene thread's following: the long slice's giving way to a camera that moves is
     for it), a miss in any other is **loader side** (a brick that the bands ask for is not there:
-    the generator, or decision A's curve). The two add up to `camera_soft_miss_frames`.
+    the generator; decision A's curve, 3 levels at 50 m/s on levels 0 to 4, is in). The two add up to `camera_soft_miss_frames`.
   - `scene_release_rebuilds`, `release_frame_ms_max` and `release_update_ms_max` (#168): how many
     times a finer depth made the scene again (`Rebuild::Release`, `scene_worker.rs` `RELEASE_REBUILD_OVER`,
     500 thousand nodes) instead of looking at its nodes again, and the frame thread's cost of the
     one it took: the longest frame that had one and that frame's update (the copy to the GPU, which
     is over the budget like a jump's and is counted under `over_budget.bands`). The scene thread's
     time in it is `scene_thread.release_ms`, to be read against #217's 5 s `CATCH_UP_CAP` (the cap
-    is not changed). Reported, not gated.
+    is not changed): on the 4090 it is 8.8 to 9.2 s, so the wait for the stop's catch-up ends at
+    the cap with `before_hold.hit_cap` true, and the catch-up that follows is the rest of it.
+    The release frame is the one frame over the limit that the owner accepted (about 230 ms); the
+    frames around it are not: **while the scene thread makes the scene again the threads that read
+    and pack its bricks run at the lowest priority** (`render::scene::select::set_worker_start`,
+    `priority.rs`), because all the cores at the frame thread's priority kept it from waking for
+    30 ms at a time (26 to 43 frames over the limit, update `none`, on the 4090), and **the
+    frame thread writes only the used words of the rebuilt buffers** (`Scene::filled_words`: the
+    rest of the roomy buffers is zero, which the GPU makes itself): a rebuild writes about half of
+    what `upload.bytes_max` says (940 MB), which still counts the buffers made, the used words and
+    the zeros, so that the count is the same on every machine. Reported, not gated.
   - `hole_looks`, `holes` and `holes_per_frame`: **holes are sampled, not counted for every
     frame** (see "What the holes gate can and cannot catch"). Looking at every split brick takes
     0.3 s at full size with the store's read lock held, so the scene thread does it every 5 s

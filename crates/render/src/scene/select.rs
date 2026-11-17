@@ -39,6 +39,7 @@
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::hash::{BuildHasherDefault, Hasher};
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
 use brick_store::{Brick, BrickCoord, BrickStore, TableSize, VOXELS_PER_METRE};
@@ -465,6 +466,17 @@ fn decide(store: &BrickStore, level: usize, coord: BrickCoord, p: impl FnOnce() 
     }
 }
 
+/// What each thread of [`par_map`] runs before it starts: the client lowers their priority with it
+/// (`priority.rs` there). Making the scene again from nothing on every core at the frame thread's
+/// priority kept the frame thread from waking for 30 ms at a time (#168): on the 4090, 26 to 31
+/// frames over the limit while the scene thread made the scene again.
+static WORKER_START: OnceLock<fn()> = OnceLock::new();
+
+/// Sets what each thread of [`par_map`] runs before it starts. Once: a second call changes nothing.
+pub fn set_worker_start(start: fn()) {
+    let _ = WORKER_START.set(start);
+}
+
 /// `f` of each of `items`, in order, on as many threads as the machine has. Generating the
 /// bricks of a Planet is what takes the time, and it does not depend on the order.
 pub fn par_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R> {
@@ -478,6 +490,9 @@ pub fn par_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec
         let workers: Vec<_> = (0..threads)
             .map(|_| {
                 scope.spawn(|| {
+                    if let Some(start) = WORKER_START.get() {
+                        start();
+                    }
                     let mut mine = Vec::new();
                     loop {
                         let from = next.fetch_add(BLOCK, AtomicOrdering::Relaxed);
@@ -2794,8 +2809,8 @@ mod tests {
     }
 
     /// No level flips back and forth at a steady speed (#168): a camera that flies straight at a
-    /// speed right on the edge between two steps of the curve (36.7 m/s: the step to 1.5 levels is
-    /// asked for from 36.67), which the scene thread is told with noise of 4% on it (the velocity
+    /// speed right on the edge between two steps of the curve (30.1 m/s: the step to 2 levels is
+    /// asked for from 30.0), which the scene thread is told with noise of 4% on it (the velocity
     /// is a mean over a tenth of a second of frames, and a frame's time is not exact), draws
     /// exactly what the camera does that is told the exact speed, at every frame: the bands move
     /// once and never again. Without the release hysteresis the noise would flip the step.
@@ -2803,7 +2818,7 @@ mod tests {
     fn no_level_flips_at_a_steady_speed_on_the_edge_of_a_step() {
         let store = flat(64, 4);
         let start = [0.5, 20.0, 0.5];
-        let speed = 36.7 * brick_store::VOXELS_PER_METRE;
+        let speed = 30.1 * brick_store::VOXELS_PER_METRE;
         let step = speed / 100.0;
         let frame = 0.01;
         let run = |wobble: f64| {
@@ -2834,9 +2849,9 @@ mod tests {
         };
         let (exact, exact_rebands, depth) = run(0.0);
         let (noisy, noisy_rebands, noisy_depth) = run(0.04);
-        // One reband, at the first frame, to the 1.5 levels that 36.7 m/s holds.
+        // One reband, at the first frame, to the 2 levels that 30.1 m/s holds.
         assert_eq!((exact_rebands, noisy_rebands), (1, 1));
-        assert_eq!((depth, noisy_depth), (1.5, 1.5));
+        assert_eq!((depth, noisy_depth), (2.0, 2.0));
         assert!(exact[0].len() > 100);
         for (n, (a, b)) in exact.iter().zip(&noisy).enumerate() {
             assert_eq!(a, b, "frame {n}");

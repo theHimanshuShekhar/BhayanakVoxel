@@ -513,13 +513,24 @@ const STORAGE_USAGE: wgpu::BufferUsages = wgpu::BufferUsages::STORAGE
     .union(wgpu::BufferUsages::COPY_DST)
     .union(wgpu::BufferUsages::COPY_SRC);
 
+/// The most bytes that one `write_buffer` of a rebuild carries.
+const REBUILD_WRITE: usize = 64 << 20;
+
 /// A storage buffer holding `words`, with room for `spare` more words (as far as the device's
 /// limit allows), padded to a non-empty size as bindings must be. Returns it and its size in
 /// words. It can be written to with `COPY_DST`.
+///
+/// Only the first `filled` words are written; the rest are zero, as `words` has them (the buffers
+/// of rings are made roomy, and half of what a rebuild would write is zeros). With a `queue` and a
+/// long tail of zeros the buffer is made unmapped, which the GPU clears by itself, and the words
+/// are written through the queue, so the host copies `filled` words and not all. Without one, it
+/// is made mapped (which is cleared on the host), and still only `filled` are copied.
 fn storage_buffer(
     device: &wgpu::Device,
+    queue: Option<&wgpu::Queue>,
     label: &str,
     words: &[u32],
+    filled: usize,
     spare: usize,
 ) -> Result<(wgpu::Buffer, usize)> {
     let limit = device.limits().max_storage_buffer_binding_size;
@@ -530,21 +541,31 @@ fn storage_buffer(
         )
         .into());
     }
+    let filled = filled.min(words.len());
     let capacity = (words.len() + spare).min((limit / 4) as usize).max(4);
+    // A tail of at least half is what writing through the queue is for: it costs a copy of its
+    // own for each part.
+    let through_queue = queue.filter(|_| filled * 2 <= capacity && filled > 0);
     let buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some(label),
         size: capacity as u64 * 4,
         usage: STORAGE_USAGE,
-        mapped_at_creation: true,
+        mapped_at_creation: through_queue.is_none(),
     });
-    {
-        let mut view = buffer
-            .get_mapped_range_mut(..)
-            .expect("a buffer created mapped");
-        view.slice(..words.len() * 4)
-            .copy_from_slice(bytemuck::cast_slice(words));
+    let used: &[u8] = bytemuck::cast_slice(&words[..filled]);
+    if let Some(queue) = through_queue {
+        for (i, part) in used.chunks(REBUILD_WRITE).enumerate() {
+            queue.write_buffer(&buffer, (i * REBUILD_WRITE) as u64, part);
+        }
+    } else {
+        {
+            let mut view = buffer
+                .get_mapped_range_mut(..)
+                .expect("a buffer created mapped");
+            view.slice(..used.len()).copy_from_slice(used);
+        }
+        buffer.unmap();
     }
-    buffer.unmap();
     Ok((buffer, capacity))
 }
 
@@ -626,7 +647,12 @@ struct SceneBuffers {
 }
 
 impl SceneBuffers {
-    fn new(device: &wgpu::Device, layout: &wgpu::BindGroupLayout, scene: &Scene) -> Result<Self> {
+    fn new(
+        device: &wgpu::Device,
+        queue: Option<&wgpu::Queue>,
+        layout: &wgpu::BindGroupLayout,
+        scene: &Scene,
+    ) -> Result<Self> {
         let header = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("scene header"),
             contents: bytemuck::bytes_of(&SceneHeader::new(scene)),
@@ -639,16 +665,39 @@ impl SceneBuffers {
                 spare_words(len)
             }
         };
-        let (table, table_capacity) = storage_buffer(device, "region table", &scene.table, 0)?;
-        let (regions, regions_capacity) = storage_buffer(device, "regions", &scene.regions, 0)?;
+        let (refs_filled, bricks_filled) = scene.filled_words();
+        let (table, table_capacity) = storage_buffer(
+            device,
+            queue,
+            "region table",
+            &scene.table,
+            scene.table.len(),
+            0,
+        )?;
+        let (regions, regions_capacity) = storage_buffer(
+            device,
+            queue,
+            "regions",
+            &scene.regions,
+            scene.regions.len(),
+            0,
+        )?;
         let (brick_refs, refs_capacity) = storage_buffer(
             device,
+            queue,
             "brick refs",
             &scene.brick_refs,
+            refs_filled,
             spare(scene.brick_refs.len()),
         )?;
-        let (bricks, bricks_capacity) =
-            storage_buffer(device, "bricks", &scene.bricks, spare(scene.bricks.len()))?;
+        let (bricks, bricks_capacity) = storage_buffer(
+            device,
+            queue,
+            "bricks",
+            &scene.bricks,
+            bricks_filled,
+            spare(scene.bricks.len()),
+        )?;
         let mut buffers = Self {
             group: Self::bind(
                 device,
@@ -808,7 +857,7 @@ impl Tracer {
                 layout_entry(4, buffer_binding(STORAGE_READ)),
             ],
         });
-        let scene_buffers = SceneBuffers::new(device, &scene_layout, scene)?;
+        let scene_buffers = SceneBuffers::new(device, None, &scene_layout, scene)?;
         let scene_bytes = scene_buffers.bytes;
         let belt = wgpu::util::StagingBelt::new(device.clone(), BELT_CHUNK);
 
@@ -1210,7 +1259,7 @@ impl Tracer {
         match update {
             SceneUpdate::Rebuilt => {
                 let before = self.scene.bytes;
-                self.scene = SceneBuffers::new(device, &self.scene_layout, scene)?;
+                self.scene = SceneBuffers::new(device, Some(queue), &self.scene_layout, scene)?;
                 self.peak_rebuild_bytes = self.peak_rebuild_bytes.max(before + self.scene.bytes);
                 self.uploaded += self.scene.bytes;
                 return Ok(());
@@ -1277,7 +1326,7 @@ impl Tracer {
                     || scene.bricks.len() > buffers.capacity[3]
                 {
                     let before = self.scene.bytes;
-                    self.scene = SceneBuffers::new(device, &self.scene_layout, scene)?;
+                    self.scene = SceneBuffers::new(device, Some(queue), &self.scene_layout, scene)?;
                     self.peak_rebuild_bytes =
                         self.peak_rebuild_bytes.max(before + self.scene.bytes);
                     self.uploaded += self.scene.bytes;
