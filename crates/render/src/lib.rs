@@ -18,6 +18,7 @@
 //! one input of the shading at a time.
 
 pub mod accumulation;
+pub mod atmosphere;
 pub mod batch;
 pub mod camera;
 mod composite;
@@ -55,7 +56,7 @@ pub use scene::{
 };
 pub use sun::Sun;
 pub use timing::Timings;
-pub use tracer::{DEFAULT_SHADOW_RAYS, Fault, MAX_SHADOW_RAYS, ReferenceOptions};
+pub use tracer::{DEFAULT_SHADOW_RAYS, Fault, MAX_SHADOW_RAYS, ReferenceOptions, SkyEstimator};
 pub use upscale::Resolution;
 pub use window::{Mode, Renderer};
 

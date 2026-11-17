@@ -792,9 +792,10 @@ fn the_reference_view_meters_afresh_after_a_debug_view_instead_of_holding_a_stal
 /// that the pixel was shown from (read from the lit image before the transform).
 fn floor_under_each_curve(sun: [f32; 3]) -> Vec<(render::ToneCurve, [f32; 3], [f32; 3])> {
     let mut gpu = Offscreen::new(SIZE, SIZE, &floor_of(material("grassy soil"))).unwrap();
+    // Hero light B's gradient with this sun (the atmosphere would make the sun's light itself).
     gpu.set_look(Look {
         sun,
-        ..Look::HERO_B
+        ..Look::HERO_B_GRADIENT
     });
     gpu.set_sun(Sun::new([0.3, 0.8, 0.5], 0.12).unwrap());
     render::ToneCurve::ALL

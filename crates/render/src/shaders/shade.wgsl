@@ -121,8 +121,9 @@ fn shadows(@builtin(global_invocation_id) id: vec3<u32>) {
 }
 
 // The light leaving the hit, towards the camera; `colour` is its surface_albedo and `sun` the
-// weight of the sun's light there (`shadows`).
-fn shade(ray: Ray, hit: Hit, colour: vec3<f32>, sun: f32) -> vec3<f32> {
+// weight of the sun's light there (`shadows`); `uv` is the pixel's place in the image, 0 to 1, which
+// the air between it and the camera is looked up by (sky.wgsl).
+fn shade(ray: Ray, hit: Hit, colour: vec3<f32>, sun: f32, uv: vec2<f32>) -> vec3<f32> {
     if !hit.hit {
         // lighting: Sky and atmosphere
         return sky(ray.dir);
@@ -134,7 +135,7 @@ fn shade(ray: Ray, hit: Hit, colour: vec3<f32>, sun: f32) -> vec3<f32> {
     // lighting: Emissive Voxels
     let light = lit + emission(hit.material) * f32(frame.light.z);
     // lighting: Sky and atmosphere
-    return hazed(light, hit.t);
+    return hazed(light, hit.t, uv, ray.dir);
 }
 
 @compute @workgroup_size(8, 8)
@@ -158,5 +159,6 @@ fn shade_pass(@builtin(global_invocation_id) id: vec3<u32>) {
         // lighting: Sun and shadows
         sun = textureLoad(sun_weights, id.xy, 0).x;
     }
-    textureStore(output, id.xy, vec4<f32>(shade(ray, hit, colour, sun), 1.0));
+    let uv = (vec2<f32>(id.xy) + 0.5) / vec2<f32>(size);
+    textureStore(output, id.xy, vec4<f32>(shade(ray, hit, colour, sun, uv), 1.0));
 }

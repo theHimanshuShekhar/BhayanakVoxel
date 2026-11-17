@@ -24,7 +24,7 @@ use planet_gen::planet::Planet;
 use planet_gen::world_map::{TEST_MAP_SIZE, TEST_RADIUS, WORLD_MAP_SIZE, WorldMap};
 use render::lod::Bands;
 use render::sun::DEFAULT_ANGULAR_RADIUS;
-use render::{Camera, NormalBias, Offscreen, Resolution, Stages, Sun, ToneCurve};
+use render::{Camera, Look, NormalBias, Offscreen, Resolution, Stages, Sun, ToneCurve};
 
 use super::stamps;
 use super::{Hue, Place, SHOTS, Shot, Stamp};
@@ -43,9 +43,12 @@ const SUN_FROM_FORWARD: f64 = 70.0;
 /// view has no light sampling for emissives): four times the samples.
 const CAVE_SPP_FACTOR: u32 = 4;
 
-const USAGE: &str = "usage: client lookdev --out DIR [--size WxH] [--spp N] [--compare DIR]\n  \
+const USAGE: &str = "usage: client lookdev --out DIR [--size WxH] [--spp N] [--compare DIR] [--atmosphere]\n  \
 the 4090: client.exe lookdev --out DIR [--compare OLD_SHEET_DIR]   (1280x720, 64 spp)\n  \
 --compare: the folder of the #148 sheet; each shot's OLD/NN-shot/hero-hero-b.png is shown first\n  \
+--atmosphere (#53): instead of the combinations, each shot twice at the game's settings, hero light B\n  \
+with today's gradient sky and haze beside hero light B with the atmosphere, in both views\n  \
+(on lavapipe: client lookdev --out DIR --atmosphere --size 480x270 --spp 16)\n  \
 a smoke test on any device: client lookdev --out DIR --short";
 
 /// The smooth-normal settings of the combination sheet, in the order of its columns' groups.
@@ -117,6 +120,9 @@ pub struct Options {
     pub compare: Option<PathBuf>,
     /// Frames of the dark descent's sequence that are written, evenly over its length.
     pub descent_frames: u32,
+    /// The atmosphere's sheet (#53): each shot in both views under hero light B's gradient (what
+    /// the renderer had) and under the atmosphere, side by side, in place of the combinations.
+    pub atmosphere: bool,
     /// A smoke test: the test Planet (the shots' places are not there: the images are of nothing
     /// in particular), two shots, tiny.
     pub short: bool,
@@ -129,6 +135,7 @@ fn parse(args: impl IntoIterator<Item = String>) -> Result<Options, String> {
         spp: 64,
         compare: None,
         descent_frames: 12,
+        atmosphere: false,
         short: false,
     };
     let (mut have_out, mut size, mut spp) = (false, None, None);
@@ -151,6 +158,7 @@ fn parse(args: impl IntoIterator<Item = String>) -> Result<Options, String> {
             "--spp" => spp = Some(value("a count")?.parse().map_err(|_| "--spp is a count")?),
             "--compare" => options.compare = Some(value("a directory")?.into()),
             "--short" => options.short = true,
+            "--atmosphere" => options.atmosphere = true,
             "--help" | "-h" => return Err(USAGE.to_string()),
             other => return Err(format!("unknown argument {other}\n{USAGE}")),
         }
@@ -264,6 +272,9 @@ struct Section {
     /// liked.
     combinations: Vec<Figure>,
     descent: Vec<Figure>,
+    /// The atmosphere's sheet: the Reference and the settled Primary under the gradient, then the
+    /// same under the atmosphere.
+    versus: Vec<Figure>,
 }
 
 fn slug(name: &str) -> String {
@@ -394,6 +405,11 @@ fn write_sheet(
 pub fn run(options: &Options) -> Result<PathBuf, Box<dyn Error>> {
     let began = Instant::now();
     std::fs::create_dir_all(&options.out)?;
+    let ground_level = if options.short {
+        f64::from(TEST_RADIUS)
+    } else {
+        f64::from(planet_gen::world_map::WORLD_RADIUS)
+    };
     let (planet, guard_first, shots): (Planet, usize, Vec<usize>) = if options.short {
         // The shots' places are those of the 320 km Planet. On the test one they are in empty
         // space, which is enough to run every step of the render.
@@ -443,7 +459,19 @@ pub fn run(options: &Options) -> Result<PathBuf, Box<dyn Error>> {
             old: None,
             combinations: Vec::new(),
             descent: Vec::new(),
+            versus: Vec::new(),
         };
+        gpu.set_ground_level(ground_level);
+        if options.atmosphere {
+            versus(&mut gpu, shot, &dir, options, &mut section)?;
+            eprintln!(
+                "[{n}] {}: done in {:.0} s",
+                shot.name,
+                t.elapsed().as_secs_f64()
+            );
+            sections.push(section);
+            continue;
+        }
         // The game's settings first, for the Primary still and the descent; then the combinations.
         primary_still(&mut gpu, shot, &dir, options, &mut section)?;
         if shot.name == "dark descent" {
@@ -457,7 +485,11 @@ pub fn run(options: &Options) -> Result<PathBuf, Box<dyn Error>> {
         );
         sections.push(section);
     }
-    write_sheet(&options.out, &sections, options, began.elapsed())?;
+    if options.atmosphere {
+        write_atmosphere_sheet(&options.out, &sections, options, began.elapsed())?;
+    } else {
+        write_sheet(&options.out, &sections, options, began.elapsed())?;
+    }
     let sheet = options.out.join("index.html");
     eprintln!(
         "wrote {} ({:.0} s)",
@@ -465,6 +497,123 @@ pub fn run(options: &Options) -> Result<PathBuf, Box<dyn Error>> {
         began.elapsed().as_secs_f64()
     );
     Ok(sheet)
+}
+
+/// The two looks of the atmosphere's sheet, in the order of its columns.
+const VERSUS: [(&str, &str, Look); 2] = [
+    (
+        "gradient",
+        "today's gradient sky and haze (1/300 per m)",
+        Look::HERO_B_GRADIENT,
+    ),
+    ("atmosphere", "the atmosphere (#53)", Look::HERO_B),
+];
+
+/// The shot at the game's settings (AgX-like, smooth normals with the face bias, auto-exposure and
+/// bloom) under each of [`VERSUS`]: the Reference image, then Primary settled (the window's view
+/// of a camera that has stopped). The sun, the camera and everything but the look are the same.
+fn versus(
+    gpu: &mut Offscreen,
+    shot: &Shot,
+    dir: &str,
+    options: &Options,
+    section: &mut Section,
+) -> Result<(), Box<dyn Error>> {
+    let camera = still_camera(shot);
+    gpu.set_sun(sun_for(&camera));
+    gpu.set_stages(Stages::default());
+    let spp = if shot.cave.is_some() {
+        options.spp * CAVE_SPP_FACTOR
+    } else {
+        options.spp
+    };
+    for (view, reference) in [("reference", true), ("primary", false)] {
+        for (slug, _, look) in VERSUS {
+            let t = Instant::now();
+            gpu.set_look(look);
+            let image = if reference {
+                gpu.render_reference(&camera, spp)
+            } else {
+                gpu.reset_accumulation();
+                let mut settled = gpu.render_upscaled(&camera);
+                for _ in 1..settle_frames(options) {
+                    settled = gpu.render_upscaled(&camera);
+                }
+                settled
+            };
+            let file = format!("{dir}/{view}-{slug}.png");
+            write_png(&options.out.join(&file), &image)?;
+            section.versus.push(Figure {
+                path: file,
+                label: String::new(),
+            });
+            eprintln!("    {view}, {slug}: {:.0} s", t.elapsed().as_secs_f64());
+        }
+    }
+    Ok(())
+}
+
+fn write_atmosphere_sheet(
+    out: &Path,
+    sections: &[Section],
+    options: &Options,
+    took: Duration,
+) -> Result<(), Box<dyn Error>> {
+    let mut html = String::new();
+    html.push_str(
+        "<!doctype html><meta charset=utf-8><title>look-dev: the atmosphere (#53)</title>\
+         <style>body{font:14px system-ui;margin:1.5em;background:#16171a;color:#ddd}\
+         h1{font-weight:600}p.d{max-width:90ch;color:#aaa}\
+         table{border-collapse:collapse}th,td{vertical-align:top;padding:4px 6px;border-top:1px solid #444}\
+         th{font-size:12px;font-weight:500;color:#aaa;text-align:left;max-width:420px}\
+         td.name{max-width:190px;font-size:12px;color:#aaa;position:sticky;left:0;background:#16171a}\
+         td.name b{color:#ddd;font-size:15px}img{display:block;width:420px;height:auto}</style>",
+    );
+    let (w, h) = options.size;
+    let _ = write!(
+        html,
+        "<h1>The atmosphere against today's gradient (#53)</h1>\
+         <p class=d>Rendered at {w}&times;{h} by the renderer's own pipeline: hero light B, the sun {SUN_FROM_FORWARD}&deg; \
+         from each shot's forward ({SUN_ELEVATION}&deg; up), the game's settings (AgX-like, smooth normals with the face \
+         bias, auto-exposure and bloom). Each row is a shot. The first two columns are the Reference view ({} samples a \
+         pixel, {}&times; in the caves) under today's gradient sky and 1/300 per metre haze, then under the atmosphere; the \
+         last two are Primary, settled after {} frames of a still camera, under each. Only the look changes between a \
+         pair: the camera, the sun's direction, the Planet and the settings are the same. Took {:.0} s.{}</p>",
+        options.spp,
+        CAVE_SPP_FACTOR,
+        settle_frames(options),
+        took.as_secs_f64(),
+        if options.short {
+            " <b>A smoke test: the test Planet, which the places are not on.</b>"
+        } else {
+            ""
+        }
+    );
+    html.push_str("<table><tr><th>shot</th>");
+    for view in ["Reference", "Primary, settled"] {
+        for (_, label, _) in VERSUS {
+            let _ = write!(html, "<th>{view}: {label}</th>");
+        }
+    }
+    html.push_str("</tr>");
+    for section in sections {
+        let _ = write!(
+            html,
+            "<tr><td class=name><b>{}</b><br>{}</td>",
+            section.name, section.subject
+        );
+        for figure in &section.versus {
+            let _ = write!(
+                html,
+                "<td><a href=\"{0}\"><img src=\"{0}\" loading=lazy></a></td>",
+                figure.path
+            );
+        }
+        html.push_str("</tr>");
+    }
+    html.push_str("</table>");
+    std::fs::write(out.join("index.html"), html)?;
+    Ok(())
 }
 
 /// The camera of a shot's stills: its second keyframe, or its first if it has one frame.
@@ -728,6 +877,28 @@ mod tests {
         assert!(new.join("02-dark-descent/descent-02.png").exists());
         assert!(new.join("00-forest-floor/primary.png").exists());
         assert!(new.join("00-forest-floor/primary-settled.png").exists());
+        // The atmosphere's sheet: each shot in two views under two looks.
+        let versus = out.join("versus");
+        let options = parse(args(&[
+            "--out",
+            versus.to_str().unwrap(),
+            "--short",
+            "--atmosphere",
+        ]))
+        .unwrap();
+        assert!(options.atmosphere);
+        let html = std::fs::read_to_string(run(&options).unwrap()).unwrap();
+        let images: Vec<&str> = html
+            .split("src=\"")
+            .skip(1)
+            .map(|s| s.split('"').next().unwrap())
+            .collect();
+        assert_eq!(images.len(), 2 * 4, "{images:?}");
+        assert!(images.contains(&"00-forest-floor/reference-gradient.png"));
+        assert!(images.contains(&"00-forest-floor/primary-atmosphere.png"));
+        for image in &images {
+            assert!(versus.join(image).exists(), "{image}");
+        }
         let _ = std::fs::remove_dir_all(&out);
     }
 

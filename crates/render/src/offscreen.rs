@@ -335,6 +335,13 @@ impl Offscreen {
         self.tracer.set_look(look);
     }
 
+    /// Sets the height of the Planet's ground along the up, in Voxels, which the atmosphere
+    /// measures the camera's height from (see [`Tracer::set_ground_level`]): 0 by default, for a
+    /// world that is not a Planet.
+    pub fn set_ground_level(&mut self, voxels: f64) {
+        self.tracer.set_ground_level(voxels);
+    }
+
     /// Switches the stages of the art direction (see [`Stages`](crate::Stages)); all on by default.
     pub fn set_stages(&mut self, stages: crate::post::Stages) {
         self.tracer.set_stages(stages);
@@ -487,6 +494,44 @@ impl Offscreen {
             (size.0, size.1, pixels)
         };
         (read(&hdr, size), read(&bloom, bloom_size))
+    }
+
+    /// A table of the atmosphere as it was last filled, as linear RGB, rows from the top: for tests.
+    pub fn read_atmosphere_table(&mut self, id: crate::atmosphere::TableId) -> Vec<[f32; 3]> {
+        let (texture, size) = self.tracer.atmosphere_tables().texture(id);
+        let texture = texture.clone();
+        let encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        let bytes = read_texture(&self.device, &self.queue, encoder, &texture, size, 8);
+        bytes
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|texel| {
+                std::array::from_fn(|c| {
+                    half_to_f32(u16::from_le_bytes([texel[2 * c], texel[2 * c + 1]]))
+                })
+            })
+            .collect()
+    }
+
+    /// The cumulative distribution of the sun-free sky's brightness, as the Reference samples it:
+    /// the 32 rows' (up to and including each), then each row's 64 texels', then the total weight.
+    /// For tests.
+    pub fn read_sky_distribution(&mut self) -> Vec<f32> {
+        let buffer = self.tracer.atmosphere_tables().cdf().clone();
+        let encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        let words = crate::atmosphere::SKY_CDF_WORDS;
+        let bytes = crate::read_buffer(&self.device, &self.queue, encoder, &buffer, words * 4);
+        bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|w| f32::from_le_bytes(*w))
+            .collect()
     }
 
     /// Keeps every pass time from now on, for a report over many frames.

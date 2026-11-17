@@ -24,6 +24,9 @@ use render::{Camera, Image, Offscreen, Resolution, Scene, Sun};
 const WIDTH: u32 = 256;
 const HEIGHT: u32 = 144;
 const SEED: u64 = 0xB4A7_A9AC;
+/// Where the patch's ground is, in Voxels from the Planet's centre: the atmosphere counts the
+/// camera's height above it.
+const GROUND_LEVEL: f64 = 1535.0;
 
 /// A patch of the test Planet near the +y pole: Voxels x -440..=447, y 1360..=1575,
 /// z -360..=263, the ground out to the horizon from deep in the rock to above the highest peak.
@@ -35,9 +38,9 @@ fn planet_patch() -> Scene {
 /// The view: low over the surface near the +y pole, looking along it towards the horizon.
 fn render_view() -> Image {
     let camera = Camera::looking_at([0.0, 1548.0, 250.0], [0.0, 1535.0, -300.0]);
-    Offscreen::new(WIDTH, HEIGHT, &planet_patch())
-        .unwrap()
-        .render(&camera)
+    let mut offscreen = Offscreen::new(WIDTH, HEIGHT, &planet_patch()).unwrap();
+    offscreen.set_ground_level(GROUND_LEVEL);
+    offscreen.render(&camera)
 }
 
 #[test]
@@ -52,7 +55,9 @@ fn upscaling() -> Offscreen {
         internal: (WIDTH / 2, HEIGHT / 2),
         output: (WIDTH, HEIGHT),
     };
-    Offscreen::with_resolution(resolution, &planet_patch()).unwrap()
+    let mut offscreen = Offscreen::with_resolution(resolution, &planet_patch()).unwrap();
+    offscreen.set_ground_level(GROUND_LEVEL);
+    offscreen
 }
 
 const UPSCALED_FRAMES: u32 = 24;
@@ -104,6 +109,7 @@ const SAMPLES: u32 = 64;
 fn render_reference() -> Image {
     let camera = Camera::looking_at([0.0, 1535.0, 120.0], [0.0, 1508.0, 20.0]);
     let mut offscreen = Offscreen::new(WIDTH, HEIGHT, &planet_patch()).unwrap();
+    offscreen.set_ground_level(GROUND_LEVEL);
     offscreen.set_sun(Sun::from_angles(0.9, 0.25, 0.04));
     offscreen.render_reference(&camera, SAMPLES)
 }

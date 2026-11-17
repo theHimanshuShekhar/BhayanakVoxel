@@ -2186,6 +2186,12 @@ fn run_once(
     let d0 = built.setup.d0;
     let mut gpu = Offscreen::with_resolution(resolution, built.world.scene())
         .map_err(|e| failed("making the GPU context", e))?;
+    // The atmosphere measures the camera's height from the Planet's sea level.
+    gpu.set_ground_level(f64::from(if full {
+        planet_gen::world_map::WORLD_RADIUS
+    } else {
+        planet_gen::world_map::TEST_RADIUS
+    }));
     // A growth is cut to what a buffer of this GPU may hold (see `Scene::set_buffer_limit`).
     built.world.set_buffer_limit(gpu.buffer_limit_words());
     let report = one_run(built, &mut OffscreenGpu(&mut gpu), script, limit_ms)

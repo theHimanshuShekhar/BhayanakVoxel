@@ -393,8 +393,15 @@ fn the_short_bench_writes_a_report_and_screenshots_and_no_fail_ignores_the_budge
     );
     // The budgets could not be met: it is in the report, though the run did not fail.
     assert_eq!(report["budgets"]["ok"], false);
+    // (`primary` by name: the atmosphere's tables run before it, and have a budget of their own.)
+    let primary = report["modes"]["primary"]["passes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|pass| pass["name"] == "primary")
+        .expect("a primary pass");
     assert_eq!(
-        report["modes"]["primary"]["passes"][0]["status"],
+        primary["status"],
         if report["machine"]["timers_supported"] == true {
             "over"
         } else {
