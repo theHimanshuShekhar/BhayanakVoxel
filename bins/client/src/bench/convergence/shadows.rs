@@ -14,9 +14,11 @@
 //! scored twice, against truth A, by FLIP (mean and 99th percentile, as the other views are):
 //! - **`first_frame`**: the first frame of the view, with no history, which is what the player has
 //!   the frame after the sun changes (the shadows have no history, and neither does the upscaler
-//!   after a new sun). One sample of the sun's disc a pixel.
+//!   after a new sun). One sample of the sun's disc a pixel. **This is what the target of FLIP 0.05
+//!   is held to** (`meets_target`), as the ticket's acceptance has it.
 //! - **`settled`**: after [`Settings::settle_frames`] frames of a camera that has not moved, the
-//!   upscaler's history having gathered samples.
+//!   upscaler's history having gathered samples. Reported beside the first frame, and not held to
+//!   the target.
 //!
 //! **The shadow-edge error.** Where the sun is half hidden, Primary weighs its one sample by the
 //! cosine at the disc's centre and the Reference weighs each of its samples by its own cosine, so
@@ -131,7 +133,8 @@ pub struct ShadowsReport {
     /// Primary after `settle_frames` frames of a still camera.
     pub settled: PrimaryScore,
     pub settle_frames: u32,
-    /// Whether the settled image's FLIP mean is at or under the target; null without FLIP.
+    /// Whether the first frame's FLIP mean is at or under the target; null without FLIP. The
+    /// settled image is reported beside it and is not what is held to the target.
     pub meets_target: Option<bool>,
     /// What share of the image is on a shadow's edge, which truth A's pixels decide.
     pub edge_share: f64,
@@ -302,10 +305,12 @@ pub fn run(settings: &Settings, out: &Path) -> Result<ShadowsReport, Box<dyn Err
     let resolution = Resolution::scaled(settings.size, render::upscale::DEFAULT_SCALE);
     // The Reference at the output size, as a window has it, and Primary at the traced size.
     let mut gpu = Offscreen::with_full_reference(resolution, &view.scene)?;
-    gpu.set_sun(view.sun);
     // The light and display of before #202, as the convergence views have, so that the numbers
-    // compare from report to report: the shadows' look is the goldens'.
+    // compare from report to report: the shadows' look is the goldens'. `use_legacy_light` sets
+    // the old sun too, so the view's own (the hero sun's geometry) is set after it, or the legacy
+    // sun would be drawn and the report would name another.
     gpu.use_legacy_light();
+    gpu.set_sun(view.sun);
     gpu.set_sun_and_sky_only(true);
     gpu.set_keep_history(true);
 
@@ -356,7 +361,7 @@ pub fn run(settings: &Settings, out: &Path) -> Result<ShadowsReport, Box<dyn Err
     let settled_score = scored("Primary, settled", &settled)?;
 
     let target_counts = floor.map(|f| TARGET_FLIP >= MIN_LINE_OVER_FLOOR * f.flip_mean);
-    let meets_target = settled_score.flip.map(|f| f.flip_mean <= TARGET_FLIP);
+    let meets_target = first_frame.flip.map(|f| f.flip_mean <= TARGET_FLIP);
 
     let folder = out.join(super::FOLDER).join(name);
     fs::create_dir_all(&folder).map_err(|e| format!("cannot create {}: {e}", folder.display()))?;
@@ -446,7 +451,10 @@ pub fn print_summary(report: &ShadowsReport) {
         ),
         _ => "not scored".to_string(),
     };
-    eprintln!("  target FLIP <= {}: {note}", report.target_flip);
+    eprintln!(
+        "  target FLIP <= {} (first frame): {note}",
+        report.target_flip
+    );
 }
 
 #[cfg(test)]

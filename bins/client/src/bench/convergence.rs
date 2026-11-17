@@ -374,12 +374,14 @@ fn run_view(view: View, settings: &Settings, out: &Path) -> Result<ViewReport, B
     eprintln!("convergence: {name}...");
     let resolution = Resolution::native(settings.size.0, settings.size.1);
     let mut gpu = Offscreen::with_resolution(resolution, &view.scene)?;
-    gpu.set_sun(view.sun);
     // The light and display of before #202 (the old sun and sky, no exposure, bloom or tone
     // curve): the phase's numbers are compared from report to report, and a change of look would
     // move every one of them with no change in the estimator. The art direction's cost is in the
-    // flight's passes; its look is the goldens'.
+    // flight's passes; its look is the goldens'. This sets the old sun, too: the one these views
+    // were made with is not drawn, and the report names the sun that is.
     gpu.use_legacy_light();
+    let mut view = view;
+    view.description = views::under_the_legacy_sun(view.description);
     gpu.set_keep_history(true);
     let info = gpu.gpu_info().clone();
     let folder = out.join(FOLDER).join(name);
@@ -1073,7 +1075,7 @@ mod tests {
         assert!(floor.flip_mean < sun.first_frame.flip.unwrap().flip_mean);
         assert_eq!(
             sun.meets_target,
-            Some(sun.settled.flip.unwrap().flip_mean <= 0.05)
+            Some(sun.first_frame.flip.unwrap().flip_mean <= 0.05)
         );
         let csv = fs::read_to_string(out.join(CSV_FILE)).unwrap();
         assert!(

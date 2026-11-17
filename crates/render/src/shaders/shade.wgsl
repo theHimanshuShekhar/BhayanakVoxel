@@ -148,6 +148,7 @@ fn shade_pass(@builtin(global_invocation_id) id: vec3<u32>) {
     if hit.hit {
         // lighting: Per-Voxel colour variation
         colour = surface_albedo(hit, false);
+        // lighting: Sun and shadows
         sun = textureLoad(sun_weights, id.xy, 0).x;
     }
     textureStore(output, id.xy, vec4<f32>(shade(ray, hit, colour, sun), 1.0));

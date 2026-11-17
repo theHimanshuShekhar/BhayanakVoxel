@@ -504,8 +504,9 @@ fn primary_still(
         path: file,
         label: String::new(),
     });
-    // The upscaler's history starts with the first of these frames: the sun is the shot's, and the
-    // camera does not move.
+    // The upscaler's history starts with the first of these frames, whatever the last shot or the
+    // single frame left in it, and the camera does not move.
+    gpu.reset_accumulation();
     let mut settled = gpu.render_upscaled(&camera);
     for _ in 1..settle_frames(options) {
         settled = gpu.render_upscaled(&camera);

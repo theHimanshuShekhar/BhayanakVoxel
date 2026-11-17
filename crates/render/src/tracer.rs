@@ -425,9 +425,14 @@ pub struct Tracer {
     shade: wgpu::ComputePipeline,
     /// The display transform and the exposure it keeps from frame to frame.
     post: Post,
-    /// The sun the last frame of Primary was lit by: a frame with another one starts the upscaler's
-    /// history over, so that no shadow of the old sun is carried into the new (#52).
-    last_sun: Option<Sun>,
+    /// Counts the sun's changes that were asked for ([`Tracer::sun_changed`]), and the count the
+    /// upscaler's history has seen: a frame after a new one starts the history over, so that no
+    /// shadow of the old sun is carried into the new (#52). A signal and not a comparison of the
+    /// sun's value: the game's sun follows the camera's local up (`Sun::local`), so its direction
+    /// moves a little in f32 on every frame the camera moves, and a comparison would reset the
+    /// history of every frame of a walk.
+    sun_epoch: u64,
+    history_sun_epoch: u64,
     /// Whether the view has neither GI nor emitters (see [`Tracer::set_sun_and_sky_only`]).
     sun_and_sky_only: bool,
     /// The light's palette, and which stages of the art direction are on.
@@ -971,7 +976,8 @@ impl Tracer {
             shade_layout,
             shade,
             post: Post::new(device),
-            last_sun: None,
+            sun_epoch: 0,
+            history_sun_epoch: 0,
             sun_and_sky_only: false,
             look: Look::default(),
             stages: Stages::default(),
@@ -1058,9 +1064,9 @@ impl Tracer {
     ) {
         // A new sun starts the history over, whatever else is the same: the lit image's shadows
         // are the sun's, and nothing of the old sun's is to be carried into the new one.
-        if self.last_sun != Some(*sun) {
+        if self.history_sun_epoch != self.sun_epoch {
             self.history.reset();
-            self.last_sun = Some(*sun);
+            self.history_sun_epoch = self.sun_epoch;
         }
         let frame = self
             .history
@@ -1443,6 +1449,12 @@ impl Tracer {
 
     pub fn look(&self) -> Look {
         self.look
+    }
+
+    /// Says that the sun was changed (turned, or another one set), not that it moves with the
+    /// camera: the next frame of Primary starts the upscaler's history over (#52).
+    pub fn sun_changed(&mut self) {
+        self.sun_epoch += 1;
     }
 
     /// Sets the light's palette (see [`Look`]). The sun's and the sky's light are part of what the

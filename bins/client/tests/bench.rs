@@ -90,6 +90,15 @@ fn check_convergence(convergence: &Value, out: &Path) {
         convergence["height"].as_u64().unwrap(),
     );
     let views = convergence["views"].as_array().expect("views");
+    // The golden and pit views are drawn under the legacy sun (about 54 degrees up, 0.04 wide),
+    // and the report names that one.
+    for view in views {
+        assert!(number(&view["sun_elevation"]) > 0.9, "{view}");
+        assert!(
+            (number(&view["sun_angular_radius"]) - 0.04).abs() < 1e-6,
+            "{view}"
+        );
+    }
     let names: Vec<&str> = views.iter().map(|v| string(&v["name"])).collect();
     assert_eq!(names, ["golden", "pit"]);
     for view in views {
@@ -185,6 +194,15 @@ fn check_convergence(convergence: &Value, out: &Path) {
     assert_eq!(string(&sun["name"]), "sun");
     assert_eq!(sun["sun_and_sky_only"], true);
     assert_eq!(sun["width"], convergence["width"]);
+    // The hero sun's geometry, 8 degrees up and 0.12 wide, and not the legacy sun's.
+    assert!(
+        (number(&sun["sun_elevation"]) - 8f64.to_radians()).abs() < 1e-4,
+        "{sun}"
+    );
+    assert!(
+        (number(&sun["sun_angular_radius"]) - 0.12).abs() < 1e-6,
+        "{sun}"
+    );
     assert_eq!(sun["target_flip"], 0.05);
     assert_eq!(sun["min_line_over_floor"], 4.0);
     assert!(sun["flip"].is_null(), "--short runs no FLIP");

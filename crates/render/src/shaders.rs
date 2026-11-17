@@ -210,8 +210,10 @@ mod tests {
     }
 
     /// What reads a source of light, and the feature it is: an identifier of the shaders.
-    const READS: [(&str, &str); 5] = [
+    const READS: [(&str, &str); 6] = [
         ("frame.sun", "sun and shadows"),
+        // The sun's light at the hit, which `shadows` wrote: the lit image's read of it.
+        ("textureLoad(sun_weights", "sun and shadows"),
         ("sky(", "sky and atmosphere"),
         ("emission(", "emissive voxels"),
         ("surface_albedo(", "per-voxel colour variation"),

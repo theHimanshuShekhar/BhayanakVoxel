@@ -1172,7 +1172,8 @@ default 0.5 render scale, while the window traces the Reference view at the full
 still-view phase, at full size with batching, is the player's number.
 
 **The sun-and-sky view** (#52, `report.convergence.shadows`, `convergence/sun/`, **schema 24**). The
-golden view's camera and sun with **the sun and the sky alone in both views**: no GI (Primary has no
+golden view's camera with **the hero sun's geometry (8 degrees up, 0.12 radians wide) and the sun
+and the sky alone in both views**: no GI (Primary has no
 ambient term; the Reference follows no path past its first surface) and no emitted light
 (`Offscreen::set_sun_and_sky_only`). What is left to compare is the sun's disc and Primary's one
 shadow ray a pixel against the Reference's. It is scored at the output size (1440p), with Primary
@@ -1184,10 +1185,12 @@ traced at half of it as a window does:
   player sees (the old light with every stage off, as the other views have).
 - `first_frame` is Primary's first frame with no history, which is what the player has the frame
   after a sun change; `settled` is Primary after `settle_frames` (32) frames of a still camera. Each
-  has FLIP's `flip.flip_mean` and `flip.flip_p99`, and `edge`. **`meets_target`** is `settled`'s FLIP
-  mean at or under `target_flip` (0.05); **`target_counts`** is whether 0.05 is at least 4 times the
-  floor's mean (ADR 0005's rule, as the views' `lines[].counts`). The target is for `settled`:
-  `first_frame` has one sample of the disc a pixel and no upscaler history, and is reported beside it.
+  has FLIP's `flip.flip_mean` and `flip.flip_p99`, and `edge`. **`meets_target`** is the **first
+  frame's** FLIP mean at or under `target_flip` (0.05), as the ticket's acceptance has it (one
+  sample of the disc a pixel and no upscaler history is the frame after a sun change, and the worst
+  Primary frame); **`target_counts`** is whether 0.05 is at least 4 times the floor's mean (ADR
+  0005's rule, as the views' `lines[].counts`). `settled` is reported beside it and is not held to
+  the target.
 - **The shadow-edge error** (`edge`). FLIP's mean over a whole image says little about the few
   pixels of a shadow's edge, where Primary weighs its one sample by the cosine at the disc's centre
   and the Reference weighs each of its samples by its own. The edge is found from the Reference: a
@@ -1204,8 +1207,8 @@ traced at half of it as a window does:
   right shape; the edge error is made without FLIP. FLIP runs on a real GPU only, and in the ignored
   test `the_phase_with_flip_scores_both_views_and_writes_the_files`.
 - **For the 4090** (the ticket's acceptance, which is the orchestrator's to run): the same command
-  as the baseline above. The numbers are `report.convergence.shadows` (`settled.flip.flip_mean` at or
-  under 0.05, `meets_target`, `target_counts`; `first_frame`, `edge`) and the printed lines
+  as the baseline above. The numbers are `report.convergence.shadows` (`first_frame.flip.flip_mean` at
+  or under 0.05, `meets_target`, `target_counts`; `settled`, `edge`) and the printed lines
   `convergence, sun (...)` on stderr, and `passes[shadows]` in each mode (its 0.4 ms budget, held by
   the run's exit status). The phase's wall-clock time rose by the view's two truths and the
   unshadowed image at 1440p, which have no bounce rays and cost a fraction of the pit's.
