@@ -13,7 +13,7 @@ use sim::{Predictor, dig_seconds, target_hardness};
 use crate::clock::Clock;
 use crate::ghost::Ghost;
 use crate::loader::Loader;
-use crate::scene_worker::{Cause, Causes, LoaderStats, SceneWorker, Spent, Stats};
+use crate::scene_worker::{Cause, Causes, LoaderStats, Longest, SceneWorker, Spent, Stats};
 use crate::tool::{Tool, rotation_for};
 
 /// How many frames in a row the view must be unchanged before the reference image is taken to be
@@ -611,6 +611,14 @@ impl World {
         self.worker
             .as_ref()
             .map_or_else(Spent::default, SceneWorker::spent)
+    }
+
+    /// The longest round and update of the scene thread since the last call (see
+    /// [`SceneWorker::take_longest`]); zeros without a thread.
+    pub fn take_longest(&self) -> Longest {
+        self.worker
+            .as_ref()
+            .map_or_else(Longest::default, SceneWorker::take_longest)
     }
 
     /// Tells the scene thread the most words that a buffer of the scene may have, which is what

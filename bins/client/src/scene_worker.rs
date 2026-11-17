@@ -394,6 +394,17 @@ pub struct Spent {
     pub hole_scan: Duration,
 }
 
+/// The longest round and the longest update of the scene thread over a time (see
+/// [`SceneWorker::take_longest`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Longest {
+    pub round: Duration,
+    pub update: Duration,
+    /// The longest update in which the horizon cap came on or went off, and how many updates did.
+    pub flip: Duration,
+    pub flips: u64,
+}
+
 /// What eviction has done and what it cost the other threads, since the start.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct EvictionStats {
@@ -656,6 +667,14 @@ struct Shared {
     time_work: AtomicBool,
     /// Nanoseconds spent on each [`Part`], while timing is on.
     spent: [AtomicU64; PARTS],
+    /// The longest round since [`SceneWorker::take_longest_round`], in nanoseconds, without the
+    /// look for holes (a diagnostic of the bench), while timing is on (#213).
+    longest_round: AtomicU64,
+    /// The longest single update of the scene to a camera (one step of following it), likewise.
+    longest_update: AtomicU64,
+    /// The longest update in which the horizon cap came on or went off, and how many did.
+    longest_flip: AtomicU64,
+    flips: AtomicU64,
     /// Whether the frame thread has taken what the thread published since the thread last looked:
     /// a thread that holds work back for the budget goes on at once (see
     /// [`Engine::await_work`]), and does not sleep through the rest of the frame.
@@ -787,6 +806,10 @@ impl SceneWorker {
             looking: AtomicBool::new(false),
             time_work: AtomicBool::new(false),
             spent: std::array::from_fn(|_| AtomicU64::new(0)),
+            longest_round: AtomicU64::new(0),
+            longest_update: AtomicU64::new(0),
+            longest_flip: AtomicU64::new(0),
+            flips: AtomicU64::new(0),
             taken: AtomicBool::new(false),
             #[cfg(test)]
             throttled_waits: AtomicU64::new(0),
@@ -1012,6 +1035,21 @@ impl SceneWorker {
             evict: part(Part::Evict),
             coarse: part(Part::Coarse),
             hole_scan: part(Part::HoleScan),
+        }
+    }
+
+    /// The longest round of the thread since the last call (or since timing began), and the longest
+    /// single update of the scene to a camera in it (one step of following the camera, which is
+    /// the selection's update and what a flip of the horizon cap makes long): the longest that the
+    /// scene stood still for the frame thread (#213). The round is without the look for holes in
+    /// it. Zero if none was timed.
+    pub fn take_longest(&self) -> Longest {
+        let take = |nanos: &AtomicU64| Duration::from_nanos(nanos.swap(0, Ordering::Relaxed));
+        Longest {
+            round: take(&self.shared.longest_round),
+            update: take(&self.shared.longest_update),
+            flip: take(&self.shared.longest_flip),
+            flips: self.shared.flips.swap(0, Ordering::Relaxed),
         }
     }
 
@@ -1609,6 +1647,8 @@ impl Engine {
             self.teleported = true;
         }
         self.shared.taken.store(false, Ordering::Release);
+        let round_began = self.began();
+        let scanned_before = self.shared.spent[Part::HoleScan as usize].load(Ordering::Relaxed);
         let standing = self.told == Some(camera);
         self.told = Some(camera);
         self.at_standing_camera = false;
@@ -1738,6 +1778,17 @@ impl Engine {
         self.at_standing_camera = standing && !self.has_to_follow(camera);
         self.publish(synced);
         self.idle = !worked && !busy && !self.throttled;
+        if let Some(began) = round_began {
+            // Not the look for holes: it holds the store's lock and publishes nothing, a
+            // diagnostic that the game does not make (see `Part::HoleScan`).
+            let scanned = self.shared.spent[Part::HoleScan as usize]
+                .load(Ordering::Relaxed)
+                .saturating_sub(scanned_before);
+            let nanos = u64::try_from(self.clock.since(began).as_nanos()).unwrap_or(u64::MAX);
+            self.shared
+                .longest_round
+                .fetch_max(nanos.saturating_sub(scanned), Ordering::Relaxed);
+        }
         true
     }
 
@@ -1941,7 +1992,7 @@ impl Engine {
     /// Whether [`Engine::follow`] has anything to do for `camera`: the scene is not there, or a
     /// brick that the loader gave up on is to be asked for again.
     fn has_to_follow(&self, camera: [f64; 3]) -> bool {
-        self.camera != Some(camera) || self.scene.rewanted()
+        self.camera != Some(camera) || self.scene.rewanted() || self.scene.absorbing()
     }
 
     /// Moves the scene to `camera`, if it is not there, in steps that each cost a share of the
@@ -1986,8 +2037,24 @@ impl Engine {
             let store = self.store.read().expect("the store's lock is not poisoned");
             let before = self.scene.bricks_changed();
             let from = self.scene.camera().unwrap_or(camera);
+            let step_began = self.began();
+            let capped = self.scene.reach().horizon;
+            let absorbing = self.scene.absorbing();
             let update = self.scene.recentre(&store, target)?;
             drop(store);
+            if let Some(began) = step_began {
+                let nanos = u64::try_from(self.clock.since(began).as_nanos()).unwrap_or(u64::MAX);
+                self.shared
+                    .longest_update
+                    .fetch_max(nanos, Ordering::Relaxed);
+                let flipped = self.scene.reach().horizon != capped;
+                if flipped {
+                    self.shared.flips.fetch_add(1, Ordering::Relaxed);
+                }
+                if flipped || absorbing || self.scene.absorbing() {
+                    self.shared.longest_flip.fetch_max(nanos, Ordering::Relaxed);
+                }
+            }
             self.work.follow_bricks += self.scene.bricks_changed() - before;
             self.camera = Some(target);
             let mut cost = UploadCost::default();
@@ -2007,7 +2074,9 @@ impl Engine {
                 self.resize_follow_step(distance, cost);
             }
             self.note(Cause::Follow, update);
-            if self.camera == Some(camera) {
+            // A flip of the horizon cap that is still being absorbed goes on in the next steps, in
+            // the budget and the slice, though the camera is where the scene is (#213).
+            if self.camera == Some(camera) && !self.scene.absorbing() {
                 break;
             }
             if self.over_budget() {

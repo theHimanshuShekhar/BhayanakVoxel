@@ -1226,6 +1226,11 @@ impl Scene {
         self.rings.as_ref().is_some_and(|r| r.selection.rewanted())
     }
 
+    /// Whether a flip of the horizon cap is still being absorbed (see [`Selection::absorbing`]).
+    pub fn absorbing(&self) -> bool {
+        self.rings.as_ref().is_some_and(|r| r.selection.absorbing())
+    }
+
     /// Nodes of the selection: what the scene wants, drawn or split or in reach (see
     /// [`Selection::nodes`]).
     pub fn nodes(&self) -> usize {

@@ -3510,8 +3510,9 @@ fn thread_time() -> Duration {
 #[test]
 fn the_update_where_the_cap_goes_off_and_on_at_sea_level_is_measured() {
     // (#146) The cap is off while the camera, raised by the margin, is under the sea sphere, and
-    // comes on 50 m over it: each change looks at every node again (`reconsider_all`), the one
-    // update that is not bounded by what moved. A pit: from the spawn down to 30 m under the sea
+    // comes on 50 m over it: each change looks at every node again, a batch in each update since
+    // #213 (before it, all in the update that found the change, which was not bounded by what
+    // moved). A pit: from the spawn down to 30 m under the sea
     // and back up to 80 m over it, at 50 m/s. The stepped world runs the scene thread's round in
     // `recentre`, on this thread, so a round is timed there (by the thread's own CPU time, which a
     // busy machine does not stretch), and the rounds where the raised camera crosses the two
@@ -3550,6 +3551,13 @@ fn the_update_where_the_cap_goes_off_and_on_at_sea_level_is_measured() {
         }
         assert!(rounds.len() < 4000, "the pit is crossed");
     }
+    // The camera stands at the top while the looks at the nodes that are left go on (#213): the
+    // cut has no hole in it then either.
+    for _ in 0..120 {
+        world.recentre(at(r)).unwrap();
+        holes += world.stats().holes;
+        pace(&world, FRAME);
+    }
     let flips = rounds.iter().filter(|r| r.2).count();
     let mut sorted = rounds.iter().map(|r| r.0).collect::<Vec<_>>();
     sorted.sort();
@@ -3561,6 +3569,11 @@ fn the_update_where_the_cap_goes_off_and_on_at_sea_level_is_measured() {
         ms(sorted[sorted.len() / 2]),
         ms(sorted[sorted.len() * 99 / 100]),
         ms(*sorted.last().unwrap()),
+    );
+    let others = rounds.iter().filter(|r| !r.2).map(|r| r.0).max().unwrap();
+    eprintln!(
+        "  the slowest round that is not at a gate: {:.2} ms",
+        ms(others)
     );
     for r in rounds.iter().filter(|r| r.2) {
         eprintln!(

@@ -325,6 +325,7 @@ camera back there and the loader caught up. The camera's speed and shape are tho
 | `flight at 50 m` | 50 m/s sideways, 10 s, 50 m over the ground. |
 | `vertical take-off` | 50 m/s straight up, 6 s. |
 | `180 degree turn` | A half turn in a second, then the view still for a second. |
+| `sea-level crossing` | (#213) The raised camera down to 30 m under the sea and up to 80 m over it along the Spawn's radial at 50 m/s, held at the bottom and at the top until the scene has come to the camera (up to 90 s each), so **the horizon cap goes off and comes back on** (`CAP_ON`, 50 m over). The scene follows a camera through the ground at about 0.8 m an update, so a path that does not wait never gets to the flip. |
 | `stop after a flight` | 5 s of the flight at 2 m, then the camera stands where it was until the scene has no soft misses (up to 120 s). Settle time is in it. |
 
 After the last path the camera is back at the Spawn and the loader has caught up, and **one dig**
@@ -525,6 +526,19 @@ camera, and `holes_after_catch_up` the holes the look after it found, which must
     (`SceneWorker::count_holes`), and **one more look is forced at the end of every path**
     (`SceneWorker::look_now`), so no path has 0 looks. The report has how many looks there were in
     the path and what they found.
+  - `scene_round_max_ms`, `scene_update_max_ms`, `cap_flips`, `cap_flip_max_ms` (#213, schema 25): the
+    longest round of the scene thread in the path's frames (without the look for holes), the longest
+    single update of the scene to a camera in them (one step of `follow`, the selection's update: the
+    time the scene stood still for the frame thread), the number of times the horizon cap went off or
+    on, and the longest update that was a flip's or part of absorbing one (0 if none). A flip of the cap
+    makes every node be looked at again, and **the selection spreads that**: a sweep stamps 8 192 nodes
+    an update, and the nodes it finds changing are revisited at most 800 an update (and about 8 000
+    bricks changed), nearest first, the rest waiting in a backlog for the next updates while the
+    camera is followed as before. **The acceptance of #213: the crossing's `cap_flip_max_ms` is no
+    longer than the longest `scene_update_max_ms` of the other paths**, which the ignored test
+    `the_sea_level_crossing_round_at_full_size_is_no_longer_than_the_other_paths_worst` prints and
+    asserts (`cargo test --release -p client --bin client -- --ignored --nocapture sea_level_crossing`,
+    about 9 minutes at full size, no GPU needed).
   - `scene_thread`: milliseconds the scene thread spent in the path on `follow` (selecting again
     for a new camera and packing what changed), `pack` (asking the loader, taking in what it made
     and packing it), `upload` (publishing: copying what changed out for the frame thread, which
@@ -1175,7 +1189,7 @@ still-view phase, at full size with batching, is the player's number.
 
 ```
 {
-  "schema_version": 22,
+  "schema_version": 25,
   "build":   { "version", "commit" },          // commit: CI builds only, else null; on a PR
                                                // build it is GitHub's merge commit, not the head
   "machine": { "gpu", "device_type", "driver", "driver_info", "backend", "os", "arch",
