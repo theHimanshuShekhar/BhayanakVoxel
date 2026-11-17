@@ -193,6 +193,8 @@ fn check_convergence(convergence: &Value, out: &Path) {
     let sun = &convergence["shadows"];
     assert_eq!(string(&sun["name"]), "sun");
     assert_eq!(sun["sun_and_sky_only"], true);
+    // Two shadow rays a pixel unless `--shadow-rays` said another count.
+    assert_eq!(sun["shadow_rays"], 2);
     assert_eq!(sun["width"], convergence["width"]);
     // The hero sun's geometry, 8 degrees up and 0.12 wide, and not the legacy sun's.
     assert!(

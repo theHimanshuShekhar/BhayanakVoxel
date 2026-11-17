@@ -86,11 +86,13 @@ mod tests {
     }
 
     #[test]
-    fn the_shade_kernels_are_valid_wgsl_and_cast_one_ray_a_pixel_in_one_kernel() {
+    fn the_shade_kernels_are_valid_wgsl_and_cast_their_shadow_rays_from_one_trace_call_in_one_kernel()
+     {
         assert_eq!(entry_points(SHADE), ["normals", "shadows", "shade_pass"]);
         // The smooth normal reads the Planet through `solid_at` of trace.wgsl, and the light is
-        // drawn from what primary visibility found: the one ray of Primary's light is the sun's
-        // shadow ray, in `shadows`, and nothing else casts one.
+        // drawn from what primary visibility found: the only rays of Primary's light are the sun's
+        // shadow rays, in `shadows`, one call of trace() in a loop over `frame.light.w` rays, and
+        // nothing else casts one.
         let kernel = include_str!("shaders/shade.wgsl");
         let calls = kernel
             .lines()
@@ -103,6 +105,7 @@ mod tests {
             .and_then(|rest| rest.split("\nfn ").next())
             .expect("a shadows kernel");
         assert!(shadows.contains("trace(leave("));
+        assert!(shadows.contains("for (var k = 0u;") && shadows.contains("frame.light.w"));
     }
 
     #[test]

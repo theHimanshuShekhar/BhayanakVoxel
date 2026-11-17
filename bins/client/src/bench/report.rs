@@ -90,7 +90,8 @@ use super::stream::StreamReport;
 ///
 /// 24 (#52) adds the sun-and-sky view: `convergence.shadows`, Primary's shadows against the
 /// Reference's direct-sun image (the golden view's camera and sun, no GI and no emitters in both
-/// views): FLIP's floor in it, Primary's first frame and its settled image each with FLIP's mean
+/// views; `shadow_rays` is how many rays a pixel of Primary cast, 2 unless `--shadow-rays` said
+/// another count): FLIP's floor in it, Primary's first frame and its settled image each with FLIP's mean
 /// and p99 and the shadow-edge error (`edge`: the pixels on an edge, the mean and 99th percentile of
 /// the luma difference over them, and the mean elsewhere), whether the target of FLIP 0.05 is met
 /// and counts, and the files in `convergence/sun/`. A new pass line `shadows` is in `passes[]`

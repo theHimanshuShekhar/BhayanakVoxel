@@ -1175,9 +1175,13 @@ still-view phase, at full size with batching, is the player's number.
 golden view's camera with **the hero sun's geometry (8 degrees up, 0.12 radians wide) and the sun
 and the sky alone in both views**: no GI (Primary has no
 ambient term; the Reference follows no path past its first surface) and no emitted light
-(`Offscreen::set_sun_and_sky_only`). What is left to compare is the sun's disc and Primary's one
-shadow ray a pixel against the Reference's. It is scored at the output size (1440p), with Primary
-traced at half of it as a window does:
+(`Offscreen::set_sun_and_sky_only`). What is left to compare is the sun's disc and Primary's two
+shadow rays a pixel (`--shadow-rays N` for another count; the block's `shadow_rays` says which)
+against the Reference's. It is scored at the output size (1440p), with Primary traced at half of
+it as a window does. `--shadow-rays` changes this view alone: the `shadows` line of `passes[]` is
+timed at the default count (2), so to put 1 ray's FLIP beside its cost, read that cost from the
+run without it (0.178 ms at 1 ray on the 4090, 1440p) or from `--diag` runs of a build with
+`DEFAULT_SHADOW_RAYS` changed:
 
 - **Truth A** is the Reference's direct-sun image at `--truth-spp` samples (1024 by default, so it
   meets the ticket's "at least 1024"; pass 8192 for ADR 0005's baseline), seed 1; truth B, seed 2,
@@ -1186,13 +1190,13 @@ traced at half of it as a window does:
 - `first_frame` is Primary's first frame with no history, which is what the player has the frame
   after a sun change; `settled` is Primary after `settle_frames` (32) frames of a still camera. Each
   has FLIP's `flip.flip_mean` and `flip.flip_p99`, and `edge`. **`meets_target`** is the **first
-  frame's** FLIP mean at or under `target_flip` (0.05), as the ticket's acceptance has it (one
-  sample of the disc a pixel and no upscaler history is the frame after a sun change, and the worst
-  Primary frame); **`target_counts`** is whether 0.05 is at least 4 times the floor's mean (ADR
+  frame's** FLIP mean at or under `target_flip` (0.05), as the ticket's acceptance has it (a
+  few samples of the disc a pixel and no upscaler history is the frame after a sun change, and the
+  worst Primary frame); **`target_counts`** is whether 0.05 is at least 4 times the floor's mean (ADR
   0005's rule, as the views' `lines[].counts`). `settled` is reported beside it and is not held to
   the target.
 - **The shadow-edge error** (`edge`). FLIP's mean over a whole image says little about the few
-  pixels of a shadow's edge, where Primary weighs its one sample by the cosine at the disc's centre
+  pixels of a shadow's edge, where Primary weighs its rays by the cosine at the disc's centre
   and the Reference weighs each of its samples by its own. The edge is found from the Reference: a
   second image of the same view with the shadow rays off (`ReferenceOptions::no_shadow_rays`, 256
   samples) gives how much of the sun each pixel has (truth A over it), and a pixel is **on an edge**
@@ -1345,7 +1349,7 @@ Anything else in the file, a pass or mode with a zero, negative or non-numeric b
 a budget off.
 
 The numbers are the per-stage frame budget of the rendering decision (#10), on the RTX 4090 at 1440p
-output. Only `primary` (Primary visibility, 1.0 ms), `shadows` (the sun's shadow ray a pixel, 0.4 ms, #52),
+output. Only `primary` (Primary visibility, 1.0 ms), `shadows` (the sun's shadow rays, two a pixel, 0.4 ms, #52),
 `upscale` (the TAAU pass, 0.5 ms) and the total (8.6 ms) are live today, as those are the passes that
 exist. The later stages (GI 1.5, reflections 0.7, glass 0.7, volumetrics 1.0, denoise 1.0, atmosphere 0.3, edits 1.0, post 0.5)
 are in the file as comments: **whoever adds a pass uncomments its budget and names it the same** (a
@@ -1364,7 +1368,7 @@ they run in a Primary frame:
 | --- | --- | --- |
 | `primary` | primary visibility and the G-buffer (it no longer lights) | 1.0 (existing) |
 | `normals` | the smooth normal of every hit (the cost of the smooth normals, alone) | none yet |
-| `shadows` | the sun's shadow: one shadow ray a pixel from the G-buffer (#52, **schema 24**) | 0.4 |
+| `shadows` | the sun's shadow: two shadow rays a pixel from the G-buffer (#52, **schema 24**; `--shadow-rays N` in the bench) | 0.4 |
 | `shade` | the lit image, as linear light, from the G-buffer and the shadows | none yet |
 | `exposure`, `exposure_adapt` | the log-average luminance and the adapted exposure | none yet |
 | `bloom_down`, `bloom_h`, `bloom_v` | the bloom, at a quarter of the size | none yet |

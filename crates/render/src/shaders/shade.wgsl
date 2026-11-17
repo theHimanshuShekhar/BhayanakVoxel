@@ -1,6 +1,6 @@
 // Primary's light, drawn from what primary.wgsl wrote, in three kernels: `normals` (the smooth
 // computed normal of each hit, #202: its own pass, so that its cost has a line of its own),
-// `shadows` (the sun's light at each hit, #52: one shadow ray a pixel, its own pass for the same
+// `shadows` (the sun's light at each hit, #52: two shadow rays a pixel, its own pass for the same
 // reason) and `shade_pass`, which draws the lit image as linear light for post.wgsl to expose and
 // tone.
 //
@@ -64,27 +64,28 @@ fn normals(@builtin(global_invocation_id) id: vec3<u32>) {
 // Reference's seed (`frame.params.y`).
 const SUN_SEED = 0x5AD00052u;
 
-// The two numbers in 0..1 that choose the pixel's point on the sun's disc this frame: the
-// Reference's own sequence (sampling.wgsl, Owen-scrambled Sobol), scrambled per pixel, with the
-// frame since the history was reset as the index. Nothing is read from an earlier frame: the same
-// frame number gives the same samples.
-fn sun_sample(pixel: vec2<u32>) -> vec2<f32> {
-    return sample_group(pixel_hash(pixel, SUN_SEED), frame.light.x, 0u, false).zw;
+// The two numbers in 0..1 that choose a point on the sun's disc: the Reference's own sequence
+// (sampling.wgsl, Owen-scrambled Sobol, the dimensions 2 and 3 of its group), scrambled per pixel.
+// Nothing is read from an earlier frame: the same sample number gives the same point.
+fn sun_sample(pixel: vec2<u32>, sample: u32) -> vec2<f32> {
+    return sample_group(pixel_hash(pixel, SUN_SEED), sample, 0u, false).zw;
 }
 
 // The sun's light at the hit of each pixel (ADR 0005, "Sun and shadows"): the surface's cosine to
-// the sun's centre, as it was before shadows, times whether the sun can be seen from it. What can
-// be seen is one shadow ray, from the **geometric face**, towards one point of the sun's disc,
-// through trace(): the same disc as the Reference's, with one sample of it. A smooth normal shades
-// the hit but never moves the ray's origin. The ray is not cast where the sun is behind the
-// shading normal or the face: nothing would be lit. Nothing is carried over from another frame, so
-// a sun that has changed is right on the next one.
+// the sun's centre, as it was before shadows, times the share of the sun that can be seen from it.
+// What can be seen is `frame.light.w` shadow rays (2 by default, `tracer::DEFAULT_SHADOW_RAYS`),
+// from the **geometric face**, each towards its own point of the sun's disc, through trace(): the
+// same disc as the Reference's. The points are consecutive samples of one Owen-scrambled Sobol
+// sequence, frame * rays + ray, so that the rays of a pixel stratify the disc between them, and the
+// frames after stratify it again. A smooth normal shades the hit but never moves a ray's origin. A
+// ray is not cast where the sun is behind the shading normal or the face: nothing would be lit.
+// Nothing is carried over from another frame, so a sun that has changed is right on the next one.
 //
 // The Reference weighs each sample by its own cosine over the mean cosine of the disc; Primary
-// weighs the one it has by the cosine at the disc's centre, so that a lit surface, the whole
-// picture but the penumbra, has no noise from the wide disc. The two agree in expectation where
-// the surface faces the sun, and differ by the change of the cosine over the disc where it does
-// not and where the sun is half hidden: the bench's shadow-edge error (#52) measures that.
+// weighs the rays by the cosine at the disc's centre, so that a lit surface, the whole picture but
+// the penumbra, has no noise from the wide disc. The two agree in expectation where the surface
+// faces the sun, and differ by the change of the cosine over the disc where it does not and where
+// the sun is half hidden: the bench's shadow-edge error (#52) measures that.
 @compute @workgroup_size(8, 8)
 fn shadows(@builtin(global_invocation_id) id: vec3<u32>) {
     let size = textureDimensions(gbuffer);
@@ -103,12 +104,18 @@ fn shadows(@builtin(global_invocation_id) id: vec3<u32>) {
         }
         // lighting: Sun and shadows
         let diffuse = max(dot(normal, normalize(frame.sun.xyz)), 0.0);
-        // lighting: Sun and shadows
-        let to_sun = sample_cone(frame.sun.xyz, frame.sun.w, sun_sample(id.xy));
-        // lighting: Sun and shadows
-        if diffuse > 0.0 && dot(hit.normal, to_sun) > 0.0 && !trace(leave(ray, hit, to_sun)).hit {
-            weight = diffuse;
+        let rays = max(frame.light.w, 1u);
+        var seen = 0u;
+        for (var k = 0u; diffuse > 0.0 && k < rays; k++) {
+            // lighting: Sun and shadows
+            let to_sun = sample_cone(frame.sun.xyz, frame.sun.w, sun_sample(id.xy, frame.light.x * rays + k));
+            // lighting: Sun and shadows
+            if dot(hit.normal, to_sun) > 0.0 && !trace(leave(ray, hit, to_sun)).hit {
+                seen += 1u;
+            }
         }
+        // lighting: Sun and shadows
+        weight = diffuse * f32(seen) / f32(rays);
     }
     textureStore(sun_weights_out, id.xy, vec4<f32>(weight, 0.0, 0.0, 0.0));
 }

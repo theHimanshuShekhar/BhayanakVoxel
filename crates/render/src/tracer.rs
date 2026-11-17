@@ -103,6 +103,15 @@ impl SceneHeader {
 /// give the same image.
 pub const RNG_SEED: u32 = 0xB4A7_A9AC;
 
+/// How many shadow rays a pixel of Primary casts towards the sun's disc by default (#52): the
+/// owner's choice after the 4090 measured one ray's noise in the wide penumbrae at FLIP 0.074
+/// against a target of 0.05. The bench's `--shadow-rays` and [`Tracer::set_shadow_rays`] change it.
+pub const DEFAULT_SHADOW_RAYS: u32 = 2;
+
+/// The most shadow rays a pixel can be asked for: a bound on a loop in a kernel, for the bench's
+/// comparisons, not a setting for a game.
+pub const MAX_SHADOW_RAYS: u32 = 16;
+
 /// How the Reference view is built. The default is the player's: Owen-scrambled Sobol sample
 /// positions, the colour variation Primary has, and the estimator of ADR 0005. A test that needs
 /// something else builds the pipeline with it (see [`Tracer::set_reference_options`]); nothing
@@ -178,7 +187,7 @@ struct FrameUniform {
     /// in Voxels and the face normal's weight in it (both an f32's bits); one unused.
     flags: [u32; 4],
     /// The frame of Primary's sun samples; 1 if the view has GI (the ambient term, for Primary);
-    /// 1 if it has emitted light; one unused.
+    /// 1 if it has emitted light; the number of shadow rays a pixel casts.
     light: [u32; 4],
 }
 
@@ -435,6 +444,8 @@ pub struct Tracer {
     history_sun_epoch: u64,
     /// Whether the view has neither GI nor emitters (see [`Tracer::set_sun_and_sky_only`]).
     sun_and_sky_only: bool,
+    /// The shadow rays a pixel casts (see [`Tracer::set_shadow_rays`]).
+    shadow_rays: u32,
     /// The light's palette, and which stages of the art direction are on.
     look: Look,
     stages: Stages,
@@ -979,6 +990,7 @@ impl Tracer {
             sun_epoch: 0,
             history_sun_epoch: 0,
             sun_and_sky_only: false,
+            shadow_rays: DEFAULT_SHADOW_RAYS,
             look: Look::default(),
             stages: Stages::default(),
             last_frame_at: None,
@@ -1499,6 +1511,23 @@ impl Tracer {
         }
     }
 
+    /// Sets how many shadow rays a pixel casts towards the sun's disc (the default is
+    /// [`DEFAULT_SHADOW_RAYS`]), from 1 to [`MAX_SHADOW_RAYS`]; more are cut to that. The rays of a
+    /// pixel are consecutive samples of one sequence, so more rays are a finer penumbra and a
+    /// longer `shadows` pass, and the upscaler's history starts over, as its samples change.
+    pub fn set_shadow_rays(&mut self, rays: u32) {
+        let rays = rays.clamp(1, MAX_SHADOW_RAYS);
+        if rays != self.shadow_rays {
+            self.shadow_rays = rays;
+            self.history.reset();
+        }
+    }
+
+    /// How many shadow rays a pixel casts (see [`Tracer::set_shadow_rays`]).
+    pub fn shadow_rays(&self) -> u32 {
+        self.shadow_rays
+    }
+
     /// Sets the seed of the reference's random numbers (the default is [`RNG_SEED`]) and starts
     /// its image over: the same view, sample count and seed give the same image, and another seed
     /// gives an independent one of the same expected value.
@@ -1576,7 +1605,7 @@ impl Tracer {
                 sun_sample,
                 u32::from(!self.sun_and_sky_only),
                 u32::from(!self.sun_and_sky_only),
-                0,
+                self.shadow_rays,
             ],
         };
         queue.write_buffer(&self.frame_buffer, 0, bytemuck::bytes_of(&frame));
@@ -1663,8 +1692,8 @@ impl Tracer {
         pass.dispatch_workgroups(width.div_ceil(8), height.div_ceil(8), 1);
     }
 
-    /// The sun's light at every hit of the G-buffer: one shadow ray a pixel (`shadows` in
-    /// `shade.wgsl`), from the geometric face, towards a point of the sun's disc.
+    /// The sun's light at every hit of the G-buffer: the shadow rays of each pixel
+    /// (`shadows` in `shade.wgsl`), from the geometric face, towards points of the sun's disc.
     fn dispatch_shadows(
         &self,
         device: &wgpu::Device,

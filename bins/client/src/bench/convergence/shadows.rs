@@ -20,7 +20,7 @@
 //!   upscaler's history having gathered samples. Reported beside the first frame, and not held to
 //!   the target.
 //!
-//! **The shadow-edge error.** Where the sun is half hidden, Primary weighs its one sample by the
+//! **The shadow-edge error.** Where the sun is half hidden, Primary weighs its rays by the
 //! cosine at the disc's centre and the Reference weighs each of its samples by its own cosine, so
 //! the two differ most at a shadow's edge, and FLIP's mean over a whole image says little about a
 //! few pixels of it. The edge is found from the Reference: a second image of the same view with the
@@ -77,6 +77,9 @@ pub struct Settings {
     pub settle_frames: u32,
     /// Whether to score with FLIP (off for `--short`).
     pub flip: bool,
+    /// The shadow rays a pixel of Primary casts (`--shadow-rays`; the renderer's default if not
+    /// given).
+    pub shadow_rays: u32,
 }
 
 impl Settings {
@@ -88,6 +91,7 @@ impl Settings {
             truth_spp,
             settle_frames: 32,
             flip: true,
+            shadow_rays: render::DEFAULT_SHADOW_RAYS,
         }
     }
 
@@ -98,6 +102,7 @@ impl Settings {
             truth_spp,
             settle_frames: 4,
             flip: false,
+            shadow_rays: render::DEFAULT_SHADOW_RAYS,
         }
     }
 }
@@ -115,6 +120,8 @@ pub struct ShadowsReport {
     pub traced_height: u32,
     /// Both views have no GI and no emitters (see the module's account of the view).
     pub sun_and_sky_only: bool,
+    /// The shadow rays a pixel of Primary cast towards the sun's disc.
+    pub shadow_rays: u32,
     /// Samples of each truth, the unshadowed image's, and the seeds.
     pub truth_spp: u32,
     pub unshadowed_spp: u32,
@@ -312,6 +319,7 @@ pub fn run(settings: &Settings, out: &Path) -> Result<ShadowsReport, Box<dyn Err
     gpu.use_legacy_light();
     gpu.set_sun(view.sun);
     gpu.set_sun_and_sky_only(true);
+    gpu.set_shadow_rays(settings.shadow_rays);
     gpu.set_keep_history(true);
 
     // Truth A and B, then the unshadowed image: the Reference, with the same samples.
@@ -385,6 +393,7 @@ pub fn run(settings: &Settings, out: &Path) -> Result<ShadowsReport, Box<dyn Err
         traced_width: resolution.internal.0,
         traced_height: resolution.internal.1,
         sun_and_sky_only: true,
+        shadow_rays: settings.shadow_rays,
         truth_spp: settings.truth_spp,
         unshadowed_spp: UNSHADOWED_SPP.min(settings.truth_spp),
         seeds: Seeds {
@@ -415,11 +424,12 @@ pub fn print_summary(report: &ShadowsReport) {
     let num =
         |v: Option<f64>, digits: usize| v.map_or("n/a".to_string(), |v| format!("{v:.digits$}"));
     eprintln!(
-        "convergence, {} ({}x{}, sun and sky only): floor FLIP {}; {:.1} % of the image is on a \
-         shadow's edge",
+        "convergence, {} ({}x{}, sun and sky only, {} shadow rays): floor FLIP {}; {:.1} % of the \
+         image is on a shadow's edge",
         report.name,
         report.width,
         report.height,
+        report.shadow_rays,
         num(report.floor.map(|f| f.flip_mean), 4),
         report.edge_share * 100.0
     );

@@ -317,7 +317,7 @@ fn write_sheet(
          0.25 face bias; smooth normals with none). A Reference image takes {} samples a pixel ({}&times; that in the \
          caves), accumulated once for each normal setting and shown through each curve. The last column is Primary at the \
          game's settings (AgX-like, smooth normals with the bias), one frame, exposure settled at once, with the sun's \
-         shadows (one shadow ray a pixel towards a point of the sun's disc, #52), so its penumbra is noisy; the one after \
+         shadows (two shadow rays a pixel, each towards a point of the sun's disc, #52), so its penumbra is noisy; the one after \
          it is the same view after {} frames of a still camera, as the window shows a view that has stopped, \
          with the upscaler's history having smoothed that noise. Took {:.0} s.{}</p>",
         options.spp,
@@ -484,7 +484,7 @@ fn settle_frames(options: &Options) -> u32 {
 }
 
 /// The shot's Primary image from its still camera, at the game's settings: one frame, which has
-/// the sun's shadows from one sample of the disc a pixel (#52), and the same view after
+/// the sun's shadows from two samples of the disc a pixel (#52), and the same view after
 /// [`SETTLE_FRAMES`] frames of a camera that has not moved, which is what a window shows a view that
 /// has stopped.
 fn primary_still(

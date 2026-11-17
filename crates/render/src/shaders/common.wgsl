@@ -38,8 +38,9 @@ struct Frame {
     // The frame that Primary's sun samples are of (0 on the first frame after the upscaler's
     // history started over, a new view or a new sun, so that nothing before a frame decides its
     // shadows), then 1 if the view has GI (Primary: its ambient term, the stand-in for it; the
-    // Reference: bounce light), then 1 if it has emitted light, then one unused. Both are 0 in
-    // the bench's sun-and-sky-only view, where neither view has GI or emitters.
+    // Reference: bounce light), then 1 if it has emitted light, then the number of shadow rays a
+    // pixel of Primary casts (at least 1). Both flags are 0 in the bench's sun-and-sky-only view,
+    // where neither view has GI or emitters.
     light: vec4<u32>,
 }
 

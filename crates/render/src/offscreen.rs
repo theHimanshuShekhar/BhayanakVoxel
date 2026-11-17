@@ -360,6 +360,12 @@ impl Offscreen {
         self.tracer.set_sun_and_sky_only(only);
     }
 
+    /// Sets how many shadow rays a pixel of Primary casts towards the sun's disc (see
+    /// [`Tracer::set_shadow_rays`]). The bench's `--shadow-rays` uses it (#52).
+    pub fn set_shadow_rays(&mut self, rays: u32) {
+        self.tracer.set_shadow_rays(rays);
+    }
+
     /// Chooses what is drawn: the lit image, or one of the debug views.
     pub fn set_debug_view(&mut self, view: DebugView) {
         self.tracer.set_debug_view(view);

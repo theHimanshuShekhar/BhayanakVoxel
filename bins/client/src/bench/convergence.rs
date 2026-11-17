@@ -876,6 +876,7 @@ mod tests {
             traced_width: 32,
             traced_height: 18,
             sun_and_sky_only: true,
+            shadow_rays: 2,
             truth_spp: 16,
             unshadowed_spp: 16,
             seeds: Seeds {
@@ -976,7 +977,9 @@ mod tests {
 
     /// The phase with FLIP on, at a few dozen pixels on whatever Vulkan device there is (lavapipe
     /// locally): CI never runs FLIP, so this is run by hand, `cargo test -p client --bin client --
-    /// --ignored the_phase_with_flip`. `CONVERGENCE_TEST_SIZE=2560x1440` runs it at the real size.
+    /// --ignored the_phase_with_flip`. `CONVERGENCE_TEST_SIZE=2560x1440` runs it at the real size;
+    /// `CONVERGENCE_TEST_SHADOW_RAYS` and `CONVERGENCE_TEST_SUN_TRUTH_SPP` set the sun-and-sky
+    /// view's shadow rays (#52) and the samples of its truths.
     #[test]
     #[ignore = "runs FLIP, which CI does not"]
     fn the_phase_with_flip_scores_both_views_and_writes_the_files() {
@@ -987,6 +990,14 @@ mod tests {
                 Some((w.parse().ok()?, h.parse().ok()?))
             })
             .unwrap_or((96, 54));
+        let env = |name: &str, default: u32| {
+            std::env::var(name)
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(default)
+        };
+        let mut sun = shadows::Settings::full(size, env("CONVERGENCE_TEST_SUN_TRUTH_SPP", 64));
+        sun.shadow_rays = env("CONVERGENCE_TEST_SHADOW_RAYS", sun.shadow_rays);
         let settings = Settings {
             size,
             checkpoints: vec![1, 4, 16, 64],
@@ -997,7 +1008,7 @@ mod tests {
                 marks_s: vec![0.1, 0.25],
                 seconds: 0.3,
             },
-            shadows: shadows::Settings::full(size, 64),
+            shadows: sun,
         };
         let out = std::env::temp_dir().join(format!("bhayanak-convergence-{}", std::process::id()));
         let _ = fs::remove_dir_all(&out);

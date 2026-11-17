@@ -1,5 +1,5 @@
-//! Sun shadows in Primary (#52, ADR 0005): one shadow ray a pixel towards a sample of the sun's
-//! disc, from the geometric face, with no history. A pillar on a floor casts a shadow along -x;
+//! Sun shadows in Primary (#52, ADR 0005): two shadow rays a pixel (`DEFAULT_SHADOW_RAYS`), each
+//! towards its own sample of the sun's disc, from the geometric face, with no history. A pillar on a floor casts a shadow along -x;
 //! the CPU twin (`render::reference::trace`) says which top faces see the sun, and the GPU is held
 //! to it, a golden image holds the whole picture, and a sun that changes is right on the very next
 //! frame. Needs a Vulkan device (lavapipe in CI).
@@ -197,6 +197,52 @@ fn a_lit_point_is_lit_and_a_shadowed_point_is_dark_as_the_cpu_twin_says() {
         right * 100 >= total * 97,
         "{right} of {total} pixels agree with the CPU twin"
     );
+}
+
+/// The summed difference of the red of two images, over the whole picture.
+fn distance(a: &Image, b: &Image) -> u64 {
+    let (a, _) = a.rgba.as_chunks::<4>();
+    let (b, _) = b.rgba.as_chunks::<4>();
+    a.iter()
+        .zip(b)
+        .map(|(a, b)| u64::from(a[0].abs_diff(b[0])))
+        .sum()
+}
+
+#[test]
+fn more_shadow_rays_are_a_finer_penumbra_and_the_default_is_two() {
+    assert_eq!(render::DEFAULT_SHADOW_RAYS, 2);
+    // A wide sun, so that the pillar's shadow has a penumbra several pixels across.
+    let wide = Sun::new(TO_SUN, 0.12).unwrap();
+    let camera = overhead();
+    let image = |rays: Option<u32>| {
+        let mut gpu = gpu(SIZE, SIZE, wide);
+        if let Some(rays) = rays {
+            gpu.set_shadow_rays(rays);
+        }
+        gpu.render(&camera)
+    };
+    // Many rays are the penumbra as the disc has it, to within a few levels; one and two rays are
+    // that with noise, and two have less of it than one (the same first frame, so the rays of a
+    // pixel are samples 0, and 0 and 1, of its sequence).
+    let nearly = image(Some(render::MAX_SHADOW_RAYS));
+    let one = image(Some(1));
+    let two = image(None);
+    let (d1, d2) = (distance(&one, &nearly), distance(&two, &nearly));
+    assert!(
+        d1 > 0,
+        "a wide sun has a penumbra, and one ray is noisy in it"
+    );
+    assert!(
+        d2 * 10 < d1 * 9,
+        "two rays are {d2} levels from the many-ray penumbra and one ray {d1}"
+    );
+    // The same count and frame is the same image: nothing but the frame decides the samples.
+    assert_eq!(image(None).rgba, two.rgba);
+    // A count of 0 or past the most is cut to the range, not an error.
+    let mut gpu = gpu(SIZE, SIZE, wide);
+    gpu.set_shadow_rays(0);
+    assert_eq!(gpu.render(&camera).rgba, one.rgba);
 }
 
 #[test]
