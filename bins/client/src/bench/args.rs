@@ -60,6 +60,10 @@ Options:
   --truth-spp N    Samples of each of the convergence phase's two truths [default: 1024]; ADR
                    0005's 8192 makes each truth eight times as long (the phase takes about 2.5
                    minutes on the 4090 since #188). At least 1024, the last checkpoint
+  --shadow-rays N  Shadow rays a pixel of Primary casts towards the sun's disc in the convergence
+                   phase's sun-and-sky view (#52), 1 to 16 [default: the renderer's, 2]. The
+                   report's `convergence.shadows.shadow_rays` says which; run it with 1 and with 2
+                   to compare them
   --no-fail        Exit with status 0 even if a pass is over its budget, there is a hole or a
                    real-time gate is over
   -h, --help       Print this";
@@ -107,6 +111,9 @@ pub struct Args {
     pub truth_spp: Option<u32>,
     /// `--flip-gamma-2-2`: the convergence phase also scores the old curve's images (#188).
     pub flip_gamma22: bool,
+    /// `--shadow-rays N`: the shadow rays a pixel of Primary casts in the convergence phase's
+    /// sun-and-sky view (#52), where the renderer's default is not wanted.
+    pub shadow_rays: Option<u32>,
     pub size: Option<(u32, u32)>,
     pub bias: f64,
     pub diag: Diag,
@@ -136,6 +143,7 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Parsed, String> {
         convergence: true,
         truth_spp: None,
         flip_gamma22: false,
+        shadow_rays: None,
         size: None,
         bias: 1.0,
         diag: Diag::default(),
@@ -160,6 +168,7 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Parsed, String> {
             "--no-convergence" => parsed.convergence = false,
             "--flip-gamma-2-2" => parsed.flip_gamma22 = true,
             "--truth-spp" => parsed.truth_spp = Some(truth_spp(&value("--truth-spp")?)?),
+            "--shadow-rays" => parsed.shadow_rays = Some(shadow_rays(&value("--shadow-rays")?)?),
             "--out" => parsed.out = value("--out")?.into(),
             "--budgets" => parsed.budgets = Some(value("--budgets")?.into()),
             "--size" => parsed.size = Some(size(&value("--size")?)?),
@@ -180,6 +189,13 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Parsed, String> {
     if parsed.truth_spp.is_some() && !parsed.convergence {
         return Err(
             "--truth-spp is for the convergence phase, which --no-convergence leaves out".into(),
+        );
+    }
+    if parsed.shadow_rays.is_some() && !parsed.convergence {
+        return Err(
+            "--shadow-rays is for the convergence phase's sun-and-sky view, which \
+             --no-convergence leaves out"
+                .into(),
         );
     }
     if parsed.flip_gamma22 && (!parsed.convergence || parsed.short) {
@@ -225,6 +241,20 @@ fn truth_spp(text: &str) -> Result<u32, String> {
         .ok()
         .filter(|&n| n >= least)
         .ok_or_else(|| format!("`{text}` is not a number of samples of at least {least}"))
+}
+
+/// `--shadow-rays`: from 1 to `render::MAX_SHADOW_RAYS`, the cap of `Tracer::set_shadow_rays`
+/// (the shader's loop has none of its own).
+fn shadow_rays(text: &str) -> Result<u32, String> {
+    text.parse::<u32>()
+        .ok()
+        .filter(|n| (1..=render::MAX_SHADOW_RAYS).contains(n))
+        .ok_or_else(|| {
+            format!(
+                "`{text}` is not a number of shadow rays from 1 to {}",
+                render::MAX_SHADOW_RAYS
+            )
+        })
 }
 
 /// `--diag`'s comma-separated switches.
@@ -296,6 +326,7 @@ mod tests {
                 convergence: true,
                 truth_spp: None,
                 flip_gamma22: false,
+                shadow_rays: None,
                 size: None,
                 bias: 1.0,
                 diag: Diag::default()
@@ -377,6 +408,29 @@ mod tests {
             &["--truth-spp", "1023"],
             &["--truth-spp", "0"],
             &["--truth-spp", "lots"],
+        ] {
+            assert!(parse_all(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn the_shadow_rays_are_read_from_one_to_the_most() {
+        assert_eq!(run(&[]).shadow_rays, None);
+        assert_eq!(run(&["--shadow-rays", "1"]).shadow_rays, Some(1));
+        assert_eq!(run(&["--shadow-rays", "2"]).shadow_rays, Some(2));
+        let most = render::MAX_SHADOW_RAYS.to_string();
+        assert_eq!(
+            run(&["--shadow-rays", &most]).shadow_rays,
+            Some(render::MAX_SHADOW_RAYS)
+        );
+        let over = (render::MAX_SHADOW_RAYS + 1).to_string();
+        for bad in [
+            &["--shadow-rays", "0"][..],
+            &["--shadow-rays", &over],
+            &["--shadow-rays"],
+            &["--shadow-rays", "two"],
+            // The view is of the convergence phase, which this leaves out.
+            &["--no-convergence", "--shadow-rays", "2"],
         ] {
             assert!(parse_all(bad).is_err(), "{bad:?}");
         }

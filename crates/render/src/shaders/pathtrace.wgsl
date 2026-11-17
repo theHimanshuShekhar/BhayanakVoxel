@@ -18,6 +18,11 @@
 // surfaces use face normals. The camera ray's first hit is seen through the haze, which fades
 // its light, and only its light, to the horizon's colour.
 //
+// The sun and the sky alone (`frame.light`, #52): in the bench's sun-and-sky view the path stops at
+// its first surface (it follows no bounce, so it has no GI) and adds no emitted light, which is
+// what Primary draws in that view too (shade.wgsl: no ambient term, no emission). What is left is
+// the sun's light with its shadows, and the sky, which both views draw from the same disc.
+//
 // There is no fixed number of bounces. From the third surface on, a path ends by chance with
 // probability 1 - (the brightest channel of its throughput), and a path that goes on is scaled
 // up by 1 / (1 - that probability), so the expected light is exactly what it would have been
@@ -59,6 +64,10 @@ override FLAT_COLOURS = false;
 // White noise: the sample positions are hashed random numbers in every dimension, not
 // Owen-scrambled Sobol; the plain Monte Carlo baseline.
 override WHITE_NOISE = false;
+// The sun counts wherever it faces the surface, with no shadow ray: the same estimator without its
+// visibility, so that the bench can tell which pixels of a view have a shadow's edge in them (an
+// edge that the image with shadows has and this one does not is a shadow's).
+override NO_SHADOW_RAYS = false;
 // A fault put into the estimator, to show that the tests that guard it can fail: a test that
 // cannot fail is not a test. 0 is none.
 override FAULT = 0u;
@@ -81,25 +90,6 @@ const ROULETTE_COIN_DIM = 0x10000000u;
 // The sun's light on a surface facing it head on, as a multiple of albedo (its irradiance
 // divided by pi), is `frame.sun_radiance` (look.rs): a Lambertian surface at angle theta to the
 // sun reflects albedo * cos(theta) times it.
-// How far a ray starts inside the empty Voxel in front of the face it leaves, in Voxels. It
-// only has to beat the rounding of the hit position, so a ray cannot hit its own face.
-const NUDGE = 1e-3;
-
-// A ray leaving the face of `hit`, which `ray` found, along `dir`. It starts in the empty Voxel
-// in front of that face, a hair in from the face, rather than at a float computed from the
-// distance travelled: the Voxel is exact, so a ray cannot start behind the face it left.
-fn leave(ray: Ray, hit: Hit, dir: vec3<f32>) -> Ray {
-    let n = hit.normal;
-    let corner = vec3<f32>(hit.voxel - ray.cell) + n;
-    // Along the face, where the hit is; across it, 0 or 1 in the new Voxel as n points.
-    let along = clamp(hit.position - corner, vec3<f32>(NUDGE), vec3<f32>(1.0 - NUDGE));
-    var next: Ray;
-    next.cell = hit.voxel + vec3<i32>(n);
-    next.origin = select(along, vec3<f32>(0.5) - n * (0.5 - NUDGE), n != vec3<f32>(0.0));
-    next.dir = dir;
-    return next;
-}
-
 // The light arriving along one path from the camera: one sample of the pixel's value.
 fn radiance(first: Ray, pixel_seed: u32, sample: u32, first_group: vec4<f32>) -> vec3<f32> {
     var ray = first;
@@ -116,6 +106,11 @@ fn radiance(first: Ray, pixel_seed: u32, sample: u32, first_group: vec4<f32>) ->
     }
     if FAULT == FAULT_SHORT_CAP {
         max_depth = FAULT_SHORT_CAP_SURFACES;
+    }
+    // Without GI (`frame.light.y` is 0, in the bench's sun-and-sky-only view) the path ends at its
+    // first surface, so that what is left is the sun's light there and the sky seen directly.
+    if frame.light.y == 0u {
+        max_depth = 1u;
     }
     for (var depth = 0u; depth < max_depth; depth++) {
         // lighting: Bounce light
@@ -136,7 +131,7 @@ fn radiance(first: Ray, pixel_seed: u32, sample: u32, first_group: vec4<f32>) ->
         // lighting: Per-Voxel colour variation
         let colour = surface_albedo(hit, FLAT_COLOURS);
         // lighting: Emissive Voxels
-        light += throughput * emission(hit.material);
+        light += throughput * emission(hit.material) * f32(frame.light.z);
 
         // The mean of the cosine over the sun's cone is (1 + cos(radius)) / 2 of its value at the
         // cone's centre, so the sample's weight is divided by that: the estimate is then the
@@ -145,7 +140,7 @@ fn radiance(first: Ray, pixel_seed: u32, sample: u32, first_group: vec4<f32>) ->
         let to_sun = sample_cone(frame.sun.xyz, frame.sun.w, group.zw);
         let facing = dot(normal, to_sun);
         // lighting: Sun and shadows
-        if facing > 0.0 && dot(hit.normal, to_sun) > 0.0 && !trace(leave(ray, hit, to_sun)).hit {
+        if facing > 0.0 && dot(hit.normal, to_sun) > 0.0 && (NO_SHADOW_RAYS || !trace(leave(ray, hit, to_sun)).hit) {
             // lighting: Sun and shadows
             light += throughput * colour * frame.sun_radiance.xyz * (facing / (0.5 * (1.0 + frame.sun.w)));
         }

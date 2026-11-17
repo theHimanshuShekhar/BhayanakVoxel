@@ -1253,11 +1253,62 @@ budget in `bench-budgets.toml`, one sample) times the *internal* size, a quarter
 default 0.5 render scale, while the window traces the Reference view at the full output size. The
 still-view phase, at full size with batching, is the player's number.
 
+**The sun-and-sky view** (#52, `report.convergence.shadows`, `convergence/sun/`, **schema 24**). The
+golden view's camera with **the hero sun's geometry (8 degrees up, 0.12 radians wide) and the sun
+and the sky alone in both views**: no GI (Primary has no
+ambient term; the Reference follows no path past its first surface) and no emitted light
+(`Offscreen::set_sun_and_sky_only`). What is left to compare is the sun's disc and Primary's two
+shadow rays a pixel (`--shadow-rays N` for another count; the block's `shadow_rays` says which)
+against the Reference's. It is scored at the output size (1440p), with Primary traced at half of
+it as a window does. `--shadow-rays` changes this view alone: the `shadows` line of `passes[]` is
+timed at the default count (2), so to put 1 ray's FLIP beside its cost, read that cost from the
+run without it (0.178 ms at 1 ray on the 4090, 1440p) or from `--diag` runs of a build with
+`DEFAULT_SHADOW_RAYS` changed:
+
+- **Truth A** is the Reference's direct-sun image at `--truth-spp` samples (1024 by default, so it
+  meets the ticket's "at least 1024"; pass 8192 for ADR 0005's baseline), seed 1; truth B, seed 2,
+  gives the **floor**. FLIP is LDR at the convergence views' 67.02 ppd, on the 8-bit image the
+  player sees (the old light with every stage off, as the other views have).
+- `first_frame` is Primary's first frame with no history, which is what the player has the frame
+  after a sun change; `settled` is Primary after `settle_frames` (32) frames of a still camera. Each
+  has FLIP's `flip.flip_mean` and `flip.flip_p99`, and `edge`. **`meets_target`** is the **first
+  frame's** FLIP mean at or under `target_flip` (0.05), as the ticket's acceptance has it (a
+  few samples of the disc a pixel and no upscaler history is the frame after a sun change, and the
+  worst Primary frame); **`target_counts`** is whether 0.05 is at least 4 times the floor's mean (ADR
+  0005's rule, as the views' `lines[].counts`). `settled` is reported beside it and is not held to
+  the target. **Where it stands (#52, 4090, 1440p, hero sun, 8192-sample truth, floor 0.0008):** at
+  the default 2 rays the first frame is **0.062** and the settled image **0.059**, so
+  `meets_target` is false; 1 ray was 0.074 and 0.072 (`--shadow-rays 1`). The owner shipped 2 rays
+  with the centre-cosine weight; its bias is the cause and #55 re-judges the weight (ADR 0005's
+  "Sun and shadows" row has the numbers). `meets_target` is reported and printed only: it is not a
+  gate and does not change the exit status, and the target is not loosened.
+- **The shadow-edge error** (`edge`). FLIP's mean over a whole image says little about the few
+  pixels of a shadow's edge, where Primary weighs its rays by the cosine at the disc's centre
+  and the Reference weighs each of its samples by its own. The edge is found from the Reference: a
+  second image of the same view with the shadow rays off (`ReferenceOptions::no_shadow_rays`, 256
+  samples) gives how much of the sun each pixel has (truth A over it), and a pixel is **on an edge**
+  when it has some of the sun and not all (5 to 95 %), or has a pixel within 2 pixels on each side of
+  the half. `edge.edge_pixels`, `edge_mean` and `edge_p99` are the mean and 99th percentile of the
+  absolute difference of the 8-bit luma (Rec. 709 on the encoded values), in levels of 255, over those
+  pixels; `other_mean` is the mean over the rest of the pixels the sun reaches (the sky and the
+  faces turned from the sun say nothing of shadows, and are left out). `edge_share` is the share of
+  the image on an edge. `convergence/sun/edges.png` shows the mask, `truth-a.png`,
+  `unshadowed.png`, `primary-first.png` and `primary-settled.png` the images.
+- **CI** (`--short`) runs the view at a few dozen pixels with no FLIP, to see that the report has the
+  right shape; the edge error is made without FLIP. FLIP runs on a real GPU only, and in the ignored
+  test `the_phase_with_flip_scores_both_views_and_writes_the_files`.
+- **For the 4090** (the ticket's acceptance, which is the orchestrator's to run): the same command
+  as the baseline above. The numbers are `report.convergence.shadows` (`first_frame.flip.flip_mean` at
+  or under 0.05, `meets_target`, `target_counts`; `settled`, `edge`; `shadow_rays`) and the printed lines
+  `convergence, sun (...)` on stderr, and `passes[shadows]` in each mode (its 0.4 ms budget, held by
+  the run's exit status). The phase's wall-clock time rose by the view's two truths and the
+  unshadowed image at 1440p, which have no bounce rays and cost a fraction of the pit's.
+
 ## Reading the report
 
 ```
 {
-  "schema_version": 23,
+  "schema_version": 25,
   "build":   { "version", "commit" },          // commit: CI builds only, else null; on a PR
                                                // build it is GitHub's merge commit, not the head
   "machine": { "gpu", "device_type", "driver", "driver_info", "backend", "os", "arch",
@@ -1283,7 +1334,13 @@ still-view phase, at full size with batching, is the player's number.
                    "views": [ { "name", ...the view's camera and sun, "reference": STATS,
                                 "gpu_total": STATS, "ms_per_mpix_per_sample", "converged", "floor",
                                 "curve": [...], "lines": [...], "files": [...],
-                                "still": STILL }... ] } | null,
+                                "still": STILL }... ],
+                   "shadows": { "name": "sun", ...the view's camera and sun, "width", "height",
+                                "traced_width", "traced_height", "sun_and_sky_only", "truth_spp",
+                                "unshadowed_spp", "seeds", "flip", "floor": SCORES | null,
+                                "target_flip", "min_line_over_floor", "target_counts",
+                                "first_frame": PRIMARY, "settled": PRIMARY, "settle_frames",
+                                "meets_target", "edge_share", "files" } } | null,
                                       // null with --no-convergence or if the phase failed;
                                       // see its section
   "streaming": { "deterministic": true, "schedule", "counts_hash", "upload", "soft_misses",
@@ -1335,8 +1392,8 @@ still-view phase, at full size with batching, is the player's number.
 - `caves` is the same for the two cave stills (the camera at the mouth, and the one inside),
   with the bricks of the bands at a tenth of the flight's `d0`, so far fewer than the sweep's. Empty
   for `--short`. Their screenshots are in `screenshots`.
-- `budgets.unmatched` lists budgets for passes that did not run (`passes.shadows` before there is
-  a shadows pass): they are not an error.
+- `budgets.unmatched` lists budgets for passes that did not run (a budget for a stage whose pass
+  does not exist yet): they are not an error.
 
 The mean is what is held to the budget; look at `p95_ms` and `max_ms` for stutter.
 
@@ -1379,9 +1436,9 @@ Anything else in the file, a pass or mode with a zero, negative or non-numeric b
 a budget off.
 
 The numbers are the per-stage frame budget of the rendering decision (#10), on the RTX 4090 at 1440p
-output. Only `primary` (Primary visibility, 1.0 ms), `upscale` (the TAAU pass, 0.5 ms) and the total
-(8.6 ms) are live today, as those are the passes that exist. The later stages (sun shadows 0.4, GI
-1.5, reflections 0.7, glass 0.7, volumetrics 1.0, denoise 1.0, atmosphere 0.3, edits 1.0, post 0.5)
+output. Only `primary` (Primary visibility, 1.0 ms), `shadows` (the sun's shadow rays, two a pixel, 0.4 ms, #52),
+`upscale` (the TAAU pass, 0.5 ms) and the total (8.6 ms) are live today, as those are the passes that
+exist. The later stages (GI 1.5, reflections 0.7, glass 0.7, volumetrics 1.0, denoise 1.0, atmosphere 0.3, edits 1.0, post 0.5)
 are in the file as comments: **whoever adds a pass uncomments its budget and names it the same** (a
 pass is named by the string given to `Profiler::compute_pass`). `reference` has no budget in #10;
 its 3.0 ms (a sample, pass and total) catches a gross regression, set from the first real run on the
@@ -1398,7 +1455,8 @@ they run in a Primary frame:
 | --- | --- | --- |
 | `primary` | primary visibility and the G-buffer (it no longer lights) | 1.0 (existing) |
 | `normals` | the smooth normal of every hit (the cost of the smooth normals, alone) | none yet |
-| `shade` | the lit image, as linear light, from the G-buffer | none yet |
+| `shadows` | the sun's shadow: two shadow rays a pixel from the G-buffer (#52, **schema 24**; `--shadow-rays N` in the bench) | 0.4 |
+| `shade` | the lit image, as linear light, from the G-buffer and the shadows | none yet |
 | `exposure`, `exposure_adapt` | the log-average luminance and the adapted exposure | none yet |
 | `bloom_down`, `bloom_h`, `bloom_v` | the bloom, at a quarter of the size | none yet |
 | `tone` | exposure, bloom and tone curve into the encoded image | none yet |

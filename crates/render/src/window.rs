@@ -228,6 +228,9 @@ impl Renderer {
 
     /// Changes the sun. In reference mode this starts the image over.
     pub fn set_sun(&mut self, sun: Sun) {
+        if self.local_sun.is_some() || sun != self.sun {
+            self.tracer.sun_changed();
+        }
         self.sun = sun;
         self.local_sun = None;
     }
@@ -236,6 +239,9 @@ impl Renderer {
     /// radians wide: it follows the local up, so it stays at the same height in the sky over the
     /// whole Planet ([`Sun::local`]). In reference mode this starts the image over when it moves.
     pub fn set_local_sun(&mut self, azimuth: f32, elevation: f32, radius: f32) {
+        if self.local_sun != Some((azimuth, elevation, radius)) {
+            self.tracer.sun_changed();
+        }
         self.local_sun = Some((azimuth, elevation, radius));
     }
 

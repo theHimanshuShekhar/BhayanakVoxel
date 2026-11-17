@@ -52,6 +52,7 @@ fn the_primary_pass_is_timed_or_listed_as_unavailable() {
         assert!(timings.total().last() >= primary.times.last());
         for pass in [
             "normals",
+            "shadows",
             "shade",
             "exposure",
             "exposure_adapt",
@@ -86,6 +87,7 @@ fn passes_register_in_the_order_they_first_run_and_only_the_latest_is_active() {
         [
             "primary",
             "normals",
+            "shadows",
             "shade",
             "exposure",
             "exposure_adapt",
