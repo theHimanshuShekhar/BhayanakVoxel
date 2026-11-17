@@ -1194,7 +1194,12 @@ run without it (0.178 ms at 1 ray on the 4090, 1440p) or from `--diag` runs of a
   few samples of the disc a pixel and no upscaler history is the frame after a sun change, and the
   worst Primary frame); **`target_counts`** is whether 0.05 is at least 4 times the floor's mean (ADR
   0005's rule, as the views' `lines[].counts`). `settled` is reported beside it and is not held to
-  the target.
+  the target. **Where it stands (#52, 4090, 1440p, hero sun, 8192-sample truth, floor 0.0008):** at
+  the default 2 rays the first frame is **0.062** and the settled image **0.059**, so
+  `meets_target` is false; 1 ray was 0.074 and 0.072 (`--shadow-rays 1`). The owner shipped 2 rays
+  with the centre-cosine weight; its bias is the cause and #55 re-judges the weight (ADR 0005's
+  "Sun and shadows" row has the numbers). `meets_target` is reported and printed only: it is not a
+  gate and does not change the exit status, and the target is not loosened.
 - **The shadow-edge error** (`edge`). FLIP's mean over a whole image says little about the few
   pixels of a shadow's edge, where Primary weighs its rays by the cosine at the disc's centre
   and the Reference weighs each of its samples by its own. The edge is found from the Reference: a
@@ -1212,7 +1217,7 @@ run without it (0.178 ms at 1 ray on the 4090, 1440p) or from `--diag` runs of a
   test `the_phase_with_flip_scores_both_views_and_writes_the_files`.
 - **For the 4090** (the ticket's acceptance, which is the orchestrator's to run): the same command
   as the baseline above. The numbers are `report.convergence.shadows` (`first_frame.flip.flip_mean` at
-  or under 0.05, `meets_target`, `target_counts`; `settled`, `edge`) and the printed lines
+  or under 0.05, `meets_target`, `target_counts`; `settled`, `edge`; `shadow_rays`) and the printed lines
   `convergence, sun (...)` on stderr, and `passes[shadows]` in each mode (its 0.4 ms budget, held by
   the run's exit status). The phase's wall-clock time rose by the view's two truths and the
   unshadowed image at 1440p, which have no bounce rays and cost a fraction of the pit's.

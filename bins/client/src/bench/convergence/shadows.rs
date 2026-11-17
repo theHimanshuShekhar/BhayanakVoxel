@@ -14,8 +14,10 @@
 //! scored twice, against truth A, by FLIP (mean and 99th percentile, as the other views are):
 //! - **`first_frame`**: the first frame of the view, with no history, which is what the player has
 //!   the frame after the sun changes (the shadows have no history, and neither does the upscaler
-//!   after a new sun). One sample of the sun's disc a pixel. **This is what the target of FLIP 0.05
-//!   is held to** (`meets_target`), as the ticket's acceptance has it.
+//!   after a new sun). A few samples of the sun's disc a pixel
+//!   ([`Settings::shadow_rays`]). **This is what the target of FLIP 0.05 is held to**
+//!   (`meets_target`, reported and printed, no gate), as the ticket's acceptance has it. The 4090
+//!   has it at 0.062 with 2 rays (ADR 0005's row), so the target is not met and is not loosened.
 //! - **`settled`**: after [`Settings::settle_frames`] frames of a camera that has not moved, the
 //!   upscaler's history having gathered samples. Reported beside the first frame, and not held to
 //!   the target.
