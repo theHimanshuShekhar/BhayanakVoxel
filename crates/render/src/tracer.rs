@@ -41,6 +41,9 @@ pub const SURFACE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba32Uint;
 /// Format of the smooth normals (`shade.wgsl`): a unit vector, and 1 in w where there is one.
 pub const NORMALS_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 
+/// The format of the sun's light at each hit (`sun_weights` in `shade.wgsl`): one float a pixel.
+pub const SUN_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R32Float;
+
 /// Format of the upscaler's history: encoded colour, and in alpha the frames it has been through.
 pub const HISTORY_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 
@@ -100,6 +103,18 @@ impl SceneHeader {
 /// give the same image.
 pub const RNG_SEED: u32 = 0xB4A7_A9AC;
 
+/// How many shadow rays a pixel of Primary casts towards the sun's disc by default (#52): the
+/// owner's choice after the 4090 measured one ray's noise in the wide penumbrae at FLIP 0.074
+/// against a target of 0.05. Two rays measured 0.062 there: what is left of the miss is mostly the
+/// centre-cosine weight's bias, not noise (ADR 0005). The bench's `--shadow-rays` and
+/// [`Tracer::set_shadow_rays`] change it.
+pub const DEFAULT_SHADOW_RAYS: u32 = 2;
+
+/// The most shadow rays a pixel can be asked for, for the bench's comparisons and not a setting for
+/// a game. The shader's loop has no bound of its own: this is the clamp in
+/// [`Tracer::set_shadow_rays`], which cuts a count to 1 through this.
+pub const MAX_SHADOW_RAYS: u32 = 16;
+
 /// How the Reference view is built. The default is the player's: Owen-scrambled Sobol sample
 /// positions, the colour variation Primary has, and the estimator of ADR 0005. A test that needs
 /// something else builds the pipeline with it (see [`Tracer::set_reference_options`]); nothing
@@ -115,6 +130,10 @@ pub struct ReferenceOptions {
     pub white_noise: bool,
     /// A fault put into the estimator, to show that a test of it can fail.
     pub fault: Fault,
+    /// The sun counts wherever it faces the surface, with no shadow ray: the estimator without
+    /// its visibility. The bench's sun-and-sky view runs it beside the real one to find which
+    /// pixels have a shadow's edge in them.
+    pub no_shadow_rays: bool,
 }
 
 /// A fault that a test puts into the Reference view's estimator, to show that the tests that
@@ -134,8 +153,9 @@ pub enum Fault {
 
 impl ReferenceOptions {
     /// The pipeline constants these are, as `pathtrace.wgsl` declares them.
-    fn constants(self) -> [(&'static str, f64); 3] {
+    fn constants(self) -> [(&'static str, f64); 4] {
         [
+            ("NO_SHADOW_RAYS", f64::from(u8::from(self.no_shadow_rays))),
             ("FLAT_COLOURS", f64::from(u8::from(self.flat_colours))),
             ("WHITE_NOISE", f64::from(u8::from(self.white_noise))),
             (
@@ -169,6 +189,9 @@ struct FrameUniform {
     /// 1 if natural Materials are shaded with smooth computed normals; the end of the smooth range
     /// in Voxels and the face normal's weight in it (both an f32's bits); one unused.
     flags: [u32; 4],
+    /// The frame of Primary's sun samples; 1 if the view has GI (the ambient term, for Primary);
+    /// 1 if it has emitted light; the number of shadow rays a pixel casts.
+    light: [u32; 4],
 }
 
 /// Where primary visibility traces when nothing moves it: the centre of the pixel.
@@ -260,6 +283,8 @@ pub struct Target {
     gbuffer: Plane,
     surface: Plane,
     normals: Plane,
+    /// The sun's light at each hit (`shadows`), read by the lit image's pass.
+    sun_weights: Plane,
     reference_size: (u32, u32),
     /// The reference path tracer's mean as linear light, and the display transform's images for it.
     reference_hdr: Plane,
@@ -298,6 +323,7 @@ impl Target {
             gbuffer: Plane::new(device, "G-buffer", internal, GBUFFER_FORMAT),
             surface: Plane::new(device, "surface", internal, SURFACE_FORMAT),
             normals: Plane::new(device, "smooth normals", internal, NORMALS_FORMAT),
+            sun_weights: Plane::new(device, "sun weights", internal, SUN_FORMAT),
             reference_size,
             reference_hdr: Plane::new(
                 device,
@@ -405,10 +431,24 @@ pub struct Tracer {
     /// with the layout of its own bind group.
     normals_layout: wgpu::BindGroupLayout,
     normals: wgpu::ComputePipeline,
+    shadows_layout: wgpu::BindGroupLayout,
+    shadows: wgpu::ComputePipeline,
     shade_layout: wgpu::BindGroupLayout,
     shade: wgpu::ComputePipeline,
     /// The display transform and the exposure it keeps from frame to frame.
     post: Post,
+    /// Counts the sun's changes that were asked for ([`Tracer::sun_changed`]), and the count the
+    /// upscaler's history has seen: a frame after a new one starts the history over, so that no
+    /// shadow of the old sun is carried into the new (#52). A signal and not a comparison of the
+    /// sun's value: the game's sun follows the camera's local up (`Sun::local`), so its direction
+    /// moves a little in f32 on every frame the camera moves, and a comparison would reset the
+    /// history of every frame of a walk.
+    sun_epoch: u64,
+    history_sun_epoch: u64,
+    /// Whether the view has neither GI nor emitters (see [`Tracer::set_sun_and_sky_only`]).
+    sun_and_sky_only: bool,
+    /// The shadow rays a pixel casts (see [`Tracer::set_shadow_rays`]).
+    shadow_rays: u32,
     /// The light's palette, and which stages of the art direction are on.
     look: Look,
     stages: Stages,
@@ -848,6 +888,18 @@ impl Tracer {
                 layout_entry(7, storage_texture(NORMALS_FORMAT)),
             ],
         });
+        let loaded = wgpu::TextureSampleType::Float { filterable: false };
+        let shadows_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("sun shadows"),
+            entries: &[
+                layout_entry(0, buffer_binding(wgpu::BufferBindingType::Uniform)),
+                layout_entry(2, buffer_binding(wgpu::BufferBindingType::Uniform)),
+                texture(5, uint),
+                texture(6, uint),
+                texture(8, loaded),
+                layout_entry(9, storage_texture(SUN_FORMAT)),
+            ],
+        });
         let shade_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("shade"),
             entries: &[
@@ -857,7 +909,7 @@ impl Tracer {
                 layout_entry(4, buffer_binding(STORAGE_READ)),
                 texture(5, uint),
                 texture(6, uint),
-                texture(8, wgpu::TextureSampleType::Float { filterable: false }),
+                texture(10, loaded),
             ],
         });
         let materials = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -904,6 +956,15 @@ impl Tracer {
             &scene_layout,
             &[],
         );
+        let shadows = compute_pipeline(
+            device,
+            "shadows",
+            shaders::SHADE,
+            "shadows",
+            &shadows_layout,
+            &scene_layout,
+            &[],
+        );
         let shade = compute_pipeline(
             device,
             "shade",
@@ -924,9 +985,15 @@ impl Tracer {
             reference,
             normals_layout,
             normals,
+            shadows_layout,
+            shadows,
             shade_layout,
             shade,
             post: Post::new(device),
+            sun_epoch: 0,
+            history_sun_epoch: 0,
+            sun_and_sky_only: false,
+            shadow_rays: DEFAULT_SHADOW_RAYS,
             look: Look::default(),
             stages: Stages::default(),
             last_frame_at: None,
@@ -964,7 +1031,7 @@ impl Tracer {
         sun: &Sun,
         target: &Target,
     ) {
-        self.write_uniforms(queue, camera, sun, 0, CENTRE, 0);
+        self.write_uniforms(queue, camera, sun, (0, CENTRE, 0), 0);
         // Nothing carries over from one call to the next, the exposure included: it settles at
         // once, on this image.
         self.dispatch_primary(device, queue, profiler, encoder, target, 1.0);
@@ -1010,10 +1077,22 @@ impl Tracer {
         target: &Target,
         rate: f32,
     ) {
+        // A new sun starts the history over, whatever else is the same: the lit image's shadows
+        // are the sun's, and nothing of the old sun's is to be carried into the new one.
+        if self.history_sun_epoch != self.sun_epoch {
+            self.history.reset();
+            self.history_sun_epoch = self.sun_epoch;
+        }
         let frame = self
             .history
             .begin(target.resolution(), camera, self.debug_view);
-        self.write_uniforms(queue, camera, sun, 0, frame.jitter(), 0);
+        self.write_uniforms(
+            queue,
+            camera,
+            sun,
+            (0, frame.jitter(), 0),
+            frame.sun_sample(),
+        );
         self.dispatch_primary(device, queue, profiler, encoder, target, rate);
         self.upscale
             .encode(device, queue, profiler, encoder, &frame, target);
@@ -1061,7 +1140,7 @@ impl Tracer {
         let samples = batch_of(samples, target.reference_size);
         let view = View::new(camera, sun, target);
         let first = self.accumulator.begin_batch(&view, samples);
-        self.write_uniforms(queue, camera, sun, first, CENTRE, samples);
+        self.write_uniforms(queue, camera, sun, (first, CENTRE, samples), 0);
         self.dispatch(
             device,
             profiler,
@@ -1387,6 +1466,12 @@ impl Tracer {
         self.look
     }
 
+    /// Says that the sun was changed (turned, or another one set), not that it moves with the
+    /// camera: the next frame of Primary starts the upscaler's history over (#52).
+    pub fn sun_changed(&mut self) {
+        self.sun_epoch += 1;
+    }
+
     /// Sets the light's palette (see [`Look`]). The sun's and the sky's light are part of what the
     /// views estimate, so the reference image starts over, and the upscaler's history with it.
     pub fn set_look(&mut self, look: Look) {
@@ -1412,6 +1497,31 @@ impl Tracer {
                 self.restart_reference();
             }
             self.stages = stages;
+            self.history.reset();
+        }
+    }
+
+    /// Whether both views are of the sun and the sky alone, with no GI and no emitters: Primary has
+    /// no ambient term (the stand-in for GI, ADR 0005's table) and no emitted light, and the
+    /// Reference follows no path past its first surface and adds no emitted light. This is the
+    /// bench's shadows view (#52), where what is left to compare is the sun's light and the sky. The
+    /// Reference's image starts over, and the upscaler's history with it.
+    pub fn set_sun_and_sky_only(&mut self, only: bool) {
+        if only != self.sun_and_sky_only {
+            self.sun_and_sky_only = only;
+            self.restart_reference();
+            self.history.reset();
+        }
+    }
+
+    /// Sets how many shadow rays a pixel casts towards the sun's disc (the default is
+    /// [`DEFAULT_SHADOW_RAYS`]), from 1 to [`MAX_SHADOW_RAYS`]; more are cut to that. The rays of a
+    /// pixel are consecutive samples of one sequence, so more rays are a finer penumbra and a
+    /// longer `shadows` pass, and the upscaler's history starts over, as its samples change.
+    pub fn set_shadow_rays(&mut self, rays: u32) {
+        let rays = rays.clamp(1, MAX_SHADOW_RAYS);
+        if rays != self.shadow_rays {
+            self.shadow_rays = rays;
             self.history.reset();
         }
     }
@@ -1458,14 +1568,16 @@ impl Tracer {
         self.accumulator.samples()
     }
 
+    /// Writes the camera and the frame's uniforms. `(sample_index, jitter, batch)` are the
+    /// Reference's sample (a batch's first), where Primary traces in its pixel, and the samples in
+    /// the batch; `sun_sample` is the frame that Primary's sun samples are of.
     fn write_uniforms(
         &self,
         queue: &wgpu::Queue,
         camera: &Camera,
         sun: &Sun,
-        sample_index: u32,
-        jitter: [f32; 2],
-        batch: u32,
+        (sample_index, jitter, batch): (u32, [f32; 2], u32),
+        sun_sample: u32,
     ) {
         queue.write_buffer(
             &self.camera_buffer,
@@ -1486,6 +1598,12 @@ impl Tracer {
                 self.smooth_end.to_bits(),
                 self.stages.normal_bias.weight().to_bits(),
                 0,
+            ],
+            light: [
+                sun_sample,
+                u32::from(!self.sun_and_sky_only),
+                u32::from(!self.sun_and_sky_only),
+                self.shadow_rays,
             ],
         };
         queue.write_buffer(&self.frame_buffer, 0, bytemuck::bytes_of(&frame));
@@ -1520,6 +1638,7 @@ impl Tracer {
             if self.stages.smooth_normals {
                 self.dispatch_normals(device, profiler, encoder, target);
             }
+            self.dispatch_shadows(device, profiler, encoder, target);
             self.dispatch_shade(device, profiler, encoder, target);
         }
         self.post.encode(
@@ -1571,8 +1690,38 @@ impl Tracer {
         pass.dispatch_workgroups(width.div_ceil(8), height.div_ceil(8), 1);
     }
 
-    /// The lit image as linear light, from the G-buffer and the smooth normals (`shade_pass` in
-    /// `shade.wgsl`).
+    /// The sun's light at every hit of the G-buffer: the shadow rays of each pixel
+    /// (`shadows` in `shade.wgsl`), from the geometric face, towards points of the sun's disc.
+    fn dispatch_shadows(
+        &self,
+        device: &wgpu::Device,
+        profiler: &mut Profiler,
+        encoder: &mut wgpu::CommandEncoder,
+        target: &Target,
+    ) {
+        let view = plane_entry;
+        let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("sun shadows"),
+            layout: &self.shadows_layout,
+            entries: &[
+                buffer_entry(0, &self.camera_buffer),
+                buffer_entry(2, &self.frame_buffer),
+                view(5, &target.gbuffer),
+                view(6, &target.surface),
+                view(8, &target.normals),
+                view(9, &target.sun_weights),
+            ],
+        });
+        let (width, height) = target.resolution.internal;
+        let mut pass = profiler.compute_pass(encoder, "shadows");
+        pass.set_pipeline(&self.shadows);
+        pass.set_bind_group(0, &self.scene.group, &[]);
+        pass.set_bind_group(1, &group, &[]);
+        pass.dispatch_workgroups(width.div_ceil(8), height.div_ceil(8), 1);
+    }
+
+    /// The lit image as linear light, from the G-buffer and the sun's light at each hit
+    /// (`shade_pass` in `shade.wgsl`).
     fn dispatch_shade(
         &self,
         device: &wgpu::Device,
@@ -1600,7 +1749,7 @@ impl Tracer {
                 },
                 view(5, &target.gbuffer),
                 view(6, &target.surface),
-                view(8, &target.normals),
+                view(10, &target.sun_weights),
             ],
         });
         let (width, height) = target.resolution.internal;

@@ -32,6 +32,7 @@
 //! real GPU only, and by one ignored test.
 
 mod score;
+mod shadows;
 mod still;
 mod views;
 
@@ -90,6 +91,8 @@ pub struct Settings {
     /// The still-view part (#189): the Reference view with the still-frame policy on, from the
     /// stop.
     pub still: still::Settings,
+    /// The sun-and-sky view (#52): Primary's shadows against the Reference's.
+    pub shadows: shadows::Settings,
 }
 
 impl Settings {
@@ -103,6 +106,10 @@ impl Settings {
             flip: true,
             flip_gamma22,
             still: still::Settings::full(),
+            shadows: shadows::Settings::full(
+                (traced.0 * 2, traced.1 * 2),
+                truth_spp.unwrap_or(DEFAULT_TRUTH_SPP),
+            ),
         }
     }
 
@@ -116,6 +123,10 @@ impl Settings {
             flip: false,
             flip_gamma22: false,
             still: still::Settings::short(),
+            shadows: shadows::Settings::short(
+                ((traced.0 / 2).max(1), (traced.1 / 2).max(1)),
+                truth_spp.unwrap_or(16),
+            ),
         }
     }
 
@@ -151,6 +162,8 @@ pub struct ConvergenceReport {
     /// truths, the run, scoring and the files.
     pub wall_s: f64,
     pub views: Vec<ViewReport>,
+    /// The sun-and-sky view (#52): Primary's shadows against the Reference's direct-sun image.
+    pub shadows: shadows::ShadowsReport,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -304,6 +317,7 @@ pub fn run(settings: &Settings, out: &Path) -> Result<ConvergenceReport, Box<dyn
     for view in [views::golden(), views::pit()] {
         views.push(run_view(view, settings, out)?);
     }
+    let shadows = shadows::run(&settings.shadows, out)?;
     let mut report = ConvergenceReport {
         width,
         height,
@@ -327,6 +341,7 @@ pub fn run(settings: &Settings, out: &Path) -> Result<ConvergenceReport, Box<dyn
         csv: CSV_FILE,
         wall_s: 0.0,
         views,
+        shadows,
     };
     let csv = out.join(CSV_FILE);
     fs::write(&csv, csv_of(&report)).map_err(|e| format!("cannot write {}: {e}", csv.display()))?;
@@ -359,12 +374,14 @@ fn run_view(view: View, settings: &Settings, out: &Path) -> Result<ViewReport, B
     eprintln!("convergence: {name}...");
     let resolution = Resolution::native(settings.size.0, settings.size.1);
     let mut gpu = Offscreen::with_resolution(resolution, &view.scene)?;
-    gpu.set_sun(view.sun);
     // The light and display of before #202 (the old sun and sky, no exposure, bloom or tone
     // curve): the phase's numbers are compared from report to report, and a change of look would
     // move every one of them with no change in the estimator. The art direction's cost is in the
-    // flight's passes; its look is the goldens'.
+    // flight's passes; its look is the goldens'. This sets the old sun, too: the one these views
+    // were made with is not drawn, and the report names the sun that is.
     gpu.use_legacy_light();
+    let mut view = view;
+    view.description = views::under_the_legacy_sun(view.description);
     gpu.set_keep_history(true);
     let info = gpu.gpu_info().clone();
     let folder = out.join(FOLDER).join(name);
@@ -740,6 +757,7 @@ pub fn print_summary(report: &ConvergenceReport) {
             );
         }
     }
+    shadows::print_summary(&report.shadows);
 }
 
 #[cfg(test)]
@@ -833,6 +851,53 @@ mod tests {
             wall_s: 0.0,
             csv: CSV_FILE,
             views: vec![view("golden"), view("pit")],
+            shadows: shadows_report(flip),
+        }
+    }
+
+    fn shadows_report(flip: bool) -> shadows::ShadowsReport {
+        let score = |mean: f64| shadows::PrimaryScore {
+            flip: flip.then_some(shadows::Scores {
+                flip_mean: mean,
+                flip_p99: mean * 4.0,
+            }),
+            edge: shadows::EdgeError {
+                edge_pixels: 12,
+                edge_mean: Some(6.0),
+                edge_p99: Some(30.0),
+                other_mean: Some(1.0),
+            },
+        };
+        shadows::ShadowsReport {
+            name: "sun",
+            description: views_description(),
+            width: 64,
+            height: 36,
+            traced_width: 32,
+            traced_height: 18,
+            sun_and_sky_only: true,
+            shadow_rays: 2,
+            truth_spp: 16,
+            unshadowed_spp: 16,
+            seeds: Seeds {
+                run: RUN_SEED,
+                truth_a: TRUTH_SEEDS[0],
+                truth_b: TRUTH_SEEDS[1],
+            },
+            flip: None,
+            floor: flip.then_some(shadows::Scores {
+                flip_mean: 0.002,
+                flip_p99: 0.01,
+            }),
+            target_flip: shadows::TARGET_FLIP,
+            min_line_over_floor: MIN_LINE_OVER_FLOOR,
+            target_counts: flip.then_some(true),
+            first_frame: score(0.04),
+            settled: score(0.02),
+            settle_frames: 4,
+            meets_target: flip.then_some(true),
+            edge_share: 0.05,
+            files: vec!["truth-a.png".into()],
         }
     }
 
@@ -912,7 +977,9 @@ mod tests {
 
     /// The phase with FLIP on, at a few dozen pixels on whatever Vulkan device there is (lavapipe
     /// locally): CI never runs FLIP, so this is run by hand, `cargo test -p client --bin client --
-    /// --ignored the_phase_with_flip`. `CONVERGENCE_TEST_SIZE=2560x1440` runs it at the real size.
+    /// --ignored the_phase_with_flip`. `CONVERGENCE_TEST_SIZE=2560x1440` runs it at the real size;
+    /// `CONVERGENCE_TEST_SHADOW_RAYS` and `CONVERGENCE_TEST_SUN_TRUTH_SPP` set the sun-and-sky
+    /// view's shadow rays (#52) and the samples of its truths.
     #[test]
     #[ignore = "runs FLIP, which CI does not"]
     fn the_phase_with_flip_scores_both_views_and_writes_the_files() {
@@ -923,6 +990,14 @@ mod tests {
                 Some((w.parse().ok()?, h.parse().ok()?))
             })
             .unwrap_or((96, 54));
+        let env = |name: &str, default: u32| {
+            std::env::var(name)
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(default)
+        };
+        let mut sun = shadows::Settings::full(size, env("CONVERGENCE_TEST_SUN_TRUTH_SPP", 64));
+        sun.shadow_rays = env("CONVERGENCE_TEST_SHADOW_RAYS", sun.shadow_rays);
         let settings = Settings {
             size,
             checkpoints: vec![1, 4, 16, 64],
@@ -933,6 +1008,7 @@ mod tests {
                 marks_s: vec![0.1, 0.25],
                 seconds: 0.3,
             },
+            shadows: sun,
         };
         let out = std::env::temp_dir().join(format!("bhayanak-convergence-{}", std::process::id()));
         let _ = fs::remove_dir_all(&out);
@@ -993,6 +1069,25 @@ mod tests {
                 );
             }
         }
+        // The sun-and-sky view (#52): both of Primary's images are scored, and the edge is found.
+        let sun = &report.shadows;
+        let floor = sun.floor.expect("the floor");
+        for (what, p) in [("first frame", &sun.first_frame), ("settled", &sun.settled)] {
+            let flip = p.flip.unwrap_or_else(|| panic!("{what} has no FLIP"));
+            assert!(flip.flip_p99 >= flip.flip_mean, "{what}: {flip:?}");
+            assert!(p.edge.edge_pixels > 0, "{what}: no edge pixels");
+            assert!(p.edge.edge_mean.unwrap() >= 0.0);
+        }
+        assert!(
+            sun.edge_share > 0.0 && sun.edge_share < 0.5,
+            "{}",
+            sun.edge_share
+        );
+        assert!(floor.flip_mean < sun.first_frame.flip.unwrap().flip_mean);
+        assert_eq!(
+            sun.meets_target,
+            Some(sun.first_frame.flip.unwrap().flip_mean <= 0.05)
+        );
         let csv = fs::read_to_string(out.join(CSV_FILE)).unwrap();
         assert!(
             csv.lines()

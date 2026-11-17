@@ -55,7 +55,7 @@ pub use scene::{
 };
 pub use sun::Sun;
 pub use timing::Timings;
-pub use tracer::{Fault, ReferenceOptions};
+pub use tracer::{DEFAULT_SHADOW_RAYS, Fault, MAX_SHADOW_RAYS, ReferenceOptions};
 pub use upscale::Resolution;
 pub use window::{Mode, Renderer};
 

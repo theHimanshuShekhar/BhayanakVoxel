@@ -47,6 +47,12 @@ impl Sun {
         })
     }
 
+    /// The sun the renderer had before #202: high (about 54 degrees) and 0.04 radians wide. It is
+    /// what [`Offscreen::use_legacy_light`](crate::Offscreen::use_legacy_light) sets.
+    pub fn legacy() -> Self {
+        Self::new([0.5, 0.8, 0.3], 0.04).expect("a direction")
+    }
+
     /// A sun `elevation` radians above the horizon (the xz plane) at `azimuth` radians, measured
     /// from +z towards +x.
     pub fn from_angles(azimuth: f32, elevation: f32, angular_radius: f32) -> Self {

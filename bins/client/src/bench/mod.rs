@@ -271,11 +271,14 @@ fn run(args: &Args) -> Result<u8, Box<dyn Error>> {
     // move any of it. It is not timed against a budget itself.
     let convergence = if args.convergence {
         let traced = (plan.width, plan.height);
-        let settings = if plan.patch {
+        let mut settings = if plan.patch {
             convergence::Settings::short(traced, args.truth_spp)
         } else {
             convergence::Settings::full(traced, args.truth_spp, args.flip_gamma22)
         };
+        if let Some(rays) = args.shadow_rays {
+            settings.shadows.shadow_rays = rays;
+        }
         // It is not budgeted, so a phase that fails must not take the timed results with it: not
         // by an error, and not by a panic either (the readback's `expect`s, wgpu's uncaptured-error
         // handler, a worker of FLIP's thread pool), which would end the process with status 101
