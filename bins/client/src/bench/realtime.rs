@@ -384,7 +384,7 @@ pub struct SceneThread {
     pub reband_ms: f64,
     /// Making the scene again for a finer depth, at a flight's end (#168, `Rebuild::Release`): the
     /// scene thread's time in the rebuild, which the frame thread does not wait for, against
-    /// #217's 5 s cap on the catch-up. The copy for the frame thread is in `upload_ms`.
+    /// #217's cap on the catch-up (12 s). The copy for the frame thread is in `upload_ms`.
     pub release_ms: f64,
     /// The looks for holes' share of the scene thread's **busy** time above (0 to 1): the sum of
     /// the parts, not wall time, so a thread that is idle most of the time can still read high. A

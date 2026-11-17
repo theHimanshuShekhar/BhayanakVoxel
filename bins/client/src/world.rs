@@ -29,12 +29,15 @@ pub fn loading_paused_for(mode: Mode, still_frames: u32) -> bool {
 }
 
 /// The longest a Still view waits for the scene to reach the camera before it holds the scene
-/// where it is (#217): 5 s. A Reference view that starts later costs nothing but the wait, and the
-/// Primary view is drawn meanwhile; one that starts on a scene that is behind the camera
-/// converges on ground coarser than Primary's, for as long as the camera stands. So the cap is
-/// for a scene that cannot get there (the loader far behind, say), not a time to be reached in
-/// the usual way: the bench reports a hold that began at the cap ([`HoldBegan::capped`]).
-pub const CATCH_UP_CAP: std::time::Duration = std::time::Duration::from_secs(5);
+/// where it is (#217): 12 s (it was 5 s; the owner raised it on 2026-11-17, #168). A Reference
+/// view that starts later costs nothing but the wait, and the Primary view is drawn meanwhile;
+/// one that starts on a scene that is behind the camera converges on ground coarser than
+/// Primary's, for as long as the camera stands. So the cap is for a scene that cannot get there
+/// (the loader far behind, say), not a time to be reached in the usual way: the bench reports a
+/// hold that began at the cap ([`HoldBegan::capped`]). 12 s is what lets the wait cover the
+/// release rebuild of a flight's end (#168: the scene made again at the finer depth, which
+/// ends 9.3 to 9.7 s after the stop on the 4090); the dev box's is 12.5 to 21 s and still hits it.
+pub const CATCH_UP_CAP: std::time::Duration = std::time::Duration::from_secs(12);
 
 /// How far the scene may be behind the camera, in Voxels, for it to have caught up (#217): one
 /// (5 cm). The scene thread follows the camera to the exact place, and a still camera is the

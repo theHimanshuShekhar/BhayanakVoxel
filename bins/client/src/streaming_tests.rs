@@ -2196,6 +2196,41 @@ fn a_look_now_counts_the_soft_misses_and_looks_for_holes_whatever_the_clock_says
     assert_eq!(world.stats().work.holes_found, 0);
 }
 
+/// The look for holes that is only due (every 5 s of the world's clock) is not made while the
+/// bands are speed-scaled: on the 4090 it held the store's read lock for 90 ms in a flight and the
+/// camera had misses in the second after it (#168). It is made when the camera has slowed.
+#[test]
+fn a_look_for_holes_that_is_due_waits_for_a_camera_that_has_slowed() {
+    let (mut world, _server, camera) = spawned_world(Run::Stepped);
+    world.worker().speed_scale(true);
+    fill(&mut world, camera.position);
+    world.measure_scene_thread();
+    let looks = world.stats().work.hole_scans;
+    let step = 50.0 * brick_store::VOXELS_PER_METRE / 60.0;
+    let (ahead, _) = tangents(camera.horizon_up);
+    let mut moved = camera.position;
+    // 6 s of a flight at 50 m/s: the look is due after 5.
+    for _ in 0..360 {
+        moved = std::array::from_fn(|a| moved[a] + ahead[a] * step);
+        let at = over_the_ground(&world.store(), moved);
+        stream(&mut world, at);
+        pace(&world, FRAME);
+    }
+    assert_eq!(
+        world.stats().work.hole_scans,
+        looks,
+        "a look was made in the flight"
+    );
+    // Stopped: the depth is given back after its hold, and the look that was due is made.
+    let at = over_the_ground(&world.store(), moved);
+    let mut patience = Patience::new(Duration::from_secs(60));
+    while world.stats().work.hole_scans == looks {
+        stream(&mut world, at);
+        patience.wait(&world, || "no look for holes after the stop".into());
+    }
+    assert_eq!(world.stats().work.hole_scans, looks + 1);
+}
+
 #[test]
 fn a_prefetch_lead_makes_bricks_ahead_that_a_camera_without_one_does_not() {
     let (mut without, _s, camera) = spawned_world(Run::Stepped);

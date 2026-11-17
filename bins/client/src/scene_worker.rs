@@ -293,9 +293,20 @@ fn batch_size(left: Duration, cost: Duration) -> Option<usize> {
     Some(most as usize)
 }
 
-/// How far the camera has to be from the scene, as a fraction of the scaled `d0`, for a long slice
-/// of taking in to stop for it ([`Engine::frame_waiting`]).
+/// How far the camera has to be from the scene, as a fraction of `d0` at the scale of the far
+/// levels ([`Bands::cost_scale`]), for a long slice of taking in to stop for it
+/// ([`Engine::frame_waiting`]).
 const GIVE_WAY_MOVE: f64 = 0.25;
+
+/// The distance, in Voxels, that the camera has to be from the scene for a long slice to give way
+/// (see [`GIVE_WAY_MOVE`]). **Not of the near levels' scaled `d0`**: at three levels that is 32
+/// Voxels, which a camera at 50 m/s is from the scene all the time (the scene is 50 to 68 behind
+/// it: a frame and a round), so every slice gave way after 2 ms, the loader's workers were held
+/// back for 98 of 113 worker-seconds with a queue of 3 000 to 6 000 bricks, and the 2 m flight had
+/// camera misses wherever the queue reached 6 000 (#168, the 4090 on `8f3b259`).
+fn give_way_distance(bands: &Bands) -> f64 {
+    bands.d0() * bands.cost_scale() * GIVE_WAY_MOVE
+}
 
 /// Whether a [`stream`](Engine::stream) that has gone on for `spent` of its `slice` stops for
 /// what the frame thread waits for (an Edit, a camera that has moved): only one that is longer
@@ -2662,7 +2673,7 @@ impl Engine {
     }
 
     /// Whether the frame thread is waiting for the thread's next round: it has given it a job, or
-    /// its camera is more than [`GIVE_WAY_MOVE`] of the scaled `d0` from where the scene is. A
+    /// its camera is more than [`give_way_distance`] from where the scene is. A
     /// long slice that is taking in arrivals delays the round's following the camera, and the lag
     /// rose with the slice (1.03, 1.16, 1.28, 1.31 `d0` at 2, 16, 32, 64 ms).
     fn frame_waiting(&self) -> bool {
@@ -2677,7 +2688,7 @@ impl Engine {
             .map(|a| (inbox.camera[a] - at[a]).powi(2))
             .sum::<f64>()
             .sqrt();
-        moved > bands.scaled_d0() * GIVE_WAY_MOVE
+        moved > give_way_distance(&bands)
     }
 
     /// Takes the children of bricks out of the store while it holds more than its budget. Whether it
@@ -3039,6 +3050,14 @@ impl Engine {
         if !self.shared.count_holes.load(Ordering::Relaxed) || !due {
             return;
         }
+        // A look that is only due is for a moment when the scene thread has the time: it holds the
+        // store's read lock and does not follow the camera for the 90 ms it takes on the 4090, and
+        // a flight at 2 m had 17 to 30 frames of camera misses in the second after it (#168). It
+        // is made when the camera has slowed (the depth is given back), and one that a path asks
+        // for (`forced`) is made at once, so every path still has its look at its end.
+        if !forced && self.speed.depth() > 0.0 {
+            return;
+        }
         let began = self.began();
         self.shared.looking.store(true, Ordering::Relaxed);
         let store = self.store.read().expect("the store's lock is not poisoned");
@@ -3240,6 +3259,20 @@ mod tests {
         assert_eq!(stream_slice(true, Duration::from_millis(1)), SLICE);
         assert_eq!(stream_slice(false, Duration::from_millis(1)), SLICE);
         assert_eq!(BACKED_UP_SLICE, Duration::from_millis(32));
+    }
+
+    #[test]
+    fn a_long_slice_gives_way_to_a_camera_by_the_far_levels_scale_not_the_near_levels() {
+        let rest = Bands::with_d0(1000.0);
+        assert_eq!(give_way_distance(&rest), 250.0);
+        // At 1.5 levels, the first curve's depth, and at 3 levels: the same distance.
+        let half = give_way_distance(&rest.speed_scaled(1.5));
+        let deep = give_way_distance(&rest.speed_scaled(3.0));
+        assert_eq!(half, deep);
+        assert!((deep - 250.0 * 2f64.powf(-1.5)).abs() < 1e-9, "{deep}");
+        // Well over what a camera at 50 m/s is from the scene (50 to 68 Voxels of 1028).
+        let d0 = Bands::standard(1.0).d0();
+        assert!(give_way_distance(&Bands::standard(1.0).speed_scaled(3.0)) > 80.0 * d0 / 1028.0);
     }
 
     #[test]

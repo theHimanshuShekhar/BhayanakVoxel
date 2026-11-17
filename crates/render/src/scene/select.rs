@@ -1176,13 +1176,52 @@ impl Selection {
     /// ray would find nothing in. A split node's children are resident by construction (it is split
     /// when they arrive, and eviction leaves what the scene has split), so this is the check of
     /// that, and is zero.
+    ///
+    /// The look is shared among threads that run at the lowest priority (see
+    /// [`set_worker_start`]): a pass over every node was 90 ms of the scene thread on the 4090,
+    /// with the store's read lock held, and a flight at 2 m had 17 to 30 frames of misses under the
+    /// camera in the second that it came in (#168). The count is the same whatever the threads.
     pub fn holes(&self, store: &BrickStore) -> usize {
-        self.nodes
-            .iter()
-            .filter(|&(&(level, coord), node)| {
-                node.state == State::Split && !store.children_resident(level, coord)
-            })
-            .count()
+        let threads = if self.nodes.len() < PARALLEL_FROM {
+            1
+        } else {
+            std::thread::available_parallelism()
+                .map_or(1, |n| n.get() / 2)
+                .clamp(1, MOST_THREADS)
+        };
+        self.holes_by(store, threads)
+    }
+
+    /// [`Selection::holes`] shared among `threads` (one: here and now). Each looks at every
+    /// `threads`th node of the table, whose order is the same for all of them.
+    fn holes_by(&self, store: &BrickStore, threads: usize) -> usize {
+        let hole = |(&(level, coord), node): (&Key, &Node)| {
+            node.state == State::Split && !store.children_resident(level, coord)
+        };
+        if threads <= 1 {
+            return self.nodes.iter().filter(|&entry| hole(entry)).count();
+        }
+        std::thread::scope(|scope| {
+            let parts: Vec<_> = (0..threads)
+                .map(|first| {
+                    scope.spawn(move || {
+                        if let Some(start) = WORKER_START.get() {
+                            start();
+                        }
+                        self.nodes
+                            .iter()
+                            .skip(first)
+                            .step_by(threads)
+                            .filter(|&entry| hole(entry))
+                            .count()
+                    })
+                })
+                .collect();
+            parts
+                .into_iter()
+                .map(|part| part.join().expect("a thread that looks for holes"))
+                .sum()
+        })
     }
 
     /// Takes `key` off the bricks that wait, because its children will not be generated after all (the
@@ -3897,5 +3936,9 @@ mod tests {
         // count is there to find.
         assert!(store.evict_children(level, coord, |_, _| false).is_some());
         assert_eq!(selection.holes(&store), 1);
+        // The look shared among threads counts what one does, whatever the threads.
+        for threads in [1, 2, 3, 4, 7] {
+            assert_eq!(selection.holes_by(&store, threads), 1, "{threads} threads");
+        }
     }
 }

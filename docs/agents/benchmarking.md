@@ -337,7 +337,7 @@ policy for a Reference view, which is **catch up first, then hold** (`World::hol
 client makes): once the camera has stood for 2 frames the scene thread goes on loading and following the
 camera, with Primary drawn, until the scene has reached the camera (`World::caught_up`: its lag under 1
 Voxel, and no reband pending, #168: the nodes that a change of the bands listed are looked at, and the
-speed scale has no step still to give back, `World::reband_pending`) or `CATCH_UP_CAP` (5 s) has gone by. Then loading is paused and
+speed scale has no step still to give back, `World::reband_pending`) or `CATCH_UP_CAP` (12 s, 5 s until 2026-11-17) has gone by. Then loading is paused and
 the scene thread is told; **it holds back moving the scene to the camera, the steps of coarsening and, since #168, the
 reband** (the speed scale is not looked at and what a change of the bands listed is not looked at;
 leaving Still does both) (#217, ADR 0005, "Still frames") and takes in no arrivals. The camera stands for 3 s (1 s with `--short`)
@@ -372,7 +372,7 @@ camera, and `holes_after_catch_up` the holes the look after it found, which must
     the camera when the view went Still (what a hold at once would have held it at), `lag_when_held_voxels`
     how far when the hold began (under 1 unless the cap ended the wait), `waited_s` from the view going
     Still to the hold beginning (how much later the Reference view started), and **`hit_cap`**, true if the
-    wait ran to the cap and the Reference view started on a scene still behind the camera. Expected false. After #168 the wait also covers a reband (the depth of a flight is given back half a second after the stop, and what it lists is looked at: 50 s or more at full size on the dev box), so a **`hit_cap` of true is expected after a flight at speed** until the reband is quick enough: the 5 s cap is kept (owner, 2026-11-16) and `hit_cap` and `lag_when_held_voxels` say what it held.
+    wait ran to the cap and the Reference view started on a scene still behind the camera. Expected false. After #168 the wait also covers a reband (the depth of a flight is given back half a second after the stop, and what it lists is looked at: 50 s or more at full size on the dev box), and a release over `RELEASE_REBUILD_OVER` nodes is a rebuild of 9 s on the 4090 (12.5 to 21 s on the dev box). **The cap is 12 s since 2026-11-17 (owner), so `hit_cap` is expected false on the 4090** (the rebuild ends 9.3 to 9.7 s after the stop) **and true on the dev box**; `hit_cap` and `lag_when_held_voxels` say what the cap held.
   - `hold_s`: how long the camera stood after the hold began.
   - `cuts`: `still_frames`, `cuts` and `by_cause`, as `still_cuts` under the paths, over the held frames
     only. **At most 1 is the acceptance of #217.**
@@ -574,9 +574,8 @@ camera, and `holes_after_catch_up` the holes the look after it found, which must
     500 thousand nodes) instead of looking at its nodes again, and the frame thread's cost of the
     one it took: the longest frame that had one and that frame's update (the copy to the GPU, which
     is over the budget like a jump's and is counted under `over_budget.bands`). The scene thread's
-    time in it is `scene_thread.release_ms`, to be read against #217's 5 s `CATCH_UP_CAP` (the cap
-    is not changed): on the 4090 it is 8.8 to 9.2 s, so the wait for the stop's catch-up ends at
-    the cap with `before_hold.hit_cap` true, and the catch-up that follows is the rest of it.
+    time in it is `scene_thread.release_ms`, to be read against #217's `CATCH_UP_CAP` (12 s since
+    2026-11-17; it was 5 s, which the 4090's 8.8 to 9.2 s hit with `before_hold.hit_cap` true).
     The release frame is the one frame over the limit that the owner accepted (about 230 ms); the
     frames around it are not: **while the scene thread makes the scene again the threads that read
     and pack its bricks run at the lowest priority** (`render::scene::select::set_worker_start`,
