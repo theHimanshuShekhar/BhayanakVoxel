@@ -559,7 +559,7 @@ camera, and `holes_after_catch_up` the holes the look after it found, which must
     mean of the drawn scene's lag over the path's frames, in `d0` (the maximum and the 99th percentile
     do not say how long the scene is behind), the rounds in which the scene moved to the camera and
     those in which it held work back for the upload budget, the frames with a camera soft miss in
-    each second of the path (a flight only: at the start of it or all along it), and the most that the
+    each second of the path (one entry for every second the path covers, so a trailing 0 is a second without a miss; a flight only: at the start of it or all along it), and the most that the
     scene's buffers in use were in the path. Reported, not gated.
   - `camera_soft_miss_lag_side`, `camera_soft_miss_loader_side` and `lag_over_floor_frames` (#168,
     the flights): the camera misses split by what can have caused them. The score asks for level 0
@@ -588,7 +588,9 @@ camera, and `holes_after_catch_up` the holes the look after it found, which must
   - `hole_looks`, `holes` and `holes_per_frame`: **holes are sampled, not counted for every
     frame** (see "What the holes gate can and cannot catch"). Looking at every split brick takes
     0.3 s at full size with the store's read lock held, so the scene thread does it every 5 s
-    (`SceneWorker::count_holes`), and **one more look is forced at the end of every path**
+    (`SceneWorker::count_holes`; **in threads on every core, and a look that is only due waits while
+    the bands are speed-scaled**, #168: on the 4090 it held the lock for about 90 ms in a flight and the
+    camera had misses in the second after it), and **one more look is forced at the end of every path**
     (`SceneWorker::look_now`), so no path has 0 looks. The report has how many looks there were in
     the path and what they found.
   - `scene_thread`: milliseconds the scene thread spent in the path on `follow` (selecting again
@@ -1015,7 +1017,7 @@ not gated. The final stage budgets are not these: they are the stages of #10, pe
 #### What the holes gate can and cannot catch
 
 It catches a brick that is split with the bricks under it not resident **at the moment of a look**:
-the scene thread looks every 5 s (`HOLES_EVERY`) while it works, a look is forced at the end of
+the scene thread looks every 5 s (`HOLES_EVERY`) while it works (not while the camera's speed has the bands scaled: the look is made after the release), a look is forced at the end of
 every path, of every catch-up, of the sizing and of the run, and the gate is on everything those
 looks found in the run, between the paths too. It fails when a run or a path had no look at all.
 

@@ -775,6 +775,10 @@ pub struct PathReport {
     pub scene_release_rebuilds: u64,
     pub release_frame_ms_max: f64,
     pub release_update_ms_max: f64,
+    /// The frames with a camera soft miss in each second of the path (the second a frame began in,
+    /// counted from the path's first frame): one entry for every second the path's frames cover,
+    /// so a path of 10 s has 10, and a last entry of 0 is a second without a miss (an array that
+    /// ended at the last second with one made a miss at 5 to 6 s look like a path of 6 s).
     pub camera_soft_miss_per_second: Vec<u32>,
     /// The camera misses split by what can have caused them (#168): a frame whose drawn scene is
     /// further from the camera than level 0 reaches (`floor(1)` less the hysteresis: the miss
@@ -1691,7 +1695,11 @@ impl Capture {
             scene_release_rebuilds: work.release_rebuilds - self.follow.2,
             release_frame_ms_max: self.release_frame_ms,
             release_update_ms_max: self.release_update_ms,
-            camera_soft_miss_per_second: self.miss_seconds.clone(),
+            camera_soft_miss_per_second: misses_by_second(
+                &self.miss_seconds,
+                self.started.last().copied(),
+                self.began,
+            ),
             camera_soft_miss_lag_side: self.camera_soft_miss_lag_side,
             camera_soft_miss_loader_side: self.camera_soft_miss_frames
                 - self.camera_soft_miss_lag_side,
@@ -2686,10 +2694,38 @@ pub fn run(
 
 const MIB: f64 = 1024.0 * 1024.0;
 
+/// [`PathReport::camera_soft_miss_per_second`]: the misses by second, with an entry for every
+/// second that the path's frames began in (`last` is the start of the last of them).
+fn misses_by_second(miss_seconds: &[u32], last: Option<Instant>, began: Instant) -> Vec<u32> {
+    let mut seconds = miss_seconds.to_vec();
+    if let Some(last) = last {
+        let covered = last.saturating_duration_since(began).as_secs() as usize + 1;
+        if seconds.len() < covered {
+            seconds.resize(covered, 0);
+        }
+    }
+    seconds
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::stream::Measured;
     use super::*;
+
+    #[test]
+    fn the_misses_by_second_cover_every_second_the_path_had() {
+        let began = Instant::now();
+        let at = |s: f64| Some(began + Duration::from_secs_f64(s));
+        // A miss in the sixth second of a path of ten: the array is ten long, not six.
+        let mut recorded = vec![0; 6];
+        recorded[5] = 17;
+        let by_second = misses_by_second(&recorded, at(9.99), began);
+        assert_eq!(by_second, [0, 0, 0, 0, 0, 17, 0, 0, 0, 0]);
+        // No miss at all: a zero for each second.
+        assert_eq!(misses_by_second(&[], at(2.5), began), [0, 0, 0]);
+        // A path with no frames has no seconds.
+        assert!(misses_by_second(&[], None, began).is_empty());
+    }
 
     const BUDGETS: StreamingBudgets = StreamingBudgets {
         frame_time_p99_ms: 16.7,
