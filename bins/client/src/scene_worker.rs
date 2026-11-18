@@ -316,6 +316,9 @@ pub struct Stats {
     /// Where the scene had been moved to: the centre of the scene that the frame thread draws once
     /// it has taken this (see [`crate::world::World::lag`]).
     pub camera: Option<[f64; 3]>,
+    /// Whether the selection still has nodes to look at again or revisit after a flip of the
+    /// horizon cap (#213): the scene drawn is a valid cut, but not yet the one the rule gives.
+    pub absorbing: bool,
     /// How far the camera and the places looked ahead to have gone as far as the selection is
     /// concerned (see [`render::Scene::travelled`]): what it is made to look at again for.
     #[cfg(test)]
@@ -394,6 +397,26 @@ pub struct Spent {
     pub hole_scan: Duration,
 }
 
+/// The longest round and the longest update of the scene thread over a time (see
+/// [`SceneWorker::take_longest`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Longest {
+    pub round: Duration,
+    pub update: Duration,
+    /// The longest update in which the horizon cap came on or went off, and how many updates did.
+    pub flip: Duration,
+    pub flips: u64,
+    /// The most nodes that waited to be revisited at once after a flip, how many updates the
+    /// selection was absorbing a flip in, and how long it was from the first to the last of them
+    /// (counted in the path where it ends: it goes on after the camera has stopped). Flips that
+    /// overlap are one span: from the update that found the first to the one that ended the last
+    /// absorbing, and the updates are that span's (the tidying of the queue is not part of it: it
+    /// changes nothing that is drawn, and goes on in whatever path comes after).
+    pub backlog_peak: u64,
+    pub absorb_updates: u64,
+    pub absorb: Duration,
+}
+
 /// What eviction has done and what it cost the other threads, since the start.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct EvictionStats {
@@ -466,6 +489,7 @@ fn stats_of(scene: &Scene, loader: &Loader, slow: &Arc<Slow>, eviction: Eviction
         slow: Arc::clone(slow),
         eviction,
         camera: scene.camera(),
+        absorbing: scene.absorbing(),
         #[cfg(test)]
         travelled: scene.travelled(),
         #[cfg(test)]
@@ -656,6 +680,17 @@ struct Shared {
     time_work: AtomicBool,
     /// Nanoseconds spent on each [`Part`], while timing is on.
     spent: [AtomicU64; PARTS],
+    /// The longest round since [`SceneWorker::take_longest_round`], in nanoseconds, without the
+    /// look for holes (a diagnostic of the bench), while timing is on (#213).
+    longest_round: AtomicU64,
+    /// The longest single update of the scene to a camera (one step of following it), likewise.
+    longest_update: AtomicU64,
+    /// The longest update in which the horizon cap came on or went off, and how many did.
+    longest_flip: AtomicU64,
+    flips: AtomicU64,
+    backlog_peak: AtomicU64,
+    absorb_updates: AtomicU64,
+    absorb_nanos: AtomicU64,
     /// Whether the frame thread has taken what the thread published since the thread last looked:
     /// a thread that holds work back for the budget goes on at once (see
     /// [`Engine::await_work`]), and does not sleep through the rest of the frame.
@@ -787,6 +822,13 @@ impl SceneWorker {
             looking: AtomicBool::new(false),
             time_work: AtomicBool::new(false),
             spent: std::array::from_fn(|_| AtomicU64::new(0)),
+            longest_round: AtomicU64::new(0),
+            longest_update: AtomicU64::new(0),
+            longest_flip: AtomicU64::new(0),
+            flips: AtomicU64::new(0),
+            backlog_peak: AtomicU64::new(0),
+            absorb_updates: AtomicU64::new(0),
+            absorb_nanos: AtomicU64::new(0),
             taken: AtomicBool::new(false),
             #[cfg(test)]
             throttled_waits: AtomicU64::new(0),
@@ -810,6 +852,7 @@ impl SceneWorker {
             held_at: None,
             told: None,
             at_standing_camera: false,
+            absorbing_since: None,
             arrival_cost: ARRIVAL_COST,
             changes: Changes::None,
             causes: Causes::default(),
@@ -1012,6 +1055,24 @@ impl SceneWorker {
             evict: part(Part::Evict),
             coarse: part(Part::Coarse),
             hole_scan: part(Part::HoleScan),
+        }
+    }
+
+    /// The longest round of the thread since the last call (or since timing began), and the longest
+    /// single update of the scene to a camera in it (one step of following the camera, which is
+    /// the selection's update and what a flip of the horizon cap makes long): the longest that the
+    /// scene stood still for the frame thread (#213). The round is without the look for holes in
+    /// it. Zero if none was timed.
+    pub fn take_longest(&self) -> Longest {
+        let take = |nanos: &AtomicU64| Duration::from_nanos(nanos.swap(0, Ordering::Relaxed));
+        Longest {
+            round: take(&self.shared.longest_round),
+            update: take(&self.shared.longest_update),
+            flip: take(&self.shared.longest_flip),
+            flips: self.shared.flips.swap(0, Ordering::Relaxed),
+            backlog_peak: self.shared.backlog_peak.swap(0, Ordering::Relaxed),
+            absorb_updates: self.shared.absorb_updates.swap(0, Ordering::Relaxed),
+            absorb: take(&self.shared.absorb_nanos),
         }
     }
 
@@ -1301,6 +1362,8 @@ struct Engine {
     /// The scene is at a camera that has been the same for two rounds (see
     /// [`Engine::at_a_standing_camera`]), as of this round's last step.
     at_standing_camera: bool,
+    /// When the update that began absorbing a flip of the horizon cap began, while it goes on.
+    absorbing_since: Option<Instant>,
     /// What taking in one brick's children is expected to cost.
     arrival_cost: Duration,
     changes: Changes,
@@ -1609,6 +1672,8 @@ impl Engine {
             self.teleported = true;
         }
         self.shared.taken.store(false, Ordering::Release);
+        let round_began = self.began();
+        let scanned_before = self.shared.spent[Part::HoleScan as usize].load(Ordering::Relaxed);
         let standing = self.told == Some(camera);
         self.told = Some(camera);
         self.at_standing_camera = false;
@@ -1738,6 +1803,17 @@ impl Engine {
         self.at_standing_camera = standing && !self.has_to_follow(camera);
         self.publish(synced);
         self.idle = !worked && !busy && !self.throttled;
+        if let Some(began) = round_began {
+            // Not the look for holes: it holds the store's lock and publishes nothing, a
+            // diagnostic that the game does not make (see `Part::HoleScan`).
+            let scanned = self.shared.spent[Part::HoleScan as usize]
+                .load(Ordering::Relaxed)
+                .saturating_sub(scanned_before);
+            let nanos = u64::try_from(self.clock.since(began).as_nanos()).unwrap_or(u64::MAX);
+            self.shared
+                .longest_round
+                .fetch_max(nanos.saturating_sub(scanned), Ordering::Relaxed);
+        }
         true
     }
 
@@ -1941,7 +2017,10 @@ impl Engine {
     /// Whether [`Engine::follow`] has anything to do for `camera`: the scene is not there, or a
     /// brick that the loader gave up on is to be asked for again.
     fn has_to_follow(&self, camera: [f64; 3]) -> bool {
-        self.camera != Some(camera) || self.scene.rewanted()
+        self.camera != Some(camera)
+            || self.scene.rewanted()
+            || self.scene.absorbing()
+            || self.scene.tidying()
     }
 
     /// Moves the scene to `camera`, if it is not there, in steps that each cost a share of the
@@ -1986,8 +2065,40 @@ impl Engine {
             let store = self.store.read().expect("the store's lock is not poisoned");
             let before = self.scene.bricks_changed();
             let from = self.scene.camera().unwrap_or(camera);
+            let step_began = self.began();
+            let capped = self.scene.reach().horizon;
+            let busy = self.scene.absorbing();
             let update = self.scene.recentre(&store, target)?;
             drop(store);
+            if let Some(began) = step_began {
+                let nanos = u64::try_from(self.clock.since(began).as_nanos()).unwrap_or(u64::MAX);
+                self.shared
+                    .longest_update
+                    .fetch_max(nanos, Ordering::Relaxed);
+                let flipped = self.scene.reach().horizon != capped;
+                if flipped {
+                    self.shared.flips.fetch_add(1, Ordering::Relaxed);
+                }
+                let busy_after = self.scene.absorbing();
+                if flipped || busy || busy_after {
+                    self.shared.longest_flip.fetch_max(nanos, Ordering::Relaxed);
+                    self.shared.absorb_updates.fetch_add(1, Ordering::Relaxed);
+                }
+                let peak = u64::try_from(self.scene.take_backlog_peak()).unwrap_or(u64::MAX);
+                self.shared.backlog_peak.fetch_max(peak, Ordering::Relaxed);
+                // How long the selection absorbs a flip, from the update that found it to the one
+                // that ended it. Flips that overlap are one span, from the first to the update
+                // that ends the last absorbing, and the updates counted above are the same span's.
+                // (The tidying of the queue is not absorbing: it changes nothing that is drawn.)
+                if flipped && self.absorbing_since.is_none() {
+                    self.absorbing_since = Some(began);
+                }
+                if !busy_after && let Some(since) = self.absorbing_since.take() {
+                    let nanos =
+                        u64::try_from(self.clock.since(since).as_nanos()).unwrap_or(u64::MAX);
+                    self.shared.absorb_nanos.fetch_add(nanos, Ordering::Relaxed);
+                }
+            }
             self.work.follow_bricks += self.scene.bricks_changed() - before;
             self.camera = Some(target);
             let mut cost = UploadCost::default();
@@ -2007,7 +2118,9 @@ impl Engine {
                 self.resize_follow_step(distance, cost);
             }
             self.note(Cause::Follow, update);
-            if self.camera == Some(camera) {
+            // A flip of the horizon cap that is still being absorbed goes on in the next steps, in
+            // the budget and the slice, though the camera is where the scene is (#213).
+            if self.camera == Some(camera) && !self.scene.absorbing() && !self.scene.tidying() {
                 break;
             }
             if self.over_budget() {

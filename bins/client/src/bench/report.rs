@@ -86,7 +86,7 @@ use super::stream::StreamReport;
 /// after it); and the real-time stop after a flight has `still_cuts` (null in the other paths).
 /// Nothing else is changed.
 ///
-/// 23 is taken by #168 (PR #219).
+/// 23 was taken by #168 (PR #219), which now takes 25.
 ///
 /// 24 (#52) adds the sun-and-sky view: `convergence.shadows`, Primary's shadows against the
 /// Reference's direct-sun image (the golden view's camera and sun, no GI and no emitters in both
@@ -97,7 +97,15 @@ use super::stream::StreamReport;
 /// and counts, and the files in `convergence/sun/`. A new pass line `shadows` is in `passes[]`
 /// (the report lists passes generically), and `primary` is as it was in 22.
 /// Nothing else is changed.
-pub const SCHEMA_VERSION: u32 = 24;
+///
+/// 26 (#213) added the real-time path `sea-level crossing` (the camera down to 30 m under the sea
+/// and up to 80 m over it, 50 m/s), and in each real-time path `scene_round_max_ms`,
+/// `scene_update_max_ms`, `cap_flips` and `cap_flip_max_ms`: the scene thread's longest round and
+/// longest update in the path's frames, and the flips of the horizon cap with the longest update
+/// that was a flip's or part of absorbing one; `backlog_peak`, `absorb_updates` and `absorb_ms`:
+/// what absorbing a flip held and how long it took; and `scene_used_peak_mib`: the most MiB of the
+/// scene in use at the end of one of the path's frames. Nothing else is changed.
+pub const SCHEMA_VERSION: u32 = 26;
 
 /// One timed thing (a pass, or the GPU total of a profiler frame) in one mode, against its
 /// budget. In reference mode a profiler frame is one sample, so the entries of that mode have
@@ -594,7 +602,7 @@ mod tests {
                 "streaming_real_time"
             ]
         );
-        assert_eq!(json["schema_version"], 24);
+        assert_eq!(json["schema_version"], 26);
         assert_eq!(json["convergence"], serde_json::Value::Null);
         assert_eq!(json["streaming"], serde_json::Value::Null);
         assert_eq!(json["streaming_real_time"], serde_json::Value::Null);

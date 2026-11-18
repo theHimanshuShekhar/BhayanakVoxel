@@ -384,6 +384,8 @@ struct Loaded {
     camera: Camera,
     /// A point on the ground to put the character down on.
     ground: [f64; 3],
+    /// Sea level's distance from the centre, in Voxels (the horizon cap's sphere).
+    sea: f64,
 }
 
 /// The Planet's spawn ring as the client and the in-process server each hold it, before the
@@ -568,6 +570,7 @@ fn load(map: WorldMap, reach: i32) -> Result<Loaded, RingsFull> {
         loader,
         camera,
         ground,
+        sea: planet.sea_radius(),
     })
 }
 
