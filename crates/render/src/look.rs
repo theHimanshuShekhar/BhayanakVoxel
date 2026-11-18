@@ -49,6 +49,13 @@ impl Look {
         atmosphere: Some(Atmosphere::HERO),
     };
 
+    /// Hero light B with the physical atmosphere and no tint, which the look-dev sheet shows
+    /// between the gradient and the tinted atmosphere.
+    pub const HERO_B_UNTINTED: Look = Look {
+        atmosphere: Some(Atmosphere::PHYSICAL),
+        ..Self::HERO_B
+    };
+
     /// Hero light B as it was before the atmosphere: the owner's gradient and haze, which the
     /// look-dev sheet shows beside it.
     pub const HERO_B_GRADIENT: Look = Look {

@@ -37,6 +37,12 @@ struct Atmo {
     sun_light: vec4<f32>,
     // The ground's albedo for the multiple scattering's bounce off it, rgb.
     ground: vec4<f32>,
+    // The look's tint (atmosphere.rs `Tint`): what the sky's radiance is multiplied by at the
+    // horizon (rgb) and the extra haze's density per metre (w), at the zenith (rgb), and the colour
+    // the extra haze fades to (rgb).
+    tint_horizon: vec4<f32>,
+    tint_zenith: vec4<f32>,
+    tint_haze: vec4<f32>,
 }
 
 // The tables' sizes. Keep in step with atmosphere.rs.
@@ -63,6 +69,12 @@ fn to_sub_uv(u: f32, n: f32) -> f32 {
 
 fn from_sub_uv(u: f32, n: f32) -> f32 {
     return (u * n - 0.5) / (n - 1.0);
+}
+
+// What the look's tint multiplies the sky's radiance by in a direction whose cosine with the up is
+// `mu` (the sine of its elevation): the horizon's at and below the horizon, the zenith's overhead.
+fn sky_tint(mu: f32) -> vec3<f32> {
+    return mix(atmo.tint_horizon.xyz, atmo.tint_zenith.xyz, clamp(mu, 0.0, 1.0));
 }
 
 // The altitude of radius r: below the ground it is the ground's.

@@ -43,12 +43,14 @@ const SUN_FROM_FORWARD: f64 = 70.0;
 /// view has no light sampling for emissives): four times the samples.
 const CAVE_SPP_FACTOR: u32 = 4;
 
-const USAGE: &str = "usage: client lookdev --out DIR [--size WxH] [--spp N] [--compare DIR] [--atmosphere]\n  \
+const USAGE: &str = "usage: client lookdev --out DIR [--size WxH] [--spp N] [--compare DIR] [--atmosphere] [--untinted]\n  \
 the 4090: client.exe lookdev --out DIR [--compare OLD_SHEET_DIR]   (1280x720, 64 spp)\n  \
 --compare: the folder of the #148 sheet; each shot's OLD/NN-shot/hero-hero-b.png is shown first\n  \
---atmosphere (#53): instead of the combinations, each shot twice at the game's settings, hero light B\n  \
-with today's gradient sky and haze beside hero light B with the atmosphere, in both views\n  \
+--atmosphere (#53): instead of the combinations, each shot three times at the game's settings, hero light B\n  \
+with today's gradient sky and haze, then with the untinted atmosphere, then with the atmosphere and the\n  \
+hero tint (the game's), in both views\n  \
 (on lavapipe: client lookdev --out DIR --atmosphere --size 480x270 --spp 16)\n  \
+--untinted: the other sheets (and the stills) with the physical atmosphere and no hero tint\n  \
 a smoke test on any device: client lookdev --out DIR --short";
 
 /// The smooth-normal settings of the combination sheet, in the order of its columns' groups.
@@ -123,6 +125,9 @@ pub struct Options {
     /// The atmosphere's sheet (#53): each shot in both views under hero light B's gradient (what
     /// the renderer had) and under the atmosphere, side by side, in place of the combinations.
     pub atmosphere: bool,
+    /// The other sheets with the physical atmosphere and no hero tint ([`Look::HERO_B_UNTINTED`]); the
+    /// atmosphere's sheet shows both whatever this is.
+    pub untinted: bool,
     /// A smoke test: the test Planet (the shots' places are not there: the images are of nothing
     /// in particular), two shots, tiny.
     pub short: bool,
@@ -136,6 +141,7 @@ fn parse(args: impl IntoIterator<Item = String>) -> Result<Options, String> {
         compare: None,
         descent_frames: 12,
         atmosphere: false,
+        untinted: false,
         short: false,
     };
     let (mut have_out, mut size, mut spp) = (false, None, None);
@@ -159,6 +165,7 @@ fn parse(args: impl IntoIterator<Item = String>) -> Result<Options, String> {
             "--compare" => options.compare = Some(value("a directory")?.into()),
             "--short" => options.short = true,
             "--atmosphere" => options.atmosphere = true,
+            "--untinted" => options.untinted = true,
             "--help" | "-h" => return Err(USAGE.to_string()),
             other => return Err(format!("unknown argument {other}\n{USAGE}")),
         }
@@ -462,6 +469,9 @@ pub fn run(options: &Options) -> Result<PathBuf, Box<dyn Error>> {
             versus: Vec::new(),
         };
         gpu.set_ground_level(ground_level);
+        if options.untinted {
+            gpu.set_look(Look::HERO_B_UNTINTED);
+        }
         if options.atmosphere {
             versus(&mut gpu, shot, &dir, options, &mut section)?;
             eprintln!(
@@ -499,14 +509,23 @@ pub fn run(options: &Options) -> Result<PathBuf, Box<dyn Error>> {
     Ok(sheet)
 }
 
-/// The two looks of the atmosphere's sheet, in the order of its columns.
-const VERSUS: [(&str, &str, Look); 2] = [
+/// The three looks of the atmosphere's sheet, in the order of its columns.
+const VERSUS: [(&str, &str, Look); 3] = [
     (
         "gradient",
         "today's gradient sky and haze (1/300 per m)",
         Look::HERO_B_GRADIENT,
     ),
-    ("atmosphere", "the atmosphere (#53)", Look::HERO_B),
+    (
+        "untinted",
+        "the atmosphere, untinted (physical)",
+        Look::HERO_B_UNTINTED,
+    ),
+    (
+        "tinted",
+        "the atmosphere with the hero tint (the game's)",
+        Look::HERO_B,
+    ),
 ];
 
 /// The shot at the game's settings (AgX-like, smooth normals with the face bias, auto-exposure and
@@ -575,9 +594,10 @@ fn write_atmosphere_sheet(
         "<h1>The atmosphere against today's gradient (#53)</h1>\
          <p class=d>Rendered at {w}&times;{h} by the renderer's own pipeline: hero light B, the sun {SUN_FROM_FORWARD}&deg; \
          from each shot's forward ({SUN_ELEVATION}&deg; up), the game's settings (AgX-like, smooth normals with the face \
-         bias, auto-exposure and bloom). Each row is a shot. The first two columns are the Reference view ({} samples a \
-         pixel, {}&times; in the caves) under today's gradient sky and 1/300 per metre haze, then under the atmosphere; the \
-         last two are Primary, settled after {} frames of a still camera, under each. Only the look changes between a \
+         bias, auto-exposure and bloom). Each row is a shot. The first three columns are the Reference view ({} samples a \
+         pixel, {}&times; in the caves) under today's gradient sky and 1/300 per metre haze, then under the untinted (physical) atmosphere, then \
+         under the atmosphere with the hero tint, which is the game's; the \
+         last three are Primary, settled after {} frames of a still camera, under each. Only the look changes between a \
          pair: the camera, the sun's direction, the Planet and the settings are the same. Took {:.0} s.{}</p>",
         options.spp,
         CAVE_SPP_FACTOR,
@@ -877,7 +897,7 @@ mod tests {
         assert!(new.join("02-dark-descent/descent-02.png").exists());
         assert!(new.join("00-forest-floor/primary.png").exists());
         assert!(new.join("00-forest-floor/primary-settled.png").exists());
-        // The atmosphere's sheet: each shot in two views under two looks.
+        // The atmosphere's sheet: each shot in two views under three looks.
         let versus = out.join("versus");
         let options = parse(args(&[
             "--out",
@@ -893,9 +913,10 @@ mod tests {
             .skip(1)
             .map(|s| s.split('"').next().unwrap())
             .collect();
-        assert_eq!(images.len(), 2 * 4, "{images:?}");
+        assert_eq!(images.len(), 3 * 4, "{images:?}");
         assert!(images.contains(&"00-forest-floor/reference-gradient.png"));
-        assert!(images.contains(&"00-forest-floor/primary-atmosphere.png"));
+        assert!(images.contains(&"00-forest-floor/primary-tinted.png"));
+        assert!(images.contains(&"00-forest-floor/reference-untinted.png"));
         for image in &images {
             assert!(versus.join(image).exists(), "{image}");
         }

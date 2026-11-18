@@ -10,7 +10,7 @@ use brick_store::{BrickCoord, BrickStore, Material, VoxelCoord};
 use common::{PRIMARY, check_golden};
 use materials::MaterialTable;
 use planet_gen::generate_region;
-use render::atmosphere::{Atmosphere, TableId};
+use render::atmosphere::{Atmosphere, TableId, Tint};
 use render::sun::DEFAULT_ANGULAR_RADIUS;
 use render::{Camera, Fault, Look, Offscreen, ReferenceOptions, Scene, SkyEstimator, Stages, Sun};
 
@@ -575,6 +575,80 @@ fn the_air_takes_the_contrast_of_a_distant_wall_and_leaves_the_same_light_in_bot
     );
 }
 
+// ---- The hero tint (the owner's decision of 2026-11-18): in the tables, so in both views.
+
+/// The wall of [`wall_at`] `metres` away, in the colour of its left half in the view of Primary and
+/// of the Reference, linear, under `look`.
+fn far_wall(metres: i32, look: Look) -> [[f32; 3]; 2] {
+    let mut gpu = Offscreen::new(WALL_COLUMNS, WALL_ROWS, &wall_at(metres * 20)).unwrap();
+    gpu.set_stages(Stages::NONE);
+    let primary = wall_colour(&mut gpu, look);
+    let mut camera = Camera::looking_at([0.0, 40.0, 0.5], [0.0, 40.0, -1000.0]);
+    camera.fov_y = 0.3f64.to_radians();
+    gpu.render_reference(&camera, 64);
+    let accumulation = gpu.read_accumulation();
+    let at = ((WALL_ROWS - 3) * WALL_COLUMNS + 1) as usize * 3;
+    [primary, accumulation[at..at + 3].try_into().unwrap()]
+}
+
+#[test]
+fn the_hero_tint_fades_a_far_wall_to_the_gradients_horizon_colour_in_both_views() {
+    // 3 km: the wall's own light is gone, and what is seen is the haze, which was the horizon's
+    // colour in the gradient and still is, by the same function in both views.
+    let [primary, reference] = far_wall(3_000, Look::HERO_B);
+    for (name, seen) in [("Primary", primary), ("the Reference", reference)] {
+        for c in 0..3 {
+            let d = (seen[c] - HORIZON[c]).abs() / HORIZON[c];
+            assert!(
+                d < 0.06,
+                "{name}: {seen:?} against the horizon colour {HORIZON:?}"
+            );
+        }
+    }
+    // The untinted air is a pale horizon of its own, which the tint changes.
+    let [untinted, _] = far_wall(3_000, Look::HERO_B_UNTINTED);
+    let apart = (0..3).any(|c| (untinted[c] - HORIZON[c]).abs() / HORIZON[c] > 0.15);
+    assert!(apart, "{untinted:?}");
+}
+
+#[test]
+fn the_tint_warms_the_horizon_and_blues_the_zenith_and_leaves_the_physical_tables_alone() {
+    let mut gpu = sky_gpu(16);
+    let away = (90.0f32 + 70.0).to_radians();
+    let sun = 8f32.to_radians();
+    let untinted = sky_column(&mut gpu, Look::HERO_B_UNTINTED, away, sun, 16);
+    let tinted = sky_column(&mut gpu, Look::HERO_B, away, sun, 16);
+    let (low_u, low_t) = (untinted[0].1, tinted[0].1);
+    let (high_u, high_t) = (untinted[15].1, tinted[15].1);
+    assert!(
+        low_t[0] / low_t[2] > 1.5 * low_u[0] / low_u[2],
+        "{low_t:?} against {low_u:?}"
+    );
+    assert!(
+        high_t[2] / high_t[0] > high_u[2] / high_u[0],
+        "{high_t:?} against {high_u:?}"
+    );
+    // The tint is not in the tables of the air itself: the transmittance table, which the sun's colour
+    // on the ground comes from, is the same.
+    let mut a = Offscreen::new(8, 8, &floor()).unwrap();
+    let mut b = Offscreen::new(8, 8, &floor()).unwrap();
+    let camera = Camera::looking_at([0.5, 40.0, 0.5], [100.0, 140.0, 0.5]);
+    a.set_look(Look::HERO_B_UNTINTED);
+    b.set_look(Look::HERO_B);
+    a.render(&camera);
+    b.render(&camera);
+    assert_eq!(
+        a.read_atmosphere_table(TableId::Transmittance),
+        b.read_atmosphere_table(TableId::Transmittance)
+    );
+    assert_eq!(Atmosphere::PHYSICAL.tint, Tint::NONE);
+    assert_ne!(Atmosphere::HERO.tint, Tint::NONE);
+    assert_eq!(
+        Atmosphere::HERO.sun_light_on_ground(0.14),
+        Atmosphere::PHYSICAL.sun_light_on_ground(0.14)
+    );
+}
+
 // ---- Haze on the bounce rays (ADR 0005's bias ledger): leaving it off is worth under 1 %.
 
 /// The linear light of the Reference view of `camera` over the test Planet's patch, 64 samples a
@@ -653,12 +727,12 @@ const ZENITH: [f32; 3] = [0.12, 0.18, 0.45];
 const HERO_SUN: [f32; 3] = [1.3, 0.80, 0.40];
 
 fn air_of(p: &[f64]) -> Atmosphere {
-    let mut air = Atmosphere::HERO;
+    let mut air = Atmosphere::PHYSICAL;
     // The Rayleigh scattering keeps Earth's blue-to-red ratio to within 40 % either way.
     let tilt = |c: usize| p[1 + c].clamp(-0.5, 0.5);
     air.rayleigh =
-        std::array::from_fn(|c| Atmosphere::HERO.rayleigh[c] * (p[0] + tilt(c)).exp() as f32);
-    air.ozone = Atmosphere::HERO.ozone.map(|c| c * p[4].exp() as f32);
+        std::array::from_fn(|c| Atmosphere::PHYSICAL.rayleigh[c] * (p[0] + tilt(c)).exp() as f32);
+    air.ozone = Atmosphere::PHYSICAL.ozone.map(|c| c * p[4].exp() as f32);
     air.mie_height = p[5].exp() as f32;
     air.mie_g = (p[6].tanh() * 0.95) as f32;
     air.sun_light = std::array::from_fn(|c| (p[7] + p[10 + c].clamp(-0.5, 0.5)).exp() as f32);
@@ -796,6 +870,278 @@ fn sunset_ratios() {
                 z[1],
                 z[2]
             );
+        }
+    }
+}
+
+// ---- Fitting the tint (an exploration: `cargo test -p render --test atmosphere fit_the_tint --
+// --ignored --nocapture` searches the tint's seven numbers so that the sky and a hazed wall read
+// like hero light B's gradient and its 1/300 per metre haze, and prints them for `HERO_TINT`).
+
+fn tinted(p: &[f64]) -> Atmosphere {
+    let mut air = Atmosphere::PHYSICAL;
+    air.tint = Tint {
+        sky_horizon: [p[0].exp() as f32, p[1].exp() as f32, p[2].exp() as f32],
+        sky_zenith: [p[3].exp() as f32, p[4].exp() as f32, p[5].exp() as f32],
+        haze_per_metre: p[6].exp() as f32,
+        haze_colour: HORIZON,
+    };
+    air
+}
+
+/// A wall's left-half colour as Primary draws it, linear, under `look`.
+fn wall_colour(gpu: &mut Offscreen, look: Look) -> [f32; 3] {
+    gpu.set_look(look);
+    gpu.set_sun(Sun::from_angles(
+        0.0,
+        8f32.to_radians(),
+        DEFAULT_ANGULAR_RADIUS,
+    ));
+    let mut camera = Camera::looking_at([0.0, 40.0, 0.5], [0.0, 40.0, -1000.0]);
+    camera.fov_y = 0.3f64.to_radians();
+    gpu.render(&camera);
+    let ((_, _, hdr), _) = gpu.read_hdr_and_bloom();
+    hdr[((WALL_ROWS - 3) * WALL_COLUMNS + 1) as usize]
+}
+
+/// The mean linear light of the top and of the bottom of a Reference view of the patch: the sky,
+/// and the ground that the sky and the sun light.
+fn patch_means(gpu: &mut Offscreen, look: Look, camera: &Camera) -> [[f64; 3]; 2] {
+    gpu.set_look(look);
+    gpu.render_reference(camera, 16);
+    let accumulation = gpu.read_accumulation();
+    let (w, h) = (96usize, 54usize);
+    let mean = |rows: std::ops::Range<usize>| {
+        let mut sum = [0.0f64; 3];
+        for row in rows.clone() {
+            for x in 0..w {
+                for c in 0..3 {
+                    sum[c] += f64::from(accumulation[(row * w + x) * 3 + c]);
+                }
+            }
+        }
+        sum.map(|v| v / (rows.len() * w) as f64)
+    };
+    [mean(0..6), mean(h - 12..h)]
+}
+
+fn fit_cameras() -> [Camera; 3] {
+    [
+        Camera::looking_at([0.0, 1548.0, 250.0], [0.0, 1535.0, -300.0]),
+        Camera::looking_at([0.0, 1535.0, 120.0], [0.0, 1508.0, 20.0]),
+        Camera::looking_at([0.0, 1620.0, 300.0], [0.0, 1500.0, -300.0]),
+    ]
+}
+
+fn patch_gpu() -> Offscreen {
+    let mut gpu = Offscreen::new(96, 54, &planet_patch()).unwrap();
+    gpu.set_stages(Stages::NONE);
+    gpu.set_ground_level(1535.0);
+    gpu.set_sun(Sun::from_angles(
+        1.5,
+        8f32.to_radians(),
+        DEFAULT_ANGULAR_RADIUS,
+    ));
+    gpu
+}
+
+const FIT_WALLS_M: [i32; 5] = [30, 100, 300, 1_000, 3_000];
+
+fn tint_loss(
+    sky: &mut Offscreen,
+    walls: &mut [Offscreen],
+    wanted: &[[f32; 3]],
+    patch: &mut Offscreen,
+    patch_wanted: &[[[f64; 3]; 2]],
+    p: &[f64],
+    verbose: bool,
+) -> f64 {
+    let air = tinted(p);
+    let look = Look {
+        atmosphere: Some(air),
+        ..Look::HERO_B
+    };
+    let mut total = 0.0;
+    for (away, weight) in [(40.0_f32, 1.0), (70.0, 1.0), (150.0, 0.7)] {
+        let azimuth = (90.0 + away).to_radians();
+        let col = sky_column(sky, look, azimuth, 8f32.to_radians(), 16);
+        let mut line = format!("  sun {away:3.0} off:");
+        for (i, (e, c)) in col.iter().enumerate() {
+            let h = (e.to_radians().sin()) as f32;
+            let t: [f32; 3] = std::array::from_fn(|k| HORIZON[k] + (ZENITH[k] - HORIZON[k]) * h);
+            for k in 0..3 {
+                let d = f64::from(((c[k] + 0.02) / (t[k] + 0.02)).ln());
+                total += weight * d * d / col.len() as f64;
+            }
+            if i % 4 == 0 {
+                line += &format!(" [{e:.0}: {:.2} {:.2} {:.2}]", c[0], c[1], c[2]);
+            }
+        }
+        if verbose {
+            println!("{line}");
+        }
+    }
+    for (i, camera) in fit_cameras().iter().enumerate() {
+        let got = patch_means(patch, look, camera);
+        for (part, name) in [(0, "sky"), (1, "ground")] {
+            for k in 0..3 {
+                let d = ((got[part][k] + 0.02) / (patch_wanted[i][part][k] + 0.02)).ln();
+                total += 2.0 * d * d / 3.0;
+            }
+            if verbose {
+                println!(
+                    "  view {i} {name}: {:.3?} (gradient {:.3?})",
+                    got[part], patch_wanted[i][part]
+                );
+            }
+        }
+    }
+    for (i, gpu) in walls.iter_mut().enumerate() {
+        let c = wall_colour(gpu, look);
+        let w = wanted[i];
+        for k in 0..3 {
+            let d = f64::from(((c[k] + 0.02) / (w[k] + 0.02)).ln());
+            total += 1.5 * d * d / FIT_WALLS_M.len() as f64;
+        }
+        if verbose {
+            println!("  wall {:5} m: {c:.3?} (gradient {w:.3?})", FIT_WALLS_M[i]);
+        }
+    }
+    total
+}
+
+#[test]
+#[ignore = "exploration"]
+fn fit_the_tint() {
+    let mut sky = sky_gpu(16);
+    let mut walls: Vec<Offscreen> = FIT_WALLS_M
+        .iter()
+        .map(|m| {
+            let mut gpu = Offscreen::new(WALL_COLUMNS, WALL_ROWS, &wall_at(m * 20)).unwrap();
+            gpu.set_stages(Stages::NONE);
+            gpu
+        })
+        .collect();
+    let wanted: Vec<[f32; 3]> = walls
+        .iter_mut()
+        .map(|gpu| wall_colour(gpu, Look::HERO_B_GRADIENT))
+        .collect();
+    let mut p = std::env::var("FIT_START")
+        .ok()
+        .map(|s| {
+            s.split(',')
+                .map(|v| v.parse::<f64>().unwrap())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_else(|| vec![0.5625, -0.1, -0.3125, -0.25, -0.325, 0.2125, -6.0469]);
+    let mut patch = patch_gpu();
+    let patch_wanted: Vec<[[f64; 3]; 2]> = fit_cameras()
+        .iter()
+        .map(|c| patch_means(&mut patch, Look::HERO_B_GRADIENT, c))
+        .collect();
+    let mut best = tint_loss(
+        &mut sky,
+        &mut walls,
+        &wanted,
+        &mut patch,
+        &patch_wanted,
+        &p,
+        false,
+    );
+    let mut step = 0.2;
+    for round in 0..30 {
+        let mut improved = false;
+        for i in 0..p.len() {
+            for sign in [1.0, -1.0] {
+                let mut q = p.clone();
+                q[i] += sign * step;
+                let l = tint_loss(
+                    &mut sky,
+                    &mut walls,
+                    &wanted,
+                    &mut patch,
+                    &patch_wanted,
+                    &q,
+                    false,
+                );
+                if l < best {
+                    best = l;
+                    p = q;
+                    improved = true;
+                }
+            }
+        }
+        if !improved {
+            step *= 0.5;
+        }
+        println!("round {round}: loss {best:.5} step {step:.3}");
+        if step < 0.01 {
+            break;
+        }
+    }
+    tint_loss(
+        &mut sky,
+        &mut walls,
+        &wanted,
+        &mut patch,
+        &patch_wanted,
+        &p,
+        true,
+    );
+    let e = |i: usize| p[i].exp();
+    println!(
+        "TINT sky_horizon [{:.3}, {:.3}, {:.3}] sky_zenith [{:.3}, {:.3}, {:.3}] haze_per_metre {:.6} (1/{:.0})",
+        e(0),
+        e(1),
+        e(2),
+        e(3),
+        e(4),
+        e(5),
+        e(6),
+        1.0 / e(6)
+    );
+    println!(
+        "FIT_START={}",
+        p.iter()
+            .map(|v| format!("{v:.4}"))
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+}
+
+#[test]
+#[ignore = "exploration"]
+fn dump_the_tint_views() {
+    let out = std::path::PathBuf::from("/tmp/tint-views");
+    std::fs::create_dir_all(&out).unwrap();
+    let views = [
+        (
+            "surface",
+            Camera::looking_at([0.0, 1548.0, 250.0], [0.0, 1535.0, -300.0]),
+        ),
+        (
+            "hillside",
+            Camera::looking_at([0.0, 1535.0, 120.0], [0.0, 1508.0, 20.0]),
+        ),
+        (
+            "high",
+            Camera::looking_at([0.0, 1620.0, 300.0], [0.0, 1500.0, -300.0]),
+        ),
+    ];
+    let looks = [
+        ("1-gradient", Look::HERO_B_GRADIENT),
+        ("2-untinted", Look::HERO_B_UNTINTED),
+        ("3-tinted", Look::HERO_B),
+    ];
+    for (name, camera) in &views {
+        let sun = Sun::from_angles(1.5, 8f32.to_radians(), DEFAULT_ANGULAR_RADIUS);
+        for (slug, look) in looks {
+            let mut gpu = Offscreen::new(320, 180, &planet_patch()).unwrap();
+            gpu.set_ground_level(1535.0);
+            gpu.set_look(look);
+            gpu.set_sun(sun);
+            let image = gpu.render_reference(camera, 32);
+            common::write_png(&out.join(format!("{name}-{slug}.png")), &image);
         }
     }
 }

@@ -43,6 +43,49 @@ const MIN_CAMERA_HEIGHT: f64 = 0.5;
 /// The Planet's radius at sea level, ADR 0008: 320 km.
 pub const PLANET_RADIUS_M: f32 = 320_000.0;
 
+/// The art direction's tint on the physical tables (#53, the owner's decision of 2026-11-18): the
+/// air is Hillaire's, and this is what the look adds to the light of the sky and of the air between
+/// the camera and a surface. It is not physical, and it is in the tables, so both views read the
+/// same tinted sky and the same tinted haze from the same functions (`sky.wgsl`) and the Reference
+/// still matches Primary. [`Tint::NONE`] leaves the tables as the model makes them.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Tint {
+    /// What the sky's radiance is multiplied by at the horizon and at the zenith (linear RGB), and
+    /// between them by the sine of the elevation, as the gradient it replaces blended its two
+    /// colours. Below the horizon it is the horizon's. It applies to the sky seen by the camera, to
+    /// the sun-free sky that surfaces see (so the light that bounces off the sky is tinted too), and
+    /// to the light the air adds along a camera ray to a surface (by that ray's elevation).
+    pub sky_horizon: [f32; 3],
+    pub sky_zenith: [f32; 3],
+    /// An extra haze on the camera ray to a surface, as the gradient had: `1 - exp(-haze * d)` of
+    /// `haze_colour` fades in over the `d` metres the ray travels in air, whatever the air's
+    /// density there. The physical air is the same; this is added to it. 0 for none.
+    pub haze_per_metre: f32,
+    pub haze_colour: [f32; 3],
+}
+
+impl Tint {
+    /// No tint: the physical tables.
+    pub const NONE: Tint = Tint {
+        sky_horizon: [1.0; 3],
+        sky_zenith: [1.0; 3],
+        haze_per_metre: 0.0,
+        haze_colour: [0.0; 3],
+    };
+}
+
+/// The hero tint (see [`Atmosphere::HERO`]).
+const HERO_TINT: Tint = Tint {
+    // The sky: warmer at the horizon, and bluer overhead, than the air makes it (a 8-degree sun on
+    // a thick shell of air gives a pale, cool sky where the gradient was mauve).
+    sky_horizon: [1.916, 0.928, 0.687],
+    sky_zenith: [0.769, 0.714, 1.206],
+    // The extra haze, on top of the air's own 35 m layer of it (1/300 per metre at the ground in
+    // all), fading to the gradient's horizon colour as it did.
+    haze_per_metre: 1.0 / 342.0,
+    haze_colour: [1.0, 0.55, 0.38],
+};
+
 /// The air, as the model reads it. Rates are per metre.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Atmosphere {
@@ -70,17 +113,19 @@ pub struct Atmosphere {
     /// How high above the ground the sun-free sky is seen from: a surface's height, a couple of
     /// metres.
     pub observer_height: f32,
+    /// The look's tint on the sky and the haze (see [`Tint`]).
+    pub tint: Tint,
 }
 
 impl Atmosphere {
-    /// The Planet's air, tuned to keep hero light B's look: the horizon-to-zenith colours, the
+    /// The Planet's air, as the model makes it with no tint, tuned towards hero light B's look: the horizon-to-zenith colours, the
     /// warmth of the sun on the ground and the depth of the haze of the gradient it replaces (the
     /// look-dev sheet shows the two side by side). A white sun above the air; Earth's Rayleigh
     /// colours to within 40 % (blue-ish, a little redder than Earth's), a scale height of 20 km
     /// (the Planet is 320 km: its sky is a thick, low shell), and almost no ozone; and, in place
     /// of Mie's thin high haze, a dense layer 35 m thick whose extinction is the gradient's
     /// 1/300 per metre at the ground. Found by `tune` in `tests/atmosphere.rs`.
-    pub const HERO: Atmosphere = Atmosphere {
+    pub const PHYSICAL: Atmosphere = Atmosphere {
         ground_radius: PLANET_RADIUS_M,
         top_height: 100_000.0,
         rayleigh: [8.5e-6, 15.0e-6, 26.0e-6],
@@ -95,6 +140,15 @@ impl Atmosphere {
         sun_light: [4.87, 4.87, 4.87],
         ground_albedo: [0.5, 0.5, 0.5],
         observer_height: 2.0,
+        tint: Tint::NONE,
+    };
+
+    /// The air of hero light B: [`Atmosphere::PHYSICAL`] with the owner's tint (see [`Tint`]), fitted by
+    /// `fit_the_tint` in `tests/atmosphere.rs` so that the hero views read like the gradient and
+    /// haze of #148 and #202 (the look-dev sheet shows today's gradient, the untinted air and this).
+    pub const HERO: Atmosphere = Atmosphere {
+        tint: HERO_TINT,
+        ..Self::PHYSICAL
     };
 
     /// The air's extinction (scattering and absorption) at height `h` metres, per colour channel.
@@ -187,6 +241,9 @@ pub struct AtmosphereUniform {
     up: [f32; 4],
     sun_light: [f32; 4],
     ground: [f32; 4],
+    tint_horizon: [f32; 4],
+    tint_zenith: [f32; 4],
+    tint_haze: [f32; 4],
 }
 
 impl Atmosphere {
@@ -211,6 +268,9 @@ impl Atmosphere {
             up: v3(view.up, self.observer_height),
             sun_light: v3(self.sun_light, 0.0),
             ground: v3(self.ground_albedo, 0.0),
+            tint_horizon: v3(self.tint.sky_horizon, self.tint.haze_per_metre),
+            tint_zenith: v3(self.tint.sky_zenith, 0.0),
+            tint_haze: v3(self.tint.haze_colour, 0.0),
         }
     }
 }
@@ -679,8 +739,8 @@ mod tests {
 
     #[test]
     fn the_uniform_is_the_size_the_shader_declares() {
-        // Nine vec4s: `Atmo` in atmosphere_model.wgsl.
-        assert_eq!(size_of::<AtmosphereUniform>(), 9 * 16);
+        // Twelve vec4s: `Atmo` in atmosphere_model.wgsl.
+        assert_eq!(size_of::<AtmosphereUniform>(), 12 * 16);
     }
 
     #[test]

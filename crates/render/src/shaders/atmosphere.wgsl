@@ -230,7 +230,7 @@ fn sky_view_kernel(@builtin(global_invocation_id) id: vec3<u32>) {
     let angles = sky_view_params(r, unit);
     let mu_s = clamp(dot(atmo.sun_dir.xyz, atmo.up.xyz), -1.0, 1.0);
     let nu = cos_between(angles.x, mu_s, angles.y);
-    textureStore(sky_view_out, id.xy, vec4<f32>(integrate_ray(r, angles.x, mu_s, nu, SKY_STEPS), 1.0));
+    textureStore(sky_view_out, id.xy, vec4<f32>(integrate_ray(r, angles.x, mu_s, nu, SKY_STEPS) * sky_tint(angles.x), 1.0));
 }
 
 // The sun-free table: the sky as a surface sees it, over the sky's half of the sphere, in texels
@@ -246,7 +246,7 @@ fn ground_sky_kernel(@builtin(global_invocation_id) id: vec3<u32>) {
     let mu = (f32(id.y) + 0.5) / f32(GROUND_SKY_H);
     let mu_s = clamp(dot(atmo.sun_dir.xyz, atmo.up.xyz), -1.0, 1.0);
     let nu = cos_between(mu, mu_s, dphi);
-    textureStore(ground_sky_out, id.xy, vec4<f32>(integrate_ray(r, mu, mu_s, nu, SKY_STEPS), 1.0));
+    textureStore(ground_sky_out, id.xy, vec4<f32>(integrate_ray(r, mu, mu_s, nu, SKY_STEPS) * sky_tint(mu), 1.0));
 }
 
 var<workgroup> row_sums: array<f32, 32>;
@@ -318,8 +318,12 @@ fn aerial_kernel(@builtin(global_invocation_id) id: vec3<u32>) {
                 state = accumulate(state, r, mu, mu_s, nu, seg.x + lo, seg.x + hi);
             }
         }
-        textureStore(aerial_scatter_out, vec3<u32>(id.x, id.y, k), vec4<f32>(state.l, 0.0));
-        textureStore(aerial_transmittance_out, vec3<u32>(id.x, id.y, k), vec4<f32>(state.t, 1.0));
+        // The look's tint: the air's light by the ray's elevation, and then the extra haze over the
+        // distance travelled in air, which fades what is behind it and what the air added to its colour.
+        let extra = exp(-atmo.tint_horizon.w * min(next, length_in_air));
+        let added = state.l * sky_tint(mu) * extra + atmo.tint_haze.xyz * (1.0 - extra);
+        textureStore(aerial_scatter_out, vec3<u32>(id.x, id.y, k), vec4<f32>(added, 0.0));
+        textureStore(aerial_transmittance_out, vec3<u32>(id.x, id.y, k), vec4<f32>(state.t * extra, 1.0));
         prev = next;
     }
 }

@@ -1427,12 +1427,14 @@ says the chamber is roofed; it does not prove there is no sky from the side.
 
 ### The atmosphere sheet (#53)
 
-`client lookdev --out DIR --atmosphere` renders every shot twice, in both views, with hero light B's
-**gradient and haze as they were before #53 and with the atmosphere**, and writes the pairs side by
-side to `DIR/index.html` and `DIR/<shot>/{primary,reference}-{gradient,atmosphere}.png`: the sheet
-for the owner to judge by eye that the atmosphere keeps the hero look (#148, #202). It needs the
+`client lookdev --out DIR --atmosphere` renders every shot in both views under **three looks** and
+writes them side by side to `DIR/index.html` and
+`DIR/<shot>/{primary,reference}-{gradient,untinted,tinted}.png`: hero light B's **gradient and haze as
+they were before #53**, **the physical atmosphere with no tint**, and **the atmosphere with the hero tint**
+(the game's look, `Look::HERO_B`; the owner's decision of 2026-11-18: see ADR 0005's sky row). It is the
+sheet for the owner to judge by eye that the atmosphere keeps the hero look (#148, #202). It needs the
 real Planet, so it makes the world map (25 s) per shot. On lavapipe (the dev box) a sheet at
-480x270 with 16 samples takes about 7 minutes:
+480x270 with 16 samples takes about 10 minutes:
 
 ```
 cargo run --release -p client -- lookdev --out /tmp/lookdev-atmo --atmosphere --size 480x270 --spp 16
@@ -1440,6 +1442,14 @@ cargo run --release -p client -- lookdev --out /tmp/lookdev-atmo --atmosphere --
 
 On the 4090 the same command at the default size and samples is the sheet. Each shot's camera sets
 the Planet's ground level (`set_ground_level`), which the atmosphere counts the camera's height from.
+`--untinted` makes the other sheets (the combinations, the stills) use the physical atmosphere with no
+tint (`Look::HERO_B_UNTINTED`), so that the tint can be compared on any of them.
+
+The tint's seven numbers (`HERO_TINT` in `atmosphere.rs`) come from `fit_the_tint` in
+`crates/render/tests/atmosphere.rs` (`cargo test -p render --test atmosphere fit_the_tint -- --ignored
+--nocapture`, about 3 minutes on lavapipe): it searches them so that the sky columns, the sky and ground
+of three Reference views of the test Planet's patch, and a wall fading into the haze at 30 m to 3 km read
+like the gradient and its 1/300 per metre haze. It prints what to put in `HERO_TINT`.
 
 ## Tests
 
