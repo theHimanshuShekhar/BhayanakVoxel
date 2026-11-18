@@ -57,7 +57,7 @@ use super::stream::{
     test_planet, within_reach,
 };
 use crate::loader::{Loader, workers_for};
-use crate::scene_worker::{Cause, Done, Spent, UPLOAD_BUDGET};
+use crate::scene_worker::{Cause, Done, Longest, Spent, UPLOAD_BUDGET};
 use crate::tool::Tool;
 use crate::world::{Hold, STILL_FRAMES, StillCuts, Stillness, World};
 
@@ -427,6 +427,14 @@ impl SceneThread {
     }
 }
 
+/// How far under sea level the sea-level crossing goes, and how high over it, in metres: the pit of
+/// #146's stepped test (the cap goes off about 20 m under, and comes back on 50 m over).
+pub const CROSSING_UNDER_METRES: f64 = 30.0;
+pub const CROSSING_OVER_METRES: f64 = 80.0;
+/// The longest that the crossing waits at the bottom and at the top for the scene to come to the
+/// camera.
+pub const CROSSING_HOLD_CAP: Duration = Duration::from_secs(90);
+
 /// How many of the slowest frames of a path are kept.
 const SLOWEST: usize = 5;
 
@@ -756,11 +764,8 @@ pub struct PathReport {
     pub scene_lag_d0_p99: f64,
     /// The mean of the drawn scene's lag over the frames of the path, in `d0` (#168: how far
     /// behind the camera the scene is for most of a flight, which the maximum and the 99th
-    /// percentile do not say), and the most the scene's buffers in use were in the path, in MiB
-    /// (`Scene::used_bytes`, as the scene thread says it every 250 ms; the run's
-    /// `memory.scene_used_peak_mib` is the most of these). Reported, not gated.
+    /// percentile do not say). Reported, not gated.
     pub scene_lag_d0_mean: f64,
-    pub scene_used_peak_mib: f64,
     /// Rounds in which the scene thread moved the scene to the camera, and in which it held work
     /// back for the upload budget (`Done::follow_steps` and `budget_cuts`), and the frames that
     /// scored a camera soft miss in each second of the path (the flights only; empty for the
@@ -832,6 +837,28 @@ pub struct PathReport {
     /// The scene thread's time in the frames of the path: without the look for holes that is forced
     /// after them.
     pub scene_thread: SceneThread,
+    /// The longest round of the scene thread in the frames of the path, in milliseconds, without
+    /// the look for holes (#213), and the longest single update of the scene to a camera in it (a
+    /// step of following the camera): the longest that the scene stood still for the frame thread
+    /// (`SceneWorker::take_longest`). The sea-level crossing's update is held against the other
+    /// paths' worst.
+    pub scene_round_max_ms: f64,
+    pub scene_update_max_ms: f64,
+    /// The updates in which the horizon cap came on or went off, and the longest update that was
+    /// one of those or part of absorbing one (the revisiting goes on after the flip, and into the
+    /// next path if the camera has stopped: its figures are in the path where it ends).
+    pub cap_flips: u64,
+    pub cap_flip_max_ms: f64,
+    /// The most MiB of the scene in use at the end of one of the path's frames (the run's
+    /// `memory.scene_used_peak_mib`, the gate, is the most of these and of the looks between frames).
+    pub scene_used_peak_mib: f64,
+    /// Absorbing a flip: the most nodes that waited to be revisited at once, the updates that
+    /// were absorbing, and the milliseconds from the update that found a flip to the one that
+    /// ended its absorbing (summed over the spans that ended in the path; flips that overlap are
+    /// one span, and `absorb_updates` counts the same span's updates).
+    pub backlog_peak: u64,
+    pub absorb_updates: u64,
+    pub absorb_ms: f64,
     /// What the forced look at the end of the path took in the scene thread, in milliseconds (the
     /// scan itself): a look after the frames, not in them.
     pub end_look_ms: f64,
@@ -1289,6 +1316,8 @@ struct Setup {
     start: Start,
     /// What the store may hold before eviction starts.
     store_limit: usize,
+    /// Sea level's distance from the centre, in Voxels: the horizon cap's sphere.
+    sea: f64,
     constants: Constants,
     world_map_s: Option<f64>,
     load: Duration,
@@ -1326,6 +1355,7 @@ fn build_full() -> Result<Built, Box<dyn Error>> {
             d0,
             start,
             store_limit,
+            sea: loaded.sea,
             // Level 0 beyond the spawn ring is in what is measured here, so none of it is taken
             // out.
             constants: Constants {
@@ -1349,6 +1379,7 @@ fn build_test() -> Result<Built, Box<dyn Error>> {
         spawn,
         bands,
         start,
+        sea,
     } = test_planet();
     // The budget of the client's constants, for this `d0`, over the spawn ring that is held as well
     // (it is not scaled with `d0`).
@@ -1373,6 +1404,7 @@ fn build_test() -> Result<Built, Box<dyn Error>> {
             d0: bands.d0(),
             start,
             store_limit: budget.limit(),
+            sea,
             constants: Constants::of_the_client(),
             world_map_s: None,
             load: began.elapsed(),
@@ -1424,13 +1456,13 @@ struct Frame {
     release_rebuild: bool,
     /// Whether the scene the frame draws is at the frame's camera ([`Settle`]).
     at_camera: bool,
+    /// The words of the scene in use at the end of the frame, in bytes.
+    scene_used_bytes: u64,
     /// Whether the scene thread held work back in this frame for the upload budget.
     throttled: bool,
     /// The bricks the loader had been asked for and not yet taken in, as of the frame's look at the
     /// scene (the loader's queue and what its workers have, see [`PathReport::loader_queue_max`]).
     loader_queue: usize,
-    /// The scene's buffers in use, in bytes (see [`PathReport::scene_used_peak_mib`]).
-    scene_used: u64,
     /// The drawn scene's lag behind the camera in Voxels (see [`PathReport::scene_lag_voxels_max`]).
     lag: f64,
     /// Whether the look at the scene in this frame has the newest Edit in it (from this frame or an
@@ -1461,13 +1493,16 @@ struct Capture {
     queue_max: usize,
     queue_sum: u64,
     /// The most the scene's buffers in use were, in bytes.
-    used_max: u64,
     /// The scene thread's follow rounds and budget cuts when the path began.
     follow: (u64, u64, u64),
     /// Frames with a camera soft miss, by second of the path.
     miss_seconds: Vec<u32>,
     /// What the scene thread had spent when the path's frames were done, before the forced look.
     frames_done: Option<Spent>,
+    /// The scene thread's longest round in the path's frames, taken when they were done.
+    longest: Longest,
+    /// The most bytes of the scene in use at the end of one of the path's frames.
+    scene_used_peak_bytes: u64,
     frame_ms: Vec<f64>,
     cpu_ms: Vec<f64>,
     /// The start of each frame, to work the cycles out from, and the overshoot of the sleeps.
@@ -1514,11 +1549,15 @@ struct Capture {
 impl Capture {
     fn start(name: &'static str, world: &World, limit_ms: f64) -> Self {
         let work = world.stats().work;
+        // What an earlier round left is not this path's.
+        world.take_longest();
         Self {
             name,
             began: Instant::now(),
             seconds: None,
             frames_done: None,
+            longest: Longest::default(),
+            scene_used_peak_bytes: 0,
             limit_ms,
             over_limit: 0,
             over_by_update: UpdateKinds::default(),
@@ -1544,7 +1583,6 @@ impl Capture {
             streams: (work.stream_calls, work.stream_slices_used),
             queue_max: 0,
             queue_sum: 0,
-            used_max: 0,
             follow: (work.follow_steps, work.budget_cuts, work.release_rebuilds),
             miss_seconds: Vec::new(),
             frame_ms: Vec::new(),
@@ -1568,6 +1606,7 @@ impl Capture {
     }
 
     fn add(&mut self, frame: &Frame) {
+        self.scene_used_peak_bytes = self.scene_used_peak_bytes.max(frame.scene_used_bytes);
         if frame.time_ms > self.limit_ms {
             if self.over_limit_at.len() < OVER_LIMIT_INDEXES {
                 self.over_limit_at.push(self.frame_ms.len());
@@ -1578,7 +1617,6 @@ impl Capture {
         self.lags.push(frame.lag);
         self.queue_max = self.queue_max.max(frame.loader_queue);
         self.queue_sum += frame.loader_queue as u64;
-        self.used_max = self.used_max.max(frame.scene_used);
         self.over_budget.add(frame.parts.over_budget);
         if frame.parts.grown_bytes > 0 {
             self.growth_frames += 1;
@@ -1650,6 +1688,7 @@ impl Capture {
     fn frames_done(&mut self, world: &World) {
         self.seconds = Some(self.began.elapsed().as_secs_f64());
         self.frames_done = Some(world.scene_thread_time());
+        self.longest = world.take_longest();
     }
 
     fn finish(
@@ -1689,7 +1728,6 @@ impl Capture {
             scene_lag_d0_mean: d0.map_or(0.0, |d0| {
                 self.lags.iter().sum::<f64>() / self.lags.len().max(1) as f64 / d0
             }),
-            scene_used_peak_mib: self.used_max as f64 / MIB,
             scene_follow_steps: work.follow_steps - self.follow.0,
             scene_budget_cuts: work.budget_cuts - self.follow.1,
             scene_release_rebuilds: work.release_rebuilds - self.follow.2,
@@ -1753,6 +1791,14 @@ impl Capture {
             holes,
             holes_per_frame: per_frame(holes),
             scene_thread: SceneThread::between(self.spent, frames_end),
+            scene_round_max_ms: self.longest.round.as_secs_f64() * 1e3,
+            scene_update_max_ms: self.longest.update.as_secs_f64() * 1e3,
+            cap_flips: self.longest.flips,
+            cap_flip_max_ms: self.longest.flip.as_secs_f64() * 1e3,
+            scene_used_peak_mib: self.scene_used_peak_bytes as f64 / (1024.0 * 1024.0),
+            backlog_peak: self.longest.backlog_peak,
+            absorb_updates: self.longest.absorb_updates,
+            absorb_ms: self.longest.absorb.as_secs_f64() * 1e3,
             end_look_ms: now
                 .hole_scan
                 .saturating_sub(frames_end.hole_scan)
@@ -2037,9 +2083,9 @@ impl<'a> Session<'a> {
                         > bands.floor(1) * (1.0 - render::lod::HYSTERESIS)
                 }),
             at_camera: self.world.lag(camera.position) == 0.0,
+            scene_used_bytes: self.world.used_bytes(),
             throttled: self.world.stats().throttled,
             loader_queue: self.world.stats().loader.pending,
-            scene_used: self.world.used_bytes(),
             lag: self.world.lag(camera.position),
             edit_taken,
             taken_at,
@@ -2211,7 +2257,18 @@ impl<'a> Session<'a> {
         &mut self,
         name: &'static str,
         seconds: Duration,
+        at: impl FnMut(&World, f64) -> Camera,
+    ) -> Result<PathReport, Box<dyn Error>> {
+        self.path_until(name, at, |_, t| t >= seconds.as_secs_f64())
+    }
+
+    /// The camera at `at(world, t)` until `done(world, t)` says so after a frame, `t` the seconds
+    /// since the path began.
+    fn path_until(
+        &mut self,
+        name: &'static str,
         mut at: impl FnMut(&World, f64) -> Camera,
+        mut done: impl FnMut(&World, f64) -> bool,
     ) -> Result<PathReport, Box<dyn Error>> {
         self.step = name.to_string();
         // A path's first frame follows the end look of the path before (about 0.3 s at full size),
@@ -2226,12 +2283,95 @@ impl<'a> Session<'a> {
             self.camera_wait = began.elapsed() - Duration::from_secs_f64(t);
             let frame = self.frame(&camera, true)?;
             capture.add(&frame);
-            if began.elapsed() >= seconds {
+            if done(&self.world, began.elapsed().as_secs_f64()) {
                 break camera;
             }
         };
         self.score_camera = false;
         self.end_path(capture, &camera, None, None)
+    }
+
+    /// The sea-level crossing (#213): straight down from the Spawn to [`CROSSING_UNDER_METRES`] under
+    /// sea level, held there until the scene has come to the camera (or [`CROSSING_HOLD_CAP`]),
+    /// up to [`CROSSING_OVER_METRES`] over it, and held there the same way, along the Spawn's
+    /// radial up at the flights' speed. The horizon cap goes off when the scene's raised camera is
+    /// under the sea's sphere and comes back on 50 m over it (`select::CAP_ON`), so this path has
+    /// both flips of the cap, the update that looks at every node again being the one it is for.
+    /// The scene follows a camera that goes through the ground much slower than the camera moves
+    /// (at full size, about a step of 0.8 m for each update of 100 to 500 ms), so a path that
+    /// does not wait for it never brings the scene to the flip: the holds do.
+    fn sea_level_crossing(
+        &mut self,
+        spawn: &Camera,
+        sea: f64,
+    ) -> Result<PathReport, Box<dyn Error>> {
+        #[derive(Clone, Copy, PartialEq)]
+        enum Leg {
+            Down,
+            HoldBottom,
+            Up,
+            HoldTop,
+            Done,
+        }
+        let speed = FLIGHT_METRES_PER_SECOND * VOXELS_PER_METRE;
+        let start = norm(spawn.position);
+        let bottom = sea - CROSSING_UNDER_METRES * VOXELS_PER_METRE;
+        let top = sea + CROSSING_OVER_METRES * VOXELS_PER_METRE;
+        let spawn = *spawn;
+        let at = |radius: f64| Camera {
+            position: std::array::from_fn(|a| {
+                spawn.position[a] + spawn.horizon_up[a] * (radius - start)
+            }),
+            ..spawn
+        };
+        // The leg, and the time it began.
+        let state = std::cell::Cell::new((Leg::Down, 0.0));
+        let done = std::cell::Cell::new(false);
+        let cap = CROSSING_HOLD_CAP.as_secs_f64();
+        self.path_until(
+            "sea-level crossing",
+            |world, t| {
+                let (leg, since) = state.get();
+                // Held until the scene is at the camera, and at the top until the flip is absorbed too
+                // (`World::caught_up`): so the path ends with nothing left to absorb, which would
+                // spill into the next path. At the bottom the flip is *not* waited for: the scene a
+                // cap that is off builds when it is waited for is the wide one (544 to 557 MiB at
+                // 30 m under the sea, 567 at the top, over the 512 MiB gate; see `measurements.md`),
+                // and what the path is for is the flip's update.
+                let held = |camera: Camera, next: Leg, absorbed: bool| {
+                    let at_camera = world.lag(camera.position) < crate::world::CAUGHT_UP_LAG;
+                    if (at_camera && (!absorbed || world.caught_up(camera.position)))
+                        || t - since > cap
+                    {
+                        state.set((next, t));
+                    }
+                    camera
+                };
+                match leg {
+                    Leg::Down => {
+                        let radius = (start - t * speed).max(bottom);
+                        if radius <= bottom {
+                            state.set((Leg::HoldBottom, t));
+                        }
+                        at(radius)
+                    }
+                    Leg::HoldBottom => held(at(bottom), Leg::Up, false),
+                    Leg::Up => {
+                        let radius = (bottom + (t - since) * speed).min(top);
+                        if radius >= top {
+                            state.set((Leg::HoldTop, t));
+                        }
+                        at(radius)
+                    }
+                    Leg::HoldTop => held(at(top), Leg::Done, true),
+                    Leg::Done => {
+                        done.set(true);
+                        at(top)
+                    }
+                }
+            },
+            |_, _| done.get(),
+        )
     }
 
     /// A flight, and then the camera standing where it stopped until no brick is drawn coarser than
@@ -2503,6 +2643,8 @@ impl<'a> Session<'a> {
             turned
         })?);
         self.settle(&spawn, cap, "the 180 degree turn")?;
+        paths.push(self.sea_level_crossing(&spawn, setup.sea)?);
+        self.settle(&spawn, cap, "the sea-level crossing")?;
         paths.push(self.stop_after_a_flight(&course, script)?);
         self.settle(&spawn, cap, "the stop after a flight")?;
         let still_after_flight = self.still_after_a_flight(&course, script)?;
@@ -2797,6 +2939,13 @@ mod tests {
             holes,
             holes_per_frame: 0.0,
             scene_thread: SceneThread::default(),
+            scene_round_max_ms: 0.0,
+            scene_update_max_ms: 0.0,
+            cap_flips: 0,
+            cap_flip_max_ms: 0.0,
+            backlog_peak: 0,
+            absorb_updates: 0,
+            absorb_ms: 0.0,
             end_look_ms: 0.0,
             settle: None,
             still_cuts: None,
@@ -3347,11 +3496,16 @@ mod tests {
         assert_eq!(
             keys(&json["runs"][0]["paths"][0]),
             [
+                "absorb_ms",
+                "absorb_updates",
                 "arrived_bricks",
+                "backlog_peak",
                 "camera_soft_miss_frames",
                 "camera_soft_miss_lag_side",
                 "camera_soft_miss_loader_side",
                 "camera_soft_miss_per_second",
+                "cap_flip_max_ms",
+                "cap_flips",
                 "end_look_ms",
                 "frame_cpu",
                 "frame_cycle",
@@ -3382,7 +3536,9 @@ mod tests {
                 "scene_lag_voxels_p99",
                 "scene_level_bricks_end",
                 "scene_release_rebuilds",
+                "scene_round_max_ms",
                 "scene_thread",
+                "scene_update_max_ms",
                 "scene_used_end_mib",
                 "scene_used_peak_mib",
                 "seconds",
@@ -3944,6 +4100,7 @@ mod tests {
                 "flight at 50 m",
                 "vertical take-off",
                 "180 degree turn",
+                "sea-level crossing",
                 "stop after a flight"
             ]
         );
@@ -3962,13 +4119,33 @@ mod tests {
             "{still:?}"
         );
         assert!(still.before_hold.waited_s < crate::world::CATCH_UP_CAP.as_secs_f64());
+        // The crossing took the horizon cap off and on again (#213).
+        let crossing = run.paths.iter().find(|p| p.name == "sea-level crossing");
+        assert!(crossing.is_some_and(|p| p.cap_flips >= 2), "{crossing:?}");
+        // The flips were absorbed: the updates that did it are counted in the crossing or the
+        // path after it.
+        assert!(
+            run.paths
+                .iter()
+                .any(|p| p.absorb_updates > 0 && p.absorb_ms > 0.0),
+            "no path absorbed a flip"
+        );
         let stop = run.paths.last().unwrap();
         assert!(stop.still_cuts.is_some());
-        assert!(run.paths[..5].iter().all(|p| p.still_cuts.is_none()));
+        assert!(run.paths[..6].iter().all(|p| p.still_cuts.is_none()));
         for path in &run.paths {
             assert!(path.frames > 0, "{}", path.name);
             assert_eq!(path.frame_time.samples, path.frames);
             assert_eq!(path.frame_cpu.samples, path.frames);
+            // The scene thread's longest round (#213) was timed.
+            assert!(path.scene_round_max_ms > 0.0, "{}", path.name);
+            // Not that the round is at least as long as the update: the counters are taken
+            // between an update and the end of its round, so the longest update of the round that
+            // straddles the end of a path is in this path and the round's time in the next.
+            eprintln!(
+                "{}: round {:.2} ms, update {:.2} ms, {} cap flips",
+                path.name, path.scene_round_max_ms, path.scene_update_max_ms, path.cap_flips
+            );
             // The cycles are from one frame's start to the next's (the last has none), and the
             // frames are paced to 16.667 ms: a cycle is never shorter, and the sleeps that ran
             // over by more than a frame would show in the worst figure.
@@ -4177,6 +4354,89 @@ mod tests {
                 report.memory.scene_used_peak_level_bricks
             );
         }
+    }
+
+    /// The sea-level crossing at full size, without a GPU (#213): the scene thread's longest round
+    /// in each path, and the flips' updates held against the others'. The scene thread's rounds are
+    /// the same work as on the 4090 (a frame's time is not, with no GPU). It runs the whole
+    /// real-time run once, as the bench does: about 8 minutes.
+    /// `cargo test --release -p client --bin client -- --ignored --nocapture sea_level_crossing`
+    #[test]
+    #[ignore = "generates the full-size world map and runs every path: about 8 minutes"]
+    fn the_sea_level_crossing_round_at_full_size_is_no_longer_than_the_other_paths_worst() {
+        let built = build_full().expect("the full-size Planet loads");
+        let run = one_run(
+            built,
+            &mut NoGpu,
+            &Script::full(),
+            BUDGETS.frame_time_p99_ms,
+        )
+        .unwrap_or_else(|stopped| panic!("the run stopped at {}: {}", stopped.step, stopped.error));
+        for p in &run.paths {
+            eprintln!(
+                "{:<20} longest scene round {:>8.2} ms, update {:>8.2} ms, cap flips {} (longest {:.2} ms), scene {:.1} MiB, backlog at most {} nodes, {} absorbing updates over {:.0} ms (follow {:.0} ms, pack {:.0} ms, publish {:.0} ms in {} frames); holes {}",
+                p.name,
+                p.scene_round_max_ms,
+                p.scene_update_max_ms,
+                p.cap_flips,
+                p.cap_flip_max_ms,
+                p.scene_used_peak_mib,
+                p.backlog_peak,
+                p.absorb_updates,
+                p.absorb_ms,
+                p.scene_thread.follow_ms,
+                p.scene_thread.pack_ms,
+                p.scene_thread.upload_ms,
+                p.frames,
+                p.holes,
+            );
+        }
+        for p in &run.paths {
+            eprintln!(
+                "{}: {:.1} s, soft misses {:.0} a frame, settle {:?}",
+                p.name, p.seconds, p.soft_misses_per_frame, p.settle
+            );
+        }
+        let crossing = run
+            .paths
+            .iter()
+            .find(|p| p.name == "sea-level crossing")
+            .expect("the crossing is a path");
+        // The paths in which no flip was absorbed: the update of an ordinary follow is what the
+        // flip's updates are held against. A flip's absorbing goes on into the path after the
+        // crossing, so the flips' longest update is the longest of any path's `cap_flip_max_ms`.
+        let ordinary = |of: fn(&PathReport) -> f64| {
+            run.paths
+                .iter()
+                .filter(|p| p.cap_flip_max_ms == 0.0)
+                .map(of)
+                .fold(0.0, f64::max)
+        };
+        let (ordinary_update, ordinary_round) = (
+            ordinary(|p| p.scene_update_max_ms),
+            ordinary(|p| p.scene_round_max_ms),
+        );
+        let flip_update = run
+            .paths
+            .iter()
+            .map(|p| p.cap_flip_max_ms)
+            .fold(0.0, f64::max);
+        eprintln!(
+            "sea-level crossing: the flips' longest update {flip_update:.2} ms ({} flips); the \
+             crossing's longest update {:.2} ms and round {:.2} ms (any update of an ordinary \
+             follow, which varies by a few percent from run to run); the other paths' longest \
+             update {ordinary_update:.2} ms and round {ordinary_round:.2} ms",
+            crossing.cap_flips, crossing.scene_update_max_ms, crossing.scene_round_max_ms,
+        );
+        assert_eq!(crossing.holes, 0);
+        assert!(
+            crossing.cap_flips >= 2,
+            "the crossing flipped the cap both ways"
+        );
+        assert!(
+            flip_update <= ordinary_update,
+            "a flip's update is {flip_update:.2} ms, over the other paths' {ordinary_update:.2} ms"
+        );
     }
 
     /// A run that cannot finish says at which step, and why: here the cold start, with no time to

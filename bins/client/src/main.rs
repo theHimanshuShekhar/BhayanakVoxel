@@ -392,6 +392,8 @@ struct Loaded {
     /// sky.
     ring_took: Duration,
     guard_took: Duration,
+    /// Sea level's distance from the centre, in Voxels (the horizon cap's sphere).
+    sea: f64,
 }
 
 /// The Planet's spawn ring as the client and the in-process server each hold it, before the
@@ -583,6 +585,7 @@ fn load(map: WorldMap, reach: i32) -> Result<Loaded, RingsFull> {
         ground,
         ring_took,
         guard_took,
+        sea: planet.sea_radius(),
     })
 }
 

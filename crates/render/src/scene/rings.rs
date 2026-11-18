@@ -1323,6 +1323,25 @@ impl Scene {
         self.rings.as_ref().is_some_and(|r| r.selection.rewanted())
     }
 
+    /// Whether a flip of the horizon cap is still being absorbed (see [`Selection::absorbing`]).
+    pub fn absorbing(&self) -> bool {
+        self.rings.as_ref().is_some_and(|r| r.selection.absorbing())
+    }
+
+    /// Whether the selection's queue is yet to be tidied after a flip (see
+    /// [`Selection::tidying`]).
+    pub fn tidying(&self) -> bool {
+        self.rings.as_ref().is_some_and(|r| r.selection.tidying())
+    }
+
+    /// The most nodes that waited to be revisited at once after a flip of the horizon cap since
+    /// the last call (see [`Selection::take_backlog_peak`]).
+    pub fn take_backlog_peak(&mut self) -> usize {
+        self.rings
+            .as_mut()
+            .map_or(0, |r| r.selection.take_backlog_peak())
+    }
+
     /// Nodes of the selection: what the scene wants, drawn or split or in reach (see
     /// [`Selection::nodes`]).
     pub fn nodes(&self) -> usize {

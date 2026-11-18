@@ -326,6 +326,7 @@ camera back there and the loader caught up. The camera's speed and shape are tho
 | `flight at 50 m` | 50 m/s sideways, 10 s, 50 m over the ground. |
 | `vertical take-off` | 50 m/s straight up, 6 s. |
 | `180 degree turn` | A half turn in a second, then the view still for a second. |
+| `sea-level crossing` | (#213) The raised camera down to 30 m under the sea and up to 80 m over it along the Spawn's radial at 50 m/s, held at the bottom until the scene has come to the camera, and at the top until it has and the flip is absorbed (`World::caught_up`; up to 90 s each), so **the horizon cap goes off and comes back on** (`CAP_ON`, 50 m over) and the path ends with nothing left to absorb. The scene follows a camera through the ground at about 0.8 m an update, so a path that does not wait never gets to the flip. **The bottom does not wait for the flip to be absorbed on purpose:** a scene whose cap is off, once built, is the wide one, **544 to 557 MiB in use at 30 m under the sea and 567 MiB at the top before the cap comes on** (the dev box; the 4090 read 566 to 567 MiB at the peak, #213), over the 512 MiB gate, so a path that lingers there fails `scene_mib`; this path passes the cap off in about 20 s of the scene thread's work and peaks at 469 MiB. The owner decided on 2026-11-18 that the wide state does not have to fit 512 MiB in #213; it is #226. |
 | `stop after a flight` | 5 s of the flight at 2 m, then the camera stands where it was until the scene has no soft misses (up to 120 s). Settle time is in it. |
 
 After the last path the camera is back at the Spawn and the loader has caught up, and **one dig**
@@ -554,13 +555,13 @@ camera, and `holes_after_catch_up` the holes the look after it found, which must
     most of the time with the queue long means the scene thread's taking in limits the loader, not
     the generator. And how many times the scene thread took in (its time is `scene_thread.pack_ms`)
     and in how many of them it stopped because its slice was used up. Reported, not gated.
-  - `scene_lag_d0_mean`, `scene_follow_steps`, `scene_budget_cuts`, `camera_soft_miss_per_second` and
-    `scene_used_peak_mib` (#168; the last two lines of the 4090 sweep of the slice ask for them): the
+  - `scene_lag_d0_mean`, `scene_follow_steps`, `scene_budget_cuts` and `camera_soft_miss_per_second` (#168; the last two
+    lines of the 4090 sweep of the slice ask for them): the
     mean of the drawn scene's lag over the path's frames, in `d0` (the maximum and the 99th percentile
     do not say how long the scene is behind), the rounds in which the scene moved to the camera and
     those in which it held work back for the upload budget, the frames with a camera soft miss in
-    each second of the path (one entry for every second the path covers, so a trailing 0 is a second without a miss; a flight only: at the start of it or all along it), and the most that the
-    scene's buffers in use were in the path. Reported, not gated.
+    each second of the path (one entry for every second the path covers, so a trailing 0 is a second without a miss; a flight only: at the start of it or all along it). Reported, not gated. (The most that the
+    scene's buffers in use were in a path is `scene_used_peak_mib`, #213's, below.)
   - `camera_soft_miss_lag_side`, `camera_soft_miss_loader_side` and `lag_over_floor_frames` (#168,
     the flights): the camera misses split by what can have caused them. The score asks for level 0
     within `floor(1) * (1 - HYSTERESIS)` (about 0.67 `d0`) of the frame's camera, so a frame whose
@@ -593,6 +594,33 @@ camera, and `holes_after_catch_up` the holes the look after it found, which must
     camera had misses in the second after it), and **one more look is forced at the end of every path**
     (`SceneWorker::look_now`), so no path has 0 looks. The report has how many looks there were in
     the path and what they found.
+  - `scene_used_peak_mib` (#213): the most MiB of the scene in use at the end of one of the path's frames (the run's `memory.scene_used_peak_mib`, which is the gate, is the most of these and of the looks between frames; this says which path holds it).
+  - `scene_round_max_ms`, `scene_update_max_ms`, `cap_flips`, `cap_flip_max_ms`, `backlog_peak`,
+    `absorb_updates`, `absorb_ms` (#213, schema 26): the longest round of the scene thread in the
+    path's frames (without the look for holes), the longest single update of the scene to a camera in
+    them (one step of `follow`, the selection's update: the time the scene stood still for the frame
+    thread), the number of times the horizon cap went off or on, and the longest update that was a
+    flip's or part of absorbing one (0 if none). A flip of the cap makes every node be looked at
+    again, and **the selection spreads that**: a sweep stamps 8 192 nodes an update, and the nodes
+    that it finds changing when it first looks at them (with the children that revisiting them
+    makes, and the nodes still queued under the old cap that change when their turn comes) are
+    revisited at most 800 an update (and about 8 000 bricks changed), nearest to the camera *as it is
+    then* first, the rest waiting in a backlog; what changes because the camera moved is not held
+    back by it. Then the queue is tidied (65 536
+    entries an update) of the entries that the sweep left stale. `backlog_peak` is the most nodes
+    waiting at once, `absorb_updates` how many updates were absorbing (the sweep, the backlog, the
+    tidying), and `absorb_ms` the time from the update that found a flip to the one that ended its
+    absorbing, summed over the flips that ended in the path. **Absorbing goes on after the camera
+    has stopped, so it can spill over into the next path** (the crossing waits at the top for it, so it
+    does not; a flip absorbed at the end of another path would): these fields are in the path where it
+    ends, and `cap_flips` is in the path where the flip was. **The acceptance of #213: the longest
+    `cap_flip_max_ms` of any path (not only the crossing's) is no longer than the longest
+    `scene_update_max_ms` of the paths with no flip** (those with `cap_flip_max_ms` 0), which the
+    ignored test `the_sea_level_crossing_round_at_full_size_is_no_longer_than_the_other_paths_worst`
+    prints and asserts (`cargo test --release -p client --bin client -- --ignored --nocapture
+    sea_level_crossing`, about 8 minutes at full size, no GPU needed). The crossing's own longest
+    update is an ordinary follow step and is within a few percent of the others' from run to run.
+    A Still view waits for the absorbing to end (`World::caught_up`).
   - `scene_thread`: milliseconds the scene thread spent in the path on `follow` (selecting again
     for a new camera and packing what changed), `pack` (asking the loader, taking in what it made
     and packing it), `upload` (publishing: copying what changed out for the frame thread, which
@@ -1310,7 +1338,7 @@ run without it (0.178 ms at 1 ray on the 4090, 1440p) or from `--diag` runs of a
 
 ```
 {
-  "schema_version": 25,
+  "schema_version": 27,
   "build":   { "version", "commit" },          // commit: CI builds only, else null; on a PR
                                                // build it is GitHub's merge commit, not the head
   "machine": { "gpu", "device_type", "driver", "driver_info", "backend", "os", "arch",

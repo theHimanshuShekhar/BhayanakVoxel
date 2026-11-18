@@ -751,6 +751,8 @@ pub(super) struct TestPlanet {
     pub(super) spawn: Camera,
     pub(super) bands: Bands,
     pub(super) start: Start,
+    /// Sea level's distance from the centre, in Voxels.
+    pub(super) sea: f64,
 }
 
 /// The test Planet (see [`TestPlanet`]), which the stepped and the real-time modes both start from.
@@ -782,6 +784,7 @@ pub(super) fn test_planet() -> TestPlanet {
         spawn,
         bands,
         start,
+        sea: planet.sea_radius(),
     }
 }
 
@@ -794,6 +797,7 @@ impl Streamer {
             spawn,
             bands,
             start,
+            ..
         } = test_planet();
         let (ahead, _) = tangents(spawn.horizon_up);
         let point = |metres: f64| -> [f64; 3] {

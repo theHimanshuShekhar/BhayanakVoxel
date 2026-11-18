@@ -13,7 +13,7 @@ use sim::{Predictor, dig_seconds, target_hardness};
 use crate::clock::Clock;
 use crate::ghost::Ghost;
 use crate::loader::Loader;
-use crate::scene_worker::{Cause, Causes, LoaderStats, SceneWorker, Spent, Stats};
+use crate::scene_worker::{Cause, Causes, LoaderStats, Longest, SceneWorker, Spent, Stats};
 use crate::tool::{Tool, rotation_for};
 
 /// How many frames in a row the view must be unchanged before the reference image is taken to be
@@ -644,6 +644,14 @@ impl World {
             .map_or_else(Spent::default, SceneWorker::spent)
     }
 
+    /// The longest round and update of the scene thread since the last call (see
+    /// [`SceneWorker::take_longest`]); zeros without a thread.
+    pub fn take_longest(&self) -> Longest {
+        self.worker
+            .as_ref()
+            .map_or_else(Longest::default, SceneWorker::take_longest)
+    }
+
     /// Tells the scene thread the most words that a buffer of the scene may have, which is what
     /// the device allows a storage buffer to be (`Renderer::buffer_limit_words`).
     pub fn set_buffer_limit(&self, words: usize) {
@@ -997,10 +1005,11 @@ impl World {
 
     /// Whether the scene has reached `camera` and nothing else is going to move it, for a Still
     /// view to be held (see [`StillHold`]): the drawn scene's lag is under [`CAUGHT_UP_LAG`], and
-    /// no reband is pending ([`World::reband_pending`]). A world with no scene thread has nothing
-    /// to follow.
+    /// no reband is pending ([`World::reband_pending`]), and the selection is not still looking
+    /// again at the nodes after a flip of the horizon cap (#213). A world with no scene thread has
+    /// nothing to follow.
     pub fn caught_up(&self, camera: [f64; 3]) -> bool {
-        self.lag(camera) < CAUGHT_UP_LAG && !self.reband_pending()
+        self.lag(camera) < CAUGHT_UP_LAG && !self.reband_pending() && !self.stats.absorbing
     }
 
     /// Whether the bands have changed and nodes are yet to be looked at again for them, or the
