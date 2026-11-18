@@ -408,7 +408,9 @@ pub struct Longest {
     pub flips: u64,
     /// The most nodes that waited to be revisited at once after a flip, how many updates the
     /// selection was absorbing a flip in, and how long it was from the first to the last of them
-    /// (counted in the path where it ends: it goes on after the camera has stopped).
+    /// (counted in the path where it ends: it goes on after the camera has stopped). Flips that
+    /// overlap are one span: from the update that found the first to the one that ended the last
+    /// absorbing (the tidying of the queue included), and the updates are that span's.
     pub backlog_peak: u64,
     pub absorb_updates: u64,
     pub absorb: Duration,
@@ -2014,7 +2016,10 @@ impl Engine {
     /// Whether [`Engine::follow`] has anything to do for `camera`: the scene is not there, or a
     /// brick that the loader gave up on is to be asked for again.
     fn has_to_follow(&self, camera: [f64; 3]) -> bool {
-        self.camera != Some(camera) || self.scene.rewanted() || self.scene.absorbing()
+        self.camera != Some(camera)
+            || self.scene.rewanted()
+            || self.scene.absorbing()
+            || self.scene.tidying()
     }
 
     /// Moves the scene to `camera`, if it is not there, in steps that each cost a share of the
@@ -2061,7 +2066,7 @@ impl Engine {
             let from = self.scene.camera().unwrap_or(camera);
             let step_began = self.began();
             let capped = self.scene.reach().horizon;
-            let absorbing = self.scene.absorbing();
+            let busy = self.scene.absorbing() || self.scene.tidying();
             let update = self.scene.recentre(&store, target)?;
             drop(store);
             if let Some(began) = step_began {
@@ -2073,20 +2078,20 @@ impl Engine {
                 if flipped {
                     self.shared.flips.fetch_add(1, Ordering::Relaxed);
                 }
-                if flipped || absorbing || self.scene.absorbing() {
+                let busy_after = self.scene.absorbing() || self.scene.tidying();
+                if flipped || busy || busy_after {
                     self.shared.longest_flip.fetch_max(nanos, Ordering::Relaxed);
                     self.shared.absorb_updates.fetch_add(1, Ordering::Relaxed);
                 }
                 let peak = u64::try_from(self.scene.take_backlog_peak()).unwrap_or(u64::MAX);
                 self.shared.backlog_peak.fetch_max(peak, Ordering::Relaxed);
                 // How long the selection absorbs a flip, from the update that found it to the one
-                // that ended it.
-                if flipped {
+                // that ended it. Flips that overlap are one span, from the first to the update that ends the last
+                // absorbing, and the updates counted above are the same span's.
+                if flipped && self.absorbing_since.is_none() {
                     self.absorbing_since = Some(began);
                 }
-                if !self.scene.absorbing()
-                    && let Some(since) = self.absorbing_since.take()
-                {
+                if !busy_after && let Some(since) = self.absorbing_since.take() {
                     let nanos =
                         u64::try_from(self.clock.since(since).as_nanos()).unwrap_or(u64::MAX);
                     self.shared.absorb_nanos.fetch_add(nanos, Ordering::Relaxed);
@@ -2113,7 +2118,7 @@ impl Engine {
             self.note(Cause::Follow, update);
             // A flip of the horizon cap that is still being absorbed goes on in the next steps, in
             // the budget and the slice, though the camera is where the scene is (#213).
-            if self.camera == Some(camera) && !self.scene.absorbing() {
+            if self.camera == Some(camera) && !self.scene.absorbing() && !self.scene.tidying() {
                 break;
             }
             if self.over_budget() {

@@ -102,7 +102,9 @@ use super::stream::StreamReport;
 /// and up to 80 m over it, 50 m/s), and in each real-time path `scene_round_max_ms`,
 /// `scene_update_max_ms`, `cap_flips` and `cap_flip_max_ms`: the scene thread's longest round and
 /// longest update in the path's frames, and the flips of the horizon cap with the longest update
-/// that was a flip's or part of absorbing one. Nothing else is changed.
+/// that was a flip's or part of absorbing one; `backlog_peak`, `absorb_updates` and `absorb_ms`:
+/// what absorbing a flip held and how long it took; and `scene_used_peak_mib`: the most MiB of the
+/// scene in use at the end of one of the path's frames. Nothing else is changed.
 pub const SCHEMA_VERSION: u32 = 26;
 
 /// One timed thing (a pass, or the GPU total of a profiler frame) in one mode, against its

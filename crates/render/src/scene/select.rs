@@ -1033,10 +1033,16 @@ impl Selection {
     }
 
     /// Whether a flip of the horizon cap is still being absorbed (#213): nodes are left to look at
-    /// again or to change, or the queue is yet to be tidied. The next [`Selection::update`] is to
-    /// run whether the camera moves or not.
+    /// again or to change, so what is drawn is not yet what the rule gives. (The tidying of the
+    /// queue is [`Selection::tidying`].)
     pub fn absorbing(&self) -> bool {
-        self.absorbing || self.tidy.is_some()
+        self.absorbing
+    }
+
+    /// Whether the queue is yet to be tidied of the entries that a flip made stale (#213). It
+    /// changes nothing that is drawn, but the next [`Selection::update`] is to run for it.
+    pub fn tidying(&self) -> bool {
+        self.tidy.is_some()
     }
 
     /// The most nodes that waited to be revisited at once since the last call (#213).
@@ -1305,7 +1311,10 @@ impl Selection {
         let top = self.top;
         self.sweep = self.roots.iter().map(|&coord| (top, coord)).collect();
         self.flip_stamp = self.stamps;
-        self.tidy = None;
+        // The tidying goes on through a flip that comes before the sweep of the last has ended
+        // (and starts, for the one that has none): an entry that is stale is stale whenever it is
+        // looked at, and a sweep that is cut short leaves its own.
+        self.tidy.get_or_insert((0, 0));
     }
 
     /// Drops the entries of the queue whose node was stamped again since, [`TIDY`] of them in each
@@ -1351,7 +1360,9 @@ impl Selection {
         for bucket in empty {
             self.queue.remove(&bucket);
         }
-        self.tidy = next;
+        // A pass that ends while the sweep goes on starts again: the sweep makes entries stale
+        // as it goes.
+        self.tidy = next.or_else(|| (!self.sweep.is_empty()).then_some((0, 0)));
     }
 
     /// Looks at the next batch of the sweep again: each node is stamped and put on the hot list,
@@ -1890,9 +1901,12 @@ impl Selection {
         };
         owed.sort_by(nearest);
         let mut waiting: Vec<(u64, Key)> = rest.into_iter().map(|(_, s, k)| (s, k)).collect();
+        // The bricks the revisits of the backlog change are what the budget counts: not those that
+        // the camera's own changes above did.
+        let changed_before = diff.added.len() + diff.removed.len();
         self.marking = true;
         for (_, stamp, key) in owed {
-            if diff.added.len() + diff.removed.len() >= fewest_bricks {
+            if diff.added.len() + diff.removed.len() - changed_before >= fewest_bricks {
                 waiting.push((stamp, key));
             } else if self.nodes.get(&key).is_some_and(|n| n.stamp == stamp) {
                 self.revisit(store, key, &mut diff);
@@ -1904,7 +1918,7 @@ impl Selection {
         self.absorbing = !self.sweep.is_empty()
             || !self.backlog.is_empty()
             || self.hot.iter().any(|entry| entry.swept);
-        self.rewanted = self.absorbing();
+        self.rewanted = self.absorbing() || self.tidying();
         diff
     }
 
@@ -2401,7 +2415,7 @@ mod tests {
             assert!(*y > 0.0 && *y < 2500.0, "the cap never flipped");
         }
         let mut updates = 0;
-        while selection.absorbing() {
+        while selection.absorbing() || selection.tidying() {
             selection.update(store, [0.0, *y, 0.0]);
             updates += 1;
             assert!(updates < 100_000, "the flip is never absorbed");
@@ -2442,6 +2456,66 @@ mod tests {
         assert!(
             queued[3] <= queued[0] + queued[0] / 10,
             "the entries pile up: {queued:?}"
+        );
+    }
+
+    #[test]
+    fn flips_that_come_before_the_sweep_of_the_last_has_ended_leave_no_stale_entries_either() {
+        // Each flip restarts the sweep, which stamps the nodes it has got to again: a flip that
+        // comes soon leaves the entries of those stamps, and the tidying has to go on through it
+        // (without that the queue grew by about a quarter of its size in each round trip here).
+        let (store, mut selection) = capped_ball([0.0, 150.0, 0.0], true);
+        selection.set_margins(
+            &store,
+            Margins {
+                radial: 1.25,
+                vertical: 100.0,
+            },
+        );
+        selection.sweep_by = 300;
+        selection.absorb_by = 50;
+        selection.tidy_by = 2000;
+        let mut y = 150.0;
+        let mut climbing = true;
+        let mut quick = 0;
+        let mut queued = Vec::new();
+        for _ in 0..12 {
+            // Big steps: the flip comes in a few updates, and the camera goes back at once.
+            while selection.reach().horizon.is_none() == climbing {
+                y += if climbing { 60.0 } else { -60.0 };
+                selection.update(&store, [0.0, y, 0.0]);
+                assert!(y > 0.0 && y < 2500.0, "the cap never flipped");
+            }
+            selection.update(&store, [0.0, y, 0.0]);
+            quick += usize::from(!selection.sweep.is_empty());
+            if climbing {
+                queued.push(selection.queued());
+            }
+            climbing = !climbing;
+        }
+        assert!(
+            quick >= 10,
+            "{quick} of the flips came before the sweep ended"
+        );
+        // The same point of each round trip: the queue does not grow.
+        assert!(
+            queued[5] <= queued[1] + queued[1] / 4,
+            "the entries pile up in the flips that cut the sweep short: {queued:?}"
+        );
+        let mut updates = 0;
+        while selection.absorbing() || selection.tidying() {
+            selection.update(&store, [0.0, y, 0.0]);
+            updates += 1;
+            assert!(updates < 100_000, "the flips are never absorbed");
+        }
+        is_a_cut(&selection);
+        is_as_the_rule_says(&selection, "after the quick flips");
+        let nodes = selection.nodes();
+        // On main a flip leaves 1.1 entries for each node (see the test above).
+        assert!(
+            selection.queued() < 2 * nodes,
+            "{} entries for {nodes} nodes",
+            selection.queued()
         );
     }
 

@@ -1231,6 +1231,12 @@ impl Scene {
         self.rings.as_ref().is_some_and(|r| r.selection.absorbing())
     }
 
+    /// Whether the selection's queue is yet to be tidied after a flip (see
+    /// [`Selection::tidying`]).
+    pub fn tidying(&self) -> bool {
+        self.rings.as_ref().is_some_and(|r| r.selection.tidying())
+    }
+
     /// The most nodes that waited to be revisited at once after a flip of the horizon cap since
     /// the last call (see [`Selection::take_backlog_peak`]).
     pub fn take_backlog_peak(&mut self) -> usize {

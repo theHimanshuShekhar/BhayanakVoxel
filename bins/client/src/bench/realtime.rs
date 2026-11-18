@@ -754,7 +754,8 @@ pub struct PathReport {
     pub scene_used_peak_mib: f64,
     /// Absorbing a flip: the most nodes that waited to be revisited at once, the updates that
     /// were absorbing, and the milliseconds from the update that found a flip to the one that
-    /// ended its absorbing (a flip's, summed over the flips that ended in the path).
+    /// ended its absorbing (summed over the spans that ended in the path; flips that overlap are
+    /// one span, and `absorb_updates` counts the same span's updates).
     pub backlog_peak: u64,
     pub absorb_updates: u64,
     pub absorb_ms: f64,
