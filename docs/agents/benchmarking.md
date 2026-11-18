@@ -325,7 +325,7 @@ camera back there and the loader caught up. The camera's speed and shape are tho
 | `flight at 50 m` | 50 m/s sideways, 10 s, 50 m over the ground. |
 | `vertical take-off` | 50 m/s straight up, 6 s. |
 | `180 degree turn` | A half turn in a second, then the view still for a second. |
-| `sea-level crossing` | (#213) The raised camera down to 30 m under the sea and up to 80 m over it along the Spawn's radial at 50 m/s, held at the bottom and at the top until the scene has come to the camera (up to 90 s each), so **the horizon cap goes off and comes back on** (`CAP_ON`, 50 m over). The scene follows a camera through the ground at about 0.8 m an update, so a path that does not wait never gets to the flip. |
+| `sea-level crossing` | (#213) The raised camera down to 30 m under the sea and up to 80 m over it along the Spawn's radial at 50 m/s, held at the bottom until the scene has come to the camera, and at the top until it has and the flip is absorbed (`World::caught_up`; up to 90 s each), so **the horizon cap goes off and comes back on** (`CAP_ON`, 50 m over) and the path ends with nothing left to absorb. The scene follows a camera through the ground at about 0.8 m an update, so a path that does not wait never gets to the flip. **The bottom does not wait for the flip to be absorbed on purpose:** a scene whose cap is off, once built, is the wide one, **544 to 557 MiB in use at 30 m under the sea and 567 MiB at the top before the cap comes on** (the dev box; the 4090 read 566 to 567 MiB at the peak, #213), over the 512 MiB gate, so a path that lingers there fails `scene_mib`; this path passes the cap off in about 20 s of the scene thread's work and peaks at 469 MiB. Whether the wide state has to fit 512 MiB is the owner's to decide. |
 | `stop after a flight` | 5 s of the flight at 2 m, then the camera stands where it was until the scene has no soft misses (up to 120 s). Settle time is in it. |
 
 After the last path the camera is back at the Spawn and the loader has caught up, and **one dig**
@@ -526,6 +526,7 @@ camera, and `holes_after_catch_up` the holes the look after it found, which must
     (`SceneWorker::count_holes`), and **one more look is forced at the end of every path**
     (`SceneWorker::look_now`), so no path has 0 looks. The report has how many looks there were in
     the path and what they found.
+  - `scene_used_peak_mib` (#213): the most MiB of the scene in use at the end of one of the path's frames (the run's `memory.scene_used_peak_mib`, which is the gate, is the most of these and of the looks between frames; this says which path holds it).
   - `scene_round_max_ms`, `scene_update_max_ms`, `cap_flips`, `cap_flip_max_ms`, `backlog_peak`,
     `absorb_updates`, `absorb_ms` (#213, schema 26): the longest round of the scene thread in the
     path's frames (without the look for holes), the longest single update of the scene to a camera in
@@ -542,9 +543,9 @@ camera, and `holes_after_catch_up` the holes the look after it found, which must
     waiting at once, `absorb_updates` how many updates were absorbing (the sweep, the backlog, the
     tidying), and `absorb_ms` the time from the update that found a flip to the one that ended its
     absorbing, summed over the flips that ended in the path. **Absorbing goes on after the camera
-    has stopped, so it spills over into the next path** (`stop after a flight` follows the crossing):
-    these fields are in the path where it ends, and `cap_flips` is in the path where the flip was. Read
-    the crossing and the path after it together. **The acceptance of #213: the longest
+    has stopped, so it can spill over into the next path** (the crossing waits at the top for it, so it
+    does not; a flip absorbed at the end of another path would): these fields are in the path where it
+    ends, and `cap_flips` is in the path where the flip was. **The acceptance of #213: the longest
     `cap_flip_max_ms` of any path (not only the crossing's) is no longer than the longest
     `scene_update_max_ms` of the paths with no flip** (those with `cap_flip_max_ms` 0), which the
     ignored test `the_sea_level_crossing_round_at_full_size_is_no_longer_than_the_other_paths_worst`

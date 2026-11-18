@@ -749,6 +749,9 @@ pub struct PathReport {
     /// next path if the camera has stopped: its figures are in the path where it ends).
     pub cap_flips: u64,
     pub cap_flip_max_ms: f64,
+    /// The most MiB of the scene in use at the end of one of the path's frames (the run's
+    /// `memory.scene_used_peak_mib`, the gate, is the most of these and of the looks between frames).
+    pub scene_used_peak_mib: f64,
     /// Absorbing a flip: the most nodes that waited to be revisited at once, the updates that
     /// were absorbing, and the milliseconds from the update that found a flip to the one that
     /// ended its absorbing (a flip's, summed over the flips that ended in the path).
@@ -1238,6 +1241,8 @@ struct Frame {
     /// The parts of the frame; its `index` and `at_ms` are set by the path that takes it in.
     parts: SlowFrame,
     soft_misses: usize,
+    /// The words of the scene in use at the end of the frame, in bytes.
+    scene_used_bytes: u64,
     /// Whether the scene thread held work back in this frame for the upload budget.
     throttled: bool,
     /// The drawn scene's lag behind the camera in Voxels (see [`PathReport::scene_lag_voxels_max`]).
@@ -1262,6 +1267,8 @@ struct Capture {
     frames_done: Option<Spent>,
     /// The scene thread's longest round in the path's frames, taken when they were done.
     longest: Longest,
+    /// The most bytes of the scene in use at the end of one of the path's frames.
+    scene_used_peak_bytes: u64,
     frame_ms: Vec<f64>,
     cpu_ms: Vec<f64>,
     /// The start of each frame, to work the cycles out from, and the overshoot of the sleeps.
@@ -1311,6 +1318,7 @@ impl Capture {
             seconds: None,
             frames_done: None,
             longest: Longest::default(),
+            scene_used_peak_bytes: 0,
             limit_ms,
             over_limit: 0,
             over_by_update: UpdateKinds::default(),
@@ -1343,6 +1351,7 @@ impl Capture {
     }
 
     fn add(&mut self, frame: &Frame) {
+        self.scene_used_peak_bytes = self.scene_used_peak_bytes.max(frame.scene_used_bytes);
         if frame.time_ms > self.limit_ms {
             if self.over_limit_at.len() < OVER_LIMIT_INDEXES {
                 self.over_limit_at.push(self.frame_ms.len());
@@ -1470,6 +1479,7 @@ impl Capture {
             scene_update_max_ms: self.longest.update.as_secs_f64() * 1e3,
             cap_flips: self.longest.flips,
             cap_flip_max_ms: self.longest.flip.as_secs_f64() * 1e3,
+            scene_used_peak_mib: self.scene_used_peak_bytes as f64 / (1024.0 * 1024.0),
             backlog_peak: self.longest.backlog_peak,
             absorb_updates: self.longest.absorb_updates,
             absorb_ms: self.longest.absorb.as_secs_f64() * 1e3,
@@ -1697,6 +1707,7 @@ impl<'a> Session<'a> {
             cpu_ms: parts.cpu_ms,
             parts,
             soft_misses: self.world.stats().soft_misses,
+            scene_used_bytes: self.world.used_bytes(),
             throttled: self.world.stats().throttled,
             lag: self.world.lag(camera.position),
             edit_taken,
@@ -1903,8 +1914,17 @@ impl<'a> Session<'a> {
             "sea-level crossing",
             |world, t| {
                 let (leg, since) = state.get();
-                let held = |camera: Camera, next: Leg| {
-                    if world.caught_up(camera.position) || t - since > cap {
+                // Held until the scene is at the camera, and at the top until the flip is absorbed too
+                // (`World::caught_up`): so the path ends with nothing left to absorb, which would
+                // spill into the next path. At the bottom the flip is *not* waited for: the scene a
+                // cap that is off builds when it is waited for is the wide one (544 to 557 MiB at
+                // 30 m under the sea, 567 at the top, over the 512 MiB gate; see `measurements.md`),
+                // and what the path is for is the flip's update.
+                let held = |camera: Camera, next: Leg, absorbed: bool| {
+                    let at_camera = world.lag(camera.position) < crate::world::CAUGHT_UP_LAG;
+                    if (at_camera && (!absorbed || world.caught_up(camera.position)))
+                        || t - since > cap
+                    {
                         state.set((next, t));
                     }
                     camera
@@ -1917,7 +1937,7 @@ impl<'a> Session<'a> {
                         }
                         at(radius)
                     }
-                    Leg::HoldBottom => held(at(bottom), Leg::Up),
+                    Leg::HoldBottom => held(at(bottom), Leg::Up, false),
                     Leg::Up => {
                         let radius = (bottom + (t - since) * speed).min(top);
                         if radius >= top {
@@ -1925,7 +1945,7 @@ impl<'a> Session<'a> {
                         }
                         at(radius)
                     }
-                    Leg::HoldTop => held(at(top), Leg::Done),
+                    Leg::HoldTop => held(at(top), Leg::Done, true),
                     Leg::Done => {
                         done.set(true);
                         at(top)
@@ -2428,6 +2448,7 @@ mod tests {
             scene_update_max_ms: 0.0,
             cap_flips: 0,
             cap_flip_max_ms: 0.0,
+            scene_used_peak_mib: 0.0,
             backlog_peak: 0,
             absorb_updates: 0,
             absorb_ms: 0.0,
@@ -2894,6 +2915,7 @@ mod tests {
                 "scene_round_max_ms",
                 "scene_thread",
                 "scene_update_max_ms",
+                "scene_used_peak_mib",
                 "seconds",
                 "settle",
                 "sleep_overshoot",
@@ -3561,12 +3583,13 @@ mod tests {
         .unwrap_or_else(|stopped| panic!("the run stopped at {}: {}", stopped.step, stopped.error));
         for p in &run.paths {
             eprintln!(
-                "{:<20} longest scene round {:>8.2} ms, update {:>8.2} ms, cap flips {} (longest {:.2} ms), backlog at most {} nodes, {} absorbing updates over {:.0} ms (follow {:.0} ms, pack {:.0} ms, publish {:.0} ms in {} frames); holes {}",
+                "{:<20} longest scene round {:>8.2} ms, update {:>8.2} ms, cap flips {} (longest {:.2} ms), scene {:.1} MiB, backlog at most {} nodes, {} absorbing updates over {:.0} ms (follow {:.0} ms, pack {:.0} ms, publish {:.0} ms in {} frames); holes {}",
                 p.name,
                 p.scene_round_max_ms,
                 p.scene_update_max_ms,
                 p.cap_flips,
                 p.cap_flip_max_ms,
+                p.scene_used_peak_mib,
                 p.backlog_peak,
                 p.absorb_updates,
                 p.absorb_ms,
