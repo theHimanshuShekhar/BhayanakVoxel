@@ -80,9 +80,13 @@ pub const HYSTERESIS: f64 = 0.05;
 /// side of the scene's camera, so it is farther from it by `lag^2 / 2h` at a height `h`. A camera
 /// that flies at a height that a boundary is at (`floor(3)` is `d0`, the bench's 50 m flight is at
 /// 0.97 of it) had that brick drawn a level too coarse for 1 to 2 frames where the ground rose by a
-/// Voxel or two, at 9.6 s of the path on the 4090. 2% is 20 Voxels there: a lag of up to 200. Not
-/// at rest, where there is no such lag to cover (and the bands are what they were).
-pub const SPLIT_LEAD: f64 = 0.02;
+/// Voxel or two, at 9.6 s of the path on the 4090. 1% is 10 Voxels there: a lag of up to 140. It is
+/// not more because every whole brick that the bands split goes that far out, which is more to take
+/// in on a flight at the ground (2% was 3% more bricks followed in the stepped run, and the 2 m
+/// flight is at the loader's limit on the 4090, where 2% was followed by a queue half as large
+/// again). Not at rest, where there is no such lag to cover (and the
+/// bands are what they were).
+pub const SPLIT_LEAD: f64 = 0.01;
 
 /// Height in pixels of the image the bands are for: 1440p, the output that the frame budgets are
 /// for (the traced image is half of it, and TAAU upscales it).
@@ -1001,16 +1005,16 @@ mod tests {
         assert!(!rest.split(2, 381.0, Some(false)));
         assert!(rest.split(2, 379.0, Some(false)));
         assert_eq!(rest.split_edge(2), 380.0);
-        // At 1 level coarser the boundary is at 200 and the brick splits at 190 + 4 (2%).
+        // At 1 level coarser the boundary is at 200 and the brick splits at 190 + 2 (1%).
         let fast = rest.speed_scaled(1.0);
-        assert!((fast.split_edge(2) - 194.0).abs() < 1e-9);
-        assert!(fast.split(2, 193.0, Some(false)));
-        assert!(!fast.split(2, 195.0, Some(false)));
+        assert!((fast.split_edge(2) - 192.0).abs() < 1e-9);
+        assert!(fast.split(2, 191.0, Some(false)));
+        assert!(!fast.split(2, 193.0, Some(false)));
         // What is split stays split to the same distance, and a new brick is split at the boundary.
         assert!(fast.split(2, 209.0, Some(true)) && !fast.split(2, 211.0, Some(true)));
         assert!(fast.split(2, 199.0, None) && !fast.split(2, 201.0, None));
         // The slack is to the edge that splits it, and the clear radius is within it.
-        assert!((fast.slack(2, 254.0, false) - 60.0).abs() < 1e-9);
+        assert!((fast.slack(2, 254.0, false) - 62.0).abs() < 1e-9);
         assert_eq!(fast.clear_radius(2), fast.split_edge(2));
         // The lead is under the hysteresis: a brick that is split by it is not merged at once.
         const { assert!(SPLIT_LEAD < 2.0 * HYSTERESIS) };
