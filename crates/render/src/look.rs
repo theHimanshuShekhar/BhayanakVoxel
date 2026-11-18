@@ -7,10 +7,16 @@
 //! whose answer is worked out from the colours, and the bench's convergence phase, whose numbers
 //! are compared across reports, use it.
 //!
-//! The sky is a gradient along the local up, which is the camera's `horizon_up` (the Planet's
-//! radial up once the camera is carried over a Planet, the world's +y otherwise).
+//! The sky is the atmosphere's ([`Look::atmosphere`], #53) when the look has one: the sun's light
+//! is what the air lets through, and the sky and the haze are what it scatters. Without one
+//! (`atmosphere: None`: the legacy look, and hero light B's gradient, which the look-dev sheet
+//! shows beside the atmosphere) the sky is a gradient along the local up, which is the camera's
+//! `horizon_up` (the Planet's radial up once the camera is carried over a Planet, the world's +y
+//! otherwise), with the haze that fades distant surfaces to its horizon.
 
 use bytemuck::{Pod, Zeroable};
+
+use crate::atmosphere::Atmosphere;
 
 /// The sun's and the sky's colours, and how thick the air is.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -25,6 +31,9 @@ pub struct Look {
     /// Haze per metre, along the camera ray: a surface `d` metres away is seen as
     /// `exp(-haze * d)` of its own light and the rest of the horizon's colour. 0 for none.
     pub haze_per_metre: f32,
+    /// The Planet's air, which makes the sun's light, the sky and the haze when there is one; the
+    /// fields above are then the gradient it replaces, and are not used.
+    pub atmosphere: Option<Atmosphere>,
 }
 
 impl Look {
@@ -37,6 +46,21 @@ impl Look {
         zenith: [0.12, 0.18, 0.45],
         horizon: [1.0, 0.55, 0.38],
         haze_per_metre: 1.0 / 300.0,
+        atmosphere: Some(Atmosphere::HERO),
+    };
+
+    /// Hero light B with the physical atmosphere and no tint, which the look-dev sheet shows
+    /// between the gradient and the tinted atmosphere.
+    pub const HERO_B_UNTINTED: Look = Look {
+        atmosphere: Some(Atmosphere::PHYSICAL),
+        ..Self::HERO_B
+    };
+
+    /// Hero light B as it was before the atmosphere: the owner's gradient and haze, which the
+    /// look-dev sheet shows beside it.
+    pub const HERO_B_GRADIENT: Look = Look {
+        atmosphere: None,
+        ..Self::HERO_B
     };
 
     /// What the renderer had before #202: a neutral sun, a pale sky and no haze.
@@ -45,6 +69,7 @@ impl Look {
         zenith: [0.25, 0.45, 0.85],
         horizon: [0.75, 0.82, 0.92],
         haze_per_metre: 0.0,
+        atmosphere: None,
     };
 
     /// Haze per Voxel, which is what the shaders work in (distances along a ray are in Voxels).

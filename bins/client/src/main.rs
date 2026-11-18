@@ -743,6 +743,10 @@ impl App {
             size.height,
             &Scene::default(),
         )?);
+        if let Some(renderer) = &mut self.renderer {
+            // The atmosphere measures the camera's height from the Planet's sea level.
+            renderer.set_ground_level(f64::from(WORLD_RADIUS));
+        }
         let ctx = egui::Context::default();
         let state = egui_winit::State::new(
             ctx.clone(),

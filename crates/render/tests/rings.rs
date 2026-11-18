@@ -65,9 +65,20 @@ const HORIZON: ([f64; 3], [f64; 3]) = ([0.0, 1700.0, 600.0], [0.0, 1450.0, -400.
 const ORBIT: ([f64; 3], [f64; 3]) = ([0.0, 400.0, 3400.0], [0.0; 3]);
 
 fn render_view((from, to): ([f64; 3], [f64; 3])) -> Image {
-    Offscreen::new(WIDTH, HEIGHT, &rings_at(from))
-        .unwrap()
-        .render(&Camera::looking_at(from, to))
+    let mut gpu = Offscreen::new(WIDTH, HEIGHT, &rings_at(from)).unwrap();
+    // The test Planet's ground, as in the patch golden's view (golden.rs): the atmosphere counts
+    // the camera's height above it.
+    gpu.set_ground_level(1535.0);
+    let mut camera = Camera::looking_at(from, to);
+    if from == ORBIT.0 {
+        // Up is the Planet's radial up, as in the game (the atmosphere counts the camera's height
+        // along it): left at +y, this camera is under the ground that the model puts at the ground
+        // level, and the model's ground cuts the haze in two across the ball.
+        camera.carry_up(from);
+        // The Planet is straight down from there (carrying the up keeps the pitch from the old up).
+        camera.turn(0.0, -10.0);
+    }
+    gpu.render(&camera)
 }
 
 #[test]

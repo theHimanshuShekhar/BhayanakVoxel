@@ -26,6 +26,10 @@ pub const SHADE: &str = concat!(
     "\n",
     include_str!("shaders/sampling.wgsl"),
     "\n",
+    include_str!("shaders/atmosphere_model.wgsl"),
+    "\n",
+    include_str!("shaders/sky.wgsl"),
+    "\n",
     include_str!("shaders/shade.wgsl")
 );
 
@@ -41,7 +45,20 @@ pub const PATHTRACE: &str = concat!(
     "\n",
     include_str!("shaders/sampling.wgsl"),
     "\n",
+    include_str!("shaders/atmosphere_model.wgsl"),
+    "\n",
+    include_str!("shaders/sky.wgsl"),
+    "\n",
     include_str!("shaders/pathtrace.wgsl")
+);
+
+/// The atmosphere's tables (#53): the kernels that fill the transmittance, multi-scattering,
+/// sky-view, ground-sky and aerial perspective tables and the sky's cumulative distribution, from
+/// the atmosphere's model (which the views read the tables of too: sky.wgsl). It reads no Planet.
+pub const ATMOSPHERE: &str = concat!(
+    include_str!("shaders/atmosphere_model.wgsl"),
+    "\n",
+    include_str!("shaders/atmosphere.wgsl")
 );
 
 /// Random numbers and the distributions the path tracer samples. It needs nothing else, so tests
@@ -140,6 +157,24 @@ mod tests {
     }
 
     #[test]
+    fn the_atmosphere_module_is_valid_wgsl_and_sees_neither_the_planet_nor_a_view() {
+        assert_eq!(
+            entry_points(ATMOSPHERE),
+            [
+                "transmittance_kernel",
+                "multiscatter_kernel",
+                "sky_view_kernel",
+                "ground_sky_kernel",
+                "cdf_kernel",
+                "aerial_kernel"
+            ]
+        );
+        for view in ["trace(", "scene.", "bricks[", "accum[", "frame."] {
+            assert!(!ATMOSPHERE.contains(view), "atmosphere.wgsl reads {view}");
+        }
+    }
+
+    #[test]
     fn the_sampling_module_is_valid_wgsl_on_its_own() {
         // Only helper functions: it validates, and has no entry point.
         assert_eq!(entry_points(SAMPLING), Vec::<String>::new());
@@ -213,11 +248,15 @@ mod tests {
     }
 
     /// What reads a source of light, and the feature it is: an identifier of the shaders.
-    const READS: [(&str, &str); 6] = [
+    const READS: [(&str, &str); 8] = [
         ("frame.sun", "sun and shadows"),
         // The sun's light at the hit, which `shadows` wrote: the lit image's read of it.
         ("textureLoad(sun_weights", "sun and shadows"),
         ("sky(", "sky and atmosphere"),
+        // The sun-free table that a ray that has bounced reads, and the air between the camera and
+        // its first hit.
+        ("escaped_sky(", "sky and atmosphere"),
+        ("hazed(", "sky and atmosphere"),
         ("emission(", "emissive voxels"),
         ("surface_albedo(", "per-voxel colour variation"),
         ("varied_albedo(", "per-voxel colour variation"),
@@ -225,7 +264,7 @@ mod tests {
 
     /// The bindings the shaders have, none of which is a source of light that has no row. A new
     /// one fails the check until it is added here with a decision.
-    const BINDINGS: [&str; 17] = [
+    const BINDINGS: [&str; 24] = [
         "scene",
         "table",
         "regions",
@@ -245,11 +284,21 @@ mod tests {
         "sun_weights_out",
         "sun_weights",
         "probe_rays",
+        // The atmosphere's tables (sky.wgsl reads them; atmosphere.wgsl fills them): the sky and the
+        // air, covered by the "Sky and atmosphere" row, whose reads (`sky(`, `escaped_sky(`,
+        // `hazed(`) are the only ones.
+        "atmo",
+        "sky_view",
+        "aerial_scatter",
+        "aerial_transmittance",
+        "ground_sky",
+        "sky_cdf",
+        "sky_sampler",
     ];
 
     /// The shader files, all of them known: a new one is neither of a view nor checked until it is
     /// listed here.
-    const FILES: [&str; 10] = [
+    const FILES: [&str; 13] = [
         "trace.wgsl",
         "common.wgsl",
         "sampling.wgsl",
@@ -260,6 +309,11 @@ mod tests {
         "probe.wgsl",
         "upscale.wgsl",
         "blit.wgsl",
+        // The atmosphere's tables: sky.wgsl is read by both views and checked with each; the
+        // model and its kernels carry no view's light of their own.
+        "sky.wgsl",
+        "atmosphere_model.wgsl",
+        "atmosphere.wgsl",
     ];
 
     /// Whether `line` (trimmed, code) contains `needle` as a call or member, not in `fn needle(`.
@@ -282,16 +336,26 @@ mod tests {
         ("common.wgsl", include_str!("shaders/common.wgsl")),
         ("primary.wgsl", include_str!("shaders/primary.wgsl")),
     ];
-    const SHADE_FILES: [(&str, &str); 4] = [
+    const SHADE_FILES: [(&str, &str); 6] = [
         ("trace.wgsl", include_str!("shaders/trace.wgsl")),
         ("common.wgsl", include_str!("shaders/common.wgsl")),
         ("sampling.wgsl", include_str!("shaders/sampling.wgsl")),
+        (
+            "atmosphere_model.wgsl",
+            include_str!("shaders/atmosphere_model.wgsl"),
+        ),
+        ("sky.wgsl", include_str!("shaders/sky.wgsl")),
         ("shade.wgsl", include_str!("shaders/shade.wgsl")),
     ];
-    const PATHTRACE_FILES: [(&str, &str); 4] = [
+    const PATHTRACE_FILES: [(&str, &str); 6] = [
         ("trace.wgsl", include_str!("shaders/trace.wgsl")),
         ("common.wgsl", include_str!("shaders/common.wgsl")),
         ("sampling.wgsl", include_str!("shaders/sampling.wgsl")),
+        (
+            "atmosphere_model.wgsl",
+            include_str!("shaders/atmosphere_model.wgsl"),
+        ),
+        ("sky.wgsl", include_str!("shaders/sky.wgsl")),
         ("pathtrace.wgsl", include_str!("shaders/pathtrace.wgsl")),
     ];
 
@@ -430,9 +494,10 @@ mod tests {
             let problems = lighting_problems(files, &rows);
             assert!(problems.is_empty(), "{name}: {problems:#?}");
         }
-        // And both really name some: the check is not passing on an empty shader.
+        // And both really name some: the check is not passing on an empty shader. (Primary's sky and
+        // haze functions are in sky.wgsl now, where the call sites carry the tags, so it names 3.)
         for source in [PRIMARY, SHADE, PATHTRACE] {
-            assert!(source.matches("// lighting:").count() >= 4);
+            assert!(source.matches("// lighting:").count() >= 3);
         }
     }
 

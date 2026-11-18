@@ -17,13 +17,13 @@ fn pcg(v: u32) -> u32 {
 // give the same bits on every device. A path asks for its dimensions by number, in any order,
 // and a path that ends early simply never asks for the later ones.
 //
-// The first SOBOL_GROUPS * 4 = 64 dimensions are Sobol, in groups of four. Each group has its own scramble,
+// The first SOBOL_GROUPS * 4 = 72 dimensions are Sobol, in groups of four. Each group has its own scramble,
 // so the groups are not correlated with each other (Burley, section 4), and within a group the
 // four dimensions keep Sobol's stratification: the first two are a (0,2)-sequence, so 4^k
 // consecutive samples put one point in each cell of every 2^i by 2^(k-i) grid. Dimensions past
 // those are hashed random numbers. `white` replaces all of them by hashed random numbers:
 // white noise, which tests use as the plain Monte Carlo baseline.
-const SOBOL_GROUPS = 16u;
+const SOBOL_GROUPS = 18u;
 
 // The scramble of one pixel under one seed. Whole numbers, so it is the same on every device.
 fn pixel_hash(pixel: vec2<u32>, seed: u32) -> u32 {

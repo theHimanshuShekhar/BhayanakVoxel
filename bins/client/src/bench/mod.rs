@@ -207,6 +207,10 @@ fn run(args: &Args) -> Result<u8, Box<dyn Error>> {
         output: (plan.width * 2, plan.height * 2),
     };
     let mut gpu = Offscreen::with_resolution(resolution, &flight.scene)?;
+    if !plan.patch {
+        // The atmosphere measures the camera's height from the Planet's sea level.
+        gpu.set_ground_level(f64::from(planet_gen::world_map::WORLD_RADIUS));
+    }
     eprintln!(
         "the Planet takes {:.1} MiB of GPU memory",
         gpu.scene_bytes() as f64 / (1024.0 * 1024.0)
@@ -426,6 +430,7 @@ fn run_streaming(
     eprintln!("streaming: making the test Planet's world (this takes a while)...");
     let streamer = stream::Streamer::new();
     let mut gpu = Offscreen::with_resolution(resolution, streamer.scene())?;
+    gpu.set_ground_level(f64::from(planet_gen::world_map::TEST_RADIUS));
     streamer.set_buffer_limit(gpu.buffer_limit_words());
     // A frame is drawn every frame in a measurement, and every tenth in a smoke test, where a
     // software driver takes long to draw one.

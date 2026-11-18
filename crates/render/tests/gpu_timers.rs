@@ -85,6 +85,7 @@ fn passes_register_in_the_order_they_first_run_and_only_the_latest_is_active() {
     assert_eq!(
         names,
         [
+            "atmosphere",
             "primary",
             "normals",
             "shadows",
@@ -100,8 +101,10 @@ fn passes_register_in_the_order_they_first_run_and_only_the_latest_is_active() {
     );
     let active: Vec<_> = gpu.timings().passes().iter().map(|p| p.active).collect();
     if gpu.timers_supported() {
-        // The latest frame ran the Reference view and the display transform after it.
+        // The latest frame ran the atmosphere's tables (every frame does), the Reference view and the
+        // display transform after it.
         let ran = [
+            "atmosphere",
             "exposure",
             "exposure_adapt",
             "bloom_down",

@@ -275,7 +275,7 @@ mod cpu {
     }
 
     pub fn group(pixel_seed: u32, sample: u32, group: u32, white: bool) -> [f32; 4] {
-        if white || group >= 16 {
+        if white || group >= 18 {
             return std::array::from_fn(|i| hashed(pixel_seed, sample, group * 4 + i as u32));
         }
         let seed = hash_combine(pixel_seed, group);
@@ -541,7 +541,7 @@ fn the_first_pair_is_stratified_64_samples_put_one_point_in_each_cell_of_an_8_by
     // 64 by 1 and every other. And so are the 16 samples from sample 16, and those from 192. Only
     // the first pair of a group is held to be a (0, m, 2)-net: Sobol's third and fourth
     // dimensions are not, so the sun's disc (slots 2 and 3) is stratified less well.
-    for group in 0..16 {
+    for group in 0..18 {
         for (first_sample, count) in [(0u32, 64u32), (64, 64), (16, 16), (192, 64)] {
             let values = grid_on_gpu(group, count, first_sample, 3, false);
             for pixel in (0..4096).step_by(37) {
@@ -625,7 +625,7 @@ fn groups_and_neighbouring_pixels_are_not_correlated() {
     let g1 = columns(1, 11);
     let g2 = columns(2, 11);
     let g9 = columns(9, 11);
-    let g16 = columns(16, 11);
+    let g20 = columns(20, 11);
     let limit = 0.02;
     // Between groups, slot against the same and another slot, near and far, hashed too.
     for (name, a, b) in [
@@ -636,7 +636,7 @@ fn groups_and_neighbouring_pixels_are_not_correlated() {
         ("1.x and 2.x", &g1[0], &g2[0]),
         ("0.x and 9.x", &g0[0], &g9[0]),
         ("0.w and 9.w", &g0[3], &g9[3]),
-        ("9.x and 16.x (hashed)", &g9[0], &g16[0]),
+        ("9.x and 20.x (hashed)", &g9[0], &g20[0]),
     ] {
         let r = correlation(a, b);
         assert!(r.abs() < limit, "{name}: correlation {r}");

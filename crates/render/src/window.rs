@@ -258,6 +258,13 @@ impl Renderer {
         self.tracer.set_look(look);
     }
 
+    /// Sets the height of the Planet's ground along the up, in Voxels, which the atmosphere
+    /// measures the camera's height from: the Planet's radius over the Planet (see
+    /// [`Tracer::set_ground_level`]).
+    pub fn set_ground_level(&mut self, voxels: f64) {
+        self.tracer.set_ground_level(voxels);
+    }
+
     /// Switches the stages of the art direction (see [`Stages`]).
     pub fn set_stages(&mut self, stages: Stages) {
         self.tracer.set_stages(stages);

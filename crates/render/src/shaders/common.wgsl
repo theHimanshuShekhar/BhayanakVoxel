@@ -1,5 +1,5 @@
-// What the primary and reference kernels share: their bindings, what Materials look like, the
-// sky, and how a linear colour is written to the image. Used after trace.wgsl.
+// What the primary and reference kernels share: their bindings, and what Materials look like. The
+// sky and the air are sky.wgsl's. Used after trace.wgsl.
 
 struct Camera {
     // The Voxel the camera is in, then its position inside that Voxel. The CPU splits the f64
@@ -22,18 +22,19 @@ struct Frame {
     params: vec4<u32>,
     // Where in its pixel primary visibility traces its ray, (0, 0) to (1, 1), then two unused.
     jitter: vec4<f32>,
-    // The local up (a unit vector, the camera's `horizon_up`) that the sky is a gradient along,
-    // then one unused.
+    // The local up (a unit vector, the camera's `horizon_up`) that the gradient sky (the atmosphere
+    // off, sky.wgsl) is a gradient along, then one unused.
     look_up: vec4<f32>,
     // The sun's radiance on a surface that faces it: a multiple of the surface's colour (look.rs).
     sun_radiance: vec4<f32>,
-    // The sky at the zenith, then one unused.
+    // The gradient sky at the zenith, then one unused.
     zenith: vec4<f32>,
-    // The sky at the horizon and below, then the haze per Voxel along the camera ray.
+    // The gradient sky at the horizon and below, then its haze per Voxel along the camera ray.
     horizon: vec4<f32>,
     // 1 if natural Materials are shaded with smooth computed normals (0: face normals); the end of
     // the smooth range in Voxels (an f32's bits); the weight of the face's normal that the smooth
-    // normal is kept to the face's side with (an f32's bits); one unused.
+    // normal is kept to the face's side with (an f32's bits); 1 if the sky and the air are the
+    // atmosphere's (sky.wgsl; 0: the gradient above).
     flags: vec4<u32>,
     // The frame that Primary's sun samples are of (0 on the first frame after the upscaler's
     // history started over, a new view or a new sun, so that nothing before a frame decides its
@@ -132,23 +133,6 @@ fn surface_albedo(hit: Hit, flat_colours: bool) -> vec3<f32> {
 fn is_smooth(material: u32) -> bool {
     let at = material * RECORD_VEC4S;
     return at + 3u < arrayLength(&materials) && materials[at + 3u].w != 0.0;
-}
-
-// A simple gradient from the horizon to the zenith, until the atmosphere replaces it: along the
-// local up (`look_up`, the Planet's radial up), not the world's y.
-fn sky(dir: vec3<f32>) -> vec3<f32> {
-    // lighting: Sky and atmosphere
-    let height = clamp(dot(dir, frame.look_up.xyz), 0.0, 1.0);
-    // lighting: Sky and atmosphere
-    return mix(frame.horizon.xyz, frame.zenith.xyz, height);
-}
-
-// The light of a hit `t` Voxels from the camera as the camera sees it through the haze: the horizon's
-// colour fades in as `1 - exp(-haze * t)`. Only for the first hit of the camera ray; the sky itself
-// is not hazed.
-fn hazed(light: vec3<f32>, t: f32) -> vec3<f32> {
-    // lighting: Sky and atmosphere
-    return mix(frame.horizon.xyz, light, exp(-frame.horizon.w * t));
 }
 
 // Hits keep their face normals from `smooth_end()` on, which is 30 m (600 Voxels) or, where level 0

@@ -11,6 +11,17 @@
 // A path that escapes collects the sky. The sun is not part of the sky, so it is never counted
 // twice. Every ray goes through trace(), the only thing that knows about the Planet's storage.
 //
+// The sky is the atmosphere's (#53, sky.wgsl): the camera sees it from where the camera is (the
+// sky-view table), and a ray that has bounced and escapes reads the **sun-free** table (the sky as a
+// surface sees it, which has no sun disc: the sun is counted by its next-event estimate only). That
+// table is also sampled: at every surface a second next-event estimate chooses a direction of the
+// sky with a probability proportional to its brightness (`sky_sample`) and counts it if nothing is
+// in the way, and the bounce ray that escapes is weighed against it (multiple importance sampling,
+// the balance heuristic: Veach and Guibas 1995). The two estimators do not both count a direction
+// in full; the weights add up to 1. The weights use the true density of the bounce, `bounce_pdf`,
+// including the mirroring below. With the atmosphere off the sky has no samples and every escaped
+// ray counts in full, as it did before.
+//
 // The first surface of a path (the one the camera sees) is shaded with the smooth computed normal
 // of #202 where the Material has one (`shading_normal`, common.wgsl): the sun's cosine and the
 // bounce's cosine-weighted direction use it, while the shadow ray, and a bounce that would go
@@ -46,11 +57,13 @@
 //   0, 1             where in the pixel the camera ray goes        (group 0, slots 0 and 1)
 //   4s + 2, 4s + 3   the sun's disc at surface s                   (group s, slots 2 and 3)
 //   4s + 4, 4s + 5   the bounce direction at surface s             (group s + 1, slots 0 and 1)
+//   64 + 2s, 65 + 2s the sky's direction at surface s, s < 4       (groups 16 and 17)
 // so each pair that is an integral of its own is a stratified pair, and the dimensions that
-// matter most come first. They run to dimension 63, which is surface 14's bounce and surface 15's
-// sun; a deeper surface's are hashed random numbers. The roulette's coin at surface s is hashed
-// too (its own stream: a single number that nothing is gained by stratifying). A new term goes at
-// the end of the list, not in the middle, or the pairs after it lose their stratification.
+// matter most come first. The sun's and the bounce's run to dimension 63, which is surface 14's
+// bounce and surface 15's sun; a deeper surface's are hashed random numbers. The roulette's coin at surface s is hashed
+// too (its own stream: a single number that nothing is gained by stratifying), and so are the sky's
+// directions from surface 4 on. A new term goes at the end of the list, not in the middle, or the
+// pairs after it lose their stratification.
 
 @group(1) @binding(3) var<storage, read_write> accum: array<vec4<f32>>;
 
@@ -68,6 +81,16 @@ override WHITE_NOISE = false;
 // visibility, so that the bench can tell which pixels of a view have a shadow's edge in them (an
 // edge that the image with shadows has and this one does not is a shadow's).
 override NO_SHADOW_RAYS = false;
+// How the sky is estimated, when it is the atmosphere's. 0: both estimators, weighed against each
+// other, which is the estimator. 1: bounce rays only (the sky is found only by the bounce that
+// escapes). 2: the sky's samples only. The three have the same expected value where the bounce rays
+// cannot leave below the horizon, which a test holds: it is how the weights are shown to add up.
+override SKY_MODE = 0u;
+// Haze on the bounce rays, which the estimator leaves off (ADR 0005's bias ledger): for the test that
+// measures what leaving it off is worth. When set, the air along every segment between two surfaces
+// is the air at the ground, whose extinction is the most any segment of a path has (it thins with
+// height), and what it adds is the horizon's sky: an upper bound of the haze, not the air itself.
+override BOUNCE_HAZE = false;
 // A fault put into the estimator, to show that the tests that guard it can fail: a test that
 // cannot fail is not a test. 0 is none.
 override FAULT = 0u;
@@ -79,6 +102,8 @@ const FAULT_NO_RESCALE = 2u;
 // A depth cap of 190 surfaces instead of 256, which leaves out 2 % of the light at albedo 0.98.
 const FAULT_SHORT_CAP = 3u;
 const FAULT_SHORT_CAP_SURFACES = 190u;
+// The sky counted in full by both of its estimators.
+const FAULT_SKY_DOUBLE_COUNT = 4u;
 
 // The most surfaces a path visits, the camera ray's first hit being the first.
 const MAX_DEPTH = 256u;
@@ -90,8 +115,52 @@ const ROULETTE_COIN_DIM = 0x10000000u;
 // The sun's light on a surface facing it head on, as a multiple of albedo (its irradiance
 // divided by pi), is `frame.sun_radiance` (look.rs): a Lambertian surface at angle theta to the
 // sun reflects albedo * cos(theta) times it.
-// The light arriving along one path from the camera: one sample of the pixel's value.
-fn radiance(first: Ray, pixel_seed: u32, sample: u32, first_group: vec4<f32>) -> vec3<f32> {
+// The density, over solid angle, with which the bounce at a surface with shading normal `normal` and
+// geometric normal `face` chooses `dir` (above the face): the cosine-weighted direction about the
+// shading normal where it is above the face, and the mirror image of the one that was below it. Both
+// are the same density where the two normals are one.
+fn bounce_pdf(normal: vec3<f32>, face: vec3<f32>, dir: vec3<f32>) -> f32 {
+    let above = dot(dir, face);
+    if above < 0.0 {
+        return 0.0;
+    }
+    let mirrored = dir - 2.0 * above * face;
+    return (max(dot(normal, dir), 0.0) + max(dot(normal, mirrored), 0.0)) / PI;
+}
+
+// How much of the sky `dir` that a bounce ray found counts, against the sky's own samples: its
+// density over the two, the balance heuristic. 1 where the sky is not sampled.
+fn escape_weight(normal: vec3<f32>, face: vec3<f32>, dir: vec3<f32>) -> f32 {
+    if !atmosphere_on() || SKY_MODE == 1u || FAULT == FAULT_SKY_DOUBLE_COUNT {
+        return 1.0;
+    }
+    if SKY_MODE == 2u {
+        return 0.0;
+    }
+    let bounce = bounce_pdf(normal, face, dir);
+    let sky = sky_pdf(dir);
+    if bounce + sky <= 0.0 {
+        return 1.0;
+    }
+    return bounce / (bounce + sky);
+}
+
+// The two numbers that choose the sky's direction at surface `depth`: the first four surfaces' are
+// two slots each of the groups 16 and 17, the rest's are hashed, in groups of their own so that no
+// other dimension's numbers are repeated.
+fn sky_uniform(pixel_seed: u32, sample: u32, depth: u32) -> vec2<f32> {
+    if depth < 4u {
+        let group = sample_group(pixel_seed, sample, 16u + depth / 2u, WHITE_NOISE);
+        return select(group.xy, group.zw, (depth & 1u) == 1u);
+    }
+    return sample_group(pixel_seed, sample, 0x1000u + depth, WHITE_NOISE).xy;
+}
+
+// The light arriving along one path from the camera: one sample of the pixel's value. `uv` is the
+// pixel's place in the image (0 to 1), which the haze on the camera ray's first hit is looked up by.
+fn radiance(
+    first: Ray, pixel_seed: u32, sample: u32, first_group: vec4<f32>, uv: vec2<f32>,
+) -> vec3<f32> {
     var ray = first;
     var throughput = vec3<f32>(1.0);
     var light = vec3<f32>(0.0);
@@ -100,6 +169,9 @@ fn radiance(first: Ray, pixel_seed: u32, sample: u32, first_group: vec4<f32>) ->
     var group = first_group;
     // The distance to the camera ray's first hit, for the haze; negative if it hit nothing.
     var first_t = -1.0;
+    // The normals of the surface that the bounce ray left, for the weight of the sky it finds.
+    var bounce_normal = vec3<f32>(0.0, 0.0, 1.0);
+    var bounce_face = vec3<f32>(0.0, 0.0, 1.0);
     var max_depth = MAX_DEPTH;
     if FAULT == FAULT_FOUR_BOUNCE_CUT {
         max_depth = FAULT_CUT_SURFACES;
@@ -116,12 +188,27 @@ fn radiance(first: Ray, pixel_seed: u32, sample: u32, first_group: vec4<f32>) ->
         // lighting: Bounce light
         let hit = trace(ray);
         if !hit.hit {
-            // lighting: Sky and atmosphere
-            light += throughput * sky(ray.dir);
+            if depth == 0u {
+                // lighting: Sky and atmosphere
+                light += throughput * sky(ray.dir);
+            } else {
+                // lighting: Sky and atmosphere
+                light += throughput * escaped_sky(ray.dir) * escape_weight(bounce_normal, bounce_face, ray.dir);
+            }
             break;
         }
         if depth == 0u {
             first_t = hit.t;
+        } else if BOUNCE_HAZE && atmosphere_on() {
+            let across = ray.dir - atmo.up.xyz * dot(ray.dir, atmo.up.xyz);
+            let along = select(across, vec3<f32>(1.0, 0.0, 0.0), dot(across, across) < 1e-10);
+            // The look's extra haze (the tint) counts too: it fades to the sky.
+            let through = exp(-(medium_at(0.0).extinction + atmo.tint_horizon.w) / AIR_VOXELS_PER_METRE * hit.t);
+            // lighting: Sky and atmosphere
+            let fades_to = escaped_sky(normalize(along));
+            // lighting: Sky and atmosphere
+            light += throughput * fades_to * (vec3<f32>(1.0) - through);
+            throughput *= through;
         }
         // The normal the surface is shaded with: smooth for the camera's first hit, else the face's.
         var normal = hit.normal;
@@ -145,6 +232,24 @@ fn radiance(first: Ray, pixel_seed: u32, sample: u32, first_group: vec4<f32>) ->
             light += throughput * colour * frame.sun_radiance.xyz * (facing / (0.5 * (1.0 + frame.sun.w)));
         }
 
+        // The sky's next-event estimate: a direction chosen in proportion to the sky's brightness,
+        // which counts where nothing is in the way. The surface gives back the sky's light along it
+        // times its colour and the bounce's density of it, over the density that chose it (with
+        // the bounce's in the denominator too, unless it is the only estimator): the same colour and
+        // density that the bounce ray that found it would have had, so the weights add up to 1.
+        // Only where there is GI: the sun-and-sky-only view has no bounce light, and no sky light on
+        // a surface.
+        if atmosphere_on() && frame.light.y != 0u && SKY_MODE != 1u {
+            let chosen = sky_sample(sky_uniform(pixel_seed, sample, depth));
+            let toward = bounce_pdf(normal, hit.normal, chosen.dir);
+            // lighting: Sky and atmosphere
+            if chosen.pdf > 0.0 && toward > 0.0 && !trace(leave(ray, hit, chosen.dir)).hit {
+                let over = select(toward + chosen.pdf, chosen.pdf, SKY_MODE == 2u || FAULT == FAULT_SKY_DOUBLE_COUNT);
+                // lighting: Sky and atmosphere
+                light += throughput * colour * escaped_sky(chosen.dir) * (toward / over);
+            }
+        }
+
         throughput *= colour;
         if FAULT != FAULT_FOUR_BOUNCE_CUT && depth >= ROULETTE_FROM {
             let brightest = max(throughput.x, max(throughput.y, throughput.z));
@@ -161,6 +266,8 @@ fn radiance(first: Ray, pixel_seed: u32, sample: u32, first_group: vec4<f32>) ->
             break;
         }
         group = sample_group(pixel_seed, sample, depth + 1u, WHITE_NOISE);
+        bounce_normal = normal;
+        bounce_face = hit.normal;
         var bounce_dir = cosine_hemisphere(normal, group.xy);
         // A smooth normal tilts the hemisphere, so a direction can point below the face: mirror it
         // about the face, which keeps it cosine-weighted about the face's side.
@@ -172,7 +279,7 @@ fn radiance(first: Ray, pixel_seed: u32, sample: u32, first_group: vec4<f32>) ->
     }
     if first_t >= 0.0 {
         // lighting: Sky and atmosphere
-        light = hazed(light, first_t);
+        light = hazed(light, first_t, uv, first.dir);
     }
     return light;
 }
@@ -189,6 +296,7 @@ fn reference(@builtin(global_invocation_id) id: vec3<u32>) {
     let batch = max(frame.params.w, 1u);
     let pixel_seed = pixel_hash(id.xy, frame.params.y);
     let at = id.y * size.x + id.x;
+    let uv = (vec2<f32>(id.xy) + 0.5) / vec2<f32>(size);
 
     // The running mean: after n samples, mean + (new - mean) / (n + 1). The first replaces
     // whatever the buffer held. Unlike a sum, it keeps its precision however long it runs.
@@ -209,7 +317,7 @@ fn reference(@builtin(global_invocation_id) id: vec3<u32>) {
         // sample.
         let group0 = sample_group(pixel_seed, sample_index, 0u, WHITE_NOISE);
         let estimate =
-            radiance(camera_ray(id.xy, size, group0.xy), pixel_seed, sample_index, group0);
+            radiance(camera_ray(id.xy, size, group0.xy), pixel_seed, sample_index, group0, uv);
         if sample_index == 0u {
             mean = estimate;
         } else {

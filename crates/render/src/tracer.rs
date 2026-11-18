@@ -7,6 +7,7 @@ use materials::MaterialTable;
 use wgpu::util::DeviceExt;
 
 use crate::accumulation::Accumulator;
+use crate::atmosphere::{AtmosphereTables, AtmosphereView};
 use crate::batch::max_samples;
 use crate::camera::{Camera, CameraUniform};
 use crate::debug_view::DebugView;
@@ -134,6 +135,26 @@ pub struct ReferenceOptions {
     /// its visibility. The bench's sun-and-sky view runs it beside the real one to find which
     /// pixels have a shadow's edge in them.
     pub no_shadow_rays: bool,
+    /// How the atmosphere's sky is estimated (#53).
+    pub sky: SkyEstimator,
+    /// Haze on the bounce rays, as an upper bound of it: for the test that measures what ADR 0005's
+    /// leaving it off is worth (#53). Never on in a view that is shown.
+    pub bounce_haze: bool,
+}
+
+/// How the Reference estimates the light of the atmosphere's sky on a surface. The player's view
+/// is [`SkyEstimator::Both`]; the other two are for the test that shows that the weights of the two
+/// estimators add up to 1, which is that all three have the same expected value.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SkyEstimator {
+    /// A direction of the sky chosen in proportion to its brightness, and the bounce ray that
+    /// escapes, weighed against each other (multiple importance sampling).
+    #[default]
+    Both,
+    /// The bounce rays alone: the sky is what the ones that escape find.
+    BounceOnly,
+    /// The sky's own samples alone.
+    SkySamplesOnly,
 }
 
 /// A fault that a test puts into the Reference view's estimator, to show that the tests that
@@ -149,11 +170,13 @@ pub enum Fault {
     NoRescale,
     /// A depth cap of 190 surfaces in place of 256.
     ShortCap,
+    /// The sky counted in full by both of its estimators: the weights add up to 2, not 1.
+    SkyDoubleCount,
 }
 
 impl ReferenceOptions {
     /// The pipeline constants these are, as `pathtrace.wgsl` declares them.
-    fn constants(self) -> [(&'static str, f64); 4] {
+    fn constants(self) -> [(&'static str, f64); 6] {
         [
             ("NO_SHADOW_RAYS", f64::from(u8::from(self.no_shadow_rays))),
             ("FLAT_COLOURS", f64::from(u8::from(self.flat_colours))),
@@ -165,8 +188,18 @@ impl ReferenceOptions {
                     Fault::FourBounceCut => 1.0,
                     Fault::NoRescale => 2.0,
                     Fault::ShortCap => 3.0,
+                    Fault::SkyDoubleCount => 4.0,
                 },
             ),
+            (
+                "SKY_MODE",
+                match self.sky {
+                    SkyEstimator::Both => 0.0,
+                    SkyEstimator::BounceOnly => 1.0,
+                    SkyEstimator::SkySamplesOnly => 2.0,
+                },
+            ),
+            ("BOUNCE_HAZE", f64::from(u8::from(self.bounce_haze))),
         ]
     }
 }
@@ -449,6 +482,11 @@ pub struct Tracer {
     sun_and_sky_only: bool,
     /// The shadow rays a pixel casts (see [`Tracer::set_shadow_rays`]).
     shadow_rays: u32,
+    /// The atmosphere's tables, and the height of the Planet's ground along the up: 0 in a world
+    /// that is not a Planet (the camera's height is then its height above y = 0 along its
+    /// up), the Planet's radius over the Planet ([`Tracer::set_ground_level`]).
+    atmosphere: AtmosphereTables,
+    ground_level: f64,
     /// The light's palette, and which stages of the art direction are on.
     look: Look,
     stages: Stages,
@@ -865,7 +903,10 @@ impl Tracer {
                 layout_entry(4, buffer_binding(STORAGE_READ)),
                 layout_entry(5, storage_texture(GBUFFER_FORMAT)),
                 layout_entry(6, storage_texture(SURFACE_FORMAT)),
-            ],
+            ]
+            .into_iter()
+            .chain(AtmosphereTables::layout_entries())
+            .collect::<Vec<_>>(),
         });
         let texture = |binding, sample_type| {
             layout_entry(
@@ -910,7 +951,10 @@ impl Tracer {
                 texture(5, uint),
                 texture(6, uint),
                 texture(10, loaded),
-            ],
+            ]
+            .into_iter()
+            .chain(AtmosphereTables::layout_entries())
+            .collect::<Vec<_>>(),
         });
         let materials = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("materials"),
@@ -994,6 +1038,8 @@ impl Tracer {
             history_sun_epoch: 0,
             sun_and_sky_only: false,
             shadow_rays: DEFAULT_SHADOW_RAYS,
+            atmosphere: AtmosphereTables::new(device),
+            ground_level: 0.0,
             look: Look::default(),
             stages: Stages::default(),
             last_frame_at: None,
@@ -1022,7 +1068,7 @@ impl Tracer {
     /// to the next. The passes are timed by `profiler`.
     #[allow(clippy::too_many_arguments)]
     pub fn encode_primary(
-        &self,
+        &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         profiler: &mut Profiler,
@@ -1032,6 +1078,15 @@ impl Tracer {
         target: &Target,
     ) {
         self.write_uniforms(queue, camera, sun, (0, CENTRE, 0), 0);
+        self.encode_atmosphere(
+            device,
+            queue,
+            profiler,
+            encoder,
+            camera,
+            sun,
+            target.resolution.internal,
+        );
         // Nothing carries over from one call to the next, the exposure included: it settles at
         // once, on this image.
         self.dispatch_primary(device, queue, profiler, encoder, target, 1.0);
@@ -1093,6 +1148,15 @@ impl Tracer {
             (0, frame.jitter(), 0),
             frame.sun_sample(),
         );
+        self.encode_atmosphere(
+            device,
+            queue,
+            profiler,
+            encoder,
+            camera,
+            sun,
+            target.resolution.internal,
+        );
         self.dispatch_primary(device, queue, profiler, encoder, target, rate);
         self.upscale
             .encode(device, queue, profiler, encoder, &frame, target);
@@ -1141,6 +1205,15 @@ impl Tracer {
         let view = View::new(camera, sun, target);
         let first = self.accumulator.begin_batch(&view, samples);
         self.write_uniforms(queue, camera, sun, (first, CENTRE, samples), 0);
+        self.encode_atmosphere(
+            device,
+            queue,
+            profiler,
+            encoder,
+            camera,
+            sun,
+            target.reference_size,
+        );
         self.dispatch(
             device,
             profiler,
@@ -1466,6 +1539,67 @@ impl Tracer {
         self.look
     }
 
+    /// The atmosphere's tables, for tests that read them back.
+    pub(crate) fn atmosphere_tables(&self) -> &AtmosphereTables {
+        &self.atmosphere
+    }
+
+    /// Sets the height of the Planet's ground along the up, in Voxels, which the atmosphere
+    /// measures the camera's height from: the Planet's radius over the Planet. 0 (the default) for
+    /// a world that is not a Planet, where the camera's height is its height above y = 0. The
+    /// views start over, as the sky they see changes.
+    pub fn set_ground_level(&mut self, voxels: f64) {
+        if voxels != self.ground_level {
+            self.ground_level = voxels;
+            self.restart_reference();
+            self.history.reset();
+        }
+    }
+
+    /// The atmosphere's view of `camera` and `sun` on an image of `size` pixels.
+    fn atmosphere_view(
+        &self,
+        camera: &Camera,
+        sun: &Sun,
+        (width, height): (u32, u32),
+    ) -> AtmosphereView {
+        let up = camera.horizon_up;
+        let above: f64 = (0..3).map(|a| camera.position[a] * up[a]).sum();
+        AtmosphereView {
+            camera_height: (above - self.ground_level) / brick_store::VOXELS_PER_METRE,
+            up: up.map(|c| c as f32),
+            sun_direction: sun.direction(),
+            aspect: width as f32 / height.max(1) as f32,
+        }
+    }
+
+    /// Records the atmosphere's pass for the view of `camera` and `sun` on an image of `size`
+    /// pixels, if the look has an atmosphere; the camera's uniform must have been written.
+    #[allow(clippy::too_many_arguments)]
+    fn encode_atmosphere(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        profiler: &mut Profiler,
+        encoder: &mut wgpu::CommandEncoder,
+        camera: &Camera,
+        sun: &Sun,
+        size: (u32, u32),
+    ) {
+        if let Some(air) = self.look.atmosphere {
+            let view = self.atmosphere_view(camera, sun, size);
+            self.atmosphere.encode(
+                device,
+                queue,
+                profiler,
+                encoder,
+                &self.camera_buffer,
+                &air,
+                &view,
+            );
+        }
+    }
+
     /// Says that the sun was changed (turned, or another one set), not that it moves with the
     /// camera: the next frame of Primary starts the upscaler's history over (#52).
     pub fn sun_changed(&mut self) {
@@ -1592,12 +1726,21 @@ impl Tracer {
                 let [x, y, z] = camera.horizon_up;
                 [x as f32, y as f32, z as f32, 0.0]
             },
-            look: self.look.uniform(),
+            look: {
+                let mut look = self.look.uniform();
+                // The sun's light is what the air lets through to the ground.
+                if let Some(air) = self.look.atmosphere {
+                    let view = self.atmosphere_view(camera, sun, (1, 1));
+                    let [r, g, b] = air.sun_light_on_ground(view.mu_s());
+                    look.sun = [r, g, b, 0.0];
+                }
+                look
+            },
             flags: [
                 u32::from(self.stages.smooth_normals),
                 self.smooth_end.to_bits(),
                 self.stages.normal_bias.weight().to_bits(),
-                0,
+                u32::from(self.look.atmosphere.is_some()),
             ],
             light: [
                 sun_sample,
@@ -1750,7 +1893,10 @@ impl Tracer {
                 view(5, &target.gbuffer),
                 view(6, &target.surface),
                 view(10, &target.sun_weights),
-            ],
+            ]
+            .into_iter()
+            .chain(self.atmosphere.entries())
+            .collect::<Vec<_>>(),
         });
         let (width, height) = target.resolution.internal;
         let mut pass = profiler.compute_pass(encoder, "shade");
@@ -1805,7 +1951,10 @@ impl Tracer {
                     binding: 6,
                     resource: wgpu::BindingResource::TextureView(&target.surface.view),
                 },
-            ],
+            ]
+            .into_iter()
+            .chain(self.atmosphere.entries())
+            .collect::<Vec<_>>(),
         });
         let mut pass = profiler.compute_pass(encoder, name);
         pass.set_pipeline(pipeline);
