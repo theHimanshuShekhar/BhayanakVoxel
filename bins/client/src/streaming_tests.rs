@@ -3551,8 +3551,11 @@ fn the_update_where_the_cap_goes_off_and_on_at_sea_level_is_measured() {
         }
         assert!(rounds.len() < 4000, "the pit is crossed");
     }
-    // The camera stands at the top while the looks at the nodes that are left go on (#213): the
-    // cut has no hole in it then either.
+    // The camera stands at the top (#213): no hole once the scene has settled either. The
+    // revisiting of this world's flip ends during the climb, a long way under the top: the test
+    // Planet has few nodes that change, and 800 revisits an update get through them (the backlog
+    // that a small budget builds, and a camera that moves while it is worked off, are the
+    // selection's own tests in `select.rs`).
     for _ in 0..120 {
         world.recentre(at(r)).unwrap();
         holes += world.stats().holes;

@@ -948,10 +948,11 @@ impl World {
 
     /// Whether the scene has reached `camera` and nothing else is going to move it, for a Still
     /// view to be held (see [`StillHold`]): the drawn scene's lag is under [`CAUGHT_UP_LAG`], and
-    /// no reband is pending ([`World::reband_pending`]). A world with no scene thread has nothing
-    /// to follow.
+    /// no reband is pending ([`World::reband_pending`]), and the selection is not still looking
+    /// again at the nodes after a flip of the horizon cap (#213). A world with no scene thread has
+    /// nothing to follow.
     pub fn caught_up(&self, camera: [f64; 3]) -> bool {
-        self.lag(camera) < CAUGHT_UP_LAG && !self.reband_pending()
+        self.lag(camera) < CAUGHT_UP_LAG && !self.reband_pending() && !self.stats.absorbing
     }
 
     /// Whether the bands are about to change (a reband), which moves what every ring selects and

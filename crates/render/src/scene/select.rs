@@ -232,6 +232,10 @@ struct Hot {
     split: bool,
     /// Whether the node is whole and in reach (see [`Node::margin`]).
     margin: bool,
+    /// Whether the sweep of a flip of the horizon cap put it here, to be looked at for the first
+    /// time under the cap as it is now (#213): if it changes then, the revisit is the sweep's to
+    /// spread (see [`ABSORB_REVISITS`]), and a change that comes later is not.
+    swept: bool,
 }
 
 /// A look at all the stuck bricks, in steps.
@@ -529,6 +533,10 @@ const SWEEP: usize = 8192;
 /// full size a flip made 89 thousand nodes change at once, 620 thousand bricks, in one update of
 /// 8.5 s.
 const ABSORB_REVISITS: usize = 800;
+/// How many entries of the queue a step of tidying it looks at, after a sweep (#213): the sweep
+/// stamps every node again, and the entry that a node had in the queue is stale from then, so the
+/// queue is gone through, a few at a time, and what is stale is dropped.
+const TIDY: usize = 65_536;
 const ABSORB_BRICKS_PER_REVISIT: usize = 10;
 
 /// What to do with a brick that is in the tree.
@@ -651,10 +659,27 @@ pub struct Selection {
     /// A flip of the horizon cap is being absorbed: the sweep has nodes to look at, or the backlog
     /// has nodes that change.
     absorbing: bool,
-    /// The nodes that were found to change while a flip was absorbed and have not been revisited
-    /// yet (see [`ABSORB_REVISITS`]), with the stamp they had: the next updates take them from the
-    /// front. Not on the hot list, which every update looks at in full.
-    backlog: std::collections::VecDeque<(u64, Key)>,
+    /// The nodes that the sweep found to change and have not been revisited yet (see
+    /// [`ABSORB_REVISITS`]), with the stamp they had. Each update revisits the nearest to the
+    /// camera as it is then. Not on the hot list, which every update looks at in full.
+    backlog: Vec<(u64, Key)>,
+    /// The last stamp given out before the latest flip of the horizon cap began to be absorbed:
+    /// a node that still has a stamp up to it was queued under the cap as it was, and what it does
+    /// when it is looked at is the flip's to spread (the sweep, or the queue's turn for it,
+    /// whichever comes first), not the camera's.
+    flip_stamp: u64,
+    /// Whether the nodes that a revisit puts on the hot list are the sweep's to spread too: they are
+    /// while the nodes the sweep found are revisited, so that the children of a node that splits are
+    /// not all split in the next update, and theirs after, without the budget (#213).
+    marking: bool,
+    /// The most that the backlog has held since [`Selection::take_backlog_peak`].
+    backlog_peak: usize,
+    /// Where the tidying of the queue is: the next bucket and the entry in it, once the sweep has ended
+    /// (the sweep stamps every node again and leaves the entries of the old stamps in the queue).
+    tidy: Option<(u64, usize)>,
+    /// How many entries of the queue a tidying step looks at: [`TIDY`], or fewer for a test.
+    #[cfg(test)]
+    tidy_by: usize,
     /// How many nodes an update revisits while absorbing: [`ABSORB_REVISITS`], or fewer for a test.
     #[cfg(test)]
     absorb_by: usize,
@@ -750,7 +775,13 @@ impl Selection {
             #[cfg(test)]
             sweep_by: SWEEP,
             absorbing: false,
-            backlog: std::collections::VecDeque::new(),
+            backlog: Vec::new(),
+            backlog_peak: 0,
+            marking: false,
+            flip_stamp: 0,
+            tidy: None,
+            #[cfg(test)]
+            tidy_by: TIDY,
             #[cfg(test)]
             absorb_by: ABSORB_REVISITS,
             nodes: HashMap::default(),
@@ -1002,9 +1033,15 @@ impl Selection {
     }
 
     /// Whether a flip of the horizon cap is still being absorbed (#213): nodes are left to look at
-    /// again or to change. The next [`Selection::update`] is to run whether the camera moves or not.
+    /// again or to change, or the queue is yet to be tidied. The next [`Selection::update`] is to
+    /// run whether the camera moves or not.
     pub fn absorbing(&self) -> bool {
-        self.absorbing
+        self.absorbing || self.tidy.is_some()
+    }
+
+    /// The most nodes that waited to be revisited at once since the last call (#213).
+    pub fn take_backlog_peak(&mut self) -> usize {
+        std::mem::take(&mut self.backlog_peak)
     }
 
     /// Nodes of the tree: the bricks drawn, those split, and air that may have something in it.
@@ -1168,6 +1205,7 @@ impl Selection {
                     stamp: self.stamps,
                     split: false,
                     margin: false,
+                    swept: false,
                 });
             } else {
                 let distance = brick_distance(self.camera, key.0, key.1);
@@ -1243,6 +1281,7 @@ impl Selection {
         self.sweep.clear();
         self.backlog.clear();
         self.absorbing = false;
+        self.tidy = None;
         self.queue.clear();
         self.hot.clear();
         for (&key, node) in &mut self.nodes {
@@ -1253,6 +1292,7 @@ impl Selection {
                 stamp: self.stamps,
                 split: node.state == State::Split,
                 margin: node.margin,
+                swept: false,
             });
         }
     }
@@ -1264,6 +1304,54 @@ impl Selection {
     fn begin_sweep(&mut self) {
         let top = self.top;
         self.sweep = self.roots.iter().map(|&coord| (top, coord)).collect();
+        self.flip_stamp = self.stamps;
+        self.tidy = None;
+    }
+
+    /// Drops the entries of the queue whose node was stamped again since, [`TIDY`] of them in each
+    /// call, once the sweep has ended: without it each flip leaves about one stale entry for each
+    /// node, until the camera has travelled what the entry was queued for.
+    fn tidy_some(&mut self) {
+        let Some((from, mut at)) = self.tidy else {
+            return;
+        };
+        #[cfg(test)]
+        let mut left = self.tidy_by;
+        #[cfg(not(test))]
+        let mut left = TIDY;
+        let nodes = &self.nodes;
+        let mut next = None;
+        let mut empty = Vec::new();
+        // A bucket can hold a million entries, so the step may end inside one.
+        for (&bucket, entries) in self.queue.range_mut(from..) {
+            if bucket != from {
+                at = 0;
+            }
+            while at < entries.len() && left > 0 {
+                left -= 1;
+                let (stamp, key) = entries[at];
+                if nodes.get(&key).is_some_and(|n| n.stamp == stamp) {
+                    at += 1;
+                } else {
+                    entries.swap_remove(at);
+                }
+            }
+            if at < entries.len() {
+                next = Some((bucket, at));
+                break;
+            }
+            if entries.is_empty() {
+                empty.push(bucket);
+            }
+            if left == 0 {
+                next = Some((bucket + 1, 0));
+                break;
+            }
+        }
+        for bucket in empty {
+            self.queue.remove(&bucket);
+        }
+        self.tidy = next;
     }
 
     /// Looks at the next batch of the sweep again: each node is stamped and put on the hot list,
@@ -1274,6 +1362,7 @@ impl Selection {
         let batch = self.sweep_by;
         #[cfg(not(test))]
         let batch = SWEEP;
+        let had = !self.sweep.is_empty();
         for _ in 0..batch {
             let Some(key) = self.sweep.pop() else {
                 break;
@@ -1289,11 +1378,15 @@ impl Selection {
                 stamp: self.stamps,
                 split,
                 margin,
+                swept: true,
             });
             if split {
                 self.sweep
                     .extend(key.1.children().map(|child| (key.0 - 1, child)));
             }
+        }
+        if had && self.sweep.is_empty() {
+            self.tidy = Some((0, 0));
         }
     }
 
@@ -1559,6 +1652,7 @@ impl Selection {
                 stamp,
                 split,
                 margin,
+                swept: self.marking,
             });
         } else {
             // At least half of `HOT` on, so that a node that is just out of reach is not looked at
@@ -1677,6 +1771,7 @@ impl Selection {
             self.absorbing = true;
         }
         self.sweep_some();
+        self.tidy_some();
         let mut diff = Diff::default();
         // The nodes that may have become hot are taken out first, and each is either hot now,
         // changes, or is queued again for when it may be: what is queued again is looked at after
@@ -1711,13 +1806,28 @@ impl Selection {
             node_slack(bands, reach, key, distance, split, margin)
         };
         let mut changing: Vec<(u64, Key)> = Vec::new();
+        // The nodes the sweep has just looked at that change: those are spread over the updates.
+        let mut owed: Vec<(u64, Key)> = Vec::new();
         let hot = std::mem::take(&mut self.hot);
         let mut stay = Vec::with_capacity(hot.len());
         let mut cooled = Vec::new();
-        for entry in hot {
+        for mut entry in hot {
+            // The entry of a node that was stamped again is stale: the node has another.
+            if !self
+                .nodes
+                .get(&entry.key)
+                .is_some_and(|n| n.stamp == entry.stamp)
+            {
+                continue;
+            }
+            let swept = std::mem::take(&mut entry.swept);
             let distance = brick_distance(camera, entry.key.0, entry.key.1);
             if changes(entry.key, distance, entry.split, entry.margin) {
-                changing.push((entry.stamp, entry.key));
+                if swept {
+                    owed.push((entry.stamp, entry.key));
+                } else {
+                    changing.push((entry.stamp, entry.key));
+                }
             } else {
                 let slack = slack(entry.key, distance, entry.split, entry.margin);
                 if slack > 2.0 * HOT {
@@ -1743,49 +1853,58 @@ impl Selection {
                 } => self.watch(key, stamp, split, margin, slack),
             }
         }
-        // While a flip of the cap is absorbed the nodes that change are revisited a few at a time,
-        // nearest first, and the rest wait in the backlog for the next updates (#213). The nodes
-        // found now come before those already waiting.
+        // A node that changes under the cap as it is now, and was queued under the one before, is
+        // the flip's, and is spread with what the sweep found; the rest is the camera's.
+        let flip_stamp = self.flip_stamp;
+        let (flips, changing): (Vec<_>, Vec<_>) = changing
+            .into_iter()
+            .partition(|&(stamp, _)| stamp <= flip_stamp);
+        owed.extend(flips);
+        // What changes, but not because of the flip, is revisited now, as it is when
+        // there is no flip: the camera's move is not held back by a flip (#213).
+        for (stamp, key) in changing {
+            if self.nodes.get(&key).is_some_and(|n| n.stamp == stamp) {
+                self.revisit(store, key, &mut diff);
+            }
+        }
+        // What the sweep found changing is revisited a few at a time, nearest to the camera as it
+        // is now first, and the rest wait in the backlog for the next updates.
+        owed.append(&mut self.backlog);
+        let mut owed: Vec<(f64, u64, Key)> = owed
+            .into_iter()
+            .filter(|&(stamp, key)| self.nodes.get(&key).is_some_and(|n| n.stamp == stamp))
+            .map(|(stamp, key)| (brick_distance(camera, key.0, key.1), stamp, key))
+            .collect();
         #[cfg(test)]
         let most = self.absorb_by;
         #[cfg(not(test))]
         let most = ABSORB_REVISITS;
         let fewest_bricks = most.saturating_mul(ABSORB_BRICKS_PER_REVISIT);
-        let mut revisited = 0;
-        let spent = |revisited: usize, diff: &Diff| {
-            revisited >= most || diff.added.len() + diff.removed.len() >= fewest_bricks
-        };
-        if self.absorbing {
-            let mut by_distance: Vec<(f64, u64, Key)> = changing
-                .iter()
-                .map(|&(stamp, key)| (brick_distance(camera, key.0, key.1), stamp, key))
-                .collect();
-            by_distance.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.2.cmp(&b.2)));
-            for (_, stamp, key) in by_distance {
-                if spent(revisited, &diff) {
-                    self.backlog.push_back((stamp, key));
-                } else if self.nodes.get(&key).is_some_and(|n| n.stamp == stamp) {
-                    self.revisit(store, key, &mut diff);
-                    revisited += 1;
-                }
-            }
-            while !spent(revisited, &diff)
-                && let Some((stamp, key)) = self.backlog.pop_front()
-            {
-                if self.nodes.get(&key).is_some_and(|n| n.stamp == stamp) {
-                    self.revisit(store, key, &mut diff);
-                    revisited += 1;
-                }
-            }
+        let nearest =
+            |a: &(f64, u64, Key), b: &(f64, u64, Key)| a.0.total_cmp(&b.0).then(a.2.cmp(&b.2));
+        let rest = if owed.len() > most {
+            owed.select_nth_unstable_by(most, nearest);
+            owed.split_off(most)
         } else {
-            for (stamp, key) in changing {
-                if self.nodes.get(&key).is_some_and(|n| n.stamp == stamp) {
-                    self.revisit(store, key, &mut diff);
-                }
+            Vec::new()
+        };
+        owed.sort_by(nearest);
+        let mut waiting: Vec<(u64, Key)> = rest.into_iter().map(|(_, s, k)| (s, k)).collect();
+        self.marking = true;
+        for (_, stamp, key) in owed {
+            if diff.added.len() + diff.removed.len() >= fewest_bricks {
+                waiting.push((stamp, key));
+            } else if self.nodes.get(&key).is_some_and(|n| n.stamp == stamp) {
+                self.revisit(store, key, &mut diff);
             }
         }
-        self.absorbing = self.absorbing && (!self.sweep.is_empty() || !self.backlog.is_empty());
-        self.rewanted = self.absorbing;
+        self.marking = false;
+        self.backlog = waiting;
+        self.backlog_peak = self.backlog_peak.max(self.backlog.len());
+        self.absorbing = !self.sweep.is_empty()
+            || !self.backlog.is_empty()
+            || self.hot.iter().any(|entry| entry.swept);
+        self.rewanted = self.absorbing();
         diff
     }
 
@@ -2258,7 +2377,9 @@ mod tests {
     fn a_flip_of_the_cap_looks_at_a_batch_of_nodes_in_each_update_and_ends_where_one_look_does() {
         for climbing in [true, false] {
             let (at_once, drawn) = flip_in_updates(usize::MAX, usize::MAX, climbing);
-            assert_eq!(at_once, 1);
+            // One update looks at every node; the children of the nodes it splits are looked at
+            // by the next (they are the sweep's too), and no more.
+            assert!(at_once <= 2, "{at_once} updates (climbing: {climbing})");
             let (spread, spread_drawn) = flip_in_updates(50, 20, climbing);
             // The tree has some thousands of nodes: a batch of 50 takes many updates.
             assert!(spread > 20, "{spread} updates (climbing: {climbing})");
@@ -2269,6 +2390,107 @@ mod tests {
                 drawn.len()
             );
         }
+    }
+
+    /// The camera at `y` over the ball's centre, up or down in steps of 10 until the cap flips,
+    /// then standing until the flip is absorbed (the queue tidied too).
+    fn flip_and_settle(store: &BrickStore, selection: &mut Selection, y: &mut f64, climbing: bool) {
+        while selection.reach().horizon.is_none() == climbing {
+            *y += if climbing { 10.0 } else { -10.0 };
+            selection.update(store, [0.0, *y, 0.0]);
+            assert!(*y > 0.0 && *y < 2500.0, "the cap never flipped");
+        }
+        let mut updates = 0;
+        while selection.absorbing() {
+            selection.update(store, [0.0, *y, 0.0]);
+            updates += 1;
+            assert!(updates < 100_000, "the flip is never absorbed");
+        }
+    }
+
+    #[test]
+    fn flips_of_the_cap_do_not_leave_stale_entries_piling_up_in_the_queue() {
+        // Each flip stamps every node again, and the entries that the nodes had are stale: they
+        // were gone with `reconsider_all` before the sweep, and are tidied after it.
+        let (store, mut selection) = capped_ball([0.0, 150.0, 0.0], true);
+        selection.set_margins(
+            &store,
+            Margins {
+                radial: 1.25,
+                vertical: 100.0,
+            },
+        );
+        selection.sweep_by = 500;
+        selection.absorb_by = 200;
+        selection.tidy_by = 300;
+        let mut y = 150.0;
+        let mut queued = Vec::new();
+        for _ in 0..4 {
+            flip_and_settle(&store, &mut selection, &mut y, true);
+            y += 10.0;
+            selection.update(&store, [0.0, y, 0.0]);
+            flip_and_settle(&store, &mut selection, &mut y, false);
+            queued.push(selection.queued());
+            is_a_cut(&selection);
+            is_as_the_rule_says(&selection, "after a round trip");
+        }
+        let nodes = selection.nodes();
+        // On the main branch a round trip leaves 1.1 entries for each node and stays there.
+        for q in &queued {
+            assert!(*q < 2 * nodes, "{queued:?} entries for {nodes} nodes");
+        }
+        assert!(
+            queued[3] <= queued[0] + queued[0] / 10,
+            "the entries pile up: {queued:?}"
+        );
+    }
+
+    #[test]
+    fn a_camera_that_moves_while_a_flip_is_revisited_is_not_held_back_and_the_flip_is_absorbed() {
+        let (store, mut selection) = capped_ball([0.0, 150.0, 0.0], true);
+        selection.set_margins(
+            &store,
+            Margins {
+                radial: 1.25,
+                vertical: 100.0,
+            },
+        );
+        selection.sweep_by = 300;
+        selection.absorb_by = 2;
+        let mut y = 150.0;
+        while selection.reach().horizon.is_none() {
+            y += 10.0;
+            selection.update(&store, [0.0, y, 0.0]);
+        }
+        // Flying on, sideways and up, while the nodes the sweep found are revisited: the backlog
+        // does not grow once the sweep is done (what the camera's move makes change is revisited
+        // when it does, and is not put in it), and every update is a cut.
+        let mut last = None;
+        let mut flown = 0;
+        while selection.absorbing() {
+            y += 2.0;
+            let x = f64::from(flown) * 3.0;
+            selection.update(&store, [x, y, 0.0]);
+            is_a_cut(&selection);
+            if selection.sweep.is_empty() {
+                if let Some(before) = last {
+                    assert!(
+                        selection.backlog.len() <= before,
+                        "the backlog grew from {before} to {}",
+                        selection.backlog.len()
+                    );
+                }
+                last = Some(selection.backlog.len());
+            }
+            flown += 1;
+            assert!(flown < 20_000, "the flip is never absorbed while flying");
+        }
+        let peak = selection.take_backlog_peak();
+        assert!(
+            peak > 5,
+            "the budget held some back: {peak} at most, {flown} updates"
+        );
+        is_as_the_rule_says(&selection, "after the flight");
     }
 
     #[test]

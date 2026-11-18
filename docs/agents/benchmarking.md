@@ -526,19 +526,32 @@ camera, and `holes_after_catch_up` the holes the look after it found, which must
     (`SceneWorker::count_holes`), and **one more look is forced at the end of every path**
     (`SceneWorker::look_now`), so no path has 0 looks. The report has how many looks there were in
     the path and what they found.
-  - `scene_round_max_ms`, `scene_update_max_ms`, `cap_flips`, `cap_flip_max_ms` (#213, schema 26): the
-    longest round of the scene thread in the path's frames (without the look for holes), the longest
-    single update of the scene to a camera in them (one step of `follow`, the selection's update: the
-    time the scene stood still for the frame thread), the number of times the horizon cap went off or
-    on, and the longest update that was a flip's or part of absorbing one (0 if none). A flip of the cap
-    makes every node be looked at again, and **the selection spreads that**: a sweep stamps 8 192 nodes
-    an update, and the nodes it finds changing are revisited at most 800 an update (and about 8 000
-    bricks changed), nearest first, the rest waiting in a backlog for the next updates while the
-    camera is followed as before. **The acceptance of #213: the crossing's `cap_flip_max_ms` is no
-    longer than the longest `scene_update_max_ms` of the other paths**, which the ignored test
-    `the_sea_level_crossing_round_at_full_size_is_no_longer_than_the_other_paths_worst` prints and
-    asserts (`cargo test --release -p client --bin client -- --ignored --nocapture sea_level_crossing`,
-    about 9 minutes at full size, no GPU needed).
+  - `scene_round_max_ms`, `scene_update_max_ms`, `cap_flips`, `cap_flip_max_ms`, `backlog_peak`,
+    `absorb_updates`, `absorb_ms` (#213, schema 26): the longest round of the scene thread in the
+    path's frames (without the look for holes), the longest single update of the scene to a camera in
+    them (one step of `follow`, the selection's update: the time the scene stood still for the frame
+    thread), the number of times the horizon cap went off or on, and the longest update that was a
+    flip's or part of absorbing one (0 if none). A flip of the cap makes every node be looked at
+    again, and **the selection spreads that**: a sweep stamps 8 192 nodes an update, and the nodes
+    that it finds changing when it first looks at them (with the children that revisiting them
+    makes, and the nodes still queued under the old cap that change when their turn comes) are
+    revisited at most 800 an update (and about 8 000 bricks changed), nearest to the camera *as it is
+    then* first, the rest waiting in a backlog; what changes because the camera moved is not held
+    back by it. Then the queue is tidied (65 536
+    entries an update) of the entries that the sweep left stale. `backlog_peak` is the most nodes
+    waiting at once, `absorb_updates` how many updates were absorbing (the sweep, the backlog, the
+    tidying), and `absorb_ms` the time from the update that found a flip to the one that ended its
+    absorbing, summed over the flips that ended in the path. **Absorbing goes on after the camera
+    has stopped, so it spills over into the next path** (`stop after a flight` follows the crossing):
+    these fields are in the path where it ends, and `cap_flips` is in the path where the flip was. Read
+    the crossing and the path after it together. **The acceptance of #213: the longest
+    `cap_flip_max_ms` of any path (not only the crossing's) is no longer than the longest
+    `scene_update_max_ms` of the paths with no flip** (those with `cap_flip_max_ms` 0), which the
+    ignored test `the_sea_level_crossing_round_at_full_size_is_no_longer_than_the_other_paths_worst`
+    prints and asserts (`cargo test --release -p client --bin client -- --ignored --nocapture
+    sea_level_crossing`, about 8 minutes at full size, no GPU needed). The crossing's own longest
+    update is an ordinary follow step and is within a few percent of the others' from run to run.
+    A Still view waits for the absorbing to end (`World::caught_up`).
   - `scene_thread`: milliseconds the scene thread spent in the path on `follow` (selecting again
     for a new camera and packing what changed), `pack` (asking the loader, taking in what it made
     and packing it), `upload` (publishing: copying what changed out for the frame thread, which

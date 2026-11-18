@@ -316,6 +316,9 @@ pub struct Stats {
     /// Where the scene had been moved to: the centre of the scene that the frame thread draws once
     /// it has taken this (see [`crate::world::World::lag`]).
     pub camera: Option<[f64; 3]>,
+    /// Whether the selection still has nodes to look at again or revisit after a flip of the
+    /// horizon cap (#213): the scene drawn is a valid cut, but not yet the one the rule gives.
+    pub absorbing: bool,
     /// How far the camera and the places looked ahead to have gone as far as the selection is
     /// concerned (see [`render::Scene::travelled`]): what it is made to look at again for.
     #[cfg(test)]
@@ -403,6 +406,12 @@ pub struct Longest {
     /// The longest update in which the horizon cap came on or went off, and how many updates did.
     pub flip: Duration,
     pub flips: u64,
+    /// The most nodes that waited to be revisited at once after a flip, how many updates the
+    /// selection was absorbing a flip in, and how long it was from the first to the last of them
+    /// (counted in the path where it ends: it goes on after the camera has stopped).
+    pub backlog_peak: u64,
+    pub absorb_updates: u64,
+    pub absorb: Duration,
 }
 
 /// What eviction has done and what it cost the other threads, since the start.
@@ -477,6 +486,7 @@ fn stats_of(scene: &Scene, loader: &Loader, slow: &Arc<Slow>, eviction: Eviction
         slow: Arc::clone(slow),
         eviction,
         camera: scene.camera(),
+        absorbing: scene.absorbing(),
         #[cfg(test)]
         travelled: scene.travelled(),
         #[cfg(test)]
@@ -675,6 +685,9 @@ struct Shared {
     /// The longest update in which the horizon cap came on or went off, and how many did.
     longest_flip: AtomicU64,
     flips: AtomicU64,
+    backlog_peak: AtomicU64,
+    absorb_updates: AtomicU64,
+    absorb_nanos: AtomicU64,
     /// Whether the frame thread has taken what the thread published since the thread last looked:
     /// a thread that holds work back for the budget goes on at once (see
     /// [`Engine::await_work`]), and does not sleep through the rest of the frame.
@@ -810,6 +823,9 @@ impl SceneWorker {
             longest_update: AtomicU64::new(0),
             longest_flip: AtomicU64::new(0),
             flips: AtomicU64::new(0),
+            backlog_peak: AtomicU64::new(0),
+            absorb_updates: AtomicU64::new(0),
+            absorb_nanos: AtomicU64::new(0),
             taken: AtomicBool::new(false),
             #[cfg(test)]
             throttled_waits: AtomicU64::new(0),
@@ -833,6 +849,7 @@ impl SceneWorker {
             held_at: None,
             told: None,
             at_standing_camera: false,
+            absorbing_since: None,
             arrival_cost: ARRIVAL_COST,
             changes: Changes::None,
             causes: Causes::default(),
@@ -1050,6 +1067,9 @@ impl SceneWorker {
             update: take(&self.shared.longest_update),
             flip: take(&self.shared.longest_flip),
             flips: self.shared.flips.swap(0, Ordering::Relaxed),
+            backlog_peak: self.shared.backlog_peak.swap(0, Ordering::Relaxed),
+            absorb_updates: self.shared.absorb_updates.swap(0, Ordering::Relaxed),
+            absorb: take(&self.shared.absorb_nanos),
         }
     }
 
@@ -1339,6 +1359,8 @@ struct Engine {
     /// The scene is at a camera that has been the same for two rounds (see
     /// [`Engine::at_a_standing_camera`]), as of this round's last step.
     at_standing_camera: bool,
+    /// When the update that began absorbing a flip of the horizon cap began, while it goes on.
+    absorbing_since: Option<Instant>,
     /// What taking in one brick's children is expected to cost.
     arrival_cost: Duration,
     changes: Changes,
@@ -2053,6 +2075,21 @@ impl Engine {
                 }
                 if flipped || absorbing || self.scene.absorbing() {
                     self.shared.longest_flip.fetch_max(nanos, Ordering::Relaxed);
+                    self.shared.absorb_updates.fetch_add(1, Ordering::Relaxed);
+                }
+                let peak = u64::try_from(self.scene.take_backlog_peak()).unwrap_or(u64::MAX);
+                self.shared.backlog_peak.fetch_max(peak, Ordering::Relaxed);
+                // How long the selection absorbs a flip, from the update that found it to the one
+                // that ended it.
+                if flipped {
+                    self.absorbing_since = Some(began);
+                }
+                if !self.scene.absorbing()
+                    && let Some(since) = self.absorbing_since.take()
+                {
+                    let nanos =
+                        u64::try_from(self.clock.since(since).as_nanos()).unwrap_or(u64::MAX);
+                    self.shared.absorb_nanos.fetch_add(nanos, Ordering::Relaxed);
                 }
             }
             self.work.follow_bricks += self.scene.bricks_changed() - before;

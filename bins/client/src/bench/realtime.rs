@@ -744,9 +744,17 @@ pub struct PathReport {
     /// paths' worst.
     pub scene_round_max_ms: f64,
     pub scene_update_max_ms: f64,
-    /// The updates in which the horizon cap came on or went off, and the longest of them.
+    /// The updates in which the horizon cap came on or went off, and the longest update that was
+    /// one of those or part of absorbing one (the revisiting goes on after the flip, and into the
+    /// next path if the camera has stopped: its figures are in the path where it ends).
     pub cap_flips: u64,
     pub cap_flip_max_ms: f64,
+    /// Absorbing a flip: the most nodes that waited to be revisited at once, the updates that
+    /// were absorbing, and the milliseconds from the update that found a flip to the one that
+    /// ended its absorbing (a flip's, summed over the flips that ended in the path).
+    pub backlog_peak: u64,
+    pub absorb_updates: u64,
+    pub absorb_ms: f64,
     /// What the forced look at the end of the path took in the scene thread, in milliseconds (the
     /// scan itself): a look after the frames, not in them.
     pub end_look_ms: f64,
@@ -1462,6 +1470,9 @@ impl Capture {
             scene_update_max_ms: self.longest.update.as_secs_f64() * 1e3,
             cap_flips: self.longest.flips,
             cap_flip_max_ms: self.longest.flip.as_secs_f64() * 1e3,
+            backlog_peak: self.longest.backlog_peak,
+            absorb_updates: self.longest.absorb_updates,
+            absorb_ms: self.longest.absorb.as_secs_f64() * 1e3,
             end_look_ms: now
                 .hole_scan
                 .saturating_sub(frames_end.hole_scan)
@@ -2417,6 +2428,9 @@ mod tests {
             scene_update_max_ms: 0.0,
             cap_flips: 0,
             cap_flip_max_ms: 0.0,
+            backlog_peak: 0,
+            absorb_updates: 0,
+            absorb_ms: 0.0,
             end_look_ms: 0.0,
             settle: None,
             still_cuts: None,
@@ -2855,6 +2869,9 @@ mod tests {
         assert_eq!(
             keys(&json["runs"][0]["paths"][0]),
             [
+                "absorb_ms",
+                "absorb_updates",
+                "backlog_peak",
                 "cap_flip_max_ms",
                 "cap_flips",
                 "end_look_ms",
@@ -3413,6 +3430,14 @@ mod tests {
         // The crossing took the horizon cap off and on again (#213).
         let crossing = run.paths.iter().find(|p| p.name == "sea-level crossing");
         assert!(crossing.is_some_and(|p| p.cap_flips >= 2), "{crossing:?}");
+        // The flips were absorbed: the updates that did it are counted in the crossing or the
+        // path after it.
+        assert!(
+            run.paths
+                .iter()
+                .any(|p| p.absorb_updates > 0 && p.absorb_ms > 0.0),
+            "no path absorbed a flip"
+        );
         let stop = run.paths.last().unwrap();
         assert!(stop.still_cuts.is_some());
         assert!(run.paths[..6].iter().all(|p| p.still_cuts.is_none()));
@@ -3422,11 +3447,9 @@ mod tests {
             assert_eq!(path.frame_cpu.samples, path.frames);
             // The scene thread's longest round (#213) was timed.
             assert!(path.scene_round_max_ms > 0.0, "{}", path.name);
-            assert!(
-                path.scene_round_max_ms >= path.scene_update_max_ms,
-                "{}",
-                path.name
-            );
+            // Not that the round is at least as long as the update: the counters are taken
+            // between an update and the end of its round, so the longest update of the round that
+            // straddles the end of a path is in this path and the round's time in the next.
             eprintln!(
                 "{}: round {:.2} ms, update {:.2} ms, {} cap flips",
                 path.name, path.scene_round_max_ms, path.scene_update_max_ms, path.cap_flips
@@ -3520,8 +3543,6 @@ mod tests {
         serde_json::to_string(&report).expect("the report serializes");
     }
 
-    /// A run that cannot finish says at which step, and why: here the cold start, with no time to
-    /// fill. It is in `.github/real-thread-tests.txt` with the smoke test (it has threads).
     /// The sea-level crossing at full size, without a GPU (#213): the scene thread's longest round
     /// in each path, and the flips' updates held against the others'. The scene thread's rounds are
     /// the same work as on the 4090 (a frame's time is not, with no GPU). It runs the whole
@@ -3540,12 +3561,15 @@ mod tests {
         .unwrap_or_else(|stopped| panic!("the run stopped at {}: {}", stopped.step, stopped.error));
         for p in &run.paths {
             eprintln!(
-                "{:<20} longest scene round {:>8.2} ms, update {:>8.2} ms, cap flips {} (longest {:.2} ms) (follow {:.0} ms, pack {:.0} ms, publish {:.0} ms in {} frames); holes {}",
+                "{:<20} longest scene round {:>8.2} ms, update {:>8.2} ms, cap flips {} (longest {:.2} ms), backlog at most {} nodes, {} absorbing updates over {:.0} ms (follow {:.0} ms, pack {:.0} ms, publish {:.0} ms in {} frames); holes {}",
                 p.name,
                 p.scene_round_max_ms,
                 p.scene_update_max_ms,
                 p.cap_flips,
                 p.cap_flip_max_ms,
+                p.backlog_peak,
+                p.absorb_updates,
+                p.absorb_ms,
                 p.scene_thread.follow_ms,
                 p.scene_thread.pack_ms,
                 p.scene_thread.upload_ms,
@@ -3601,6 +3625,8 @@ mod tests {
         );
     }
 
+    /// A run that cannot finish says at which step, and why: here the cold start, with no time to
+    /// fill. It is in `.github/real-thread-tests.txt` with the smoke test (it has threads).
     #[test]
     fn a_run_that_stops_names_the_step_it_was_at() {
         let built = build_test().expect("the test Planet builds");
