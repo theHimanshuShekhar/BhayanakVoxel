@@ -533,10 +533,13 @@ const SWEEP: usize = 8192;
 /// full size a flip made 89 thousand nodes change at once, 620 thousand bricks, in one update of
 /// 8.5 s.
 const ABSORB_REVISITS: usize = 800;
-/// How many entries of the queue a step of tidying it looks at, after a sweep (#213): the sweep
-/// stamps every node again, and the entry that a node had in the queue is stale from then, so the
-/// queue is gone through, a few at a time, and what is stale is dropped.
-const TIDY: usize = 65_536;
+/// How many entries of the queue a step of tidying it looks at (#213): the sweep stamps every node
+/// again, and the entry that a node had in the queue is stale from then, so the queue is gone
+/// through, a few at a time, and what is stale is dropped. A step is about a millisecond (at full
+/// size an entry costs 150 ns to look at: 65 536 took 10 ms, which the stop after a flight felt
+/// in its settle): the tidying is never to hold up what is drawn, and it is not what the flip's
+/// absorbing is measured by.
+const TIDY: usize = 8_192;
 const ABSORB_BRICKS_PER_REVISIT: usize = 10;
 
 /// What to do with a brick that is in the tree.
@@ -674,8 +677,8 @@ pub struct Selection {
     marking: bool,
     /// The most that the backlog has held since [`Selection::take_backlog_peak`].
     backlog_peak: usize,
-    /// Where the tidying of the queue is: the next bucket and the entry in it, once the sweep has ended
-    /// (the sweep stamps every node again and leaves the entries of the old stamps in the queue).
+    /// Where the tidying of the queue is: the next bucket and the entry in it (the sweep stamps
+    /// every node again and leaves the entries of the old stamps in the queue).
     tidy: Option<(u64, usize)>,
     /// How many entries of the queue a tidying step looks at: [`TIDY`], or fewer for a test.
     #[cfg(test)]
@@ -1318,8 +1321,9 @@ impl Selection {
     }
 
     /// Drops the entries of the queue whose node was stamped again since, [`TIDY`] of them in each
-    /// call, once the sweep has ended: without it each flip leaves about one stale entry for each
-    /// node, until the camera has travelled what the entry was queued for.
+    /// call, in one pass from a flip and another from the end of its sweep: without it each flip
+    /// leaves about one stale entry for each node, until the camera has travelled what the entry
+    /// was queued for.
     fn tidy_some(&mut self) {
         let Some((from, mut at)) = self.tidy else {
             return;
@@ -1360,9 +1364,10 @@ impl Selection {
         for bucket in empty {
             self.queue.remove(&bucket);
         }
-        // A pass that ends while the sweep goes on starts again: the sweep makes entries stale
-        // as it goes.
-        self.tidy = next.or_else(|| (!self.sweep.is_empty()).then_some((0, 0)));
+        // A pass that ends while the sweep goes on is not started again (at full size that was
+        // seven passes over five million entries): the entries the sweep makes stale after it are
+        // for the pass that starts when the sweep ends, or the next flip's.
+        self.tidy = next;
     }
 
     /// Looks at the next batch of the sweep again: each node is stamped and put on the hot list,

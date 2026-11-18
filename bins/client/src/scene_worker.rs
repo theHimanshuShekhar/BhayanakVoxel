@@ -410,7 +410,8 @@ pub struct Longest {
     /// selection was absorbing a flip in, and how long it was from the first to the last of them
     /// (counted in the path where it ends: it goes on after the camera has stopped). Flips that
     /// overlap are one span: from the update that found the first to the one that ended the last
-    /// absorbing (the tidying of the queue included), and the updates are that span's.
+    /// absorbing, and the updates are that span's (the tidying of the queue is not part of it: it
+    /// changes nothing that is drawn, and goes on in whatever path comes after).
     pub backlog_peak: u64,
     pub absorb_updates: u64,
     pub absorb: Duration,
@@ -2066,7 +2067,7 @@ impl Engine {
             let from = self.scene.camera().unwrap_or(camera);
             let step_began = self.began();
             let capped = self.scene.reach().horizon;
-            let busy = self.scene.absorbing() || self.scene.tidying();
+            let busy = self.scene.absorbing();
             let update = self.scene.recentre(&store, target)?;
             drop(store);
             if let Some(began) = step_began {
@@ -2078,7 +2079,7 @@ impl Engine {
                 if flipped {
                     self.shared.flips.fetch_add(1, Ordering::Relaxed);
                 }
-                let busy_after = self.scene.absorbing() || self.scene.tidying();
+                let busy_after = self.scene.absorbing();
                 if flipped || busy || busy_after {
                     self.shared.longest_flip.fetch_max(nanos, Ordering::Relaxed);
                     self.shared.absorb_updates.fetch_add(1, Ordering::Relaxed);
@@ -2086,8 +2087,9 @@ impl Engine {
                 let peak = u64::try_from(self.scene.take_backlog_peak()).unwrap_or(u64::MAX);
                 self.shared.backlog_peak.fetch_max(peak, Ordering::Relaxed);
                 // How long the selection absorbs a flip, from the update that found it to the one
-                // that ended it. Flips that overlap are one span, from the first to the update that ends the last
-                // absorbing, and the updates counted above are the same span's.
+                // that ended it. Flips that overlap are one span, from the first to the update
+                // that ends the last absorbing, and the updates counted above are the same span's.
+                // (The tidying of the queue is not absorbing: it changes nothing that is drawn.)
                 if flipped && self.absorbing_since.is_none() {
                     self.absorbing_since = Some(began);
                 }
