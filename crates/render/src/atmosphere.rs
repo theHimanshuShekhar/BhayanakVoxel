@@ -43,13 +43,13 @@ const MIN_CAMERA_HEIGHT: f64 = 0.5;
 /// The Planet's radius at sea level, ADR 0008: 320 km.
 pub const PLANET_RADIUS_M: f32 = 320_000.0;
 
-/// The art direction's tint on the physical tables (#53, the owner's decision of 2026-11-18): the
-/// air is Hillaire's, and this is what the look adds to the light of the sky and of the air between
-/// the camera and a surface. It is not physical, and it is in the tables, so both views read the
-/// same tinted sky and the same tinted haze from the same functions (`sky.wgsl`) and the Reference
-/// still matches Primary. [`Tint::NONE`] leaves the tables as the model makes them.
+/// One setting of the art direction's tint on the physical tables (#53, the owner's decision of
+/// 2026-11-18): the air is Hillaire's, and this is what the look adds to the light of the sky and
+/// of the air between the camera and a surface. It is not physical, and it is in the tables, so both
+/// views read the same tinted sky and the same tinted haze from the same functions (`sky.wgsl`) and
+/// the Reference still matches Primary.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Tint {
+pub struct TintKey {
     /// What the sky's radiance is multiplied by at the horizon and at the zenith (linear RGB), and
     /// between them by the sine of the elevation, as the gradient it replaces blended its two
     /// colours. Below the horizon it is the horizon's. It applies to the sky seen by the camera, to
@@ -64,26 +64,106 @@ pub struct Tint {
     pub haze_colour: [f32; 3],
 }
 
-impl Tint {
+impl TintKey {
     /// No tint: the physical tables.
-    pub const NONE: Tint = Tint {
+    pub const NONE: TintKey = TintKey {
         sky_horizon: [1.0; 3],
         sky_zenith: [1.0; 3],
         haze_per_metre: 0.0,
         haze_colour: [0.0; 3],
     };
+
+    fn lerp(self, other: TintKey, t: f32) -> TintKey {
+        let mix3 = |a: [f32; 3], b: [f32; 3]| std::array::from_fn(|c| a[c] + (b[c] - a[c]) * t);
+        TintKey {
+            sky_horizon: mix3(self.sky_horizon, other.sky_horizon),
+            sky_zenith: mix3(self.sky_zenith, other.sky_zenith),
+            haze_per_metre: self.haze_per_metre + (other.haze_per_metre - self.haze_per_metre) * t,
+            haze_colour: mix3(self.haze_colour, other.haze_colour),
+        }
+    }
+}
+
+/// The tint by the time of day (the owner's direction of 2026-11-18: more violet, mauve and purple
+/// when it is dark, hazier and more orange in the sun): four settings at four heights of the sun,
+/// blended between by a smoothstep of the sun's elevation, so nothing pops as the sun moves. The
+/// sun's elevation is the one number that picks the setting, so it is a function of the frame's
+/// sun alone, and the tables (which are the same in both views) hold it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Tint {
+    /// The settings at [`Tint::ELEVATIONS`]: night, dusk, hero light B's sun, and the day's.
+    pub keys: [TintKey; 4],
+}
+
+impl Tint {
+    /// The sun's elevations of the four settings, in degrees: at or under the first it is night
+    /// (violet), at the second dusk (mauve), at the third hero light B's sun (the gradient's mauve
+    /// and peach), and at or over the fourth it is day (a hazy orange).
+    pub const ELEVATIONS: [f32; 4] = [-8.0, 0.0, 8.0, 30.0];
+
+    /// No tint: the physical tables.
+    pub const NONE: Tint = Tint::constant(TintKey::NONE);
+
+    /// The same setting at every height of the sun.
+    pub const fn constant(key: TintKey) -> Tint {
+        Tint { keys: [key; 4] }
+    }
+
+    /// The setting for a sun whose cosine with the up is `mu_s`: continuous in it.
+    pub fn at(&self, mu_s: f32) -> TintKey {
+        let elevation = mu_s.clamp(-1.0, 1.0).asin().to_degrees();
+        let e = Self::ELEVATIONS;
+        if elevation <= e[0] {
+            return self.keys[0];
+        }
+        for i in 0..3 {
+            if elevation <= e[i + 1] {
+                let x = (elevation - e[i]) / (e[i + 1] - e[i]);
+                return self.keys[i].lerp(self.keys[i + 1], x * x * (3.0 - 2.0 * x));
+            }
+        }
+        self.keys[3]
+    }
 }
 
 /// The hero tint (see [`Atmosphere::HERO`]).
 const HERO_TINT: Tint = Tint {
-    // The sky: warmer at the horizon, and bluer overhead, than the air makes it (a 8-degree sun on
-    // a thick shell of air gives a pale, cool sky where the gradient was mauve).
-    sky_horizon: [1.916, 0.928, 0.687],
-    sky_zenith: [0.769, 0.714, 1.206],
-    // The extra haze, on top of the air's own 35 m layer of it (1/300 per metre at the ground in
-    // all), fading to the gradient's horizon colour as it did.
-    haze_per_metre: 1.0 / 342.0,
-    haze_colour: [1.0, 0.55, 0.38],
+    keys: [
+        // Night: the sky and the haze lean violet. Found by eye on the look-dev sheet's time-of-day
+        // strip (the physical sky is a dim blue-grey).
+        TintKey {
+            sky_horizon: [0.8, 0.28, 1.4],
+            sky_zenith: [0.35, 0.13, 0.8],
+            haze_per_metre: 1.0 / 400.0,
+            haze_colour: [0.14, 0.07, 0.18],
+        },
+        // Dusk: mauve and purple.
+        TintKey {
+            sky_horizon: [1.6, 0.7, 1.5],
+            sky_zenith: [0.7, 0.35, 1.0],
+            haze_per_metre: 1.0 / 360.0,
+            haze_colour: [0.30, 0.15, 0.22],
+        },
+        // Hero light B's sun (8 degrees), fitted by `fit_the_tint`: warmer at the horizon, and
+        // bluer overhead, than the air makes it (an 8-degree sun on a thick shell of air gives a
+        // pale, cool sky where the gradient was mauve), and an extra haze on top of the air's own
+        // 35 m layer of it (1/300 per metre at the ground in all), fading to the gradient's horizon
+        // colour as it did.
+        TintKey {
+            sky_horizon: [1.916, 0.928, 0.687],
+            sky_zenith: [0.769, 0.714, 1.206],
+            haze_per_metre: 1.0 / 342.0,
+            haze_colour: [1.0, 0.55, 0.38],
+        },
+        // Day: a hazier, warmer sky, not a clear blue one: an orange horizon, a pale warm zenith,
+        // and a denser orange haze.
+        TintKey {
+            sky_horizon: [1.9, 1.0, 0.55],
+            sky_zenith: [1.7, 1.0, 0.7],
+            haze_per_metre: 1.0 / 180.0,
+            haze_colour: [2.0, 1.1, 0.55],
+        },
+    ],
 };
 
 /// The air, as the model reads it. Rates are per metre.
@@ -253,6 +333,8 @@ impl Atmosphere {
         // radius the horizon is a degenerate angle and the sky-view table has bands in it.
         let camera_radius =
             (f64::from(self.ground_radius) + view.camera_height.max(MIN_CAMERA_HEIGHT)) as f32;
+        // The tint of this sun's height: the same in both views, as the tables hold it.
+        let tint = self.tint.at(view.mu_s());
         AtmosphereUniform {
             radii: [
                 self.ground_radius,
@@ -268,9 +350,9 @@ impl Atmosphere {
             up: v3(view.up, self.observer_height),
             sun_light: v3(self.sun_light, 0.0),
             ground: v3(self.ground_albedo, 0.0),
-            tint_horizon: v3(self.tint.sky_horizon, self.tint.haze_per_metre),
-            tint_zenith: v3(self.tint.sky_zenith, 0.0),
-            tint_haze: v3(self.tint.haze_colour, 0.0),
+            tint_horizon: v3(tint.sky_horizon, tint.haze_per_metre),
+            tint_zenith: v3(tint.sky_zenith, 0.0),
+            tint_haze: v3(tint.haze_colour, 0.0),
         }
     }
 }

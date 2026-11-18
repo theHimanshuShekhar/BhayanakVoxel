@@ -1445,11 +1445,20 @@ the Planet's ground level (`set_ground_level`), which the atmosphere counts the 
 `--untinted` makes the other sheets (the combinations, the stills) use the physical atmosphere with no
 tint (`Look::HERO_B_UNTINTED`), so that the tint can be compared on any of them.
 
-The tint's seven numbers (`HERO_TINT` in `atmosphere.rs`) come from `fit_the_tint` in
+The sheet ends with **the tint by the time of day**: the forest floor and the canyon with haze, in the
+Reference view, at sun elevations of -12 (night), -4 (dusk), 0, 8 (the hero sun), 25 and 60 degrees (midday),
+the untinted atmosphere over the tinted one, in `DIR/<shot>/strip-<elevation>-{untinted,tinted}.png`. The
+tint is violet, mauve and purple when the sun is low or under the horizon and hazier and more orange when it
+is up, blended by the sun's elevation (ADR 0005's sky row). The display's auto-exposure settles on each
+image, so the night's brightness is evened out and what the strip shows is the colour. The sun is the same
+70 degrees from each shot's forward; only its height changes.
+
+The tint's hero setting (the 8-degree one of the four in `HERO_TINT` in `atmosphere.rs`) comes from `fit_the_tint` in
 `crates/render/tests/atmosphere.rs` (`cargo test -p render --test atmosphere fit_the_tint -- --ignored
 --nocapture`, about 3 minutes on lavapipe): it searches them so that the sky columns, the sky and ground
 of three Reference views of the test Planet's patch, and a wall fading into the haze at 30 m to 3 km read
-like the gradient and its 1/300 per metre haze. It prints what to put in `HERO_TINT`.
+like the gradient and its 1/300 per metre haze. It prints what to put in the hero setting of `HERO_TINT`; the night, dusk and day settings are set by eye
+on the strip.
 
 ## Tests
 

@@ -10,7 +10,7 @@ use brick_store::{BrickCoord, BrickStore, Material, VoxelCoord};
 use common::{PRIMARY, check_golden};
 use materials::MaterialTable;
 use planet_gen::generate_region;
-use render::atmosphere::{Atmosphere, TableId, Tint};
+use render::atmosphere::{Atmosphere, TableId, Tint, TintKey};
 use render::sun::DEFAULT_ANGULAR_RADIUS;
 use render::{Camera, Fault, Look, Offscreen, ReferenceOptions, Scene, SkyEstimator, Stages, Sun};
 
@@ -65,10 +65,11 @@ fn luminance(c: [f32; 3]) -> f32 {
 
 #[test]
 fn the_sky_is_blue_overhead_and_warm_and_pale_at_the_horizon_by_day() {
+    // The physical air's: the tint (below) is what makes the day's sky hazy and orange.
     let mut gpu = sky_gpu(16);
     let column = sky_column(
         &mut gpu,
-        Look::HERO_B,
+        Look::HERO_B_UNTINTED,
         270f32.to_radians(),
         40f32.to_radians(),
         16,
@@ -166,22 +167,24 @@ fn day_follows_the_sun_and_night_is_dark() {
 #[test]
 fn the_sunset_is_redder_at_the_horizon_than_the_noon_sky() {
     let mut gpu = sky_gpu(8);
-    let ratio = |gpu: &mut Offscreen, elevation: f32, azimuth: f32| {
+    let ratio = |gpu: &mut Offscreen, look: Look, elevation: f32, azimuth: f32| {
         // The column looks along +x (azimuth 90): the sun at `azimuth`.
-        let column = sky_column(
-            gpu,
-            Look::HERO_B,
-            azimuth.to_radians(),
-            elevation.to_radians(),
-            8,
-        );
+        let column = sky_column(gpu, look, azimuth.to_radians(), elevation.to_radians(), 8);
         let (_, c) = column[0];
         c[0] / c[2]
     };
-    // The sun is behind the camera, which looks along +x.
-    let noon = ratio(&mut gpu, 60.0, 270.0);
-    let sunset = ratio(&mut gpu, 4.0, 270.0);
+    // The sun is behind the camera, which looks along +x. The air's own reddening:
+    let noon = ratio(&mut gpu, Look::HERO_B_UNTINTED, 60.0, 270.0);
+    let sunset = ratio(&mut gpu, Look::HERO_B_UNTINTED, 4.0, 270.0);
     assert!(sunset > noon * 1.5, "reddening: {sunset} against {noon}");
+    // With the tint, which makes the noon's horizon orange too, a low sun is still the redder: at the
+    // hero sun's height, the sky's horizon is more red than at noon.
+    let noon = ratio(&mut gpu, Look::HERO_B, 60.0, 270.0);
+    let hero = ratio(&mut gpu, Look::HERO_B, 8.0, 270.0);
+    assert!(
+        hero > noon * 1.15,
+        "reddening, tinted: {hero} against {noon}"
+    );
 }
 
 /// The sun-free table's weights and its distribution, from the table itself.
@@ -649,6 +652,102 @@ fn the_tint_warms_the_horizon_and_blues_the_zenith_and_leaves_the_physical_table
     );
 }
 
+// ---- The tint follows the time of day (the owner's direction of 2026-11-18).
+
+#[test]
+fn the_tint_blends_smoothly_between_its_settings_as_the_sun_moves() {
+    let tint = Atmosphere::HERO.tint;
+    // At each setting's own height of the sun, exactly that setting.
+    for (key, elevation) in tint.keys.iter().zip(Tint::ELEVATIONS) {
+        assert_eq!(&tint.at(elevation.to_radians().sin()), key, "{elevation}");
+    }
+    // Beyond the first and the last, the same as they are.
+    assert_eq!(tint.at(-1.0), tint.keys[0]);
+    assert_eq!(tint.at(1.0), tint.keys[3]);
+    // No pops: over a sweep of the sun in steps of a hundredth of a degree, no part of the tint
+    // moves by more than a hundredth of its own size.
+    let parts = |k: TintKey| {
+        let mut v = Vec::new();
+        v.extend(k.sky_horizon);
+        v.extend(k.sky_zenith);
+        v.push(k.haze_per_metre * 300.0);
+        v.extend(k.haze_colour);
+        v
+    };
+    let mut last = parts(tint.at((-20.0f32).to_radians().sin()));
+    let mut moved = 0.0f32;
+    for step in 1..=9000 {
+        let elevation = -20.0 + step as f32 * 0.01;
+        let now = parts(tint.at(elevation.to_radians().sin()));
+        for (a, b) in last.iter().zip(&now) {
+            assert!(
+                (a - b).abs() < 0.01,
+                "pop at {elevation} degrees: {a} to {b}"
+            );
+            moved += (a - b).abs();
+        }
+        last = now;
+    }
+    assert!(moved > 1.0, "the tint moves with the sun: {moved}");
+    // Its direction: violet in the dark, hazier and more orange in the sun.
+    let [nr, ng, nb] = tint.keys[0].sky_horizon;
+    assert!(nb > nr && nr > ng, "violet at night: {:?}", tint.keys[0]);
+    let [dr, dg, db] = tint.keys[3].sky_zenith;
+    assert!(dr > dg && dg > db, "warm by day: {:?}", tint.keys[3]);
+    assert!(
+        tint.keys[3].haze_per_metre > tint.keys[2].haze_per_metre
+            && tint.keys[2].haze_per_metre > tint.keys[0].haze_per_metre,
+        "hazier as the sun climbs"
+    );
+    // The physical air has none of it, at any height of the sun.
+    assert_eq!(Tint::NONE.at(0.3), TintKey::NONE);
+    assert_eq!(Tint::NONE.at(-0.3), TintKey::NONE);
+}
+
+#[test]
+fn the_sky_is_violet_in_the_dark_and_hazy_orange_in_the_sun() {
+    let mut gpu = sky_gpu(16);
+    let away = (90.0f32 + 70.0).to_radians();
+    let mut at = |look: Look, elevation: f32| {
+        let column = sky_column(&mut gpu, look, away, elevation.to_radians(), 16);
+        (column[0].1, column[15].1)
+    };
+    // Night: the sky overhead and at the horizon leans to blue and red over green.
+    let (low, top) = at(Look::HERO_B, -12.0);
+    for c in [low, top] {
+        assert!(c[2] > c[0] && c[0] > c[1] * 1.5, "violet at night: {c:?}");
+    }
+    // Midday: not the blue overhead of the physical air: warm, and an orange horizon.
+    let (low, top) = at(Look::HERO_B, 60.0);
+    assert!(top[0] > top[2] * 1.15, "warm overhead by day: {top:?}");
+    assert!(
+        low[0] > low[2] * 1.8 && low[0] > low[1] * 1.4,
+        "orange horizon: {low:?}"
+    );
+    let (_, physical_top) = at(Look::HERO_B_UNTINTED, 60.0);
+    assert!(
+        physical_top[2] > physical_top[0],
+        "it is the tint: {physical_top:?}"
+    );
+    // Between, the tint moves a little at a time: what it does to the sky at the horizon (the tinted
+    // sky over the physical one), in steps of a degree of the sun across the whole range, never
+    // changes by more than a fifth of itself.
+    let mut gain = |elevation: f32| {
+        let (tinted, _) = at(Look::HERO_B, elevation);
+        let (physical, _) = at(Look::HERO_B_UNTINTED, elevation);
+        std::array::from_fn::<f32, 3, _>(|c| tinted[c] / physical[c])
+    };
+    let mut last = gain(-15.0);
+    for step in 1..=75 {
+        let now = gain(-15.0 + step as f32);
+        for c in 0..3 {
+            let rel = (now[c] - last[c]).abs() / last[c];
+            assert!(rel < 0.2, "pop at {} degrees: {last:?} {now:?}", -15 + step);
+        }
+        last = now;
+    }
+}
+
 // ---- Haze on the bounce rays (ADR 0005's bias ledger): leaving it off is worth under 1 %.
 
 /// The linear light of the Reference view of `camera` over the test Planet's patch, 64 samples a
@@ -707,6 +806,16 @@ fn leaving_haze_off_the_bounce_rays_is_worth_under_one_percent_of_a_pixels_light
         (
             Camera::looking_at([0.0, 1620.0, 300.0], [0.0, 1500.0, -300.0]),
             Sun::from_angles(2.0, 0.14, DEFAULT_ANGULAR_RADIUS),
+        ),
+        // The tint's densest haze (midday, a sun 60 degrees up) and its dusk (just under the
+        // horizon): the tint follows the sun, and so does the haze the bound is for.
+        (
+            Camera::looking_at([0.0, 1548.0, 250.0], [0.0, 1535.0, -300.0]),
+            Sun::from_angles(0.9, 60f32.to_radians(), DEFAULT_ANGULAR_RADIUS),
+        ),
+        (
+            Camera::looking_at([0.0, 1620.0, 300.0], [0.0, 1500.0, -300.0]),
+            Sun::from_angles(2.0, -4f32.to_radians(), DEFAULT_ANGULAR_RADIUS),
         ),
     ];
     for (camera, sun) in views {
@@ -880,12 +989,12 @@ fn sunset_ratios() {
 
 fn tinted(p: &[f64]) -> Atmosphere {
     let mut air = Atmosphere::PHYSICAL;
-    air.tint = Tint {
+    air.tint = Tint::constant(TintKey {
         sky_horizon: [p[0].exp() as f32, p[1].exp() as f32, p[2].exp() as f32],
         sky_zenith: [p[3].exp() as f32, p[4].exp() as f32, p[5].exp() as f32],
         haze_per_metre: p[6].exp() as f32,
         haze_colour: HORIZON,
-    };
+    });
     air
 }
 
@@ -1134,14 +1243,36 @@ fn dump_the_tint_views() {
         ("3-tinted", Look::HERO_B),
     ];
     for (name, camera) in &views {
-        let sun = Sun::from_angles(1.5, 8f32.to_radians(), DEFAULT_ANGULAR_RADIUS);
-        for (slug, look) in looks {
-            let mut gpu = Offscreen::new(320, 180, &planet_patch()).unwrap();
-            gpu.set_ground_level(1535.0);
-            gpu.set_look(look);
-            gpu.set_sun(sun);
-            let image = gpu.render_reference(camera, 32);
-            common::write_png(&out.join(format!("{name}-{slug}.png")), &image);
+        for el in [-12.0f32, -4.0, 0.0, 8.0, 25.0, 60.0] {
+            let sun = Sun::from_angles(1.5, el.to_radians(), DEFAULT_ANGULAR_RADIUS);
+            for (slug, look) in looks {
+                let mut gpu = Offscreen::new(320, 180, &planet_patch()).unwrap();
+                gpu.set_ground_level(1535.0);
+                gpu.set_look(look);
+                gpu.set_sun(sun);
+                let image = gpu.render_reference(camera, 32);
+                common::write_png(&out.join(format!("{name}-{el:+03}-{slug}.png")), &image);
+            }
+        }
+    }
+}
+
+#[test]
+#[ignore = "exploration"]
+fn sky_by_sun_elevation() {
+    let mut gpu = sky_gpu(16);
+    let away = (90.0f32 + 70.0).to_radians();
+    for el in [-12.0f32, -8.0, -4.0, 0.0, 4.0, 8.0, 15.0, 25.0, 40.0, 60.0] {
+        for (name, look) in [
+            ("untinted", Look::HERO_B_UNTINTED),
+            ("tinted", Look::HERO_B),
+        ] {
+            let col = sky_column(&mut gpu, look, away, el.to_radians(), 16);
+            let (h, m, z) = (col[0].1, col[8].1, col[15].1);
+            println!(
+                "sun {el:5.0} {name:9}: horizon {:.3} {:.3} {:.3}  mid {:.3} {:.3} {:.3}  zenith {:.3} {:.3} {:.3}",
+                h[0], h[1], h[2], m[0], m[1], m[2], z[0], z[1], z[2]
+            );
         }
     }
 }

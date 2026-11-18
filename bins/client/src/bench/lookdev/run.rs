@@ -39,6 +39,12 @@ const SUN_ELEVATION: f64 = 8.0;
 /// side that is the camera's left (`cross(up, forward)`).
 const SUN_FROM_FORWARD: f64 = 70.0;
 
+/// The atmosphere sheet's time-of-day strip (#53): the sun's elevations, in degrees, night, dusk,
+/// the horizon, the hero sun, the afternoon and midday; and the shots it is made of (outdoors, the
+/// forest floor and the canyon with its haze).
+const STRIP_ELEVATIONS: [f64; 6] = [-12.0, -4.0, 0.0, SUN_ELEVATION, 25.0, 60.0];
+const STRIP_SHOTS: [&str; 2] = ["forest floor", "canyon with haze"];
+
 /// The caves are lit by their crystals alone, which a path finds only by chance (the Reference
 /// view has no light sampling for emissives): four times the samples.
 const CAVE_SPP_FACTOR: u32 = 4;
@@ -48,7 +54,8 @@ the 4090: client.exe lookdev --out DIR [--compare OLD_SHEET_DIR]   (1280x720, 64
 --compare: the folder of the #148 sheet; each shot's OLD/NN-shot/hero-hero-b.png is shown first\n  \
 --atmosphere (#53): instead of the combinations, each shot three times at the game's settings, hero light B\n  \
 with today's gradient sky and haze, then with the untinted atmosphere, then with the atmosphere and the\n  \
-hero tint (the game's), in both views\n  \
+hero tint (the game's), in both views; then a time-of-day strip of the forest floor and the canyon, the\n  \
+Reference view at sun elevations of -12, -4, 0, 8, 25 and 60 degrees, untinted and tinted\n  \
 (on lavapipe: client lookdev --out DIR --atmosphere --size 480x270 --spp 16)\n  \
 --untinted: the other sheets (and the stills) with the physical atmosphere and no hero tint\n  \
 a smoke test on any device: client lookdev --out DIR --short";
@@ -210,12 +217,17 @@ pub fn main(args: impl IntoIterator<Item = String>) -> ExitCode {
 /// sun is as high above the ground in every shot. (`Sun::local` measures from the frame's zero-yaw
 /// heading, which is not where a shot looks.)
 fn sun_for(camera: &Camera) -> Sun {
+    sun_at(camera, SUN_ELEVATION)
+}
+
+/// [`sun_for`] at another elevation (degrees), under the same rules.
+fn sun_at(camera: &Camera, elevation: f64) -> Sun {
     let up = camera.horizon_up;
     let forward = camera.forward();
     let tilt = dot(forward, up);
     let flat = unit(std::array::from_fn(|a| forward[a] - up[a] * tilt));
     let side = cross(up, flat);
-    let (az, el) = (SUN_FROM_FORWARD.to_radians(), SUN_ELEVATION.to_radians());
+    let (az, el) = (SUN_FROM_FORWARD.to_radians(), elevation.to_radians());
     let direction: [f32; 3] = std::array::from_fn(|a| {
         (up[a] * el.sin() + (flat[a] * az.cos() + side[a] * az.sin()) * el.cos()) as f32
     });
@@ -282,6 +294,9 @@ struct Section {
     /// The atmosphere's sheet: the Reference and the settled Primary under the gradient, then the
     /// same under the atmosphere.
     versus: Vec<Figure>,
+    /// The time-of-day strip (outdoor shots only): for each of [`VERSUS`]'s untinted and tinted
+    /// looks, the Reference view at each of [`STRIP_ELEVATIONS`], in that order.
+    strip: Vec<Figure>,
 }
 
 fn slug(name: &str) -> String {
@@ -467,6 +482,7 @@ pub fn run(options: &Options) -> Result<PathBuf, Box<dyn Error>> {
             combinations: Vec::new(),
             descent: Vec::new(),
             versus: Vec::new(),
+            strip: Vec::new(),
         };
         gpu.set_ground_level(ground_level);
         if options.untinted {
@@ -474,6 +490,9 @@ pub fn run(options: &Options) -> Result<PathBuf, Box<dyn Error>> {
         }
         if options.atmosphere {
             versus(&mut gpu, shot, &dir, options, &mut section)?;
+            if STRIP_SHOTS.contains(&shot.name) {
+                time_of_day(&mut gpu, shot, &dir, options, &mut section)?;
+            }
             eprintln!(
                 "[{n}] {}: done in {:.0} s",
                 shot.name,
@@ -572,6 +591,38 @@ fn versus(
     Ok(())
 }
 
+/// The shot's Reference view at each of [`STRIP_ELEVATIONS`] under the untinted atmosphere and the
+/// tinted one, at the game's settings: only the sun's height and the look change.
+fn time_of_day(
+    gpu: &mut Offscreen,
+    shot: &Shot,
+    dir: &str,
+    options: &Options,
+    section: &mut Section,
+) -> Result<(), Box<dyn Error>> {
+    let camera = still_camera(shot);
+    gpu.set_stages(Stages::default());
+    for (slug, _, look) in &VERSUS[1..] {
+        gpu.set_look(*look);
+        for elevation in STRIP_ELEVATIONS {
+            let t = Instant::now();
+            gpu.set_sun(sun_at(&camera, elevation));
+            let image = gpu.render_reference(&camera, options.spp);
+            let file = format!("{dir}/strip-{elevation:+03}-{slug}.png");
+            write_png(&options.out.join(&file), &image)?;
+            section.strip.push(Figure {
+                path: file,
+                label: format!("{elevation:+.0}&deg;"),
+            });
+            eprintln!(
+                "    time of day, {slug}, sun {elevation:+.0} deg: {:.0} s",
+                t.elapsed().as_secs_f64()
+            );
+        }
+    }
+    Ok(())
+}
+
 fn write_atmosphere_sheet(
     out: &Path,
     sections: &[Section],
@@ -598,7 +649,8 @@ fn write_atmosphere_sheet(
          pixel, {}&times; in the caves) under today's gradient sky and 1/300 per metre haze, then under the untinted (physical) atmosphere, then \
          under the atmosphere with the hero tint, which is the game's; the \
          last three are Primary, settled after {} frames of a still camera, under each. Only the look changes between a \
-         pair: the camera, the sun's direction, the Planet and the settings are the same. Took {:.0} s.{}</p>",
+         pair: the camera, the sun's direction, the Planet and the settings are the same. Below them, the time of day. \
+         Took {:.0} s.{}</p>",
         options.spp,
         CAVE_SPP_FACTOR,
         settle_frames(options),
@@ -632,6 +684,45 @@ fn write_atmosphere_sheet(
         html.push_str("</tr>");
     }
     html.push_str("</table>");
+    let strips: Vec<&Section> = sections.iter().filter(|s| !s.strip.is_empty()).collect();
+    if !strips.is_empty() {
+        let _ = write!(
+            html,
+            "<h1>The tint by the time of day (#53)</h1>\
+             <p class=d>The Reference view at the game's settings, the sun {SUN_FROM_FORWARD}&deg; from each \
+             shot's forward as above, at six elevations: night, dusk, the horizon, the hero sun ({SUN_ELEVATION}&deg;), the \
+             afternoon and midday. For each shot, the untinted (physical) atmosphere over the tinted one, \
+             which is the game's: the tint leans violet, mauve and purple when the sun is low or under the \
+             horizon, and hazier and more orange when it is up, blending between by the sun's elevation. The \
+             display's auto-exposure settles on each image, as it does in the game after a moment, so a dark \
+             sky is not as dark here as it is in the first frames of a night.</p>"
+        );
+        html.push_str("<table><tr><th>shot</th><th>look</th>");
+        for elevation in STRIP_ELEVATIONS {
+            let _ = write!(html, "<th>sun {elevation:+.0}&deg;</th>");
+        }
+        html.push_str("</tr>");
+        for section in strips {
+            for (row, (_, label, _)) in VERSUS[1..].iter().enumerate() {
+                let _ = write!(
+                    html,
+                    "<tr><td class=name><b>{}</b></td><td class=name>{label}</td>",
+                    section.name
+                );
+                for figure in
+                    &section.strip[row * STRIP_ELEVATIONS.len()..][..STRIP_ELEVATIONS.len()]
+                {
+                    let _ = write!(
+                        html,
+                        "<td><a href=\"{0}\"><img src=\"{0}\" loading=lazy></a></td>",
+                        figure.path
+                    );
+                }
+                html.push_str("</tr>");
+            }
+        }
+        html.push_str("</table>");
+    }
     std::fs::write(out.join("index.html"), html)?;
     Ok(())
 }
@@ -897,7 +988,7 @@ mod tests {
         assert!(new.join("02-dark-descent/descent-02.png").exists());
         assert!(new.join("00-forest-floor/primary.png").exists());
         assert!(new.join("00-forest-floor/primary-settled.png").exists());
-        // The atmosphere's sheet: each shot in two views under three looks.
+        // The atmosphere's sheet: each shot in two views under three looks, and the strip.
         let versus = out.join("versus");
         let options = parse(args(&[
             "--out",
@@ -913,7 +1004,11 @@ mod tests {
             .skip(1)
             .map(|s| s.split('"').next().unwrap())
             .collect();
-        assert_eq!(images.len(), 3 * 4, "{images:?}");
+        // Each shot in two views under three looks, and the forest floor's strip: six sun
+        // elevations under two looks.
+        assert_eq!(images.len(), 3 * 4 + 2 * 6, "{images:?}");
+        assert!(images.contains(&"00-forest-floor/strip-+08-tinted.png"));
+        assert!(images.contains(&"00-forest-floor/strip--12-untinted.png"));
         assert!(images.contains(&"00-forest-floor/reference-gradient.png"));
         assert!(images.contains(&"00-forest-floor/primary-tinted.png"));
         assert!(images.contains(&"00-forest-floor/reference-untinted.png"));
