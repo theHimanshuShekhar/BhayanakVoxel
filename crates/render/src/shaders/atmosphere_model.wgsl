@@ -210,23 +210,25 @@ fn horizon_angles(r: f32) -> vec2<f32> {
     return vec2<f32>(beta, ATMO_PI - beta);
 }
 
-// How far short of the horizon, in radians, the sky's colour is held: the rays that graze the
-// horizon cross the most air at the ground and are a thin line brighter (or darker) than the sky a
-// degree above them, and a hard line is not what the look wants of a horizon.
-const HORIZON_SOFT: f32 = 0.012;
-
-// The angle from the zenith to look the sky up at instead of `angle`, from radius r: the same, but
-// held HORIZON_SOFT short of the horizon.
-fn soft_angle(r: f32, angle: f32) -> f32 {
-    return min(angle, horizon_angles(r).y - HORIZON_SOFT);
-}
-
 // How much of the sky below the horizon is the sky at the horizon, as a ground camera sees it (the
 // ground is not in the table: where nothing is drawn there, the air is the horizon's too, and the
 // ground dissolves into it), 1 near the ground and 0 high over it, where below the horizon is the
 // planet seen through its air.
 fn horizon_fill() -> f32 {
     return 1.0 - smoothstep(300.0, 3000.0, atmo.radii.z - atmo.radii.x);
+}
+
+// How far short of the horizon, in radians, the sky's colour is held for a camera near the ground:
+// the rays that graze the horizon cross the most air at the ground and are a thin line brighter (or
+// darker) than the sky a degree above them, and a hard line is not what the look wants of a
+// horizon. The hold fades out with `horizon_fill`: it is an angle, so high over the Planet it would
+// hold a band of tangent altitudes tens of kilometres thick, which is the limb.
+const HORIZON_SOFT: f32 = 0.012;
+
+// The angle from the zenith to look the sky up at instead of `angle`, from radius r: the same, but
+// held short of the horizon (below).
+fn soft_angle(r: f32, angle: f32) -> f32 {
+    return min(angle, horizon_angles(r).y - HORIZON_SOFT * horizon_fill());
 }
 
 fn sky_view_uv(r: f32, mu: f32, dphi: f32) -> vec2<f32> {

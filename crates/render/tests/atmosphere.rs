@@ -851,6 +851,7 @@ fn leaving_haze_off_the_bounce_rays_is_worth_under_one_percent_of_a_pixels_light
             "haze on bounce rays: pixel mean {mean:.5}, 99th percentile {p99:.5}, whole image {whole:.5}"
         );
         assert!(mean < 0.01, "the mean pixel moves by {mean}");
+        assert!(p99 < 0.01, "the 99th percentile pixel moves by {p99}");
         assert!(whole < 0.01, "the image moves by {whole}");
     }
 }
@@ -1113,5 +1114,53 @@ fn horizon_profile() {
                 println!("  {e:+6.2} deg  {:.4} {:.4} {:.4}", c[0], c[1], c[2]);
             }
         }
+    }
+}
+
+/// The limb at the zoom of ADR 0008 (1.8 to 20 Planet radii): the air's glow is brightest at the
+/// edge of the Planet, fades into space over the tens of kilometres of the air above it, and the
+/// brightness does not step. (The soft horizon of a camera near the ground holds the sky short of
+/// the horizon by an angle, which would hold the limb's tens of kilometres at 20 radii if it did
+/// not fade out with height.)
+#[test]
+fn the_limb_is_a_lit_glow_at_long_zoom_too() {
+    for (radii, fov, limb) in [(10.0f64, 12.0f64, 5.74f64), (20.0, 6.0, 2.87)] {
+        let mut camera = Camera::looking_at([0.0, 0.0, 0.0], [-1.0, 0.0, 0.0]);
+        camera.position = [radii * GROUND, 0.0, 0.0];
+        camera.carry_up([1.0, 0.0, 0.0]);
+        camera.pitch = -(90.0f64 - limb).to_radians();
+        camera.fov_y = fov.to_radians();
+        let mut gpu = Offscreen::new(WIDTH, HEIGHT, &Scene::default()).unwrap();
+        gpu.set_ground_level(GROUND);
+        gpu.set_stages(Stages::NONE);
+        gpu.set_sun(Sun::from_angles(1.0, 0.4, DEFAULT_ANGULAR_RADIUS));
+        gpu.render(&camera);
+        let ((w, h, hdr), _) = gpu.read_hdr_and_bloom();
+        let column: Vec<f32> = (0..h)
+            .map(|y| luminance(hdr[(y * w + w / 2) as usize]))
+            .collect();
+        let (peak_row, peak) =
+            column.iter().enumerate().fold(
+                (0, 0.0f32),
+                |best, (y, &v)| if v > best.1 { (y, v) } else { best },
+            );
+        let bottom = column[h as usize - 1];
+        assert_eq!(column[0], 0.0, "{radii} radii: space is black");
+        assert!(
+            peak > 1.8 * bottom,
+            "{radii} radii: the limb is brightest: {peak} against {bottom}"
+        );
+        // Above the peak the glow fades into space over many rows, not a step: a few rows up it is
+        // still over half the peak (held short of the horizon, it is a twentieth), and a dozen up it
+        // is a fraction.
+        let (near, far) = (column[peak_row - 6], column[peak_row - 12]);
+        assert!(
+            near > 0.45 * peak,
+            "{radii} radii: the glow is not a step: {near} against {peak}"
+        );
+        assert!(
+            far > 0.02 * peak && far < 0.4 * peak,
+            "{radii} radii: the glow fades into space: {far} against {peak}"
+        );
     }
 }

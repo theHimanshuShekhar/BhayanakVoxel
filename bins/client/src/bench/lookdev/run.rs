@@ -454,20 +454,22 @@ pub fn run(options: &Options) -> Result<PathBuf, Box<dyn Error>> {
         eprintln!("making the 320 km world map (about 25 s)...");
         let planet = Planet::new(WorldMap::generate(crate::SEED, WORLD_MAP_SIZE));
         let first = crate::loader::GUARD_FIRST;
-        let shots: Vec<usize> = (0..SHOTS.len())
-            .filter(|&n| {
-                options.only.is_empty()
-                    || options
-                        .only
-                        .iter()
-                        .any(|o| SHOTS[n].name.contains(o.as_str()))
-            })
-            .collect();
-        if shots.is_empty() {
-            return Err(format!("no shot has {:?} in its name", options.only).into());
-        }
-        (planet, first, shots)
+        (planet, first, (0..SHOTS.len()).collect())
     };
+    // `--shot`: only the shots with those names in them, in a short run too.
+    let shots: Vec<usize> = shots
+        .into_iter()
+        .filter(|&n| {
+            options.only.is_empty()
+                || options
+                    .only
+                    .iter()
+                    .any(|o| SHOTS[n].name.contains(o.as_str()))
+        })
+        .collect();
+    if shots.is_empty() {
+        return Err(format!("no shot has {:?} in its name", options.only).into());
+    }
     let (w, h) = options.size;
     let d0 = f64::from(h) / (2.0 * 35f64.to_radians().tan());
     let mut sections = Vec::new();

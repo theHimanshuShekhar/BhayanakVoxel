@@ -494,7 +494,8 @@ mod tests {
             let problems = lighting_problems(files, &rows);
             assert!(problems.is_empty(), "{name}: {problems:#?}");
         }
-        // And both really name some: the check is not passing on an empty shader.
+        // And both really name some: the check is not passing on an empty shader. (Primary's sky and
+        // haze functions are in sky.wgsl now, where the call sites carry the tags, so it names 3.)
         for source in [PRIMARY, SHADE, PATHTRACE] {
             assert!(source.matches("// lighting:").count() >= 3);
         }

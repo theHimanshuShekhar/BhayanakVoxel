@@ -830,7 +830,7 @@ mod tests {
 
     #[test]
     fn the_uniform_is_the_size_the_shader_declares() {
-        // Twelve vec4s: `Atmo` in atmosphere_model.wgsl.
+        // Eleven vec4s: `Atmo` in atmosphere_model.wgsl.
         assert_eq!(size_of::<AtmosphereUniform>(), 11 * 16);
     }
 
