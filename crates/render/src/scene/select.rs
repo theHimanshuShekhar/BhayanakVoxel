@@ -466,6 +466,10 @@ fn decide(store: &BrickStore, level: usize, coord: BrickCoord, p: impl FnOnce() 
     }
 }
 
+/// How many nodes of a level [`Selection::new_reached`] plans at a time while it puts the chunk
+/// before into the tree.
+const PLAN_CHUNK: usize = 1 << 16;
+
 /// What each thread of [`par_map`] runs before it starts: the client lowers their priority with it
 /// (`priority.rs` there). Making the scene again from nothing on every core at the frame thread's
 /// priority kept the frame thread from waking for 30 ms at a time (#168): on the 4090, 26 to 31
@@ -565,13 +569,11 @@ fn node_slack(
     if level == 0 || reach.is_none() {
         return drawn;
     }
-    let floor = bands.floor(level);
-    let edge = floor
-        * if margin {
-            1.0 + HYSTERESIS
-        } else {
-            1.0 - HYSTERESIS
-        };
+    let edge = if margin {
+        bands.floor(level) * (1.0 + HYSTERESIS)
+    } else {
+        bands.split_edge(level)
+    };
     let near = reach.distance(level, coord);
     let mut slack = drawn.min((near - edge).abs());
     if bands.split(level, near, Some(margin)) {
@@ -781,6 +783,23 @@ impl Selection {
         horizon: Option<Horizon>,
         reach: Reach,
     ) -> (Self, Diff) {
+        Selection::new_reached_in_chunks(
+            store, camera, bands, top, roots, horizon, reach, PLAN_CHUNK,
+        )
+    }
+
+    /// [`Selection::new_reached`] planning `chunk` nodes of a level at a time.
+    #[allow(clippy::too_many_arguments)]
+    fn new_reached_in_chunks(
+        store: &BrickStore,
+        camera: [f64; 3],
+        bands: Bands,
+        top: usize,
+        roots: impl IntoIterator<Item = BrickCoord>,
+        horizon: Option<Horizon>,
+        reach: Reach,
+        chunk: usize,
+    ) -> (Self, Diff) {
         assert!(top < LEVELS && top < store.level_count());
         let mut selection = Selection {
             bands,
@@ -827,22 +846,43 @@ impl Selection {
             .collect();
         while !frontier.is_empty() {
             let (bands, at, camera) = (selection.bands, selection.placed, selection.camera);
-            let plans = par_map(&frontier, |&(key, p)| plan(store, bands, at, key, p));
+            // The plans of a chunk are made on all the threads while this thread puts the chunk
+            // before it into the tree (planning reads the store, the bands and the camera, and
+            // none of the tree), so the serial part is hidden behind the parallel one: on the 4090
+            // the selection of a release rebuild was the sum of the two, 6 s of an 8.5 s rebuild.
+            // The chunks are put in in order: the tree and the diff are what they were.
+            let chunks: Vec<&[(Key, Probe)]> = frontier.chunks(chunk).collect();
+            let plan_chunk =
+                |chunk: &[(Key, Probe)]| par_map(chunk, |&(key, p)| plan(store, bands, at, key, p));
             let mut next = Vec::new();
-            for (&(key, p), plan) in frontier.iter().zip(plans) {
-                let distance = brick_distance(camera, key.0, key.1);
-                match plan {
-                    Plan::Whole => selection.make_whole(store, key, distance, p, &mut diff),
-                    Plan::Wait => {
-                        selection.make_whole(store, key, distance, p, &mut diff);
-                        selection.want(key);
+            std::thread::scope(|scope| {
+                let mut coming = Some(scope.spawn(|| plan_chunk(chunks[0])));
+                for (n, chunk) in chunks.iter().enumerate() {
+                    let plans = coming
+                        .take()
+                        .expect("a chunk is coming")
+                        .join()
+                        .expect("a planner panicked");
+                    if let Some(&after) = chunks.get(n + 1) {
+                        let plan_chunk = &plan_chunk;
+                        coming = Some(scope.spawn(move || plan_chunk(after)));
                     }
-                    Plan::Split(children) => {
-                        selection.mark_split(key, distance);
-                        next.extend(children.into_iter().map(|(c, p)| ((key.0 - 1, c), p)));
+                    for (&(key, p), plan) in chunk.iter().zip(plans) {
+                        let distance = brick_distance(camera, key.0, key.1);
+                        match plan {
+                            Plan::Whole => selection.make_whole(store, key, distance, p, &mut diff),
+                            Plan::Wait => {
+                                selection.make_whole(store, key, distance, p, &mut diff);
+                                selection.want(key);
+                            }
+                            Plan::Split(children) => {
+                                selection.mark_split(key, distance);
+                                next.extend(children.into_iter().map(|(c, p)| ((key.0 - 1, c), p)));
+                            }
+                        }
                     }
                 }
-            }
+            });
             frontier = next;
         }
         (selection, diff)
@@ -2152,6 +2192,38 @@ mod tests {
         let top = top_level(store);
         let roots = top_bricks(store, top, None);
         Selection::new(store, camera, Bands::with_d0(d0), top, roots).0
+    }
+
+    #[test]
+    fn a_selection_planned_in_chunks_is_the_one_planned_in_one() {
+        let store = flat(64, 5);
+        let top = top_level(&store);
+        let roots: Vec<_> = top_bricks(&store, top, None);
+        let made = |chunk: usize| {
+            let (selection, diff) = Selection::new_reached_in_chunks(
+                &store,
+                [0.5, 20.0, 0.5],
+                Bands::with_d0(D0),
+                top,
+                roots.clone(),
+                None,
+                Reach::NONE,
+                chunk,
+            );
+            let mut bricks: Vec<_> = selection.bricks().collect();
+            bricks.sort_unstable();
+            (
+                bricks,
+                selection.nodes(),
+                selection.queued(),
+                format!("{diff:?}"),
+            )
+        };
+        let whole = made(usize::MAX);
+        assert!(whole.1 > 1000, "{}", whole.1);
+        for chunk in [1, 7, 100] {
+            assert_eq!(made(chunk), whole, "chunks of {chunk}");
+        }
     }
 
     /// Levels of the drawn bricks that contain the Voxel (x, -1, z): the top of the floor.

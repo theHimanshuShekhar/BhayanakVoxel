@@ -73,6 +73,17 @@ pub const WEIGHTED_LEVELS: usize = 9;
 /// boundary's distance: out at `1 + HYSTERESIS` times it, back in at `1 - HYSTERESIS` times.
 pub const HYSTERESIS: f64 = 0.05;
 
+/// How much sooner than the hysteresis says a whole brick is split while the bands are speed-scaled
+/// (ADR 0009, #168), as a fraction of the boundary's distance: it is split at `1 - HYSTERESIS +
+/// SPLIT_LEAD` times it. The scene is a frame and a round behind the camera (34 to 54 Voxels at 50
+/// m/s, more when the scene thread is busy), and the brick under the camera is that much to the
+/// side of the scene's camera, so it is farther from it by `lag^2 / 2h` at a height `h`. A camera
+/// that flies at a height that a boundary is at (`floor(3)` is `d0`, the bench's 50 m flight is at
+/// 0.97 of it) had that brick drawn a level too coarse for 1 to 2 frames where the ground rose by a
+/// Voxel or two, at 9.6 s of the path on the 4090. 2% is 20 Voxels there: a lag of up to 200. Not
+/// at rest, where there is no such lag to cover (and the bands are what they were).
+pub const SPLIT_LEAD: f64 = 0.02;
+
 /// Height in pixels of the image the bands are for: 1440p, the output that the frame budgets are
 /// for (the traced image is half of it, and TAAU upscales it).
 pub const OUTPUT_HEIGHT: u32 = 1440;
@@ -248,9 +259,26 @@ impl Bands {
         let floor = self.floor(level);
         match was_split {
             None => distance < floor,
-            Some(false) => distance < floor * (1.0 - HYSTERESIS),
+            Some(false) => distance < floor * self.split_within(),
             Some(true) => distance < floor * (1.0 + HYSTERESIS),
         }
+    }
+
+    /// The fraction of a boundary's distance that a whole brick is split within: `1 - HYSTERESIS`,
+    /// and [`SPLIT_LEAD`] more while the bands are speed-scaled.
+    #[inline]
+    fn split_within(&self) -> f64 {
+        if self.scale < 1.0 {
+            1.0 - HYSTERESIS + SPLIT_LEAD
+        } else {
+            1.0 - HYSTERESIS
+        }
+    }
+
+    /// The distance within which a whole brick of `level` is split (see [`SPLIT_LEAD`]).
+    #[inline]
+    pub fn split_edge(&self, level: usize) -> f64 {
+        self.floor(level) * self.split_within()
     }
 
     /// How far the camera can move before a brick of `level` at `distance`, which is `split`,
@@ -264,7 +292,7 @@ impl Bands {
         let edge = if split {
             floor * (1.0 + HYSTERESIS)
         } else {
-            floor * (1.0 - HYSTERESIS)
+            floor * self.split_within()
         };
         (distance - edge).abs()
     }
@@ -272,7 +300,7 @@ impl Bands {
     /// The radius of the ball about the camera that no brick of `level` is in: all of them are
     /// at least this far. Zero for level 0.
     pub fn clear_radius(&self, level: usize) -> f64 {
-        self.floor(level) * (1.0 - HYSTERESIS)
+        self.split_edge(level)
     }
 }
 
@@ -964,6 +992,28 @@ mod tests {
             state = next;
         }
         assert_eq!(flips, 2);
+    }
+
+    #[test]
+    fn speed_scaled_bands_split_a_whole_brick_a_little_sooner_and_bands_at_rest_do_not() {
+        let rest = Bands::with_d0(100.0);
+        // Level 2 starts at 400: a whole brick splits at 380 at rest.
+        assert!(!rest.split(2, 381.0, Some(false)));
+        assert!(rest.split(2, 379.0, Some(false)));
+        assert_eq!(rest.split_edge(2), 380.0);
+        // At 1 level coarser the boundary is at 200 and the brick splits at 190 + 4 (2%).
+        let fast = rest.speed_scaled(1.0);
+        assert!((fast.split_edge(2) - 194.0).abs() < 1e-9);
+        assert!(fast.split(2, 193.0, Some(false)));
+        assert!(!fast.split(2, 195.0, Some(false)));
+        // What is split stays split to the same distance, and a new brick is split at the boundary.
+        assert!(fast.split(2, 209.0, Some(true)) && !fast.split(2, 211.0, Some(true)));
+        assert!(fast.split(2, 199.0, None) && !fast.split(2, 201.0, None));
+        // The slack is to the edge that splits it, and the clear radius is within it.
+        assert!((fast.slack(2, 254.0, false) - 60.0).abs() < 1e-9);
+        assert_eq!(fast.clear_radius(2), fast.split_edge(2));
+        // The lead is under the hysteresis: a brick that is split by it is not merged at once.
+        const { assert!(SPLIT_LEAD < 2.0 * HYSTERESIS) };
     }
 
     #[test]

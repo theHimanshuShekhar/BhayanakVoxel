@@ -36,7 +36,8 @@ pub fn loading_paused_for(mode: Mode, still_frames: u32) -> bool {
 /// (the loader far behind, say), not a time to be reached in the usual way: the bench reports a
 /// hold that began at the cap ([`HoldBegan::capped`]). 12 s is what lets the wait cover the
 /// release rebuild of a flight's end (#168: the scene made again at the finer depth, which
-/// ends 9.3 to 9.7 s after the stop on the 4090); the dev box's is 12.5 to 21 s and still hits it.
+/// ends 10.9 to 11.2 s after the view goes Still on the 4090, measured on `a7c6b72`: 12 s leaves
+/// little room); the dev box's is 24 to 37 s and still hits it.
 pub const CATCH_UP_CAP: std::time::Duration = std::time::Duration::from_secs(12);
 
 /// How far the scene may be behind the camera, in Voxels, for it to have caught up (#217): one
