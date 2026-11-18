@@ -202,10 +202,10 @@ fn radiance(
         } else if BOUNCE_HAZE && atmosphere_on() {
             let across = ray.dir - atmo.up.xyz * dot(ray.dir, atmo.up.xyz);
             let along = select(across, vec3<f32>(1.0, 0.0, 0.0), dot(across, across) < 1e-10);
-            // The look's extra haze (the tint) counts too, with its own colour.
+            // The look's extra haze (the tint) counts too: it fades to the sky.
             let through = exp(-(medium_at(0.0).extinction + atmo.tint_horizon.w) / AIR_VOXELS_PER_METRE * hit.t);
             // lighting: Sky and atmosphere
-            let fades_to = select(escaped_sky(normalize(along)), atmo.tint_haze.xyz, atmo.tint_horizon.w > 0.0);
+            let fades_to = escaped_sky(normalize(along));
             // lighting: Sky and atmosphere
             light += throughput * fades_to * (vec3<f32>(1.0) - through);
             throughput *= through;

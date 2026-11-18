@@ -229,8 +229,17 @@ fn sky_view_kernel(@builtin(global_invocation_id) id: vec3<u32>) {
     let unit = vec2<f32>(f32(id.x) / (SKY_VIEW_SIZE.x - 1.0), f32(id.y) / (SKY_VIEW_SIZE.y - 1.0));
     let angles = sky_view_params(r, unit);
     let mu_s = clamp(dot(atmo.sun_dir.xyz, atmo.up.xyz), -1.0, 1.0);
-    let nu = cos_between(angles.x, mu_s, angles.y);
-    textureStore(sky_view_out, id.xy, vec4<f32>(integrate_ray(r, angles.x, mu_s, nu, SKY_STEPS) * sky_tint(angles.x), 1.0));
+    // The sky held short of the horizon, which is all there is of it by day and by night; and below
+    // the horizon the planet's air, or for a camera near the ground (where nothing below the
+    // horizon is drawn) the horizon's sky.
+    let angle = acos(clamp(angles.x, -1.0, 1.0));
+    let soft_mu = cos(soft_angle(r, angle));
+    var sky = tint_sky(integrate_ray(r, soft_mu, mu_s, cos_between(soft_mu, mu_s, angles.y), SKY_STEPS), soft_mu);
+    if angle > horizon_angles(r).y {
+        let below = tint_sky(integrate_ray(r, angles.x, mu_s, cos_between(angles.x, mu_s, angles.y), SKY_STEPS), angles.x);
+        sky = mix(below, sky, horizon_fill());
+    }
+    textureStore(sky_view_out, id.xy, vec4<f32>(sky, 1.0));
 }
 
 // The sun-free table: the sky as a surface sees it, over the sky's half of the sphere, in texels
@@ -246,7 +255,7 @@ fn ground_sky_kernel(@builtin(global_invocation_id) id: vec3<u32>) {
     let mu = (f32(id.y) + 0.5) / f32(GROUND_SKY_H);
     let mu_s = clamp(dot(atmo.sun_dir.xyz, atmo.up.xyz), -1.0, 1.0);
     let nu = cos_between(mu, mu_s, dphi);
-    textureStore(ground_sky_out, id.xy, vec4<f32>(integrate_ray(r, mu, mu_s, nu, SKY_STEPS) * sky_tint(mu), 1.0));
+    textureStore(ground_sky_out, id.xy, vec4<f32>(tint_sky(integrate_ray(r, mu, mu_s, nu, SKY_STEPS), mu), 1.0));
 }
 
 var<workgroup> row_sums: array<f32, 32>;
@@ -303,6 +312,12 @@ fn aerial_kernel(@builtin(global_invocation_id) id: vec3<u32>) {
     let nu = clamp(dot(dir, atmo.sun_dir.xyz), -1.0, 1.0);
     let seg = air_segment(r, mu);
     let length_in_air = max(seg.y - seg.x, 0.0);
+    // What the extra haze fades to: the sky in the ray's direction (held short of the horizon, as
+    // the sky-view table is), so that the far ground dissolves into the sky behind it and no line
+    // is left between them.
+    let sky_angles = dir_to_sky_angles(dir);
+    let fade_mu = cos(soft_angle(r, acos(sky_angles.x)));
+    let fade = tint_sky(integrate_ray(r, fade_mu, mu_s, cos_between(fade_mu, mu_s, sky_angles.y), SKY_STEPS), fade_mu);
     var state: Integral;
     state.l = vec3<f32>(0.0);
     state.t = vec3<f32>(1.0);
@@ -321,7 +336,7 @@ fn aerial_kernel(@builtin(global_invocation_id) id: vec3<u32>) {
         // The look's tint: the air's light by the ray's elevation, and then the extra haze over the
         // distance travelled in air, which fades what is behind it and what the air added to its colour.
         let extra = exp(-atmo.tint_horizon.w * min(next, length_in_air));
-        let added = state.l * sky_tint(mu) * extra + atmo.tint_haze.xyz * (1.0 - extra);
+        let added = tint_sky(state.l, mu) * extra + fade * (1.0 - extra);
         textureStore(aerial_scatter_out, vec3<u32>(id.x, id.y, k), vec4<f32>(added, 0.0));
         textureStore(aerial_transmittance_out, vec3<u32>(id.x, id.y, k), vec4<f32>(state.t * extra, 1.0));
         prev = next;

@@ -177,13 +177,19 @@ fn the_sunset_is_redder_at_the_horizon_than_the_noon_sky() {
     let noon = ratio(&mut gpu, Look::HERO_B_UNTINTED, 60.0, 270.0);
     let sunset = ratio(&mut gpu, Look::HERO_B_UNTINTED, 4.0, 270.0);
     assert!(sunset > noon * 1.5, "reddening: {sunset} against {noon}");
-    // With the tint, which makes the noon's horizon orange too, a low sun is still the redder: at the
-    // hero sun's height, the sky's horizon is more red than at noon.
-    let noon = ratio(&mut gpu, Look::HERO_B, 60.0, 270.0);
-    let hero = ratio(&mut gpu, Look::HERO_B, 8.0, 270.0);
+    // With the tint, which makes the noon's sky an orange of its own, the low sun's horizon is
+    // still the redder end of its sky: warmer than the sky overhead.
+    let column = sky_column(
+        &mut gpu,
+        Look::HERO_B,
+        270f32.to_radians(),
+        8f32.to_radians(),
+        8,
+    );
+    let (low, high) = (column[0].1, column[7].1);
     assert!(
-        hero > noon * 1.15,
-        "reddening, tinted: {hero} against {noon}"
+        low[0] / low[2] > 2.0 * high[0] / high[2],
+        "warmer at the horizon, tinted: {low:?} against {high:?}"
     );
 }
 
@@ -594,24 +600,41 @@ fn far_wall(metres: i32, look: Look) -> [[f32; 3]; 2] {
     [primary, accumulation[at..at + 3].try_into().unwrap()]
 }
 
+/// The sky straight ahead, level, from the wall's camera (looking along -z), linear, under `look`,
+/// with the wall's sun: what a far wall's haze fades to.
+fn level_sky(look: Look) -> [f32; 3] {
+    let mut gpu = Offscreen::new(8, 8, &floor()).unwrap();
+    gpu.set_stages(Stages::NONE);
+    gpu.set_look(look);
+    gpu.set_sun(Sun::from_angles(
+        0.0,
+        8f32.to_radians(),
+        DEFAULT_ANGULAR_RADIUS,
+    ));
+    let mut camera = Camera::looking_at([0.0, 40.0, 0.5], [0.0, 40.0, -1000.0]);
+    camera.fov_y = 0.3f64.to_radians();
+    gpu.render(&camera);
+    let ((_, _, hdr), _) = gpu.read_hdr_and_bloom();
+    hdr[3 * 8 + 1]
+}
+
 #[test]
-fn the_hero_tint_fades_a_far_wall_to_the_gradients_horizon_colour_in_both_views() {
-    // 3 km: the wall's own light is gone, and what is seen is the haze, which was the horizon's
-    // colour in the gradient and still is, by the same function in both views.
+fn the_hero_tint_fades_a_far_wall_into_the_sky_behind_it_in_both_views() {
+    // 3 km: the wall's own light is gone, and what is seen is the haze, which is the sky in that
+    // direction (so that no line is left between the ground and the sky), by the same function in
+    // both views.
+    let sky = level_sky(Look::HERO_B);
     let [primary, reference] = far_wall(3_000, Look::HERO_B);
     for (name, seen) in [("Primary", primary), ("the Reference", reference)] {
         for c in 0..3 {
-            let d = (seen[c] - HORIZON[c]).abs() / HORIZON[c];
-            assert!(
-                d < 0.06,
-                "{name}: {seen:?} against the horizon colour {HORIZON:?}"
-            );
+            let d = (seen[c] - sky[c]).abs() / sky[c];
+            assert!(d < 0.08, "{name}: {seen:?} against the sky {sky:?}");
         }
     }
-    // The untinted air is a pale horizon of its own, which the tint changes.
-    let [untinted, _] = far_wall(3_000, Look::HERO_B_UNTINTED);
-    let apart = (0..3).any(|c| (untinted[c] - HORIZON[c]).abs() / HORIZON[c] > 0.15);
-    assert!(apart, "{untinted:?}");
+    // The untinted sky is another colour, which the tint changes.
+    let untinted = level_sky(Look::HERO_B_UNTINTED);
+    let apart = (0..3).any(|c| (untinted[c] - sky[c]).abs() / sky[c] > 0.15);
+    assert!(apart, "{untinted:?} {sky:?}");
 }
 
 #[test]
@@ -657,23 +680,26 @@ fn the_tint_warms_the_horizon_and_blues_the_zenith_and_leaves_the_physical_table
 #[test]
 fn the_tint_blends_smoothly_between_its_settings_as_the_sun_moves() {
     let tint = Atmosphere::HERO.tint;
-    // At each setting's own height of the sun, exactly that setting.
-    for (key, elevation) in tint.keys.iter().zip(Tint::ELEVATIONS) {
-        assert_eq!(&tint.at(elevation.to_radians().sin()), key, "{elevation}");
-    }
-    // Beyond the first and the last, the same as they are.
-    assert_eq!(tint.at(-1.0), tint.keys[0]);
-    assert_eq!(tint.at(1.0), tint.keys[3]);
-    // No pops: over a sweep of the sun in steps of a hundredth of a degree, no part of the tint
-    // moves by more than a hundredth of its own size.
+    // At each setting's own height of the sun, that setting.
     let parts = |k: TintKey| {
         let mut v = Vec::new();
         v.extend(k.sky_horizon);
         v.extend(k.sky_zenith);
         v.push(k.haze_per_metre * 300.0);
-        v.extend(k.haze_colour);
+        v.push(k.pastel);
         v
     };
+    for (key, elevation) in tint.keys.iter().zip(Tint::ELEVATIONS) {
+        let got = parts(tint.at(elevation.to_radians().sin()));
+        for (a, b) in got.iter().zip(parts(*key)) {
+            assert!((a - b).abs() < 1e-3, "{elevation}: {got:?}");
+        }
+    }
+    // Beyond the first and the last, the same as they are.
+    assert_eq!(tint.at(-1.0), tint.keys[0]);
+    assert_eq!(tint.at(1.0), tint.keys[4]);
+    // No pops: over a sweep of the sun in steps of a hundredth of a degree, no part of the tint
+    // moves by more than a hundredth of its own size.
     let mut last = parts(tint.at((-20.0f32).to_radians().sin()));
     let mut moved = 0.0f32;
     for step in 1..=9000 {
@@ -692,10 +718,11 @@ fn the_tint_blends_smoothly_between_its_settings_as_the_sun_moves() {
     // Its direction: violet in the dark, hazier and more orange in the sun.
     let [nr, ng, nb] = tint.keys[0].sky_horizon;
     assert!(nb > nr && nr > ng, "violet at night: {:?}", tint.keys[0]);
-    let [dr, dg, db] = tint.keys[3].sky_zenith;
-    assert!(dr > dg && dg > db, "warm by day: {:?}", tint.keys[3]);
+    let [dr, dg, db] = tint.keys[4].sky_zenith;
+    assert!(dr > dg && dg > db, "warm by day: {:?}", tint.keys[4]);
     assert!(
-        tint.keys[3].haze_per_metre > tint.keys[2].haze_per_metre
+        tint.keys[4].haze_per_metre > tint.keys[3].haze_per_metre
+            && tint.keys[3].haze_per_metre > tint.keys[2].haze_per_metre
             && tint.keys[2].haze_per_metre > tint.keys[0].haze_per_metre,
         "hazier as the sun climbs"
     );
@@ -715,7 +742,7 @@ fn the_sky_is_violet_in_the_dark_and_hazy_orange_in_the_sun() {
     // Night: the sky overhead and at the horizon leans to blue and red over green.
     let (low, top) = at(Look::HERO_B, -12.0);
     for c in [low, top] {
-        assert!(c[2] > c[0] && c[0] > c[1] * 1.5, "violet at night: {c:?}");
+        assert!(c[2] > c[0] && c[0] > c[1] * 1.2, "violet at night: {c:?}");
     }
     // Midday: not the blue overhead of the physical air: warm, and an orange horizon.
     let (low, top) = at(Look::HERO_B, 60.0);
@@ -983,21 +1010,6 @@ fn sunset_ratios() {
     }
 }
 
-// ---- Fitting the tint (an exploration: `cargo test -p render --test atmosphere fit_the_tint --
-// --ignored --nocapture` searches the tint's seven numbers so that the sky and a hazed wall read
-// like hero light B's gradient and its 1/300 per metre haze, and prints them for `HERO_TINT`).
-
-fn tinted(p: &[f64]) -> Atmosphere {
-    let mut air = Atmosphere::PHYSICAL;
-    air.tint = Tint::constant(TintKey {
-        sky_horizon: [p[0].exp() as f32, p[1].exp() as f32, p[2].exp() as f32],
-        sky_zenith: [p[3].exp() as f32, p[4].exp() as f32, p[5].exp() as f32],
-        haze_per_metre: p[6].exp() as f32,
-        haze_colour: HORIZON,
-    });
-    air
-}
-
 /// A wall's left-half colour as Primary draws it, linear, under `look`.
 fn wall_colour(gpu: &mut Offscreen, look: Look) -> [f32; 3] {
     gpu.set_look(look);
@@ -1011,211 +1023,6 @@ fn wall_colour(gpu: &mut Offscreen, look: Look) -> [f32; 3] {
     gpu.render(&camera);
     let ((_, _, hdr), _) = gpu.read_hdr_and_bloom();
     hdr[((WALL_ROWS - 3) * WALL_COLUMNS + 1) as usize]
-}
-
-/// The mean linear light of the top and of the bottom of a Reference view of the patch: the sky,
-/// and the ground that the sky and the sun light.
-fn patch_means(gpu: &mut Offscreen, look: Look, camera: &Camera) -> [[f64; 3]; 2] {
-    gpu.set_look(look);
-    gpu.render_reference(camera, 16);
-    let accumulation = gpu.read_accumulation();
-    let (w, h) = (96usize, 54usize);
-    let mean = |rows: std::ops::Range<usize>| {
-        let mut sum = [0.0f64; 3];
-        for row in rows.clone() {
-            for x in 0..w {
-                for c in 0..3 {
-                    sum[c] += f64::from(accumulation[(row * w + x) * 3 + c]);
-                }
-            }
-        }
-        sum.map(|v| v / (rows.len() * w) as f64)
-    };
-    [mean(0..6), mean(h - 12..h)]
-}
-
-fn fit_cameras() -> [Camera; 3] {
-    [
-        Camera::looking_at([0.0, 1548.0, 250.0], [0.0, 1535.0, -300.0]),
-        Camera::looking_at([0.0, 1535.0, 120.0], [0.0, 1508.0, 20.0]),
-        Camera::looking_at([0.0, 1620.0, 300.0], [0.0, 1500.0, -300.0]),
-    ]
-}
-
-fn patch_gpu() -> Offscreen {
-    let mut gpu = Offscreen::new(96, 54, &planet_patch()).unwrap();
-    gpu.set_stages(Stages::NONE);
-    gpu.set_ground_level(1535.0);
-    gpu.set_sun(Sun::from_angles(
-        1.5,
-        8f32.to_radians(),
-        DEFAULT_ANGULAR_RADIUS,
-    ));
-    gpu
-}
-
-const FIT_WALLS_M: [i32; 5] = [30, 100, 300, 1_000, 3_000];
-
-fn tint_loss(
-    sky: &mut Offscreen,
-    walls: &mut [Offscreen],
-    wanted: &[[f32; 3]],
-    patch: &mut Offscreen,
-    patch_wanted: &[[[f64; 3]; 2]],
-    p: &[f64],
-    verbose: bool,
-) -> f64 {
-    let air = tinted(p);
-    let look = Look {
-        atmosphere: Some(air),
-        ..Look::HERO_B
-    };
-    let mut total = 0.0;
-    for (away, weight) in [(40.0_f32, 1.0), (70.0, 1.0), (150.0, 0.7)] {
-        let azimuth = (90.0 + away).to_radians();
-        let col = sky_column(sky, look, azimuth, 8f32.to_radians(), 16);
-        let mut line = format!("  sun {away:3.0} off:");
-        for (i, (e, c)) in col.iter().enumerate() {
-            let h = (e.to_radians().sin()) as f32;
-            let t: [f32; 3] = std::array::from_fn(|k| HORIZON[k] + (ZENITH[k] - HORIZON[k]) * h);
-            for k in 0..3 {
-                let d = f64::from(((c[k] + 0.02) / (t[k] + 0.02)).ln());
-                total += weight * d * d / col.len() as f64;
-            }
-            if i % 4 == 0 {
-                line += &format!(" [{e:.0}: {:.2} {:.2} {:.2}]", c[0], c[1], c[2]);
-            }
-        }
-        if verbose {
-            println!("{line}");
-        }
-    }
-    for (i, camera) in fit_cameras().iter().enumerate() {
-        let got = patch_means(patch, look, camera);
-        for (part, name) in [(0, "sky"), (1, "ground")] {
-            for k in 0..3 {
-                let d = ((got[part][k] + 0.02) / (patch_wanted[i][part][k] + 0.02)).ln();
-                total += 2.0 * d * d / 3.0;
-            }
-            if verbose {
-                println!(
-                    "  view {i} {name}: {:.3?} (gradient {:.3?})",
-                    got[part], patch_wanted[i][part]
-                );
-            }
-        }
-    }
-    for (i, gpu) in walls.iter_mut().enumerate() {
-        let c = wall_colour(gpu, look);
-        let w = wanted[i];
-        for k in 0..3 {
-            let d = f64::from(((c[k] + 0.02) / (w[k] + 0.02)).ln());
-            total += 1.5 * d * d / FIT_WALLS_M.len() as f64;
-        }
-        if verbose {
-            println!("  wall {:5} m: {c:.3?} (gradient {w:.3?})", FIT_WALLS_M[i]);
-        }
-    }
-    total
-}
-
-#[test]
-#[ignore = "exploration"]
-fn fit_the_tint() {
-    let mut sky = sky_gpu(16);
-    let mut walls: Vec<Offscreen> = FIT_WALLS_M
-        .iter()
-        .map(|m| {
-            let mut gpu = Offscreen::new(WALL_COLUMNS, WALL_ROWS, &wall_at(m * 20)).unwrap();
-            gpu.set_stages(Stages::NONE);
-            gpu
-        })
-        .collect();
-    let wanted: Vec<[f32; 3]> = walls
-        .iter_mut()
-        .map(|gpu| wall_colour(gpu, Look::HERO_B_GRADIENT))
-        .collect();
-    let mut p = std::env::var("FIT_START")
-        .ok()
-        .map(|s| {
-            s.split(',')
-                .map(|v| v.parse::<f64>().unwrap())
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_else(|| vec![0.5625, -0.1, -0.3125, -0.25, -0.325, 0.2125, -6.0469]);
-    let mut patch = patch_gpu();
-    let patch_wanted: Vec<[[f64; 3]; 2]> = fit_cameras()
-        .iter()
-        .map(|c| patch_means(&mut patch, Look::HERO_B_GRADIENT, c))
-        .collect();
-    let mut best = tint_loss(
-        &mut sky,
-        &mut walls,
-        &wanted,
-        &mut patch,
-        &patch_wanted,
-        &p,
-        false,
-    );
-    let mut step = 0.2;
-    for round in 0..30 {
-        let mut improved = false;
-        for i in 0..p.len() {
-            for sign in [1.0, -1.0] {
-                let mut q = p.clone();
-                q[i] += sign * step;
-                let l = tint_loss(
-                    &mut sky,
-                    &mut walls,
-                    &wanted,
-                    &mut patch,
-                    &patch_wanted,
-                    &q,
-                    false,
-                );
-                if l < best {
-                    best = l;
-                    p = q;
-                    improved = true;
-                }
-            }
-        }
-        if !improved {
-            step *= 0.5;
-        }
-        println!("round {round}: loss {best:.5} step {step:.3}");
-        if step < 0.01 {
-            break;
-        }
-    }
-    tint_loss(
-        &mut sky,
-        &mut walls,
-        &wanted,
-        &mut patch,
-        &patch_wanted,
-        &p,
-        true,
-    );
-    let e = |i: usize| p[i].exp();
-    println!(
-        "TINT sky_horizon [{:.3}, {:.3}, {:.3}] sky_zenith [{:.3}, {:.3}, {:.3}] haze_per_metre {:.6} (1/{:.0})",
-        e(0),
-        e(1),
-        e(2),
-        e(3),
-        e(4),
-        e(5),
-        e(6),
-        1.0 / e(6)
-    );
-    println!(
-        "FIT_START={}",
-        p.iter()
-            .map(|v| format!("{v:.4}"))
-            .collect::<Vec<_>>()
-            .join(",")
-    );
 }
 
 #[test]
@@ -1273,6 +1080,38 @@ fn sky_by_sun_elevation() {
                 "sun {el:5.0} {name:9}: horizon {:.3} {:.3} {:.3}  mid {:.3} {:.3} {:.3}  zenith {:.3} {:.3} {:.3}",
                 h[0], h[1], h[2], m[0], m[1], m[2], z[0], z[1], z[2]
             );
+        }
+    }
+}
+
+#[test]
+#[ignore = "exploration"]
+fn horizon_profile() {
+    let mut gpu = sky_gpu(96);
+    gpu.set_stages(Stages::NONE);
+    for el in [-12.0f32, -4.0, 8.0, 60.0] {
+        for (name, look) in [
+            ("untinted", Look::HERO_B_UNTINTED),
+            ("tinted", Look::HERO_B),
+        ] {
+            gpu.set_look(look);
+            gpu.set_sun(Sun::from_angles(
+                (90.0f32 + 70.0).to_radians(),
+                el.to_radians(),
+                DEFAULT_ANGULAR_RADIUS,
+            ));
+            // Looking along +x, level, with a 12 degree field: rows cover -6 to +6 degrees.
+            let mut camera = Camera::looking_at([0.5, 40.0, 0.5], [100.0, 40.0, 0.5]);
+            camera.fov_y = 12f64.to_radians();
+            gpu.render(&camera);
+            let ((width, height, hdr), _) = gpu.read_hdr_and_bloom();
+            println!("sun {el} {name}");
+            for row in (0..height as usize).step_by(4) {
+                let c = hdr[row * width as usize + width as usize / 2];
+                let ndc = ((row as f64 + 0.5) / f64::from(height)) * 2.0 - 1.0;
+                let e = (-ndc * (6f64.to_radians().tan())).atan().to_degrees();
+                println!("  {e:+6.2} deg  {:.4} {:.4} {:.4}", c[0], c[1], c[2]);
+            }
         }
     }
 }

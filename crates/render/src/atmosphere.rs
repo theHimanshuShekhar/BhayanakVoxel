@@ -51,17 +51,21 @@ pub const PLANET_RADIUS_M: f32 = 320_000.0;
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct TintKey {
     /// What the sky's radiance is multiplied by at the horizon and at the zenith (linear RGB), and
-    /// between them by the sine of the elevation, as the gradient it replaces blended its two
-    /// colours. Below the horizon it is the horizon's. It applies to the sky seen by the camera, to
-    /// the sun-free sky that surfaces see (so the light that bounces off the sky is tinted too), and
-    /// to the light the air adds along a camera ray to a surface (by that ray's elevation).
+    /// between them by a smoothstep of the sine of the elevation (a soft, wide gradient). Below the
+    /// horizon it is the horizon's. It applies to the sky seen by the camera, to the sun-free sky
+    /// that surfaces see (so the light that bounces off the sky is tinted too), and to the light the
+    /// air adds along a camera ray to a surface (by that ray's elevation).
     pub sky_horizon: [f32; 3],
     pub sky_zenith: [f32; 3],
-    /// An extra haze on the camera ray to a surface, as the gradient had: `1 - exp(-haze * d)` of
-    /// `haze_colour` fades in over the `d` metres the ray travels in air, whatever the air's
-    /// density there. The physical air is the same; this is added to it. 0 for none.
+    /// An extra haze on the camera ray to a surface: `1 - exp(-haze * d)` of what is behind it is
+    /// replaced by the sky in the ray's direction over the `d` metres the ray travels in air,
+    /// whatever the air's density there, so that far ground dissolves into the sky with no line
+    /// between them. The physical air is the same; this is added to it. 0 for none.
     pub haze_per_metre: f32,
-    pub haze_colour: [f32; 3],
+    /// How far the tinted light is taken toward the grey of the same luminance, 0 to 1: 0 is the
+    /// tint's own colours, and more is paler, milkier, more pastel. It applies wherever the tint
+    /// does.
+    pub pastel: f32,
 }
 
 impl TintKey {
@@ -70,7 +74,7 @@ impl TintKey {
         sky_horizon: [1.0; 3],
         sky_zenith: [1.0; 3],
         haze_per_metre: 0.0,
-        haze_colour: [0.0; 3],
+        pastel: 0.0,
     };
 
     fn lerp(self, other: TintKey, t: f32) -> TintKey {
@@ -79,34 +83,34 @@ impl TintKey {
             sky_horizon: mix3(self.sky_horizon, other.sky_horizon),
             sky_zenith: mix3(self.sky_zenith, other.sky_zenith),
             haze_per_metre: self.haze_per_metre + (other.haze_per_metre - self.haze_per_metre) * t,
-            haze_colour: mix3(self.haze_colour, other.haze_colour),
+            pastel: self.pastel + (other.pastel - self.pastel) * t,
         }
     }
 }
 
 /// The tint by the time of day (the owner's direction of 2026-11-18: more violet, mauve and purple
-/// when it is dark, hazier and more orange in the sun): four settings at four heights of the sun,
+/// when it is dark, hazier and more orange in the sun): five settings at five heights of the sun,
 /// blended between by a smoothstep of the sun's elevation, so nothing pops as the sun moves. The
 /// sun's elevation is the one number that picks the setting, so it is a function of the frame's
 /// sun alone, and the tables (which are the same in both views) hold it.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Tint {
-    /// The settings at [`Tint::ELEVATIONS`]: night, dusk, hero light B's sun, and the day's.
-    pub keys: [TintKey; 4],
+    /// The settings at [`Tint::ELEVATIONS`]: night, dusk, hero light B's sun, the afternoon and midday.
+    pub keys: [TintKey; 5],
 }
 
 impl Tint {
-    /// The sun's elevations of the four settings, in degrees: at or under the first it is night
-    /// (violet), at the second dusk (mauve), at the third hero light B's sun (the gradient's mauve
-    /// and peach), and at or over the fourth it is day (a hazy orange).
-    pub const ELEVATIONS: [f32; 4] = [-8.0, 0.0, 8.0, 30.0];
+    /// The sun's elevations of the settings, in degrees: at or under the first it is night (violet),
+    /// at the second dusk (mauve), at the third hero light B's sun (the gradient's mauve and peach),
+    /// at the fourth the afternoon, and at or over the fifth midday (a hazy, light orange).
+    pub const ELEVATIONS: [f32; 5] = [-8.0, 0.0, 8.0, 28.0, 60.0];
 
     /// No tint: the physical tables.
     pub const NONE: Tint = Tint::constant(TintKey::NONE);
 
     /// The same setting at every height of the sun.
     pub const fn constant(key: TintKey) -> Tint {
-        Tint { keys: [key; 4] }
+        Tint { keys: [key; 5] }
     }
 
     /// The setting for a sun whose cosine with the up is `mu_s`: continuous in it.
@@ -116,52 +120,59 @@ impl Tint {
         if elevation <= e[0] {
             return self.keys[0];
         }
-        for i in 0..3 {
+        for i in 0..4 {
             if elevation <= e[i + 1] {
                 let x = (elevation - e[i]) / (e[i + 1] - e[i]);
                 return self.keys[i].lerp(self.keys[i + 1], x * x * (3.0 - 2.0 * x));
             }
         }
-        self.keys[3]
+        self.keys[4]
     }
 }
 
-/// The hero tint (see [`Atmosphere::HERO`]).
+/// The hero tint (see [`Atmosphere::HERO`]). The look is hazy, soft and pastel (the owner's
+/// direction of 2026-11-18): every setting takes its colours part of the way to grey, lifting them
+/// toward white, and has more haze than the gradient's 1/300 per metre.
 const HERO_TINT: Tint = Tint {
     keys: [
-        // Night: the sky and the haze lean violet. Found by eye on the look-dev sheet's time-of-day
-        // strip (the physical sky is a dim blue-grey).
+        // Night: the sky and the haze lean violet, a pastel violet and lilac. Set by eye on the
+        // look-dev sheet's time-of-day strip (the physical sky is a dim blue-grey).
         TintKey {
-            sky_horizon: [0.8, 0.28, 1.4],
-            sky_zenith: [0.35, 0.13, 0.8],
-            haze_per_metre: 1.0 / 400.0,
-            haze_colour: [0.14, 0.07, 0.18],
+            sky_horizon: [1.0, 0.45, 1.8],
+            sky_zenith: [0.5, 0.25, 1.2],
+            haze_per_metre: 1.0 / 300.0,
+            pastel: 0.35,
         },
-        // Dusk: mauve and purple.
+        // Dusk: pastel mauve and purple.
         TintKey {
-            sky_horizon: [1.6, 0.7, 1.5],
-            sky_zenith: [0.7, 0.35, 1.0],
-            haze_per_metre: 1.0 / 360.0,
-            haze_colour: [0.30, 0.15, 0.22],
+            sky_horizon: [1.8, 0.85, 1.7],
+            sky_zenith: [0.8, 0.45, 1.15],
+            haze_per_metre: 1.0 / 290.0,
+            pastel: 0.38,
         },
-        // Hero light B's sun (8 degrees), fitted by `fit_the_tint`: warmer at the horizon, and
-        // bluer overhead, than the air makes it (an 8-degree sun on a thick shell of air gives a
-        // pale, cool sky where the gradient was mauve), and an extra haze on top of the air's own
-        // 35 m layer of it (1/300 per metre at the ground in all), fading to the gradient's horizon
-        // colour as it did.
+        // Hero light B's sun (8 degrees): warmer at the horizon, and bluer overhead, than the air
+        // makes it (an 8-degree sun on a thick shell of air gives a pale, cool sky where the
+        // gradient was mauve). Fitted to the gradient before the soft, pastel look; the pastel and
+        // the haze are set by eye.
         TintKey {
             sky_horizon: [1.916, 0.928, 0.687],
             sky_zenith: [0.769, 0.714, 1.206],
-            haze_per_metre: 1.0 / 342.0,
-            haze_colour: [1.0, 0.55, 0.38],
+            haze_per_metre: 1.0 / 270.0,
+            pastel: 0.3,
         },
-        // Day: a hazier, warmer sky, not a clear blue one: an orange horizon, a pale warm zenith,
-        // and a denser orange haze.
+        // The afternoon: a warm, hazy sky, not a clear blue one.
         TintKey {
-            sky_horizon: [1.9, 1.0, 0.55],
-            sky_zenith: [1.7, 1.0, 0.7],
-            haze_per_metre: 1.0 / 180.0,
-            haze_colour: [2.0, 1.1, 0.55],
+            sky_horizon: [4.2, 1.8, 0.7],
+            sky_zenith: [3.8, 1.5, 0.65],
+            haze_per_metre: 1.0 / 200.0,
+            pastel: 0.2,
+        },
+        // Midday: a light, hazy orange, peach and apricot, with the most haze.
+        TintKey {
+            sky_horizon: [5.0, 2.1, 0.8],
+            sky_zenith: [5.0, 1.8, 0.65],
+            haze_per_metre: 1.0 / 160.0,
+            pastel: 0.15,
         },
     ],
 };
@@ -223,9 +234,9 @@ impl Atmosphere {
         tint: Tint::NONE,
     };
 
-    /// The air of hero light B: [`Atmosphere::PHYSICAL`] with the owner's tint (see [`Tint`]), fitted by
-    /// `fit_the_tint` in `tests/atmosphere.rs` so that the hero views read like the gradient and
-    /// haze of #148 and #202 (the look-dev sheet shows today's gradient, the untinted air and this).
+    /// The air of hero light B: [`Atmosphere::PHYSICAL`] with the owner's tint (see [`Tint`]), which
+    /// by the hero sun reads like the gradient and haze of #148 and #202, softer and paler (the
+    /// look-dev sheet shows today's gradient, the untinted air and this).
     pub const HERO: Atmosphere = Atmosphere {
         tint: HERO_TINT,
         ..Self::PHYSICAL
@@ -323,7 +334,6 @@ pub struct AtmosphereUniform {
     ground: [f32; 4],
     tint_horizon: [f32; 4],
     tint_zenith: [f32; 4],
-    tint_haze: [f32; 4],
 }
 
 impl Atmosphere {
@@ -351,8 +361,7 @@ impl Atmosphere {
             sun_light: v3(self.sun_light, 0.0),
             ground: v3(self.ground_albedo, 0.0),
             tint_horizon: v3(tint.sky_horizon, tint.haze_per_metre),
-            tint_zenith: v3(tint.sky_zenith, 0.0),
-            tint_haze: v3(tint.haze_colour, 0.0),
+            tint_zenith: v3(tint.sky_zenith, tint.pastel),
         }
     }
 }
@@ -822,7 +831,7 @@ mod tests {
     #[test]
     fn the_uniform_is_the_size_the_shader_declares() {
         // Twelve vec4s: `Atmo` in atmosphere_model.wgsl.
-        assert_eq!(size_of::<AtmosphereUniform>(), 12 * 16);
+        assert_eq!(size_of::<AtmosphereUniform>(), 11 * 16);
     }
 
     #[test]

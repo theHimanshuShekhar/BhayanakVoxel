@@ -1453,12 +1453,12 @@ is up, blended by the sun's elevation (ADR 0005's sky row). The display's auto-e
 image, so the night's brightness is evened out and what the strip shows is the colour. The sun is the same
 70 degrees from each shot's forward; only its height changes.
 
-The tint's hero setting (the 8-degree one of the four in `HERO_TINT` in `atmosphere.rs`) comes from `fit_the_tint` in
-`crates/render/tests/atmosphere.rs` (`cargo test -p render --test atmosphere fit_the_tint -- --ignored
---nocapture`, about 3 minutes on lavapipe): it searches them so that the sky columns, the sky and ground
-of three Reference views of the test Planet's patch, and a wall fading into the haze at 30 m to 3 km read
-like the gradient and its 1/300 per metre haze. It prints what to put in the hero setting of `HERO_TINT`; the night, dusk and day settings are set by eye
-on the strip.
+The tint's five settings (`HERO_TINT` in `atmosphere.rs`) were set by eye on the strip: change them, rerun
+`client lookdev --out DIR --atmosphere --shot canyon --shot forest` (about 3 minutes at 480x270 and 8 samples on
+lavapipe: `--shot` picks the shots whose names contain it), and look at the strip. `cargo test -p render
+--test atmosphere sky_by_sun_elevation -- --ignored --nocapture` prints the sky's linear colour at the horizon,
+half way up and overhead for sun elevations from -12 to 60 degrees, untinted and tinted, and `horizon_profile`
+prints the rows of a level view through the horizon.
 
 ## Tests
 

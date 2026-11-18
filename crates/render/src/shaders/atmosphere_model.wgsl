@@ -38,11 +38,10 @@ struct Atmo {
     // The ground's albedo for the multiple scattering's bounce off it, rgb.
     ground: vec4<f32>,
     // The look's tint (atmosphere.rs `Tint`): what the sky's radiance is multiplied by at the
-    // horizon (rgb) and the extra haze's density per metre (w), at the zenith (rgb), and the colour
-    // the extra haze fades to (rgb).
+    // horizon (rgb) and the extra haze's density per metre (w), at the zenith (rgb), and how far
+    // the tinted light is taken toward grey, which makes it pastel (w).
     tint_horizon: vec4<f32>,
     tint_zenith: vec4<f32>,
-    tint_haze: vec4<f32>,
 }
 
 // The tables' sizes. Keep in step with atmosphere.rs.
@@ -71,10 +70,15 @@ fn from_sub_uv(u: f32, n: f32) -> f32 {
     return (u * n - 0.5) / (n - 1.0);
 }
 
-// What the look's tint multiplies the sky's radiance by in a direction whose cosine with the up is
-// `mu` (the sine of its elevation): the horizon's at and below the horizon, the zenith's overhead.
-fn sky_tint(mu: f32) -> vec3<f32> {
-    return mix(atmo.tint_horizon.xyz, atmo.tint_zenith.xyz, clamp(mu, 0.0, 1.0));
+// The look's tint on the sky's radiance `l` in a direction whose cosine with the up is `mu` (the
+// sine of its elevation): `l` multiplied by the horizon's colour at and below the horizon, by the
+// zenith's overhead, and by a smoothstep of the sine between (a soft, wide gradient, with no band
+// at the horizon), and then taken part of the way to the grey of the same luminance, which is what
+// makes the sky milky and pastel.
+fn tint_sky(l: vec3<f32>, mu: f32) -> vec3<f32> {
+    let s = clamp(mu, 0.0, 1.0);
+    let c = l * mix(atmo.tint_horizon.xyz, atmo.tint_zenith.xyz, s * s * (3.0 - 2.0 * s));
+    return mix(c, vec3<f32>(dot(c, vec3<f32>(0.2126, 0.7152, 0.0722))), atmo.tint_zenith.w);
 }
 
 // The altitude of radius r: below the ground it is the ground's.
@@ -204,6 +208,25 @@ fn horizon_angles(r: f32) -> vec2<f32> {
     let ground_distance = sqrt(max((r - bottom) * (r + bottom), 0.0));
     let beta = acos(clamp(ground_distance / r, 0.0, 1.0));
     return vec2<f32>(beta, ATMO_PI - beta);
+}
+
+// How far short of the horizon, in radians, the sky's colour is held: the rays that graze the
+// horizon cross the most air at the ground and are a thin line brighter (or darker) than the sky a
+// degree above them, and a hard line is not what the look wants of a horizon.
+const HORIZON_SOFT: f32 = 0.012;
+
+// The angle from the zenith to look the sky up at instead of `angle`, from radius r: the same, but
+// held HORIZON_SOFT short of the horizon.
+fn soft_angle(r: f32, angle: f32) -> f32 {
+    return min(angle, horizon_angles(r).y - HORIZON_SOFT);
+}
+
+// How much of the sky below the horizon is the sky at the horizon, as a ground camera sees it (the
+// ground is not in the table: where nothing is drawn there, the air is the horizon's too, and the
+// ground dissolves into it), 1 near the ground and 0 high over it, where below the horizon is the
+// planet seen through its air.
+fn horizon_fill() -> f32 {
+    return 1.0 - smoothstep(300.0, 3000.0, atmo.radii.z - atmo.radii.x);
 }
 
 fn sky_view_uv(r: f32, mu: f32, dphi: f32) -> vec2<f32> {

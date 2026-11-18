@@ -49,7 +49,7 @@ const STRIP_SHOTS: [&str; 2] = ["forest floor", "canyon with haze"];
 /// view has no light sampling for emissives): four times the samples.
 const CAVE_SPP_FACTOR: u32 = 4;
 
-const USAGE: &str = "usage: client lookdev --out DIR [--size WxH] [--spp N] [--compare DIR] [--atmosphere] [--untinted]\n  \
+const USAGE: &str = "usage: client lookdev --out DIR [--size WxH] [--spp N] [--compare DIR] [--atmosphere] [--untinted] [--shot NAME]...\n  \
 the 4090: client.exe lookdev --out DIR [--compare OLD_SHEET_DIR]   (1280x720, 64 spp)\n  \
 --compare: the folder of the #148 sheet; each shot's OLD/NN-shot/hero-hero-b.png is shown first\n  \
 --atmosphere (#53): instead of the combinations, each shot three times at the game's settings, hero light B\n  \
@@ -57,6 +57,7 @@ with today's gradient sky and haze, then with the untinted atmosphere, then with
 hero tint (the game's), in both views; then a time-of-day strip of the forest floor and the canyon, the\n  \
 Reference view at sun elevations of -12, -4, 0, 8, 25 and 60 degrees, untinted and tinted\n  \
 (on lavapipe: client lookdev --out DIR --atmosphere --size 480x270 --spp 16)\n  \
+--shot: only the shots whose name has NAME in it (e.g. --shot canyon --shot forest), for a quick look\n  \
 --untinted: the other sheets (and the stills) with the physical atmosphere and no hero tint\n  \
 a smoke test on any device: client lookdev --out DIR --short";
 
@@ -135,6 +136,8 @@ pub struct Options {
     /// The other sheets with the physical atmosphere and no hero tint ([`Look::HERO_B_UNTINTED`]); the
     /// atmosphere's sheet shows both whatever this is.
     pub untinted: bool,
+    /// Only the shots whose names contain one of these (all of them if there are none).
+    pub only: Vec<String>,
     /// A smoke test: the test Planet (the shots' places are not there: the images are of nothing
     /// in particular), two shots, tiny.
     pub short: bool,
@@ -149,6 +152,7 @@ fn parse(args: impl IntoIterator<Item = String>) -> Result<Options, String> {
         descent_frames: 12,
         atmosphere: false,
         untinted: false,
+        only: Vec::new(),
         short: false,
     };
     let (mut have_out, mut size, mut spp) = (false, None, None);
@@ -173,6 +177,7 @@ fn parse(args: impl IntoIterator<Item = String>) -> Result<Options, String> {
             "--short" => options.short = true,
             "--atmosphere" => options.atmosphere = true,
             "--untinted" => options.untinted = true,
+            "--shot" => options.only.push(value("a name")?),
             "--help" | "-h" => return Err(USAGE.to_string()),
             other => return Err(format!("unknown argument {other}\n{USAGE}")),
         }
@@ -449,7 +454,19 @@ pub fn run(options: &Options) -> Result<PathBuf, Box<dyn Error>> {
         eprintln!("making the 320 km world map (about 25 s)...");
         let planet = Planet::new(WorldMap::generate(crate::SEED, WORLD_MAP_SIZE));
         let first = crate::loader::GUARD_FIRST;
-        (planet, first, (0..SHOTS.len()).collect())
+        let shots: Vec<usize> = (0..SHOTS.len())
+            .filter(|&n| {
+                options.only.is_empty()
+                    || options
+                        .only
+                        .iter()
+                        .any(|o| SHOTS[n].name.contains(o.as_str()))
+            })
+            .collect();
+        if shots.is_empty() {
+            return Err(format!("no shot has {:?} in its name", options.only).into());
+        }
+        (planet, first, shots)
     };
     let (w, h) = options.size;
     let d0 = f64::from(h) / (2.0 * 35f64.to_radians().tan());
@@ -897,6 +914,13 @@ mod tests {
         assert_eq!((o.size, o.spp), ((640, 360), 16));
         let o = parse(args(&["--out", "d", "--short"])).unwrap();
         assert!(o.short && o.size.0 < 100 && o.spp == 1);
+        let o = parse(args(&[
+            "--out", "d", "--shot", "canyon", "--shot", "forest",
+        ]))
+        .unwrap();
+        assert_eq!(o.only, ["canyon", "forest"]);
+        assert!(parse(args(&["--out", "d"])).unwrap().only.is_empty());
+        assert!(parse(args(&["--out", "d", "--shot"])).is_err());
         assert!(parse(args(&[])).is_err(), "--out is required");
         assert!(parse(args(&["--out", "d", "--size", "big"])).is_err());
         assert!(parse(args(&["--out", "d", "--spp", "0"])).is_err());
