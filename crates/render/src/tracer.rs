@@ -11,6 +11,7 @@ use crate::atmosphere::{AtmosphereTables, AtmosphereView};
 use crate::batch::max_samples;
 use crate::camera::{Camera, CameraUniform};
 use crate::debug_view::DebugView;
+use crate::emitters::{Emitters, emissive_materials};
 use crate::gpu_materials;
 use crate::look::{Look, LookUniform};
 use crate::post::{self, Exposed, HDR_FORMAT, Metering, Post, Scratch, Stages};
@@ -140,6 +141,26 @@ pub struct ReferenceOptions {
     /// Haze on the bounce rays, as an upper bound of it: for the test that measures what ADR 0005's
     /// leaving it off is worth (#53). Never on in a view that is shown.
     pub bounce_haze: bool,
+    /// How the emissive Voxels are estimated (#54).
+    pub emitters: EmitterEstimator,
+}
+
+/// How the Reference estimates the light of emissive Voxels on a surface. The player's view is
+/// [`EmitterEstimator::Both`]; the other two are for the test that shows that the weights of the two
+/// estimators add up to 1, which is that all three have the same expected value (where every
+/// emitter is in the list of every surface that sees it).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum EmitterEstimator {
+    /// One emitter chosen from the cell's list and a direction over the solid angle it covers, and
+    /// the bounce ray that finds an emitter, weighed against each other (multiple importance
+    /// sampling).
+    #[default]
+    Both,
+    /// The bounce rays alone.
+    BounceOnly,
+    /// The emitters' own samples alone (an emitter that is not in the list of a surface is still
+    /// found by the bounce ray that hits it).
+    SamplesOnly,
 }
 
 /// How the Reference estimates the light of the atmosphere's sky on a surface. The player's view
@@ -172,11 +193,13 @@ pub enum Fault {
     ShortCap,
     /// The sky counted in full by both of its estimators: the weights add up to 2, not 1.
     SkyDoubleCount,
+    /// The emissive Voxels counted in full by both of theirs.
+    EmitterDoubleCount,
 }
 
 impl ReferenceOptions {
     /// The pipeline constants these are, as `pathtrace.wgsl` declares them.
-    fn constants(self) -> [(&'static str, f64); 6] {
+    fn constants(self) -> [(&'static str, f64); 7] {
         [
             ("NO_SHADOW_RAYS", f64::from(u8::from(self.no_shadow_rays))),
             ("FLAT_COLOURS", f64::from(u8::from(self.flat_colours))),
@@ -189,6 +212,7 @@ impl ReferenceOptions {
                     Fault::NoRescale => 2.0,
                     Fault::ShortCap => 3.0,
                     Fault::SkyDoubleCount => 4.0,
+                    Fault::EmitterDoubleCount => 5.0,
                 },
             ),
             (
@@ -200,6 +224,14 @@ impl ReferenceOptions {
                 },
             ),
             ("BOUNCE_HAZE", f64::from(u8::from(self.bounce_haze))),
+            (
+                "EMITTER_MODE",
+                match self.emitters {
+                    EmitterEstimator::Both => 0.0,
+                    EmitterEstimator::BounceOnly => 1.0,
+                    EmitterEstimator::SamplesOnly => 2.0,
+                },
+            ),
         ]
     }
 }
@@ -457,6 +489,11 @@ pub struct Tracer {
     frame_buffer: wgpu::Buffer,
     /// The Material table (see [`gpu_materials`]), which nothing changes after the upload.
     materials: wgpu::Buffer,
+    /// The emissive Voxels of the scene as lights (see [`crate::emitters`]): which Materials give
+    /// off light, the emitters of the scene as they were last found, and their buffer.
+    emissive: Vec<bool>,
+    emitters: Emitters,
+    emitter_buffer: wgpu::Buffer,
     camera_layout: wgpu::BindGroupLayout,
     primary: wgpu::ComputePipeline,
     reference: wgpu::ComputePipeline,
@@ -533,6 +570,19 @@ pub struct Tracer {
 
 /// The size of a chunk of the staging belt, in bytes: a patch is written to a few of them.
 const BELT_CHUNK: u64 = 4 << 20;
+
+/// Where the emitters' buffer is bound, in group 1 of the kernels that sample them (`emitters` in
+/// `emitters.wgsl`).
+pub(crate) const EMITTERS_BINDING: u32 = 18;
+
+/// The GPU buffer for `emitters`.
+fn emitter_buffer(device: &wgpu::Device, emitters: &Emitters) -> wgpu::Buffer {
+    device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("emitters"),
+        contents: bytemuck::cast_slice(&emitters.words),
+        usage: wgpu::BufferUsages::STORAGE,
+    })
+}
 
 pub(crate) fn layout_entry(binding: u32, ty: wgpu::BindingType) -> wgpu::BindGroupLayoutEntry {
     wgpu::BindGroupLayoutEntry {
@@ -903,6 +953,7 @@ impl Tracer {
                 layout_entry(4, buffer_binding(STORAGE_READ)),
                 layout_entry(5, storage_texture(GBUFFER_FORMAT)),
                 layout_entry(6, storage_texture(SURFACE_FORMAT)),
+                layout_entry(EMITTERS_BINDING, buffer_binding(STORAGE_READ)),
             ]
             .into_iter()
             .chain(AtmosphereTables::layout_entries())
@@ -1018,12 +1069,18 @@ impl Tracer {
             &scene_layout,
             &[],
         );
+        let emissive = emissive_materials(table);
+        let emitters = Emitters::of(scene, &emissive);
+        let emitter_buffer = emitter_buffer(device, &emitters);
         Ok(Self {
             scene: scene_buffers,
             scene_layout,
             camera_buffer,
             frame_buffer,
             materials,
+            emissive,
+            emitters,
+            emitter_buffer,
             camera_layout,
             primary,
             reference,
@@ -1061,6 +1118,23 @@ impl Tracer {
             peak_rebuild_bytes: 0,
             belt,
         })
+    }
+
+    /// Finds the emitters of `scene` again, and makes a new buffer of them if they are not what the
+    /// last buffer held. The scan reads the packed level 0 (a few thousand words in most scenes) and
+    /// is made on every update of the scene, so a dig that opens an emitter to the room is seen by
+    /// the next frame.
+    fn update_emitters(&mut self, device: &wgpu::Device, scene: &Scene) {
+        let emitters = Emitters::of(scene, &self.emissive);
+        if emitters != self.emitters {
+            self.emitter_buffer = emitter_buffer(device, &emitters);
+            self.emitters = emitters;
+        }
+    }
+
+    /// The emitters of the scene as the shaders have them, for tests.
+    pub fn emitters(&self) -> &Emitters {
+        &self.emitters
     }
 
     /// Records the primary visibility pass: one ray per pixel of the lit image of `target`, through
@@ -1351,6 +1425,7 @@ impl Tracer {
     ) -> Result<()> {
         self.restart_reference();
         self.smooth_end = smooth_end(scene);
+        self.update_emitters(device, scene);
         // Counted where each write is made, not summed from the patch's cost: [`upload_cost`] is
         // the other count, and the two are compared. Both go over `RingPatch::copies()`, so the
         // comparison does not check that list (the stepped tests' `GpuCopy::assert_is` does).
@@ -1951,6 +2026,7 @@ impl Tracer {
                     binding: 6,
                     resource: wgpu::BindingResource::TextureView(&target.surface.view),
                 },
+                buffer_entry(EMITTERS_BINDING, &self.emitter_buffer),
             ]
             .into_iter()
             .chain(self.atmosphere.entries())

@@ -22,6 +22,15 @@
 // including the mirroring below. With the atmosphere off the sky has no samples and every escaped
 // ray counts in full, as it did before.
 //
+// The emissive Voxels (#54, emitters.wgsl) are lights that are sampled directly, as the sky is: at
+// every surface a third next-event estimate chooses one emitter from the bounded list of the cell the
+// surface is in, and a direction over the solid angle that the emitter's faces cover (so that a
+// close emitter makes no speckle), and counts it if nothing is in the way. The bounce ray that
+// finds an emitter is weighed against that sample by the balance heuristic, with the true density of
+// the sampling (`emitter_hit_pdf`) and of the bounce, so the weights add up to 1; an emitter that
+// the list does not hold is found by the bounce rays alone and counted in full. A room that is lit
+// by one emissive Voxel and nothing else converges for that reason.
+//
 // The first surface of a path (the one the camera sees) is shaded with the smooth computed normal
 // of #202 where the Material has one (`shading_normal`, common.wgsl): the sun's cosine and the
 // bounce's cosine-weighted direction use it, while the shadow ray, and a bounce that would go
@@ -58,11 +67,13 @@
 //   4s + 2, 4s + 3   the sun's disc at surface s                   (group s, slots 2 and 3)
 //   4s + 4, 4s + 5   the bounce direction at surface s             (group s + 1, slots 0 and 1)
 //   64 + 2s, 65 + 2s the sky's direction at surface s, s < 4       (groups 16 and 17)
+//   72 + 4s ... 75 + 4s the emitter at surface s: which box, which of its faces, and the two numbers
+//                    that place the point in the face, s < 4        (groups 18 to 21)
 // so each pair that is an integral of its own is a stratified pair, and the dimensions that
 // matter most come first. The sun's and the bounce's run to dimension 63, which is surface 14's
 // bounce and surface 15's sun; a deeper surface's are hashed random numbers. The roulette's coin at surface s is hashed
 // too (its own stream: a single number that nothing is gained by stratifying), and so are the sky's
-// directions from surface 4 on. A new term goes at the end of the list, not in the middle, or the
+// and the emitters' from surface 4 on. A new term goes at the end of the list, not in the middle, or the
 // pairs after it lose their stratification.
 
 @group(1) @binding(3) var<storage, read_write> accum: array<vec4<f32>>;
@@ -91,6 +102,12 @@ override SKY_MODE = 0u;
 // is the air at the ground, whose extinction is the most any segment of a path has (it thins with
 // height), and what it adds is the horizon's sky: an upper bound of the haze, not the air itself.
 override BOUNCE_HAZE = false;
+// How the emissive Voxels are estimated. 0: both estimators, weighed against each other, which is the
+// estimator. 1: bounce rays only (an emitter is found only by the bounce that hits it). 2: the
+// emitters' own samples only (where the list has the emitter: one the list does not hold is still
+// found by a bounce ray). The three have the same expected value wherever every emitter is in the
+// list of every surface that sees it, which a test holds: it is how the weights are shown to add up.
+override EMITTER_MODE = 0u;
 // A fault put into the estimator, to show that the tests that guard it can fail: a test that
 // cannot fail is not a test. 0 is none.
 override FAULT = 0u;
@@ -104,6 +121,8 @@ const FAULT_SHORT_CAP = 3u;
 const FAULT_SHORT_CAP_SURFACES = 190u;
 // The sky counted in full by both of its estimators.
 const FAULT_SKY_DOUBLE_COUNT = 4u;
+// The emitters counted in full by both of their estimators.
+const FAULT_EMITTER_DOUBLE_COUNT = 5u;
 
 // The most surfaces a path visits, the camera ray's first hit being the first.
 const MAX_DEPTH = 256u;
@@ -145,6 +164,13 @@ fn escape_weight(normal: vec3<f32>, face: vec3<f32>, dir: vec3<f32>) -> f32 {
     return bounce / (bounce + sky);
 }
 
+// The four numbers that choose an emitter at surface `depth`: which box, which of its faces and the
+// point in it. The first four surfaces' are a group each, 18 to 21; the rest's are hashed in groups of
+// their own.
+fn emitter_uniform(pixel_seed: u32, sample: u32, depth: u32) -> vec4<f32> {
+    return sample_group(pixel_seed, sample, select(0x2000u + depth, 18u + depth, depth < 4u), WHITE_NOISE);
+}
+
 // The two numbers that choose the sky's direction at surface `depth`: the first four surfaces' are
 // two slots each of the groups 16 and 17, the rest's are hashed, in groups of their own so that no
 // other dimension's numbers are repeated.
@@ -172,6 +198,8 @@ fn radiance(
     // The normals of the surface that the bounce ray left, for the weight of the sky it finds.
     var bounce_normal = vec3<f32>(0.0, 0.0, 1.0);
     var bounce_face = vec3<f32>(0.0, 0.0, 1.0);
+    // The Voxel that the bounce ray left, whose cell's list of emitters the ray found one of.
+    var bounce_voxel = vec3<i32>(0);
     var max_depth = MAX_DEPTH;
     if FAULT == FAULT_FOUR_BOUNCE_CUT {
         max_depth = FAULT_CUT_SURFACES;
@@ -218,7 +246,20 @@ fn radiance(
         // lighting: Per-Voxel colour variation
         let colour = surface_albedo(hit, FLAT_COLOURS);
         // lighting: Emissive Voxels
-        light += throughput * emission(hit.material) * f32(frame.light.z);
+        let emitted = emission(hit.material) * f32(frame.light.z);
+        // The light that a bounce ray finds on an emitter counts in full, unless the emitter's own
+        // sample could have found it from the surface the ray left (it is in that cell's list):
+        // then the two are weighed against each other. The camera's own ray (depth 0) sees it.
+        var emitted_weight = 1.0;
+        if depth > 0u && any(emitted > vec3<f32>(0.0)) && EMITTER_MODE != 1u && FAULT != FAULT_EMITTER_DOUBLE_COUNT {
+            let listed = emitter_hit_pdf(ray, hit, bounce_voxel);
+            if listed > 0.0 {
+                let bounce = bounce_pdf(bounce_normal, bounce_face, ray.dir);
+                emitted_weight = select(bounce / (bounce + listed), 0.0, EMITTER_MODE == 2u);
+            }
+        }
+        // lighting: Emissive Voxels
+        light += throughput * emitted * emitted_weight;
 
         // The mean of the cosine over the sun's cone is (1 + cos(radius)) / 2 of its value at the
         // cone's centre, so the sample's weight is divided by that: the estimate is then the
@@ -250,6 +291,28 @@ fn radiance(
             }
         }
 
+        // The emitters' next-event estimate: one box of the list of the cell this surface is in, and a
+        // direction over the solid angle it covers, which counts where the first thing the ray
+        // finds is that box. The surface gives back its colour times the emitter's light times the
+        // bounce's density of that direction, over the density that chose it (with the bounce's in
+        // the denominator too, unless it is the only estimator): the colour and the density the
+        // bounce ray that found the emitter would have had, so the weights add up to 1.
+        if frame.light.z != 0u && frame.light.y != 0u && EMITTER_MODE != 1u {
+            let at = leave(ray, hit, hit.normal);
+            let lamp = sample_emitter(at, hit.voxel, emitter_uniform(pixel_seed, sample, depth));
+            let toward = bounce_pdf(normal, hit.normal, lamp.dir);
+            if lamp.pdf > 0.0 && toward > 0.0 {
+                let shadow = leave(ray, hit, lamp.dir);
+                // lighting: Emissive Voxels
+                let seen = trace(shadow);
+                if seen.hit && hit_in_box(shadow, seen, emitter_box(lamp.box)) {
+                    let over = select(toward + lamp.pdf, lamp.pdf, EMITTER_MODE == 2u || FAULT == FAULT_EMITTER_DOUBLE_COUNT);
+                    // lighting: Emissive Voxels
+                    light += throughput * colour * emission(lamp.material) * (toward / over);
+                }
+            }
+        }
+
         throughput *= colour;
         if FAULT != FAULT_FOUR_BOUNCE_CUT && depth >= ROULETTE_FROM {
             let brightest = max(throughput.x, max(throughput.y, throughput.z));
@@ -268,6 +331,7 @@ fn radiance(
         group = sample_group(pixel_seed, sample, depth + 1u, WHITE_NOISE);
         bounce_normal = normal;
         bounce_face = hit.normal;
+        bounce_voxel = hit.voxel;
         var bounce_dir = cosine_hemisphere(normal, group.xy);
         // A smooth normal tilts the hemisphere, so a direction can point below the face: mirror it
         // about the face, which keeps it cosine-weighted about the face's side.

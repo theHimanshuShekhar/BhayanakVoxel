@@ -9,7 +9,9 @@
 
 use brick_store::{BrickStore, Material, VoxelCoord};
 use materials::MaterialTable;
-use render::{Camera, Fault, Offscreen, ReferenceOptions, Resolution, Scene, Sun};
+use render::{
+    Camera, EmitterEstimator, Fault, Offscreen, ReferenceOptions, Resolution, Scene, Sun,
+};
 
 const WALL: Material = Material(1);
 
@@ -211,6 +213,139 @@ fn the_closed_box_fails_with_the_roulettes_rescale_dropped() {
         );
         assert!(mean < 0.9, "albedo {albedo}: {mean}");
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Emitters
+
+const LAMP: Material = Material(2);
+
+/// A table of the wall (grey, albedo 0.6, gives off nothing) and a lamp (gives off 6 in every
+/// channel), flat.
+fn lit_room_table() -> MaterialTable {
+    let entry = |id: u32, name: &str, albedo: f32, emission: f32| {
+        format!(
+            r#"
+[[material]]
+id = {id}
+name = "{name}"
+category = "natural"
+colour = [{albedo}, {albedo}, {albedo}]
+noise_scale = 1.0
+hue_jitter = 0.0
+value_jitter = 0.0
+roughness = 1.0
+metalness = 0.0
+emissive = [1.0, 1.0, 1.0]
+emissive_intensity = {emission}
+transparency = 0.0
+ior = 1.0
+hardness = 1.0
+density = 1000.0
+fluid = "none"
+"#
+        )
+    };
+    MaterialTable::parse(&format!(
+        "{}{}",
+        entry(1, "wall", 0.6, 0.0),
+        entry(2, "lamp", 0.2, 6.0)
+    ))
+    .unwrap()
+}
+
+/// The closed box with two lamps in it: a block of 6 Voxels on the floor and a small one in the
+/// air, so that a Voxel's list holds two emitters, one of them hidden from part of the room by the
+/// other.
+fn a_room_with_two_lamps() -> Scene {
+    let mut store = BrickStore::new();
+    let outer = 24;
+    for x in -2..outer + 2 {
+        for y in -2..outer + 2 {
+            for z in -2..outer + 2 {
+                let inside =
+                    (0..outer).contains(&x) && (0..outer).contains(&y) && (0..outer).contains(&z);
+                if !inside {
+                    store.set(VoxelCoord([x, y, z]), Some(WALL));
+                }
+            }
+        }
+    }
+    for x in 9..15 {
+        for y in 0..6 {
+            for z in 9..15 {
+                store.set(VoxelCoord([x, y, z]), Some(LAMP));
+            }
+        }
+    }
+    for x in 19..21 {
+        for y in 12..14 {
+            for z in 3..5 {
+                store.set(VoxelCoord([x, y, z]), Some(LAMP));
+            }
+        }
+    }
+    Scene::new(&store, None)
+}
+
+/// The mean of the Reference's image of the room, in luminance, and its standard error, with the
+/// emitters' light counted by `emitters` and with `fault`.
+fn the_lamps_room(emitters: EmitterEstimator, fault: Fault, samples: u32) -> (f64, f64) {
+    let size = 24;
+    let mut offscreen = Offscreen::with_materials(
+        Resolution::native(size, size),
+        &a_room_with_two_lamps(),
+        &lit_room_table(),
+    )
+    .unwrap();
+    offscreen.use_legacy_light();
+    offscreen.set_reference_options(ReferenceOptions {
+        flat_colours: true,
+        emitters,
+        fault,
+        ..Default::default()
+    });
+    offscreen.set_sun(Sun::from_angles(0.5, 0.9, 0.04));
+    let camera = Camera::looking_at([3.0, 8.0, 21.0], [12.0, 3.0, 8.0]);
+    for _ in 0..samples {
+        offscreen.reference_sample(&camera);
+    }
+    mean_and_error(&offscreen.read_accumulation())
+}
+
+#[test]
+fn the_emitters_samples_and_the_bounce_rays_weigh_to_the_same_light_as_either_alone() {
+    // The light of the room is the same expected value whether the lamps' light is found by the
+    // rays that bounce into them, by the rays aimed at them, or by both weighed against each
+    // other (MIS): the estimators differ in noise, not in value.
+    const SAMPLES: u32 = 192;
+    let (both, e_both) = the_lamps_room(EmitterEstimator::Both, Fault::None, SAMPLES);
+    let (bounce, e_bounce) = the_lamps_room(EmitterEstimator::BounceOnly, Fault::None, SAMPLES);
+    let (samples, e_samples) = the_lamps_room(EmitterEstimator::SamplesOnly, Fault::None, SAMPLES);
+    eprintln!(
+        "both {both:.4} (+-{e_both:.4}), bounce {bounce:.4} (+-{e_bounce:.4}), samples \
+         {samples:.4} (+-{e_samples:.4})"
+    );
+    assert!(both > 0.1, "there is light to count: {both}");
+    for (name, other, error) in [
+        ("bounce rays only", bounce, e_bounce),
+        ("the emitters' samples only", samples, e_samples),
+    ] {
+        let d = (both - other).abs() / both;
+        assert!(
+            d < 0.03 && (both - other).abs() < 5.0 * (error + e_both),
+            "{name}: {other} against {both} (both) differ by {d}"
+        );
+    }
+}
+
+#[test]
+fn counting_the_emitters_in_full_twice_is_caught_by_that_test() {
+    const SAMPLES: u32 = 192;
+    let (honest, _) = the_lamps_room(EmitterEstimator::Both, Fault::None, SAMPLES);
+    let (doubled, _) = the_lamps_room(EmitterEstimator::Both, Fault::EmitterDoubleCount, SAMPLES);
+    let d = (doubled - honest) / honest;
+    assert!(d > 0.1, "the weights add up to 2 and the light is {d} over");
 }
 
 // ---------------------------------------------------------------------------------------------

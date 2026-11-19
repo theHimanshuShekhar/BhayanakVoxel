@@ -49,6 +49,8 @@ pub const PATHTRACE: &str = concat!(
     "\n",
     include_str!("shaders/sky.wgsl"),
     "\n",
+    include_str!("shaders/emitters.wgsl"),
+    "\n",
     include_str!("shaders/pathtrace.wgsl")
 );
 
@@ -264,7 +266,7 @@ mod tests {
 
     /// The bindings the shaders have, none of which is a source of light that has no row. A new
     /// one fails the check until it is added here with a decision.
-    const BINDINGS: [&str; 24] = [
+    const BINDINGS: [&str; 25] = [
         "scene",
         "table",
         "regions",
@@ -294,11 +296,15 @@ mod tests {
         "ground_sky",
         "sky_cdf",
         "sky_sampler",
+        // The emissive Voxels' boxes and the lists of them for each region (#54): the data of the
+        // lights, covered by the "Emissive Voxels" row. The light itself is read through
+        // `emission(`, which is marked wherever it is.
+        "emitters",
     ];
 
     /// The shader files, all of them known: a new one is neither of a view nor checked until it is
     /// listed here.
-    const FILES: [&str; 13] = [
+    const FILES: [&str; 14] = [
         "trace.wgsl",
         "common.wgsl",
         "sampling.wgsl",
@@ -314,6 +320,8 @@ mod tests {
         "sky.wgsl",
         "atmosphere_model.wgsl",
         "atmosphere.wgsl",
+        // The emissive Voxels as lights (#54): read by both views, checked with each.
+        "emitters.wgsl",
     ];
 
     /// Whether `line` (trimmed, code) contains `needle` as a call or member, not in `fn needle(`.
@@ -347,7 +355,7 @@ mod tests {
         ("sky.wgsl", include_str!("shaders/sky.wgsl")),
         ("shade.wgsl", include_str!("shaders/shade.wgsl")),
     ];
-    const PATHTRACE_FILES: [(&str, &str); 6] = [
+    const PATHTRACE_FILES: [(&str, &str); 7] = [
         ("trace.wgsl", include_str!("shaders/trace.wgsl")),
         ("common.wgsl", include_str!("shaders/common.wgsl")),
         ("sampling.wgsl", include_str!("shaders/sampling.wgsl")),
@@ -356,6 +364,7 @@ mod tests {
             include_str!("shaders/atmosphere_model.wgsl"),
         ),
         ("sky.wgsl", include_str!("shaders/sky.wgsl")),
+        ("emitters.wgsl", include_str!("shaders/emitters.wgsl")),
         ("pathtrace.wgsl", include_str!("shaders/pathtrace.wgsl")),
     ];
 
