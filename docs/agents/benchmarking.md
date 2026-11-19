@@ -1250,6 +1250,55 @@ run without it (0.178 ms at 1 ray on the 4090, 1440p) or from `--diag` runs of a
   the run's exit status). The phase's wall-clock time rose by the view's two truths and the
   unshadowed image at 1440p, which have no bounce rays and cost a fraction of the pit's.
 
+**Primary's GI against truth, the dig and the gates** (#54, `report.convergence.views[].gi`,
+`report.convergence.gi`, **schema 28**). The phase has a third view, **`room`**, the emissive
+room (a closed box of rock, 40 by 16 by 40 Voxels inside, with one block of warm light on the floor,
+seen from the opposite corner: `views::room`), which converges like the other two, with truths,
+the curve and the still run. In **each** view Primary is also drawn as the window draws it (traced at
+half the size, upscaled) and scored by FLIP (LDR, 67.02 ppd, mean and 99th percentile) against that
+view's **truth A**, which the view's own run made, at the output size:
+
+- **`gi.flat`** is Primary with **the flat ambient of 0.25** that main had (`set_flat_ambient(true)`):
+  the baseline, **before**. It is not a mode of the game, only here so that "no view moves further from
+  the Reference than main's Primary" has a number on the same build.
+- **`gi.gi`** is Primary with the radiance cache's GI: **after**.
+- Each has `first_frame` (the frame after the view is made, with a cache that has nothing in it) and
+  `settled` (after `gi.settle_frames` = 64 frames of a still camera, about a second at 60 Hz), each with `flip`
+  (`flip_mean`, `flip_p99`; null without FLIP) and `luminance_ratio` (the image's mean luminance in
+  linear light over truth A's image's, both 8-bit as the player sees them, 1 = as bright; it needs
+  no FLIP, so a short run has it).
+  `gi_not_further` is whether the settled GI image's FLIP mean is at most the flat one's.
+  The images are in `convergence/VIEW/primary-{flat,gi}-{first-frame,settled}.png`.
+- **`convergence.gi.edit`**, **the dig**: the room with a wall across it that the lamp's light does not
+  get through, seen from the dark side, warmed up for 90 frames; a gap of 160 Voxels is dug in
+  the wall the way the game applies an Edit (`Scene::update`, `Offscreen::update_scene`), and frames are
+  drawn at 60 Hz (a frame that takes longer than 1/60 s takes its own time). The image's mean
+  luminance after each frame is `luminance[]`, at `frame_ms[]` from the start of the update.
+  **`settle_ms`** is the time of the first frame after which the luminance stays within a tenth of the
+  change's size of where it ends up (null if the dig changed it by under 5 %); `before`, `after`,
+  `update_ms` (the Edit's CPU time) and `slow_frames` (frames over 60 Hz) say the rest.
+- **The gates** (`convergence.gi.gates`, held with FLIP only, **exit status 2** if any is over, `--no-fail`
+  silences it): `room-flip` (the room's settled GI image at FLIP mean 0.10 or under, 1440p, the ticket's;
+  #55 tightens it), `no-further:VIEW` (a view's settled GI image no further from truth than its flat
+  one, for each of the three), `settle` (the dig settles within 500 ms), and `reference-room` (the
+  room's Reference view reaches FLIP 0.05 within 0.25 s of the hold beginning, which the room's
+  `still.flip_within_target` already scores: direct emitter sampling). `gates.over` names those that
+  are over.
+- **Why gate the settled frame**: the first frame of a cold cache is the noisiest GI is, and the player
+  has it once, in the frame the scene is made; it is reported beside the settled one, not held.
+- **CI** (`--short`) draws all of it at a few dozen pixels with no FLIP: the report has the shape, the
+  dig's frames are there, no gate is held. The ignored test
+  `the_phase_with_flip_scores_both_views_and_writes_the_files` runs it with FLIP.
+- **For the 4090** (the ticket's acceptance, which is the orchestrator's to run): the baseline command
+  above. The numbers are `report.convergence.views[].gi`, `report.convergence.gi`, `passes[gi]` (its
+  1.5 ms budget, held by the run's exit status) and the printed `convergence, Primary against truth`
+  lines. The phase's wall-clock time rose by the room's truths and still run, and twelve FLIPs of
+  1440p images.
+
+The flight, the cave stills, the streaming mode, the real-time mode and the look-dev sheet draw Primary
+with the radiance cache (`set_flat_ambient(false)`), since that is the player's frame; the convergence
+views' Reference images do not depend on it.
+
 ## Reading the report
 
 ```
@@ -1384,7 +1433,7 @@ a budget off.
 The numbers are the per-stage frame budget of the rendering decision (#10), on the RTX 4090 at 1440p
 output. Only `primary` (Primary visibility, 1.0 ms), `shadows` (the sun's shadow rays, two a pixel, 0.4 ms, #52),
 `atmosphere` (the atmosphere's tables, 0.3 ms, #53), `upscale` (the TAAU pass, 0.5 ms) and the total (8.6 ms) are live today, as those are the passes that
-exist. The later stages (GI 1.5, reflections 0.7, glass 0.7, volumetrics 1.0, denoise 1.0, edits 1.0, post 0.5)
+exist, and `gi` (the radiance-cache GI, 1.5 ms, #54). The later stages (reflections 0.7, glass 0.7, volumetrics 1.0, denoise 1.0, edits 1.0, post 0.5)
 are in the file as comments: **whoever adds a pass uncomments its budget and names it the same** (a
 pass is named by the string given to `Profiler::compute_pass`). `reference` has no budget in #10;
 its 3.0 ms (a sample, pass and total) catches a gross regression, set from the first real run on the
@@ -1403,7 +1452,8 @@ they run in a Primary frame:
 | `normals` | the smooth normal of every hit (the cost of the smooth normals, alone) | none yet |
 | `atmosphere` | the tables of the atmosphere (#53): the sky-view table and the aerial-perspective volumes every frame, and the transmittance, multiple-scattering and sun-free tables only when the air or the sun's height changes. It runs first, in both views, and is a pass of its own, so it adds a line to `passes[]` and no field (no schema bump). The 0.3 ms budget is the issue's, **for the 4090**: the orchestrator measures it | 0.3 |
 | `shadows` | the sun's shadow: two shadow rays a pixel from the G-buffer (#52, **schema 24**; `--shadow-rays N` in the bench) | 0.4 |
-| `shade` | the lit image, as linear light, from the G-buffer and the shadows | none yet |
+| `gi` | Primary's global illumination (#54, **schema 28**): one bounce and an emitter sample a pixel from the G-buffer, the world-space radiance cache that supplies the bounces after it, and the cache's per-frame resolve | 1.5 |
+| `shade` | the lit image, as linear light, from the G-buffer, the shadows and the GI | none yet |
 | `exposure`, `exposure_adapt` | the log-average luminance and the adapted exposure | none yet |
 | `bloom_down`, `bloom_h`, `bloom_v` | the bloom, at a quarter of the size | none yet |
 | `tone` | exposure, bloom and tone curve into the encoded image | none yet |
@@ -1452,6 +1502,18 @@ the finder finds) and `the_recorded_shots_are_where_they_say` (every camera is i
 stamp place is air against rock, each cave shot is 20 m or more under the ground at every keyframe
 with rock straight overhead, and the dark descent ends 15 m or more under, roofed). Rock overhead
 says the chamber is roofed; it does not prove there is no sky from the side.
+
+### The GI sheet (#54)
+
+`client lookdev --out DIR --gi` renders every shot, and the bench's emissive room, three times at the
+game's settings and writes them side by side to `DIR/index.html` and
+`DIR/<shot>/{reference,primary-flat,primary-gi}.png` (`DIR/room/` for the room): the Reference
+(the truth), Primary as it was before the radiance cache (the flat ambient of 0.25: today's look), and
+Primary with the cache's GI, both settled over 32 frames of a still camera. The crystal caves and the
+forest floor are shots of the list; the room is the bench's. It is for the owner's eye: the
+cache's image is held to the Reference, and the art direction (hazy, soft, pastel, a time-of-day tint,
+a warm hero light, #53) must be where it was. On lavapipe:
+`client lookdev --out DIR --gi --size 480x270 --spp 16`; `--shot NAME` narrows it.
 
 ### The atmosphere sheet (#53)
 

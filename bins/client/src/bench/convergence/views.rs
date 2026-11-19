@@ -8,13 +8,19 @@
 //! was 4 m by 6 m and 4 m deep. Nothing in the tracer depends on a Voxel's size in metres, so the
 //! pictures are the same.
 
-use brick_store::{BrickCoord, BrickStore, VoxelCoord};
+use brick_store::{BrickCoord, BrickStore, Material, VoxelCoord};
+use materials::MaterialTable;
 use render::{Camera, Scene, Sun};
 use serde::Serialize;
+
+/// The scene of the views on the patch.
+const PATCH: &str = "patch of the test Planet";
 
 /// A still camera and sun on a scene.
 pub struct View {
     pub name: &'static str,
+    /// What the scene is, for a truth's sidecar.
+    pub scene_name: &'static str,
     pub scene: Scene,
     pub camera: Camera,
     pub sun: Sun,
@@ -91,6 +97,7 @@ pub fn golden() -> View {
     let sun_angles = (0.9, 0.25, 0.04);
     View {
         name: "golden",
+        scene_name: PATCH,
         scene: Scene::new(&patch_store(), None),
         camera,
         sun: Sun::from_angles(sun_angles.0, sun_angles.1, sun_angles.2),
@@ -212,6 +219,7 @@ pub fn pit() -> View {
     let sun_angles = (std::f32::consts::PI + 0.26, 0.8, 0.04);
     View {
         name: "pit",
+        scene_name: PATCH,
         scene: Scene::new(&store, None),
         camera,
         sun: Sun::from_angles(sun_angles.0, sun_angles.1, sun_angles.2),
@@ -224,6 +232,94 @@ pub fn pit() -> View {
             Some(pit),
         ),
     }
+}
+
+/// The rock of the room's walls and the block of light in it.
+const ROOM_WALL: &str = "rock";
+const ROOM_LAMP: &str = "warm light";
+
+fn material(name: &str) -> Material {
+    Material(
+        MaterialTable::built_in()
+            .by_name(name)
+            .unwrap_or_else(|| panic!("the built-in table has {name}"))
+            .id,
+    )
+}
+
+/// The room's walls: a box of rock with a hollow of 40 by 16 by 40 Voxels inside (x, y and z all
+/// from 0), two Voxels thick, and with a wall across it at `x = 18..20` if `wall`.
+fn room_store(wall: bool) -> BrickStore {
+    let rock = material(ROOM_WALL);
+    let lamp = material(ROOM_LAMP);
+    let mut store = BrickStore::new();
+    for x in -2..42 {
+        for y in -2..18 {
+            for z in -2..42 {
+                let inside = (0..40).contains(&x) && (0..16).contains(&y) && (0..40).contains(&z);
+                if !inside || (wall && (18..20).contains(&x)) {
+                    store.set(VoxelCoord([x, y, z]), Some(rock));
+                }
+            }
+        }
+    }
+    // The light: a block of 4 by 3 by 4 Voxels on the floor, in the far corner from the camera.
+    for x in 28..32 {
+        for y in 0..3 {
+            for z in 8..12 {
+                store.set(VoxelCoord([x, y, z]), Some(lamp));
+            }
+        }
+    }
+    store
+}
+
+/// The emissive room (#54): a closed room of rock, lit by one block of warm light and by nothing
+/// else (no sun gets in), seen from a corner. Everything the room shows is the lamp's light, bounced:
+/// what Primary's GI and the Reference's emitter sampling are for. The sun's angles are the golden
+/// view's, and are not seen.
+pub fn room() -> View {
+    let (from, to) = ([4.0, 6.0, 34.0], [26.0, 3.0, 12.0]);
+    let camera = Camera::looking_at(from, to);
+    let sun_angles = (0.9, 0.25, 0.04);
+    View {
+        name: "room",
+        scene_name: "emissive room: a closed box of rock with a block of warm light on the floor",
+        scene: Scene::new(&room_store(false), None),
+        camera,
+        sun: Sun::from_angles(sun_angles.0, sun_angles.1, sun_angles.2),
+        description: description(
+            "a closed room of rock lit only by a block of warm light on its floor, seen from \
+             the opposite corner",
+            (from, to),
+            &camera,
+            sun_angles,
+            None,
+        ),
+    }
+}
+
+/// The room with a wall across it that the lamp's light does not get through, for the dig that
+/// lets it through: the store, and the camera that looks at the dark side. The Voxels to dig are
+/// [`room_gap`].
+pub fn walled_room() -> (BrickStore, Camera) {
+    (
+        room_store(true),
+        Camera::looking_at([4.0, 6.0, 34.0], [14.0, 3.0, 10.0]),
+    )
+}
+
+/// The Voxels of the wall that the dig takes out: a gap 2 Voxels thick, 8 high and 10 wide.
+pub fn room_gap() -> Vec<VoxelCoord> {
+    let mut gap = Vec::new();
+    for x in 18..20 {
+        for y in 2..10 {
+            for z in 14..24 {
+                gap.push(VoxelCoord([x, y, z]));
+            }
+        }
+    }
+    gap
 }
 
 #[cfg(test)]

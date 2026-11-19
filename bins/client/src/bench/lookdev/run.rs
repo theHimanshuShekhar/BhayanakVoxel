@@ -45,12 +45,15 @@ const SUN_FROM_FORWARD: f64 = 70.0;
 const STRIP_ELEVATIONS: [f64; 6] = [-12.0, -4.0, 0.0, SUN_ELEVATION, 25.0, 60.0];
 const STRIP_SHOTS: [&str; 2] = ["forest floor", "canyon with haze"];
 
-/// The caves are lit by their crystals alone, which a path finds only by chance (the Reference
-/// view has no light sampling for emissives): four times the samples.
+/// The caves are lit by their crystals alone: four times the samples (the Reference samples the
+/// crystals directly since #54, and the light that reaches the far side of a cave takes more).
 const CAVE_SPP_FACTOR: u32 = 4;
 
 const USAGE: &str = "usage: client lookdev --out DIR [--size WxH] [--spp N] [--compare DIR] [--atmosphere] [--untinted] [--shot NAME]...\n  \
 the 4090: client.exe lookdev --out DIR [--compare OLD_SHEET_DIR]   (1280x720, 64 spp)\n  \
+--gi (#54): instead of the combinations, each shot (and the emissive room) at the game's settings as the Reference\n  \
+has it, as Primary was before the radiance cache (the flat ambient of 0.25), and as it is with the cache's GI\n  \
+(on lavapipe: client lookdev --out DIR --gi --size 480x270 --spp 16)\n  \
 --compare: the folder of the #148 sheet; each shot's OLD/NN-shot/hero-hero-b.png is shown first\n  \
 --atmosphere (#53): instead of the combinations, each shot three times at the game's settings, hero light B\n  \
 with today's gradient sky and haze, then with the untinted atmosphere, then with the atmosphere and the\n  \
@@ -133,6 +136,10 @@ pub struct Options {
     /// The atmosphere's sheet (#53): each shot in both views under hero light B's gradient (what
     /// the renderer had) and under the atmosphere, side by side, in place of the combinations.
     pub atmosphere: bool,
+    /// The GI sheet (#54): each shot, and the emissive room, as the Reference has it, as Primary was
+    /// with the flat ambient, and as Primary is with the radiance cache, in place of the
+    /// combinations.
+    pub gi: bool,
     /// The other sheets with the physical atmosphere and no hero tint ([`Look::HERO_B_UNTINTED`]); the
     /// atmosphere's sheet shows both whatever this is.
     pub untinted: bool,
@@ -151,6 +158,7 @@ fn parse(args: impl IntoIterator<Item = String>) -> Result<Options, String> {
         compare: None,
         descent_frames: 12,
         atmosphere: false,
+        gi: false,
         untinted: false,
         only: Vec::new(),
         short: false,
@@ -176,6 +184,7 @@ fn parse(args: impl IntoIterator<Item = String>) -> Result<Options, String> {
             "--compare" => options.compare = Some(value("a directory")?.into()),
             "--short" => options.short = true,
             "--atmosphere" => options.atmosphere = true,
+            "--gi" => options.gi = true,
             "--untinted" => options.untinted = true,
             "--shot" => options.only.push(value("a name")?),
             "--help" | "-h" => return Err(USAGE.to_string()),
@@ -485,6 +494,7 @@ pub fn run(options: &Options) -> Result<PathBuf, Box<dyn Error>> {
         crate::bench::caves::fill(&mut scene, &mut store, site)?;
         // The shipped Materials and the prototype's eight crystals.
         let mut gpu = Offscreen::with_materials(Resolution::native(w, h), &scene, stamps::table())?;
+        gpu.set_flat_ambient(false);
         eprintln!(
             "[{n}] {}: {written} stamp Voxels, ready in {:.0} s; {}",
             shot.name,
@@ -506,6 +516,23 @@ pub fn run(options: &Options) -> Result<PathBuf, Box<dyn Error>> {
         gpu.set_ground_level(ground_level);
         if options.untinted {
             gpu.set_look(Look::HERO_B_UNTINTED);
+        }
+        if options.gi {
+            let camera = still_camera(shot);
+            gpu.set_sun(sun_for(&camera));
+            let spp = if shot.cave.is_some() {
+                options.spp * CAVE_SPP_FACTOR
+            } else {
+                options.spp
+            };
+            gi_versus(&mut gpu, &camera, &dir, spp, options, &mut section)?;
+            eprintln!(
+                "[{n}] {}: done in {:.0} s",
+                shot.name,
+                t.elapsed().as_secs_f64()
+            );
+            sections.push(section);
+            continue;
         }
         if options.atmosphere {
             versus(&mut gpu, shot, &dir, options, &mut section)?;
@@ -533,7 +560,10 @@ pub fn run(options: &Options) -> Result<PathBuf, Box<dyn Error>> {
         );
         sections.push(section);
     }
-    if options.atmosphere {
+    if options.gi {
+        sections.push(emissive_room(options)?);
+        write_gi_sheet(&options.out, &sections, options, began.elapsed())?;
+    } else if options.atmosphere {
         write_atmosphere_sheet(&options.out, &sections, options, began.elapsed())?;
     } else {
         write_sheet(&options.out, &sections, options, began.elapsed())?;
@@ -545,6 +575,140 @@ pub fn run(options: &Options) -> Result<PathBuf, Box<dyn Error>> {
         began.elapsed().as_secs_f64()
     );
     Ok(sheet)
+}
+
+/// The GI sheet's three images of a view, in the order of its columns: the Reference, Primary with
+/// the flat ambient it had before #54, and Primary with the radiance cache.
+const GI_COLUMNS: [&str; 3] = [
+    "the Reference (the truth)",
+    "Primary before #54: the flat ambient of 0.25",
+    "Primary with the radiance cache's GI",
+];
+
+/// The view at the game's settings as the Reference has it, then as Primary draws it, settled
+/// (the window's view of a camera that has stopped), with the flat ambient and with GI.
+fn gi_versus(
+    gpu: &mut Offscreen,
+    camera: &Camera,
+    dir: &str,
+    spp: u32,
+    options: &Options,
+    section: &mut Section,
+) -> Result<(), Box<dyn Error>> {
+    gpu.set_stages(Stages::default());
+    let reference = gpu.render_reference(camera, spp);
+    let mut images = vec![("reference", reference)];
+    for (slug, flat) in [("primary-flat", true), ("primary-gi", false)] {
+        gpu.set_flat_ambient(flat);
+        // A new history, and a cache with nothing in it.
+        gpu.reset_accumulation();
+        let mut settled = gpu.render_upscaled(camera);
+        for _ in 1..settle_frames(options) {
+            settled = gpu.render_upscaled(camera);
+        }
+        images.push((slug, settled));
+    }
+    gpu.set_flat_ambient(false);
+    for (slug, image) in images {
+        let file = format!("{dir}/{slug}.png");
+        write_png(&options.out.join(&file), &image)?;
+        section.versus.push(Figure {
+            path: file,
+            label: String::new(),
+        });
+    }
+    Ok(())
+}
+
+/// The emissive room of the bench's convergence phase (#54): a closed box of rock lit by one block
+/// of warm light, in the three images of the GI sheet.
+fn emissive_room(options: &Options) -> Result<Section, Box<dyn Error>> {
+    let view = crate::bench::convergence::emissive_room();
+    let (w, h) = options.size;
+    let mut gpu = Offscreen::with_resolution(Resolution::native(w, h), &view.scene)?;
+    gpu.set_flat_ambient(false);
+    let dir = "room";
+    std::fs::create_dir_all(options.out.join(dir))?;
+    let mut section = Section {
+        name: "emissive room",
+        subject: "a closed box of rock, lit by one block of warm light on the floor (the bench's room)",
+        stills: Vec::new(),
+        old: None,
+        combinations: Vec::new(),
+        descent: Vec::new(),
+        versus: Vec::new(),
+        strip: Vec::new(),
+    };
+    gi_versus(
+        &mut gpu,
+        &view.camera,
+        dir,
+        options.spp,
+        options,
+        &mut section,
+    )?;
+    Ok(section)
+}
+
+fn write_gi_sheet(
+    out: &Path,
+    sections: &[Section],
+    options: &Options,
+    took: Duration,
+) -> Result<(), Box<dyn Error>> {
+    let mut html = String::new();
+    html.push_str(
+        "<!doctype html><meta charset=utf-8><title>look-dev GI (#54)</title>\
+         <style>body{font:14px system-ui;margin:1.5em;background:#16171a;color:#ddd}\
+         h1{font-weight:600}p.d{max-width:90ch;color:#aaa}\
+         table{border-collapse:collapse}th,td{vertical-align:top;padding:4px 6px;border-top:1px solid #444}\
+         th{font-size:12px;font-weight:500;color:#aaa;text-align:left;max-width:420px}\
+         td.name{max-width:190px;font-size:12px;color:#aaa;position:sticky;left:0;background:#16171a}\
+         td.name b{color:#ddd;font-size:15px}img{display:block;width:420px;height:auto}</style>",
+    );
+    let (w, h) = options.size;
+    let _ = write!(
+        html,
+        "<h1>Look-dev: GI and emissive Voxels (#54)</h1>\
+         <p class=d>Rendered at {w}&times;{h} at the game's settings (AgX-like, smooth normals with the face bias, \
+         auto-exposure and bloom, hero light B, the tinted atmosphere). Left to right: the Reference ({} samples a \
+         pixel, {}&times; that in the caves), Primary as it was before the radiance cache (a flat ambient of 0.25 of \
+         the surface's colour), and Primary with the cache's GI, both after {} frames of a still camera as the \
+         window shows a view that has stopped. The Reference is the truth: the cache's image is the one to hold to it, \
+         with the art direction (hazy, soft, pastel, a time-of-day tint, a warm hero light) where it was. Took {:.0} s.{}</p>",
+        options.spp,
+        CAVE_SPP_FACTOR,
+        settle_frames(options),
+        took.as_secs_f64(),
+        if options.short {
+            " <b>A smoke test: the test Planet, which the places are not on.</b>"
+        } else {
+            ""
+        }
+    );
+    html.push_str("<table><tr><th>shot</th>");
+    for column in GI_COLUMNS {
+        let _ = write!(html, "<th>{column}</th>");
+    }
+    html.push_str("</tr>");
+    for section in sections {
+        let _ = write!(
+            html,
+            "<tr><td class=name><b>{}</b><br>{}</td>",
+            section.name, section.subject
+        );
+        for figure in &section.versus {
+            let _ = write!(
+                html,
+                "<td><a href=\"{0}\"><img src=\"{0}\" loading=lazy></a></td>",
+                figure.path
+            );
+        }
+        html.push_str("</tr>");
+    }
+    html.push_str("</table>");
+    std::fs::write(out.join("index.html"), html)?;
+    Ok(())
 }
 
 /// The three looks of the atmosphere's sheet, in the order of its columns.
@@ -1041,6 +1205,25 @@ mod tests {
         for image in &images {
             assert!(versus.join(image).exists(), "{image}");
         }
+        // The GI sheet (#54): each shot and the emissive room in three images.
+        let gi = out.join("gi");
+        let options = parse(args(&["--out", gi.to_str().unwrap(), "--short", "--gi"])).unwrap();
+        assert!(options.gi);
+        let html = std::fs::read_to_string(run(&options).unwrap()).unwrap();
+        let images: Vec<&str> = html
+            .split("src=\"")
+            .skip(1)
+            .map(|s| s.split('"').next().unwrap())
+            .collect();
+        // Two shots and the room, each the Reference, Primary with the flat ambient and with GI.
+        assert_eq!(images.len(), 3 * 3, "{images:?}");
+        assert!(images.contains(&"00-forest-floor/primary-flat.png"));
+        assert!(images.contains(&"00-forest-floor/primary-gi.png"));
+        assert!(images.contains(&"room/reference.png"));
+        for image in &images {
+            assert!(gi.join(image).exists(), "{image}");
+        }
+        assert!(html.contains("emissive room"));
         let _ = std::fs::remove_dir_all(&out);
     }
 

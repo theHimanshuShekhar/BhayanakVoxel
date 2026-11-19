@@ -48,8 +48,12 @@ shadows = 0.4
 # sun-free tables only when the air or the sun's height changes).
 atmosphere = 0.3
 
+# GI (#54): the `gi` pass, one bounce and an emitter sample a pixel from the G-buffer, and the
+# world-space radiance cache that supplies the bounces after it (the cache's fill and its resolve
+# are in it).
+gi = 1.5
+
 # M1 stages from #10, for when the passes exist (the names are suggestions):
-# gi           = 1.5   # GI bounce and radiance cache
 # reflections  = 0.7
 # glass        = 0.7
 # volumetrics  = 1.0

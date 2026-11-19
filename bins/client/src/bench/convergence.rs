@@ -31,12 +31,14 @@
 //! see that it runs and that the report has the right shape. FLIP is run by `client bench` on a
 //! real GPU only, and by one ignored test.
 
+mod gi;
 mod score;
 mod shadows;
 mod still;
 mod views;
 
 pub use views::patch_store;
+pub use views::room as emissive_room;
 
 use std::error::Error;
 use std::fs;
@@ -93,6 +95,8 @@ pub struct Settings {
     pub still: still::Settings,
     /// The sun-and-sky view (#52): Primary's shadows against the Reference's.
     pub shadows: shadows::Settings,
+    /// Primary's GI against the Reference's truth in each view, and the dig (#54).
+    pub gi: gi::Settings,
 }
 
 impl Settings {
@@ -110,6 +114,7 @@ impl Settings {
                 (traced.0 * 2, traced.1 * 2),
                 truth_spp.unwrap_or(DEFAULT_TRUTH_SPP),
             ),
+            gi: gi::Settings::full((traced.0 * 2, traced.1 * 2)),
         }
     }
 
@@ -127,6 +132,7 @@ impl Settings {
                 ((traced.0 / 2).max(1), (traced.1 / 2).max(1)),
                 truth_spp.unwrap_or(16),
             ),
+            gi: gi::Settings::short(((traced.0 / 2).max(1), (traced.1 / 2).max(1))),
         }
     }
 
@@ -142,7 +148,8 @@ pub struct ConvergenceReport {
     /// The Reference view's size, traced and presented.
     pub width: u32,
     pub height: u32,
-    /// The scene the views are on: the patch of the test Planet, not the 320 km Planet.
+    /// The scene the views are on: the patch of the test Planet, not the 320 km Planet (the `room`
+    /// view's own scene is a box of rock; see its `what`).
     pub scene: &'static str,
     pub checkpoints: Vec<u32>,
     pub truth_spp: u32,
@@ -164,6 +171,8 @@ pub struct ConvergenceReport {
     pub views: Vec<ViewReport>,
     /// The sun-and-sky view (#52): Primary's shadows against the Reference's direct-sun image.
     pub shadows: shadows::ShadowsReport,
+    /// Primary's GI against truth in each of `views` (their `gi`), the dig, and the gates of #54.
+    pub gi: gi::GiReport,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -202,6 +211,9 @@ pub struct ViewReport {
     pub files: Vec<String>,
     /// The Reference view with the still-frame policy on, from the stop (#189).
     pub still: still::StillReport,
+    /// Primary against this view's truth A, with the flat ambient of before #54 and with the
+    /// radiance cache (#54).
+    pub gi: gi::ViewGi,
 }
 
 /// How bright a view's converged image is, in linear light before the display encoding, over all
@@ -314,10 +326,22 @@ pub fn run(settings: &Settings, out: &Path) -> Result<ConvergenceReport, Box<dyn
         if settings.flip { "on" } else { "off" }
     );
     let mut views = Vec::new();
-    for view in [views::golden(), views::pit()] {
+    for view in [views::golden(), views::pit(), views::room()] {
         views.push(run_view(view, settings, out)?);
     }
     let shadows = shadows::run(&settings.shadows, out)?;
+    eprintln!("convergence: the dig...");
+    let edit = gi::dig(&settings.gi, out)?;
+    let gi = {
+        let scored: Vec<_> = views
+            .iter()
+            .map(|v| (v.name, &v.gi, v.still.flip_within_target))
+            .collect();
+        gi::GiReport {
+            gates: gi::gates(&settings.gi, &scored, &edit),
+            edit,
+        }
+    };
     let mut report = ConvergenceReport {
         width,
         height,
@@ -342,11 +366,17 @@ pub fn run(settings: &Settings, out: &Path) -> Result<ConvergenceReport, Box<dyn
         wall_s: 0.0,
         views,
         shadows,
+        gi,
     };
     let csv = out.join(CSV_FILE);
     fs::write(&csv, csv_of(&report)).map_err(|e| format!("cannot write {}: {e}", csv.display()))?;
     report.wall_s = started.elapsed().as_secs_f64();
     Ok(report)
+}
+
+/// The exit status of the phase's gates (#54): 2 if one is over, unless `no_fail`.
+pub fn gi_exit_code(report: &ConvergenceReport, no_fail: bool) -> u8 {
+    gi::exit_code(&report.gi, no_fail)
 }
 
 /// Draws `samples` more samples of the reference image, timing each as the flight's reference mode
@@ -532,6 +562,7 @@ fn run_view(view: View, settings: &Settings, out: &Path) -> Result<ViewReport, B
         )?);
         still_mse.push(score::mse(&capture.linear, &truth_a.linear));
     }
+    let gi = gi::score_view(&view, &settings.gi, &truth_a.image, &truth_a_rgb, &folder)?;
     let still = still::report(
         batching_exact,
         max_batch_samples,
@@ -552,6 +583,7 @@ fn run_view(view: View, settings: &Settings, out: &Path) -> Result<ViewReport, B
         &checkpoints,
         &still_run,
     )?;
+    files.extend(gi.files.iter().cloned());
     files.sort();
     let megapixels = f64::from(settings.size.0) * f64::from(settings.size.1) / 1e6;
     Ok(ViewReport {
@@ -566,6 +598,7 @@ fn run_view(view: View, settings: &Settings, out: &Path) -> Result<ViewReport, B
         lines,
         files,
         still,
+        gi,
     })
 }
 
@@ -637,7 +670,7 @@ fn write_files(
                 height: settings.size.1,
                 f32_format: "f32 little-endian, interleaved RGB, rows from the top, linear \
                              radiance (the running mean, before the display encoding)",
-                scene: "patch of the test Planet",
+                scene: view.scene_name,
                 generator_version: planet_gen::GENERATOR_VERSION,
                 gpu: &info.name,
                 device_type: &info.device_type,
@@ -758,6 +791,8 @@ pub fn print_summary(report: &ConvergenceReport) {
         }
     }
     shadows::print_summary(&report.shadows);
+    let scored: Vec<_> = report.views.iter().map(|v| (v.name, &v.gi)).collect();
+    gi::print_summary(&scored, &report.gi);
 }
 
 #[cfg(test)]
@@ -830,6 +865,7 @@ mod tests {
                 lines: Vec::new(),
                 files: vec!["spp0001.png".into()],
                 still: still_report(),
+                gi: gi_view(flip),
             }
         };
         ConvergenceReport {
@@ -852,6 +888,50 @@ mod tests {
             csv: CSV_FILE,
             views: vec![view("golden"), view("pit")],
             shadows: shadows_report(flip),
+            gi: gi::GiReport {
+                edit: gi::EditSettle {
+                    width: 64,
+                    height: 36,
+                    voxels_dug: 160,
+                    update_ms: 1.0,
+                    before: 0.1,
+                    after: 0.2,
+                    frame_ms: vec![16.7, 33.3],
+                    luminance: vec![0.15, 0.2],
+                    settle_ms: flip.then_some(33.3),
+                    slow_frames: 0,
+                    within_target: flip.then_some(true),
+                },
+                gates: gi::Gates {
+                    room_target_flip: gi::ROOM_TARGET_FLIP,
+                    settle_within_ms: gi::SETTLE_WITHIN_MS,
+                    reference_flip: still::FLIP_TARGET,
+                    reference_within_s: still::WITHIN_S,
+                    held: flip,
+                    over: Vec::new(),
+                },
+            },
+        }
+    }
+
+    fn gi_view(flip: bool) -> gi::ViewGi {
+        let score = |mean: f64| gi::Score {
+            flip: flip.then_some(shadows::Scores {
+                flip_mean: mean,
+                flip_p99: mean * 4.0,
+            }),
+            luminance_ratio: 1.0,
+        };
+        let variant = |first: f64, settled: f64| gi::Variant {
+            first_frame: score(first),
+            settled: score(settled),
+        };
+        gi::ViewGi {
+            flat: variant(0.2, 0.2),
+            gi: variant(0.2, 0.1),
+            settle_frames: 4,
+            gi_not_further: flip.then_some(true),
+            files: vec!["primary-gi-settled.png".into()],
         }
     }
 
@@ -1009,6 +1089,7 @@ mod tests {
                 seconds: 0.3,
             },
             shadows: sun,
+            gi: gi::Settings::full(size),
         };
         let out = std::env::temp_dir().join(format!("bhayanak-convergence-{}", std::process::id()));
         let _ = fs::remove_dir_all(&out);
@@ -1018,7 +1099,7 @@ mod tests {
         eprintln!("the phase took {:.1?}", began.elapsed());
         print_summary(&report);
         assert_eq!(report.flip.as_ref().map(|f| f.ppd), Some(67.02));
-        assert_eq!(report.views.len(), 2);
+        assert_eq!(report.views.len(), 3);
         for view in &report.views {
             // The curve falls: more samples are closer to the truth, by every score.
             let flips: Vec<f64> = view.curve.iter().map(|p| p.flip_mean.unwrap()).collect();

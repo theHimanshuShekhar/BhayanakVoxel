@@ -2338,6 +2338,7 @@ fn run_once(
     let d0 = built.setup.d0;
     let mut gpu = Offscreen::with_resolution(resolution, built.world.scene())
         .map_err(|e| failed("making the GPU context", e))?;
+    gpu.set_flat_ambient(false);
     // The atmosphere measures the camera's height from the Planet's sea level.
     gpu.set_ground_level(f64::from(if full {
         planet_gen::world_map::WORLD_RADIUS

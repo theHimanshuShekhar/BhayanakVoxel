@@ -105,7 +105,17 @@ use super::stream::StreamReport;
 /// that was a flip's or part of absorbing one; `backlog_peak`, `absorb_updates` and `absorb_ms`:
 /// what absorbing a flip held and how long it took; and `scene_used_peak_mib`: the most MiB of the
 /// scene in use at the end of one of the path's frames. Nothing else is changed.
-pub const SCHEMA_VERSION: u32 = 26;
+///
+/// 28 (#54; 27 is #219's) added the emissive room to the convergence phase (`convergence.views[]`
+/// has a third view, `room`), and Primary's GI against truth: each view's `gi` (Primary's FLIP
+/// mean and 99th percentile against truth A and its luminance over truth's, for the first frame
+/// and the settled one, with the flat ambient of before the radiance cache (`flat`) and with it
+/// (`gi`), and whether GI is no further from truth), and `convergence.gi`: the dig of the room's
+/// wall (the time its lit result takes to settle, with the frames) and the gates of the ticket
+/// (the room's FLIP, no view further from truth, the settling time, the Reference's room within
+/// 0.25 s), with the names of those that are over. A new pass line `gi` is in `passes[]` (the
+/// report lists passes generically). Nothing else is changed.
+pub const SCHEMA_VERSION: u32 = 28;
 
 /// One timed thing (a pass, or the GPU total of a profiler frame) in one mode, against its
 /// budget. In reference mode a profiler frame is one sample, so the entries of that mode have
@@ -602,7 +612,7 @@ mod tests {
                 "streaming_real_time"
             ]
         );
-        assert_eq!(json["schema_version"], 26);
+        assert_eq!(json["schema_version"], 28);
         assert_eq!(json["convergence"], serde_json::Value::Null);
         assert_eq!(json["streaming"], serde_json::Value::Null);
         assert_eq!(json["streaming_real_time"], serde_json::Value::Null);

@@ -207,6 +207,9 @@ fn run(args: &Args) -> Result<u8, Box<dyn Error>> {
         output: (plan.width * 2, plan.height * 2),
     };
     let mut gpu = Offscreen::with_resolution(resolution, &flight.scene)?;
+    // The flight times what the player's frame costs, and the player's Primary has the radiance
+    // cache's GI (#54): an `Offscreen` starts with the flat ambient of before it.
+    gpu.set_flat_ambient(false);
     if !plan.patch {
         // The atmosphere measures the camera's height from the Planet's sea level.
         gpu.set_ground_level(f64::from(planet_gen::world_map::WORLD_RADIUS));
@@ -402,7 +405,20 @@ fn run(args: &Args) -> Result<u8, Box<dyn Error>> {
             r.gates.over.join(", ")
         );
     }
-    let code = code.max(streaming_code).max(real_time_code);
+    // A gate of the GI (#54) is a failure whatever `--diag` said: it holds Primary to the Reference.
+    let gi_code = report
+        .convergence
+        .as_ref()
+        .map_or(0, |c| convergence::gi_exit_code(c, args.no_fail));
+    if gi_code != 0
+        && let Some(c) = &report.convergence
+    {
+        eprintln!(
+            "convergence: over its gates: {}",
+            c.gi.gates.over.join(", ")
+        );
+    }
+    let code = code.max(streaming_code).max(real_time_code).max(gi_code);
     // An error of the real-time mode is exit status 1, not 2 (a gate that is over): nothing says
     // whether its gates would have held.
     let code = match &report.streaming_real_time {
@@ -430,6 +446,7 @@ fn run_streaming(
     eprintln!("streaming: making the test Planet's world (this takes a while)...");
     let streamer = stream::Streamer::new();
     let mut gpu = Offscreen::with_resolution(resolution, streamer.scene())?;
+    gpu.set_flat_ambient(false);
     gpu.set_ground_level(f64::from(planet_gen::world_map::TEST_RADIUS));
     streamer.set_buffer_limit(gpu.buffer_limit_words());
     // A frame is drawn every frame in a measurement, and every tenth in a smoke test, where a
