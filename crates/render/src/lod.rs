@@ -86,7 +86,7 @@ pub const HYSTERESIS: f64 = 0.05;
 /// flight is at the loader's limit on the 4090, where 2% was followed by a queue half as large
 /// again). Not at rest, where there is no such lag to cover (and the
 /// bands are what they were).
-pub const SPLIT_LEAD: f64 = 0.01;
+pub const SPLIT_LEAD: f64 = 0.0;
 
 /// Height in pixels of the image the bands are for: 1440p, the output that the frame budgets are
 /// for (the traced image is half of it, and TAAU upscales it).
@@ -1005,16 +1005,16 @@ mod tests {
         assert!(!rest.split(2, 381.0, Some(false)));
         assert!(rest.split(2, 379.0, Some(false)));
         assert_eq!(rest.split_edge(2), 380.0);
-        // At 1 level coarser the boundary is at 200 and the brick splits at 190 + 2 (1%).
+        // At 1 level coarser the boundary is at 200 and the brick splits at 190 + 0 (no lead: the diagnostic branch).
         let fast = rest.speed_scaled(1.0);
-        assert!((fast.split_edge(2) - 192.0).abs() < 1e-9);
-        assert!(fast.split(2, 191.0, Some(false)));
-        assert!(!fast.split(2, 193.0, Some(false)));
+        assert!((fast.split_edge(2) - 190.0).abs() < 1e-9);
+        assert!(fast.split(2, 189.0, Some(false)));
+        assert!(!fast.split(2, 191.0, Some(false)));
         // What is split stays split to the same distance, and a new brick is split at the boundary.
         assert!(fast.split(2, 209.0, Some(true)) && !fast.split(2, 211.0, Some(true)));
         assert!(fast.split(2, 199.0, None) && !fast.split(2, 201.0, None));
         // The slack is to the edge that splits it, and the clear radius is within it.
-        assert!((fast.slack(2, 254.0, false) - 62.0).abs() < 1e-9);
+        assert!((fast.slack(2, 254.0, false) - 64.0).abs() < 1e-9);
         assert_eq!(fast.clear_radius(2), fast.split_edge(2));
         // The lead is under the hysteresis: a brick that is split by it is not merged at once.
         const { assert!(SPLIT_LEAD < 2.0 * HYSTERESIS) };
