@@ -4137,8 +4137,15 @@ mod tests {
             assert!(path.frames > 0, "{}", path.name);
             assert_eq!(path.frame_time.samples, path.frames);
             assert_eq!(path.frame_cpu.samples, path.frames);
-            // The scene thread's longest round (#213) was timed.
-            assert!(path.scene_round_max_ms > 0.0, "{}", path.name);
+            // The scene thread's longest round (#213) was timed. Not in the turn: the camera
+            // stands, so the thread is idle there and no round need fall in its frames (the CI's
+            // Ubuntu runner had none; the rounds of a machine that keeps up are the tail of the
+            // path before).
+            assert!(
+                path.scene_round_max_ms > 0.0 || path.name == "180 degree turn",
+                "{}",
+                path.name
+            );
             // Not that the round is at least as long as the update: the counters are taken
             // between an update and the end of its round, so the longest update of the round that
             // straddles the end of a path is in this path and the round's time in the next.
