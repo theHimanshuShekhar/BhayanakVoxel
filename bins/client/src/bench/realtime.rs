@@ -4130,6 +4130,16 @@ mod tests {
                 .any(|p| p.absorb_updates > 0 && p.absorb_ms > 0.0),
             "no path absorbed a flip"
         );
+        // The scene thread's longest round (#213) was timed: in the run, and in the crossing,
+        // where the thread works the whole time.
+        assert!(
+            run.paths.iter().any(|p| p.scene_round_max_ms > 0.0),
+            "no path timed a round of the scene thread"
+        );
+        assert!(
+            crossing.is_some_and(|p| p.scene_round_max_ms > 0.0),
+            "the crossing timed no round: {crossing:?}"
+        );
         let stop = run.paths.last().unwrap();
         assert!(stop.still_cuts.is_some());
         assert!(run.paths[..6].iter().all(|p| p.still_cuts.is_none()));
@@ -4137,15 +4147,10 @@ mod tests {
             assert!(path.frames > 0, "{}", path.name);
             assert_eq!(path.frame_time.samples, path.frames);
             assert_eq!(path.frame_cpu.samples, path.frames);
-            // The scene thread's longest round (#213) was timed. Not in the turn: the camera
-            // stands, so the thread is idle there and no round need fall in its frames (the CI's
-            // Ubuntu runner had none; the rounds of a machine that keeps up are the tail of the
-            // path before).
-            assert!(
-                path.scene_round_max_ms > 0.0 || path.name == "180 degree turn",
-                "{}",
-                path.name
-            );
+            // (That the scene thread's longest round was timed is asserted below for the run and
+            // for the crossing, not for each path: a thread on a runner that is slow to schedule
+            // may have no round end in the frames of a path, as the CI's Ubuntu runner had none in
+            // the turn and its Windows runner none in the 50 m flight.)
             // Not that the round is at least as long as the update: the counters are taken
             // between an update and the end of its round, so the longest update of the round that
             // straddles the end of a path is in this path and the round's time in the next.
