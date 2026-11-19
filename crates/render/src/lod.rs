@@ -439,6 +439,27 @@ impl SpeedScale {
         std::mem::replace(&mut self.step, step) != step
     }
 
+    /// Whether the speed has been under what the step asks for long enough to begin giving it
+    /// back: a step is to be given back if the speed stays where it is, however the hold goes.
+    pub fn wants_less(&self, speed: f64) -> bool {
+        self.steps(speed * RELEASE) < self.step
+    }
+
+    /// [`SpeedScale::observe`] for a camera whose depth is **not to be given back** now (the
+    /// caller's reason: see the client's `Engine::rescale`): a deeper step is still taken at once,
+    /// and what falls under the step does not start the hold, nor keep one that had. Returns
+    /// whether the depth changed.
+    pub fn observe_keeping(&mut self, speed: f64) -> bool {
+        self.calm_since = None;
+        let up = self.steps(speed);
+        if up > self.step {
+            self.step = up;
+            true
+        } else {
+            false
+        }
+    }
+
     /// The depth for a camera that was **put** at the speed `speed` (a teleport is no flight): the
     /// step the speed asks for, both ways, with no hold, and any release that was pending ended.
     /// Returns whether the depth changed.
@@ -1554,6 +1575,28 @@ mod tests {
         assert!(scale.observe(0.0), "over it");
         assert_eq!(scale.depth(), 0.0);
         assert!(!scale.scale.releasing());
+    }
+
+    #[test]
+    fn a_depth_that_is_kept_is_not_given_back_nor_held_for_a_release_but_still_deepens() {
+        let mut scale = SpeedScale::AT_REST;
+        scale.observe(metres(50.0), 0.0);
+        assert_eq!(scale.depth(), 3.0);
+        // Stopped, with the depth kept: it does not start the hold (so that nothing waits for it),
+        // and says that it would give it back.
+        assert!(scale.wants_less(0.0));
+        assert!(!scale.observe_keeping(0.0));
+        assert!(!scale.releasing());
+        assert_eq!(scale.depth(), 3.0);
+        // Not kept any more: the hold is from the first look at it, not from before.
+        assert!(!scale.observe(0.0, 10.0));
+        assert!(scale.releasing());
+        assert!(scale.observe(0.0, 10.0 + RELEASE_HOLD));
+        assert_eq!(scale.depth(), 0.0);
+        // A deeper step is taken at once, kept or not.
+        assert!(!scale.wants_less(0.0));
+        assert!(scale.observe_keeping(metres(30.0)));
+        assert_eq!(scale.depth(), 1.5);
     }
 
     #[test]

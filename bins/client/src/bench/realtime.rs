@@ -4436,6 +4436,14 @@ mod tests {
             crossing.cap_flips, crossing.scene_update_max_ms, crossing.scene_round_max_ms,
         );
         assert_eq!(crossing.holes, 0);
+        // The depth of the dive is kept under the sea (#168): a release that found the camera there
+        // made the scene as the wide one, 552 to 572 MiB.
+        assert!(
+            crossing.scene_used_peak_mib <= BUDGETS.scene_mib,
+            "the crossing's scene peaked at {:.1} MiB, over the {} MiB gate",
+            crossing.scene_used_peak_mib,
+            BUDGETS.scene_mib
+        );
         assert!(
             crossing.cap_flips >= 2,
             "the crossing flipped the cap both ways"

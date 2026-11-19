@@ -1621,6 +1621,22 @@ impl Selection {
         self.reach.horizon != was
     }
 
+    /// Whether the cap was asked for and would be off for a camera at `camera`, as [`Selection::place`]
+    /// works it out for the selection's own: off while the raised camera is under the sea's sphere,
+    /// and until it is [`CAP_ON`] over it if it was off. What a scene made again at `camera` has.
+    pub fn cap_is_off_at(&self, camera: [f64; 3]) -> bool {
+        let Some(horizon) = self.horizon else {
+            return false;
+        };
+        let was = self.reach.horizon;
+        let height = Reach {
+            horizon: Some(horizon),
+            ..self.reach
+        }
+        .height(camera);
+        !height.is_some_and(|h| h > if was.is_some() { 0.0 } else { CAP_ON })
+    }
+
     /// Looks at every node at the next [`Selection::update`], for a change of the cap.
     fn reconsider_all(&mut self) {
         self.rewanted = true;

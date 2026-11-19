@@ -1383,6 +1383,23 @@ impl Scene {
             .map_or(Reach::NONE, |r| r.selection.reach())
     }
 
+    /// Whether the horizon cap was asked for and is off: the camera's raised height is under the
+    /// sea's sphere, so what is past the horizon is not left coarse (ADR 0004, #213), and the scene
+    /// at rest is the wide one.
+    pub fn cap_is_off(&self) -> bool {
+        self.rings.as_ref().is_some_and(|r| {
+            r.selection.horizon().is_some() && r.selection.reach().horizon.is_none()
+        })
+    }
+
+    /// Whether the horizon cap was asked for and would be off for a camera at `camera` (see
+    /// [`Selection::cap_is_off_at`]): what a scene made again there has.
+    pub fn cap_is_off_at(&self, camera: [f64; 3]) -> bool {
+        self.rings
+            .as_ref()
+            .is_some_and(|r| r.selection.cap_is_off_at(camera))
+    }
+
     /// Culls by the Planet's horizon (see [`crate::lod::Horizon`], [`Selection::set_horizon`]): what
     /// is drawn and wanted resident is what a camera over `horizon`'s sphere could see. Kept when
     /// the scene is made again for other bands or a jump. Returns what changed, as
