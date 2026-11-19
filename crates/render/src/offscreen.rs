@@ -293,6 +293,12 @@ impl Offscreen {
         Ok(())
     }
 
+    /// Says that the last [`Offscreen::update_scene`] was an Edit, so that the radiance cache follows
+    /// the light round it faster (see [`Tracer::edit_made`]).
+    pub fn edit_made(&mut self) {
+        self.tracer.edit_made();
+    }
+
     /// The parts of the CPU's time in the last [`Offscreen::update_scene`].
     pub fn last_update_times(&self) -> UpdateTimes {
         self.last_update
@@ -544,6 +550,23 @@ impl Offscreen {
             .0
             .iter()
             .map(|w| f32::from_le_bytes(*w))
+            .collect()
+    }
+
+    /// The radiance cache's table as it stands, `GI_SLOT_WORDS` (12) words a slot, for tests of
+    /// how the table is kept (`cache.wgsl` has the layout).
+    pub fn read_radiance_cache(&mut self) -> Vec<u32> {
+        let buffer = crate::tracer::radiance_cache_buffer(&self.tracer).clone();
+        let encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        let size = crate::tracer::GI_CACHE_SLOTS * 12 * 4;
+        let bytes = crate::read_buffer(&self.device, &self.queue, encoder, &buffer, size);
+        bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|w| u32::from_le_bytes(*w))
             .collect()
     }
 

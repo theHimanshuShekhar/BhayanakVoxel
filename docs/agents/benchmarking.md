@@ -63,7 +63,7 @@ release: a debug build's CPU side is slow enough to distort the frame times.
 | `--runs N` | With `--real-time`, how many times to run the paths in this process. Default 3. The report keeps each run and the least and the most of every number over them; the gates use the worst. |
 | `--flip-gamma-2-2` | Also score each checkpoint with the old gamma-2.2 curve (#188), from the same samples, to tell the sRGB move from the estimator's effect. Not with `--no-convergence` or `--short`. |
 | `--no-convergence` | Leave out the convergence phase (below), which otherwise runs after the caves. |
-| `--truth-spp N` | Samples of each of the convergence phase's two truths. Default 1024; ADR 0005's is 8192, which takes eight times as long (`client.exe bench --truth-spp 8192` is the 4090 baseline). At least 1024, the last checkpoint. |
+| `--truth-spp N` | Samples of each of the convergence phase's two truths (the emissive room's have at least 4096 with FLIP, `ROOM_TRUTH_SPP`). Default 1024; ADR 0005's is 8192, which takes eight times as long (`client.exe bench --truth-spp 8192` is the 4090 baseline). At least 1024, the last checkpoint. |
 | `--no-fail` | Exit with status 0 even if a pass is over budget, a frame of the streaming mode has a hole, or a gate of the real-time mode is over. |
 
 It runs unattended. Without the convergence phase it takes a minute or so (generating the whole Planet is about 22 s of it); the convergence phase, on by default, adds about 45 s on the 4090 at the default `--truth-spp`, and more on a slower GPU or with a larger `--truth-spp`.
@@ -1282,8 +1282,12 @@ view's **truth A**, which the view's own run made, at the output size:
   #55 tightens it), `no-further:VIEW` (a view's settled GI image no further from truth than its flat
   one, for each of the three), `settle` (the dig settles within 500 ms), and `reference-room` (the
   room's Reference view reaches FLIP 0.05 within 0.25 s of the hold beginning, which the room's
-  `still.flip_within_target` already scores: direct emitter sampling). `gates.over` names those that
-  are over.
+  `still.flip_within_target` already scores: direct emitter sampling) **where that line counts in the
+  room** (ADR 0005: at least 4 times the room's floor, so a room whose truths are noisier than 0.0125
+  is not held to it; **the room's truths have at least 4096 samples** when FLIP is run, `ROOM_TRUTH_SPP`,
+  for a floor of about 0.0105 that 0.05 is four times, since the room's floor was 0.0211 at 1024).
+  `gates.over` names those that are over, `gates.not_counted` those that were not held for being under
+  4 times the floor.
 - **Why gate the settled frame**: the first frame of a cold cache is the noisiest GI is, and the player
   has it once, in the frame the scene is made; it is reported beside the settled one, not held.
 - **CI** (`--short`) draws all of it at a few dozen pixels with no FLIP: the report has the shape, the

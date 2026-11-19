@@ -72,6 +72,10 @@ pub const CHECKPOINTS: [u32; 6] = [1, 4, 16, 64, 256, 1024];
 /// How many samples a truth has when `--truth-spp` does not say: the last checkpoint. ADR 0005's
 /// is 8192, which takes eight times as long.
 pub const DEFAULT_TRUTH_SPP: u32 = 1024;
+/// How many samples the room's truths have at least when FLIP is run (#54): its noise floor was
+/// 0.0211 at 1024, and a 0.05 line counts only where it is four times the floor (0.0125). The
+/// floor goes with one over the square root of the samples, so 4096 gives about 0.0105.
+pub const ROOM_TRUTH_SPP: u32 = 4096;
 
 /// Where the pictures and truths go, in the output folder.
 const FOLDER: &str = "convergence";
@@ -133,6 +137,16 @@ impl Settings {
                 truth_spp.unwrap_or(16),
             ),
             gi: gi::Settings::short(((traced.0 / 2).max(1), (traced.1 / 2).max(1))),
+        }
+    }
+
+    /// How many samples each of a view's truths has: the room's has more where FLIP is run, for
+    /// a floor that the 0.05 line is four times (the room is dim, so its truth is noisier).
+    pub fn truth_spp_for(&self, view: &str) -> u32 {
+        if self.flip && view == "room" {
+            self.truth_spp.max(ROOM_TRUTH_SPP)
+        } else {
+            self.truth_spp
         }
     }
 
@@ -335,7 +349,15 @@ pub fn run(settings: &Settings, out: &Path) -> Result<ConvergenceReport, Box<dyn
     let gi = {
         let scored: Vec<_> = views
             .iter()
-            .map(|v| (v.name, &v.gi, v.still.flip_within_target))
+            .map(|v| {
+                // The 0.05 line counts in a view where it is four times the floor.
+                let counts = v
+                    .lines
+                    .iter()
+                    .find(|l| l.flip == still::FLIP_TARGET)
+                    .is_none_or(|l| l.counts);
+                (v.name, &v.gi, v.still.flip_within_target, counts)
+            })
             .collect();
         gi::GiReport {
             gates: gi::gates(&settings.gi, &scored, &edit),
@@ -417,18 +439,13 @@ fn run_view(view: View, settings: &Settings, out: &Path) -> Result<ViewReport, B
     let folder = out.join(FOLDER).join(name);
     fs::create_dir_all(&folder).map_err(|e| format!("cannot create {}: {e}", folder.display()))?;
     let last = settings.checkpoints.last().copied().unwrap_or(0);
+    let truth_spp = settings.truth_spp_for(name);
 
     // The truths first: they warm the GPU's clocks and caches, and they are not timed.
     let truth = |gpu: &mut Offscreen, seed| {
-        draw(
-            gpu,
-            &view.camera,
-            seed,
-            &[settings.truth_spp],
-            settings.truth_spp,
-        )
-        .pop()
-        .expect("a truth has samples")
+        draw(gpu, &view.camera, seed, &[truth_spp], truth_spp)
+            .pop()
+            .expect("a truth has samples")
     };
     let truth_a = truth(&mut gpu, TRUTH_SEEDS[0]);
     let truth_b = truth(&mut gpu, TRUTH_SEEDS[1]);
@@ -909,6 +926,7 @@ mod tests {
                     reference_within_s: still::WITHIN_S,
                     held: flip,
                     over: Vec::new(),
+                    not_counted: Vec::new(),
                 },
             },
         }

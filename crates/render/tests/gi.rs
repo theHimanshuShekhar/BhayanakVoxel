@@ -113,6 +113,27 @@ fn a_room_lit_only_by_an_emissive_block_is_lit_as_the_reference_has_it() {
 }
 
 #[test]
+fn the_upscaler_does_not_take_light_from_the_noise_of_one_sample_of_gi() {
+    // The history is a mean of noisy samples; a mean in a perceptual encoding of noise is darker than
+    // the noise's mean (a bright and a dark sample average to less than the light of the two).
+    let scene = lit_room();
+    let camera = room_camera();
+    let mut gpu = gpu_of(&scene);
+    warmed(&mut gpu, &camera, 60);
+    let frames: Vec<Image> = (0..16).map(|_| gpu.render(&camera)).collect();
+    let single = frames.iter().map(mean).sum::<f32>() / 16.0;
+    let mut gpu = gpu_of(&scene);
+    warmed(&mut gpu, &camera, 60);
+    let upscaled = mean(&settled(&mut gpu, &camera, 40));
+    let reference = mean(&gpu.render_reference(&camera, 128));
+    eprintln!("single {single} upscaled {upscaled} reference {reference}");
+    assert!(
+        (upscaled / single - 1.0).abs() < 0.04,
+        "one sample's frames have {single}, the upscaled has {upscaled}"
+    );
+}
+
+#[test]
 fn the_same_room_with_the_lamp_replaced_by_rock_is_dark() {
     let rock = material("rock");
     let mut store = BrickStore::new();
@@ -212,6 +233,94 @@ fn light_let_into_a_dark_side_of_a_room_shows_within_half_a_second_and_settles_t
     assert!(
         (at_30 - settled_at).abs() < 0.1 * (settled_at - before),
         "frame 30 is {at_30} of {before} to {settled_at}"
+    );
+}
+
+#[test]
+fn a_wall_thinner_than_a_cell_keeps_the_light_of_the_lit_side_off_the_dark_one() {
+    // The wall at x = 18..20 is inside one 8-voxel cell along x (16..24): the floors either side of
+    // it must not be one cell, whatever order the two sides are looked at in.
+    let scene = Scene::new(&walled_room(), None);
+    let lit_side = Camera::looking_at([34.0, 6.0, 34.0], [26.0, 3.0, 12.0]);
+    let dark_side = Camera::looking_at([4.0, 6.0, 34.0], [14.0, 3.0, 10.0]);
+    for lit_first in [false, true] {
+        let mut gpu = gpu_of(&scene);
+        if lit_first {
+            warmed(&mut gpu, &lit_side, 40);
+        }
+        let from_the_start = mean(&warmed(&mut gpu, &dark_side, 1));
+        let after_a_while = mean(&warmed(&mut gpu, &dark_side, 60));
+        if !lit_first {
+            warmed(&mut gpu, &lit_side, 40);
+        }
+        let later = mean(&warmed(&mut gpu, &dark_side, 60));
+        let reference = mean(&gpu.render_reference(&dark_side, 32));
+        // The Reference has the dark side dark (the wall does not let light by).
+        for (when, light) in [
+            ("at first", from_the_start),
+            ("after a while", after_a_while),
+            ("after the lit side was seen", later),
+        ] {
+            assert!(
+                light <= reference + 0.0002,
+                "lit side first: {lit_first}: the dark side is {light} {when}, the Reference has {reference}"
+            );
+        }
+    }
+    let mut gpu = gpu_of(&scene);
+    let lit = mean(&warmed(&mut gpu, &lit_side, 60));
+    assert!(lit > 0.01, "the lit side is lit: {lit}");
+}
+
+/// The slots of the radiance cache (12 words each, `cache.wgsl`): the cells that hold light
+/// (check, odd, and a weight), and the tombstones of the cells that were dropped (check 2).
+fn cache_census(gpu: &mut Offscreen) -> (usize, usize, usize) {
+    const TOMBSTONE: u32 = 2;
+    let words = gpu.read_radiance_cache();
+    let slots = words.chunks(12);
+    let live: Vec<u32> = slots
+        .clone()
+        .filter(|s| s[0] & 1 == 1 && f32::from_bits(s[8]) > 0.0)
+        .map(|s| s[0])
+        .collect();
+    let mut distinct = live.clone();
+    distinct.sort_unstable();
+    distinct.dedup();
+    let dropped = slots.filter(|s| s[0] == TOMBSTONE).count();
+    (live.len(), live.len() - distinct.len(), dropped)
+}
+
+#[test]
+fn an_expired_cell_leaves_a_tombstone_so_the_cells_after_it_are_still_found() {
+    // A free slot ends a probe, so a dropped cell's slot must not be free: the cells put beyond it
+    // would not be found, and would be made again (twice in the table, until the first expired).
+    // The two sides of the wall: no ray from one gets to the other, so the cells of the side that
+    // is no longer looked at are fed by no one.
+    let scene = Scene::new(&walled_room(), None);
+    let mut gpu = gpu_of(&scene);
+    let west = Camera::looking_at([4.0, 6.0, 34.0], [14.0, 3.0, 10.0]);
+    let east = Camera::looking_at([34.0, 6.0, 34.0], [26.0, 3.0, 12.0]);
+    warmed(&mut gpu, &west, 20);
+    warmed(&mut gpu, &east, 20);
+    let (both, _, none_yet) = cache_census(&mut gpu);
+    assert_eq!(none_yet, 0, "nothing has expired yet");
+    // 180 frames of looking only east, and the west's cells go: those that nothing east of it
+    // feeds or reads.
+    warmed(&mut gpu, &east, 200);
+    let (live, duplicates, dropped) = cache_census(&mut gpu);
+    assert!(
+        dropped > 0,
+        "cells expired ({both} then {live}, none dropped)"
+    );
+    assert!(live < both, "{both} cells, then {live}");
+    assert_eq!(duplicates, 0, "a cell is in the table once");
+    // Looking west again takes the tombstones' slots back, and makes each cell once.
+    warmed(&mut gpu, &west, 20);
+    let (_, duplicates, after) = cache_census(&mut gpu);
+    assert_eq!(duplicates, 0, "a cell is in the table once");
+    assert!(
+        after < dropped,
+        "the slots are used again: {dropped} then {after}"
     );
 }
 

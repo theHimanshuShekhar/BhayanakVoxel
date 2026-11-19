@@ -188,6 +188,10 @@ pub struct Gates {
     /// The names of the gates that are over, empty if none: `room-flip`, `no-further:VIEW`,
     /// `settle`, `reference-room`.
     pub over: Vec<String>,
+    /// The gates that were not held because the view cannot tell their line from its own noise
+    /// (ADR 0005: a line counts where it is at least `MIN_LINE_OVER_FLOOR` times the floor):
+    /// `reference-room` where the room's FLIP 0.05 is under four times its floor.
+    pub not_counted: Vec<String>,
 }
 
 /// The report's `convergence.gi` block.
@@ -323,6 +327,7 @@ pub fn dig(settings: &Settings, out: &Path) -> Result<EditSettle, Box<dyn Error>
     let changed: Vec<_> = changed.into_iter().collect();
     let update = scene.update(&store, &changed)?;
     gpu.update_scene(&scene, &update)?;
+    gpu.edit_made();
     let update_ms = started.elapsed().as_secs_f64() * 1e3;
 
     // The frames, at 60 Hz: each takes its own time or a frame's, whichever is more. The time is
@@ -366,21 +371,27 @@ pub fn dig(settings: &Settings, out: &Path) -> Result<EditSettle, Box<dyn Error>
 }
 
 /// The gates of the phase over its views and its dig.
+///
+/// Each view comes with whether its Reference was within the target ([`still::FLIP_TARGET`] in
+/// [`still::WITHIN_S`]) and whether that line counts in the view.
 pub fn gates(
     settings: &Settings,
-    views: &[(&'static str, &ViewGi, Option<bool>)],
+    views: &[(&'static str, &ViewGi, Option<bool>, bool)],
     edit: &EditSettle,
 ) -> Gates {
     let mut over = Vec::new();
+    let mut not_counted = Vec::new();
     if settings.flip {
-        for &(name, gi, reference_within) in views {
+        for &(name, gi, reference_within, counts) in views {
             if name == "room" {
                 // A room that FLIP did not score is over: nothing says it is lit.
                 let flip = gi.gi.settled.flip.map(|f| f.flip_mean);
                 if !flip.is_some_and(|f| f <= ROOM_TARGET_FLIP) {
                     over.push("room-flip".to_string());
                 }
-                if reference_within != Some(true) {
+                if !counts {
+                    not_counted.push("reference-room".to_string());
+                } else if reference_within != Some(true) {
                     over.push("reference-room".to_string());
                 }
             }
@@ -399,6 +410,7 @@ pub fn gates(
         reference_within_s: still::WITHIN_S,
         held: settings.flip,
         over,
+        not_counted,
     }
 }
 
@@ -442,6 +454,13 @@ pub fn print_summary(views: &[(&'static str, &ViewGi)], report: &GiReport) {
     if !g.held {
         eprintln!("  gates: not held (no FLIP)");
     } else if g.over.is_empty() {
+        if !g.not_counted.is_empty() {
+            eprintln!(
+                "  gates: not held, the line is under {} times the floor: {}",
+                super::MIN_LINE_OVER_FLOOR,
+                g.not_counted.join(", ")
+            );
+        }
         eprintln!("  gates: all met");
     } else {
         eprintln!("  gates: OVER: {}", g.over.join(", "));
@@ -519,9 +538,9 @@ mod tests {
     fn the_gates_are_the_tickets_and_each_is_over_by_itself() {
         let settings = Settings::full((2560, 1440));
         let ok = [
-            ("golden", &view(0.2, 0.15), None),
-            ("pit", &view(0.2, 0.19), None),
-            ("room", &view(0.4, 0.09), Some(true)),
+            ("golden", &view(0.2, 0.15), None, true),
+            ("pit", &view(0.2, 0.19), None, true),
+            ("room", &view(0.4, 0.09), Some(true), true),
         ];
         let g = gates(&settings, &ok, &edit(Some(300.0)));
         assert!(g.held && g.over.is_empty(), "{g:?}");
@@ -529,15 +548,21 @@ mod tests {
         // that did not get there in time: each is named.
         let worse = view(0.2, 0.25);
         let bad = [
-            ("golden", &worse, None),
-            ("pit", &view(0.2, 0.19), None),
-            ("room", &view(0.4, 0.11), Some(false)),
+            ("golden", &worse, None, true),
+            ("pit", &view(0.2, 0.19), None, true),
+            ("room", &view(0.4, 0.11), Some(false), true),
         ];
         let g = gates(&settings, &bad, &edit(Some(600.0)));
         assert_eq!(
             g.over,
             ["no-further:golden", "room-flip", "reference-room", "settle"]
         );
+        // A Reference whose line the room cannot tell from its floor is not held to it, and the
+        // report says so.
+        let blurred = [("room", &view(0.4, 0.09), Some(false), false)];
+        let g = gates(&settings, &blurred, &edit(Some(300.0)));
+        assert!(g.over.is_empty(), "{g:?}");
+        assert_eq!(g.not_counted, ["reference-room"]);
         // A dig whose time cannot be told is over too.
         let g = gates(&settings, &ok, &edit(None));
         assert_eq!(g.over, ["settle"]);

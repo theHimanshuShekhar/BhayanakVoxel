@@ -46,9 +46,12 @@ struct Frame {
     // view has GI or emitters.
     light: vec4<u32>,
     // Primary's radiance cache (gi.wgsl): the number of the frame (it counts every frame of
-    // Primary, from 1, whatever the upscaler's history does), then 1 for the frames after the
-    // scene changed, when the cache forgets faster, then two unused.
+    // Primary, from 1, whatever the upscaler's history does), then 1 for the frames after an Edit
+    // or a new sun, when the cells of the box below forget faster, then two unused.
     gi: vec4<u32>,
+    // The first Voxel of that box and one past its last (level 0 coordinates), then one unused each.
+    boost_min: vec4<i32>,
+    boost_max: vec4<i32>,
 }
 
 @group(1) @binding(0) var<uniform> camera: Camera;

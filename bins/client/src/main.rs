@@ -832,7 +832,13 @@ impl App {
             return Ok(());
         }
         let update = world.edit(&self.camera, &self.editor.tool)?;
-        self.show(update)
+        let edited = update.is_some();
+        self.show(update)?;
+        // The Edit, and not streaming, is what makes the radiance cache follow the light faster.
+        if edited && let Some(renderer) = &mut self.renderer {
+            renderer.edit_made();
+        }
+        Ok(())
     }
 
     /// Holds a Dig for `dt` seconds, while the button is down on one: it is made, as an ordinary

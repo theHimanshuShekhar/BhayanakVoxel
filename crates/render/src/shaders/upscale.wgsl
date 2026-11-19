@@ -60,8 +60,23 @@ const SHARPNESS = 8.0;
 // How far (in encoded colour) the clamp may move the history before the pixel's history is
 // thrown away: it was of something else.
 const CLAMP_REJECT = 0.1;
+// How far beyond the range of the traced samples (a share of the range's width, each side) the
+// history is allowed: a pixel of noisy samples (GI) has a range that the mean of its light is
+// often outside of, and a hard clamp to it takes the light away.
+const CLAMP_SLACK = 0.5;
 // Keep in step with DebugView in debug_view.rs.
 const VIEW_HISTORY_LENGTH = 5u;
+
+// sRGB's transfer function and its inverse, on values in 0 to 1.
+fn to_linear(encoded: vec3<f32>) -> vec3<f32> {
+    let c = clamp(encoded, vec3<f32>(0.0), vec3<f32>(1.0));
+    return select(pow((c + 0.055) / 1.055, vec3<f32>(2.4)), c / 12.92, c <= vec3<f32>(0.04045));
+}
+
+fn to_encoded(linear: vec3<f32>) -> vec3<f32> {
+    let c = clamp(linear, vec3<f32>(0.0), vec3<f32>(1.0));
+    return select(1.055 * pow(c, vec3<f32>(1.0 / 2.4)) - 0.055, 12.92 * c, c <= vec3<f32>(0.0031308));
+}
 
 fn load_colour(p: vec2<i32>, size: vec2<i32>) -> vec3<f32> {
     return textureLoad(colour, clamp(p, vec2<i32>(0), size - 1), 0).rgb;
@@ -130,7 +145,7 @@ fn upscale_pass(@builtin(global_invocation_id) id: vec3<u32>) {
             high = max(high, c);
             let d = vec2<f32>(p) + jitter - centre;
             let w = exp(-dot(d, d) * SHARPNESS);
-            sum += c * w;
+            sum += to_linear(c) * w;
             total += w;
         }
     }
@@ -141,7 +156,7 @@ fn upscale_pass(@builtin(global_invocation_id) id: vec3<u32>) {
         // The first frame is plain primary visibility: the sample nearest to the pixel.
         shown = load_colour(nearest, in_size);
     } else {
-        shown = sum / total;
+        shown = to_encoded(sum / total);
         // Where this pixel's point was in the last frame. The point is the hit of the nearest
         // sample's distance along the ray through this pixel's centre; a miss is infinitely far,
         // so only the camera's turn moves it.
@@ -165,12 +180,15 @@ fn upscale_pass(@builtin(global_invocation_id) id: vec3<u32>) {
         let at = (projected * 0.5 + 0.5) * vec2<f32>(out_size);
         if z > 1e-4 && all(at >= vec2<f32>(0.0)) && all(at < vec2<f32>(out_size)) {
             let past = read_history(at, out_size);
-            let kept = clamp(past, low, high);
+            let slack = CLAMP_SLACK * (high - low);
+            let kept = clamp(past, low - slack, high + slack);
             if distance(kept, past) <= CLAMP_REJECT {
                 frames = min(textureLoad(history, vec2<i32>(at), 0).a + 1.0, MAX_HISTORY);
                 // A traced sample far from the pixel's centre (a weak total weight) says little
                 // about it, so it takes a smaller share than a near one.
-                shown = mix(kept, shown, clamp(total, 0.0, 1.0) / frames);
+                // In linear light: the mean of noisy samples (one sample of GI a frame) in the encoded
+                // colour is darker than their light, by more the noisier they are.
+                shown = to_encoded(mix(to_linear(kept), to_linear(shown), clamp(total, 0.0, 1.0) / frames));
             }
             // Otherwise the history was of something else: it is thrown away, and the pixel
             // starts again from this frame's samples alone (frames is 1, the current colour).

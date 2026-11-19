@@ -146,6 +146,13 @@ impl Renderer {
             .update_scene(&self.device, &self.queue, scene, update)
     }
 
+    /// Says that the last [`Renderer::update_scene`] was the player's Edit, so that the radiance
+    /// cache follows the light round it faster (see [`Tracer::edit_made`]); streaming loads and
+    /// moves of the scene are not Edits.
+    pub fn edit_made(&mut self) {
+        self.tracer.edit_made();
+    }
+
     /// Bytes of GPU memory that the Planet's bricks take.
     pub fn scene_bytes(&self) -> u64 {
         self.tracer.scene_bytes()

@@ -38,7 +38,7 @@ const GI_GROUP_FILL = 4u;
 const GI_GROUP_FILL_EMITTER = 5u;
 // One pixel in this many adds its own sample to the cache, and one reader in this many of a cell
 // that has not been fed for REFRESH_AGE frames adds a fresh sample of it (more of them for the
-// frames after the scene changed: `frame.gi.y`).
+// cells round an Edit, in the frames after it: `cache_boosted`).
 const GI_FEED_ONE_IN = 16u;
 const GI_REFRESH_ONE_IN = 32u;
 const GI_REFRESH_ONE_IN_AFTER_EDIT = 8u;
@@ -154,7 +154,7 @@ fn gi_gather(ray: Ray, hit: Hit, normal: vec3<f32>, pixel_seed: u32) -> vec3<f32
     // A cell that is not there yet is worked out here and added; one that is there and has not been
     // fed for a while is added to now and then, by a reader in a few dozen, so that it follows the
     // scene even when nothing the camera sees feeds it.
-    let every = select(GI_REFRESH_ONE_IN, GI_REFRESH_ONE_IN_AFTER_EDIT, frame.gi.y != 0u);
+    let every = select(GI_REFRESH_ONE_IN, GI_REFRESH_ONE_IN_AFTER_EDIT, cell.boosted);
     let chosen = pixel_hash(vec2<u32>(pixel_seed, n), GI_SEED) % every == 0u;
     if !cell.known || (cell.age > REFRESH_AGE && chosen) {
         let fresh = gi_fill(next, landed, pixel_seed);

@@ -254,8 +254,8 @@ fluid = "none"
     .unwrap()
 }
 
-/// The closed box with two lamps in it: a block of 6 Voxels on the floor and a small one in the
-/// air, so that a Voxel's list holds two emitters, one of them hidden from part of the room by the
+/// The closed box with two lamps in it: a block of 6 Voxels on the floor (across a brick boundary) and
+/// a small one in the air, so that a Voxel's list holds two emitters, one of them hidden from part of the room by the
 /// other.
 fn a_room_with_two_lamps() -> Scene {
     let mut store = BrickStore::new();
@@ -271,7 +271,9 @@ fn a_room_with_two_lamps() -> Scene {
             }
         }
     }
-    for x in 9..15 {
+    // The big lamp straddles the boundary of two bricks (x = 8), so that it is two emitter boxes
+    // that sampling must weigh as one light: the two halves' light is not counted twice, nor lost.
+    for x in 5..11 {
         for y in 0..6 {
             for z in 9..15 {
                 store.set(VoxelCoord([x, y, z]), Some(LAMP));

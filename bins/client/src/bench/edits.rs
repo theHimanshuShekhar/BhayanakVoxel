@@ -139,6 +139,7 @@ pub fn run(
             let packed = began.elapsed();
             // The frame thread again: the writes to the GPU.
             gpu.update_scene(scene, &update)?;
+            gpu.edit_made();
             let done = began.elapsed();
             took = done.as_secs_f64() * 1e3;
             frame_thread.push(((done - packed) + written).as_secs_f64() * 1e3);

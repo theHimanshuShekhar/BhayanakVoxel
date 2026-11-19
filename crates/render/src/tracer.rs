@@ -11,7 +11,7 @@ use crate::atmosphere::{AtmosphereTables, AtmosphereView};
 use crate::batch::max_samples;
 use crate::camera::{Camera, CameraUniform};
 use crate::debug_view::DebugView;
-use crate::emitters::{Emitters, emissive_materials};
+use crate::emitters::{Applied, EmitterIndex, Emitters, Touched, emissive_materials};
 use crate::gpu_materials;
 use crate::look::{Look, LookUniform};
 use crate::post::{self, Exposed, HDR_FORMAT, Metering, Post, Scratch, Stages};
@@ -56,9 +56,15 @@ pub const GI_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 pub const GI_CACHE_SLOTS: u64 = 1 << 19;
 const GI_SLOT_WORDS: u64 = 12;
 
-/// The frames after the scene (or the sun) changed in which the cache forgets faster (`frame.gi.y`):
-/// half a second at 60 Hz, which is the time that the lit result has to settle in after a dig.
+/// The frames after an Edit (or a change of the sun) in which the cache forgets faster, in the cells
+/// of the boost's box (`frame.gi.y`, `frame.boost_min` and `boost_max`): half a second at 60 Hz,
+/// which is the time that the lit result has to settle in after a dig.
 const GI_BOOST_FRAMES: u32 = 30;
+/// How far round the regions an Edit wrote the boost reaches, in Voxels: the light that an Edit lets
+/// in or shuts out changes the cells about it most (two regions, 6.4 m).
+const GI_BOOST_MARGIN: i32 = 128;
+/// A box that holds every Voxel, for a change of the sun.
+const EVERYWHERE: ([i32; 3], [i32; 3]) = ([i32::MIN / 2; 3], [i32::MAX / 2; 3]);
 
 /// Format of the upscaler's history: encoded colour, and in alpha the frames it has been through.
 pub const HISTORY_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
@@ -272,9 +278,13 @@ struct FrameUniform {
     /// ambient, see [`Tracer::set_flat_ambient`]); 1 if it has emitted light; the number of shadow
     /// rays a pixel casts.
     light: [u32; 4],
-    /// Primary's radiance cache: the frame's number, 1 if the scene or the sun changed lately, and
-    /// two unused.
+    /// Primary's radiance cache: the frame's number, 1 if an Edit or the sun changed lately (in the
+    /// cells of the box below), and two unused.
     gi: [u32; 4],
+    /// The first Voxel of the box that the cache forgets faster in, and one past its last (the
+    /// fourth word of each is unused).
+    boost_min: [i32; 4],
+    boost_max: [i32; 4],
 }
 
 /// Where primary visibility traces when nothing moves it: the centre of the pixel.
@@ -534,8 +544,14 @@ pub struct Tracer {
     gi_cache: wgpu::Buffer,
     /// The number of the frame of Primary being drawn (from 1), which the cache ages by.
     gi_frame: u32,
-    /// How many more frames the cache forgets fast in, after the scene or the sun changed.
+    /// How many more frames the cache forgets fast in, after an Edit or the sun changed, and in
+    /// which cells (the first Voxel and one past the last, of level 0).
     gi_boost: u32,
+    gi_boost_box: ([i32; 3], [i32; 3]),
+    /// The regions of level 0 that the last [`Tracer::update_scene`] wrote.
+    last_touched: Touched,
+    /// The emitters of level 0 by region, which an update of the scene takes in region by region.
+    emitter_index: EmitterIndex,
     /// Whether Primary's light has the flat ambient of before #54 in place of its GI (see
     /// [`Tracer::set_flat_ambient`]).
     flat_ambient: bool,
@@ -610,6 +626,11 @@ const BELT_CHUNK: u64 = 4 << 20;
 /// Where the emitters' buffer is bound, in group 1 of the kernels that sample them (`emitters` in
 /// `emitters.wgsl`).
 pub(crate) const EMITTERS_BINDING: u32 = 18;
+
+/// The radiance cache's table, for tests (`Offscreen::read_radiance_cache`).
+pub(crate) fn radiance_cache_buffer(tracer: &Tracer) -> &wgpu::Buffer {
+    &tracer.gi_cache
+}
 
 /// Where the radiance cache is bound (`gi_cache` in `cache.wgsl`).
 const GI_CACHE_BINDING: u32 = 19;
@@ -1149,7 +1170,9 @@ impl Tracer {
         let gi_cache = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("radiance cache"),
             size: GI_CACHE_SLOTS * GI_SLOT_WORDS * 4,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
         let shade = compute_pipeline(
@@ -1162,7 +1185,8 @@ impl Tracer {
             &[],
         );
         let emissive = emissive_materials(table);
-        let emitters = Emitters::of(scene, &emissive);
+        let emitter_index = EmitterIndex::scan(scene, &emissive);
+        let emitters = emitter_index.emitters();
         let emitter_buffer = emitter_buffer(device, &emitters);
         Ok(Self {
             scene: scene_buffers,
@@ -1187,6 +1211,9 @@ impl Tracer {
             gi_cache,
             gi_frame: 0,
             gi_boost: 0,
+            gi_boost_box: EVERYWHERE,
+            last_touched: Touched::Nothing,
+            emitter_index,
             flat_ambient: false,
             shade_layout,
             shade,
@@ -1224,12 +1251,26 @@ impl Tracer {
     /// last buffer held. The scan reads the packed level 0 (a few thousand words in most scenes) and
     /// is made on every update of the scene, so a dig that opens an emitter to the room is seen by
     /// the next frame.
-    fn update_emitters(&mut self, device: &wgpu::Device, scene: &Scene) {
-        let emitters = Emitters::of(scene, &self.emissive);
-        if emitters != self.emitters {
-            self.emitter_buffer = emitter_buffer(device, &emitters);
-            self.emitters = emitters;
+    fn update_emitters(&mut self, device: &wgpu::Device, scene: &Scene, update: &SceneUpdate) {
+        let Applied {
+            emitters_changed,
+            touched,
+        } = self.emitter_index.apply(scene, &self.emissive, update);
+        self.last_touched = touched;
+        if emitters_changed {
+            let emitters = self.emitter_index.emitters();
+            if emitters != self.emitters {
+                self.emitter_buffer = emitter_buffer(device, &emitters);
+                self.emitters = emitters;
+            }
         }
+        // What an update takes in is what a scan of all of level 0 would find (a scan is the cost
+        // that it avoids; this is checked where it is cheap, which is everywhere but a scene
+        // of thousands of boxes).
+        debug_assert!(
+            self.emitters.boxes > 2048 || self.emitters == Emitters::of(scene, &self.emissive),
+            "the emitters of an update are not those of the scene"
+        );
     }
 
     /// The emitters of the scene as the shaders have them, for tests.
@@ -1529,9 +1570,8 @@ impl Tracer {
         update: &SceneUpdate,
     ) -> Result<()> {
         self.restart_reference();
-        self.gi_boost = GI_BOOST_FRAMES;
         self.smooth_end = smooth_end(scene);
-        self.update_emitters(device, scene);
+        self.update_emitters(device, scene, update);
         // Counted where each write is made, not summed from the patch's cost: [`upload_cost`] is
         // the other count, and the two are compared. Both go over `RingPatch::copies()`, so the
         // comparison does not check that list (the stepped tests' `GpuCopy::assert_is` does).
@@ -1786,6 +1826,36 @@ impl Tracer {
     pub fn sun_changed(&mut self) {
         self.sun_epoch += 1;
         self.gi_boost = GI_BOOST_FRAMES;
+        self.gi_boost_box = EVERYWHERE;
+    }
+
+    /// Says that the last [`Tracer::update_scene`] was an Edit (and not the scene thread's
+    /// streaming, which changes the world far from where anyone looks and must not make the cache
+    /// forget): for [`GI_BOOST_FRAMES`] frames the cells within [`GI_BOOST_MARGIN`] Voxels of the
+    /// regions it wrote follow the new light faster. A scene that was made again is all of it.
+    pub fn edit_made(&mut self) {
+        let region = crate::scene::REGION_VOXELS;
+        // Taken: a second call for the same update does nothing.
+        let touched = std::mem::replace(&mut self.last_touched, Touched::Nothing);
+        let reach = match touched {
+            Touched::Nothing => return,
+            Touched::Everything => EVERYWHERE,
+            Touched::Regions(first, last) => (
+                first.map(|k| k * region - GI_BOOST_MARGIN),
+                last.map(|k| (k + 1) * region + GI_BOOST_MARGIN),
+            ),
+        };
+        let covered = self.gi_boost > 0;
+        self.gi_boost_box = if covered {
+            // An Edit while another is settling: the cells of both.
+            (
+                std::array::from_fn(|a| self.gi_boost_box.0[a].min(reach.0[a])),
+                std::array::from_fn(|a| self.gi_boost_box.1[a].max(reach.1[a])),
+            )
+        } else {
+            reach
+        };
+        self.gi_boost = GI_BOOST_FRAMES;
     }
 
     /// Sets the light's palette (see [`Look`]). The sun's and the sky's light are part of what the
@@ -1949,6 +2019,18 @@ impl Tracer {
                 self.shadow_rays,
             ],
             gi: [self.gi_frame, u32::from(self.gi_boost > 0), 0, 0],
+            boost_min: [
+                self.gi_boost_box.0[0],
+                self.gi_boost_box.0[1],
+                self.gi_boost_box.0[2],
+                0,
+            ],
+            boost_max: [
+                self.gi_boost_box.1[0],
+                self.gi_boost_box.1[1],
+                self.gi_boost_box.1[2],
+                0,
+            ],
         };
         queue.write_buffer(&self.frame_buffer, 0, bytemuck::bytes_of(&frame));
     }
