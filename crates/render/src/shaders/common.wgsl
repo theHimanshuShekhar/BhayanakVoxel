@@ -38,11 +38,17 @@ struct Frame {
     flags: vec4<u32>,
     // The frame that Primary's sun samples are of (0 on the first frame after the upscaler's
     // history started over, a new view or a new sun, so that nothing before a frame decides its
-    // shadows), then 1 if the view has GI (Primary: its ambient term, the stand-in for it; the
-    // Reference: bounce light), then 1 if it has emitted light, then the number of shadow rays a
-    // pixel of Primary casts (at least 1). Both flags are 0 in the bench's sun-and-sky-only view,
-    // where neither view has GI or emitters.
+    // shadows), then whether the view has GI (0 none; 1 Primary's bounce and radiance cache, or
+    // the Reference's bounce light; 2 Primary's flat ambient of 0.25, the stand-in that #54
+    // replaced, kept only for the bench's "before" numbers, and the Reference has its bounce light
+    // then too), then 1 if it has emitted light, then the number of shadow rays a pixel of Primary
+    // casts (at least 1). Both flags are 0 in the bench's sun-and-sky-only view, where neither
+    // view has GI or emitters.
     light: vec4<u32>,
+    // Primary's radiance cache (gi.wgsl): the number of the frame (it counts every frame of
+    // Primary, from 1, whatever the upscaler's history does), then 1 for the frames after the
+    // scene changed, when the cache forgets faster, then two unused.
+    gi: vec4<u32>,
 }
 
 @group(1) @binding(0) var<uniform> camera: Camera;
@@ -244,6 +250,10 @@ const VIEW_SAMPLE_COUNT = 4u;
 const VIEW_HISTORY_LENGTH = 5u;
 // The normal that the hit is shaded with, as `(n + 1) / 2`: the smooth one, or the face's.
 const VIEW_SHADING_NORMALS = 6u;
+// The radiance cache's cell of each hit, as a colour of its own (the same colour for the same cell),
+// black where the cache holds nothing yet (shade.wgsl draws it; the Reference has no cache and shows
+// its lit image).
+const VIEW_CACHE_CELLS = 7u;
 // Voxels at which the depth view is half as bright as at the camera.
 const DEPTH_HALF = 64.0;
 // The sample count at which the sample count view reaches its brightest colour.

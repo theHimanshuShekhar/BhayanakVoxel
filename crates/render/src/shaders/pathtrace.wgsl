@@ -134,19 +134,6 @@ const ROULETTE_COIN_DIM = 0x10000000u;
 // The sun's light on a surface facing it head on, as a multiple of albedo (its irradiance
 // divided by pi), is `frame.sun_radiance` (look.rs): a Lambertian surface at angle theta to the
 // sun reflects albedo * cos(theta) times it.
-// The density, over solid angle, with which the bounce at a surface with shading normal `normal` and
-// geometric normal `face` chooses `dir` (above the face): the cosine-weighted direction about the
-// shading normal where it is above the face, and the mirror image of the one that was below it. Both
-// are the same density where the two normals are one.
-fn bounce_pdf(normal: vec3<f32>, face: vec3<f32>, dir: vec3<f32>) -> f32 {
-    let above = dot(dir, face);
-    if above < 0.0 {
-        return 0.0;
-    }
-    let mirrored = dir - 2.0 * above * face;
-    return (max(dot(normal, dir), 0.0) + max(dot(normal, mirrored), 0.0)) / PI;
-}
-
 // How much of the sky `dir` that a bounce ray found counts, against the sky's own samples: its
 // density over the two, the balance heuristic. 1 where the sky is not sampled.
 fn escape_weight(normal: vec3<f32>, face: vec3<f32>, dir: vec3<f32>) -> f32 {
@@ -393,7 +380,7 @@ fn reference(@builtin(global_invocation_id) id: vec3<u32>) {
     var shown = mean;
     // A debug view replaces what is shown, not what is accumulated, so switching back to the
     // lit image loses no samples. Its colours are encoded already, and post.wgsl copies them.
-    if frame.params.z != 0u {
+    if frame.params.z != 0u && frame.params.z != VIEW_CACHE_CELLS {
         let first = camera_ray(id.xy, size, vec2<f32>(0.5));
         // lighting: Geometry (LOD and what is loaded)
         shown = debug_colour(frame.params.z, trace(first), first_sample + batch - 1u);

@@ -242,10 +242,15 @@ impl Offscreen {
             driver_info: info.driver_info,
             backend: format!("{:?}", info.backend),
         };
-        let tracer = match table {
+        let mut tracer = match table {
             Some(table) => Tracer::with_materials(&device, scene, table)?,
             None => Tracer::new(&device, scene)?,
         };
+        // The flat ambient, not Primary's GI (#54), until a caller asks for GI: most of what
+        // renders here is a test of geometry, colours or the sun, whose frames must be a function of
+        // the scene alone (GI is a noisy sample that depends on the cache's history), and goldens
+        // of them stay as they were. The bench and the look-dev sheet turn GI on.
+        tracer.set_flat_ambient(true);
         let profiler = Profiler::new(&device, &queue);
         let target = if full_reference {
             Target::with_full_reference(&device, resolution)
@@ -365,6 +370,14 @@ impl Offscreen {
     /// shadows view uses it (#52).
     pub fn set_sun_and_sky_only(&mut self, only: bool) {
         self.tracer.set_sun_and_sky_only(only);
+    }
+
+    /// Puts the flat ambient of before #54 in place of Primary's GI, or takes it out (see
+    /// [`Tracer::set_flat_ambient`]). **An `Offscreen` starts with it in**: a caller that looks at
+    /// GI (the bench, the look-dev sheet, the tests of the cache) calls `set_flat_ambient(false)`.
+    /// The window's tracer has GI from the start.
+    pub fn set_flat_ambient(&mut self, flat: bool) {
+        self.tracer.set_flat_ambient(flat);
     }
 
     /// Sets how many shadow rays a pixel of Primary casts towards the sun's disc (see

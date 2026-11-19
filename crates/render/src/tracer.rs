@@ -46,6 +46,20 @@ pub const NORMALS_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float
 /// The format of the sun's light at each hit (`sun_weights` in `shade.wgsl`): one float a pixel.
 pub const SUN_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R32Float;
 
+/// The format of the incident light that Primary's GI finds at each hit (`gi_light` in `gi.wgsl`):
+/// linear light, three half floats a pixel (and one unused).
+pub const GI_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
+
+/// The slots of Primary's radiance cache, a power of two, and the words of a slot (`cache.wgsl`
+/// holds the layout; keep `CACHE_SLOTS` and `SLOT_WORDS` there in step): 24 MiB of storage
+/// buffer for a table that a frame fills a tenth of at most.
+pub const GI_CACHE_SLOTS: u64 = 1 << 19;
+const GI_SLOT_WORDS: u64 = 12;
+
+/// The frames after the scene (or the sun) changed in which the cache forgets faster (`frame.gi.y`):
+/// half a second at 60 Hz, which is the time that the lit result has to settle in after a dig.
+const GI_BOOST_FRAMES: u32 = 30;
+
 /// Format of the upscaler's history: encoded colour, and in alpha the frames it has been through.
 pub const HISTORY_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 
@@ -254,9 +268,13 @@ struct FrameUniform {
     /// 1 if natural Materials are shaded with smooth computed normals; the end of the smooth range
     /// in Voxels and the face normal's weight in it (both an f32's bits); one unused.
     flags: [u32; 4],
-    /// The frame of Primary's sun samples; 1 if the view has GI (the ambient term, for Primary);
-    /// 1 if it has emitted light; the number of shadow rays a pixel casts.
+    /// The frame of Primary's sun samples; whether the view has GI (0 no, 1 yes, 2 Primary's flat
+    /// ambient, see [`Tracer::set_flat_ambient`]); 1 if it has emitted light; the number of shadow
+    /// rays a pixel casts.
     light: [u32; 4],
+    /// Primary's radiance cache: the frame's number, 1 if the scene or the sun changed lately, and
+    /// two unused.
+    gi: [u32; 4],
 }
 
 /// Where primary visibility traces when nothing moves it: the centre of the pixel.
@@ -350,6 +368,9 @@ pub struct Target {
     normals: Plane,
     /// The sun's light at each hit (`shadows`), read by the lit image's pass.
     sun_weights: Plane,
+    /// The light from the bounce, the sky and the emitters at each hit (`gi_trace`), read by the lit
+    /// image's pass.
+    gi_light: Plane,
     reference_size: (u32, u32),
     /// The reference path tracer's mean as linear light, and the display transform's images for it.
     reference_hdr: Plane,
@@ -389,6 +410,7 @@ impl Target {
             surface: Plane::new(device, "surface", internal, SURFACE_FORMAT),
             normals: Plane::new(device, "smooth normals", internal, NORMALS_FORMAT),
             sun_weights: Plane::new(device, "sun weights", internal, SUN_FORMAT),
+            gi_light: Plane::new(device, "gi light", internal, GI_FORMAT),
             reference_size,
             reference_hdr: Plane::new(
                 device,
@@ -503,6 +525,20 @@ pub struct Tracer {
     normals: wgpu::ComputePipeline,
     shadows_layout: wgpu::BindGroupLayout,
     shadows: wgpu::ComputePipeline,
+    gi_layout: wgpu::BindGroupLayout,
+    gi: wgpu::ComputePipeline,
+    gi_resolve_layout: wgpu::BindGroupLayout,
+    gi_resolve: wgpu::ComputePipeline,
+    /// Primary's radiance cache (`cache.wgsl`): a hash table in world space of the light on the
+    /// faces of the world, which `gi_trace` fills and reads.
+    gi_cache: wgpu::Buffer,
+    /// The number of the frame of Primary being drawn (from 1), which the cache ages by.
+    gi_frame: u32,
+    /// How many more frames the cache forgets fast in, after the scene or the sun changed.
+    gi_boost: u32,
+    /// Whether Primary's light has the flat ambient of before #54 in place of its GI (see
+    /// [`Tracer::set_flat_ambient`]).
+    flat_ambient: bool,
     shade_layout: wgpu::BindGroupLayout,
     shade: wgpu::ComputePipeline,
     /// The display transform and the exposure it keeps from frame to frame.
@@ -575,6 +611,9 @@ const BELT_CHUNK: u64 = 4 << 20;
 /// `emitters.wgsl`).
 pub(crate) const EMITTERS_BINDING: u32 = 18;
 
+/// Where the radiance cache is bound (`gi_cache` in `cache.wgsl`).
+const GI_CACHE_BINDING: u32 = 19;
+
 /// The GPU buffer for `emitters`.
 fn emitter_buffer(device: &wgpu::Device, emitters: &Emitters) -> wgpu::Buffer {
     device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -603,6 +642,8 @@ pub(crate) fn buffer_binding(ty: wgpu::BufferBindingType) -> wgpu::BindingType {
 
 pub(crate) const STORAGE_READ: wgpu::BufferBindingType =
     wgpu::BufferBindingType::Storage { read_only: true };
+const STORAGE_WRITE: wgpu::BufferBindingType =
+    wgpu::BufferBindingType::Storage { read_only: false };
 
 fn compute_pipeline(
     device: &wgpu::Device,
@@ -992,6 +1033,31 @@ impl Tracer {
                 layout_entry(9, storage_texture(SUN_FORMAT)),
             ],
         });
+        let gi_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("gi"),
+            entries: &[
+                layout_entry(0, buffer_binding(wgpu::BufferBindingType::Uniform)),
+                layout_entry(2, buffer_binding(wgpu::BufferBindingType::Uniform)),
+                layout_entry(4, buffer_binding(STORAGE_READ)),
+                texture(5, uint),
+                texture(6, uint),
+                texture(8, loaded),
+                texture(10, loaded),
+                layout_entry(EMITTERS_BINDING, buffer_binding(STORAGE_READ)),
+                layout_entry(GI_CACHE_BINDING, buffer_binding(STORAGE_WRITE)),
+                layout_entry(20, storage_texture(GI_FORMAT)),
+            ]
+            .into_iter()
+            .chain(AtmosphereTables::layout_entries())
+            .collect::<Vec<_>>(),
+        });
+        let gi_resolve_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("gi resolve"),
+            entries: &[
+                layout_entry(2, buffer_binding(wgpu::BufferBindingType::Uniform)),
+                layout_entry(GI_CACHE_BINDING, buffer_binding(STORAGE_WRITE)),
+            ],
+        });
         let shade_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("shade"),
             entries: &[
@@ -1002,6 +1068,8 @@ impl Tracer {
                 texture(5, uint),
                 texture(6, uint),
                 texture(10, loaded),
+                layout_entry(GI_CACHE_BINDING, buffer_binding(STORAGE_WRITE)),
+                texture(21, loaded),
             ]
             .into_iter()
             .chain(AtmosphereTables::layout_entries())
@@ -1060,6 +1128,30 @@ impl Tracer {
             &scene_layout,
             &[],
         );
+        let gi = compute_pipeline(
+            device,
+            "gi",
+            shaders::SHADE,
+            "gi_trace",
+            &gi_layout,
+            &scene_layout,
+            &[],
+        );
+        let gi_resolve = compute_pipeline(
+            device,
+            "gi resolve",
+            shaders::SHADE,
+            "gi_resolve",
+            &gi_resolve_layout,
+            &scene_layout,
+            &[],
+        );
+        let gi_cache = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("radiance cache"),
+            size: GI_CACHE_SLOTS * GI_SLOT_WORDS * 4,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         let shade = compute_pipeline(
             device,
             "shade",
@@ -1088,6 +1180,14 @@ impl Tracer {
             normals,
             shadows_layout,
             shadows,
+            gi_layout,
+            gi,
+            gi_resolve_layout,
+            gi_resolve,
+            gi_cache,
+            gi_frame: 0,
+            gi_boost: 0,
+            flat_ambient: false,
             shade_layout,
             shade,
             post: Post::new(device),
@@ -1151,6 +1251,7 @@ impl Tracer {
         sun: &Sun,
         target: &Target,
     ) {
+        self.gi_frame += 1;
         self.write_uniforms(queue, camera, sun, (0, CENTRE, 0), 0);
         self.encode_atmosphere(
             device,
@@ -1162,8 +1263,9 @@ impl Tracer {
             target.resolution.internal,
         );
         // Nothing carries over from one call to the next, the exposure included: it settles at
-        // once, on this image.
+        // once, on this image. (The radiance cache does: it is the world's, not the image's.)
         self.dispatch_primary(device, queue, profiler, encoder, target, 1.0);
+        self.gi_boost = self.gi_boost.saturating_sub(1);
     }
 
     /// Records a frame of primary visibility from `camera`, lit by `sun`: the primary pass, one ray
@@ -1215,6 +1317,7 @@ impl Tracer {
         let frame = self
             .history
             .begin(target.resolution(), camera, self.debug_view);
+        self.gi_frame += 1;
         self.write_uniforms(
             queue,
             camera,
@@ -1232,6 +1335,7 @@ impl Tracer {
             target.resolution.internal,
         );
         self.dispatch_primary(device, queue, profiler, encoder, target, rate);
+        self.gi_boost = self.gi_boost.saturating_sub(1);
         self.upscale
             .encode(device, queue, profiler, encoder, &frame, target);
     }
@@ -1331,7 +1435,8 @@ impl Tracer {
             &target.reference_scratch,
             &target.reference,
             self.stages,
-            self.debug_view != DebugView::Lit,
+            // The Reference has no cache: it shows its lit image for that view.
+            !matches!(self.debug_view, DebugView::Lit | DebugView::CacheCells),
             Exposed::Reference,
             metering,
         );
@@ -1424,6 +1529,7 @@ impl Tracer {
         update: &SceneUpdate,
     ) -> Result<()> {
         self.restart_reference();
+        self.gi_boost = GI_BOOST_FRAMES;
         self.smooth_end = smooth_end(scene);
         self.update_emitters(device, scene);
         // Counted where each write is made, not summed from the patch's cost: [`upload_cost`] is
@@ -1679,6 +1785,7 @@ impl Tracer {
     /// camera: the next frame of Primary starts the upscaler's history over (#52).
     pub fn sun_changed(&mut self) {
         self.sun_epoch += 1;
+        self.gi_boost = GI_BOOST_FRAMES;
     }
 
     /// Sets the light's palette (see [`Look`]). The sun's and the sky's light are part of what the
@@ -1719,6 +1826,17 @@ impl Tracer {
         if only != self.sun_and_sky_only {
             self.sun_and_sky_only = only;
             self.restart_reference();
+            self.history.reset();
+        }
+    }
+
+    /// Puts the flat ambient of before #54 (0.25 of the surface's colour, on every lit surface) in
+    /// place of Primary's GI. It is the bench's "before": a view's Primary-against-truth score with
+    /// it is what the radiance cache must not be further from the Reference than. The Reference has
+    /// its bounce light either way. The upscaler's history starts over.
+    pub fn set_flat_ambient(&mut self, flat: bool) {
+        if flat != self.flat_ambient {
+            self.flat_ambient = flat;
             self.history.reset();
         }
     }
@@ -1819,10 +1937,18 @@ impl Tracer {
             ],
             light: [
                 sun_sample,
-                u32::from(!self.sun_and_sky_only),
+                // 0 without GI, 1 with the bounce and the cache, 2 with the flat ambient.
+                if self.sun_and_sky_only {
+                    0
+                } else if self.flat_ambient {
+                    2
+                } else {
+                    1
+                },
                 u32::from(!self.sun_and_sky_only),
                 self.shadow_rays,
             ],
+            gi: [self.gi_frame, u32::from(self.gi_boost > 0), 0, 0],
         };
         queue.write_buffer(&self.frame_buffer, 0, bytemuck::bytes_of(&frame));
     }
@@ -1851,12 +1977,20 @@ impl Tracer {
             &target.lit_hdr.view,
             target,
         );
+        // A debug view that primary visibility drew skips the lighting: it is the colours as they
+        // are. The history length is the upscaler's, over the lit image; the cache's cells are
+        // drawn by the lit image's pass, from the same GI as the lit image has.
+        let drawn_early = !matches!(
+            self.debug_view,
+            DebugView::Lit | DebugView::HistoryLength | DebugView::CacheCells
+        );
         let debug = !matches!(self.debug_view, DebugView::Lit | DebugView::HistoryLength);
-        if !debug {
+        if !drawn_early {
             if self.stages.smooth_normals {
                 self.dispatch_normals(device, profiler, encoder, target);
             }
             self.dispatch_shadows(device, profiler, encoder, target);
+            self.dispatch_gi(device, profiler, encoder, target);
             self.dispatch_shade(device, profiler, encoder, target);
         }
         self.post.encode(
@@ -1938,6 +2072,56 @@ impl Tracer {
         pass.dispatch_workgroups(width.div_ceil(8), height.div_ceil(8), 1);
     }
 
+    /// The light from the bounce, the sky and the emitters at every hit of the G-buffer (`gi_trace`
+    /// in `gi.wgsl`), and the radiance cache's fold of the frame's samples (`gi_resolve` in
+    /// `cache.wgsl`), in one timed pass called `gi`.
+    fn dispatch_gi(
+        &self,
+        device: &wgpu::Device,
+        profiler: &mut Profiler,
+        encoder: &mut wgpu::CommandEncoder,
+        target: &Target,
+    ) {
+        let view = plane_entry;
+        let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("gi"),
+            layout: &self.gi_layout,
+            entries: &[
+                buffer_entry(0, &self.camera_buffer),
+                buffer_entry(2, &self.frame_buffer),
+                buffer_entry(4, &self.materials),
+                view(5, &target.gbuffer),
+                view(6, &target.surface),
+                view(8, &target.normals),
+                view(10, &target.sun_weights),
+                buffer_entry(EMITTERS_BINDING, &self.emitter_buffer),
+                buffer_entry(GI_CACHE_BINDING, &self.gi_cache),
+                view(20, &target.gi_light),
+            ]
+            .into_iter()
+            .chain(self.atmosphere.entries())
+            .collect::<Vec<_>>(),
+        });
+        let resolve = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("gi resolve"),
+            layout: &self.gi_resolve_layout,
+            entries: &[
+                buffer_entry(2, &self.frame_buffer),
+                buffer_entry(GI_CACHE_BINDING, &self.gi_cache),
+            ],
+        });
+        let (width, height) = target.resolution.internal;
+        let mut pass = profiler.compute_pass(encoder, "gi");
+        pass.set_pipeline(&self.gi);
+        pass.set_bind_group(0, &self.scene.group, &[]);
+        pass.set_bind_group(1, &group, &[]);
+        pass.dispatch_workgroups(width.div_ceil(8), height.div_ceil(8), 1);
+        pass.set_pipeline(&self.gi_resolve);
+        pass.set_bind_group(0, &self.scene.group, &[]);
+        pass.set_bind_group(1, &resolve, &[]);
+        pass.dispatch_workgroups(GI_CACHE_SLOTS.div_ceil(64) as u32, 1, 1);
+    }
+
     /// The lit image as linear light, from the G-buffer and the sun's light at each hit
     /// (`shade_pass` in `shade.wgsl`).
     fn dispatch_shade(
@@ -1968,6 +2152,8 @@ impl Tracer {
                 view(5, &target.gbuffer),
                 view(6, &target.surface),
                 view(10, &target.sun_weights),
+                buffer_entry(GI_CACHE_BINDING, &self.gi_cache),
+                view(21, &target.gi_light),
             ]
             .into_iter()
             .chain(self.atmosphere.entries())

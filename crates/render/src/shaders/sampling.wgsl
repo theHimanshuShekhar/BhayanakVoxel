@@ -160,6 +160,19 @@ fn cosine_hemisphere(n: vec3<f32>, u: vec2<f32>) -> vec3<f32> {
     return basis(n) * local;
 }
 
+// The density, over solid angle, with which the bounce at a surface with shading normal `normal` and
+// geometric normal `face` chooses `dir` (above the face): the cosine-weighted direction about the
+// shading normal where it is above the face, and the mirror image of the one that was below it. Both
+// are the same density where the two normals are one.
+fn bounce_pdf(normal: vec3<f32>, face: vec3<f32>, dir: vec3<f32>) -> f32 {
+    let above = dot(dir, face);
+    if above < 0.0 {
+        return 0.0;
+    }
+    let mirrored = dir - 2.0 * above * face;
+    return (max(dot(normal, dir), 0.0) + max(dot(normal, mirrored), 0.0)) / PI;
+}
+
 // A unit vector uniform over the cone of directions within `acos(cos_max)` of the unit vector
 // `axis`. With cos_max = 1 it is exactly `axis`.
 fn sample_cone(axis: vec3<f32>, cos_max: f32, u: vec2<f32>) -> vec3<f32> {

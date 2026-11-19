@@ -1,8 +1,9 @@
-// Primary's light, drawn from what primary.wgsl wrote, in three kernels: `normals` (the smooth
+// Primary's light, drawn from what primary.wgsl wrote, in four kernels: `normals` (the smooth
 // computed normal of each hit, #202: its own pass, so that its cost has a line of its own),
 // `shadows` (the sun's light at each hit, #52: two shadow rays a pixel, its own pass for the same
-// reason) and `shade_pass`, which draws the lit image as linear light for post.wgsl to expose and
-// tone.
+// reason), `gi_trace` (gi.wgsl, #54: the bounce light and the emitters', which `gi_resolve` of
+// cache.wgsl follows in the one pass) and `shade_pass`, which draws the lit image as linear light
+// for post.wgsl to expose and tone.
 //
 // Every read of a source of light, every ray cast through the walk and every line of `shade` (the light), control
 // flow aside, needs a whole-line `// lighting: <feature>` comment on one of the two lines directly
@@ -120,18 +121,22 @@ fn shadows(@builtin(global_invocation_id) id: vec3<u32>) {
     textureStore(sun_weights_out, id.xy, vec4<f32>(weight, 0.0, 0.0, 0.0));
 }
 
-// The light leaving the hit, towards the camera; `colour` is its surface_albedo and `sun` the
-// weight of the sun's light there (`shadows`); `uv` is the pixel's place in the image, 0 to 1, which
-// the air between it and the camera is looked up by (sky.wgsl).
-fn shade(ray: Ray, hit: Hit, colour: vec3<f32>, sun: f32, uv: vec2<f32>) -> vec3<f32> {
+// The light leaving the hit, towards the camera; `colour` is its surface_albedo, `sun` the weight of
+// the sun's light there (`shadows`) and `gi` the incident light from everything else (`gi_trace`,
+// gi.wgsl); `uv` is the pixel's place in the image, 0 to 1, which the air between it and the camera
+// is looked up by (sky.wgsl).
+fn shade(ray: Ray, hit: Hit, colour: vec3<f32>, sun: f32, gi: vec3<f32>, uv: vec2<f32>) -> vec3<f32> {
     if !hit.hit {
         // lighting: Sky and atmosphere
         return sky(ray.dir);
     }
+    // The light of the bounces, the sky and the emitters on the surface is `gi`'s; the flat 0.25 that
+    // stood in for it before #54 (`frame.light.y` 2) is the bench's "before" and nothing else's.
+    // lighting: Bounce light
     // lighting: Ambient term
-    let ambient = select(0.0, 0.25, frame.light.y != 0u);
+    let bounce = select(gi, vec3<f32>(0.25), frame.light.y == 2u);
     // lighting: Sun and shadows
-    let lit = colour * (ambient + frame.sun_radiance.xyz * sun);
+    let lit = colour * (bounce + frame.sun_radiance.xyz * sun);
     // lighting: Emissive Voxels
     let light = lit + emission(hit.material) * f32(frame.light.z);
     // lighting: Sky and atmosphere
@@ -145,20 +150,35 @@ fn shade_pass(@builtin(global_invocation_id) id: vec3<u32>) {
         return;
     }
     // The primary kernel drew a debug view; the upscaler draws the history length one itself, over
-    // the lit image.
-    if frame.params.z != 0u && frame.params.z != VIEW_HISTORY_LENGTH {
+    // the lit image. The cache's cells are drawn here, where the hit is known.
+    if frame.params.z != 0u && frame.params.z != VIEW_HISTORY_LENGTH && frame.params.z != VIEW_CACHE_CELLS {
         return;
     }
     let ray = camera_ray(id.xy, size, frame.jitter.xy);
     let hit = load_hit(id.xy);
+    if frame.params.z == VIEW_CACHE_CELLS {
+        var cells = vec3<f32>(0.0);
+        if hit.hit {
+            // lighting: Bounce light
+            let cell = cache_incident(hit.voxel, hit.normal, hit.t);
+            if cell.known {
+                cells = cache_cell_colour(hit.voxel, hit.normal, hit.t);
+            }
+        }
+        textureStore(output, id.xy, vec4<f32>(cells, 1.0));
+        return;
+    }
     var colour = vec3<f32>(0.0);
     var sun = 0.0;
+    var gi = vec3<f32>(0.0);
     if hit.hit {
         // lighting: Per-Voxel colour variation
         colour = surface_albedo(hit, false);
         // lighting: Sun and shadows
         sun = textureLoad(sun_weights, id.xy, 0).x;
+        // lighting: Bounce light
+        gi = textureLoad(gi_light, id.xy, 0).xyz;
     }
     let uv = (vec2<f32>(id.xy) + 0.5) / vec2<f32>(size);
-    textureStore(output, id.xy, vec4<f32>(shade(ray, hit, colour, sun, uv), 1.0));
+    textureStore(output, id.xy, vec4<f32>(shade(ray, hit, colour, sun, gi, uv), 1.0));
 }

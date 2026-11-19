@@ -25,10 +25,14 @@ pub enum DebugView {
     /// The normal the first hit is shaded with, as `(n + 1) / 2` in RGB: the smooth computed normal
     /// (#202) for natural Materials where that stage is on, the face's otherwise. The sky is black.
     ShadingNormals,
+    /// The radiance cache's cell (#54) each hit reads and feeds, as a colour of the cell's own, and
+    /// black where the cache holds nothing yet: cells grow with the distance from the camera, so
+    /// the colours show how. Primary only; the Reference (which has no cache) shows its lit image.
+    CacheCells,
 }
 
 impl DebugView {
-    pub const ALL: [DebugView; 7] = [
+    pub const ALL: [DebugView; 8] = [
         Self::Lit,
         Self::Normals,
         Self::Albedo,
@@ -36,6 +40,7 @@ impl DebugView {
         Self::SampleCount,
         Self::HistoryLength,
         Self::ShadingNormals,
+        Self::CacheCells,
     ];
 
     /// The number the shaders switch on.
@@ -52,6 +57,7 @@ impl DebugView {
             Self::SampleCount => "Sample count",
             Self::HistoryLength => "History length",
             Self::ShadingNormals => "Shading normals",
+            Self::CacheCells => "Cache cells",
         }
     }
 

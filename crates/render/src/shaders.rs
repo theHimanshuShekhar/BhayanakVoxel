@@ -17,8 +17,9 @@ pub const PRIMARY: &str = concat!(
 );
 
 /// Primary's light: the kernels that compute the smooth normals (#202), cast the sun's shadow rays
-/// (#52) and then shade the lit image from the G-buffer, as linear light. It has the sampling
-/// module for the sun's samples, which are the Reference's sequence.
+/// (#52), find the bounce light and the emitters' and keep the radiance cache (#54), and then shade
+/// the lit image from the G-buffer, as linear light. It has the sampling module for the sun's and
+/// the bounce's samples, which are the Reference's sequence, and the emitters the Reference samples.
 pub const SHADE: &str = concat!(
     include_str!("shaders/trace.wgsl"),
     "\n",
@@ -30,7 +31,13 @@ pub const SHADE: &str = concat!(
     "\n",
     include_str!("shaders/sky.wgsl"),
     "\n",
-    include_str!("shaders/shade.wgsl")
+    include_str!("shaders/emitters.wgsl"),
+    "\n",
+    include_str!("shaders/cache.wgsl"),
+    "\n",
+    include_str!("shaders/shade.wgsl"),
+    "\n",
+    include_str!("shaders/gi.wgsl")
 );
 
 /// The display transform (#202): auto-exposure, bloom and the tone curve, on either view's linear
@@ -107,11 +114,14 @@ mod tests {
     #[test]
     fn the_shade_kernels_are_valid_wgsl_and_cast_their_shadow_rays_from_one_trace_call_in_one_kernel()
      {
-        assert_eq!(entry_points(SHADE), ["normals", "shadows", "shade_pass"]);
+        assert_eq!(
+            entry_points(SHADE),
+            ["gi_resolve", "normals", "shadows", "shade_pass", "gi_trace"]
+        );
         // The smooth normal reads the Planet through `solid_at` of trace.wgsl, and the light is
-        // drawn from what primary visibility found: the only rays of Primary's light are the sun's
+        // drawn from what primary visibility found: the only rays of `shade.wgsl` are the sun's
         // shadow rays, in `shadows`, one call of trace() in a loop over `frame.light.w` rays, and
-        // nothing else casts one.
+        // nothing else there casts one (the bounce's and the emitters' are `gi.wgsl`'s).
         let kernel = include_str!("shaders/shade.wgsl");
         let calls = kernel
             .lines()
@@ -250,10 +260,14 @@ mod tests {
     }
 
     /// What reads a source of light, and the feature it is: an identifier of the shaders.
-    const READS: [(&str, &str); 8] = [
+    const READS: [(&str, &str); 10] = [
         ("frame.sun", "sun and shadows"),
         // The sun's light at the hit, which `shadows` wrote: the lit image's read of it.
         ("textureLoad(sun_weights", "sun and shadows"),
+        // Primary's bounce light: what `gi_trace` wrote for the lit image, and the radiance cache's
+        // light (#54).
+        ("textureLoad(gi_light", "bounce light"),
+        ("cache_incident(", "bounce light"),
         ("sky(", "sky and atmosphere"),
         // The sun-free table that a ray that has bounced reads, and the air between the camera and
         // its first hit.
@@ -266,7 +280,7 @@ mod tests {
 
     /// The bindings the shaders have, none of which is a source of light that has no row. A new
     /// one fails the check until it is added here with a decision.
-    const BINDINGS: [&str; 25] = [
+    const BINDINGS: [&str; 28] = [
         "scene",
         "table",
         "regions",
@@ -300,11 +314,19 @@ mod tests {
         // lights, covered by the "Emissive Voxels" row. The light itself is read through
         // `emission(`, which is marked wherever it is.
         "emitters",
+        // Primary's radiance cache (#54: `gi_cache`, the light on the world's faces, which `gi_trace`
+        // fills and reads and `gi_resolve` folds the frame's samples into), and the incident light
+        // that `gi_trace` writes for the lit image (`gi_out`, read as `gi_light`): all of them are
+        // "Bounce light", whose row they are covered by. The cache's light is read through
+        // `cache_incident(`, and the texture through `textureLoad(gi_light`; both are marked.
+        "gi_cache",
+        "gi_out",
+        "gi_light",
     ];
 
     /// The shader files, all of them known: a new one is neither of a view nor checked until it is
     /// listed here.
-    const FILES: [&str; 14] = [
+    const FILES: [&str; 16] = [
         "trace.wgsl",
         "common.wgsl",
         "sampling.wgsl",
@@ -322,6 +344,9 @@ mod tests {
         "atmosphere.wgsl",
         // The emissive Voxels as lights (#54): read by both views, checked with each.
         "emitters.wgsl",
+        // Primary's bounce light (#54): the radiance cache and the kernel that finds the light.
+        "cache.wgsl",
+        "gi.wgsl",
     ];
 
     /// Whether `line` (trimmed, code) contains `needle` as a call or member, not in `fn needle(`.
@@ -344,7 +369,7 @@ mod tests {
         ("common.wgsl", include_str!("shaders/common.wgsl")),
         ("primary.wgsl", include_str!("shaders/primary.wgsl")),
     ];
-    const SHADE_FILES: [(&str, &str); 6] = [
+    const SHADE_FILES: [(&str, &str); 9] = [
         ("trace.wgsl", include_str!("shaders/trace.wgsl")),
         ("common.wgsl", include_str!("shaders/common.wgsl")),
         ("sampling.wgsl", include_str!("shaders/sampling.wgsl")),
@@ -353,7 +378,10 @@ mod tests {
             include_str!("shaders/atmosphere_model.wgsl"),
         ),
         ("sky.wgsl", include_str!("shaders/sky.wgsl")),
+        ("emitters.wgsl", include_str!("shaders/emitters.wgsl")),
+        ("cache.wgsl", include_str!("shaders/cache.wgsl")),
         ("shade.wgsl", include_str!("shaders/shade.wgsl")),
+        ("gi.wgsl", include_str!("shaders/gi.wgsl")),
     ];
     const PATHTRACE_FILES: [(&str, &str); 7] = [
         ("trace.wgsl", include_str!("shaders/trace.wgsl")),
@@ -542,6 +570,7 @@ mod tests {
         let primary = [
             named(include_str!("shaders/primary.wgsl")),
             named(include_str!("shaders/shade.wgsl")),
+            named(include_str!("shaders/gi.wgsl")),
         ]
         .concat();
         for feature in primary {
@@ -678,6 +707,9 @@ mod tests {
             include_str!("shaders/pathtrace.wgsl"),
             include_str!("shaders/primary.wgsl"),
             include_str!("shaders/shade.wgsl"),
+            include_str!("shaders/gi.wgsl"),
+            include_str!("shaders/cache.wgsl"),
+            include_str!("shaders/emitters.wgsl"),
             include_str!("shaders/post.wgsl"),
             include_str!("shaders/probe.wgsl"),
             UPSCALE,

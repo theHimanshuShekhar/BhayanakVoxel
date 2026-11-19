@@ -53,7 +53,7 @@ fn primary(@builtin(global_invocation_id) id: vec3<u32>) {
     }
     textureStore(surface, id.xy, voxel);
     // The upscaler draws the history length view itself, over the lit image.
-    if frame.params.z != 0u && frame.params.z != VIEW_HISTORY_LENGTH {
+    if frame.params.z != 0u && frame.params.z != VIEW_HISTORY_LENGTH && frame.params.z != VIEW_CACHE_CELLS {
         textureStore(output, id.xy, vec4<f32>(debug_colour(frame.params.z, hit, frame.params.x), 1.0));
     }
 }
