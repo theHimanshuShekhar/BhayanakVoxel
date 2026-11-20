@@ -880,16 +880,17 @@ pub struct ColdStart {
     /// [`crate::load`]: the spawn ring, the Guard, and the first scene.
     pub load_s: f64,
     /// The spawn ring (20 m, #168), which is when the player has control (ADR 0009), and the part
-    /// of the Guard after it that a camera within 2 km of the Spawn could see (#220: `guard_cells_at_control`
-    /// of the `guard_cells` cells of the Guard, as [`crate::loader::plan_guard`] says), which the
-    /// window waits for as well so that nothing visible past the ring is sky. Both are in
+    /// of the Guard after it that a camera within 2 km of the Spawn could see (#220:
+    /// `guard_cells_at_control` of the `guard_cells` cells of the Guard, as
+    /// [`crate::loader::plan_guard`] says), which the window waits for as well so that nothing
+    /// visible past the ring is sky. Both are in
     /// `load_s`. **The `spawn_ring_s` gate is on the ring.**
     pub spawn_ring_s: f64,
     pub guard_s: f64,
     /// The cells of the Guard, in all (the bricks of the pyramid's top level that hold it, see
     /// `Planet::guard_cells`), and how many of them were made before the window opened (#220). The
-    /// rest are made by the loader's workers in the background, a quarter of them at a time while
-    /// there is other work. 0 for the test Planet's, whose Guard is whole at the start.
+    /// rest are made by the loader's workers in the background, `GUARD_WORKERS` of them at a time
+    /// while there is other work. 0 for the test Planet's, whose Guard is whole at the start.
     pub guard_cells: u32,
     pub guard_cells_at_control: u32,
     /// The real time to control: from the world map being ready to the window opening (`load`
@@ -914,7 +915,8 @@ pub struct ColdStart {
     /// end or for the slice to give way), timed as the one after the paths is. Null if the fill
     /// was over before one could be made. Reported, not gated.
     pub edit_during_fill: Option<EditLatency>,
-    /// The bricks that the loader had been asked for and not taken in when that Edit was made.
+    /// The bricks that the loader had been asked for and not taken in when that Edit was made: the
+    /// streaming's, not the cells of the Guard, which are made beside them (#220).
     pub edit_during_fill_pending: usize,
 }
 
@@ -2104,7 +2106,10 @@ impl<'a> Session<'a> {
             at_camera: self.world.lag(camera.position) == 0.0,
             scene_used_bytes: self.world.used_bytes(),
             throttled: self.world.stats().throttled,
-            loader_queue: self.world.stats().loader.pending,
+            loader_queue: {
+                let loader = self.world.stats().loader;
+                loader.pending - loader.guard_pending
+            },
             lag: self.world.lag(camera.position),
             edit_taken,
             taken_at,
@@ -2242,7 +2247,11 @@ impl<'a> Session<'a> {
             }
             // One Edit, in the fill, once the loader has a queue (its workers are ahead, and the
             // scene thread takes in for a long slice): its time is not the next frame's wait.
-            let pending = self.world.loader().map_or(0, |l| l.pending);
+            // The streaming's bricks, not the cells of the Guard that are made beside them (#220).
+            let pending = self
+                .world
+                .loader()
+                .map_or(0, |l| l.pending - l.guard_pending);
             if control.is_some() && edit_during_fill.is_none() && pending > 0 {
                 if let Edit::Taken(latency) = self.edit(&setup.spawn)? {
                     edit_during_fill = Some(latency);

@@ -357,8 +357,8 @@ camera, and `holes_after_catch_up` the holes the look after it found, which must
   the start of the load to the first frame in which one ray from the camera straight down hits the
   ground at level 0) and `fill_s` (from the start of the load to the resident set being complete).
   `time_to_level_0_under_camera_s` is not gated, and **is not the spec's "time to control"**: the
-  field is named for the ray that it uses, and the window waits for the Guard too, so it reads the
-  load time. **`spawn_ring_s`, `guard_s` and `time_to_control_s`** (#168, #220) are the parts of the
+  field is named for the ray that it uses, and the window opens at the end of the load, so it reads
+  the load time. **`spawn_ring_s`, `guard_s` and `time_to_control_s`** (#168, #220) are the parts of the
   load, from `crate::load`: the 20 m spawn ring (`SPAWN_REACH`), which is the player's control (ADR
   0009: the character stands in it, and the bench has no server), the part of the Guard after it that
   a camera within 2 km of the Spawn could see (`guard_s`: the cells that `plan_guard` says are

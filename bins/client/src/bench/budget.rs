@@ -58,8 +58,8 @@ pub struct StreamingBudgets {
     pub spawn_ring_s: f64,
     /// Time to control as the player sees it: seconds from the world map being ready to the window
     /// opening, which is the spawn ring, the part of the Guard that a camera within 2 km of the
-    /// Spawn could see (so that nothing visible past the ring is sky) and the first scene: 2 s since
-    /// #220, which makes the rest of the Guard in the background.
+    /// Spawn could see (so that nothing visible past the ring is sky) and the first scene: 2 s
+    /// since #220, which makes the rest of the Guard in the background.
     pub time_to_control_s: f64,
     /// Settle time: seconds from the camera stopping after a flight of 50 m/s to a scene that is
     /// at the camera, has no soft miss and nothing left to look at again for the bands: main's

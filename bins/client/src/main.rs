@@ -527,8 +527,14 @@ fn load(map: WorldMap, reach: i32) -> Result<Loaded, RingsFull> {
     let guarded = Instant::now();
     // The Guard is made in two parts (#220): the cells that a camera within `GUARD_REACH` of the
     // Spawn could see, which the window waits for, and the rest, which the loader makes while
-    // the player plays, a quarter of its workers at a time.
-    let (visible, later) = loader::plan_guard(&planet, RING_LEVELS, camera.position, GUARD_REACH);
+    // the player plays, two of its workers at a time while there is other work.
+    let (visible, later) = loader::plan_guard(
+        &planet,
+        RING_LEVELS,
+        camera.position,
+        GUARD_REACH,
+        loader::GUARD_MARGIN,
+    );
     let held = loader::hold_guard_cells(&mut store, &planet, GUARD_FIRST, &visible, &later);
     let guard_took = guarded.elapsed();
     eprintln!(

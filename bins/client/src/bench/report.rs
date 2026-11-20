@@ -125,12 +125,13 @@ use super::stream::StreamReport;
 /// the keys `camera_soft_miss_frames`, `scene_lag_d0_max`, `spawn_ring_s`, `time_to_control_s` and
 /// `settle_s`, in `[streaming]`. Nothing else is changed.
 ///
-/// 28 (#220) builds the Guard in two parts: the cells that a camera within 2 km of the Spawn could see,
-/// before the window opens, and the rest in the background. The real-time report's cold start gets
-/// `guard_cells` (the Guard's cells in all), `guard_cells_at_control` (those made before the
-/// window opened) and `guard_complete_s` (from the start of the load to the last cell being taken
-/// in); `guard_s` is now the time of the first part only, `time_to_control_s` no longer waits for
-/// the whole Guard, and its gate is 2 s in the budgets file (it was 10). Nothing else is changed.
+/// 28 (#220) builds the Guard in two parts: the cells that a camera within 2 km of the Spawn could
+/// see, before the window opens, and the rest in the background. The real-time report's cold start
+/// gets
+/// `guard_cells` (the Guard's cells in all), `guard_cells_at_control` (those made before the window
+/// opened) and `guard_complete_s` (from the start of the load to the last cell being taken in);
+/// `guard_s` is now the time of the first part only, `time_to_control_s` no longer waits for the
+/// whole Guard, and its gate is 2 s in the budgets file (it was 10). Nothing else is changed.
 pub const SCHEMA_VERSION: u32 = 28;
 
 /// One timed thing (a pass, or the GPU total of a profiler frame) in one mode, against its

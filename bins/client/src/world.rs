@@ -377,8 +377,8 @@ pub struct World {
     motion: Motion,
     /// The time that the camera's velocity is measured in: the machine's, or a stepped world's.
     clock: Clock,
-    /// Where the Guard was made complete around, and how far from it a camera may be before the Guard
-    /// is complete (see [`World::hold_to_guard`]).
+    /// Where the Guard was made complete around, and how far from it a camera may be before the
+    /// Guard is complete (see [`World::hold_to_guard`]).
     guard_hold: Option<([f64; 3], f64)>,
 }
 

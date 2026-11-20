@@ -747,10 +747,12 @@ impl BrickStore {
 
     /// Whether the brick at `coord` of `level` is under a cell of the Guard that is not held yet.
     pub fn guard_cell_pending(&self, level: usize, coord: BrickCoord) -> bool {
-        if self.guard_pending.is_empty() {
+        // Nothing is above the top level: the parent of a brick of it (a read of the brick asks
+        // whether the children of that are resident) is under no cell.
+        if self.guard_pending.is_empty() || level >= self.level_count() {
             return false;
         }
-        let up = self.level_count().saturating_sub(1).saturating_sub(level);
+        let up = self.level_count() - 1 - level;
         self.guard_pending
             .contains(&BrickCoord(coord.0.map(|c| c >> up)))
     }
@@ -2459,8 +2461,7 @@ mod tests {
     }
 
     #[test]
-    fn a_cell_of_the_guard_that_is_not_held_yet_has_no_children_resident_under_it_and_is_held_in_one_call()
-     {
+    fn a_cell_of_the_guard_not_held_has_no_children_resident_under_it_and_is_held_in_one_call() {
         // Levels 2 to 4 are the Guard of a store of five levels that streams from 2, and the top
         // level, 4, holds the cells.
         let mut store = resident(5, 2, &[]);
@@ -2478,6 +2479,12 @@ mod tests {
         assert!(store.guard_cell_pending(3, under(there)));
         // Other cells, and the levels that are streamed in, are as they were.
         assert!(store.children_resident(4, here) && store.children_resident(3, under(here)));
+        // A brick of the top level has no parent that could be one of them: its parent's
+        // coordinates, asked as a level above the pyramid, are not looked up as a cell (a read of
+        // a top-level brick would go to the source, a brick's generation, on the scene thread).
+        let mut other = resident(5, 2, &[]);
+        other.defer_guard([there.parent()]);
+        assert!(other.children_resident(5, there.parent()));
         // Held, it is no longer pending, with the bricks in the store.
         store.hold_guard_cell(there, [(4, there, Brick::solid(ROCK), true)]);
         assert_eq!(store.guard_pending(), 0);

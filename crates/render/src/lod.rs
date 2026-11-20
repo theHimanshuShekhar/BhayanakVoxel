@@ -559,8 +559,11 @@ impl Horizon {
     /// which are bigger than the Planet's relief: the farthest point of the box is clamped to
     /// `highest`, since the Planet has no ground above it, and the camera is taken as far from the
     /// centre as the ball allows (the horizon grows with height) and as near the box as it allows.
-    /// Not seeing is exact for a sphere: what this leaves out cannot be seen from any camera in the
-    /// ball, so it can be left out of what a scene is built from.
+    /// `margin` Voxels is what a coarse voxel that is drawn may be out by: it may stand that much
+    /// over `highest` and the sea's sphere that much under its radius, so the Guard's cells are
+    /// judged for a sphere that much smaller and a Planet that much higher. Not seeing is exact for
+    /// a sphere: what this leaves out cannot be seen from any camera in the ball, so it can be left
+    /// out of what a scene is built from.
     pub fn could_see(
         &self,
         spawn: [f64; 3],
@@ -568,11 +571,13 @@ impl Horizon {
         level: usize,
         coord: BrickCoord,
         highest: f64,
+        margin: f64,
     ) -> bool {
+        let sea = Self::new((self.radius - margin).max(1.0));
         let from_centre = spawn.iter().map(|c| c * c).sum::<f64>().sqrt();
-        let top = brick_top(level, coord).min(highest);
+        let top = brick_top(level, coord).min(highest + margin);
         brick_distance(spawn, level, coord) - reach
-            <= self.tangent(from_centre + reach) + self.tangent(top)
+            <= sea.tangent(from_centre + reach) + sea.tangent(top)
     }
 }
 
@@ -1249,7 +1254,7 @@ mod tests {
         let highest = SEA + 8_000.0 * VOXELS_PER_METRE;
         let cell = |x: i32| BrickCoord([x, 6, 0]);
         let sees = |reach_m: f64, x: i32| {
-            horizon.could_see(spawn, reach_m * VOXELS_PER_METRE, 17, cell(x), highest)
+            horizon.could_see(spawn, reach_m * VOXELS_PER_METRE, 17, cell(x), highest, 0.0)
         };
         // The cell the Spawn is over, and the next, are in whatever the reach is.
         assert!(sees(0.0, 0) && sees(0.0, -1) && sees(0.0, 1));
@@ -1265,9 +1270,150 @@ mod tests {
         // The cell's own height is clamped to the Planet's highest point: a cell whose far corner
         // is a long way up sees no further than the Planet's peaks do.
         let tall = |highest: f64| {
-            horizon.could_see(spawn, 0.0, 17, cell(1), SEA + highest * VOXELS_PER_METRE)
+            horizon.could_see(
+                spawn,
+                0.0,
+                17,
+                cell(1),
+                SEA + highest * VOXELS_PER_METRE,
+                0.0,
+            )
         };
         assert!(tall(8_000.0) && !tall(8.0));
+    }
+
+    /// Whether the segment from `a` to `b` stays out of the sphere of radius `sea` round the
+    /// origin.
+    fn clear_of(a: [f64; 3], b: [f64; 3], sea: f64) -> bool {
+        let d: [f64; 3] = std::array::from_fn(|i| b[i] - a[i]);
+        let len2: f64 = d.iter().map(|c| c * c).sum();
+        let t = if len2 == 0.0 {
+            0.0
+        } else {
+            (-(0..3).map(|i| a[i] * d[i]).sum::<f64>() / len2).clamp(0.0, 1.0)
+        };
+        let nearest: f64 = (0..3).map(|i| (a[i] + d[i] * t).powi(2)).sum();
+        nearest >= sea * sea
+    }
+
+    /// A small deterministic stream of numbers in 0..1, so that the sampling is the same every run.
+    fn unit_stream(mut state: u64) -> impl FnMut() -> f64 {
+        move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 11) as f64 / (1u64 << 53) as f64
+        }
+    }
+
+    /// The level of the cells that the tests of `could_see` look at (3.3 km across, so that a
+    /// horizon moved by a kilometre moves the cells that are seen).
+    const CELLS: usize = 13;
+
+    /// The cells of [`CELLS`] on the sea's surface along a great circle from the Spawn (on the +y
+    /// axis), to 140 km from it.
+    fn cells_along_the_sea() -> Vec<BrickCoord> {
+        let size = (8u64 << CELLS) as f64;
+        let mut cells = Vec::new();
+        let mut metres = 0.0;
+        while metres < 140_000.0 {
+            let angle = metres * VOXELS_PER_METRE / SEA;
+            let at = [SEA * angle.sin(), SEA * angle.cos() * 1.0001, 0.0];
+            let cell = BrickCoord(at.map(|c| (c / size).floor() as i32));
+            if !cells.contains(&cell) {
+                cells.push(cell);
+            }
+            metres += 500.0;
+        }
+        cells
+    }
+
+    /// The cells (of [`cells_along_the_sea`]) that a camera in the ball of radius
+    /// `reach` round `spawn` can see a point of that is no higher than `highest`, over the sphere
+    /// of radius `sea`: each cell is looked at along 20 000 lines from sampled places in the ball
+    /// (most of them on its boundary, where a flying camera is held) to sampled points of its box
+    /// that are no higher than `highest`, and it is seen if one of them is clear of the sphere.
+    /// Every cell that this finds is one that can be seen; the ones that it does not find are the
+    /// ones whose lines are too few to count.
+    fn cells_seen_by_sampling(
+        spawn: [f64; 3],
+        reach: f64,
+        sea: f64,
+        highest: f64,
+    ) -> Vec<BrickCoord> {
+        let mut random = unit_stream(0x9E37_79B9_7F4A_7C15);
+        let size = (8u64 << CELLS) as f64;
+        let mut seen = Vec::new();
+        {
+            for cell in cells_along_the_sea() {
+                let low: [f64; 3] = std::array::from_fn(|i| f64::from(cell.0[i]) * size);
+                let mut found = false;
+                for _ in 0..20_000 {
+                    // A place in the ball: a point of its boundary (the ball is where a flying
+                    // camera is held) or of its inside, more of the boundary.
+                    let mut on: [f64; 3];
+                    loop {
+                        on = std::array::from_fn(|_| random() * 2.0 - 1.0);
+                        let n: f64 = on.iter().map(|c| c * c).sum::<f64>().sqrt();
+                        if n > 0.1 && n <= 1.0 {
+                            let scale = if random() < 0.7 { 1.0 / n } else { 1.0 };
+                            on = on.map(|c| c * scale * reach);
+                            break;
+                        }
+                    }
+                    let camera: [f64; 3] = std::array::from_fn(|i| spawn[i] + on[i]);
+                    let target: [f64; 3] = std::array::from_fn(|i| low[i] + random() * size);
+                    let r: f64 = target.iter().map(|c| c * c).sum::<f64>().sqrt();
+                    if r <= highest && r >= sea && clear_of(camera, target, sea) {
+                        found = true;
+                        break;
+                    }
+                }
+                if found {
+                    seen.push(cell);
+                }
+            }
+        }
+        seen
+    }
+
+    /// The cells that `could_see` leaves out that a line from a camera in the ball to a point of
+    /// the cell shows can be seen, with `could_see` told a `reach` of `told` where the ball's is
+    /// `reach`.
+    fn cells_wrongly_left_out(told: f64, margin: f64) -> Vec<BrickCoord> {
+        let horizon = Horizon::new(SEA);
+        let spawn = [0.0, SEA + 2.0 * VOXELS_PER_METRE, 0.0];
+        let reach = 2_000.0 * VOXELS_PER_METRE;
+        let highest = SEA + 8_000.0 * VOXELS_PER_METRE;
+        // The sampled lines are to the sphere and the Planet's height with the margin allowed.
+        cells_seen_by_sampling(spawn, reach, SEA - margin, highest + margin)
+            .into_iter()
+            .filter(|&cell| !horizon.could_see(spawn, told, CELLS, cell, highest, margin))
+            .collect()
+    }
+
+    #[test]
+    fn every_cell_that_a_line_from_the_ball_shows_can_be_seen_is_one_that_could_see_keeps() {
+        let reach = 2_000.0 * VOXELS_PER_METRE;
+        for margin in [0.0, 8192.0] {
+            assert_eq!(cells_wrongly_left_out(reach, margin), [], "margin {margin}");
+        }
+        // The sampling finds cells at the edge of what is seen (it is not looking at the near ones
+        // only): there are some that could_see keeps and that a ball of half the reach cannot be
+        // shown to see, which is what the next test counts.
+        let spawn = [0.0, SEA + 2.0 * VOXELS_PER_METRE, 0.0];
+        let highest = SEA + 8_000.0 * VOXELS_PER_METRE;
+        let seen = cells_seen_by_sampling(spawn, reach, SEA, highest);
+        assert!(seen.len() >= 5, "{} cells seen", seen.len());
+    }
+
+    #[test]
+    fn a_could_see_that_is_told_less_than_the_ball_leaves_out_cells_that_the_sampling_finds_seen() {
+        // Told half the reach, or no reach, could_see leaves out cells that a camera at the edge of
+        // the ball can see: the test above would fail for it.
+        let reach = 2_000.0 * VOXELS_PER_METRE;
+        assert!(!cells_wrongly_left_out(reach / 2.0, 0.0).is_empty());
+        assert!(!cells_wrongly_left_out(0.0, 0.0).is_empty());
     }
 
     #[test]
