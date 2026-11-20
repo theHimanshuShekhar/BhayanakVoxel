@@ -3686,92 +3686,57 @@ fn the_update_where_the_cap_goes_off_and_on_at_sea_level_is_measured() {
     assert_eq!(holes, 0, "the cap going off and on left holes");
 }
 
-/// The depth of a flight is not given back while the camera itself is under the sea's sphere
-/// (#168, #213): a camera that dives under the sea at 50 m/s and stops there keeps the bands of
-/// the flight, and no release rebuilds the scene as the wide one (a scene made again there has the
-/// horizon cap off), which is over the memory gate at full size (555 to 572 MiB against 512). Once
-/// the raised camera is over the sphere, **even inside the 50 m that the cap's hysteresis holds it
-/// off for**, the release goes through: a scene made again there has the cap on.
+/// A camera held under the sea has a cap of its own, not none (#226): it dives to 30 m under the
+/// sea at 50 m/s and stands there for 600 frames (10 s), with the cap and the margins, and the scene
+/// it holds is a camera in a cave's: the bricks drawn are fewer than the uncapped scene's (the
+/// whole Planet to its far side), there is no hole on the way down or in the hold, and everything a
+/// camera at the mouth of a cave within the cave's reach could see is in the resident set.
 #[test]
-fn the_depth_of_a_flight_is_kept_while_the_camera_is_under_the_sea_and_given_back_over_it() {
-    dive_and_release(0);
-}
-
-/// [`the_depth_of_a_flight_is_kept_while_the_camera_is_under_the_sea_and_given_back_over_it`] with a
-/// release that lists fewer nodes than the limit: it is made again all the same, because the scene's
-/// cap went off under the sea and a reband in place would keep it off (until 50 m over): the scene
-/// would be the wide one at rest bands for a camera that stopped 10 m over.
-#[test]
-fn a_release_over_the_sphere_under_the_rebuild_limit_still_makes_the_scene_again_while_the_cap_is_off()
- {
-    dive_and_release(usize::MAX);
-}
-
-fn dive_and_release(rebuild_over: usize) {
-    let (mut world, _server, camera) = margined_world_under(Run::Stepped, None, true);
-    world.worker().speed_scale(true);
-    world.worker().set_release_rebuild_over(rebuild_over);
-    world.count_exactly();
-    fill(&mut world, camera.position);
-    let sea = planet().sea_radius();
-    let raise = render::lod::Margins::standard().vertical;
-    let radius = |p: [f64; 3]| p.iter().map(|c| c * c).sum::<f64>().sqrt();
-    let up = camera.position.map(|c| c / radius(camera.position));
-    let at = |r: f64| up.map(|u| u * r);
-    let step = FIFTY_METRES_A_SECOND;
-    let scale = |world: &World| world.stats().bands.expect("a scene with bands").scale();
-    // The radius at which the raised camera is `height` Voxels over the sea's sphere.
-    let radius_at = |height: f64| sea + height - raise;
-    let mut r = radius(camera.position);
-    // Flies the camera to the radius `to` at 50 m/s, and stands there for `frames`.
-    let fly = |world: &mut World, r: &mut f64, to: f64, frames: usize| {
-        let sign = if to > *r { 1.0 } else { -1.0 };
-        while (to - *r) * sign > 0.0 {
-            *r += sign * step.min((to - *r).abs());
-            let velocity = up.map(|u| u * sign * step * 60.0);
-            world.recentre_moving(at(*r), velocity).unwrap();
-            pace(world, FRAME);
+fn a_camera_held_under_the_sea_has_a_scene_of_its_own_and_no_hole() {
+    let held = |capped: bool| {
+        let (mut world, _server, camera) = margined_world_under(Run::Stepped, None, capped);
+        world.count_exactly();
+        fill(&mut world, camera.position);
+        let sea = planet().sea_radius();
+        let radius = |p: [f64; 3]| p.iter().map(|c| c * c).sum::<f64>().sqrt();
+        let up = camera.position.map(|c| c / radius(camera.position));
+        let at = |r: f64| up.map(|u| u * r);
+        let bottom = sea - 30.0 * VOXELS_PER_METRE;
+        let mut holes = 0;
+        let mut r = radius(camera.position);
+        while r > bottom {
+            r = (r - FIFTY_METRES_A_SECOND).max(bottom);
+            world.recentre(at(r)).unwrap();
+            holes += world.stats().holes;
+            pace(&world, FRAME);
         }
-        for _ in 0..frames {
-            world.recentre_moving(at(*r), [0.0; 3]).unwrap();
-            pace(world, FRAME);
+        for _ in 0..600 {
+            world.recentre(at(r)).unwrap();
+            holes += world.stats().holes;
+            pace(&world, FRAME);
         }
+        // The resident set is complete there, and the cap is the one of a camera under the sea.
+        fill(&mut world, at(r));
+        holes += world.stats().holes;
+        let reach = world.worker().selection_reach();
+        let drawn: usize = (0..LEVELS).map(|l| world.level_bricks(l)).sum();
+        (holes, drawn, reach, world.worker().selection_cap_is_off())
     };
-    // Down through the sea and a way under it.
-    fly(&mut world, &mut r, radius_at(-30.0 * VOXELS_PER_METRE), 0);
-    let deep = scale(&world);
-    assert!(deep < 0.5, "the dive is at depth: {deep}");
-    // Stopped at the bottom for several seconds (the hold is half of one): kept, nothing waits.
-    for _ in 0..300 {
-        world.recentre_moving(at(r), [0.0; 3]).unwrap();
-        pace(&world, FRAME);
-    }
-    assert_eq!(scale(&world), deep, "given back at the bottom");
-    assert_eq!(world.stats().work.release_rebuilds, 0);
+    let (holes, drawn, reach, off) = held(true);
+    let (_, uncapped, _, _) = held(false);
+    eprintln!("held under the sea: {drawn} bricks drawn, {uncapped} with no cap; holes {holes}");
+    assert_eq!(holes, 0, "the camera under the sea saw holes");
+    assert!(off, "the cap went off under the sea");
     assert!(
-        !world.reband_pending(),
-        "nothing is waited for: no release is pending"
+        reach.horizon.is_none() && reach.under.is_some(),
+        "{reach:?}"
     );
-    // Up to just under the sphere, and stopped: still kept.
-    fly(&mut world, &mut r, radius_at(-2.0 * VOXELS_PER_METRE), 300);
-    assert_eq!(scale(&world), deep, "given back under the sphere");
-    assert_eq!(world.stats().work.release_rebuilds, 0);
-    // The scene's cap went off under the sea, and stays off until 50 m over it.
-    assert!(world.worker().selection_cap_is_off());
-    // 10 m over it, inside the hysteresis band of the cap's coming on (50 m), and stopped: given
-    // back, as a rebuild (the scene made again there has the cap on).
-    fly(&mut world, &mut r, radius_at(10.0 * VOXELS_PER_METRE), 0);
-    let mut frames = 0;
-    while scale(&world) < 1.0 || world.reband_pending() {
-        world.recentre_moving(at(r), [0.0; 3]).unwrap();
-        pace(&world, FRAME);
-        frames += 1;
-        assert!(frames < 20_000, "never given back: depth {}", scale(&world));
-    }
-    assert_eq!(world.stats().work.release_rebuilds, 1);
-    assert!(radius_at(10.0 * VOXELS_PER_METRE) + raise - sea < CAP_ON_VOXELS);
-    // The scene made again at the camera has the cap on there.
-    assert!(!world.worker().selection_cap_is_off());
+    // The cap has to be there, not only to be asked for: 13 637 bricks against 15 527 with it,
+    // 15 383 without it (the horizon asked for and no viewpoint to cap from).
+    assert!(
+        drawn * 100 < uncapped * 95,
+        "{drawn} bricks drawn, {uncapped} with no cap"
+    );
 }
 
 /// The height over the sea at which the cap comes back on (`select::CAP_ON`), 50 m.

@@ -27,9 +27,10 @@
 //! be seen, so it stays whole at the coarse level that holds it (never a hole), and its children
 //! are not wanted. The cap is another reason for a node to change, tracked like the bands' by
 //! how far the camera has to go for it to (a unit of path moves the margin by up to a hundred near
-//! the ground, for a climb: see `Cap::slack`). It is off for a camera under sea level, and is
-//! turned on again [`CAP_ON`] above it, so that a swimmer does not flip it. A flip changes the cap of
-//! every node at once, so the nodes are looked at again [`SWEEP`] at a time, one batch in each
+//! the ground, for a climb: see `Cap::slack`). It is off for a camera under sea level, where the
+//! camera is capped as one at the sea's surface over it instead (`Reach::under`, #226: with no
+//! cap the scene was the whole Planet), and is turned on again [`CAP_ON`] above it, so that a
+//! swimmer does not flip it. A flip changes the cap of every node at once, so the nodes are looked at again [`SWEEP`] at a time, one batch in each
 //! [`Selection::update`], and not all in the update that found it (#213): a node that is not
 //! reached yet is as it was, which is a cut through the tree like any other.
 //!
@@ -1417,7 +1418,7 @@ impl Selection {
         self.look_again(store);
         // The cap seen from a camera raised by another margin has other nodes in it, whether or not
         // it came on or went off.
-        if flipped || self.reach.horizon.is_some() {
+        if flipped || self.horizon.is_some() {
             self.reconsider_all();
         }
     }
@@ -1622,23 +1623,10 @@ impl Selection {
         .height(self.camera);
         let on = height.is_some_and(|h| h > if was.is_some() { 0.0 } else { CAP_ON });
         self.reach.horizon = if on { self.horizon } else { None };
+        // Off, the camera is under the sea and has the cap of a camera in a cave (#226).
+        self.reach.under = if on { None } else { self.horizon };
         self.placed = self.reach.from(self.camera);
         self.reach.horizon != was
-    }
-
-    /// Whether the cap was asked for and the raised camera at `camera` is under the sea's sphere
-    /// itself: no hysteresis, as [`Selection::place`] has for a cap that is on. A selection made
-    /// again at such a camera has the cap off; at any camera over the sphere it has it on.
-    pub fn camera_under_horizon(&self, camera: [f64; 3]) -> bool {
-        let Some(horizon) = self.horizon else {
-            return false;
-        };
-        let height = Reach {
-            horizon: Some(horizon),
-            ..self.reach
-        }
-        .height(camera);
-        height.is_some_and(|h| h <= 0.0)
     }
 
     /// Looks at every node at the next [`Selection::update`], for a change of the cap.
@@ -2979,11 +2967,6 @@ mod tests {
         selection.set_margins(&store, margins);
         assert!(selection.reach().horizon.is_none());
         assert_eq!(selection.horizon(), Some(Horizon::new(SEA)));
-        // A camera is under the sphere when its raised height is: no hysteresis (a scene made
-        // again over it has the cap on), though the cap here is off until 50 m over it.
-        assert!(selection.camera_under_horizon([0.0, SEA - 101.0, 0.0]));
-        assert!(!selection.camera_under_horizon([0.0, SEA - 99.0, 0.0]));
-        assert!(!selection.camera_under_horizon([0.0, SEA + 500.0, 0.0]));
         assert!(selection.reach().horizon.is_none());
         let (_, free) = capped_ball([0.0, 150.0, 0.0], false);
         assert_eq!(
@@ -3060,8 +3043,12 @@ mod tests {
         for climbing in [true, false] {
             let (at_once, drawn) = flip_in_updates(usize::MAX, usize::MAX, climbing);
             // One update looks at every node; the children of the nodes it splits are looked at
-            // by the next (they are the sweep's too), and no more.
-            assert!(at_once <= 2, "{at_once} updates (climbing: {climbing})");
+            // by the next (they are the sweep's too), and no more. A cap that comes on over a
+            // camera under the sea grows from the sea's own (#226: `Reach::under`) to the
+            // camera's, so it splits what it newly reaches a level in each update (5 updates in
+            // this tree). One that goes off shrinks, and merges.
+            let most = if climbing { 5 } else { 2 };
+            assert!(at_once <= most, "{at_once} updates (climbing: {climbing})");
             let (spread, spread_drawn) = flip_in_updates(50, 20, climbing);
             // The tree has some thousands of nodes: a batch of 50 takes many updates.
             assert!(spread > 20, "{spread} updates (climbing: {climbing})");

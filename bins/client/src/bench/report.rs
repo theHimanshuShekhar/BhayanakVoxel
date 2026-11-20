@@ -150,7 +150,13 @@ use super::stream::StreamReport;
 /// `unpaced_control` (standing frames with no pacing sleep); the real-time gates have `gi_mean_ms`, `gi_p99_ms`
 /// and `gi_paths_timed` (`over` may name `gi`), and the budgets file's `[streaming]` the keys `gi_mean_ms`
 /// and `gi_p99_ms`. Nothing else is changed than what this note lists.
-pub const SCHEMA_VERSION: u32 = 29;
+///
+/// 30 (#226) adds a path to the real-time report: `held under the sea` (the camera dives to 30 m
+/// under the sea at 8 m/s and is held there until the loader has caught up), between the sea-level
+/// crossing and `stop after a flight`; the paths after it move one place down in `paths`, and its
+/// peak is in the run's `scene_used_peak_mib`, which the `scene_mib` gate reads. Nothing else is
+/// changed.
+pub const SCHEMA_VERSION: u32 = 30;
 
 /// One timed thing (a pass, or the GPU total of a profiler frame) in one mode, against its
 /// budget. In reference mode a profiler frame is one sample, so the entries of that mode have
@@ -652,7 +658,7 @@ mod tests {
                 "streaming_real_time"
             ]
         );
-        assert_eq!(json["schema_version"], 29);
+        assert_eq!(json["schema_version"], 30);
         assert_eq!(json["convergence"], serde_json::Value::Null);
         assert_eq!(json["streaming"], serde_json::Value::Null);
         assert_eq!(json["streaming_real_time"], serde_json::Value::Null);

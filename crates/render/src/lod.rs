@@ -439,27 +439,6 @@ impl SpeedScale {
         std::mem::replace(&mut self.step, step) != step
     }
 
-    /// Whether the speed has been under what the step asks for long enough to begin giving it
-    /// back: a step is to be given back if the speed stays where it is, however the hold goes.
-    pub fn wants_less(&self, speed: f64) -> bool {
-        self.steps(speed * RELEASE) < self.step
-    }
-
-    /// [`SpeedScale::observe`] for a camera whose depth is **not to be given back** now (the
-    /// caller's reason: see the client's `Engine::rescale`): a deeper step is still taken at once,
-    /// and what falls under the step does not start the hold, nor keep one that had. Returns
-    /// whether the depth changed.
-    pub fn observe_keeping(&mut self, speed: f64) -> bool {
-        self.calm_since = None;
-        let up = self.steps(speed);
-        if up > self.step {
-            self.step = up;
-            true
-        } else {
-            false
-        }
-    }
-
     /// The depth for a camera that was **put** at the speed `speed` (a teleport is no flight): the
     /// step the speed asks for, both ways, with no hold, and any release that was pending ended.
     /// Returns whether the depth changed.
@@ -531,8 +510,8 @@ pub const HORIZON_RADIAL: f64 = 1.75;
 /// ([`Class::Margin`] and [`Class::Prefetch`]) reaches [`HORIZON_RADIAL`] times further, and
 /// from the places that prefetch looks at as well ([`Placed::in_cap_wanted`]).
 ///
-/// A camera that is not above the sphere (under the sea, or dug into the Planet) is not
-/// shadowed by it: it has no cap, and everything is as the bands say.
+/// A camera that is not above the sphere (under the sea, or dug into the Planet) is not shadowed
+/// by it, and the cap is off for it: what it is capped by instead is in [`Reach::caps`] (#226).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Horizon {
     /// Sea level's distance from the centre of the Planet, in Voxels.
@@ -597,6 +576,9 @@ struct Cap {
     /// The lowest altitude, over the sphere, of the places the cap is seen from, in Voxels (0 if
     /// one is not above it).
     low: f64,
+    /// How much faster than the camera a place the cap is seen from can move (1.001 and a little
+    /// more for a place raised a long way).
+    extra: f64,
 }
 
 impl Cap {
@@ -627,16 +609,16 @@ impl Cap {
         let margin = margin.abs();
         // The altitude of a place moves with the camera's, and a little more (the up it is raised
         // along turns): 0.1% is more than 1 + 400 / 6 400 000.
-        const EXTRA: f64 = 1.001;
+        let extra = self.extra;
         let half = self.radius + self.low / 2.0;
         let slope_of_tangent = half / self.tangent(half).max(f64::MIN_POSITIVE);
         let slope = 1.0 + hold * (self.radial * slope_of_tangent + 1.0);
-        let near = (margin / (slope * EXTRA)).min(self.low / 2.0 / EXTRA);
+        let near = (margin / (slope * extra)).min(self.low / 2.0 / extra);
         // Half of the margin for the tangent, half for the rest of the path: the tangent grows by
         // `g` in a climb of `x(g)`.
         let g = margin / (2.0 * hold * self.radial);
         let climb = g * g / ((self.radius * self.radius + g * g).sqrt() + self.radius);
-        let far = (climb / EXTRA).min(margin / (2.0 * (1.0 + hold) * EXTRA));
+        let far = (climb / extra).min(margin / (2.0 * (1.0 + hold) * extra));
         near.max(far).max(0.0)
     }
 }
@@ -664,6 +646,10 @@ pub struct Reach {
     pub ahead: [Option<[f64; 3]>; AHEAD],
     /// The horizon cap, if there is one (see [`Horizon`]).
     pub horizon: Option<Horizon>,
+    /// The sphere of the horizon cap while the cap is **off**: the raised camera is under it, and
+    /// stays off until it is far enough over it. What the cap of a camera under the sea is judged
+    /// by (#226, see [`Reach::from`]). Never set together with `horizon`.
+    pub under: Option<Horizon>,
 }
 
 impl Reach {
@@ -672,6 +658,7 @@ impl Reach {
         margins: Margins::NONE,
         ahead: [None; AHEAD],
         horizon: None,
+        under: None,
     };
 
     /// Whether this asks for nothing beyond the bands: no margins and no lead. (The horizon cap
@@ -688,13 +675,18 @@ impl Reach {
     /// `camera` raised by the vertical margin, along the Planet's radial up (the Planet is a
     /// sphere about the origin of the frame).
     pub fn raised(&self, camera: [f64; 3]) -> [f64; 3] {
+        Self::moved(camera, self.margins.vertical)
+    }
+
+    /// `camera` moved `by` Voxels along the Planet's radial up.
+    fn moved(camera: [f64; 3], by: f64) -> [f64; 3] {
         let length = camera.iter().map(|c| c * c).sum::<f64>().sqrt();
         let up = if length > 1.0 {
             camera.map(|c| c / length)
         } else {
             [0.0, 1.0, 0.0]
         };
-        std::array::from_fn(|a| camera[a] + up[a] * self.margins.vertical)
+        std::array::from_fn(|a| camera[a] + up[a] * by)
     }
 
     /// How high the raised camera is above the sphere of the horizon cap, in Voxels, if there is a
@@ -709,7 +701,7 @@ impl Reach {
     /// that are asked about.
     pub fn from(&self, camera: [f64; 3]) -> Placed {
         let raised = self.raised(camera);
-        let (drawn, wanted) = self.caps(camera, raised);
+        let (drawn, wanted) = self.caps(camera);
         Placed {
             reach: *self,
             camera,
@@ -721,21 +713,53 @@ impl Reach {
 
     /// The caps of what is drawn and of what is wanted resident, from `camera` and the places it
     /// is raised to: none if there is no horizon, or the raised camera is not above the sphere.
-    fn caps(&self, camera: [f64; 3], raised: [f64; 3]) -> (Option<Cap>, Option<Cap>) {
-        let Some(horizon) = self.horizon else {
+    ///
+    /// **A camera under the sea** (the cap is off: `under` has the sphere, #226) is capped as one
+    /// standing at the sea's sphere under it: seen from the sphere's surface raised by the vertical
+    /// margin, straight over the camera, and not from the camera raised by the margin, which is
+    /// under it. A pit or a cave under the sea looks out of a mouth that is at about sea level,
+    /// and a camera that stands on the beach is what the 512 MiB scene gate is met with (466 MiB at
+    /// 2 m); with no cap at all the scene is the whole Planet to its far side, 774 MiB at full
+    /// size. What the cap leaves out is not a hole or the sky: it stays whole at the coarse level
+    /// that holds it, as it does beyond the horizon of a camera over the sea. (A mouth that is
+    /// high over the sea, on a mountain, sees further than this: it is drawn coarser.) A camera
+    /// over the sphere is raised by the margin, which is this too.
+    fn caps(&self, camera: [f64; 3]) -> (Option<Cap>, Option<Cap>) {
+        let Some(horizon) = self.horizon.or(self.under) else {
             return (None, None);
         };
+        // How far a place is moved up: the margin, and to the sphere's raised surface if that is
+        // higher (so that a camera under the sea is not under its own cap).
+        let rise = |p: [f64; 3]| {
+            let r = p.iter().map(|c| c * c).sum::<f64>().sqrt();
+            match self.horizon {
+                Some(_) => self.margins.vertical,
+                None => (horizon.radius + self.margins.vertical - r).max(self.margins.vertical),
+            }
+        };
         let norm = |p: [f64; 3]| p.iter().map(|c| c * c).sum::<f64>().sqrt();
+        let raised = Self::moved(camera, rise(camera));
         let height = norm(raised) - horizon.radius;
         if height <= 0.0 {
             return (None, None);
         }
         let from_camera = |p: [f64; 3]| norm(std::array::from_fn(|a| p[a] - camera[a]));
+        // The places the cap is seen from move with the camera, and a little more (the up they
+        // are raised along turns, so a place `rise` out moves `1 + rise / r` for a path of 1): 0.1%
+        // is more than that for the vertical margin on the 320 km Planet, and a camera that is
+        // deep under the sea has a place much further out.
+        let extra = 1.001
+            + if self.horizon.is_some() {
+                0.0
+            } else {
+                rise(camera) / (horizon.radius - rise(camera)).max(1.0)
+            };
         let cap = |radial: f64, a: f64, low: f64| Cap {
             radius: horizon.radius,
             radial,
             a,
             low,
+            extra,
         };
         let drawn = cap(
             1.0,
@@ -750,7 +774,7 @@ impl Reach {
         let place = |p: [f64; 3]| radial * horizon.tangent(norm(p)) + from_camera(p);
         let (mut a, mut low) = (place(raised), height);
         for &at in self.ahead.iter().flatten() {
-            let at = self.raised(at);
+            let at = Self::moved(at, rise(at));
             a = a.max(place(at));
             low = low.min(norm(at) - horizon.radius);
         }
@@ -1161,6 +1185,7 @@ mod tests {
             },
             ahead: [Some([1000.0, 0.0, 0.0]), None],
             horizon: None,
+            under: None,
         };
         let camera = [0.0, 0.0, 0.0];
         let at = |x: i32| BrickCoord([x, 0, 0]);
@@ -1208,6 +1233,7 @@ mod tests {
             },
             ahead: [None; AHEAD],
             horizon: None,
+            under: None,
         };
         // On the +x axis the radial up is +x.
         let up = reach.raised([5000.0, 0.0, 0.0]);
@@ -1232,6 +1258,7 @@ mod tests {
             },
             ahead: [None; AHEAD],
             horizon: Some(Horizon::new(SEA)),
+            under: None,
         }
     }
 
@@ -1451,7 +1478,8 @@ mod tests {
             ])
         };
         assert!(at.in_cap(0, on_a_ridge, false));
-        // The camera under the sea has no cap, and neither has a reach with no horizon.
+        // The camera under the sea has no cap of the horizon's, and neither has a reach with no
+        // horizon (a camera under the sea has a cap of its own, `under`: the tests below).
         assert!(!reach.from([0.0, SEA - 3000.0, 0.0]).has_cap());
         assert!(
             Reach::NONE
@@ -1625,6 +1653,236 @@ mod tests {
         assert!(seen > 5_000, "{seen}");
     }
 
+    /// The reach of a camera under the sea: the cap is off (`horizon` none) and the sphere is
+    /// `under` (what the selection sets while it is, #226).
+    fn under_the_sea() -> Reach {
+        Reach {
+            horizon: None,
+            under: Some(Horizon::new(SEA)),
+            ..capped(20.0 * VOXELS_PER_METRE)
+        }
+    }
+
+    #[test]
+    fn a_camera_under_the_sea_has_the_cap_of_the_sea_s_surface_over_it_and_not_none() {
+        let on_the_ground = |metres: f64| {
+            let angle = metres * VOXELS_PER_METRE / SEA;
+            BrickCoord([
+                (SEA * angle.sin() / 8.0) as i32,
+                (SEA * angle.cos() / 8.0) as i32,
+                0,
+            ])
+        };
+        let margin = 20.0 * VOXELS_PER_METRE;
+        // On the sea's sphere itself, raised by the margin: the horizon is 3.6 km (sqrt(2 R 20 m)).
+        let surface = capped(margin).from([0.0, SEA + 0.001, 0.0]);
+        for depth in [5.0, 30.0, 300.0] {
+            let under = under_the_sea().from([0.0, SEA - depth * VOXELS_PER_METRE, 0.0]);
+            assert!(under.has_cap(), "{depth} m");
+            // What is drawn: in at 3 km, out at 40 km and at the far side of the Planet.
+            assert!(under.in_cap(0, on_the_ground(3_000.0), false), "{depth} m");
+            assert!(
+                !under.in_cap(0, on_the_ground(40_000.0), false),
+                "{depth} m"
+            );
+            assert!(
+                !under.in_cap(0, on_the_ground(500_000.0), false),
+                "{depth} m"
+            );
+            assert!(
+                !under.in_cap_wanted(0, on_the_ground(500_000.0), false),
+                "{depth} m"
+            );
+            // How far along the ground the cap reaches (the farthest brick in it: the brick's own
+            // height moves the edge about, so not the first brick out). The camera is `depth` and
+            // the margin under the place that sees, and the cap reaches that much further than the
+            // camera's on the surface does.
+            let reaches = |at: &Placed| {
+                (0..400)
+                    .map(|i| 100.0 + i as f64 * 50.0)
+                    .rfind(|&m| at.in_cap(0, on_the_ground(m), false))
+                    .unwrap()
+            };
+            let (here, there) = (reaches(&under), reaches(&surface));
+            assert!(
+                (here - there - depth).abs() <= 120.0,
+                "{depth} m: {here} against {there} m"
+            );
+        }
+        // With no sphere there is no cap at all.
+        assert!(!Reach::NONE.from([0.0, SEA - 30.0, 0.0]).has_cap());
+    }
+
+    #[test]
+    fn nothing_that_the_sea_s_surface_over_a_camera_under_the_sea_can_see_is_outside_its_cap() {
+        // A pit or a cave under the sea looks out of a mouth at about sea level (0 to the margin
+        // over it), which is within the camera's depth and the margin of it. So from random
+        // cameras 5 to 900 m under the sea, and mouths within that distance, every point that the
+        // mouth sees (the segment between does not cross the sphere) has its brick, at every
+        // level, in the cap.
+        let reach = under_the_sea();
+        let margin = 20.0 * VOXELS_PER_METRE;
+        let mut state = 0xD1B5_4A32_D192_ED03u64;
+        let mut next = move || {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (state >> 11) as f64 / (1u64 << 53) as f64
+        };
+        let unit = |a: f64, b: f64| [a.sin() * b.cos(), a.cos(), a.sin() * b.sin()];
+        let mut seen = 0;
+        for _ in 0..20_000 {
+            let depth = (5.0 + next() * 895.0) * VOXELS_PER_METRE;
+            let camera =
+                unit(next() * 0.1, next() * std::f64::consts::TAU).map(|c| c * (SEA - depth));
+            let at = reach.from(camera);
+            // A mouth over the sphere's surface within the camera's reach of it.
+            let mouth_height = next() * margin;
+            let mouth = {
+                // A point of the sphere's surface about the camera's own up, near enough that it
+                // is within the reach.
+                let cam_up = camera.map(|c| c / (SEA - depth));
+                let (e1, e2) = tangents(cam_up);
+                let across = next() * (depth + margin) * 0.99;
+                let bearing = next() * std::f64::consts::TAU;
+                let up_to = depth + mouth_height;
+                let angle = (across * across - up_to * up_to).max(0.0).sqrt() / SEA;
+                let dir: [f64; 3] = std::array::from_fn(|a| {
+                    cam_up[a] * angle.cos()
+                        + (e1[a] * bearing.cos() + e2[a] * bearing.sin()) * angle.sin()
+                });
+                let p = dir.map(|c| c * (SEA + mouth_height));
+                let d: f64 = (0..3)
+                    .map(|a| (p[a] - camera[a]).powi(2))
+                    .sum::<f64>()
+                    .sqrt();
+                assert!(d <= depth + margin, "{d} {depth}");
+                p
+            };
+            // A point of the ground (or a peak) that the mouth sees, at about its horizon.
+            let peak = next() * 600.0 * VOXELS_PER_METRE;
+            let range = (2.0 * SEA * (mouth_height + peak)).sqrt().max(1.0) * 1.2 * next();
+            let direction = unit((range / SEA).max(1e-9), next() * std::f64::consts::TAU);
+            let m_len: f64 = mouth.iter().map(|c| c * c).sum::<f64>().sqrt();
+            let up: [f64; 3] = mouth.map(|c| c / m_len);
+            let (e1, e2) = tangents(up);
+            let around: [f64; 3] = std::array::from_fn(|a| {
+                up[a] * direction[1] + e1[a] * direction[0] + e2[a] * direction[2]
+            });
+            let point = around.map(|c| c * (SEA + peak));
+            let along: [f64; 3] = std::array::from_fn(|a| point[a] - mouth[a]);
+            let length2 = along.iter().map(|v| v * v).sum::<f64>();
+            let t = (-mouth.iter().zip(&along).map(|(c, a)| c * a).sum::<f64>() / length2)
+                .clamp(0.0, 1.0);
+            let nearest: f64 = (0..3)
+                .map(|a| (mouth[a] + along[a] * t).powi(2))
+                .sum::<f64>()
+                .sqrt();
+            if nearest < SEA {
+                continue;
+            }
+            seen += 1;
+            for level in 0..6 {
+                let size = (8u64 << level) as f64;
+                let coord = BrickCoord(point.map(|c| (c / size).floor() as i32));
+                assert!(
+                    at.in_cap(level, coord, false),
+                    "level {level}, {depth} under, mouth {mouth_height} high, point {peak} high at {range}"
+                );
+            }
+        }
+        assert!(seen > 3_000, "{seen}");
+    }
+
+    /// Two directions at right angles to `up` and to each other.
+    fn tangents(up: [f64; 3]) -> ([f64; 3], [f64; 3]) {
+        let other = if up[0].abs() < 0.9 {
+            [1.0, 0.0, 0.0]
+        } else {
+            [0.0, 1.0, 0.0]
+        };
+        let cross = |a: [f64; 3], b: [f64; 3]| {
+            [
+                a[1] * b[2] - a[2] * b[1],
+                a[2] * b[0] - a[0] * b[2],
+                a[0] * b[1] - a[1] * b[0],
+            ]
+        };
+        let e1 = cross(up, other);
+        let n = e1.iter().map(|c| c * c).sum::<f64>().sqrt();
+        let e1 = e1.map(|c| c / n);
+        (e1, cross(up, e1))
+    }
+
+    #[test]
+    fn the_camera_cannot_change_a_bricks_side_of_the_under_sea_cap_in_less_than_its_slack() {
+        // As the test of the camera over the sphere: random bricks about a camera 10 to 900 m under
+        // the sea, go the slack in the directions that matter, and the brick is where it was. The
+        // places the cap is seen from are a depth out, so they move a little faster than the
+        // camera (`Cap::extra`).
+        let reach = under_the_sea();
+        let mut state = 0x1234_5678_9ABC_DEF1u64;
+        let mut next = move || {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (state >> 11) as f64 / (1u64 << 53) as f64
+        };
+        let mut checked = 0;
+        for _ in 0..4000 {
+            let depth = (10.0 + next() * 890.0) * VOXELS_PER_METRE;
+            let tilt = next() * 0.2;
+            let direction = |a: f64, b: f64| [a.sin() * b.cos(), a.cos(), a.sin() * b.sin()];
+            let up_dir = direction(tilt, next() * std::f64::consts::TAU);
+            let camera = up_dir.map(|c| c * (SEA - depth));
+            let at = reach.from(camera);
+            let level = (next() * 6.0) as usize;
+            let angle = (next() * 2.0 - 1.0) * 0.01 + tilt;
+            let spot = direction(angle.abs().max(1e-9), next() * std::f64::consts::TAU);
+            let r = SEA + (next() * 2.0 - 0.2) * 2000.0 * VOXELS_PER_METRE;
+            let size = (8u64 << level) as f64;
+            let coord = BrickCoord(spot.map(|c| (c * r / size).floor() as i32));
+            let d = brick_distance(camera, level, coord);
+            for was in [false, true] {
+                let now = (
+                    at.in_cap(level, coord, was),
+                    at.in_cap_wanted(level, coord, was),
+                );
+                let slack = at
+                    .cap_slack(level, coord, d, was)
+                    .min(at.cap_slack_wanted(level, coord, d, was));
+                if !slack.is_finite() || slack > 1.0e7 {
+                    continue;
+                }
+                checked += 1;
+                for step in [
+                    up_dir,
+                    up_dir.map(|c| -c),
+                    direction(
+                        next() * std::f64::consts::PI,
+                        next() * std::f64::consts::TAU,
+                    ),
+                ] {
+                    let moved: [f64; 3] =
+                        std::array::from_fn(|a| camera[a] + step[a] * slack * 0.999);
+                    let after = reach.from(moved);
+                    if !after.has_cap() {
+                        continue;
+                    }
+                    assert_eq!(
+                        now,
+                        (
+                            after.in_cap(level, coord, was),
+                            after.in_cap_wanted(level, coord, was)
+                        ),
+                        "level {level}, {depth} under, slack {slack}"
+                    );
+                }
+            }
+        }
+        assert!(checked > 1000, "{checked}");
+    }
+
     fn metres(speed: f64) -> f64 {
         speed * VOXELS_PER_METRE
     }
@@ -1773,28 +2031,6 @@ mod tests {
         assert!(scale.observe(0.0), "over it");
         assert_eq!(scale.depth(), 0.0);
         assert!(!scale.scale.releasing());
-    }
-
-    #[test]
-    fn a_depth_that_is_kept_is_not_given_back_nor_held_for_a_release_but_still_deepens() {
-        let mut scale = SpeedScale::AT_REST;
-        scale.observe(metres(50.0), 0.0);
-        assert_eq!(scale.depth(), 3.0);
-        // Stopped, with the depth kept: it does not start the hold (so that nothing waits for it),
-        // and says that it would give it back.
-        assert!(scale.wants_less(0.0));
-        assert!(!scale.observe_keeping(0.0));
-        assert!(!scale.releasing());
-        assert_eq!(scale.depth(), 3.0);
-        // Not kept any more: the hold is from the first look at it, not from before.
-        assert!(!scale.observe(0.0, 10.0));
-        assert!(scale.releasing());
-        assert!(scale.observe(0.0, 10.0 + RELEASE_HOLD));
-        assert_eq!(scale.depth(), 0.0);
-        // A deeper step is taken at once, kept or not.
-        assert!(!scale.wants_less(0.0));
-        assert!(scale.observe_keeping(metres(30.0)));
-        assert_eq!(scale.depth(), 1.5);
     }
 
     #[test]
