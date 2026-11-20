@@ -26,8 +26,9 @@
 //! - no view's settled GI image is further from truth than its flat-ambient one;
 //! - the lit result settles within [`SETTLE_WITHIN_MS`] of a dig ([`EditSettle`]);
 //! - the Reference converges in the room: FLIP at most [`still::FLIP_TARGET`] within
-//!   [`still::ROOM_WITHIN_S`] (0.3 s, the owner's exception for the closed room) of the hold
-//!   beginning, which the room's still run already scores.
+//!   [`still::ROOM_WITHIN_S`] (0.3 s, the owner's exception for the closed room) **of GPU time**
+//!   (the line's `gpu_s`, the owner's decision of 2026-11-20); the still run's wall clock for it is
+//!   reported and not gated.
 //!
 //! **The dig.** The emissive room with a wall across it that the lamp's light does not get
 //! through, seen from the dark side, warmed up until the cache has settled. A gap is dug in the
@@ -582,7 +583,8 @@ fn dig_in_the_game(settings: &Settings, out: &Path) -> Result<EditSettle, Box<dy
 /// The gates of the phase over its views and its dig.
 ///
 /// Each view comes with whether its Reference was within the target ([`still::FLIP_TARGET`] in
-/// [`still::WITHIN_S`]) and whether that line counts in the view.
+/// [`still::WITHIN_S`] of the wall clock; the room's in [`still::ROOM_WITHIN_S`] of GPU time, which
+/// `convergence::reference_within` works out) and whether that line counts in the view.
 pub fn gates(
     settings: &Settings,
     views: &[(&'static str, &ViewGi, Option<bool>, bool)],

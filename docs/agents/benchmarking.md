@@ -1398,20 +1398,22 @@ view's **truth A**, which the view's own run made, at the output size:
   silences it): `room-flip` (the room's settled GI image at FLIP mean 0.10 or under, 1440p, the ticket's;
   #55 tightens it), `no-further:VIEW` (a view's settled GI image no further from truth than its flat
   one, for each of the three), `settle` (the dig settles within 500 ms), and `reference-room` (the
-  room's Reference view reaches FLIP 0.05 within **0.3 s** of the hold beginning, `still::ROOM_WITHIN_S`:
-  the owner's exception of 2026-11-20 for the closed room, whose long light paths cost about three times
-  a sample as much as the outdoor views', which keep 0.25 s and have no gate here; the still run scores
-  a mark at 0.3 s for it, and `still.flip_within_s` says which time `flip_within_target` is of)
-  **where that line counts in the room** (ADR 0005: at least 4 times the room's floor, so a room whose
-  truths are noisier than 0.0125 is not held to it; **the room's truths have at least 8192 samples** when
-  FLIP is run, `ROOM_TRUTH_SPP`: the floor was 0.0211 at 1024 and 0.0137 at 4096 on the 4090, and about
-  0.0120 is what the two fit for 8192).
-  **Two clocks:** the gate is on the still run's **wall clock** (the image at the 0.3 s mark of the 60 Hz
-  run, `still.flip_within_target`, with the first still frames, the batch budget of 12 ms a frame and
-  the vsyncs in it, as #189's acceptance is), while a FLIP line's `gpu_s` (`lines[].gpu_s`) is only
-  samples times the Reference pass's mean GPU time. A room can have a line at 0.29 `gpu_s` and be over
-  the gate: read `still.to_line[].seconds` (the line from the stop in the run) and
-  `still.marks[]` at 0.3 s, which the summary prints together as "room Reference gate".
+  room's Reference view reaches FLIP 0.05 within **0.3 s of GPU time**: the line's `gpu_s`
+  (`views[].lines[]`, `flip` 0.05: its samples times the Reference pass's mean GPU time), against
+  `still::ROOM_WITHIN_S`: the owner's exception of 2026-11-20 for the closed room, whose long light
+  paths cost about three times a sample as much as the outdoor views', and **his decision the same
+  day that the gate is on GPU time**; the 4090 has 0.292 and 0.289 s; no timers (a `gpu_s` of null) is
+  over) **where that line counts in the room** (ADR 0005: at least 4 times the room's floor, so a room
+  whose truths are noisier than 0.0125 is not held to it; **the room's truths have at least 8192
+  samples** when FLIP is run, `ROOM_TRUTH_SPP`: the floor was 0.0211 at 1024 and 0.0137 at 4096 on the
+  4090, and about 0.0120 is what the two fit for 8192).
+  **Two clocks, one gated:** the room is gated on the line's `gpu_s`. The 60 Hz **wall clock** of the
+  still run (the image at the 0.3 s mark, `still.flip_within_target` with `still.flip_within_s`, and the
+  line's seconds from the stop, `still.to_line[].seconds`, which have the first still frames, the batch
+  budget of 12 ms a frame and the vsyncs in them: 0.674 s and FLIP 0.066 at the mark on the 4090) is
+  **reported, not gated**; the summary prints both as "room Reference gate". **The outdoor views are
+  unchanged**: their acceptance is still the still run's FLIP at 0.25 s on the wall clock
+  (`flip_within_target`, "met" or "NOT met" in the summary; they have no entry in `gates.over`).
   Each view's `truth_spp` (`views[].truth_spp`, and the summary's "truths of N samples") says how many
   samples its truths had; the room's is `ROOM_TRUTH_SPP` when that is more than `--truth-spp`.
   `gates.over` names those that are over, `gates.not_counted` those that were not held for being under

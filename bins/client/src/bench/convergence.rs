@@ -363,7 +363,17 @@ pub fn run(settings: &Settings, out: &Path) -> Result<ConvergenceReport, Box<dyn
                     .iter()
                     .find(|l| l.flip == still::FLIP_TARGET)
                     .is_none_or(|l| l.counts);
-                (v.name, &v.gi, v.still.flip_within_target, counts)
+                let gpu_s = v
+                    .lines
+                    .iter()
+                    .find(|l| l.flip == still::FLIP_TARGET)
+                    .and_then(|l| l.gpu_s);
+                (
+                    v.name,
+                    &v.gi,
+                    reference_within(v.name, v.still.flip_within_target, gpu_s),
+                    counts,
+                )
             })
             .collect();
         gi::GiReport {
@@ -820,17 +830,35 @@ pub fn print_summary(report: &ConvergenceReport) {
     shadows::print_summary(&report.shadows);
     let scored: Vec<_> = report.views.iter().map(|v| (v.name, &v.gi)).collect();
     gi::print_summary(&scored, &report.gi);
-    // The room's Reference gate reads the still run's wall clock, not the line's GPU time.
+    // The room's Reference gate is on the line's GPU time; the wall-clock result is shown beside it.
     for v in report.views.iter().filter(|v| v.name == "room") {
         eprintln!("{}", room_clocks(v));
     }
 }
 
-/// The two clocks of the room's Reference gate, side by side. The gate (`reference-room`) is the
-/// still run's FLIP at the mark [`still::ROOM_WITHIN_S`] after the stop, on the wall clock of the
-/// 60 Hz run; the `gpu_s` of a FLIP line is only the samples times the Reference pass's mean GPU
-/// time, with none of the run's frames in it (the first still frames, the batch budget, the
-/// vsyncs).
+/// Whether a view's Reference was within its target, for the gate: the room's is **on GPU time**
+/// (the owner's decision of 2026-11-20: the line's `gpu_s`, samples times the Reference pass's mean
+/// GPU time, within [`still::ROOM_WITHIN_S`]; null where there are no timers or no line), and the
+/// other views' the still run's FLIP at their mark on the wall clock (`flip_within_target`). The
+/// room's wall-clock result stays in the report (`still.flip_within_target` and
+/// `still.to_line[].seconds`) and in the summary, and is not gated.
+fn reference_within(
+    name: &str,
+    flip_within_target: Option<bool>,
+    gpu_s: Option<f64>,
+) -> Option<bool> {
+    if name == "room" {
+        gpu_s.map(|s| s <= still::ROOM_WITHIN_S)
+    } else {
+        flip_within_target
+    }
+}
+
+/// The two clocks of the room's Reference gate, side by side. **The gate (`reference-room`) is the
+/// line's `gpu_s`**, its samples times the Reference pass's mean GPU time, within
+/// [`still::ROOM_WITHIN_S`] (the owner's decision of 2026-11-20). The wall clock of the 60 Hz still
+/// run (the FLIP at that mark after the stop, and the line's seconds from the stop, with the first
+/// still frames, the batch budget and the vsyncs in them) is reported beside it and is not gated.
 fn room_clocks(view: &ViewReport) -> String {
     let num =
         |v: Option<f64>, digits: usize| v.map_or("n/a".to_string(), |v| format!("{v:.digits$}"));
@@ -850,20 +878,47 @@ fn room_clocks(view: &ViewReport) -> String {
                 .find(|l| l.flip == still::FLIP_TARGET),
         );
     format!(
-        "  room Reference gate (FLIP <= {} within {} s of the stop, wall clock): FLIP {} at the mark ({} samples); the line is {} samples, {} s of GPU time but {} s from the stop in the run",
+        "  room Reference gate (FLIP <= {}, the line's GPU time within {} s): {} samples, {} s of GPU time (gated); not gated, on the 60 Hz wall clock: {} s from the stop, FLIP {} at the {} s mark ({} samples)",
         still::FLIP_TARGET,
         still::ROOM_WITHIN_S,
-        num(at_mark.and_then(|m| m.flip_mean), 4),
-        at_mark.map_or("n/a".to_string(), |m| m.samples.to_string()),
         num(line.and_then(|(l, _)| l.samples), 1),
         num(line.and_then(|(l, _)| l.gpu_s), 3),
         num(line.and_then(|(_, s)| s.seconds), 3),
+        num(at_mark.and_then(|m| m.flip_mean), 4),
+        still::ROOM_WITHIN_S,
+        at_mark.map_or("n/a".to_string(), |m| m.samples.to_string()),
     )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_rooms_reference_gate_is_on_gpu_time_and_the_outdoor_views_on_their_wall_clock_mark() {
+        // The room: the line's GPU seconds, whatever the wall clock's FLIP at the mark said.
+        assert_eq!(
+            reference_within("room", Some(false), Some(0.292)),
+            Some(true)
+        );
+        assert_eq!(
+            reference_within("room", Some(true), Some(0.301)),
+            Some(false)
+        );
+        assert_eq!(reference_within("room", Some(false), Some(0.3)), Some(true));
+        // No timers or no line: nothing to say, which the gate counts as over.
+        assert_eq!(reference_within("room", Some(true), None), None);
+        // The outdoor views keep the still run's mark, and the GPU time does not enter.
+        assert_eq!(
+            reference_within("golden", Some(true), Some(9.0)),
+            Some(true)
+        );
+        assert_eq!(
+            reference_within("pit", Some(false), Some(0.01)),
+            Some(false)
+        );
+        assert_eq!(reference_within("pit", None, Some(0.01)), None);
+    }
 
     fn point(samples: u32, flip_mean: Option<f64>) -> Point {
         Point {
