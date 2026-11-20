@@ -514,11 +514,11 @@ fn walled_room() -> BrickStore {
 }
 
 /// A floor of rock 128 Voxels across, walled on three sides 48 Voxels high (a valley open towards +x),
-/// and (if `ridge`) a floating slab of rock 17 000 Voxels (850 m) away along +x, at the height that
-/// the sun's disc is behind from the floor: the sun is 45 degrees up towards +x, so the slab, a
-/// brick thick, from 16 200 to 17 800 up and 912 wide, puts all of the valley in its shadow, from
-/// further than the 820 m that the bounces of Primary's GI reach (`GI_REACH`).
-fn valley_in_a_far_ridges_shadow(ridge: bool) -> Scene {
+/// and (if `ridge_at` is `Some(distance)`) a floating slab of rock `distance` Voxels away along +x, at
+/// the height that the sun's disc is behind from the floor: the sun is 45 degrees up towards +x with
+/// a disc of half-angle `cone`, so the slab, a brick thick, is as high as it is far, and wide
+/// enough (the disc's width at that distance, and some) to put all of the valley in its shadow.
+fn valley_in_a_far_ridges_shadow(ridge_at: Option<i32>, cone: f32) -> Scene {
     let rock = material("rock");
     let mut store = BrickStore::new();
     for x in -8..8 {
@@ -533,38 +533,42 @@ fn valley_in_a_far_ridges_shadow(ridge: bool) -> Scene {
             store.insert(BrickCoord([a, y, 7]), Brick::solid(rock));
         }
     }
-    if ridge {
-        for y in 2025..2225 {
-            for z in -57..57 {
-                store.insert(BrickCoord([2125, y, z]), Brick::solid(rock));
+    if let Some(distance) = ridge_at {
+        let x = distance / 8;
+        let half = (cone * distance as f32 / 8.0 * 1.5).ceil() as i32 + 8;
+        for y in x - half..x + half {
+            for z in -half..half {
+                store.insert(BrickCoord([x, y, z]), Brick::solid(rock));
             }
         }
     }
     Scene::new(&store, None)
 }
 
-#[test]
-fn a_far_ridges_shadow_is_not_lit_by_the_bounce_as_if_the_sun_were_open() {
-    // The valley is in the shadow of a ridge more than 820 m off. The sun's rays of Primary's GI
-    // (`gi_fill`, which gives the cache the light of a surface the bounce landed on) must not stop
-    // at the bounces' reach, or the shadowed walls and floor are lit by the sun in the cache and
-    // bounce it into one another: the valley comes out brighter than the Reference's.
+/// Primary's mean luminance and the Reference's, for the valley with and without a ridge `ridge_at`
+/// Voxels off, against truth.
+fn valley_means(ridge_at: i32, cone: f32) -> [(f32, f32); 2] {
     let camera = Camera::looking_at([40.0, 24.0, 0.0], [-60.0, 14.0, 0.0]);
-    let sun = Sun::new([1.0, 1.0, 0.0], 0.02).expect("a direction");
-    let mut means = Vec::new();
-    for ridge in [false, true] {
-        let scene = valley_in_a_far_ridges_shadow(ridge);
+    let sun = Sun::new([1.0, 1.0, 0.0], cone).expect("a direction");
+    [None, Some(ridge_at)].map(|ridge| {
+        let scene = valley_in_a_far_ridges_shadow(ridge, cone);
         let mut gpu = gpu_of(&scene);
         gpu.set_sun(sun);
         warmed(&mut gpu, &camera, 60);
         let frames: Vec<Image> = (0..8).map(|_| gpu.render(&camera)).collect();
         let primary = frames.iter().map(mean).sum::<f32>() / 8.0;
         let reference = mean(&gpu.render_reference(&camera, 128));
-        eprintln!("ridge {ridge}: primary {primary} reference {reference}");
-        means.push((primary, reference));
-    }
-    let (open_p, open_r) = means[0];
-    let (shaded_p, shaded_r) = means[1];
+        eprintln!("ridge {ridge:?}: primary {primary} reference {reference}");
+        (primary, reference)
+    })
+}
+
+/// The valley is in the shadow of a ridge `ridge_at` Voxels off. The sun's rays of Primary's GI
+/// (`gi_fill`, which gives the cache the light of a surface the bounce landed on) must not stop at
+/// the bounces' reach, or the shadowed walls and floor are lit by the sun in the cache and bounce it
+/// into one another: the valley comes out brighter than the Reference's.
+fn assert_far_ridges_shadow_is_held(ridge_at: i32, cone: f32) {
+    let [(open_p, open_r), (shaded_p, shaded_r)] = valley_means(ridge_at, cone);
     // The sun is what lights the open floor, and the ridge takes it away.
     assert!(
         open_r > 1.5 * shaded_r,
@@ -579,4 +583,18 @@ fn a_far_ridges_shadow_is_not_lit_by_the_bounce_as_if_the_sun_were_open() {
         (shaded_p / shaded_r - 1.0).abs() < 0.015,
         "in the ridge's shadow: Primary {shaded_p}, the Reference's {shaded_r}"
     );
+}
+
+#[test]
+fn a_far_ridges_shadow_is_not_lit_by_the_bounce_as_if_the_sun_were_open() {
+    // 17 000 Voxels: 850 m, past the 820 m that the bounces reach.
+    assert_far_ridges_shadow_is_held(17_000, 0.02);
+}
+
+#[test]
+fn a_ridge_near_the_end_of_the_suns_reach_still_shades_the_valley_for_the_bounce() {
+    // The slab is 44 000 Voxels along +x and as high, 62 200 Voxels (3.1 km) along the sun's ray, which
+    // is within its reach (`GI_SUN_REACH`, 65 536 Voxels, 3.3 km). What is further than that is lit
+    // as if open in the cache, which ADR 0005 names; this holds the reach itself.
+    assert_far_ridges_shadow_is_held(44_000, 0.01);
 }

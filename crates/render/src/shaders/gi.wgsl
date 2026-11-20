@@ -59,13 +59,16 @@ const GI_REFRESH_ONE_IN_AFTER_EDIT = 2u;
 // horizon; past this distance a surface's light is a few thousandths of a pixel's, which the sky's
 // stands in for. Keep in step with the ledger in ADR 0005 ("Bounce light").
 const GI_REACH = 16384.0;
-// How far the sun's ray at a landing looks (`gi_sun`), in voxels (13 km): **much further**, because
-// a sun ray that stops early is open and lights the whole sun, not a thousandth of it: a ridge
-// 150 m high at 10 degrees of sun casts 850 m of shadow, and a mountain range at a low sun a good
-// deal more. The levels past it are skipped (the shadow of a blocker over 13 km off, a range
-// 1.1 km high at 5 degrees of sun, is open). The cost is the fills' (`gi_fill`), which only run for
-// cells that are not known yet or have not been fed for a while.
-const GI_SUN_REACH = 262144.0;
+// How far the sun's ray at a landing looks (`gi_sun`), along the ray, in voxels (3.3 km): four times
+// as far as a bounce, because a sun ray that stops early is open and lights the whole sun, not a
+// thousandth of it (a ridge 150 m high at 10 degrees of sun casts 850 m of shadow). It is not
+// further because each doubling of the reach costs the `gi` pass about 0.1 ms of its mean and
+// 0.5 ms of its p99 on the 4090 (13 km measured +0.4 to +0.5 ms and +1.8 to +2.1 ms, over the
+// gates of 1.5 and 3.0): the owner's decision of 2026-11-21. What a blocker further than this
+// shades is lit as if open **in the cache's cells only** (the bounce light in the shadow of a
+// range more than 3.3 km off comes out a few percent too bright); the `shadows` pass casts its
+// rays with no reach, so the direct sun there is right. Keep in step with ADR 0005 ("Bounce light").
+const GI_SUN_REACH = 65536.0;
 
 // The ray that a bounce from `hit` leaves along: cosine-weighted about `normal`, and mirrored about
 // the geometric face when the smooth normal tilts it below, as the Reference's is.
