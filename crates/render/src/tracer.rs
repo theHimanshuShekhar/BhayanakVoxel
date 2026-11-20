@@ -1914,27 +1914,13 @@ impl Tracer {
             hi.map(|k| (k + 1) * 8 + GI_BOOST_MARGIN),
         );
         self.gi_boost_box = if self.gi_boost > 0 {
-            // An Edit while another is settling: the cells of both, up to a box of
-            // GI_BOOST_MAX_EXTENT along each axis; past that, the newest Edit's alone.
-            let both: ([i32; 3], [i32; 3]) = (
-                std::array::from_fn(|a| self.gi_boost_box.0[a].min(reach.0[a])),
-                std::array::from_fn(|a| self.gi_boost_box.1[a].max(reach.1[a])),
-            );
-            let small = (0..3).all(|a| {
-                i64::from(both.1[a]) - i64::from(both.0[a]) <= i64::from(GI_BOOST_MAX_EXTENT)
-            });
-            if small { both } else { reach }
+            merged_boost_box(self.gi_boost_box, reach, self.camera_position)
         } else {
             reach
         };
         self.gi_boost = GI_BOOST_FRAMES;
         // The upscaler's short history is for the whole image: only for an Edit near the camera.
-        let near = (0..3).all(|a| {
-            let (lo, hi) = (f64::from(reach.0[a]), f64::from(reach.1[a]));
-            (self.camera_position[a].clamp(lo, hi) - self.camera_position[a]).abs()
-                <= EDIT_SETTLING_REACH
-        });
-        if near {
+        if box_near(reach, self.camera_position) {
             self.edit_settling = GI_BOOST_FRAMES;
         }
     }
@@ -2519,8 +2505,111 @@ fn batch_of(samples: u32, size: (u32, u32)) -> u32 {
     samples.clamp(1, max_samples(pixels(size)))
 }
 
+/// Whether `bx` is within [`EDIT_SETTLING_REACH`] Voxels of `camera` along every axis.
+fn box_near(bx: ([i32; 3], [i32; 3]), camera: [f64; 3]) -> bool {
+    (0..3).all(|a| {
+        let (lo, hi) = (f64::from(bx.0[a]), f64::from(bx.1[a]));
+        (camera[a].clamp(lo, hi) - camera[a]).abs() <= EDIT_SETTLING_REACH
+    })
+}
+
+/// The box of cells that forget fast after an Edit whose box is `reach`, while the box `current`
+/// (of a sun change, [`EVERYWHERE`], or of an Edit) is still settling:
+/// - a sun change's whole-world box stays the whole world (every cell's light is the old sun's);
+/// - two Edits' boxes are merged, while the merge is at most [`GI_BOOST_MAX_EXTENT`] Voxels across
+///   on each axis;
+/// - past that one of the two is kept: the one near the camera (`camera`), the newest if both or
+///   neither are (so a server's Edit from the far side of the world does not take the box from the
+///   dig the player is watching settle).
+fn merged_boost_box(
+    current: ([i32; 3], [i32; 3]),
+    reach: ([i32; 3], [i32; 3]),
+    camera: [f64; 3],
+) -> ([i32; 3], [i32; 3]) {
+    if current == EVERYWHERE {
+        return EVERYWHERE;
+    }
+    let both: ([i32; 3], [i32; 3]) = (
+        std::array::from_fn(|a| current.0[a].min(reach.0[a])),
+        std::array::from_fn(|a| current.1[a].max(reach.1[a])),
+    );
+    let small = (0..3)
+        .all(|a| i64::from(both.1[a]) - i64::from(both.0[a]) <= i64::from(GI_BOOST_MAX_EXTENT));
+    if small {
+        both
+    } else if !box_near(reach, camera) && box_near(current, camera) {
+        current
+    } else {
+        reach
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_sun_change_then_an_edit_keeps_the_whole_world_box() {
+        let reach = ([0, 0, 0], [200, 200, 200]);
+        assert_eq!(merged_boost_box(EVERYWHERE, reach, [0.0; 3]), EVERYWHERE);
+        // Far from the camera too.
+        assert_eq!(
+            merged_boost_box(EVERYWHERE, reach, [1.0e6, 0.0, 0.0]),
+            EVERYWHERE
+        );
+    }
+
+    #[test]
+    fn edits_that_come_while_one_settles_merge_up_to_the_cap_and_no_further() {
+        let a = ([0, 0, 0], [400, 400, 400]);
+        let near = ([1000, 0, 0], [1400, 400, 400]);
+        let merged = merged_boost_box(a, near, [0.0; 3]);
+        assert_eq!(
+            merged,
+            ([0, 0, 0], [1400, 400, 400]),
+            "within the cap: both"
+        );
+        // Past the cap (2048 along x): the one near the camera, and the newest of two near ones.
+        let past = ([2000, 0, 0], [2400, 400, 400]);
+        let camera = [0.0; 3];
+        assert_eq!(
+            merged_boost_box(a, past, camera),
+            past,
+            "the newest of two near"
+        );
+        // The camera is at the origin; this one is 100 km away along x.
+        let far = ([2_000_000, 0, 0], [2_000_400, 400, 400]);
+        assert_eq!(
+            merged_boost_box(a, far, camera),
+            a,
+            "a far Edit does not take the dig's box"
+        );
+        assert_eq!(
+            merged_boost_box(far, a, camera),
+            a,
+            "the one near the camera, the newest"
+        );
+        let far_too = ([3_000_000, 0, 0], [3_000_400, 400, 400]);
+        assert_eq!(
+            merged_boost_box(far, far_too, camera),
+            far_too,
+            "neither near: the newest"
+        );
+    }
+
+    #[test]
+    fn an_edit_shortens_the_upscalers_history_only_within_its_reach_of_the_camera() {
+        let bx = ([0, 0, 0], [400, 400, 400]);
+        assert!(box_near(bx, [0.0, 0.0, 0.0]));
+        assert!(
+            box_near(bx, [400.0 + EDIT_SETTLING_REACH, 0.0, 0.0]),
+            "at the reach"
+        );
+        assert!(
+            !box_near(bx, [400.0 + EDIT_SETTLING_REACH + 1.0, 0.0, 0.0]),
+            "past it"
+        );
+        assert!(!box_near(bx, [0.0, -EDIT_SETTLING_REACH - 1.0, 0.0]));
+    }
+
     #[test]
     fn a_batch_is_clamped_by_the_size_of_the_image_it_is_of() {
         use crate::batch::MAX_BATCH_SAMPLES;

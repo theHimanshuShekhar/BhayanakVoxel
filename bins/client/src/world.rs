@@ -1357,6 +1357,34 @@ mod tests {
         Camera::looking_at([4016.5, 16.5, 20.5], [4016.5, 16.5, 0.0])
     }
 
+    #[test]
+    fn the_edited_list_keeps_the_newest_bricks_and_is_emptied_by_taking_it() {
+        let (mut world, _server) = world();
+        let brick = |n: i32| BrickCoord([n, 0, 0]);
+        let first: Vec<BrickCoord> = (0..EDITED_KEPT as i32).map(brick).collect();
+        world.note_edited(&first);
+        assert_eq!(
+            world.edited.len(),
+            EDITED_KEPT,
+            "up to the limit: all of them"
+        );
+        // Ten more: the ten oldest are dropped.
+        let more: Vec<BrickCoord> = (EDITED_KEPT as i32..EDITED_KEPT as i32 + 10)
+            .map(brick)
+            .collect();
+        world.note_edited(&more);
+        assert_eq!(world.edited.len(), EDITED_KEPT);
+        assert_eq!(
+            world.edited[0],
+            brick(10),
+            "the oldest are the ones dropped"
+        );
+        assert_eq!(world.edited[EDITED_KEPT - 1], brick(EDITED_KEPT as i32 + 9));
+        // Taking them (what the client does with no renderer too) empties the list.
+        assert_eq!(world.take_edited().len(), EDITED_KEPT);
+        assert!(world.take_edited().is_empty());
+    }
+
     fn world() -> (World, ServerEnd) {
         let store = wall();
         let scene = Scene::new(&store, None);

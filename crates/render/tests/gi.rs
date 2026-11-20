@@ -176,6 +176,10 @@ fn mse(a: &Image, b: &Image) -> f64 {
     sum as f64 / (3 * a.width * a.height) as f64
 }
 
+/// How many frames the strafe tests move for: 0.4 Voxels a frame, 16 frames end 6.4 Voxels from where
+/// they began, in the room (24 would end in its wall).
+const STRAFE_FRAMES: u32 = 16;
+
 /// A camera strafing through `scene` as the window draws it: the frame after `frames` frames of
 /// it, and the mse of that against the view it is of, settled, and against the view of 8 frames
 /// before, settled.
@@ -195,6 +199,13 @@ fn strafe_errors(scene: &Scene, frames: u32) -> (f64, f64) {
         let right = camera.right();
         camera.position =
             std::array::from_fn(|a| camera.position[a] + right[a] * 0.4 * f64::from(frames));
+        // Inside the room (0..40 in x and z, and the wall is rock): a frame from inside a wall is
+        // the same black image whatever the history holds, and says nothing.
+        assert!(
+            (0.0..40.0).contains(&camera.position[0]) && (0.0..40.0).contains(&camera.position[2]),
+            "the camera is in the room at frame {frames}: {:?}",
+            camera.position
+        );
         camera
     };
     // The cache is warm, and the history is of the first view.
@@ -218,12 +229,13 @@ fn strafe_errors(scene: &Scene, frames: u32) -> (f64, f64) {
 }
 
 #[test]
-fn a_camera_moving_sideways_through_noisy_gi_is_not_smeared_by_the_history_the_clamp_lets_through()
-{
-    // The upscaler's clamp lets history stray beyond the range of the traced samples, because the
-    // mean of noisy GI is often outside the range of one frame's samples. That slack must not let
-    // a frame carry the light of where the camera was.
-    let (now, unmoved) = strafe_errors(&lit_room(), 24);
+fn a_camera_moving_sideways_through_noisy_gi_has_its_history_carried_along_with_it() {
+    // What this guards: the upscaler's history is reprojected with the camera's motion, in a room
+    // lit by noisy GI, so the frame is closer to the view it is of than to the view of 8 frames
+    // before (it fails with no reprojection: 103 against 75). What it does **not** guard is the
+    // clamp's slack, which a plain wall cannot show (16.3 against 119.9 with the clamp off): that is
+    // `a_wall_a_pillar_uncovers...`'s.
+    let (now, unmoved) = strafe_errors(&lit_room(), STRAFE_FRAMES);
     eprintln!("strafe with GI: {now:.2} against now, {unmoved:.2} against 8 frames back");
     assert!(
         now * 2.0 < unmoved,
@@ -235,8 +247,10 @@ fn a_camera_moving_sideways_through_noisy_gi_is_not_smeared_by_the_history_the_c
 fn a_wall_a_pillar_uncovers_is_not_ghosted_by_the_history_of_the_pillar_in_noisy_gi() {
     // The same, with a pillar between the camera and the lamp's wall that the strafe moves across:
     // the wall it uncovers has the history of the pillar in front of it (disocclusion), which the
-    // clamp's slack must not let through into a frame of lit, noisy GI.
-    let (now, unmoved) = strafe_errors(&pillared_room(), 24);
+    // clamp's slack must not let through into a frame of lit, noisy GI. Without the clamp and its
+    // rejection the frame is 164 from its view and 261 from the old one (this fails); at a slack of
+    // 6 instead of 1.5, 161 and 271 (this fails); as shipped, 105 and 340.
+    let (now, unmoved) = strafe_errors(&pillared_room(), STRAFE_FRAMES);
     eprintln!(
         "strafe past a pillar with GI: {now:.2} against now, {unmoved:.2} against 8 frames back"
     );
