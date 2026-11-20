@@ -78,7 +78,7 @@ use super::stream::StreamReport;
 /// no longer include the lighting: a number of schema 19 or before is not comparable with them
 /// except as `primary` + `normals` + `shade`. Nothing else is changed.
 ///
-/// 21 is taken by #168 (PR #219).
+/// 21 is not used: #168 (PR #219) takes 27, as #217, #52 and #213 landed first.
 ///
 /// 22 (#217) counts the cuts of a Still view: each convergence view's `still` has `cuts` (`total`,
 /// `view`, `scene`); each real-time run has `still_after_flight` (the view held Still after a
@@ -86,7 +86,7 @@ use super::stream::StreamReport;
 /// after it); and the real-time stop after a flight has `still_cuts` (null in the other paths).
 /// Nothing else is changed.
 ///
-/// 23 was taken by #168 (PR #219), which now takes 25.
+/// 23 is not used: #168 (PR #219) takes 27, as #52 and #213 landed first.
 ///
 /// 24 (#52) adds the sun-and-sky view: `convergence.shadows`, Primary's shadows against the
 /// Reference's direct-sun image (the golden view's camera and sun, no GI and no emitters in both
@@ -98,6 +98,8 @@ use super::stream::StreamReport;
 /// (the report lists passes generically), and `primary` is as it was in 22.
 /// Nothing else is changed.
 ///
+/// 25 is not used.
+///
 /// 26 (#213) added the real-time path `sea-level crossing` (the camera down to 30 m under the sea
 /// and up to 80 m over it, 50 m/s), and in each real-time path `scene_round_max_ms`,
 /// `scene_update_max_ms`, `cap_flips` and `cap_flip_max_ms`: the scene thread's longest round and
@@ -106,15 +108,35 @@ use super::stream::StreamReport;
 /// what absorbing a flip held and how long it took; and `scene_used_peak_mib`: the most MiB of the
 /// scene in use at the end of one of the path's frames. Nothing else is changed.
 ///
-/// 28 (#54; 27 is #219's) added the emissive room to the convergence phase (`convergence.views[]`
+/// 27 (#168) adds to the real-time
+/// report's cold start `spawn_ring_s` (the 20 m spawn ring), `guard_s` (the Guard that the window
+/// waits for as well) and `time_to_control_s` (from the world map being ready to the window
+/// opening), to each path `camera_soft_miss_frames` (frames whose ground below the frame's camera
+/// was drawn coarser than the bands ask), `generated_bricks` and `arrived_bricks` (what the loader
+/// did in the path), `loader_queue_max` and `loader_queue_mean` (the bricks asked for and not yet
+/// taken in, at each frame), `loader_generating_s`, `loader_held_back_s`, `stream_calls` and
+/// `stream_slices_used` (what the loader's workers did with their time, and how often the scene
+/// thread took in and used up its slice), `scene_lag_d0_mean`, `scene_follow_steps`, `scene_budget_cuts` and `camera_soft_miss_per_second` (to find where a path's misses and
+/// memory come from), to `memory` `scene_used_peak_in` and `scene_used_peak_level_bricks`, to the `config` `stream_slice_ms`, to each `scene_thread` `reband_ms` (the change of the bands for the
+/// camera's speed, which is not in `follow_ms`), to the stop's `settle` `walk_s`, `reband_s` and
+/// `fill_s` (its three parts, which add up to `seconds`), to each path `scene_used_end_mib` and `scene_level_bricks_end` (the scene's MiB in use and the bricks drawn at each level when the path ended, against `scene_used_peak_mib`), `camera_soft_miss_lag_side`, `camera_soft_miss_loader_side`, `lag_over_floor_frames`, `scene_release_rebuilds`, `release_frame_ms_max` and `release_update_ms_max`, to each `scene_thread` `release_ms`, to the cold start `edit_during_fill` and `edit_during_fill_pending`, and to its gates `camera_soft_miss_frames`, `scene_soft_miss_frames` (reported),
+/// `scene_lag_d0_max`, `spawn_ring_s`, `time_to_control_s` and `settle_s` (`over` may now also name
+/// `soft_misses`, `scene_lag`, `spawn_ring`, `time_to_control` and `settle`). The budgets file has
+/// the keys `camera_soft_miss_frames`, `scene_lag_d0_max`, `spawn_ring_s`, `time_to_control_s` and
+/// `settle_s`, in `[streaming]`. Nothing else is changed.
+///
+/// 28 (#54; 27 is #168's) added the emissive room to the convergence phase (`convergence.views[]`
 /// has a third view, `room`), and Primary's GI against truth: each view's `gi` (Primary's FLIP
 /// mean and 99th percentile against truth A and its luminance over truth's, for the first frame
 /// and the settled one, with the flat ambient of before the radiance cache (`flat`) and with it
 /// (`gi`), and whether GI is no further from truth), and `convergence.gi`: the dig of the room's
 /// wall (the time its lit result takes to settle, with the frames) and the gates of the ticket
 /// (the room's FLIP, no view further from truth, the settling time, the Reference's room within
-/// 0.25 s), with the names of those that are over. A new pass line `gi` is in `passes[]` (the
-/// report lists passes generically). Nothing else is changed.
+/// 0.3 s), with the names of those that are over. A new pass line `gi` is in `passes[]` (the
+/// report lists passes generically). Each real-time path has `frame_parts` (the frame thread's
+/// recentre, update, encode, submit and wait, the passes' GPU total and the wait that no pass
+/// accounts for) and `gpu_passes` (the GPU time of every timed pass), and a real-time run has
+/// `unpaced_control` (standing frames with no pacing sleep). Nothing else is changed.
 pub const SCHEMA_VERSION: u32 = 28;
 
 /// One timed thing (a pass, or the GPU total of a profiler frame) in one mode, against its
@@ -365,6 +387,10 @@ pub struct Config {
     pub keyframes: usize,
     /// The LOD bias: output pixels one Voxel may cover (`--bias`).
     pub bias: f64,
+    /// How long the scene thread takes in what the loader made for in a round while the loader's
+    /// workers are as far ahead as they may be, in milliseconds: the client's
+    /// (`scene_worker::BACKED_UP_SLICE`) unless `--stream-slice-ms` said (the real-time mode).
+    pub stream_slice_ms: f64,
     /// The `--diag` switches that were on, as spelled there. Empty for a measurement; a report
     /// that has any is not one, and its budgets are not checked.
     pub diag: Vec<String>,
@@ -566,6 +592,7 @@ mod tests {
                 path: "flyover".into(),
                 keyframes: 3,
                 bias: 1.0,
+                stream_slice_ms: 32.0,
                 diag: Vec::new(),
             },
             modes: modes(0.5),

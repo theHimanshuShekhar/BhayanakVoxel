@@ -43,7 +43,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use brick_store::{BrickCoord, BrickStore, Candidate, LodWork, TableSize, VOXELS_PER_METRE};
-use render::lod::{AHEAD, Bands, Class, LEVELS, brick_distance};
+use render::lod::{AHEAD, Bands, Class, LEVELS, SpeedScale, brick_distance};
 use render::{PatchCopy, RingPatch, RingsFull, Scene, SceneUpdate, UploadCost};
 use sim::SharedStore;
 
@@ -53,6 +53,22 @@ use crate::loader::{Arrival, Loader};
 /// The time this thread spends taking in bricks before it looks at what the frame thread has
 /// asked of it (a new camera, an Edit) and publishes what it has done.
 const SLICE: Duration = Duration::from_millis(2);
+
+/// The time [`Engine::stream`] takes in bricks for while the loader's workers are as far ahead as
+/// they may be ([`Loader::backed_up`]), in place of [`SLICE`]: with the camera followed and the
+/// bands changed first in a round, a 2 ms slice was 7% of a flight's scene thread, which took in
+/// 920 bricks' children a second while the workers spent 85% of their time held back and the
+/// queue held 40 000 (measured on the dev box, #168). 32 ms took in nine times as many, and the
+/// camera was over soft misses on 63 frames of 590 in place of 387. It is cut short by an Edit
+/// (see [`Engine::stream`]), so that it is not a delay on one. `client bench --stream-slice-ms`
+/// measures others.
+pub const BACKED_UP_SLICE: Duration = Duration::from_millis(32);
+
+/// The slice of one [`Engine::stream`]: `SLICE`, or `backed_up` if the loader's workers are as far
+/// ahead as they may be.
+fn stream_slice(backed_up: bool, longer: Duration) -> Duration {
+    if backed_up { longer.max(SLICE) } else { SLICE }
+}
 
 /// How much the scene thread lets wait for the frame thread to upload (#145): it stops following the
 /// camera and taking in what the loader made while what it has published and not had taken, and
@@ -121,6 +137,29 @@ const FOLLOW_SHARE: (u64, u64) = (1, 4);
 /// all that sizes the next one (it was 1 028 Voxels at full size once, the 34 MB operation of the
 /// first 4090 run).
 const FOLLOW_MIN_COST: (f64, f64) = (32.0 * 1024.0, 2.0);
+
+/// Nodes that one look at the nodes a change of the speed scale listed takes
+/// ([`Engine::reband_more`]), and the bricks it changes at the most to begin with, the least and
+/// the most it is sized to after (from the upload budget, as a follow step is).
+/// How long one [`Engine::reband_more`] goes on for at the most: more than a follow step's
+/// [`SLICE`], since the camera is followed first in the round and this is what is left of it.
+const REBAND_SLICE: Duration = Duration::from_millis(5);
+
+/// More nodes than this to look at again for a finer depth (the camera's speed fell) and the scene
+/// is made again at that depth instead ([`Rebuild::Release`], #168): the owner's trigger for it
+/// was a stop that relooks more than about 500 thousand nodes (a flight's release lists 1.2 to
+/// 4.2 million at full size), where the relook takes 40 s and keeps the scene finer than it ends
+/// up for as long.
+const RELEASE_REBUILD_OVER: usize = 500_000;
+
+/// How often the thread looks at the clock while a step of the speed scale waits to be given back
+/// ([`Engine::await_work`]).
+const RELEASE_TICK: Duration = Duration::from_millis(100);
+
+const REBAND_NODES: usize = 2048;
+const REBAND_FIRST: usize = 512;
+const REBAND_LEAST: usize = 32;
+const REBAND_MOST: usize = 16 * 1024;
 
 /// How much a follow step's length changes by after one step, at the most, up and down: a step
 /// that cost half of what it may goes on twice as far, and one that cost over twice goes half.
@@ -218,6 +257,19 @@ const LEAD: [f64; AHEAD] = [1.0, 2.0];
 /// Slower than this, in Voxels a second (1 m/s), the camera is standing and there is no lead.
 const LEAD_FROM_SPEED: f64 = VOXELS_PER_METRE;
 
+/// The speed scale of a camera at rest. A test can measure another curve: `SPEED_DEPTH` is the
+/// depth in levels that the ramp ends at (3 is the curve, 0 is no speed scaling).
+fn speed_scale_at_rest() -> SpeedScale {
+    #[cfg(test)]
+    if let Some(most) = std::env::var("SPEED_DEPTH")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+    {
+        return SpeedScale::at_rest_up_to(most);
+    }
+    SpeedScale::AT_REST
+}
+
 /// `bands` at `step` of [`COARSENING`] (0 is as they are).
 fn coarsened(bands: Bands, step: usize) -> Bands {
     match step.checked_sub(1).and_then(|i| COARSENING.get(i)) {
@@ -241,6 +293,29 @@ fn batch_size(left: Duration, cost: Duration) -> Option<usize> {
     Some(most as usize)
 }
 
+/// How far the camera has to be from the scene, as a fraction of `d0` at the scale of the far
+/// levels ([`Bands::cost_scale`]), for a long slice of taking in to stop for it
+/// ([`Engine::frame_waiting`]).
+const GIVE_WAY_MOVE: f64 = 0.25;
+
+/// The distance, in Voxels, that the camera has to be from the scene for a long slice to give way
+/// (see [`GIVE_WAY_MOVE`]). **Not of the near levels' scaled `d0`**: at three levels that is 32
+/// Voxels, which a camera at 50 m/s is from the scene all the time (the scene is 50 to 68 behind
+/// it: a frame and a round), so every slice gave way after 2 ms, the loader's workers were held
+/// back for 98 of 113 worker-seconds with a queue of 3 000 to 6 000 bricks, and the 2 m flight had
+/// camera misses wherever the queue reached 6 000 (#168, the 4090 on `8f3b259`).
+fn give_way_distance(bands: &Bands) -> f64 {
+    bands.d0() * bands.cost_scale() * GIVE_WAY_MOVE
+}
+
+/// Whether a [`stream`](Engine::stream) that has gone on for `spent` of its `slice` stops for
+/// what the frame thread waits for (an Edit, a camera that has moved): only one that is longer
+/// than [`SLICE`] does, and not before the time of an ordinary slice, which is what it always had.
+/// `frame_waiting` is asked only then.
+fn gives_way(spent: Duration, slice: Duration, frame_waiting: impl FnOnce() -> bool) -> bool {
+    spent >= SLICE && slice > SLICE && frame_waiting()
+}
+
 /// What the loader is doing, as of a [`Ready`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct LoaderStats {
@@ -248,6 +323,11 @@ pub struct LoaderStats {
     pub pending: usize,
     /// Bricks the workers have asked the generator for, since the start.
     pub generated: u64,
+    /// What the workers have done with their time since the start, summed over them, in
+    /// microseconds: generating, and waiting with jobs queued because they were as far ahead as
+    /// they may be (see [`Loader::busy`]).
+    pub generating_us: u64,
+    pub held_back_us: u64,
     /// Jobs the workers have taken that have not been taken in.
     #[cfg(test)]
     pub ahead: usize,
@@ -266,9 +346,12 @@ impl LoaderStats {
     fn of(loader: &Loader) -> Self {
         #[cfg(test)]
         let (queued, cancelled) = loader.queue_sizes();
+        let (generating, held_back) = loader.busy();
         Self {
             pending: loader.pending(),
             generated: loader.generated(),
+            generating_us: (generating * 1e6) as u64,
+            held_back_us: (held_back * 1e6) as u64,
             #[cfg(test)]
             ahead: loader.ahead(),
             #[cfg(test)]
@@ -289,6 +372,13 @@ impl LoaderStats {
 pub struct Stats {
     /// Bricks that wait for the bricks under them to be resident.
     pub waiting: usize,
+    /// Nodes that a change of the bands for the camera's speed has yet to look at again (see
+    /// [`Scene::rebanding`]).
+    pub rebanding: usize,
+    /// Whether the speed scale has a step to give back that it has not yet (see
+    /// [`SpeedScale::releasing`]): the camera has slowed, and the bands will be listed again for
+    /// it when the hold of the release is over. A reband that is on its way.
+    pub speed_releasing: bool,
     /// Bricks drawn at each level (see [`Scene::level_bricks`]).
     pub level_bricks: [usize; LEVELS],
     pub bands: Option<Bands>,
@@ -354,6 +444,12 @@ pub struct Done {
     pub pack_bricks: u64,
     /// Bricks the loader's arrivals held in the store, which the packing is for.
     pub arrived_bricks: u64,
+    /// Times the thread took in what the loader made (a call of [`Engine::stream`]), and in how
+    /// many of them it stopped because its slice was used up, with more to take in, and not
+    /// because the loader had no more, the upload budget was reached, or the loader stopped being
+    /// backed up in the middle of a long slice, which an ordinary one then ends.
+    pub stream_calls: u64,
+    pub stream_slices_used: u64,
     /// Rounds in which eviction was going on, the units it took, and the bricks they held.
     pub evict_steps: u64,
     pub evicted_units: u64,
@@ -364,6 +460,13 @@ pub struct Done {
     pub holes_found: u64,
     /// Rounds in which the thread held work back for the upload budget.
     pub budget_cuts: u64,
+    /// Times the camera's speed moved the bands to another depth (ADR 0009), and the bricks drawn
+    /// that changed in them, which came or went.
+    pub speed_changes: u64,
+    pub speed_bricks: u64,
+    /// Of those changes, the finer ones that made the scene again at the new depth, because
+    /// looking again at their nodes was more than [`RELEASE_REBUILD_OVER`].
+    pub release_rebuilds: u64,
 }
 
 /// The parts of a round that [`Spent`] times.
@@ -381,9 +484,16 @@ enum Part {
     Coarse,
     /// Looking at every split brick for a hole (see [`HOLES_EVERY`]).
     HoleScan,
+    /// Looking again at the nodes that a change of the speed scale listed, and packing what that
+    /// changed (see [`Engine::reband_more`]): charged to no follow step.
+    Reband,
+    /// Making the scene again at the depth that a finer step asked for ([`Engine::rescale`]): the
+    /// listing that was not looked at, and the selection and packing from nothing. The copy that
+    /// is made for the frame thread is [`Part::Publish`].
+    Release,
 }
 
-const PARTS: usize = 6;
+const PARTS: usize = 8;
 
 /// How long the scene thread spent on each part of its rounds since timing was turned on
 /// ([`SceneWorker::time_work`]): the real-time bench's scene-thread time by category (#162).
@@ -395,6 +505,11 @@ pub struct Spent {
     pub evict: Duration,
     pub coarse: Duration,
     pub hole_scan: Duration,
+    pub reband: Duration,
+    /// The scene thread's time making the scene again for a finer depth (the listing that it
+    /// would have looked at, and the selection and packing from nothing), not the copy for the
+    /// frame thread, which is in `publish`.
+    pub release: Duration,
 }
 
 /// The longest round and the longest update of the scene thread over a time (see
@@ -457,6 +572,8 @@ impl Stats {
     fn same_counts(&self, other: &Stats, exactly: bool) -> bool {
         self.waiting == other.waiting
             && self.soft_misses == other.soft_misses
+            && (self.rebanding > 0) == (other.rebanding > 0)
+            && self.speed_releasing == other.speed_releasing
             && self.coarsening == other.coarsening
             && self.throttled == other.throttled
             && self.loader == other.loader
@@ -477,6 +594,8 @@ fn stats_of(scene: &Scene, loader: &Loader, slow: &Arc<Slow>, eviction: Eviction
     }
     Stats {
         waiting: scene.waiting(),
+        rebanding: scene.rebanding(),
+        speed_releasing: false,
         level_bricks,
         bands: scene.bands(),
         coarsening: 0,
@@ -535,16 +654,20 @@ pub enum Cause {
     Arrival,
     /// A step of the memory cap's coarsening, or one taken back.
     Coarsen,
+    /// Nodes looked at again for a change of the bands for the camera's speed (#168): the work of
+    /// [`Engine::reband_more`]. (`Engine::rescale`, which lists them, makes no patch.)
+    Reband,
 }
 
 impl Cause {
-    pub const ALL: [Cause; 6] = [
+    pub const ALL: [Cause; 7] = [
         Cause::Edit,
         Cause::Bands,
         Cause::Coarse,
         Cause::Follow,
         Cause::Arrival,
         Cause::Coarsen,
+        Cause::Reband,
     ];
 }
 
@@ -634,6 +757,9 @@ struct Inbox {
     /// The camera's velocity, in Voxels a second, as the frame thread has seen it move: what the
     /// lead looks ahead along (zero for no lead).
     velocity: [f64; 3],
+    /// The camera's speed as the bands are drawn for it (ADR 0009), in Voxels a second: not the
+    /// lead's, which is none with the lead off and is cut at a jump.
+    speed: f64,
     /// Jobs that the frame thread waits for, with the number each is to be told done by.
     jobs: VecDeque<(u64, Job)>,
     issued: u64,
@@ -710,8 +836,17 @@ struct Shared {
     /// [`SceneWorker::forget_largest`]).
     #[cfg(test)]
     forget_largest: AtomicBool,
+    /// A test turned the speed scale off (see [`SceneWorker::without_speed_scale`]).
+    #[cfg(test)]
+    no_speed_scale: AtomicBool,
     /// The most words a buffer of the scene may have (see [`SceneWorker::set_buffer_limit`]).
     buffer_limit: AtomicUsize,
+    /// [`BACKED_UP_SLICE`], in microseconds, or what the bench was told (see
+    /// [`SceneWorker::set_backed_up_slice`]).
+    backed_up_slice_us: AtomicU64,
+    /// [`RELEASE_REBUILD_OVER`], or what a test or the bench was told (see
+    /// [`SceneWorker::set_release_rebuild_over`]).
+    release_rebuild_over: AtomicUsize,
 }
 
 /// What the frame thread has no more use for, which it hands back for the scene thread to use
@@ -802,6 +937,7 @@ impl SceneWorker {
             inbox: Mutex::new(Inbox {
                 camera,
                 velocity: [0.0; 3],
+                speed: 0.0,
                 jobs: VecDeque::new(),
                 issued: 0,
                 shutdown: false,
@@ -838,7 +974,11 @@ impl SceneWorker {
             budget_writes: AtomicU32::new(UPLOAD_BUDGET.writes),
             #[cfg(test)]
             forget_largest: AtomicBool::new(false),
+            #[cfg(test)]
+            no_speed_scale: AtomicBool::new(false),
             buffer_limit: AtomicUsize::new(usize::MAX),
+            backed_up_slice_us: AtomicU64::new(BACKED_UP_SLICE.as_micros() as u64),
+            release_rebuild_over: AtomicUsize::new(RELEASE_REBUILD_OVER),
         });
         let (garbage, graveyard) = mpsc::channel();
         let user_bands = scene.bands();
@@ -867,6 +1007,7 @@ impl SceneWorker {
             evict_from: 0,
             eviction: EvictionStats::default(),
             user_bands,
+            speed: speed_scale_at_rest(),
             coarsening: 0,
             coarsened_at: clock.now(),
             units_per_node: 0.0,
@@ -883,15 +1024,26 @@ impl SceneWorker {
             work: Done::default(),
             ahead: [None; AHEAD],
             velocity: [0.0; 3],
+            speed_in: 0.0,
+            speed_epoch: clock.now(),
             idle: false,
             throttled: false,
             pending: UploadCost::default(),
             batch_cost: UploadCost::default(),
             follow_step: None,
+            reband_bricks: REBAND_FIRST,
             teleported: false,
             clock,
             #[cfg(test)]
             coarse_sleep: Duration::ZERO,
+            #[cfg(test)]
+            arrival_sleep: Duration::ZERO,
+            #[cfg(test)]
+            job_after: None,
+            #[cfg(test)]
+            camera_after: None,
+            #[cfg(test)]
+            caught_up_after: None,
             #[cfg(test)]
             excess_ops: UploadCost::default(),
             #[cfg(test)]
@@ -919,6 +1071,24 @@ impl SceneWorker {
         self.shared.buffer_limit.store(words, Ordering::Relaxed);
     }
 
+    /// Changes the time that taking in what the loader made goes on for while its workers are as
+    /// far ahead as they may be ([`BACKED_UP_SLICE`]): for the bench to measure what another does.
+    pub fn set_backed_up_slice(&self, slice: Duration) {
+        let micros = u64::try_from(slice.as_micros()).unwrap_or(u64::MAX);
+        self.shared
+            .backed_up_slice_us
+            .store(micros, Ordering::Relaxed);
+    }
+
+    /// Changes how many nodes a finer depth may list before the scene is made again instead
+    /// ([`RELEASE_REBUILD_OVER`]): for a test, whose scenes are small, to see either.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn set_release_rebuild_over(&self, nodes: usize) {
+        self.shared
+            .release_rebuild_over
+            .store(nodes, Ordering::Relaxed);
+    }
+
     /// Changes the upload budget (see [`UPLOAD_BUDGET`]), for a test or the bench to see what a
     /// smaller one does.
     #[cfg_attr(not(test), allow(dead_code))]
@@ -939,6 +1109,26 @@ impl SceneWorker {
         self.shared.forget_largest.store(true, Ordering::Release);
     }
 
+    /// Turns the speed scale of the bands (ADR 0009: the camera's speed makes `d0` coarser from
+    /// 10 m/s) on or off. The tests of what following and the budget do are in worlds that have it
+    /// off, as their flights are at the speeds that it changes; the tests of the scale turn it on.
+    #[cfg(test)]
+    pub fn speed_scale(&self, on: bool) {
+        self.shared.no_speed_scale.store(!on, Ordering::Release);
+    }
+
+    /// Whether the horizon cap of the selection of a stepped thread is off (see
+    /// [`Scene::cap_is_off`]).
+    #[cfg(test)]
+    pub fn selection_cap_is_off(&self) -> bool {
+        let engine = self.stepped.as_ref().expect("only a stepped thread");
+        engine
+            .lock()
+            .expect("the engine is not poisoned")
+            .scene
+            .cap_is_off()
+    }
+
     /// The nodes of the selection of a stepped thread (see [`Scene::nodes`]).
     #[cfg(test)]
     pub fn selection_nodes(&self) -> usize {
@@ -948,6 +1138,13 @@ impl SceneWorker {
             .expect("the engine is not poisoned")
             .scene
             .nodes()
+    }
+
+    /// The speed that a stepped thread has looked at last, for the bands (see [`Engine::rescale`]).
+    #[cfg(test)]
+    pub fn speed_looked_at(&self) -> f64 {
+        let engine = self.stepped.as_ref().expect("only a stepped thread");
+        engine.lock().expect("the engine is not poisoned").speed_in
     }
 
     /// How many waits for the frame thread to take what was published the scene thread began, and
@@ -977,6 +1174,47 @@ impl SceneWorker {
         }
     }
 
+    /// For a test of the slice of the loader's arrivals that a stepped thread takes in: the loader
+    /// says it is backed up, each batch takes `arrival` of the thread's clock, and `job_after`
+    /// batches into a round a job is waiting in the inbox, as one from the frame thread would be.
+    #[cfg(test)]
+    pub fn back_up_arrivals(&self, arrival: Duration, job_after: Option<u32>) {
+        let mut engine = self
+            .stepped
+            .as_ref()
+            .expect("only a stepped thread is backed up")
+            .lock()
+            .expect("the engine is not poisoned");
+        engine.loader.pretend_backed_up(true);
+        engine.arrival_sleep = arrival;
+        engine.job_after = job_after;
+    }
+
+    /// For a test of the slice's count: the loader is no longer backed up `batches` into a round.
+    #[cfg(test)]
+    pub fn catch_up_after(&self, batches: u32) {
+        let mut engine = self
+            .stepped
+            .as_ref()
+            .expect("only a stepped thread is backed up")
+            .lock()
+            .expect("the engine is not poisoned");
+        engine.caught_up_after = Some(batches);
+    }
+
+    /// For a test of the slice's giving way to the camera: `batches` into a round the frame thread's
+    /// camera is at `to`, as a moving camera would be, with no job.
+    #[cfg(test)]
+    pub fn move_camera_after(&self, batches: u32, to: [f64; 3]) {
+        let mut engine = self
+            .stepped
+            .as_ref()
+            .expect("only a stepped thread is backed up")
+            .lock()
+            .expect("the engine is not poisoned");
+        engine.camera_after = Some((batches, to));
+    }
+
     /// Has a stepped thread busy for `time` of its clock from now, as the camera or the arrivals
     /// keep a real one: it does nothing until then, the jobs it has included. A wait for a job with
     /// a timeout that is over before that gives up with the clock moved on to the timeout, and the
@@ -1001,9 +1239,18 @@ impl SceneWorker {
     /// thread is at the camera at this moment, it is told the next time.
     /// A `velocity` for the camera, in Voxels a second, makes the thread look ahead along it for
     /// prefetch (zero for none).
+    #[cfg(test)]
     pub fn follow_moving(&self, camera: [f64; 3], velocity: [f64; 3]) {
+        let speed = velocity.iter().map(|v| v * v).sum::<f64>().sqrt();
+        self.follow_at(camera, velocity, speed);
+    }
+
+    /// [`SceneWorker::follow_moving`] with the `speed` the bands are drawn for given, in Voxels a
+    /// second: the camera's own, which a lead of none (`velocity` zero) or a jump does not cut
+    /// (ADR 0009: a fast Zoom is drawn coarse).
+    pub fn follow_at(&self, camera: [f64; 3], velocity: [f64; 3], speed: f64) {
         if let Ok(mut inbox) = self.shared.inbox.try_lock()
-            && (inbox.camera != camera || inbox.velocity != velocity)
+            && (inbox.camera != camera || inbox.velocity != velocity || inbox.speed != speed)
         {
             let moved = (0..3)
                 .map(|a| (camera[a] - inbox.camera[a]).powi(2))
@@ -1012,6 +1259,7 @@ impl SceneWorker {
             inbox.moved = inbox.moved.max(moved);
             inbox.camera = camera;
             inbox.velocity = velocity;
+            inbox.speed = speed;
             self.shared.wake.notify_one();
         }
     }
@@ -1055,6 +1303,8 @@ impl SceneWorker {
             evict: part(Part::Evict),
             coarse: part(Part::Coarse),
             hole_scan: part(Part::HoleScan),
+            reband: part(Part::Reband),
+            release: part(Part::Release),
         }
     }
 
@@ -1386,8 +1636,11 @@ struct Engine {
     /// Eviction does not begin before the store holds more than this (see [`EVICT_RETRY`]).
     evict_from: usize,
     eviction: EvictionStats,
-    /// The bands the frame thread asked for, which the scene's are [`COARSENING`] of.
+    /// The bands the frame thread asked for, which the scene's are the camera's speed and then
+    /// [`COARSENING`] of (see [`Engine::bands_at`]).
     user_bands: Option<Bands>,
+    /// How many levels coarser than at rest the bands are for the camera's speed (ADR 0009, #168).
+    speed: SpeedScale,
     /// How many steps of [`COARSENING`] the scene's bands are at, and when that last changed.
     coarsening: usize,
     coarsened_at: Instant,
@@ -1421,6 +1674,10 @@ struct Engine {
     /// camera that was looked at last.
     ahead: [Option<[f64; 3]>; AHEAD],
     velocity: [f64; 3],
+    /// The camera's speed for the bands that was looked at last, and the time the speed's release
+    /// hold is told in seconds from.
+    speed_in: f64,
+    speed_epoch: Instant,
     /// The last round did nothing, so a thread waits to be told (see [`Engine::await_work`]).
     idle: bool,
     /// The last round held work back for the upload budget (see [`Engine::over_budget`]), so the
@@ -1435,6 +1692,8 @@ struct Engine {
     /// How long the next step of following the camera is (None before the first), from how the
     /// steps so far cost (see [`Engine::follow`]).
     follow_step: Option<FollowStep>,
+    /// The bricks that the next [`Engine::reband_more`] changes at the most.
+    reband_bricks: usize,
     /// The camera was put somewhere far, further than the scene follows by patching (a
     /// teleport), since the last follow: the scene is made again there, not walked to.
     teleported: bool,
@@ -1442,6 +1701,19 @@ struct Engine {
     clock: Clock,
     #[cfg(test)]
     coarse_sleep: Duration,
+    /// For a test of the slice of `stream`: time that goes by in each batch of arrivals (the clock
+    /// of a stepped thread does not move by itself), and the number of batches after which a job
+    /// from the frame thread is waiting in the inbox, as one that came in meanwhile would be.
+    #[cfg(test)]
+    arrival_sleep: Duration,
+    #[cfg(test)]
+    job_after: Option<u32>,
+    /// Likewise a camera that the frame thread has moved to `.1` by then, with no job.
+    #[cfg(test)]
+    camera_after: Option<(u32, [f64; 3])>,
+    /// Likewise the loader that is no longer backed up.
+    #[cfg(test)]
+    caught_up_after: Option<u32>,
     /// See [`Stats::excess_ops`].
     #[cfg(test)]
     excess_ops: UploadCost,
@@ -1608,14 +1880,20 @@ impl Engine {
             && inbox.jobs.is_empty()
             && [self.camera, self.held_at].contains(&Some(inbox.camera))
             && inbox.velocity == self.velocity
+            && inbox.speed == self.speed_in
         {
             let shared = Arc::clone(&self.shared);
-            let (cameras, paused, moving) =
-                ([self.camera, self.held_at], self.paused, self.velocity);
+            let (cameras, paused, moving, speed) = (
+                [self.camera, self.held_at],
+                self.paused,
+                self.velocity,
+                self.speed_in,
+            );
             let quiet = |inbox: &mut Inbox| {
                 inbox.jobs.is_empty()
                     && cameras.contains(&Some(inbox.camera))
                     && inbox.velocity == moving
+                    && inbox.speed == speed
                     && !inbox.shutdown
                     && shared.paused.load(Ordering::Acquire) == paused
             };
@@ -1629,6 +1907,17 @@ impl Engine {
                 }
             } else {
                 Duration::ZERO
+            };
+            // A step of the speed scale that is to be given back when the camera has been slow for
+            // a time (see [`SpeedScale::observe`]) needs the clock looked at as well.
+            let held = if self.speed.releasing() {
+                if held.is_zero() {
+                    RELEASE_TICK
+                } else {
+                    held.min(RELEASE_TICK)
+                }
+            } else {
+                held
             };
             inbox = if self.published.loader.pending == 0 && !self.over_the_cap {
                 // Nothing is on its way: only the frame thread can give it something to do.
@@ -1698,7 +1987,15 @@ impl Engine {
             self.next_place(camera)
         };
         self.look_ahead(place, velocity);
+        // Read before the speed scale looks at the speed: a Still view holds that too.
         self.paused = self.shared.paused.load(Ordering::Acquire);
+        let rescaled = match self.rescale(camera) {
+            Ok(rescaled) => rescaled,
+            Err(full) => {
+                self.fail(full);
+                return false;
+            }
+        };
         self.scene
             .set_buffer_limit(self.shared.buffer_limit.load(Ordering::Relaxed));
         self.throttled = false;
@@ -1708,7 +2005,7 @@ impl Engine {
             self.largest_batch = UploadCost::default();
             self.largest_follow = UploadCost::default();
         }
-        let mut worked = !jobs.is_empty();
+        let mut worked = rescaled || !jobs.is_empty();
         // A sync is done when the rest of what the thread does in this round is.
         #[cfg_attr(not(test), allow(unused_mut))]
         let mut synced: Option<u64> = None;
@@ -1768,6 +2065,19 @@ impl Engine {
             })
             .and_then(|moved| {
                 worked |= moved;
+                // The nodes that a change of the bands listed are looked at when the view is not
+                // Still, like the scene's move to the camera: a patch of them restarts the Reference
+                // view too. They stay listed (`World::reband_pending` says so) and are looked at in
+                // the rounds after the pause ends.
+                if frozen {
+                    return Ok(false);
+                }
+                let more = self.reband_more();
+                worked |= self.scene.rebanding() > 0;
+                more
+            })
+            .and_then(|more| {
+                worked |= more;
                 let began = self.began();
                 let took = self.stream(camera);
                 self.spend(Part::Pack, began);
@@ -1935,6 +2245,165 @@ impl Engine {
         }
     }
 
+    /// The bands the scene is selected by at `step` of [`COARSENING`]: the frame thread's, drawn
+    /// coarser for the camera's speed ([`SpeedScale`], ADR 0009), and then the farthest of them
+    /// coarser still at the memory cap. The two multiply, so where both apply the coarser wins and
+    /// the bands stay in order (see `render::lod`).
+    fn bands_at(&self, step: usize) -> Bands {
+        let user = self.user_bands.expect("the frame thread asked for bands");
+        coarsened(user.speed_scaled(self.speed.depth()), step)
+    }
+
+    /// Shows the speed of the camera to the bands' scale (ADR 0009, #168): when it takes a step,
+    /// the scene is selected in place for the new `d0` (a coarser one at once, a finer one when
+    /// the speed has fallen), and what that changed is packed and noted like a follow step.
+    fn rescale(&mut self, camera: [f64; 3]) -> Result<bool, RingsFull> {
+        // The speed that was looked at is noted first, whatever follows: a thread that is idle
+        // waits for the inbox's speed to differ from it, so one that is not noted (no bands, or the
+        // scale off) would find it different and not wait.
+        let speed = lock(&self.shared.inbox).speed;
+        self.speed_in = speed;
+        #[cfg(test)]
+        if self.shared.no_speed_scale.load(Ordering::Acquire) {
+            return Ok(false);
+        }
+        if self.user_bands.is_none() {
+            return Ok(false);
+        }
+        // A change of the bands moves what every ring selects, and every patch of it restarts the
+        // Reference view (#217): while the view is Still the speed is not looked at, as the camera
+        // is not followed. A camera that has stopped is waited for to give its depth back before
+        // the hold (see [`Stats::speed_releasing`]); leaving Still looks at it again, and does what
+        // it held.
+        if self.paused {
+            return Ok(false);
+        }
+        let jumping = self.jumping(camera);
+        let changed = if jumping {
+            // A camera that was put somewhere is no flight: the depth is its speed's, at once. A
+            // release that was pending is over, so that it does not come after the scene is made
+            // again there and list the whole of it to look at.
+            self.speed.settle_to(speed)
+        } else {
+            // The hold of a release is from when the speed first fell, by the clock: not from the
+            // time that each look saw, which a busy thread makes too short.
+            let now = self.clock.since(self.speed_epoch).as_secs_f64();
+            // While the camera itself is under the sea's sphere the depth is not given back: a
+            // release makes the scene again at the camera, and one made there has the horizon cap
+            // off, which at rest bands is the wide scene (the planet's shell out to the top level),
+            // 552 to 572 MiB at full size against the 512 MiB of the gate; the hold at the bottom
+            // of a dive made all of it at once. Over the sphere (the camera's own height, not the
+            // cap's hysteresis: a scene made again there has the cap on) the release goes the way it
+            // does anywhere. Nothing needs the clock for this: the camera's height changes only
+            // when the camera moves, which wakes the thread.
+            if self.scene.camera_under_horizon(camera) && self.speed.wants_less(speed) {
+                self.speed.observe_keeping(speed)
+            } else {
+                self.speed.observe(speed, now)
+            }
+        };
+        if !changed {
+            return Ok(false);
+        }
+        if jumping {
+            // The scene is made again for these bands by [`Engine::follow`], at the camera: there
+            // is nothing in this one to list, and the walk over it would be for nothing.
+            self.work.speed_changes += 1;
+            return Ok(true);
+        }
+        // Only the listing is done here: what changes is looked at by [`Engine::reband_more`], a
+        // few at a time and inside the budget, as the follow steps are. (A scene that is made
+        // again at once, for a camera that was put, is selected by these bands, and has nothing
+        // listed.)
+        let bands = self.bands_at(self.coarsening);
+        let began = self.began();
+        let before = self.scene.bands().map_or(0.0, |b| b.scaled_d0());
+        self.scene.reband(bands);
+        self.work.speed_changes += 1;
+        self.reband_bricks = REBAND_FIRST;
+        // A finer depth that lists more than the owner's 500 thousand nodes is not looked at
+        // again: the scene is made again at that depth, which has none of the stale nodes that
+        // the flight's coarser bands left (a stale split stays for the flight, and the nearest-
+        // first relook adds the new near ones before the far ones are merged: the memory peak).
+        // What waits to be looked at is gone with the old selection, so [`World::reband_pending`]
+        // (the stats of this publish, which carries the new scene) is false only once it is
+        // published.
+        //
+        // **Also a scene whose cap is off** (it went off under the sea and comes on only 50 m over
+        // it, `select::CAP_ON`): a release is let through only for a camera over the sea's sphere,
+        // and a reband in place would keep that cap state, so a camera that stops 10 m over would
+        // have the wide scene at rest bands (552 to 572 MiB at full size). A scene made again at
+        // the camera has the cap on there.
+        let over = self.shared.release_rebuild_over.load(Ordering::Relaxed);
+        if bands.scaled_d0() > before && (self.scene.rebanding() > over || self.scene.cap_is_off())
+        {
+            let store = self.store.read().expect("the store's lock is not poisoned");
+            let update = self.scene.rebuild_for(&store, camera, bands);
+            drop(store);
+            self.camera = Some(camera);
+            self.work.release_rebuilds += 1;
+            self.spend(Part::Release, began);
+            self.note(Cause::Reband, update?);
+        }
+        Ok(true)
+    }
+
+    /// Looks at some more of the nodes that the last change of the speed scale listed
+    /// ([`Engine::rescale`]) and packs what changed, as many as fit [`SLICE`] and the upload
+    /// budget: this is its own work, charged to no follow step. Each call is sized from how much
+    /// the last cost against [`Engine::follow_target`], so that a change of millions of bricks is
+    /// a few hundred at a time and the frame thread's uploads stay inside the budget. Whether any
+    /// were looked at.
+    fn reband_more(&mut self) -> Result<bool, RingsFull> {
+        if self.scene.rebanding() == 0 {
+            return Ok(false);
+        }
+        let started = self.clock.now();
+        let began = self.began();
+        let absorbing = self.scene.absorbing();
+        let mut looked = false;
+        while self.scene.rebanding() > 0 {
+            if self.over_budget() {
+                self.throttled = true;
+                break;
+            }
+            let store = self.store.read().expect("the store's lock is not poisoned");
+            let before = self.scene.bricks_changed();
+            let update = self
+                .scene
+                .reband_some(&store, REBAND_NODES, self.reband_bricks)?;
+            drop(store);
+            let changed = self.scene.bricks_changed() - before;
+            self.work.speed_bricks += changed;
+            looked = true;
+            if let Some(SceneUpdate::Rings(patch)) = &update {
+                let cost = patch.cost();
+                let target = self.follow_target();
+                let room = |target: f64, cost: f64| if cost <= 0.0 { 2.0 } else { target / cost };
+                let scale = room(target.bytes as f64, cost.bytes as f64)
+                    .min(room(f64::from(target.writes), f64::from(cost.writes)))
+                    .clamp(0.5, 2.0);
+                self.reband_bricks =
+                    ((self.reband_bricks as f64 * scale) as usize).clamp(REBAND_LEAST, REBAND_MOST);
+                #[cfg(test)]
+                {
+                    self.largest_follow.bytes = self.largest_follow.bytes.max(cost.bytes);
+                    self.largest_follow.writes = self.largest_follow.writes.max(cost.writes);
+                }
+            }
+            self.note(Cause::Reband, update);
+            // A flip of the horizon cap that the follow step of this round is absorbing (#213) has
+            // had its share of the round (a sweep and the nodes it found, in that step's update):
+            // the speed scale's is one step then, not the slice, so that the two do not add up in a
+            // round. The steps go on in the rounds after, and the scene is the same at the end.
+            if absorbing || self.clock.since(started) >= REBAND_SLICE {
+                break;
+            }
+        }
+        self.spend(Part::Reband, began);
+        Ok(looked)
+    }
+
     fn run_job(&mut self, job: Job) -> Result<(), RingsFull> {
         let store = self.store.read().expect("the store's lock is not poisoned");
         let cause = match job {
@@ -1956,7 +2425,7 @@ impl Engine {
             Job::Bands(bands) => {
                 self.user_bands = Some(bands);
                 self.scene
-                    .set_bands(&store, coarsened(bands, self.coarsening))?
+                    .set_bands(&store, self.bands_at(self.coarsening))?
             }
             Job::Look { .. } => unreachable!("not run here"),
             #[cfg(test)]
@@ -2014,6 +2483,25 @@ impl Engine {
         Ok(true)
     }
 
+    /// Whether the scene is to be made again at `camera`, not walked to: it was put (see
+    /// [`Engine::teleported`]) further than [`render::scene::JUMP`] of `d0` from where the scene is,
+    /// which is where `Scene::recentre` makes it again too: one that ended within a jump of the
+    /// scene would be patched in one operation of up to two `d0`, outside the budget, so it is
+    /// walked to.
+    fn jumping(&self, camera: [f64; 3]) -> bool {
+        self.teleported
+            && match (self.scene.camera(), self.scene.bands()) {
+                (Some(from), Some(bands)) => {
+                    (0..3)
+                        .map(|a| (camera[a] - from[a]).powi(2))
+                        .sum::<f64>()
+                        .sqrt()
+                        > render::scene::JUMP * bands.d0()
+                }
+                _ => true,
+            }
+    }
+
     /// Whether [`Engine::follow`] has anything to do for `camera`: the scene is not there, or a
     /// brick that the loader gave up on is to be asked for again.
     fn has_to_follow(&self, camera: [f64; 3]) -> bool {
@@ -2042,19 +2530,9 @@ impl Engine {
             return Ok(false);
         }
         // A teleport is jumped to (the scene is made again) only if the camera is past what
-        // `Scene::recentre` makes again for: one that ended within a jump of the scene would be
-        // patched in one operation of up to two `d0`, outside the budget, so it is walked to.
-        let teleported = std::mem::take(&mut self.teleported)
-            && match (self.scene.camera(), self.scene.bands()) {
-                (Some(from), Some(bands)) => {
-                    (0..3)
-                        .map(|a| (camera[a] - from[a]).powi(2))
-                        .sum::<f64>()
-                        .sqrt()
-                        > render::scene::JUMP * bands.d0()
-                }
-                _ => true,
-            };
+        // `Scene::recentre` makes again for.
+        let teleported = self.jumping(camera);
+        self.teleported = false;
         let started = self.clock.now();
         loop {
             let target = if teleported {
@@ -2068,7 +2546,14 @@ impl Engine {
             let step_began = self.began();
             let capped = self.scene.reach().horizon;
             let busy = self.scene.absorbing();
-            let update = self.scene.recentre(&store, target)?;
+            // A scene made again is made for the bands of the camera's speed now (a release that was
+            // pending when it was put is over, see [`Engine::rescale`]).
+            let update = if teleported && self.user_bands.is_some() {
+                self.scene
+                    .jump_to(&store, target, self.bands_at(self.coarsening))?
+            } else {
+                self.scene.recentre(&store, target)?
+            };
             drop(store);
             if let Some(began) = step_began {
                 let nanos = u64::try_from(self.clock.since(began).as_nanos()).unwrap_or(u64::MAX);
@@ -2146,11 +2631,14 @@ impl Engine {
 
     /// The longest that a step of following the camera is: a step that costs the least that a
     /// Voxel does ([`FOLLOW_MIN_COST`]) at [`Engine::follow_target`], and no more than half a
-    /// jump.
+    /// jump. A speed-scaled scene (ADR 0009) has coarser bands, and a Voxel of the camera's way
+    /// costs less in proportion (fewer, larger bricks change), so the least cost is multiplied by the
+    /// bands' scale (the limit is longer by its inverse); a jump is of the unscaled `d0`, which is what `d0` is here.
     fn follow_limit(&self, d0: f64) -> f64 {
         let target = self.follow_target();
-        (target.bytes as f64 / FOLLOW_MIN_COST.0)
-            .min(f64::from(target.writes) / FOLLOW_MIN_COST.1)
+        let scale = self.scene.bands().map_or(1.0, |bands| bands.cost_scale());
+        (target.bytes as f64 / (FOLLOW_MIN_COST.0 * scale))
+            .min(f64::from(target.writes) / (FOLLOW_MIN_COST.1 * scale))
             .min(render::scene::JUMP * d0 / 2.0)
             .max(1.0)
     }
@@ -2221,6 +2709,13 @@ impl Engine {
         // moves so that following alone comes to the budget every round would be followed and no
         // arrival would ever be taken in, with the bricks that are asked for waiting behind it.
         let mut guaranteed = self.outbox_is_empty();
+        let longer = Duration::from_micros(self.shared.backed_up_slice_us.load(Ordering::Relaxed));
+        let mut slice_used = false;
+        // The slice the call began with: a loader that stops being backed up in the middle of it
+        // makes the slice an ordinary one, which is over though the long one was not used up, and
+        // that is not a slice that was used up.
+        let first = stream_slice(self.loader.backed_up(), longer);
+        self.work.stream_calls += 1;
         loop {
             // What the loader made waits in its queue, in the order it made it, while the frame
             // thread has more to upload than the budget.
@@ -2229,8 +2724,17 @@ impl Engine {
                 self.throttled = true;
                 break;
             }
-            let left = SLICE.saturating_sub(self.clock.since(started));
+            let slice = stream_slice(self.loader.backed_up(), longer);
+            let spent = self.clock.since(started);
+            // A slice that is longer than [`SLICE`] gives way to what the frame thread has asked
+            // of the thread (an Edit, a new camera's jobs): they are done at the start of a round.
+            if gives_way(spent, slice, || self.frame_waiting()) {
+                slice_used = true;
+                break;
+            }
+            let left = slice.saturating_sub(spent);
             let Some(most) = batch_size(left, self.arrival_cost) else {
+                slice_used = slice >= first;
                 break;
             };
             let batch_started = self.clock.now();
@@ -2238,6 +2742,32 @@ impl Engine {
             let arrivals = self.loader.receive(most);
             if arrivals.is_empty() {
                 break;
+            }
+            #[cfg(test)]
+            {
+                self.clock.pause(self.arrival_sleep);
+                if let Some(batches) = &mut self.job_after {
+                    *batches = batches.saturating_sub(1);
+                    if *batches == 0 {
+                        self.job_after = None;
+                        lock(&self.shared.inbox).jobs.push_back((0, Job::Sync));
+                    }
+                }
+                if let Some(batches) = &mut self.caught_up_after {
+                    *batches = batches.saturating_sub(1);
+                    if *batches == 0 {
+                        self.caught_up_after = None;
+                        self.loader.pretend_backed_up(false);
+                    }
+                }
+                if let Some((batches, to)) = &mut self.camera_after {
+                    *batches = batches.saturating_sub(1);
+                    if *batches == 0 {
+                        let to = *to;
+                        self.camera_after = None;
+                        lock(&self.shared.inbox).camera = to;
+                    }
+                }
             }
             {
                 let mut store = self
@@ -2281,6 +2811,7 @@ impl Engine {
             self.note(Cause::Arrival, update);
             worst = worst.max(self.clock.since(batch_started) / resident.len() as u32);
         }
+        self.work.stream_slices_used += u64::from(slice_used);
         // What the next slice expects one to cost: a running mean of the worst batch of each
         // slice, and never more than [`MOST_ARRIVAL_COST`].
         if !worst.is_zero() {
@@ -2288,6 +2819,25 @@ impl Engine {
                 (self.arrival_cost.mul_f64(0.8) + worst.mul_f64(0.2)).min(MOST_ARRIVAL_COST);
         }
         Ok(took)
+    }
+
+    /// Whether the frame thread is waiting for the thread's next round: it has given it a job, or
+    /// its camera is more than [`give_way_distance`] from where the scene is. A
+    /// long slice that is taking in arrivals delays the round's following the camera, and the lag
+    /// rose with the slice (1.03, 1.16, 1.28, 1.31 `d0` at 2, 16, 32, 64 ms).
+    fn frame_waiting(&self) -> bool {
+        let inbox = lock(&self.shared.inbox);
+        if !inbox.jobs.is_empty() {
+            return true;
+        }
+        let (Some(at), Some(bands)) = (self.camera, self.scene.bands()) else {
+            return false;
+        };
+        let moved = (0..3)
+            .map(|a| (inbox.camera[a] - at[a]).powi(2))
+            .sum::<f64>()
+            .sqrt();
+        moved > give_way_distance(&bands)
     }
 
     /// Takes the children of bricks out of the store while it holds more than its budget. Whether it
@@ -2381,7 +2931,10 @@ impl Engine {
     /// At the memory cap, takes the next step of [`COARSENING`] once the last has stood for
     /// [`COARSEN_HOLD`], and has eviction look again.
     fn coarsen_more(&mut self) {
-        if !self.over_the_cap || self.clock.since(self.coarsened_at) < COARSEN_HOLD {
+        if !self.over_the_cap
+            || self.scene.rebanding() > 0
+            || self.clock.since(self.coarsened_at) < COARSEN_HOLD
+        {
             return;
         }
         // What the store holds for each node, while all it holds is wanted: taken before the
@@ -2407,14 +2960,11 @@ impl Engine {
     /// [`COARSEN_HOLD`]: the scene is selected and packed again, and the units that the coarser
     /// bands do not want are for eviction to take. Whether it did.
     fn coarsen(&mut self, step: usize) -> bool {
-        let Some(bands) = self.user_bands else {
-            return false;
-        };
-        if self.clock.since(self.coarsened_at) < COARSEN_HOLD {
+        if self.user_bands.is_none() || self.clock.since(self.coarsened_at) < COARSEN_HOLD {
             return false;
         }
         let store = self.store.read().expect("the store's lock is not poisoned");
-        let update = self.scene.set_bands(&store, coarsened(bands, step));
+        let update = self.scene.set_bands(&store, self.bands_at(step));
         drop(store);
         match update {
             Ok(update) => {
@@ -2443,6 +2993,7 @@ impl Engine {
             return;
         };
         if self.coarsening == 0
+            || self.scene.rebanding() > 0
             || self.loader.pending() != 0
             || self.evicting.is_some()
             || self.clock.since(self.coarsened_at) < COARSEN_HOLD
@@ -2461,8 +3012,8 @@ impl Engine {
             }
             self.barred = None;
         }
-        let before = coarsened(bands, self.coarsening - 1).weight();
-        let now = coarsened(bands, self.coarsening).weight();
+        let before = self.bands_at(self.coarsening - 1).weight();
+        let now = self.bands_at(self.coarsening).weight();
         let would_want = self.scene.nodes() as f64 * before / now * self.units_per_node;
         let fits = {
             let store = self.store.read().expect("the store's lock is not poisoned");
@@ -2648,6 +3199,14 @@ impl Engine {
         if !self.shared.count_holes.load(Ordering::Relaxed) || !due {
             return;
         }
+        // A look that is only due is for a moment when the scene thread has the time: it holds the
+        // store's read lock and does not follow the camera for the 90 ms it takes on the 4090, and
+        // a flight at 2 m had 17 to 30 frames of camera misses in the second after it (#168). It
+        // is made when the camera has slowed (the depth is given back), and one that a path asks
+        // for (`forced`) is made at once, so every path still has its look at its end.
+        if !forced && self.speed.depth() > 0.0 {
+            return;
+        }
         let began = self.began();
         self.shared.looking.store(true, Ordering::Relaxed);
         let store = self.store.read().expect("the store's lock is not poisoned");
@@ -2695,6 +3254,7 @@ impl Engine {
         }
         let mut stats = stats_of(&self.scene, &self.loader, &self.slow, self.eviction);
         stats.coarsening = self.coarsening;
+        stats.speed_releasing = self.speed.releasing();
         stats.work = self.work;
         stats.throttled = self.throttled;
         #[cfg(test)]
@@ -2837,6 +3397,41 @@ mod tests {
         assert_eq!((share as f64 / FOLLOW_MIN_COST.0) as u64, 64);
         let writes = u64::from(UPLOAD_BUDGET.writes) * FOLLOW_SHARE.0 / FOLLOW_SHARE.1;
         assert_eq!((writes as f64 / FOLLOW_MIN_COST.1) as u64, 256);
+    }
+
+    #[test]
+    fn the_longer_slice_is_for_a_loader_that_is_backed_up_and_never_less_than_the_ordinary_one() {
+        let longer = Duration::from_millis(32);
+        assert_eq!(stream_slice(false, longer), SLICE);
+        assert_eq!(stream_slice(true, longer), longer);
+        // Whatever the bench asks for, a backed-up loader's slice is at least the ordinary.
+        assert_eq!(stream_slice(true, Duration::from_millis(1)), SLICE);
+        assert_eq!(stream_slice(false, Duration::from_millis(1)), SLICE);
+        assert_eq!(BACKED_UP_SLICE, Duration::from_millis(32));
+    }
+
+    #[test]
+    fn a_long_slice_gives_way_to_a_camera_by_the_far_levels_scale_not_the_near_levels() {
+        let rest = Bands::with_d0(1000.0);
+        assert_eq!(give_way_distance(&rest), 250.0);
+        // At 1.5 levels, the first curve's depth, and at 3 levels: the same distance.
+        let half = give_way_distance(&rest.speed_scaled(1.5));
+        let deep = give_way_distance(&rest.speed_scaled(3.0));
+        assert_eq!(half, deep);
+        assert!((deep - 250.0 * 2f64.powf(-1.5)).abs() < 1e-9, "{deep}");
+        // Well over what a camera at 50 m/s is from the scene (50 to 68 Voxels of 1028).
+        let d0 = Bands::standard(1.0).d0();
+        assert!(give_way_distance(&Bands::standard(1.0).speed_scaled(3.0)) > 80.0 * d0 / 1028.0);
+    }
+
+    #[test]
+    fn a_longer_slice_gives_way_to_a_job_after_an_ordinary_slice_and_an_ordinary_one_never_asks() {
+        let ms = Duration::from_millis;
+        let never = || panic!("asked");
+        assert!(!gives_way(ms(50), SLICE, never));
+        assert!(!gives_way(ms(1), ms(32), never));
+        assert!(gives_way(ms(2), ms(32), || true));
+        assert!(!gives_way(ms(31), ms(32), || false));
     }
 
     #[test]

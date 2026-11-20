@@ -328,6 +328,10 @@ pub enum Rebuild {
     Bands,
     /// The camera jumped further than the rings follow: expected.
     Jump,
+    /// The camera's speed gave a depth back and the nodes that would be looked at again were more
+    /// than a rebuild costs (ADR 0009, #168): the scene is made again at the new depth, which
+    /// drops what the finer step would have kept as stale. Expected.
+    Release,
 }
 
 /// A [`RingPatch`] in the making.
@@ -900,7 +904,26 @@ impl Scene {
             bound: self.bound,
             shown_coarsest: rings.selection.coarsest(),
             shown_rebuilt: rings.rebuilt,
+            shown_filled: Some(self.filled_words()),
             ..Scene::default()
+        }
+    }
+
+    /// How many words of `brick_refs` and `bricks` can hold anything: the buffers of rings are
+    /// made roomy, and the words after what the pools have in use are zero, which the GPU makes
+    /// itself (a rebuild writes only the words before). All of them for a scene that is not rings
+    /// and has no copy's count.
+    pub fn filled_words(&self) -> (usize, usize) {
+        match (&self.rings, self.shown_filled) {
+            (Some(rings), _) => (
+                rings.refs.used_end(self.brick_refs.len()),
+                rings.data.used_end(self.bricks.len()),
+            ),
+            (None, Some((refs, words))) => (
+                refs.min(self.brick_refs.len()),
+                words.min(self.bricks.len()),
+            ),
+            (None, None) => (self.brick_refs.len(), self.bricks.len()),
         }
     }
 
@@ -982,6 +1005,11 @@ impl Scene {
                 at += range.len();
             }
         }
+        if let Some((refs, words)) = &mut self.shown_filled {
+            let end = |ranges: &[Range<usize>]| ranges.iter().map(|r| r.end).max().unwrap_or(0);
+            *refs = (*refs).max(end(&patch.brick_refs));
+            *words = (*words).max(end(&patch.bricks));
+        }
         self.levels.clone_from(&copy.levels);
         self.bound = copy.bound;
         self.shown_coarsest = copy.coarsest;
@@ -1023,6 +1051,54 @@ impl Scene {
         }
         let camera = rings.selection.camera();
         self.rebuilt_at(store, camera, bands, Rebuild::Bands)
+            .map(Some)
+    }
+
+    /// Draws by other `bands`, patching what changes level instead of making the scene again (see
+    /// [`Selection::set_bands`]): what the camera's speed asks of the bands (ADR 0009, #168), which
+    /// changes a few times in a flight. Nothing is drawn differently until [`Scene::reband_some`]
+    /// has looked at the nodes. A scene that is not rings has no bands, and changes nothing.
+    pub fn reband(&mut self, bands: Bands) {
+        if let Some(rings) = &mut self.rings {
+            rings.selection.set_bands(bands);
+        }
+    }
+
+    /// Looks again at some of the nodes that [`Scene::reband`] listed (see
+    /// [`Selection::relook_some`]), up to `nodes` of them and about `bricks` changed, and packs what
+    /// changed. Returns what changed, as [`Scene::recentre`] does. Its own call, with its own
+    /// size: it is not a step of following the camera.
+    pub fn reband_some(
+        &mut self,
+        store: &BrickStore,
+        nodes: usize,
+        bricks: usize,
+    ) -> Result<Option<SceneUpdate>, RingsFull> {
+        let Some(rings) = &mut self.rings else {
+            return Ok(None);
+        };
+        let diff = rings.selection.relook_some(store, nodes, bricks);
+        self.show_diff(store, &diff)
+    }
+
+    /// How many nodes [`Scene::reband_some`] has yet to look at.
+    pub fn rebanding(&self) -> usize {
+        self.rings.as_ref().map_or(0, |r| r.selection.relooking())
+    }
+
+    /// Makes the scene again for `bands` at `camera`, in place, from nothing: what a change of the
+    /// speed's depth does when looking again at its nodes would cost more ([`Rebuild::Release`],
+    /// ADR 0009). Reported as [`SceneUpdate::Rebuilt`].
+    pub fn rebuild_for(
+        &mut self,
+        store: &BrickStore,
+        camera: [f64; 3],
+        bands: Bands,
+    ) -> Result<Option<SceneUpdate>, RingsFull> {
+        if self.rings.is_none() {
+            return Ok(None);
+        }
+        self.rebuilt_at(store, camera, bands, Rebuild::Release)
             .map(Some)
     }
 
@@ -1175,6 +1251,23 @@ impl Scene {
         self.show_diff(store, &diff)
     }
 
+    /// The scene made again at `camera`, in place, with `bands`: what a camera that was put far
+    /// from the scene asks for ([`Scene::recentre`] does it past a jump), with the bands that the
+    /// camera's speed asks for where it is now, so that the nodes of the scene that is gone are
+    /// not looked at for the bands it had. Reported as [`SceneUpdate::Rebuilt`].
+    pub fn jump_to(
+        &mut self,
+        store: &BrickStore,
+        camera: [f64; 3],
+        bands: Bands,
+    ) -> Result<Option<SceneUpdate>, RingsFull> {
+        if self.rings.is_none() {
+            return Ok(None);
+        }
+        self.rebuilt_at(store, camera, bands, Rebuild::Jump)
+            .map(Some)
+    }
+
     /// Packs again the regions that `diff` (what the selection changed) touches. Returns what
     /// changed, or `None` if nothing did; the buffer that is full grows if the regions do not fit.
     fn show_diff(
@@ -1227,9 +1320,13 @@ impl Scene {
         }
     }
 
-    /// How many bricks wait for the bricks under them to be resident.
+    /// How many bricks wait for the bricks under them to be resident, and how many nodes wait to be
+    /// looked at again for new bands ([`Scene::reband`]): what the scene is yet to do before it
+    /// draws what its bands ask for.
     pub fn waiting(&self) -> usize {
-        self.rings.as_ref().map_or(0, |r| r.selection.waiting())
+        self.rings
+            .as_ref()
+            .map_or(0, |r| r.selection.waiting() + r.selection.relooking())
     }
 
     /// Whether the selection has a brick to look at again that no camera move will bring (see
@@ -1296,6 +1393,24 @@ impl Scene {
         self.rings
             .as_ref()
             .map_or(Reach::NONE, |r| r.selection.reach())
+    }
+
+    /// Whether the horizon cap was asked for and the selection has it off: it goes off when the
+    /// raised camera is under the sea's sphere and stays off until the camera is 50 m over it
+    /// (`select::CAP_ON`), so a scene that was under the sea can be off with the camera over.
+    pub fn cap_is_off(&self) -> bool {
+        self.rings.as_ref().is_some_and(|r| {
+            r.selection.horizon().is_some() && r.selection.reach().horizon.is_none()
+        })
+    }
+
+    /// Whether the horizon cap was asked for and the raised camera at `camera` is under the sea's
+    /// sphere (see [`Selection::camera_under_horizon`]): a scene made again there has the cap off,
+    /// which is the wide scene at rest bands (ADR 0004, #213); over the sphere it has it on.
+    pub fn camera_under_horizon(&self, camera: [f64; 3]) -> bool {
+        self.rings
+            .as_ref()
+            .is_some_and(|r| r.selection.camera_under_horizon(camera))
     }
 
     /// Culls by the Planet's horizon (see [`crate::lod::Horizon`], [`Selection::set_horizon`]): what
@@ -2173,6 +2288,23 @@ mod tests {
 
     fn rings_at(camera: [f64; 3]) -> Scene {
         Scene::rings(ground(), camera, bands(), bound()).unwrap()
+    }
+
+    #[test]
+    fn a_copys_filled_words_are_the_pools_and_a_paste_past_them_moves_them() {
+        let scene = rings_at(ABOVE);
+        let (refs, words) = scene.filled_words();
+        assert!(refs < scene.brick_refs.len() || words < scene.bricks.len());
+        let mut copy = scene.mirror();
+        assert_eq!(copy.filled_words(), (refs, words));
+        // Past what was in use: the tail of the buffer is words that a patch wrote since.
+        let at = words + 10;
+        let mut patch = PatchCopy::default();
+        patch.patch.bricks.push(at..at + 3);
+        patch.bricks = vec![7, 8, 9];
+        copy.paste(&patch);
+        assert_eq!(copy.filled_words(), (refs, at + 3));
+        assert_eq!(&copy.bricks[at..at + 3], &[7, 8, 9]);
     }
 
     #[test]

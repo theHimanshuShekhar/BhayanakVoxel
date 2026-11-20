@@ -177,6 +177,10 @@ impl GrowthWatch {
                 "rebuilt after jump",
                 "after the camera jumped further than the rings follow, as expected",
             ),
+            Some(Rebuild::Release) => (
+                "rebuilt at the end of a flight",
+                "when the camera's speed gave a depth back, as expected",
+            ),
             None => ("rebuilt", "for a reason that is not known"),
         };
         self.say(kind, now, |held| {

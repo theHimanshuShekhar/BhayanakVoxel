@@ -42,6 +42,11 @@ Options:
   --flat-ambient   With --real-time, draw Primary with the flat ambient of before #54 and not the
                    radiance cache's GI: a baseline on the same build, to read GI's cost against
                    (the report's planet says `flat ambient`; the gates are held as ever)
+  --stream-slice-ms N
+                   With --real-time, how long the scene thread takes in what the loader made
+                   for, in a round, while the loader's workers are as far ahead as they may be
+                   [default: 32]. For finding what a slice does to the flights' soft misses, the
+                   settle and the frame times; the report's config says what it was
   --no-convergence Leave out the convergence phase (ADR 0005), which otherwise runs last of the
                    timed phases: the Reference view on two still views (the reference golden's,
                    and a pit lit by bounce light) at the output resolution, scored with FLIP and
@@ -102,6 +107,9 @@ pub struct Args {
     /// `--flat-ambient`: the real-time mode draws Primary with the flat ambient of before #54, as a
     /// baseline on the same build to read GI's cost against.
     pub flat_ambient: bool,
+    /// `--stream-slice-ms`: the scene thread's slice for taking in while the loader is backed up,
+    /// if it was said (see [`crate::scene_worker::BACKED_UP_SLICE`]).
+    pub stream_slice_ms: Option<u32>,
     pub no_fail: bool,
     /// The convergence phase (#187), which runs unless `--no-convergence`, and its truths' samples
     /// if `--truth-spp` said.
@@ -137,6 +145,7 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Parsed, String> {
         real_time: false,
         runs: DEFAULT_RUNS,
         flat_ambient: false,
+        stream_slice_ms: None,
         no_fail: false,
         convergence: true,
         truth_spp: None,
@@ -160,6 +169,9 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Parsed, String> {
                 runs_given = true;
             }
             "--flat-ambient" => parsed.flat_ambient = true,
+            "--stream-slice-ms" => {
+                parsed.stream_slice_ms = Some(stream_slice_ms(&value("--stream-slice-ms")?)?);
+            }
             "--no-fail" => parsed.no_fail = true,
             "--no-convergence" => parsed.convergence = false,
             "--flip-gamma-2-2" => parsed.flip_gamma22 = true,
@@ -181,6 +193,9 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Parsed, String> {
     }
     if parsed.flat_ambient && !parsed.real_time {
         return Err("--flat-ambient is for --real-time".into());
+    }
+    if parsed.stream_slice_ms.is_some() && !parsed.real_time {
+        return Err("--stream-slice-ms is for --real-time".into());
     }
     if parsed.truth_spp.is_some() && !parsed.convergence {
         return Err(
@@ -219,6 +234,15 @@ fn runs(text: &str) -> Result<u32, String> {
         .ok()
         .filter(|&n| n > 0)
         .ok_or_else(|| format!("`{text}` is not a number of runs like 3"))
+}
+
+/// `--stream-slice-ms`: from 1 ms (under the 2 ms of an ordinary slice it would be no slice) to a
+/// second.
+fn stream_slice_ms(text: &str) -> Result<u32, String> {
+    text.parse::<u32>()
+        .ok()
+        .filter(|ms| (1..=1000).contains(ms))
+        .ok_or_else(|| format!("`{text}` is not a slice in milliseconds like 32 (1 to 1000)"))
 }
 
 /// `--truth-spp`: at least the last checkpoint, or the truth would be rougher than what it judges.
@@ -309,6 +333,7 @@ mod tests {
                 real_time: false,
                 runs: 3,
                 flat_ambient: false,
+                stream_slice_ms: None,
                 no_fail: false,
                 convergence: true,
                 truth_spp: None,
@@ -338,6 +363,22 @@ mod tests {
             &["--streaming", "--flat-ambient"],
             // The diagnostic switches say the budgets are not checked, which the gates always are.
             &["--streaming", "--real-time", "--diag", "no-flush"],
+        ] {
+            assert!(parse_all(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn the_stream_slice_is_read_for_the_real_time_mode_and_bounded() {
+        assert_eq!(run(&["--streaming", "--real-time"]).stream_slice_ms, None);
+        let args = run(&["--streaming", "--real-time", "--stream-slice-ms", "64"]);
+        assert_eq!(args.stream_slice_ms, Some(64));
+        for bad in [
+            &["--streaming", "--stream-slice-ms", "64"][..],
+            &["--streaming", "--real-time", "--stream-slice-ms"],
+            &["--streaming", "--real-time", "--stream-slice-ms", "0"],
+            &["--streaming", "--real-time", "--stream-slice-ms", "1001"],
+            &["--streaming", "--real-time", "--stream-slice-ms", "fast"],
         ] {
             assert!(parse_all(bad).is_err(), "{bad:?}");
         }

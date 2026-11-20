@@ -22,9 +22,9 @@ dev's RTX 4090.
   changes one says so and why.
 - **Streaming gates** (decided 2026-11-10): on the full-size Planet the bench also gates frame
   time p99 (16.7 ms), frame-thread CPU p99 (8 ms), holes (none) and memory (#162, "The real-time
-  mode" below); soft misses at the speed-scaled level (none, ADR 0009), time to control and
-  settle time are reported by that run and become gates in #168 (Edit latency is reported by it
-  too, ADR 0006's bound). The part of this that CI can do,
+  mode" below); soft misses at the speed-scaled level (none on the flights, ADR 0009), time to
+  control (the 20 m ring) and settle time are gated by that run since #168, the settle limit
+  **proposed** and not yet agreed (Edit latency is reported by it too, ADR 0006's bound). The part of this that CI can do,
   with counts and no times, is the stepped streaming mode of #181 (`--streaming`, below); the
   full-size run in real time is `--streaming --real-time`, on the 4090.
 - **`needs-stream-bench`** goes on a CPU-only PR that touches **the loader, prefetch, eviction or
@@ -60,6 +60,7 @@ release: a debug build's CPU side is slow enough to distort the frame times.
 | `--short` | A tiny run (160x90, a handful of frames, a patch of the Planet): the CI smoke test. |
 | `--streaming` | Also runs the streaming mode (below): the test Planet streamed in, stepped, on a fixed frame schedule, with counts that are the same on every run. The report's `streaming` is null without it. |
 | `--real-time` | With `--streaming`, also runs the real-time mode (below): the full-size Planet with the real loader workers and scene thread, on the machine's clock, along paths of 50 m/s flights, a take-off, a turn, a stop and a cold start. It takes tens of minutes and is not deterministic. With `--short` it runs on the test Planet, as a smoke test. The report's `streaming_real_time` is null without it. |
+| `--stream-slice-ms N` | With `--real-time`, how long the scene thread takes in what the loader made for in a round while the loader's workers are as far ahead as they may be (`scene_worker::BACKED_UP_SLICE`, default 32). For measuring what another slice does to the flights' camera soft misses, the settle and the frame times (#168); the report's `config.stream_slice_ms` says what it was. |
 | `--runs N` | With `--real-time`, how many times to run the paths in this process. Default 3. The report keeps each run and the least and the most of every number over them; the gates use the worst. |
 | `--flat-ambient` | With `--real-time`, runs it with the flat ambient light (the goldens' and tests' lighting, no radiance-cache GI) instead of the game's GI, to tell what the GI costs in the real-time frame: the same run, the same paths. The planet's label in the report says ", flat ambient". An error without `--real-time`. |
 | `--flip-gamma-2-2` | Also score each checkpoint with the old gamma-2.2 curve (#188), from the same samples, to tell the sRGB move from the estimator's effect. Not with `--no-convergence` or `--short`. |
@@ -163,7 +164,7 @@ except `timing`.
   constants). It is the one number to compare: `bins/client/src/bench/streaming-counts.golden` has the committed value, a unit
   test (`the_counts_are_the_committed_ones`, which runs on Linux and on Windows, since it needs no
   GPU) and `tests/bench.rs` check it. When a change to the streaming code moves the counts on
-  purpose, the test prints the new hash; put it in the file and say why in the PR. It is `2466f0700e79713a` since #167 (18 levels and the test Planet's Guard from level 10: the pyramid is deeper, so the rings and the soft-miss levels are 18, not 14; `38b58d66b96791af` from #146 before it): the stepped scene has the horizon cap, so the drawn bricks of the Guard's levels went from 9 536 to 8 482, the rings' and a follow step's counts and the upload (64.30 to 64.80 MB, 6 439 to 6 986 copies) moved with them; what is streamed, arrived and evicted did not (`docs/measurements.md`).
+  purpose, the test prints the new hash; put it in the file and say why in the PR. It is `2466f0700e79713a` since #167 (18 levels and the test Planet's Guard from level 10: the pyramid is deeper, so the rings and the soft-miss levels are 18, not 14; `38b58d66b96791af` from #146 before it): the stepped scene has the horizon cap, so the drawn bricks of the Guard's levels went from 9 536 to 8 482, the rings' and a follow step's counts and the upload (64.30 to 64.80 MB, 6 439 to 6 986 copies) moved with them; what is streamed, arrived and evicted did not (`docs/measurements.md`). **The committed hash is the stepped run with the speed scale on** (#168), which is not that one: `26a1ce75…` at the first push of #168, `bd99020be09af4ba` at `99b08c4` (the scene thread takes in for longer while the loader is backed up and a margin node is not parked by a coarser change), `485be9b0eb879d35` once a coarser change parks only the nodes on the hot list (`docs/measurements.md`). The run with the scale **off** is still `2466f0700e79713a` (`with_the_speed_scale_off_the_counts_are_those_the_run_had_before_it`).
 - `upload`: bytes written to the GPU per frame (`bytes`: `total`, `max`, frames and frames with
   any) and the belt copies per frame (`writes`, the same, each a copy with a barrier of
   its own: neighbouring ranges of a patch are joined into one when they are within `COPY_GAP`
@@ -337,9 +338,11 @@ gate sees its frames): 5 s of the flight of `stop after a flight`, then the came
 policy for a Reference view, which is **catch up first, then hold** (`World::hold_still`, the call the
 client makes): once the camera has stood for 2 frames the scene thread goes on loading and following the
 camera, with Primary drawn, until the scene has reached the camera (`World::caught_up`: its lag under 1
-Voxel, and, after #168, no reband pending) or `CATCH_UP_CAP` (5 s) has gone by. Then loading is paused and
-the scene thread is told; **it holds back moving the scene to the camera and the steps of coarsening**
-(#217, ADR 0005, "Still frames") and takes in no arrivals. The camera stands for 3 s (1 s with `--short`)
+Voxel, and no reband pending, #168: the nodes that a change of the bands listed are looked at, and the
+speed scale has no step still to give back, `World::reband_pending`) or `CATCH_UP_CAP` (12 s, 5 s until 2026-11-17) has gone by. Then loading is paused and
+the scene thread is told; **it holds back moving the scene to the camera, the steps of coarsening and, since #168, the
+reband** (the speed scale is not looked at and what a change of the bands listed is not looked at;
+leaving Still does both) (#217, ADR 0005, "Still frames") and takes in no arrivals. The camera stands for 3 s (1 s with `--short`)
 from then. What the frame thread takes in meanwhile is the cuts of the Reference view, counted by cause
 (`cuts`, as `still_cuts` below, under the paths) over the held frames. **The acceptance of #217 is at most 1 cut here from
 scene patches** (the Planet has no Edit in this run). Then the view changes (loading goes on) and
@@ -354,13 +357,18 @@ camera, and `holes_after_catch_up` the holes the look after it found, which must
   (`load`: the spawn ring, the Guard, the first scene), **`time_to_level_0_under_camera_s`** (from
   the start of the load to the first frame in which one ray from the camera straight down hits the
   ground at level 0) and `fill_s` (from the start of the load to the resident set being complete).
-  Not gated. **This is not the spec's "time to control"** (the 20 m ring round the Spawn at full
-  detail, with the character standing in it: the bench has no server, so the character is not in
-  it). The field is named for the ray that it uses: the spawn ring is made inside `load`, so the
-  ring of 20 m is there before the first frame and the spec's condition would read the load time
-  too; the time that streaming adds to it is `fill_s` minus this. The ray is cheap, and a ring of
-  rays at 20 m could not be tried at full size without the 4090.
-- `frame_parts` and `gpu_passes` (#54; in each path, schema 28 unchanged), to find where a frame's
+  `time_to_level_0_under_camera_s` is not gated, and **is not the spec's "time to control"**: the
+  field is named for the ray that it uses, and the window waits for the Guard too, so it reads the
+  load time. **`spawn_ring_s`, `guard_s` and `time_to_control_s`** (#168) are the parts of the load,
+  from `crate::load`: the 20 m spawn ring (`SPAWN_REACH`), which is the player's control (ADR
+  0009: the character stands in it, and the bench has no server), the Guard after it, and the real
+  time from the world map being ready to the window opening (the ring, the Guard and the first
+  scene: the window waits for the Guard so that nothing past the ring is sky). **Two gates**, each
+  the worst over the runs: `spawn_ring_s` (2 s) on the ring, and `time_to_control_s` on the real
+  time, held at what it measures now plus a margin (10 s; 4.3 s on the 4090, 7 s on the loaded dev
+  box). **"Control in 2 s with nothing beyond the ring sky" is not met**: it is #220, a
+  background Guard.
+- `frame_parts` and `gpu_passes` (#54, schema 28; in each path), to find where a frame's
   time goes: `frame_parts` is `{recentre, update, encode, submit, wait, gpu_total, wait_not_passes}`,
   each a `Spread` (`samples, mean_ms, p99_ms, worst_ms`) of the frame thread's parts of one frame
   (`wait` is the wait for the GPU after submitting; `gpu_total` the GPU's own time of the passes;
@@ -369,7 +377,7 @@ camera, and `holes_after_catch_up` the holes the look after it found, which must
   from the name of each timed pass (`primary`, `normals`, `shadows`, `gi`, `shade`, `atmosphere`,
   `bloom_*`, `exposure*`, `tone`, `upscale`) to the `Spread` of its GPU time, so a pass that costs
   more in the game than in the GPU bench is visible. The summary prints both per path.
-- `unpaced_control` (#54; a run's, a path's form, not gated and not in `paths`): 180 frames with the
+- `unpaced_control` (#54, schema 28; a run's, a path's form, not gated and not in `paths`): 180 frames with the
   camera standing at the Spawn **and no pacing sleep**, each frame following the one before as the
   GPU bench's do. Set its `frame_time` and `gpu_passes` beside a paced path's: a frame that is much
   longer paced than unpaced is the GPU idling between frames (clocks dropping, the driver), which no
@@ -380,7 +388,7 @@ camera, and `holes_after_catch_up` the holes the look after it found, which must
     the camera when the view went Still (what a hold at once would have held it at), `lag_when_held_voxels`
     how far when the hold began (under 1 unless the cap ended the wait), `waited_s` from the view going
     Still to the hold beginning (how much later the Reference view started), and **`hit_cap`**, true if the
-    wait ran to the cap and the Reference view started on a scene still behind the camera. Expected false.
+    wait ran to the cap and the Reference view started on a scene still behind the camera. Expected false. After #168 the wait also covers a reband (the depth of a flight is given back half a second after the stop, and what it lists is looked at: 50 s or more at full size on the dev box), and a release over `RELEASE_REBUILD_OVER` nodes is a rebuild of 8.5 to 9.0 s of the scene thread's time in the stop path and 10.0 to 10.4 s in this one on the 4090 (24 to 37 s on the dev box). **The cap is 12 s since 2026-11-17 (owner), so `hit_cap` is expected false on the 4090** (`a7c6b72`: the wait ended 10.87 to 11.24 s after the view went Still in 5 of 6 runs, and ran to the cap in 1; the figure of 9.3 to 9.7 s that the cap was set from was the stop path's `reband_s`, counted from the start of that path) **and true on the dev box**; `hit_cap` and `lag_when_held_voxels` say what the cap held.
   - `hold_s`: how long the camera stood after the hold began.
   - `cuts`: `still_frames`, `cuts` and `by_cause`, as `still_cuts` under the paths, over the held frames
     only. **At most 1 is the acceptance of #217.**
@@ -533,15 +541,76 @@ camera, and `holes_after_catch_up` the holes the look after it found, which must
     the same per frame). Nothing here is gated.
   - `soft_misses` (a `Series` of what each frame reported: frames, total, max, frames with any) and
     `soft_misses_per_frame`. The scene thread counts them a few times a second, so a frame
-    reports the last count, and the count stays within about 100 ms of the truth. Not gated yet
-    (#168).
+    reports the last count, and the count stays within about 100 ms of the truth. The scene thread's own soft misses are **reported and not gated**: it counts
+    them against **its own** camera, which lags the frame thread's (see `scene_lag_*`), so 0 is the
+    scene's, not the camera's (`gates.scene_soft_miss_frames` is the flights' frames with any).
+  - `camera_soft_miss_frames`: the frames of the path in which **one ray straight down from the
+    frame's camera** hits ground drawn coarser than the (speed-scaled) bands ask at its distance,
+    less the bands' 5% hysteresis (scored on the flights only). **Gated** (#168): on the flights at
+    2 m and 50 m, the take-off and the turn, summed, at the most of the runs, must be 0
+    (`camera_soft_miss_frames`). It is the soft miss of what the player stands on, at the camera
+    that is drawn from, which the scene's own count is not. The alternative, scoring every brick
+    at the frame camera, was not taken: it is a pass over every node a frame, for the same answer
+    where the player looks. The cold start and the stop are not flights: they fill and refine,
+    and have many.
+  - `scene_lag_d0_max` and the others: **the max over the four flights is gated**
+    (`scene_lag_d0_max`, 8.0): main's 7.81 `d0` on the 4090 at 50 m plus a margin, for now. **The
+    limit tightens to about 2 `d0` once the follow fixes land**; it is not a statement of what the
+    lag should be.
+  - `generated_bricks`, `arrived_bricks`, `loader_queue_max` and `loader_queue_mean` (#168): what
+    the loader did in the path (and in the forced look after it): the bricks the generator was
+    asked for, and the bricks of the arrivals that the scene thread took in; and the loader's
+    queue, the bricks asked for and not yet taken in (`LoaderStats::pending`), as of each frame,
+    its most and its mean. They are for reading a flight as limited by the generator (a long
+    queue, few arrived) or not; reported, not gated.
+  - `loader_generating_s`, `loader_held_back_s`, `stream_calls` and `stream_slices_used` (#168):
+    what the loader's workers did with their time in the path, summed over them (the paths'
+    seconds times the workers is what there is): generating, and waiting **with jobs queued**
+    because they were `MAX_AHEAD` jobs ahead of what the scene thread had taken in. Held back
+    most of the time with the queue long means the scene thread's taking in limits the loader, not
+    the generator. And how many times the scene thread took in (its time is `scene_thread.pack_ms`)
+    and in how many of them it stopped because its slice was used up. Reported, not gated.
+  - `scene_lag_d0_mean`, `scene_follow_steps`, `scene_budget_cuts` and `camera_soft_miss_per_second` (#168; the last two
+    lines of the 4090 sweep of the slice ask for them): the
+    mean of the drawn scene's lag over the path's frames, in `d0` (the maximum and the 99th percentile
+    do not say how long the scene is behind), the rounds in which the scene moved to the camera and
+    those in which it held work back for the upload budget, the frames with a camera soft miss in
+    each second of the path (one entry for every second the path covers, so a trailing 0 is a second without a miss; a flight only: at the start of it or all along it). Reported, not gated. (The most that the
+    scene's buffers in use were in a path is `scene_used_peak_mib`, #213's, below.)
+  - `camera_soft_miss_lag_side`, `camera_soft_miss_loader_side` and `lag_over_floor_frames` (#168,
+    the flights): the camera misses split by what can have caused them. The score asks for level 0
+    within `floor(1) * (1 - HYSTERESIS)` (about 0.67 `d0`) of the frame's camera, so a frame whose
+    drawn scene is further behind the camera than that is a miss by construction, whatever the loader
+    has made. `lag_over_floor_frames` counts those frames (misses or not); a miss in one is **lag
+    side** (the scene thread's following: the long slice's giving way to a camera that moves is
+    for it), a miss in any other is **loader side** (a brick that the bands ask for is not there:
+    the generator; decision A's curve, 3 levels at 50 m/s on levels 0 to 4, is in). The two add up to `camera_soft_miss_frames`.
+  - `scene_release_rebuilds`, `release_frame_ms_max` and `release_update_ms_max` (#168): how many
+    times a finer depth made the scene again (`Rebuild::Release`, `scene_worker.rs` `RELEASE_REBUILD_OVER`,
+    500 thousand nodes) instead of looking at its nodes again, and the frame thread's cost of the
+    one it took: the longest frame that had one and that frame's update (the copy to the GPU, which
+    is over the budget like a jump's and is counted under `over_budget.bands`). The scene thread's
+    time in it is `scene_thread.release_ms`, to be read against #217's `CATCH_UP_CAP` (12 s since
+    2026-11-17; it was 5 s, which the 4090's 8.8 to 9.2 s hit with `before_hold.hit_cap` true).
+    The release frame is the one frame over the limit that the owner accepted (about 230 ms); the
+    frames around it are not: **while the scene thread makes the scene again the threads that read
+    and pack its bricks run at the lowest priority** (`render::scene::select::set_worker_start`,
+    `priority.rs`), because all the cores at the frame thread's priority kept it from waking for
+    30 ms at a time (26 to 43 frames over the limit, update `none`, on the 4090), and **the
+    frame thread writes only the used words of the rebuilt buffers** (`Scene::filled_words`: the
+    rest of the roomy buffers is zero, which the GPU makes itself): a rebuild writes about half of
+    what `upload.bytes_max` says (940 MB), which still counts the buffers made, the used words and
+    the zeros, so that the count is the same on every machine. Reported, not gated.
   - `hole_looks`, `holes` and `holes_per_frame`: **holes are sampled, not counted for every
     frame** (see "What the holes gate can and cannot catch"). Looking at every split brick takes
     0.3 s at full size with the store's read lock held, so the scene thread does it every 5 s
-    (`SceneWorker::count_holes`), and **one more look is forced at the end of every path**
+    (`SceneWorker::count_holes`; **in threads on every core, and a look that is only due waits while
+    the bands are speed-scaled**, #168: on the 4090 it held the lock for about 90 ms in a flight and the
+    camera had misses in the second after it), and **one more look is forced at the end of every path**
     (`SceneWorker::look_now`), so no path has 0 looks. The report has how many looks there were in
     the path and what they found.
   - `scene_used_peak_mib` (#213): the most MiB of the scene in use at the end of one of the path's frames (the run's `memory.scene_used_peak_mib`, which is the gate, is the most of these and of the looks between frames; this says which path holds it).
+  - `scene_used_end_mib` and `scene_level_bricks_end` (#168, schema 27): the scene's buffers in use (MiB) and the bricks drawn at each level when the path ended, to be read against `scene_used_peak_mib` and the bricks at each level at that peak (`memory.scene_used_peak_level_bricks`): a peak far over the end is a transient, and the levels say what it was made of (the crossing's 552 to 572 MiB was 251 K bricks at level 13). Reported, not gated.
   - `scene_round_max_ms`, `scene_update_max_ms`, `cap_flips`, `cap_flip_max_ms`, `backlog_peak`,
     `absorb_updates`, `absorb_ms` (#213, schema 26): the longest round of the scene thread in the
     path's frames (without the look for holes), the longest single update of the scene to a camera in
@@ -572,7 +641,10 @@ camera, and `holes_after_catch_up` the holes the look after it found, which must
     for a new camera and packing what changed), `pack` (asking the loader, taking in what it made
     and packing it), `upload` (publishing: copying what changed out for the frame thread, which
     copies it to the GPU), `evict` (eviction), `coarse` (the coarse levels over an Edit) and
-    `hole_scan` (the looks for holes), and **`hole_scan_share`**: the looks' share of the scene
+    `hole_scan` (the looks for holes), `release` (making the scene again for a depth that was
+    given back, and the listing that was not looked at: `Rebuild::Release`), `reband` (looking again at the nodes that a change of the
+    bands for the camera's speed listed, and packing what changed: **not in `follow`**; ADR 0009),
+    and **`hole_scan_share`**: the looks' share of the scene
     thread's **busy** time, which is the sum of the parts above and not wall time (a thread that is
     idle most of the time can still read high). **A path's figures are those of its frames: the look
     that is forced after the last frame is not in them**, so a path in which no look came due reads
@@ -584,7 +656,7 @@ camera, and `holes_after_catch_up` the holes the look after it found, which must
   - `end_look_ms`: what the look that is forced at the end of the path took in the scene thread
     (the scan itself), in milliseconds. It is made after the frames, so it is in no frame's time.
   - `still_cuts`, for `stop after a flight` only (null for the others; #217, schema 22):
-    `still_frames`, `cuts` and `by_cause` (`edit`, `bands`, `coarse`, `follow`, `arrival`, `coarsen`).
+    `still_frames`, `cuts` and `by_cause` (`edit`, `bands`, `coarse`, `follow`, `arrival`, `coarsen`, `reband`).
     A **cut** is an update that the frame thread took in while the view was Still and the Reference view
     was being shown: the camera had stood for 2 frames (`STILL_FRAMES`) and the frame before had no
     update either, as `render::still::Still::plan` counts (an update in the 2 frames after another is
@@ -593,7 +665,8 @@ camera, and `holes_after_catch_up` the holes the look after it found, which must
     scene thread was doing when it made the patch: `edit` (an Edit's bricks), `bands` (a new LOD
     bias), `coarse` (the coarse levels remade after an Edit), `follow` (the scene moving to the
     camera), `arrival` (bricks the loader made, taken in) and `coarsen` (a step of the memory cap's
-    coarsening, or one taken back). A cut that was made of several kinds of work counts under each,
+    coarsening, or one taken back) and `reband` (#168: nodes looked at again for a change of the bands for
+    the camera's speed). A cut that was made of several kinds of work counts under each,
     so the causes add up to at least `cuts`. In **this** path nothing is held back (it measures the
     settle time, which needs the loader to go on), so this is what a Still view would get if the
     scene thread worked as it does for the Primary view. The held view is `still_after_flight` of the
@@ -601,7 +674,14 @@ camera, and `holes_after_catch_up` the holes the look after it found, which must
     holds the number on the test Planet: 118 cuts in 120 held frames before #217, all of them
     `follow`, and at most 1 after.
   - `settle`, for `stop after a flight` only (null for the others): `seconds` from the frame the
-    camera stopped in to the first frame with no soft misses, or the cap, and `settled`. Not gated.
+    camera stopped in to the first frame in which the scene is at the camera (the drawn scene's camera is
+    the frame's), has no soft misses and nothing left to look at again for the bands
+    (`Scene::waiting` counts both), or the cap, and `settled`; `walk_s` is the first part (the
+    scene walking to where the camera stopped), `reband_s` the second (until the scene thread has
+    looked at every node that the change of the bands for the stop listed: 0 if it had by then)
+    and `fill_s` the rest (waiting for the loader's bricks, and making them into the scene); the
+    three add up to `seconds`. **Gated** (#168), `settle_s`, 55 s:
+    main's 47.8 s on the 4090 plus 15%. Over if it is over the limit or did not settle.
     The scene thread's count of soft misses can be from before the stop (it counts a few times a
     second, and not at all while it sleeps), so a stale 0 would read as settled at once. So the
     stop is followed by **a count made after it** (`SceneWorker::look_now(false)`, the count and no
@@ -631,6 +711,10 @@ camera, and `holes_after_catch_up` the holes the look after it found, which must
     set, which cannot be reset; Linux's `VmHWM`) since it began. It includes the normal bench's
     generation of the full Planet and every earlier run, so it is an upper bound of the run's, and
     only grows over the runs. Null where the system does not say (as `resident_peak_mib`).
+  - `scene_used_peak_in` and `scene_used_peak_level_bricks` (#168): what the run was doing when
+    `scene_used_peak_mib` was reached (a path's name, or "the loader's catch-up after ...", which
+    is time that is in no path), and the bricks drawn at each level then. The run's peak is of
+    every frame, those between paths included; a path's is `scene_used_peak_mib` under it.
   - `scene_used_peak_mib`: the scene's buffers **in use** (`Scene::used_bytes`), at the most of
     what the scene thread said: it works the figure out every 250 ms (`TABLES_EVERY`), so this is
     the most of those, not of every frame. **The memory gate is on this**, against the full-size
@@ -668,7 +752,8 @@ camera, and `holes_after_catch_up` the holes the look after it found, which must
   `docs/measurements.md` are measured again.
 
 `gates` holds, for each measure, the `worst` over every run (and path) and the `limit`, and `over`
-lists the gates that are over: `frame_time`, `frame_cpu`, `holes`, `memory`. For the holes it also
+lists the gates that are over: `frame_time`, `frame_cpu`, `holes`, `memory`, `soft_misses`
+(under the camera), `scene_lag`, `spawn_ring`, `time_to_control`, `settle`. For the holes it also
 has `hole_looks_fewest_in_a_run` and `hole_looks_fewest_in_a_path`.
 
 **Edit latency is measured in this mode**, as ADR 0006's bound needs the real scene thread and the
@@ -976,7 +1061,7 @@ not gated. The final stage budgets are not these: they are the stages of #10, pe
 #### What the holes gate can and cannot catch
 
 It catches a brick that is split with the bricks under it not resident **at the moment of a look**:
-the scene thread looks every 5 s (`HOLES_EVERY`) while it works, a look is forced at the end of
+the scene thread looks every 5 s (`HOLES_EVERY`) while it works (not while the camera's speed has the bands scaled: the look is made after the release), a look is forced at the end of
 every path, of every catch-up, of the sizing and of the run, and the gate is on everything those
 looks found in the run, between the paths too. It fails when a run or a path had no look at all.
 
@@ -1346,7 +1431,7 @@ views' Reference images do not depend on it.
 
 ```
 {
-  "schema_version": 26,
+  "schema_version": 28,
   "build":   { "version", "commit" },          // commit: CI builds only, else null; on a PR
                                                // build it is GitHub's merge commit, not the head
   "machine": { "gpu", "device_type", "driver", "driver_info", "backend", "os", "arch",

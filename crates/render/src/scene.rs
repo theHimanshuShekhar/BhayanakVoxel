@@ -205,6 +205,10 @@ pub struct Scene {
     shown_coarsest: Option<usize>,
     /// Likewise, why the scene it is a copy of was last packed again.
     shown_rebuilt: Option<Rebuild>,
+    /// For a copy of a scene of rings: how many words of `brick_refs` and `bricks` can hold
+    /// anything (what the pools had in use, and what pastes have written since); the words after
+    /// are zero ([`Scene::filled_words`]).
+    shown_filled: Option<(usize, usize)>,
     /// Bricks drawn that changed (came or went) in the selections that packed the scene so far,
     /// which a scene made again keeps (see [`Scene::bricks_changed`]).
     changed: u64,
