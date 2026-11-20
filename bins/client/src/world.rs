@@ -377,6 +377,9 @@ pub struct World {
     motion: Motion,
     /// The time that the camera's velocity is measured in: the machine's, or a stepped world's.
     clock: Clock,
+    /// Where the Guard was made complete around, and how far from it a camera may be before the
+    /// Guard is complete (see [`World::hold_to_guard`]).
+    guard_hold: Option<([f64; 3], f64)>,
 }
 
 /// The camera's velocity as the frames show it: a running mean over about a tenth of a second, so
@@ -499,7 +502,42 @@ impl World {
             lead: true,
             motion: Motion::default(),
             clock: Clock::real(),
+            guard_hold: None,
         }
+    }
+
+    /// Says that the part of the Guard that was made before the world started is every cell that a
+    /// camera within `reach` Voxels of `spawn` could see (#220, [`crate::loader::plan_guard`]):
+    /// until the rest is made, a camera that is not the character's is to be held to that ball
+    /// ([`World::hold_to_guard`]), which is what a camera that flies fast or jumps far before the
+    /// Guard is complete gets, in place of sky past the cells that are there.
+    pub fn with_guard_hold(mut self, spawn: [f64; 3], reach: f64) -> Self {
+        self.guard_hold = Some((spawn, reach));
+        self
+    }
+
+    /// Whether every cell of the Guard has been taken in (as of the scene the world has).
+    pub fn guard_complete(&self) -> bool {
+        self.loader().is_none_or(|loader| loader.guard_pending == 0)
+    }
+
+    /// `position`, a camera that flies, held to the ball that the Guard that is made so far covers
+    /// ([`World::with_guard_hold`]) while the Guard is not complete, else as it is. The hold is the
+    /// position, not the speed: a camera is free in a ball of 2 km and cannot see sky in it, and it
+    /// is not told how fast it may go.
+    pub fn hold_to_guard(&self, position: [f64; 3]) -> [f64; 3] {
+        let Some((centre, reach)) = self.guard_hold else {
+            return position;
+        };
+        if self.guard_complete() {
+            return position;
+        }
+        let from: [f64; 3] = std::array::from_fn(|a| position[a] - centre[a]);
+        let away = from.iter().map(|c| c * c).sum::<f64>().sqrt();
+        if away <= reach {
+            return position;
+        }
+        std::array::from_fn(|a| centre[a] + from[a] * reach / away)
     }
 
     /// Streams the Planet in with `loader`, on a thread of its own that follows the camera and takes

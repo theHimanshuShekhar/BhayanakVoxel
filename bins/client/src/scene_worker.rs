@@ -319,8 +319,11 @@ fn gives_way(spent: Duration, slice: Duration, frame_waiting: impl FnOnce() -> b
 /// What the loader is doing, as of a [`Ready`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct LoaderStats {
-    /// Bricks asked for whose children have not been taken in (see [`Loader::pending`]).
+    /// Bricks asked for whose children have not been taken in, and cells of the Guard not taken in
+    /// (see [`Loader::pending`]).
     pub pending: usize,
+    /// Of `pending`, the cells of the Guard that have not been taken in (#220).
+    pub guard_pending: usize,
     /// Bricks the workers have asked the generator for, since the start.
     pub generated: u64,
     /// What the workers have done with their time since the start, summed over them, in
@@ -349,6 +352,7 @@ impl LoaderStats {
         let (generating, held_back) = loader.busy();
         Self {
             pending: loader.pending(),
+            guard_pending: loader.guard_pending(),
             generated: loader.generated(),
             generating_us: (generating * 1e6) as u64,
             held_back_us: (held_back * 1e6) as u64,
@@ -2739,6 +2743,8 @@ impl Engine {
             };
             let batch_started = self.clock.now();
             let mut resident = Vec::new();
+            // The cells of the Guard that came in this batch (#220).
+            let mut cells = Vec::new();
             let arrivals = self.loader.receive(most);
             if arrivals.is_empty() {
                 break;
@@ -2786,17 +2792,33 @@ impl Engine {
                             // The scene looks at it again: that is work for the next round.
                             took = true;
                         }
+                        Arrival::Guard { cell, bricks } => {
+                            self.work.arrived_bricks += bricks.len() as u64;
+                            // Held and no longer pending in one go; the scene is told below.
+                            store.hold_guard_cell(cell, bricks);
+                            cells.push(cell);
+                        }
                     }
                 }
             }
-            if resident.is_empty() {
+            if resident.is_empty() && cells.is_empty() {
                 continue;
             }
             took = true;
             let store = self.store.read().expect("the store's lock is not poisoned");
             let before = self.scene.bricks_changed();
-            let update = self.scene.arrive(&store, &resident)?;
+            let rooted = if cells.is_empty() {
+                None
+            } else {
+                self.scene.add_roots(&store, &cells)?
+            };
+            let update = if resident.is_empty() {
+                None
+            } else {
+                self.scene.arrive(&store, &resident)?
+            };
             drop(store);
+            self.note(Cause::Arrival, rooted);
             if let Some(SceneUpdate::Rings(patch)) = &update {
                 let cost = patch.cost();
                 self.batch_cost = cost;
@@ -2809,7 +2831,8 @@ impl Engine {
             self.work.pack_steps += 1;
             self.work.pack_bricks += self.scene.bricks_changed() - before;
             self.note(Cause::Arrival, update);
-            worst = worst.max(self.clock.since(batch_started) / resident.len() as u32);
+            worst =
+                worst.max(self.clock.since(batch_started) / (resident.len() + cells.len()) as u32);
         }
         self.work.stream_slices_used += u64::from(slice_used);
         // What the next slice expects one to cost: a running mean of the worst batch of each

@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
-use brick_store::{BrickStore, TableSize, VOXELS_PER_METRE, VoxelCoord};
+use brick_store::{BrickCoord, BrickStore, TableSize, VOXELS_PER_METRE, VoxelCoord};
 use net::{ClientMessage, EditOp, RejectReason, ServerEnd, ServerMessage, loopback};
 use planet_gen::planet::{Planet, tangents};
 use planet_gen::world_map::WorldMap;
@@ -5467,5 +5467,281 @@ fn repeated_stop_and_go_flights_do_not_stack_the_scene_above_the_rest_set_plus_o
                 "{name}: cycle {cycle} drew {peak}, {at_rest} at rest and a band of {band}"
             );
         }
+    }
+}
+
+/// The pyramid of the stores of the Guard's tests (#220): 14 levels, the top being level 13, a
+/// brick of which is 3.3 km across. The Guard is the levels `GUARD_FIRST` to it, in cells of that
+/// size, of which the test Planet (40 km in radius) has some ten thousand, as the real Planet has
+/// several hundred of the 52 km cells of its top, level 17 (a pyramid of 18 levels has four here).
+const GUARD_LEVELS: usize = 14;
+/// The ball that a flying camera is held to in these tests (#220): 8 km, where the game's is 2 km,
+/// since the test Planet is an eighth of the radius and its horizon from 2 km is that much shorter
+/// than the game's 36 km: a ball a fifth of the Planet's radius, as the game's is a sixteenth of
+/// the 320 km, is the one whose edge sees cells that the Spawn does not.
+const GUARD_REACH: f64 = 8000.0 * VOXELS_PER_METRE;
+/// One voxel of the Guard's finest level, as the game has it ([`crate::loader::GUARD_MARGIN`]).
+const GUARD_MARGIN: f64 = (1u64 << GUARD_FIRST) as f64;
+
+/// A world right after the spawn whose Guard is held in part (#220): the cells `now` are held,
+/// the cells `later` are asked of a stepped loader, as the game's `load` does them, and the world
+/// holds a flying camera to the ball of `GUARD_REACH` around the Spawn until they are in.
+fn guard_in_part(now: &[BrickCoord], later: &[BrickCoord]) -> (World, Camera) {
+    let mut store = planet().crust_around(ground(), RING, GUARD_LEVELS - 1);
+    crate::loader::hold_guard_cells(&mut store, planet(), GUARD_FIRST, now, later);
+    let camera = crate::spawn_camera(ground());
+    let scene = Scene::rings(&store, camera.position, bands(), bound()).unwrap();
+    let source = store.source().unwrap();
+    let mut loader = Loader::stepped(source, camera.position, bands());
+    loader.request_guard(GUARD_FIRST, GUARD_LEVELS - 1, later.iter().copied());
+    let (client, _server) = loopback();
+    let world = World::new(scene, Predictor::new(store), client)
+        .with_stepped_loader(loader)
+        .with_guard_hold(camera.position, GUARD_REACH);
+    world.worker().speed_scale(false);
+    (world, camera)
+}
+
+/// Where a camera held to the Guard's ball may be, above the ground, to the edge of it: the Spawn,
+/// the point of the ball's radius over it, the four along the Planet's tangents, and the four
+/// between those and the one over it. (Under the ground a camera sees through the crust to the far
+/// side of the hollow Planet, which is not a view that the Spawn has: see
+/// [`crate::world::World::hold_to_guard`].)
+fn points_in_the_ball(camera: &Camera) -> Vec<[f64; 3]> {
+    let (ahead, right) = tangents(camera.horizon_up);
+    let mut points = vec![camera.position];
+    let mut push = |direction: [f64; 3]| {
+        points.push(std::array::from_fn(|a| {
+            camera.position[a] + direction[a] * GUARD_REACH
+        }));
+    };
+    push(camera.horizon_up);
+    for axis in [ahead, right] {
+        for sign in [1.0, -1.0] {
+            let along: [f64; 3] = std::array::from_fn(|a| axis[a] * sign);
+            push(along);
+            let half = std::f64::consts::FRAC_1_SQRT_2;
+            push(std::array::from_fn(|a| {
+                (along[a] + camera.horizon_up[a]) * half
+            }));
+        }
+    }
+    points
+}
+
+/// The rays from `points` all round (48 ways) that meet something in `scene`, as the tracer takes
+/// them: from each point 30 and 10 degrees under its level, and at the angles round the horizon of
+/// the sea (a sphere of radius `sea`), from 3 degrees under it to 3 over, which is where what the
+/// Guard shows is, at the far edge of the horizon cap (a ray over the horizon meets only the
+/// ground that rises over it).
+fn rays_that_meet(scene: &Scene, points: &[[f64; 3]], sea: f64) -> Vec<Ray> {
+    let mut rays = Vec::new();
+    for &at in points {
+        let (cell, origin) = camera::split(at);
+        let radius = at.iter().map(|c| c * c).sum::<f64>().sqrt();
+        let up: [f64; 3] = at.map(|c| c / radius);
+        let (ahead, right) = tangents(up);
+        let dip = (sea / radius).min(1.0).acos().to_degrees();
+        let mut under = vec![30.0, 10.0];
+        under.extend(
+            [3.0, 1.0, 0.3, 0.1, 0.05, 0.0, -0.05, -0.1, -0.3, -1.0, -3.0].map(|e| dip + e),
+        );
+        for turn in 0..48 {
+            let angle = f64::from(turn) * std::f64::consts::TAU / 48.0;
+            let along: [f64; 3] =
+                std::array::from_fn(|a| angle.cos() * ahead[a] + angle.sin() * right[a]);
+            for &degrees in &under {
+                let down = degrees.to_radians();
+                let dir: [f32; 3] =
+                    std::array::from_fn(|a| (down.cos() * along[a] - down.sin() * up[a]) as f32);
+                let ray = Ray { cell, origin, dir };
+                if trace(scene, &ray).is_some() {
+                    rays.push(ray);
+                }
+            }
+        }
+    }
+    rays
+}
+
+/// The rays from `points` to the middle of each brick of the Guard's finest level under the first
+/// `cells` of `cells` (the nearest of the cells that are made later) that meet something in `scene`
+/// at or past that brick: a brick that can be seen from the ball, as the tracer sees it, which a
+/// scene that is without its cell does not show.
+fn rays_at_the_bricks_of(scene: &Scene, points: &[[f64; 3]], cells: &[BrickCoord]) -> Vec<Ray> {
+    let edge = f64::from(8u32 << GUARD_FIRST);
+    let mut rays = Vec::new();
+    for &cell in cells {
+        let bricks = planet().guard_cell(GUARD_FIRST..=GUARD_LEVELS - 1, GUARD_LEVELS - 1, cell);
+        for (level, coord, _, _) in bricks {
+            if level != GUARD_FIRST {
+                continue;
+            }
+            let centre: [f64; 3] = coord.0.map(|c| (f64::from(c) + 0.5) * edge);
+            for &at in points {
+                let to: [f64; 3] = std::array::from_fn(|a| centre[a] - at[a]);
+                let away = to.iter().map(|c| c * c).sum::<f64>().sqrt();
+                let (cell, origin) = camera::split(at);
+                let dir: [f32; 3] = to.map(|c| (c / away) as f32);
+                let ray = Ray { cell, origin, dir };
+                if trace(scene, &ray).is_some_and(|hit| f64::from(hit.t) >= away - edge) {
+                    rays.push(ray);
+                }
+            }
+        }
+    }
+    rays
+}
+
+/// How many of `rays` (that meet something in the scene that has every cell of the Guard) meet
+/// nothing in `scene`: sky where there is ground.
+fn rays_that_see_sky(scene: &Scene, rays: &[Ray]) -> usize {
+    rays.iter()
+        .filter(|ray| {
+            trace(
+                scene,
+                &Ray {
+                    cell: ray.cell,
+                    origin: ray.origin,
+                    dir: ray.dir,
+                },
+            )
+            .is_none()
+        })
+        .count()
+}
+
+/// The Guard built in the background (#220): the window opens with the cells that a camera within
+/// 2 km of the Spawn could see and the ring, and the rest come in a few at a time. At every frame
+/// from the first, nothing is sky that the whole Guard would show a camera in the ball, nothing is
+/// a hole, and no cell that comes late makes the scene again; at the end the Guard is whole.
+/// Without the visible cells held the same rays do see sky, so the test would notice.
+#[test]
+fn nothing_seen_from_the_spawn_is_sky_at_any_frame_while_the_rest_of_the_guard_is_made() {
+    let camera = crate::spawn_camera(ground());
+    let (now, later) = crate::loader::plan_guard(
+        planet(),
+        GUARD_LEVELS,
+        camera.position,
+        GUARD_REACH,
+        GUARD_MARGIN,
+    );
+    assert!(
+        now.len() > 100 && later.len() > now.len(),
+        "the test Planet's Guard is more later than now: {} now, {} later",
+        now.len(),
+        later.len()
+    );
+    let points = points_in_the_ball(&camera);
+    // What the whole Guard shows, from the ball, once the ring is filled: the scene that the one
+    // that is made in the background comes to.
+    let all: Vec<BrickCoord> = now.iter().chain(&later).copied().collect();
+    let (mut whole, _) = guard_in_part(&all, &[]);
+    fill(&mut whole, camera.position);
+    let mut rays = rays_that_meet(whole.scene(), &points, planet().sea_radius());
+    let at_bricks = rays_at_the_bricks_of(whole.scene(), &points, &later[..later.len().min(2000)]);
+    eprintln!(
+        "{} rays all round, {} at the bricks of the later cells",
+        rays.len(),
+        at_bricks.len()
+    );
+    rays.extend(at_bricks);
+    assert!(rays.len() > 1000, "{} rays meet something", rays.len());
+
+    // The control: with none of the visible cells held, the rays see sky.
+    let (empty, _) = guard_in_part(&[], &now);
+    let missed = rays_that_see_sky(empty.scene(), &rays);
+    eprintln!(
+        "control: {missed} of {} rays see sky with no cell held",
+        rays.len()
+    );
+    assert!(
+        missed > 0,
+        "the rays are not able to see the cells being held"
+    );
+
+    let (mut world, camera) = guard_in_part(&now, &later);
+    world.measure_scene_thread();
+    assert!(!world.guard_complete(), "the later cells are not made yet");
+    // At control, before the loader has made a cell of the rest (a frame's step makes up to 256,
+    // the nearest first, which are the ones that a ball too narrow would have left out): the rays
+    // from the ball's edge see no sky and the scene has no hole.
+    assert_eq!(world.loader().unwrap().guard_pending, later.len());
+    let at_control = rays_that_see_sky(world.scene(), &rays);
+    assert_eq!(
+        at_control,
+        0,
+        "at control: {at_control} of {} rays from the ball see sky",
+        rays.len()
+    );
+    assert_eq!(world.scene().holes(&world.store()), 0, "at control: a hole");
+    let looks = world.stats().work.hole_scans;
+    let mut patience = Patience::new(Duration::from_secs(60));
+    let mut frames = 0;
+    let mut left = later.len();
+    loop {
+        let updates = stream(&mut world, camera.position);
+        assert!(
+            !updates.iter().any(|u| matches!(u, SceneUpdate::Rebuilt)),
+            "frame {frames}: a cell that came late made the scene again"
+        );
+        assert_eq!(world.stats().holes, 0, "frame {frames}: a hole");
+        // Every frame: a look at every split brick, and the rays.
+        let pending = world.loader().unwrap().guard_pending;
+        {
+            world.look_now(true).unwrap();
+            assert_eq!(world.stats().work.holes_found, 0, "frame {frames}: holes");
+            let sky = rays_that_see_sky(world.scene(), &rays);
+            assert_eq!(
+                sky,
+                0,
+                "frame {frames}: {sky} of {} rays from the ball see sky ({pending} cells of the \
+                 Guard are not made)",
+                rays.len()
+            );
+        }
+        // A flying camera is held to the ball while the Guard is not whole, and free after.
+        let far: [f64; 3] =
+            std::array::from_fn(|a| camera.position[a] + camera.horizon_up[a] * 10.0 * GUARD_REACH);
+        let held = world.hold_to_guard(far);
+        if world.guard_complete() {
+            assert_eq!(held, far, "frame {frames}: held with the Guard whole");
+        } else {
+            let from: f64 = (0..3)
+                .map(|a| (held[a] - camera.position[a]).powi(2))
+                .sum::<f64>()
+                .sqrt();
+            assert!(
+                (from - GUARD_REACH).abs() < 1.0,
+                "frame {frames}: held {from} from the Spawn"
+            );
+        }
+        assert!(pending <= left, "cells are only taken in");
+        left = pending;
+        frames += 1;
+        if world.guard_complete() && pending == 0 {
+            break;
+        }
+        patience.wait(&world, || "the Guard is not made".into());
+    }
+    assert!(
+        frames > 5,
+        "the Guard comes over frames, not at once: {frames}"
+    );
+    assert!(
+        world.stats().work.hole_scans > looks,
+        "no look for holes was made"
+    );
+    eprintln!("the Guard came in {frames} frames");
+    // The ring fills as it does with the Guard held whole, and then the two are the same to the
+    // rays.
+    fill(&mut world, camera.position);
+    assert_eq!(rays_that_see_sky(world.scene(), &rays), 0, "after the fill");
+    assert_eq!(world.waiting(), whole.waiting());
+    // The Guard is whole: every brick of it is held.
+    let store = world.store();
+    assert_eq!(store.guard_pending(), 0);
+    for (level, coord, _, _) in planet().guard(GUARD_FIRST..=GUARD_LEVELS - 1) {
+        assert!(store.holds(level, coord), "level {level} {coord:?}");
     }
 }

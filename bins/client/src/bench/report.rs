@@ -124,7 +124,15 @@ use super::stream::StreamReport;
 /// `soft_misses`, `scene_lag`, `spawn_ring`, `time_to_control` and `settle`). The budgets file has
 /// the keys `camera_soft_miss_frames`, `scene_lag_d0_max`, `spawn_ring_s`, `time_to_control_s` and
 /// `settle_s`, in `[streaming]`. Nothing else is changed.
-pub const SCHEMA_VERSION: u32 = 27;
+///
+/// 28 (#220) builds the Guard in two parts: the cells that a camera within 2 km of the Spawn could
+/// see, before the window opens, and the rest in the background. The real-time report's cold start
+/// gets
+/// `guard_cells` (the Guard's cells in all), `guard_cells_at_control` (those made before the window
+/// opened) and `guard_complete_s` (from the start of the load to the last cell being taken in);
+/// `guard_s` is now the time of the first part only, `time_to_control_s` no longer waits for the
+/// whole Guard, and its gate is 2 s in the budgets file (it was 10). Nothing else is changed.
+pub const SCHEMA_VERSION: u32 = 28;
 
 /// One timed thing (a pass, or the GPU total of a profiler frame) in one mode, against its
 /// budget. In reference mode a profiler frame is one sample, so the entries of that mode have
@@ -626,7 +634,7 @@ mod tests {
                 "streaming_real_time"
             ]
         );
-        assert_eq!(json["schema_version"], 27);
+        assert_eq!(json["schema_version"], 28);
         assert_eq!(json["convergence"], serde_json::Value::Null);
         assert_eq!(json["streaming"], serde_json::Value::Null);
         assert_eq!(json["streaming_real_time"], serde_json::Value::Null);
