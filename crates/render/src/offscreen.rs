@@ -293,10 +293,10 @@ impl Offscreen {
         Ok(())
     }
 
-    /// Says that the last [`Offscreen::update_scene`] was an Edit, so that the radiance cache follows
-    /// the light round it faster (see [`Tracer::edit_made`]).
-    pub fn edit_made(&mut self) {
-        self.tracer.edit_made();
+    /// Says that an Edit changed `bricks`, so that the radiance cache follows the light round them
+    /// faster (see [`Tracer::edit_made`]).
+    pub fn edit_made(&mut self, bricks: &[brick_store::BrickCoord]) {
+        self.tracer.edit_made(bricks);
     }
 
     /// The parts of the CPU's time in the last [`Offscreen::update_scene`].

@@ -2,6 +2,7 @@
 //! Windowed and offscreen rendering share this, so the golden image test exercises the same
 //! code path the window does.
 
+use brick_store::BrickCoord;
 use bytemuck::{Pod, Zeroable};
 use materials::MaterialTable;
 use wgpu::util::DeviceExt;
@@ -11,7 +12,7 @@ use crate::atmosphere::{AtmosphereTables, AtmosphereView};
 use crate::batch::max_samples;
 use crate::camera::{Camera, CameraUniform};
 use crate::debug_view::DebugView;
-use crate::emitters::{Applied, EmitterIndex, Emitters, Touched, emissive_materials};
+use crate::emitters::{Applied, EmitterIndex, Emitters, emissive_materials};
 use crate::gpu_materials;
 use crate::look::{Look, LookUniform};
 use crate::post::{self, Exposed, HDR_FORMAT, Metering, Post, Scratch, Stages};
@@ -548,8 +549,6 @@ pub struct Tracer {
     /// which cells (the first Voxel and one past the last, of level 0).
     gi_boost: u32,
     gi_boost_box: ([i32; 3], [i32; 3]),
-    /// The regions of level 0 that the last [`Tracer::update_scene`] wrote.
-    last_touched: Touched,
     /// The emitters of level 0 by region, which an update of the scene takes in region by region.
     emitter_index: EmitterIndex,
     /// Whether Primary's light has the flat ambient of before #54 in place of its GI (see
@@ -1212,7 +1211,6 @@ impl Tracer {
             gi_frame: 0,
             gi_boost: 0,
             gi_boost_box: EVERYWHERE,
-            last_touched: Touched::Nothing,
             emitter_index,
             flat_ambient: false,
             shade_layout,
@@ -1253,10 +1251,8 @@ impl Tracer {
     /// the next frame.
     fn update_emitters(&mut self, device: &wgpu::Device, scene: &Scene, update: &SceneUpdate) {
         let Applied {
-            emitters_changed,
-            touched,
+            emitters_changed, ..
         } = self.emitter_index.apply(scene, &self.emissive, update);
-        self.last_touched = touched;
         if emitters_changed {
             let emitters = self.emitter_index.emitters();
             if emitters != self.emitters {
@@ -1829,24 +1825,25 @@ impl Tracer {
         self.gi_boost_box = EVERYWHERE;
     }
 
-    /// Says that the last [`Tracer::update_scene`] was an Edit (and not the scene thread's
-    /// streaming, which changes the world far from where anyone looks and must not make the cache
-    /// forget): for [`GI_BOOST_FRAMES`] frames the cells within [`GI_BOOST_MARGIN`] Voxels of the
-    /// regions it wrote follow the new light faster. A scene that was made again is all of it.
-    pub fn edit_made(&mut self) {
-        let region = crate::scene::REGION_VOXELS;
-        // Taken: a second call for the same update does nothing.
-        let touched = std::mem::replace(&mut self.last_touched, Touched::Nothing);
-        let reach = match touched {
-            Touched::Nothing => return,
-            Touched::Everything => EVERYWHERE,
-            Touched::Regions(first, last) => (
-                first.map(|k| k * region - GI_BOOST_MARGIN),
-                last.map(|k| (k + 1) * region + GI_BOOST_MARGIN),
-            ),
+    /// Says that an Edit changed `bricks` (and not the scene thread's streaming, which changes the
+    /// world far from where anyone looks and must not make the cache forget): for
+    /// [`GI_BOOST_FRAMES`] frames the cells within [`GI_BOOST_MARGIN`] Voxels of the bricks follow
+    /// the new light faster. Called when the Edit is made, which is not when its patch reaches
+    /// the GPU (the scene thread packs it a frame or more later): the cache forgets from the Edit.
+    pub fn edit_made(&mut self, bricks: &[BrickCoord]) {
+        let Some(first) = bricks.first() else {
+            return;
         };
-        let covered = self.gi_boost > 0;
-        self.gi_boost_box = if covered {
+        let (mut lo, mut hi) = (first.0, first.0);
+        for b in bricks {
+            lo = std::array::from_fn(|a| lo[a].min(b.0[a]));
+            hi = std::array::from_fn(|a| hi[a].max(b.0[a]));
+        }
+        let reach = (
+            lo.map(|k| k * 8 - GI_BOOST_MARGIN),
+            hi.map(|k| (k + 1) * 8 + GI_BOOST_MARGIN),
+        );
+        self.gi_boost_box = if self.gi_boost > 0 {
             // An Edit while another is settling: the cells of both.
             (
                 std::array::from_fn(|a| self.gi_boost_box.0[a].min(reach.0[a])),

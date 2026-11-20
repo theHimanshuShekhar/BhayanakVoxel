@@ -340,6 +340,8 @@ struct Patch {
     table: BTreeSet<usize>,
     brick_refs: Vec<Range<usize>>,
     bricks: Vec<Range<usize>>,
+    /// The regions of level 0 with bricks rewritten in place (see [`RingPatch::rewritten`]).
+    rewritten: BTreeSet<[i32; 3]>,
     levels: bool,
 }
 
@@ -377,6 +379,11 @@ pub struct RingPatch {
     /// touch.
     pub brick_refs: Vec<Range<usize>>,
     pub bricks: Vec<Range<usize>>,
+    /// The regions of level 0, by key (ascending), that have mixed bricks whose words were written
+    /// where they were, with no word of `regions` or `brick_refs` written for them: the words of
+    /// `bricks` do not say which region they are in, and what a Voxel is made of may have changed
+    /// (the emitters' index reads this).
+    pub rewritten: Vec<[i32; 3]>,
     /// Whether [`Scene::levels`] changed: the boxes walked, the holes, or the ball that rays are
     /// clipped to.
     pub levels: bool,
@@ -506,6 +513,11 @@ impl RingPatch {
         };
         self.brick_refs = both(std::mem::take(&mut self.brick_refs), later.brick_refs);
         self.bricks = both(std::mem::take(&mut self.bricks), later.bricks);
+        let mut rewritten = std::mem::take(&mut self.rewritten);
+        rewritten.extend(later.rewritten);
+        rewritten.sort_unstable();
+        rewritten.dedup();
+        self.rewritten = rewritten;
         self.levels |= later.levels;
         // The buffers only grow, so the later lengths are the longer.
         self.sizes = later.sizes.or(self.sizes);
@@ -1588,6 +1600,9 @@ impl Scene {
                             self.bricks[at..at + range.len()]
                                 .copy_from_slice(&words[range.clone()]);
                             self.patch().bricks.push(at..at + range.len());
+                            if level == 0 {
+                                self.patch().rewritten.insert(key);
+                            }
                         }
                         Want::Absent => unreachable!("the brick stays"),
                     }
@@ -1622,6 +1637,9 @@ impl Scene {
                         let at = entry as usize;
                         self.bricks[at..at + range.len()].copy_from_slice(&words[range.clone()]);
                         self.patch().bricks.push(at..at + range.len());
+                        if level == 0 {
+                            self.patch().rewritten.insert(key);
+                        }
                         new[*bit] = Some(entry);
                     }
                     (_, Some(entry)) => self.release_brick(entry),
@@ -2103,6 +2121,7 @@ impl Scene {
             table: patch.table.into_iter().collect(),
             brick_refs: merged(patch.brick_refs),
             bricks: merged(patch.bricks),
+            rewritten: patch.rewritten.into_iter().collect(),
             levels: patch.levels,
             sizes,
         }
@@ -2426,6 +2445,75 @@ mod tests {
         };
         assert!(again.bricks.is_empty(), "{again:?}");
         assert_eq!(copy, Copy::of(&scene));
+    }
+
+    #[test]
+    fn emitters_dug_out_and_placed_in_mixed_bricks_in_place_are_in_the_index_as_a_scan_has_them() {
+        // The usual Edit of a ring scene rewrites the brick's words where they were: the patch
+        // lists words of `bricks` and nothing else, and the region's record and list of entries are
+        // not written (`rewritten` names the region).
+        use crate::emitters::{EmitterIndex, Touched};
+        let mut emissive = vec![false; 8];
+        emissive[7] = true;
+        let lamp = Material(7);
+        let mut store = ground().clone();
+        // The ground's surface at one column, and a place above it in the same brick.
+        let (x, z) = (20, -30);
+        let surface = (1400..1575)
+            .rev()
+            .find(|&y| store.get(VoxelCoord([x, y, z])).is_some())
+            .expect("ground");
+        let first = (surface + 1..surface + 8)
+            .find(|y| y % 8 <= 5)
+            .expect("a place");
+        let place: Vec<VoxelCoord> = (0..2)
+            .flat_map(|dx| (0..2).map(move |dy| VoxelCoord([x + dx, first + dy, z])))
+            .collect();
+        let mut scene = Scene::rings(&store, ABOVE, bands(), bound()).unwrap();
+        let mut index = EmitterIndex::scan(&scene, &emissive);
+        assert!(index.emitters().boxes().is_empty());
+        let edit = |store: &mut BrickStore, scene: &mut Scene, voxels: &[VoxelCoord], to| {
+            let mut changed = BTreeSet::new();
+            for &v in voxels {
+                changed.insert(v.brick());
+                store.set(v, to);
+            }
+            let changed: Vec<_> = changed.into_iter().collect();
+            store.refresh_lod(changed.iter().copied());
+            patch_of(Some(scene.update(store, &changed).unwrap()))
+        };
+        // Four lamp Voxels in the air.
+        let patch = edit(&mut store, &mut scene, &place, Some(lamp));
+        let applied = index.apply(&scene, &emissive, &SceneUpdate::Rings(patch));
+        assert!(applied.emitters_changed);
+        assert_eq!(index.emitters().boxes().len(), 1);
+        // One of them dug out: the words are rewritten where they were.
+        let patch = edit(&mut store, &mut scene, &place[..1], None);
+        assert!(
+            patch.regions.is_empty() && patch.brick_refs.is_empty() && !patch.bricks.is_empty(),
+            "an in-place rewrite: {patch:?}"
+        );
+        let applied = index.apply(&scene, &emissive, &SceneUpdate::Rings(patch));
+        assert!(applied.emitters_changed, "{applied:?}");
+        assert!(
+            matches!(applied.touched, Touched::Regions(..)),
+            "{applied:?}"
+        );
+        let scan = EmitterIndex::scan(&scene, &emissive);
+        assert_eq!(index.emitters().boxes(), scan.emitters().boxes());
+        let volume: i32 = index
+            .emitters()
+            .boxes()
+            .iter()
+            .map(|b| (0..3).map(|a| b.max[a] - b.min[a]).product::<i32>())
+            .sum();
+        assert_eq!(volume, 3);
+        // And a new lamp in the same mixed brick, in place again.
+        let patch = edit(&mut store, &mut scene, &place[..1], Some(lamp));
+        index.apply(&scene, &emissive, &SceneUpdate::Rings(patch));
+        let scan = EmitterIndex::scan(&scene, &emissive);
+        assert_eq!(index.emitters().boxes(), scan.emitters().boxes());
+        assert_eq!(index.emitters().boxes().len(), 1);
     }
 
     /// Words of `bricks` that the scene's bricks take.

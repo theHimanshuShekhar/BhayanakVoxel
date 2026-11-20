@@ -360,6 +360,10 @@ pub struct World {
     /// Edits made so far: those that the client did not know the server would turn down (see
     /// [`World::edits_made`]).
     edits_made: u64,
+    /// The bricks that Edits changed since [`World::take_edited`]: the Edit the player made (known
+    /// when it is made, a frame or more before the scene thread's patch of it arrives) and what
+    /// the server sent of Edits (others', and corrections).
+    edited: Vec<brick_store::BrickCoord>,
     /// The longest a result that the scene thread published waited, since it was last asked for,
     /// when the counts are exact (see [`World::take_outbox_wait`]).
     outbox_wait: std::time::Duration,
@@ -461,6 +465,7 @@ impl World {
             unshown_edit: None,
             edit_ticket: 0,
             edits_made: 0,
+            edited: Vec::new(),
             taken_done: 0,
             outbox_wait: std::time::Duration::ZERO,
             lengthened: std::time::Duration::ZERO,
@@ -510,6 +515,12 @@ impl World {
     #[cfg(test)]
     pub fn is_stepped(&self) -> bool {
         self.clock.is_stepped()
+    }
+
+    /// The bricks that Edits changed since the last call (this player's, when they were made, and
+    /// what the server sent), for the renderer's radiance cache to follow the light there faster.
+    pub fn take_edited(&mut self) -> Vec<brick_store::BrickCoord> {
+        std::mem::take(&mut self.edited)
     }
 
     /// Edits made in this world so far. [`World::edit`] makes none when nothing is aimed at or when
@@ -1174,6 +1185,7 @@ impl World {
             return Ok(None);
         };
         self.edits_made += 1;
+        self.edited.extend_from_slice(&changed);
         self.link.send(request)?;
         let Some(worker) = &self.worker else {
             return Ok(self.refresh(&changed)?);
@@ -1222,6 +1234,7 @@ impl World {
         if changed.is_empty() {
             return Ok(None);
         }
+        self.edited.extend_from_slice(changed);
         // What the ghost would change has changed with them, if they are where it reads.
         if let Some(ghost) = &mut self.ghost {
             ghost.dirty |= ghost.touches(changed);

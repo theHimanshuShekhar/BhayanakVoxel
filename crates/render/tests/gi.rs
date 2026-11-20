@@ -133,6 +133,65 @@ fn the_upscaler_does_not_take_light_from_the_noise_of_one_sample_of_gi() {
     );
 }
 
+/// Mean squared error per channel of two images, 0..=255.
+fn mse(a: &Image, b: &Image) -> f64 {
+    let sum: u64 = a
+        .rgba
+        .chunks(4)
+        .zip(b.rgba.chunks(4))
+        .flat_map(|(p, q)| (0..3).map(move |c| u64::from(p[c].abs_diff(q[c])).pow(2)))
+        .sum();
+    sum as f64 / (3 * a.width * a.height) as f64
+}
+
+#[test]
+fn a_camera_moving_sideways_through_noisy_gi_is_not_smeared_by_the_history_the_clamp_lets_through()
+{
+    // The upscaler's clamp lets history stray beyond the range of the traced samples, because the
+    // mean of noisy GI is often outside the range of one frame's samples. That slack must not let
+    // a frame carry the light of where the camera was.
+    let scene = lit_room();
+    let resolution = Resolution {
+        internal: (80, 45),
+        output: (W, H),
+    };
+    let fresh = || {
+        let mut gpu = Offscreen::with_resolution(resolution, &scene).unwrap();
+        gpu.use_legacy_light();
+        gpu.set_flat_ambient(false);
+        gpu
+    };
+    let at = |frames: u32| {
+        let mut camera = room_camera();
+        let right = camera.right();
+        camera.position =
+            std::array::from_fn(|a| camera.position[a] + right[a] * 0.4 * f64::from(frames));
+        camera
+    };
+    let frames = 24;
+    // The cache is warm, and the history is of the first view.
+    let mut moving = fresh();
+    for _ in 0..60 {
+        moving.render_upscaled(&at(0));
+    }
+    let mut image = moving.render_upscaled(&at(0));
+    for frame in 1..=frames {
+        image = moving.render_upscaled(&at(frame));
+    }
+    // What the camera sees now, settled; and what it saw 8 frames before, settled.
+    let settled_at = |frame: u32| {
+        let mut gpu = fresh();
+        settled(&mut gpu, &at(frame), 100)
+    };
+    let now = mse(&image, &settled_at(frames));
+    let unmoved = mse(&image, &settled_at(frames - 8));
+    eprintln!("strafe with GI: {now:.2} against now, {unmoved:.2} against 8 frames back");
+    assert!(
+        now * 2.0 < unmoved,
+        "the frame is no closer to the view it is of ({now}) than to an old one ({unmoved})"
+    );
+}
+
 #[test]
 fn the_same_room_with_the_lamp_replaced_by_rock_is_dark() {
     let rock = material("rock");

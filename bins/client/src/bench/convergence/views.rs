@@ -305,8 +305,45 @@ pub fn room() -> View {
 pub fn walled_room() -> (BrickStore, Camera) {
     (
         room_store(true),
-        Camera::looking_at([4.0, 6.0, 34.0], [14.0, 3.0, 10.0]),
+        Camera::looking_at(DARK_SIDE.0, DARK_SIDE.1),
     )
+}
+
+/// Where the dig's camera is and what it looks at, in the room's own Voxels (x, y and z from 0).
+pub const DARK_SIDE: ([f64; 3], [f64; 3]) = ([4.0, 6.0, 34.0], [14.0, 3.0, 10.0]);
+/// The point of the wall the game's dig is aimed at, from the dark side's camera: the face of the
+/// wall at x = 18, in its middle.
+pub const WALL_AIM: [f64; 3] = [18.0, 5.5, 19.0];
+
+/// The walled room (see [`walled_room`]) made in `store` with its corner at `at`, in Voxels:
+/// the hollow is cleared, so that it may be made where there is ground. Returns the bricks it
+/// changed, for the scene to take in.
+pub fn put_walled_room(store: &mut BrickStore, at: [i32; 3]) -> Vec<BrickCoord> {
+    let rock = material(ROOM_WALL);
+    let lamp = material(ROOM_LAMP);
+    let mut changed = std::collections::BTreeSet::new();
+    let mut set = |store: &mut BrickStore, v: [i32; 3], m: Option<Material>| {
+        let at = VoxelCoord(std::array::from_fn(|a| v[a] + at[a]));
+        changed.insert(at.brick());
+        store.set(at, m);
+    };
+    for x in -2..42 {
+        for y in -2..18 {
+            for z in -2..42 {
+                let inside = (0..40).contains(&x) && (0..16).contains(&y) && (0..40).contains(&z);
+                let wall = (18..20).contains(&x);
+                set(store, [x, y, z], (!inside || wall).then_some(rock));
+            }
+        }
+    }
+    for x in 28..32 {
+        for y in 0..3 {
+            for z in 8..12 {
+                set(store, [x, y, z], Some(lamp));
+            }
+        }
+    }
+    changed.into_iter().collect()
 }
 
 /// The Voxels of the wall that the dig takes out: a gap 2 Voxels thick, 8 high and 10 wide.

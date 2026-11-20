@@ -166,6 +166,7 @@ pub struct ConvergenceReport {
     /// view's own scene is a box of rock; see its `what`).
     pub scene: &'static str,
     pub checkpoints: Vec<u32>,
+    /// The samples of each truth by default; a view may have more (`views[].truth_spp`).
     pub truth_spp: u32,
     pub seeds: Seeds,
     /// How the images were scored; null where FLIP was not run (`--short`).
@@ -209,6 +210,10 @@ pub struct ViewReport {
     pub name: &'static str,
     #[serde(flatten)]
     pub description: Description,
+    /// The samples of each of this view's truths: the report's `truth_spp`, or more where the view
+    /// asks for it (the room's, [`ROOM_TRUTH_SPP`], so that its floor is low enough for the 0.05
+    /// line to count).
+    pub truth_spp: u32,
     /// The GPU time of one sample (the `reference` pass) and of the whole frame of it
     /// (`gpu_total`), in the run that is scored: as the flight's reference mode reports them.
     pub reference: Stats,
@@ -606,6 +611,7 @@ fn run_view(view: View, settings: &Settings, out: &Path) -> Result<ViewReport, B
     Ok(ViewReport {
         name,
         description: view.description,
+        truth_spp,
         ms_per_mpix_per_sample: reference.mean_ms.map(|ms| ms / megapixels),
         converged: Converged::of(&truth_a.linear, &truth_b.linear),
         reference,
@@ -758,10 +764,11 @@ pub fn print_summary(report: &ConvergenceReport) {
         |v: Option<f64>, digits: usize| v.map_or("n/a".to_string(), |v| format!("{v:.digits$}"));
     for view in &report.views {
         eprintln!(
-            "convergence, {} ({}x{}): one sample {} ms (p95 {}), {} ms per megapixel; floor FLIP {} (mse {:.3e})",
+            "convergence, {} ({}x{}, truths of {} samples): one sample {} ms (p95 {}), {} ms per megapixel; floor FLIP {} (mse {:.3e})",
             view.name,
             report.width,
             report.height,
+            view.truth_spp,
             num(view.reference.mean_ms, 3),
             num(view.reference.p95_ms, 3),
             num(view.ms_per_mpix_per_sample, 3),
@@ -862,6 +869,7 @@ mod tests {
             ViewReport {
                 name,
                 description: view,
+                truth_spp: 16,
                 reference: Stats::of(&[2.0, 3.0]),
                 gpu_total: Stats::of(&[2.5, 3.5]),
                 ms_per_mpix_per_sample: Some(0.7),
@@ -918,6 +926,7 @@ mod tests {
                     settle_ms: flip.then_some(33.3),
                     slow_frames: 0,
                     within_target: flip.then_some(true),
+                    game_path: flip,
                 },
                 gates: gi::Gates {
                     room_target_flip: gi::ROOM_TARGET_FLIP,

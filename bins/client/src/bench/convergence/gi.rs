@@ -47,7 +47,8 @@ use std::fs;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use render::{Image, Offscreen, Resolution, Scene};
+use brick_store::VoxelCoord;
+use render::{Camera, Image, Offscreen, Resolution, Scene};
 use serde::Serialize;
 
 use super::shadows::Scores;
@@ -87,6 +88,10 @@ pub struct Settings {
     /// The dig's warm-up and frames.
     pub warm_frames: u32,
     pub dig_frames: u32,
+    /// Whether the dig goes the game's way: a ring scene of the test Planet with the room in it, the
+    /// Edit made through `World::edit` with the scene thread, the frames paced at 60 Hz by the clock
+    /// (the scene thread's time is real). Off for `--short`, which has no Planet to make.
+    pub game_path: bool,
 }
 
 impl Settings {
@@ -100,6 +105,7 @@ impl Settings {
             flip: true,
             warm_frames: WARM_FRAMES,
             dig_frames: DIG_FRAMES,
+            game_path: true,
         }
     }
 
@@ -111,6 +117,7 @@ impl Settings {
             flip: false,
             warm_frames: 6,
             dig_frames: 12,
+            game_path: false,
         }
     }
 }
@@ -174,6 +181,9 @@ pub struct EditSettle {
     pub slow_frames: usize,
     /// Whether it settled within [`SETTLE_WITHIN_MS`]; null where `settle_ms` is.
     pub within_target: Option<bool>,
+    /// Whether the dig went the game's way (a ring scene, `World::edit` and the scene thread), not
+    /// on a flat scene.
+    pub game_path: bool,
 }
 
 /// The gates, and what is over.
@@ -300,8 +310,70 @@ pub fn settled_at(series: &[f64], before: f64, after: f64) -> Option<usize> {
     (from < series.len()).then_some(from)
 }
 
-/// Digs the gap in the room's wall and times how long the lit result takes to follow.
+/// Digs the gap in the room's wall and times how long the lit result takes to follow: through the
+/// game's path with [`Settings::game_path`], else on a flat scene (CI's smoke test).
 pub fn dig(settings: &Settings, out: &Path) -> Result<EditSettle, Box<dyn Error>> {
+    if settings.game_path {
+        dig_in_the_game(settings, out)
+    } else {
+        dig_flat(settings, out)
+    }
+}
+
+/// The frames of a dig and what they say, from the Edit's start.
+struct Frames {
+    frame_ms: Vec<f64>,
+    luminance: Vec<f64>,
+    slow: usize,
+}
+
+/// Where a dig ends: the settled time, the image and the report from `frames`.
+fn settle_report(
+    settings: &Settings,
+    out: &Path,
+    gpu: &mut Offscreen,
+    before: f64,
+    update_ms: f64,
+    voxels_dug: usize,
+    frames: Frames,
+) -> Result<EditSettle, Box<dyn Error>> {
+    let Frames {
+        frame_ms,
+        luminance,
+        slow,
+    } = frames;
+    let tail = &luminance[luminance.len().saturating_sub(END_FRAMES)..];
+    let after = tail.iter().sum::<f64>() / tail.len() as f64;
+    let settle_ms = settled_at(&luminance, before, after).map(|i| frame_ms[i]);
+    // The last frame, for whoever looks at the result.
+    let image = gpu.primary_image();
+    let folder = out.join(super::FOLDER).join("dig");
+    fs::create_dir_all(&folder).map_err(|e| format!("cannot create {}: {e}", folder.display()))?;
+    write_png(&folder.join("after.png"), &image)?;
+    Ok(EditSettle {
+        width: settings.size.0,
+        height: settings.size.1,
+        voxels_dug,
+        update_ms,
+        before,
+        after,
+        frame_ms,
+        luminance,
+        settle_ms,
+        slow_frames: slow,
+        within_target: settle_ms.map(|ms| ms <= SETTLE_WITHIN_MS),
+        game_path: settings.game_path,
+    })
+}
+
+/// The mean luminance of the last [`END_FRAMES`] of `recent`.
+fn tail_mean(recent: &[f64]) -> f64 {
+    let tail = &recent[recent.len().saturating_sub(END_FRAMES)..];
+    tail.iter().sum::<f64>() / tail.len() as f64
+}
+
+/// The dig on a flat scene: the Edit's update made on this thread and copied at once.
+fn dig_flat(settings: &Settings, out: &Path) -> Result<EditSettle, Box<dyn Error>> {
     let (mut store, camera) = views::walled_room();
     let mut scene = Scene::new(&store, None);
     let resolution = Resolution::scaled(settings.size, render::upscale::DEFAULT_SCALE);
@@ -313,8 +385,7 @@ pub fn dig(settings: &Settings, out: &Path) -> Result<EditSettle, Box<dyn Error>
     for _ in 0..settings.warm_frames {
         recent.push(mean_luminance(&gpu.render_upscaled(&camera)));
     }
-    let tail = &recent[recent.len().saturating_sub(END_FRAMES)..];
-    let before = tail.iter().sum::<f64>() / tail.len() as f64;
+    let before = tail_mean(&recent);
 
     // The Edit: the gap's Voxels become air, the scene changes, the GPU is told, as the game does.
     let gap = views::room_gap();
@@ -327,7 +398,7 @@ pub fn dig(settings: &Settings, out: &Path) -> Result<EditSettle, Box<dyn Error>
     let changed: Vec<_> = changed.into_iter().collect();
     let update = scene.update(&store, &changed)?;
     gpu.update_scene(&scene, &update)?;
-    gpu.edit_made();
+    gpu.edit_made(&changed);
     let update_ms = started.elapsed().as_secs_f64() * 1e3;
 
     // The frames, at 60 Hz: each takes its own time or a frame's, whichever is more. The time is
@@ -347,27 +418,161 @@ pub fn dig(settings: &Settings, out: &Path) -> Result<EditSettle, Box<dyn Error>
         // Read after the clock has been read: not in any frame's time.
         luminance.push(mean_luminance(&gpu.primary_image()));
     }
-    let tail = &luminance[luminance.len().saturating_sub(END_FRAMES)..];
-    let after = tail.iter().sum::<f64>() / tail.len() as f64;
-    let settle_ms = settled_at(&luminance, before, after).map(|i| frame_ms[i]);
-    // The last frame, for whoever looks at the result.
-    let image = gpu.primary_image();
-    let folder = out.join(super::FOLDER).join("dig");
-    fs::create_dir_all(&folder).map_err(|e| format!("cannot create {}: {e}", folder.display()))?;
-    write_png(&folder.join("after.png"), &image)?;
-    Ok(EditSettle {
-        width: settings.size.0,
-        height: settings.size.1,
-        voxels_dug: gap.len(),
-        update_ms,
-        before,
-        after,
+    let frames = Frames {
         frame_ms,
         luminance,
-        settle_ms,
-        slow_frames: slow,
-        within_target: settle_ms.map(|ms| ms <= SETTLE_WITHIN_MS),
-    })
+        slow,
+    };
+    settle_report(
+        settings,
+        out,
+        &mut gpu,
+        before,
+        update_ms,
+        gap.len(),
+        frames,
+    )
+}
+
+/// How many Voxels of the room's wall (x = 18..20) are solid in `store`.
+fn wall_voxels(store: &brick_store::BrickStore, at: [i32; 3]) -> usize {
+    let mut solid = 0;
+    for x in 18..20 {
+        for y in 0..16 {
+            for z in 0..40 {
+                let v = VoxelCoord([x + at[0], y + at[1], z + at[2]]);
+                solid += usize::from(store.get(v).is_some());
+            }
+        }
+    }
+    solid
+}
+
+/// The dig the game's way. The room is made in the test Planet's store a little above the spawn
+/// (a ring scene, streamed by the loader and the scene thread), the camera is inside it on the dark
+/// side, and the Edit is the player's: [`World::edit`] with a Brush aimed at the wall, which only
+/// queues the work for the scene thread and returns. The scene thread's patch of it arrives in a
+/// frame's `recentre`, as it does in the game's (`main.rs`), and is copied to the GPU there; the
+/// cache is told which bricks the Edit changed when it is made (`World::take_edited`). The frames
+/// are paced at 60 Hz by the clock, since the scene thread's time is real, and the time is from the
+/// click.
+fn dig_in_the_game(settings: &Settings, out: &Path) -> Result<EditSettle, Box<dyn Error>> {
+    use net::{EditMode, Shape, loopback};
+    use sim::Predictor;
+
+    use crate::bench::stream::{TestPlanet, test_planet};
+    use crate::loader::Loader;
+    use crate::tool::Tool;
+    use crate::world::World;
+
+    let TestPlanet {
+        mut store,
+        mut scene,
+        spawn,
+        bands,
+        ..
+    } = test_planet();
+    // The room's corner: its wall's aim point is 3 m above the spawn (the Edit's reach is from
+    // the camera, the room is a few metres from the character).
+    let up = spawn.horizon_up;
+    let at: [i32; 3] = std::array::from_fn(|a| {
+        (spawn.position[a] + up[a] * 60.0 - views::WALL_AIM[a]).round() as i32
+    });
+    let shift = at.map(f64::from);
+    let shifted = |p: [f64; 3]| std::array::from_fn(|a| p[a] + shift[a]);
+    let placed = views::put_walled_room(&mut store, at);
+    store.refresh_lod(placed.iter().copied());
+    scene.update(&store, &placed)?;
+    let walls_before = wall_voxels(&store, at);
+
+    let camera = Camera::looking_at(shifted(views::DARK_SIDE.0), shifted(views::DARK_SIDE.1));
+    // The player aims at the wall from where they stand.
+    let aim = Camera::looking_at(shifted(views::DARK_SIDE.0), shifted(views::WALL_AIM));
+    let source = store.source().expect("the store has a source");
+    let (client, _server) = loopback();
+    let mut world = World::new(scene, Predictor::new(store), client).with_loader(Loader::new(
+        source,
+        camera.position,
+        bands,
+        2,
+    ));
+    let resolution = Resolution::scaled(settings.size, render::upscale::DEFAULT_SCALE);
+    let mut gpu = Offscreen::with_resolution(resolution, world.scene())?;
+    gpu.use_legacy_light();
+    gpu.set_flat_ambient(false);
+
+    let frame = Duration::from_secs_f64(FRAME_MS / 1e3);
+    // One frame as the game draws it: the camera is told, what the scene thread made is copied.
+    let frame_of = |world: &mut World, gpu: &mut Offscreen| -> Result<(), Box<dyn Error>> {
+        if let Some(update) = world.recentre(camera.position)? {
+            gpu.update_scene(world.scene(), &update)?;
+        }
+        gpu.draw_upscaled(&camera);
+        Ok(())
+    };
+    // The warm-up: the scene thread brings the rings round the camera, and the cache gathers the
+    // dark side's light. The luminance is read at the end of it only.
+    let mut recent = Vec::new();
+    for n in 0..settings.warm_frames {
+        let begun = Instant::now();
+        frame_of(&mut world, &mut gpu)?;
+        if let Some(rest) = frame.checked_sub(begun.elapsed()) {
+            std::thread::sleep(rest);
+        }
+        if n + END_FRAMES as u32 >= settings.warm_frames {
+            recent.push(mean_luminance(&gpu.primary_image()));
+        }
+    }
+    let before = tail_mean(&recent);
+
+    // The click.
+    let tool = Tool {
+        mode: EditMode::Dig,
+        shape: Shape::Cube,
+        radius: 4,
+        ..Tool::default()
+    };
+    let started = Instant::now();
+    let edits = world.edits_made();
+    let update = world.edit(&aim, &tool)?;
+    if world.edits_made() == edits {
+        return Err("the dig was not made: nothing was aimed at, or it is out of reach".into());
+    }
+    if let Some(update) = update {
+        gpu.update_scene(world.scene(), &update)?;
+    }
+    gpu.edit_made(&world.take_edited());
+    let update_ms = started.elapsed().as_secs_f64() * 1e3;
+    let voxels_dug = walls_before - wall_voxels(&world.store(), at);
+
+    // The frames, from the click, one for every 1/60 s of the clock: a frame that takes longer takes
+    // its own time. The luminance is read outside the clock (its readback is not a frame's).
+    let (mut frame_ms, mut luminance) = (Vec::new(), Vec::new());
+    let mut slow = 0;
+    let mut reading = Duration::ZERO;
+    for _ in 0..settings.dig_frames {
+        let begun = Instant::now();
+        frame_of(&mut world, &mut gpu)?;
+        let took = begun.elapsed();
+        if took > frame {
+            slow += 1;
+        }
+        if let Some(rest) = frame.checked_sub(took) {
+            std::thread::sleep(rest);
+        }
+        frame_ms.push((started.elapsed() - reading).as_secs_f64() * 1e3);
+        let read = Instant::now();
+        luminance.push(mean_luminance(&gpu.primary_image()));
+        reading += read.elapsed();
+    }
+    let frames = Frames {
+        frame_ms,
+        luminance,
+        slow,
+    };
+    settle_report(
+        settings, out, &mut gpu, before, update_ms, voxels_dug, frames,
+    )
 }
 
 /// The gates of the phase over its views and its dig.
@@ -453,7 +658,7 @@ pub fn print_summary(views: &[(&'static str, &ViewGi)], report: &GiReport) {
     let g = &report.gates;
     if !g.held {
         eprintln!("  gates: not held (no FLIP)");
-    } else if g.over.is_empty() {
+    } else {
         if !g.not_counted.is_empty() {
             eprintln!(
                 "  gates: not held, the line is under {} times the floor: {}",
@@ -461,9 +666,16 @@ pub fn print_summary(views: &[(&'static str, &ViewGi)], report: &GiReport) {
                 g.not_counted.join(", ")
             );
         }
-        eprintln!("  gates: all met");
-    } else {
-        eprintln!("  gates: OVER: {}", g.over.join(", "));
+        if g.over.is_empty() {
+            let held = if g.not_counted.is_empty() {
+                "all met"
+            } else {
+                "the others met"
+            };
+            eprintln!("  gates: {held}");
+        } else {
+            eprintln!("  gates: OVER: {}", g.over.join(", "));
+        }
     }
 }
 
@@ -531,6 +743,7 @@ mod tests {
             settle_ms,
             slow_frames: 0,
             within_target: settle_ms.map(|ms| ms <= SETTLE_WITHIN_MS),
+            game_path: false,
         }
     }
 
@@ -569,6 +782,58 @@ mod tests {
         // Without FLIP no gate is held.
         let g = gates(&Settings::short((80, 45)), &bad, &edit(Some(600.0)));
         assert!(!g.held && g.over.is_empty());
+    }
+
+    /// The dig the game's way (a ring scene of the test Planet, `World::edit`, the scene thread)
+    /// on a software driver, for whoever wants to see it: it makes the test Planet's spawn ring, which
+    /// takes seconds, so it is not run with the others (`cargo test --release -p client -- --ignored
+    /// --nocapture the_dig_through`).
+    #[test]
+    #[ignore = "makes the test Planet: seconds, and slow on a software driver"]
+    fn the_dig_through_the_games_path_changes_the_room_and_settles() {
+        let out = std::env::temp_dir().join(format!("bhayanak-dig-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&out);
+        fs::create_dir_all(&out).unwrap();
+        for game_path in [false, true] {
+            let settings = Settings {
+                size: (320, 180),
+                settle_frames: 4,
+                flip: false,
+                warm_frames: 60,
+                dig_frames: 90,
+                game_path,
+            };
+            let edit = dig(&settings, &out).unwrap();
+            let at = |n: usize| edit.luminance[n] / edit.after;
+            eprintln!(
+                "game path {game_path}: dug {} Voxels, update {:.2} ms, before {:.4} after {:.4}, \
+                 settle {:?} ms, {} slow frames; the share of the end at frames 0 2 5 10 20 30 45 \
+                 60: {:.2} {:.2} {:.2} {:.2} {:.2} {:.2} {:.2} {:.2}",
+                edit.voxels_dug,
+                edit.update_ms,
+                edit.before,
+                edit.after,
+                edit.settle_ms,
+                edit.slow_frames,
+                at(0),
+                at(2),
+                at(5),
+                at(10),
+                at(20),
+                at(30),
+                at(45),
+                at(60)
+            );
+            assert_eq!(edit.game_path, game_path);
+            assert!(
+                edit.voxels_dug > 100,
+                "the wall was dug: {}",
+                edit.voxels_dug
+            );
+            assert!(edit.after > edit.before * 1.2, "the light shows");
+            assert!(edit.settle_ms.is_some());
+        }
+        let _ = fs::remove_dir_all(&out);
     }
 
     #[test]

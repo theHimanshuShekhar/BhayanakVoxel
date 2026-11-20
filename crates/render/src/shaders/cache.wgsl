@@ -4,9 +4,9 @@
 // trace.wgsl and common.wgsl; gi.wgsl fills and reads it (`gi_trace`), `gi_resolve` here folds each
 // frame's samples in, and shade.wgsl draws its cells for the debug view.
 //
-// A cell is a square of voxels of one face direction of the surface, one voxel thick along the
-// face's normal (`cache_cell_of`): the key is its coordinates, the face (0 to 5) and the level of
-// the square's size, which grows with the distance from the camera (`cache_level`), so a far surface that is a pixel across is a cell too, and the
+// A cell is a cube of voxels of one face direction of the surface (cut where a wall inside it
+// divides it: `cache_split`): the key is the cube's coordinates, the face (0 to 5), the split and
+// the level of the cube's size, which grows with the distance from the camera (`cache_level`), so a far surface that is a pixel across is a cell too, and the
 // table's size is bounded by what the camera sees, not by the world's. What a cell holds is the
 // **incident** light on its face, a multiple of the surface's colour (what a lit surface is the
 // colour times, the same unit as `sun_radiance`): not the emitted light of the face itself, which
@@ -106,16 +106,9 @@ fn cache_face(normal: vec3<f32>) -> u32 {
     return axis * 2u + select(0u, 1u, component(normal, axis) > 0.0);
 }
 
-// The cell's coordinates of `voxel` at `level` for a surface facing `face`: along the face, the
-// cube of 8 << level voxels it is in; along the face's normal, the voxel's own layer (coarsened only
-// by `level` itself, to 1 << level voxels, at a distance where that is less than a pixel). A cell
-// that spanned 8 voxels along the normal would be shared by the floors on both sides of a wall
-// thinner than that, and the dark side would read the lit side's light.
-fn cache_cell_of(voxel: vec3<i32>, level: u32, face: u32) -> vec3<i32> {
-    let across = voxel >> vec3<u32>(3u + level);
-    let along = voxel >> vec3<u32>(level);
-    let axis = face >> 1u;
-    return select(across, along, vec3<u32>(0u, 1u, 2u) == vec3<u32>(axis));
+// The cell's coordinates of `voxel` at `level`: the cube of 8 << level voxels it is in.
+fn cache_cell_of(voxel: vec3<i32>, level: u32) -> vec3<i32> {
+    return voxel >> vec3<u32>(3u + level);
 }
 
 // Whether the Voxel is in the box that the cache forgets faster in, in the frames after an Edit or a
@@ -124,14 +117,17 @@ fn cache_boosted(voxel: vec3<i32>) -> bool {
     return frame.gi.y != 0u && all(voxel >= frame.boost_min.xyz) && all(voxel < frame.boost_max.xyz);
 }
 
-// Where a thin wall splits a level 0 cell: the cell is 8 voxels across, and a wall of a voxel or
-// two inside it (a wall across a floor, a partition under a ceiling) stands between floors that
-// would share it and the light of the lit one. Along each of the two axes of the face, the run of
-// free Voxels the surface's own is in, two Voxels above the surface (so that a step of one Voxel
-// does not count, and a stair or a rough ground is not cut up), clipped to the cell: its two ends,
+// Where a wall splits a level 0 cell: the cell is 8 voxels across, and a wall of a voxel or two
+// inside it (a wall across a floor, a partition under a ceiling) stands between floors that would
+// share it and the light of the lit one. Along each of the two axes of the face, the row of the cell
+// two Voxels above the surface (so that a step of one Voxel does not count, and a stair or a rough
+// ground is not cut up) is read, and the run of free Voxels the surface's own is in is bounded at
+// an end only where solid is followed by free again inside the cell: a wall that divides it. A
+// slope or a hill that rises to the cell's edge divides nothing and is not a bound. The two ends,
 // in 3 bits each, are the cell's split, the same for every point of one side of a wall and another
-// for the other side. A cell nothing stands in is the one split. Bit 12: the Voxel above is solid
-// (a crevice). Level 0 only: farther the wall is less than a pixel, and the scan reads level 0.
+// for the other side: a cell nothing stands in is the one split, so most cells are not cut at
+// all. Bit 12: the Voxel above is solid (a crevice). Level 0 only: farther the wall is less than a
+// pixel, and the scan reads level 0.
 fn cache_split(voxel: vec3<i32>, face: u32, level: u32) -> u32 {
     if level != 0u {
         return 0u;
@@ -151,22 +147,29 @@ fn cache_split(voxel: vec3<i32>, face: u32, level: u32) -> u32 {
             continue;
         }
         let local = u32(voxel[a] & 7);
-        var lo = local;
-        var hi = local;
+        // The row's solid Voxels, a bit for each of the cell's 8.
+        var row = 0u;
         var at = front;
-        for (var i = 1u; i <= local; i++) {
-            at[a] = front[a] - i32(i);
-            if solid_at(at, &bricks) {
-                break;
-            }
-            lo = local - i;
+        let first = front[a] - i32(local);
+        for (var k = 0u; k < 8u; k++) {
+            at[a] = first + i32(k);
+            row |= select(0u, 1u << k, solid_at(at, &bricks));
         }
-        for (var i = 1u; i < 8u - local; i++) {
-            at[a] = front[a] + i32(i);
-            if solid_at(at, &bricks) {
-                break;
-            }
-            hi = local + i;
+        let free = ~row & 0xffu;
+        var lo = local;
+        while lo > 0u && ((row >> (lo - 1u)) & 1u) == 0u {
+            lo--;
+        }
+        // Stopped by a solid Voxel: a wall if there is free beyond it, else the cell's edge.
+        if lo > 0u && (free & ((1u << (lo - 1u)) - 1u)) == 0u {
+            lo = 0u;
+        }
+        var hi = local;
+        while hi < 7u && ((row >> (hi + 1u)) & 1u) == 0u {
+            hi++;
+        }
+        if hi < 7u && (free & (0xffu << (hi + 2u))) == 0u {
+            hi = 7u;
         }
         split |= (lo | (hi << 3u)) << shift;
         shift += 6u;
@@ -177,7 +180,7 @@ fn cache_split(voxel: vec3<i32>, face: u32, level: u32) -> u32 {
 fn cache_key(voxel: vec3<i32>, normal: vec3<f32>, distance: f32) -> vec2<u32> {
     let level = cache_level(distance);
     let face = cache_face(normal);
-    let cell = cache_cell_of(voxel, level, face);
+    let cell = cache_cell_of(voxel, level);
     let split = cache_split(voxel, face, level);
     let h = hash_voxel(cell + vec3<i32>(i32(face * 40503u + level * 9973u + split * 2654435u)));
     // Every part of the key counts in the check, and two keys that differ in the face or the split do
@@ -324,7 +327,7 @@ fn gi_resolve(@builtin(global_invocation_id) id: vec3<u32>) {
 fn cache_cell_colour(voxel: vec3<i32>, normal: vec3<f32>, distance: f32) -> vec3<f32> {
     let level = cache_level(distance);
     let face = cache_face(normal);
-    let cell = cache_cell_of(voxel, level, face);
+    let cell = cache_cell_of(voxel, level);
     let split = cache_split(voxel, face, level);
     let h = hash_voxel(cell + vec3<i32>(i32(face), i32(level), 7 + i32(split)));
     let rgb = vec3<f32>(f32(h & 255u), f32((h >> 8u) & 255u), f32((h >> 16u) & 255u)) / 255.0;

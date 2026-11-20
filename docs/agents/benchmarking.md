@@ -1271,12 +1271,17 @@ view's **truth A**, which the view's own run made, at the output size:
   The images are in `convergence/VIEW/primary-{flat,gi}-{first-frame,settled}.png`.
 - **`convergence.gi.edit`**, **the dig**: the room with a wall across it that the lamp's light does not
   get through, seen from the dark side, warmed up for 90 frames; a gap of 160 Voxels is dug in
-  the wall the way the game applies an Edit (`Scene::update`, `Offscreen::update_scene`), and frames are
-  drawn at 60 Hz (a frame that takes longer than 1/60 s takes its own time). The image's mean
+  the wall and frames are drawn at 60 Hz (a frame that takes longer than 1/60 s takes its own time). The image's mean
   luminance after each frame is `luminance[]`, at `frame_ms[]` from the start of the update.
   **`settle_ms`** is the time of the first frame after which the luminance stays within a tenth of the
   change's size of where it ends up (null if the dig changed it by under 5 %); `before`, `after`,
   `update_ms` (the Edit's CPU time) and `slow_frames` (frames over 60 Hz) say the rest.
+  **`edit.game_path`** says which path made the Edit. True (the full run): **the game's own**: a ring
+  scene of the test Planet (`stream::test_planet()`), a `World` with its loader threads, the Edit made
+  by `World::edit`, the scene worker's patch arriving in `World::recentre` a frame or two later, and
+  the cache's boost taken, on the frame thread at `World::edit` time, from the Edit's changed bricks
+  (`Offscreen::edit_made`): the settle time includes that latency, which is what a player waits.
+  False (`--short`): the flat scene, `Scene::update` and `Offscreen::update_scene` at once.
 - **The gates** (`convergence.gi.gates`, held with FLIP only, **exit status 2** if any is over, `--no-fail`
   silences it): `room-flip` (the room's settled GI image at FLIP mean 0.10 or under, 1440p, the ticket's;
   #55 tightens it), `no-further:VIEW` (a view's settled GI image no further from truth than its flat
@@ -1286,6 +1291,8 @@ view's **truth A**, which the view's own run made, at the output size:
   room** (ADR 0005: at least 4 times the room's floor, so a room whose truths are noisier than 0.0125
   is not held to it; **the room's truths have at least 4096 samples** when FLIP is run, `ROOM_TRUTH_SPP`,
   for a floor of about 0.0105 that 0.05 is four times, since the room's floor was 0.0211 at 1024).
+  Each view's `truth_spp` (`views[].truth_spp`, and the summary's "truths of N samples") says how many
+  samples its truths had; the room's is `ROOM_TRUTH_SPP` when that is more than `--truth-spp`.
   `gates.over` names those that are over, `gates.not_counted` those that were not held for being under
   4 times the floor.
 - **Why gate the settled frame**: the first frame of a cold cache is the noisiest GI is, and the player

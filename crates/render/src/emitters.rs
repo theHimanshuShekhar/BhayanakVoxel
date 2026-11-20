@@ -32,7 +32,7 @@
 //! | `lists` ..                     | the boxes of every cell's list, by index                     |
 //! | `boxes` ..                     | 8 words a box: its first Voxel (3 x i32), its Material, one past its last Voxel (3 x i32), and a pad |
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::ops::Range;
 
 use crate::scene::{
@@ -297,7 +297,8 @@ impl EmitterIndex {
     /// drops the regions the scene no longer has. The work is the table's slots, a few words a
     /// slot, and the regions it rescans; nothing of a region that did not change is read.
     pub fn apply(&mut self, scene: &Scene, emissive: &[bool], update: &SceneUpdate) -> Applied {
-        let (written, refs): (Vec<usize>, Vec<Range<usize>>) = match update {
+        let (written, refs, rewritten): (Vec<usize>, Vec<Range<usize>>, &[[i32; 3]]) = match update
+        {
             SceneUpdate::Rebuilt => {
                 let fresh = Self::scan(scene, emissive);
                 let emitters_changed = fresh.by_region != self.by_region;
@@ -314,8 +315,13 @@ impl EmitterIndex {
             } => (
                 regions.clone(),
                 std::iter::once(*brick_refs_from..usize::MAX).collect(),
+                &[],
             ),
-            SceneUpdate::Rings(patch) => (patch.regions.clone(), patch.brick_refs.clone()),
+            SceneUpdate::Rings(patch) => (
+                patch.regions.clone(),
+                patch.brick_refs.clone(),
+                &patch.rewritten,
+            ),
         };
         let mut written = written;
         written.sort_unstable();
@@ -337,7 +343,8 @@ impl EmitterIndex {
                 }
                 let record = &scene.regions[(entry - 1) * REGION_WORDS..][..REGION_WORDS];
                 let first = record[REGION_FIRST_REF];
-                let mut changed = written.binary_search(&(entry - 1)).is_ok();
+                let mut changed = written.binary_search(&(entry - 1)).is_ok()
+                    || rewritten.binary_search(&key).is_ok();
                 if !changed && first & SOLID_FLAG == 0 {
                     let count = record[..16].iter().map(|w| w.count_ones()).sum::<u32>() as usize;
                     let first = first as usize;
@@ -418,24 +425,39 @@ impl EmitterIndex {
     }
 
     /// The buffer of the boxes and lists: at most [`MAX_BOXES`] boxes, the first by region.
+    ///
+    /// A box's number is its place in region order, so a list's entries are found by the box's
+    /// region (the cell its centre is in) and its place in the region's boxes: no hash of a box.
+    /// This runs on the frame thread when an update changes the emitters, and what it costs is
+    /// the boxes and the cells that have lists, nothing else: in release about 0.1 ms for 3 000
+    /// boxes in 125 cells, 0.6 ms for 3 000 boxes each in a cell of its own, and 0.55 ms at
+    /// [`MAX_BOXES`] (it was 0.3, 0.9 and 3.2 ms with a hash of every box).
     pub fn emitters(&self) -> Emitters {
-        let boxes: Vec<EmitterBox> = self
-            .by_region
-            .values()
-            .flatten()
-            .copied()
-            .take(MAX_BOXES)
-            .collect();
-        let numbered: HashMap<EmitterBox, usize> =
-            boxes.iter().enumerate().map(|(i, &b)| (b, i)).collect();
+        let mut boxes: Vec<EmitterBox> = Vec::new();
+        // Each region taken, its first box's number, and its boxes.
+        let mut starts: Vec<([i32; 3], usize, &[EmitterBox])> =
+            Vec::with_capacity(self.by_region.len());
+        for (&key, region) in &self.by_region {
+            if boxes.len() >= MAX_BOXES {
+                break;
+            }
+            let take = region.len().min(MAX_BOXES - boxes.len());
+            starts.push((key, boxes.len(), &region[..take]));
+            boxes.extend_from_slice(&region[..take]);
+        }
+        let number = |b: &EmitterBox| -> Option<usize> {
+            let centre2 = b.centre2();
+            let home: [i32; 3] =
+                std::array::from_fn(|a| (centre2[a] / 2).div_euclid(i64::from(CELL_VOXELS)) as i32);
+            let at = starts.binary_search_by_key(&home, |s| s.0).ok()?;
+            let (_, start, region) = starts[at];
+            region.iter().position(|r| r == b).map(|i| start + i)
+        };
         let lists = self
             .lists
             .iter()
             .filter_map(|(&cell, list)| {
-                let indices: Vec<usize> = list
-                    .iter()
-                    .filter_map(|b| numbered.get(b).copied())
-                    .collect();
+                let indices: Vec<usize> = list.iter().filter_map(number).collect();
                 (!indices.is_empty()).then_some((cell, indices))
             })
             .collect();
