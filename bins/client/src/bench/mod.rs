@@ -314,9 +314,13 @@ fn run(args: &Args) -> Result<u8, Box<dyn Error>> {
     // a run of it stops on an error, the report still has everything that was done before, and the
     // error: tens of minutes of the 4090's time are not thrown away for the last run's.
     let streaming_real_time = match real_time_budgets {
-        Some(budgets) if args.real_time => {
-            Some(realtime::run(!plan.patch, args.runs, resolution, &budgets))
-        }
+        Some(budgets) if args.real_time => Some(realtime::run(
+            !plan.patch,
+            args.runs,
+            resolution,
+            args.flat_ambient,
+            &budgets,
+        )),
         _ => None,
     };
 
@@ -851,7 +855,7 @@ fn print_real_time(r: &realtime::RealTimeReport) {
             c.load_s,
             c.fill_s
         );
-        for p in &run.paths {
+        for p in run.paths.iter().chain([&run.unpaced_control]) {
             eprintln!(
                 "    {:<20} {:>5} frames: frame p99 {:>6.2} worst {:>7.2} ms, cpu p99 {:>6.2} worst {:>7.2} ms, soft misses {:.2} a frame, holes {} in {} looks ({:.0} ms, {:.0}% of the scene thread's busy time; the end look {:.0} ms), {} frames over the limit{}",
                 p.name,
@@ -877,6 +881,27 @@ fn print_real_time(r: &realtime::RealTimeReport) {
                     }
                 ))
             );
+            // What the mean frame is made of, and the GPU's own time of each pass (means).
+            let m = &p.frame_parts;
+            eprintln!(
+                "        mean frame {:.2} ms = recentre {:.2} + update {:.2} + encode {:.2} + submit {:.2} + wait {:.2} (GPU passes {:.2}, the rest of the wait {:.2})",
+                p.frame_time.mean_ms,
+                m.recentre.mean_ms,
+                m.update.mean_ms,
+                m.encode.mean_ms,
+                m.submit.mean_ms,
+                m.wait.mean_ms,
+                m.gpu_total.mean_ms,
+                m.wait_not_passes.mean_ms,
+            );
+            if !p.gpu_passes.is_empty() {
+                let passes: Vec<String> = p
+                    .gpu_passes
+                    .iter()
+                    .map(|(name, s)| format!("{name} {:.3}", s.mean_ms))
+                    .collect();
+                eprintln!("        GPU passes, mean ms: {}", passes.join(", "));
+            }
             // Where the time of the slowest frames went, when there were frames over the limit.
             if p.frames_over_limit > 0 {
                 for f in p.slowest.iter().take(3) {

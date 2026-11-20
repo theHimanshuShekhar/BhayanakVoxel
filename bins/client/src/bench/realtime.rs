@@ -145,6 +145,12 @@ pub trait Gpu {
     fn peak_rebuild_bytes(&self) -> u64 {
         0
     }
+
+    /// The GPU's own time of each pass of the frame just drawn, by the pass's name, in
+    /// milliseconds: empty with no GPU, no timers, or where this frame's times did not come in.
+    fn pass_times(&self) -> Vec<(String, f64)> {
+        Vec::new()
+    }
 }
 
 /// What a frame's copy to the GPU and draw took, by part.
@@ -213,6 +219,10 @@ impl Gpu for OffscreenGpu<'_> {
         self.0.peak_growth_bytes()
     }
 
+    fn pass_times(&self) -> Vec<(String, f64)> {
+        self.0.last_draw_pass_times().to_vec()
+    }
+
     fn peak_rebuild_bytes(&self) -> u64 {
         self.0.peak_rebuild_bytes()
     }
@@ -259,6 +269,24 @@ impl Spread {
             worst_ms: sorted[sorted.len() - 1],
         }
     }
+}
+
+/// The parts of every frame of a path, in milliseconds (see [`PathReport::frame_parts`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize)]
+pub struct FrameParts {
+    /// The frame thread's recentring of the world.
+    pub recentre: Spread,
+    /// The update's copy to the GPU, over every frame (0 where there was no update).
+    pub update: Spread,
+    /// Encoding the draw, and submitting it.
+    pub encode: Spread,
+    pub submit: Spread,
+    /// The wait for the GPU to be done.
+    pub wait: Spread,
+    /// What the GPU says the frame took, first pass to last (frames whose times came in).
+    pub gpu_total: Spread,
+    /// The wait less that: the GPU's time that no pass timed, and what it took to wake.
+    pub wait_not_passes: Spread,
 }
 
 /// What the uploads of a path's frames came to (#145): the frames that had an update, what each cost
@@ -683,6 +711,14 @@ pub struct PathReport {
     /// Frame time, up to the GPU being done, and the frame thread's CPU time (see the module).
     pub frame_time: Spread,
     pub frame_cpu: Spread,
+    /// What the frame time is made of, by part (the parts of [`SlowFrame`], over every frame of the
+    /// path): so that a path that costs more than another can be placed in the recentring, the copy
+    /// to the GPU, the encoding, the submit, the wait for the GPU, or what the GPU says its passes
+    /// took. The slowest frames have the same parts one by one; this is all of them.
+    pub frame_parts: FrameParts,
+    /// The GPU's own time of each pass, by the pass's name, over the frames whose times came in
+    /// (#54: GI is passes `gi` and `shade`, and the frame's cost is read against main's here).
+    pub gpu_passes: std::collections::BTreeMap<String, Spread>,
     /// The frames' cycle from the start of one to the start of the next (the last frame of the
     /// path has none), and by how much their pacing sleeps ran over what they asked for, over the
     /// frames that slept (#167). A cycle over 16.7 ms that `frame_time` does not show is the
@@ -877,6 +913,12 @@ pub struct RunReport {
     pub sizing: Sizing,
     /// The view held Still after a flight (#217).
     pub still_after_flight: StillAfterFlight,
+    /// A control for the frame time: 180 frames with the camera standing at the Spawn, **not paced**
+    /// (each frame follows the one before at once, as the GPU bench's do), with the same parts and
+    /// per-pass GPU times as a path. A frame time that is much more paced than unpaced is the GPU
+    /// (or its driver) idling between frames, which the game's own frames do too; one that is the
+    /// same is the work. Not gated, and not one of `paths`.
+    pub unpaced_control: PathReport,
 }
 
 /// A measure against what it is held to.
@@ -1241,6 +1283,8 @@ struct Frame {
     cpu_ms: f64,
     /// The parts of the frame; its `index` and `at_ms` are set by the path that takes it in.
     parts: SlowFrame,
+    /// The GPU's time of each of the frame's passes, by name.
+    pass_ms: Vec<(String, f64)>,
     soft_misses: usize,
     /// The words of the scene in use at the end of the frame, in bytes.
     scene_used_bytes: u64,
@@ -1272,6 +1316,15 @@ struct Capture {
     scene_used_peak_bytes: u64,
     frame_ms: Vec<f64>,
     cpu_ms: Vec<f64>,
+    /// The parts of every frame, and the GPU's time of every pass.
+    recentre_ms: Vec<f64>,
+    update_all_ms: Vec<f64>,
+    encode_ms: Vec<f64>,
+    submit_ms: Vec<f64>,
+    wait_ms: Vec<f64>,
+    gpu_total_ms: Vec<f64>,
+    wait_not_passes_ms: Vec<f64>,
+    pass_series: std::collections::BTreeMap<String, Vec<f64>>,
     /// The start of each frame, to work the cycles out from, and the overshoot of the sleeps.
     started: Vec<Instant>,
     /// The cycle from the start of each frame to the next's, less what the harness did between
@@ -1337,6 +1390,14 @@ impl Capture {
             scans: work.hole_scans,
             holes: work.holes_found,
             frame_ms: Vec::new(),
+            recentre_ms: Vec::new(),
+            update_all_ms: Vec::new(),
+            encode_ms: Vec::new(),
+            submit_ms: Vec::new(),
+            wait_ms: Vec::new(),
+            gpu_total_ms: Vec::new(),
+            wait_not_passes_ms: Vec::new(),
+            pass_series: Default::default(),
             cpu_ms: Vec::new(),
             started: Vec::new(),
             cycles: Vec::new(),
@@ -1384,6 +1445,17 @@ impl Capture {
         }
         self.frame_ms.push(frame.time_ms);
         self.cpu_ms.push(frame.cpu_ms);
+        self.recentre_ms.push(frame.parts.recentre_ms);
+        self.update_all_ms.push(frame.parts.update_ms);
+        self.encode_ms.push(frame.parts.encode_ms);
+        self.submit_ms.push(frame.parts.submit_ms);
+        self.wait_ms.push(frame.parts.wait_ms);
+        self.gpu_total_ms.extend(frame.parts.gpu_total_ms);
+        self.wait_not_passes_ms
+            .extend(frame.parts.wait_not_passes_ms);
+        for (name, ms) in &frame.pass_ms {
+            self.pass_series.entry(name.clone()).or_default().push(*ms);
+        }
         if let Some(before) = self.started.last() {
             // The harness's own look between frames is not the frame's pacing.
             let turn = frame.began.duration_since(*before).as_secs_f64() * 1e3;
@@ -1442,6 +1514,20 @@ impl Capture {
                 .unwrap_or_else(|| self.began.elapsed().as_secs_f64()),
             frame_time: Spread::of(&self.frame_ms),
             frame_cpu: Spread::of(&self.cpu_ms),
+            frame_parts: FrameParts {
+                recentre: Spread::of(&self.recentre_ms),
+                update: Spread::of(&self.update_all_ms),
+                encode: Spread::of(&self.encode_ms),
+                submit: Spread::of(&self.submit_ms),
+                wait: Spread::of(&self.wait_ms),
+                gpu_total: Spread::of(&self.gpu_total_ms),
+                wait_not_passes: Spread::of(&self.wait_not_passes_ms),
+            },
+            gpu_passes: self
+                .pass_series
+                .iter()
+                .map(|(name, ms)| (name.clone(), Spread::of(ms)))
+                .collect(),
             frame_cycle: Spread::of(&self.cycles),
             sleep_overshoot: Spread::of(&self.sleep_over_ms),
             frames_over_limit: self.over_limit,
@@ -1566,7 +1652,13 @@ struct Session<'a> {
     harness_wait: Duration,
     /// When the frame before ended, its sleep done (none before the first).
     last_ended: Option<Instant>,
+    /// Whether a frame sleeps out the rest of its 60th of a second (false only in the unpaced
+    /// control, [`RunReport::unpaced_control`]).
+    paced: bool,
 }
+
+/// The frames of the unpaced control.
+const UNPACED_FRAMES: usize = 180;
 
 /// What an update copies to the GPU: its kind, the bytes in all and those of a patch's words.
 fn uploaded(scene: &Scene, update: Option<&SceneUpdate>) -> (&'static str, u64, u64) {
@@ -1593,6 +1685,7 @@ impl<'a> Session<'a> {
             camera_wait: Duration::ZERO,
             harness_wait: Duration::ZERO,
             last_ended: None,
+            paced: true,
             step: "starting".to_string(),
             work_before,
             scene_used_peak_bytes: 0,
@@ -1692,7 +1785,9 @@ impl<'a> Session<'a> {
         };
         let slept = Instant::now();
         let asked = FRAME.saturating_sub(slept - began);
-        std::thread::sleep(asked);
+        if self.paced {
+            std::thread::sleep(asked);
+        }
         let ended = Instant::now();
         self.last_ended = Some(ended);
         let parts = SlowFrame {
@@ -1707,6 +1802,7 @@ impl<'a> Session<'a> {
             time_ms: parts.time_ms,
             cpu_ms: parts.cpu_ms,
             parts,
+            pass_ms: self.gpu.pass_times(),
             soft_misses: self.world.stats().soft_misses,
             scene_used_bytes: self.world.used_bytes(),
             throttled: self.world.stats().throttled,
@@ -2217,6 +2313,8 @@ impl<'a> Session<'a> {
         self.settle(&spawn, cap, "the stop after a flight")?;
         let still_after_flight = self.still_after_a_flight(&course, script)?;
         self.settle(&spawn, cap, "the still after a flight")?;
+        let unpaced_control = self.unpaced_control(&spawn)?;
+        self.settle(&spawn, cap, "the unpaced control")?;
         let (edit_latency, edit_not_made) = match self.edit(&spawn)? {
             Edit::Taken(latency) => (Some(latency), None),
             Edit::NotMade(why) => (None, Some(why)),
@@ -2250,7 +2348,26 @@ impl<'a> Session<'a> {
             memory,
             sizing,
             still_after_flight,
+            unpaced_control,
         })
+    }
+
+    /// [`UNPACED_FRAMES`] frames with the camera standing at `spawn` and no sleep between them, as
+    /// the GPU bench draws, to set beside the paths' paced frames.
+    fn unpaced_control(&mut self, spawn: &Camera) -> Result<PathReport, Box<dyn Error>> {
+        self.paced = false;
+        let spawn = *spawn;
+        let mut frames = 0;
+        let report = self.path_until(
+            "unpaced control",
+            |_, _| spawn,
+            |_, _| {
+                frames += 1;
+                frames >= UNPACED_FRAMES
+            },
+        );
+        self.paced = true;
+        report
     }
 }
 
@@ -2304,13 +2421,14 @@ fn whole_run(
     full: bool,
     run: u32,
     resolution: Resolution,
+    flat_ambient: bool,
     script: &Script,
     limit_ms: f64,
 ) -> Result<(RunReport, f64), Failure> {
     // What the paths do is caught where the step is known; this catches the rest (making the
     // world, the GPU, and ending the run, which drops them).
     catch_unwind(AssertUnwindSafe(|| {
-        run_once(full, run, resolution, script, limit_ms)
+        run_once(full, run, resolution, flat_ambient, script, limit_ms)
     }))
     .unwrap_or_else(|payload| {
         Err(Failure {
@@ -2325,6 +2443,7 @@ fn run_once(
     full: bool,
     run: u32,
     resolution: Resolution,
+    flat_ambient: bool,
     script: &Script,
     limit_ms: f64,
 ) -> Result<(RunReport, f64), Failure> {
@@ -2338,7 +2457,7 @@ fn run_once(
     let d0 = built.setup.d0;
     let mut gpu = Offscreen::with_resolution(resolution, built.world.scene())
         .map_err(|e| failed("making the GPU context", e))?;
-    gpu.set_flat_ambient(false);
+    gpu.set_flat_ambient(flat_ambient);
     // The atmosphere measures the camera's height from the Planet's sea level.
     gpu.set_ground_level(f64::from(if full {
         planet_gen::world_map::WORLD_RADIUS
@@ -2355,10 +2474,15 @@ fn run_once(
 /// Runs the real-time mode: `runs` runs of the paths, each on a world of its own and a GPU of its
 /// own, at full size or (for `--short`) on the test Planet, and the report of them. A run that
 /// stops ends the mode, and the report has the runs that finished and the error.
+///
+/// With `flat_ambient` Primary is drawn with the flat ambient of before #54 instead of the radiance
+/// cache's GI (`--flat-ambient`): a baseline on the same build to read GI's cost against, which the
+/// report's `planet` says. The gates are held as ever.
 pub fn run(
     full: bool,
     runs: u32,
     resolution: Resolution,
+    flat_ambient: bool,
     budgets: &StreamingBudgets,
 ) -> RealTimeReport {
     let script = if full {
@@ -2372,7 +2496,14 @@ pub fn run(
     for run in 1..=runs {
         eprintln!("real time: run {run} of {runs}");
         let began = Instant::now();
-        match whole_run(full, run, resolution, &script, budgets.frame_time_p99_ms) {
+        match whole_run(
+            full,
+            run,
+            resolution,
+            flat_ambient,
+            &script,
+            budgets.frame_time_p99_ms,
+        ) {
             Ok((report, d)) => {
                 d0 = d;
                 eprintln!("real time: run {run} took {:.0?}", began.elapsed());
@@ -2390,11 +2521,14 @@ pub fn run(
             }
         }
     }
-    let planet = if full {
+    let mut planet = if full {
         "full-size".to_string()
     } else {
         "test".to_string()
     };
+    if flat_ambient {
+        planet.push_str(", flat ambient");
+    }
     let report = RealTimeReport::new(planet, d0, reports, budgets);
     match failure {
         Some(failure) => report.failed(failure),
@@ -2433,6 +2567,8 @@ mod tests {
                 p99_ms: cpu_p99,
                 worst_ms: cpu_p99 * 2.0,
             },
+            frame_parts: FrameParts::default(),
+            gpu_passes: Default::default(),
             frame_cycle: Spread::default(),
             sleep_overshoot: Spread::default(),
             frames_over_limit: 0,
@@ -2576,6 +2712,7 @@ mod tests {
                 },
                 holes_after_catch_up: 0,
             },
+            unpaced_control: path("unpaced control", 5.0, 3.0, 0),
         };
         change(&mut run);
         run
@@ -2874,7 +3011,8 @@ mod tests {
                 "paths",
                 "scene_thread",
                 "sizing",
-                "still_after_flight"
+                "still_after_flight",
+                "unpaced_control"
             ]
         );
         assert_eq!(
@@ -2906,10 +3044,12 @@ mod tests {
                 "end_look_ms",
                 "frame_cpu",
                 "frame_cycle",
+                "frame_parts",
                 "frame_time",
                 "frames",
                 "frames_over_limit",
                 "frames_over_limit_by_update",
+                "gpu_passes",
                 "hole_looks",
                 "holes",
                 "holes_per_frame",
@@ -2933,6 +3073,18 @@ mod tests {
                 "soft_misses_per_frame",
                 "still_cuts",
                 "upload"
+            ]
+        );
+        assert_eq!(
+            keys(&json["runs"][0]["paths"][0]["frame_parts"]),
+            [
+                "encode",
+                "gpu_total",
+                "recentre",
+                "submit",
+                "update",
+                "wait",
+                "wait_not_passes"
             ]
         );
         assert_eq!(

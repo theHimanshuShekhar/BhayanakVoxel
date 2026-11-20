@@ -39,6 +39,9 @@ Options:
   --runs N         With --real-time, how many times to run the paths in this process
                    [default: 3]. The report gives each count's min and max over the runs, and
                    the gates use the worst
+  --flat-ambient   With --real-time, draw Primary with the flat ambient of before #54 and not the
+                   radiance cache's GI: a baseline on the same build, to read GI's cost against
+                   (the report's planet says `flat ambient`; the gates are held as ever)
   --no-convergence Leave out the convergence phase (ADR 0005), which otherwise runs last of the
                    timed phases: the Reference view on two still views (the reference golden's,
                    and a pit lit by bounce light) at the output resolution, scored with FLIP and
@@ -96,6 +99,9 @@ pub struct Args {
     /// The real-time mode of the streaming bench (#162), and how many runs of it.
     pub real_time: bool,
     pub runs: u32,
+    /// `--flat-ambient`: the real-time mode draws Primary with the flat ambient of before #54, as a
+    /// baseline on the same build to read GI's cost against.
+    pub flat_ambient: bool,
     pub no_fail: bool,
     /// The convergence phase (#187), which runs unless `--no-convergence`, and its truths' samples
     /// if `--truth-spp` said.
@@ -130,6 +136,7 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Parsed, String> {
         streaming: false,
         real_time: false,
         runs: DEFAULT_RUNS,
+        flat_ambient: false,
         no_fail: false,
         convergence: true,
         truth_spp: None,
@@ -152,6 +159,7 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Parsed, String> {
                 parsed.runs = runs(&value("--runs")?)?;
                 runs_given = true;
             }
+            "--flat-ambient" => parsed.flat_ambient = true,
             "--no-fail" => parsed.no_fail = true,
             "--no-convergence" => parsed.convergence = false,
             "--flip-gamma-2-2" => parsed.flip_gamma22 = true,
@@ -170,6 +178,9 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Parsed, String> {
     }
     if runs_given && !parsed.real_time {
         return Err("--runs is for --real-time".into());
+    }
+    if parsed.flat_ambient && !parsed.real_time {
+        return Err("--flat-ambient is for --real-time".into());
     }
     if parsed.truth_spp.is_some() && !parsed.convergence {
         return Err(
@@ -297,6 +308,7 @@ mod tests {
                 streaming: false,
                 real_time: false,
                 runs: 3,
+                flat_ambient: false,
                 no_fail: false,
                 convergence: true,
                 truth_spp: None,
@@ -315,6 +327,7 @@ mod tests {
         assert!(args.real_time && args.streaming);
         assert_eq!(args.runs, DEFAULT_RUNS);
         assert_eq!(run(&["--streaming", "--real-time", "--runs", "1"]).runs, 1);
+        assert!(run(&["--streaming", "--real-time", "--flat-ambient"]).flat_ambient);
         for bad in [
             &["--real-time"][..],
             &["--streaming", "--runs", "3"],
@@ -322,6 +335,7 @@ mod tests {
             &["--streaming", "--real-time", "--runs", "0"],
             &["--streaming", "--real-time", "--runs", "-1"],
             &["--streaming", "--real-time", "--runs", "many"],
+            &["--streaming", "--flat-ambient"],
             // The diagnostic switches say the budgets are not checked, which the gates always are.
             &["--streaming", "--real-time", "--diag", "no-flush"],
         ] {

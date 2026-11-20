@@ -184,6 +184,7 @@ pub struct Offscreen {
     flush_scene_updates: bool,
     last_update: UpdateTimes,
     last_draw: DrawTimes,
+    last_passes: Vec<(String, f64)>,
     presenter: Option<Presenter>,
 }
 
@@ -269,6 +270,7 @@ impl Offscreen {
             flush_scene_updates: true,
             last_update: UpdateTimes::default(),
             last_draw: DrawTimes::default(),
+            last_passes: Vec::new(),
             presenter: None,
         })
     }
@@ -307,6 +309,13 @@ impl Offscreen {
     /// The parts of the last [`Offscreen::draw_upscaled_timed`].
     pub fn last_draw_times(&self) -> DrawTimes {
         self.last_draw
+    }
+
+    /// The GPU's time of each pass of the last [`Offscreen::draw_upscaled_timed`], by the pass's
+    /// name (`primary`, `normals`, `shadows`, `gi`, `shade`, `upscale`, ...), in milliseconds:
+    /// empty where the device has no timers or this frame's own times did not come in.
+    pub fn last_draw_pass_times(&self) -> &[(String, f64)] {
+        &self.last_passes
     }
 
     /// Whether [`Offscreen::update_scene`] sends the writes to the GPU at once (the default), or
@@ -659,6 +668,18 @@ impl Offscreen {
             .poll(wgpu::PollType::wait_indefinitely())
             .expect("device poll failed");
         let waited = began.elapsed() - submitted;
+        self.last_passes = self
+            .profiler
+            .times_of_this_frame()
+            .map(|frame| {
+                let timings = self.profiler.timings();
+                frame
+                    .passes
+                    .iter()
+                    .map(|&(pass, ms)| (timings.passes()[pass].name.to_string(), ms))
+                    .collect()
+            })
+            .unwrap_or_default();
         let gpu = self.profiler.times_of_this_frame().map(|frame| {
             let timings = self.profiler.timings();
             let named = |name: &str| {

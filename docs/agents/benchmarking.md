@@ -61,6 +61,7 @@ release: a debug build's CPU side is slow enough to distort the frame times.
 | `--streaming` | Also runs the streaming mode (below): the test Planet streamed in, stepped, on a fixed frame schedule, with counts that are the same on every run. The report's `streaming` is null without it. |
 | `--real-time` | With `--streaming`, also runs the real-time mode (below): the full-size Planet with the real loader workers and scene thread, on the machine's clock, along paths of 50 m/s flights, a take-off, a turn, a stop and a cold start. It takes tens of minutes and is not deterministic. With `--short` it runs on the test Planet, as a smoke test. The report's `streaming_real_time` is null without it. |
 | `--runs N` | With `--real-time`, how many times to run the paths in this process. Default 3. The report keeps each run and the least and the most of every number over them; the gates use the worst. |
+| `--flat-ambient` | With `--real-time`, runs it with the flat ambient light (the goldens' and tests' lighting, no radiance-cache GI) instead of the game's GI, to tell what the GI costs in the real-time frame: the same run, the same paths. The planet's label in the report says ", flat ambient". An error without `--real-time`. |
 | `--flip-gamma-2-2` | Also score each checkpoint with the old gamma-2.2 curve (#188), from the same samples, to tell the sRGB move from the estimator's effect. Not with `--no-convergence` or `--short`. |
 | `--no-convergence` | Leave out the convergence phase (below), which otherwise runs after the caves. |
 | `--truth-spp N` | Samples of each of the convergence phase's two truths (the emissive room's have at least 8192 with FLIP, `ROOM_TRUTH_SPP`). Default 1024; ADR 0005's is 8192, which takes eight times as long (`client.exe bench --truth-spp 8192` is the 4090 baseline). At least 1024, the last checkpoint. |
@@ -359,6 +360,20 @@ camera, and `holes_after_catch_up` the holes the look after it found, which must
   ring of 20 m is there before the first frame and the spec's condition would read the load time
   too; the time that streaming adds to it is `fill_s` minus this. The ray is cheap, and a ring of
   rays at 20 m could not be tried at full size without the 4090.
+- `frame_parts` and `gpu_passes` (#54; in each path, schema 28 unchanged), to find where a frame's
+  time goes: `frame_parts` is `{recentre, update, encode, submit, wait, gpu_total, wait_not_passes}`,
+  each a `Spread` (`samples, mean_ms, p99_ms, worst_ms`) of the frame thread's parts of one frame
+  (`wait` is the wait for the GPU after submitting; `gpu_total` the GPU's own time of the passes;
+  **`wait_not_passes` is `wait` less `gpu_total`: time the frame waited that no timed pass accounts
+  for**, which is the driver or the GPU idling between frames when it is large). `gpu_passes` is a map
+  from the name of each timed pass (`primary`, `normals`, `shadows`, `gi`, `shade`, `atmosphere`,
+  `bloom_*`, `exposure*`, `tone`, `upscale`) to the `Spread` of its GPU time, so a pass that costs
+  more in the game than in the GPU bench is visible. The summary prints both per path.
+- `unpaced_control` (#54; a run's, a path's form, not gated and not in `paths`): 180 frames with the
+  camera standing at the Spawn **and no pacing sleep**, each frame following the one before as the
+  GPU bench's do. Set its `frame_time` and `gpu_passes` beside a paced path's: a frame that is much
+  longer paced than unpaced is the GPU idling between frames (clocks dropping, the driver), which no
+  pass accounts for; the same length is the work itself.
 - `still_after_flight` (#217, schema 22; a run's, not a path's): the view held Still after a flight, with
   the game's policy ("The still hold", above):
   - `before_hold`: the catch-up before the hold. `lag_when_still_voxels` is how far the scene was behind
