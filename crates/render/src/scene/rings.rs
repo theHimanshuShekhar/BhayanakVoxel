@@ -1383,6 +1383,15 @@ impl Scene {
             .map_or(Reach::NONE, |r| r.selection.reach())
     }
 
+    /// Whether the horizon cap was asked for and the selection has it off: it goes off when the
+    /// raised camera is under the sea's sphere and stays off until the camera is 50 m over it
+    /// (`select::CAP_ON`), so a scene that was under the sea can be off with the camera over.
+    pub fn cap_is_off(&self) -> bool {
+        self.rings.as_ref().is_some_and(|r| {
+            r.selection.horizon().is_some() && r.selection.reach().horizon.is_none()
+        })
+    }
+
     /// Whether the horizon cap was asked for and the raised camera at `camera` is under the sea's
     /// sphere (see [`Selection::camera_under_horizon`]): a scene made again there has the cap off,
     /// which is the wide scene at rest bands (ADR 0004, #213); over the sphere it has it on.

@@ -1117,6 +1117,18 @@ impl SceneWorker {
         self.shared.no_speed_scale.store(!on, Ordering::Release);
     }
 
+    /// Whether the horizon cap of the selection of a stepped thread is off (see
+    /// [`Scene::cap_is_off`]).
+    #[cfg(test)]
+    pub fn selection_cap_is_off(&self) -> bool {
+        let engine = self.stepped.as_ref().expect("only a stepped thread");
+        engine
+            .lock()
+            .expect("the engine is not poisoned")
+            .scene
+            .cap_is_off()
+    }
+
     /// The nodes of the selection of a stepped thread (see [`Scene::nodes`]).
     #[cfg(test)]
     pub fn selection_nodes(&self) -> usize {
@@ -2316,8 +2328,15 @@ impl Engine {
         // What waits to be looked at is gone with the old selection, so [`World::reband_pending`]
         // (the stats of this publish, which carries the new scene) is false only once it is
         // published.
+        //
+        // **Also a scene whose cap is off** (it went off under the sea and comes on only 50 m over
+        // it, `select::CAP_ON`): a release is let through only for a camera over the sea's sphere,
+        // and a reband in place would keep that cap state, so a camera that stops 10 m over would
+        // have the wide scene at rest bands (552 to 572 MiB at full size). A scene made again at
+        // the camera has the cap on there.
         let over = self.shared.release_rebuild_over.load(Ordering::Relaxed);
-        if bands.scaled_d0() > before && self.scene.rebanding() > over {
+        if bands.scaled_d0() > before && (self.scene.rebanding() > over || self.scene.cap_is_off())
+        {
             let store = self.store.read().expect("the store's lock is not poisoned");
             let update = self.scene.rebuild_for(&store, camera, bands);
             drop(store);

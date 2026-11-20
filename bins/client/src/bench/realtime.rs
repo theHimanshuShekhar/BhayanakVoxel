@@ -4454,8 +4454,9 @@ mod tests {
             "the crossing flipped the cap both ways"
         );
         // The bound is loose since #168: an "ordinary" update now includes the follow step right
-        // after a step of the speed scale's depth (504 to 665 ms on the 4090 against 304 to 476
-        // before it: millions of queue entries come due at once), so a regression in #213's flip
+        // after a step of the speed scale's depth (550 to 718 ms on the 4090 at `0f5a936`, 504 to 665
+        // in the orchestrator's later runs, against 304 to 476 before it: millions of queue entries
+        // come due at once), so a regression in #213's flip
         // update (214 to 284 ms there) of up to that much would not fail this.
         assert!(
             flip_update <= ordinary_update,

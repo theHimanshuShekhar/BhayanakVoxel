@@ -3694,9 +3694,23 @@ fn the_update_where_the_cap_goes_off_and_on_at_sea_level_is_measured() {
 /// off for**, the release goes through: a scene made again there has the cap on.
 #[test]
 fn the_depth_of_a_flight_is_kept_while_the_camera_is_under_the_sea_and_given_back_over_it() {
+    dive_and_release(0);
+}
+
+/// [`the_depth_of_a_flight_is_kept_while_the_camera_is_under_the_sea_and_given_back_over_it`] with a
+/// release that lists fewer nodes than the limit: it is made again all the same, because the scene's
+/// cap went off under the sea and a reband in place would keep it off (until 50 m over): the scene
+/// would be the wide one at rest bands for a camera that stopped 10 m over.
+#[test]
+fn a_release_over_the_sphere_under_the_rebuild_limit_still_makes_the_scene_again_while_the_cap_is_off()
+ {
+    dive_and_release(usize::MAX);
+}
+
+fn dive_and_release(rebuild_over: usize) {
     let (mut world, _server, camera) = margined_world_under(Run::Stepped, None, true);
     world.worker().speed_scale(true);
-    world.worker().set_release_rebuild_over(0);
+    world.worker().set_release_rebuild_over(rebuild_over);
     world.count_exactly();
     fill(&mut world, camera.position);
     let sea = planet().sea_radius();
@@ -3742,6 +3756,8 @@ fn the_depth_of_a_flight_is_kept_while_the_camera_is_under_the_sea_and_given_bac
     fly(&mut world, &mut r, radius_at(-2.0 * VOXELS_PER_METRE), 300);
     assert_eq!(scale(&world), deep, "given back under the sphere");
     assert_eq!(world.stats().work.release_rebuilds, 0);
+    // The scene's cap went off under the sea, and stays off until 50 m over it.
+    assert!(world.worker().selection_cap_is_off());
     // 10 m over it, inside the hysteresis band of the cap's coming on (50 m), and stopped: given
     // back, as a rebuild (the scene made again there has the cap on).
     fly(&mut world, &mut r, radius_at(10.0 * VOXELS_PER_METRE), 0);
@@ -3754,6 +3770,8 @@ fn the_depth_of_a_flight_is_kept_while_the_camera_is_under_the_sea_and_given_bac
     }
     assert_eq!(world.stats().work.release_rebuilds, 1);
     assert!(radius_at(10.0 * VOXELS_PER_METRE) + raise - sea < CAP_ON_VOXELS);
+    // The scene made again at the camera has the cap on there.
+    assert!(!world.worker().selection_cap_is_off());
 }
 
 /// The height over the sea at which the cap comes back on (`select::CAP_ON`), 50 m.
