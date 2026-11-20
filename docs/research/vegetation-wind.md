@@ -63,13 +63,13 @@ Read from `main` at `146cae6` (S14).
 
 - **What he showed.** In September 2020 he posted animated trees as "the #1 most requested feature" (S2), with a 31-second clip (S1). The clip holds a nearly still camera on a sunlit conifer forest with god rays. The foreground crown moves visibly between 0:16 and 0:18. Its silhouette stays axis-aligned and stair-stepped in both frames. That fits translation or re-voxelisation, but not a rotated voxel grid. The footage cannot tell those two apart.
 - **Which engine.** This was his old engine (S1, 2020). Three months earlier he had dropped RTX for a Vulkan compute tracer with a light acceleration structure that "actually allows for this type of dynamic scene" (S3). Inference: the animation relied on an acceleration structure cheap enough to rebuild. He never said so, and he never described the method.
-- **Crystal Islands (2021)** went back to the Vulkan hardware RT pipeline ([voxel-path-tracing.md §1](voxel-path-tracing.md)). It lists "animation support" (S4), but the flythrough never holds still long enough to show any ([Crystal Islands research](https://github.com/theHimanshuShekhar/bhayanakvoxel/blob/research/inspiration-john-lin-crystal-islands/docs/research/inspiration-john-lin-crystal-islands.md) §5).
+- **Crystal Islands (2021)** went back to the Vulkan hardware RT pipeline ([voxel-path-tracing.md §1](voxel-path-tracing.md)). It lists "animation support" (S4), but the flythrough never holds still long enough to show any ([Crystal Islands research](https://github.com/theHimanshuShekhar/bhayanakvoxel/blob/main/docs/research/inspiration-john-lin-crystal-islands.md) §5).
 - **Takeaway:** the look is proven to read well in a path-traced voxel forest, especially the dappled sun through moving leaves. The method is unknown. Do not design around guesses about it.
 
 ### 2.2 Teardown and Tuxedo Labs
 
 - Teardown's trees don't sway. Gustafsson's experiments failed because the shadow volume could not follow them (S5).
-- His next engine's "deformable voxels" (bending volumes) need ray tracing inside a skewed box. Eberly's verdict was that "an invertible affine transformation between a unit cube and an arbitrarily deformed cuboid does not exist", so Gustafsson uses "an approximate solution that is good enough for my use case" (S5). We already rejected deformable voxel objects ([#136](https://github.com/theHimanshuShekhar/bhayanakvoxel/issues/136); [Teardown research](https://github.com/theHimanshuShekhar/bhayanakvoxel/blob/research/inspiration-teardown-rt/docs/research/inspiration-teardown-rt.md) §7 row 19).
+- His next engine's "deformable voxels" (bending volumes) need ray tracing inside a skewed box. Eberly's verdict was that "an invertible affine transformation between a unit cube and an arbitrarily deformed cuboid does not exist", so Gustafsson uses "an approximate solution that is good enough for my use case" (S5). We already rejected deformable voxel objects ([#136](https://github.com/theHimanshuShekhar/bhayanakvoxel/issues/136); [Teardown research](https://github.com/theHimanshuShekhar/bhayanakvoxel/blob/main/docs/research/inspiration-teardown-rt.md) §7 row 19).
 - **What carries over:** with hardware RT and no shadow volume, the new engine handles "vast amounts of moving objects at a very small cost" (S5). Moving geometry is cheap when what moves is a whole rigid thing the AS can hold as is. That is the property Tier B keeps, per brick and without touching the AS.
 
 ### 2.3 Mesh engines (the established method, for contrast)
@@ -246,7 +246,7 @@ Raising `m` to 2 Voxels (10 cm, for stronger wind) multiplies the candidate term
 
 ## 10. Corrections to earlier research
 
-- **[Crystal Islands research](https://github.com/theHimanshuShekhar/bhayanakvoxel/blob/research/inspiration-john-lin-crystal-islands/docs/research/inspiration-john-lin-crystal-islands.md)** (S7 row, §5 "Animation of voxel models (wind)", and the closing "unverified" list):
+- **[Crystal Islands research](https://github.com/theHimanshuShekhar/bhayanakvoxel/blob/main/docs/research/inspiration-john-lin-crystal-islands.md)** (S7 row, §5 "Animation of voxel models (wind)", and the closing "unverified" list):
   - The "Gentle breeze animations and leaf palettes" quote is @voxelbee's, not Lin's (S6).
   - The Crystal Islands description says "animation support", not wind (S4).
   - Lin's wind is first-party, but from his 2020 compute-traced engine (S1–S3).

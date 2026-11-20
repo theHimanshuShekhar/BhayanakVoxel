@@ -109,15 +109,15 @@ Every Milestone is **done** only when all of the following hold:
 **M1a-2 order (reset 2026-11-14 by the owner; before that 2026-11-11; brought up to date with the tracking issue on 2026-11-21).** The tracking issue is [#41](https://github.com/theHimanshuShekhar/bhayanakvoxel/issues/41), and it is the source of truth for what is done. Measured numbers are in [`docs/measurements.md`](measurements.md).
 
 The visuals, lighting and world come before saves and networking, so that generator changes need no migrations. #146 comes before #167, because the 320 km scene does not fit 512 MiB without the horizon cap.
-1. Done: #177 CI (the client tests that run real threads move to a job that does not gate; Rust and the runner images pinned; the GPU-free crates tested on Windows), #180 a stepped mode for the client's tests, #181 the streaming bench in CI, #162 the full-size real-time run on the 4090 with its four gates, #145 uploads (per-buffer growth and a per-frame budget), #166 the 320 km generator (radius and seed are a value passed to the generator, the world map is 2048² a face, the ground has its detail added at generation, caves are made on demand per cube, the Spawn is seeded; measured in `measurements.md`), #148 the look-dev flythrough (the owner's picks are on #148), the 320 km chain (#146 the horizon cap, #167 the renderer's levels, Guard and sizes, #168 speed-scaled LOD and the 20 m spawn, #220 the Guard built in the background so control comes within 2 s, and #213 the horizon cap's sea-level flip re-checking every node in one update), the Reference view (#187, #188 and #189), #202 the art direction in the renderer, #217 scene patches while the view is still restarting the Reference view, #52 sun shadows and #53 the atmosphere.
+1. Done: #177 CI (the client tests that run real threads move to a job that does not gate; Rust and the runner images pinned; the GPU-free crates tested on Windows), #180 a stepped mode for the client's tests, #181 the streaming bench in CI, #162 the full-size real-time run on the 4090 with its four gates, #145 uploads (per-buffer growth and a per-frame budget), #166 the 320 km generator (radius and seed are a value passed to the generator, the world map is 2048² a face, the ground has its detail added at generation, caves are made on demand per cube, the Spawn is seeded; measured in `measurements.md`), #148 the look-dev flythrough (the owner's picks are on #148), the 320 km chain (#146 the horizon cap, #167 the renderer's levels, Guard and sizes, #168 speed-scaled LOD and the 20 m spawn, #220 the Guard built in the background so control comes within 2 s, and #213 the horizon cap's sea-level flip re-checking every node in one update), the Reference view (#187, #188 and #189), #202 the art direction in the renderer, #217 scene patches while the view is Still restart the Reference view, #52 sun shadows and #53 the atmosphere.
 2. **The 320 km chain** (done): #146 the horizon cap, #167 the renderer's levels, Guard and sizes, then #168 speed-scaled LOD and the 20 m spawn, with #220 (the Guard built in the background) and #213 (the cap's sea-level flip) found in the reviews of #168 and #146. #167 and #168 measured the sizing constants again.
 3. **A playtest on the 4090**: walk, fly, orbit and edit at 320 km. What it finds becomes tickets. It has been ready since 2026-11-21 (main at e5af211). Right after it comes #226, a camera held under the sea keeps the cap-off scene within 512 MiB (found in #213's work).
-4. **Lighting.** The Reference view first (ADR 0005, done): #187 the bench's convergence phase, #188 the reference estimator, #189 the still-frame policy. Then #202 the art direction in the renderer (M1b-1's first ticket, so that shadows and GI are judged through it; done), #217 scene patches while the view is still (done), #52 sun shadows (done), #53 atmosphere (done), #54 GI, #55 denoiser, and the #50 hardware RT spike.
+4. **Lighting.** The Reference view first (ADR 0005, done): #187 the bench's convergence phase, #188 the reference estimator, #189 the still-frame policy. Then #202 the art direction in the renderer (M1b-1's first ticket, so that shadows and GI are judged through it; done), #217 scene patches while the view is Still restart the Reference view (done), #52 sun shadows (done), #53 atmosphere (done), #54 GI, #55 denoiser, and the #50 hardware RT spike.
 5. **The M1b-1 world block** (#201): #203 the day/night cycle, #204 placement rules and crystal clusters, #205 dense vegetation, #206 rivers and lakes (a prototype, then its build ticket), #207 fantasy landmarks.
 6. **Gameplay and UI:** #57 swim, climb and fly, #58 camera and Zoom, #59 avatar, #150 bindings, #151 Edit HUD, #171 Pieces (the system and about 12 Pieces, ADR 0011), #149 heatmap.
 7. **Saves and networking:** #182 the wire codec (every message encoded, with a protocol version, the Planet's id in an Edit, golden bytes, and seeded delay, loss and reordering on the loopback), #183 a throwaway prototype that recovers a Piece's frame from its stamped Voxels (its result decides whether a stamped Piece also keeps a record, before saves are designed), #62 saves (the schema, the Edit Journal in the codec's bytes, checkpoints, loading and crash tests), #144 Edit epochs, #163 uploads, #184 backups, the generator guard and migrations (any time before #63), and #169 the server bot soak.
 8. #63 start menu, then #195 counting holes exactly at every publish in the real-time streaming bench and #196 a named failure when the brick store goes over its limit (both triaged 2026-11-21 by the owner), then #64 final budgets and soak.
-9. **Last:** #230 the performance pass, which optimises and scales dynamically from low-end to high-end hardware (the owner, 2026-11-20). It comes after #64, at the end of all planned development, and its scope is set with the owner when it starts. On the 4090 the game uses about 30–35% of the GPU and CPU today (vsync at 60 Hz plus the headroom held for the work still to come), and the pass spends the spare on quality and smoothness.
+9. **Last:** #230 the performance pass, which optimises and scales dynamically from low-end to high-end hardware (the owner, 2026-11-20). It comes after #64, at the end of all planned development, and its scope is set with the owner when it starts. On the 4090 the game uses at most 30–35% of the GPU and CPU today (vsync at 60 Hz plus the headroom held for the work still to come), and the pass spends the spare on quality and smoothness.
 
 The Reference view's contract (#100–#103) was decided on 2026-11-12 and is [ADR 0005](adr/0005-reference-view-contract.md). It adds scope to #53 (a sun-free sky table, sky sampling in the Reference, the haze bound), #54 (direct sampling of emissive Voxels in the Reference) and #55 (its gate is derived from the Reference's curve).
 
@@ -142,7 +142,7 @@ Its world block runs inside M1a's order, after the lighting and before gameplay 
 - **Fantasy accents**: glowing crystal caves, floating islands with static waterfalls, giant arches and spires, bioluminescent flora (#204, #207). The crystal-cluster generator makes radiating hexagonal prisms with pointed tips, aligned to the surface normal, as a deterministic stamp at every LOD; its smallest size is set by readability (a 0.3 m prism is 6 Voxels at 5 cm).
 - **Rivers and lakes** as static water (#206). With the coarse world map (ADR 0008) rivers need a new design: the map gives large drainage only.
 - The **day/night cycle**: a world clock that can be paused and set, moon light and a starfield (#138, #203).
-- Each Material also gets, as data, a **sway stiffness** for the wind (#152), and the `acoustic` and `sound` fields for audio (#153). They are added to the Material schema with the first ticket that reads them.
+- Each Material also gets, as data, a **sway stiffness** for the wind (#152), and the `acoustic` and `sound` fields for audio (#153).
 - **Undo** of a player's own last ~32 Edits (#138, ADR 0010). It needs the server's brick snapshots, so it comes after saves.
 - The **Piece catalogue** grows to 50 or more as data: walls, slabs, stairs, posts, fences, roofs, window and door frames, lamps (ADR 0011). It comes after #171.
 
@@ -154,16 +154,15 @@ During M1b a throwaway **Debris and Fluids prototype** at 5 cm (CPU only, on the
 - A measured **spike for coarser-LOD secondary rays** (reflection, GI and AO rays; #136), against the 0.7 ms reflection and 1.5 ms GI lines. It is adopted only if the image-difference metric against the Reference holds. Primary and shadow rays stay full resolution, and the Reference always traces full resolution.
 - Vegetation **wind sway**, in the tracer only, never in the brick store (#152). Budget **≤ 0.3 ms** of GPU time. One closed-form wind field drives two tiers:
   - Tier A wobbles the foliage's shading on both backends, for under 0.05 ms.
-  - Tier B is a hardware-RT-only spike that shifts each nearest-LOD foliage brick's leaves by up to one Voxel inside the ray–brick test, with no per-frame BVH work. Foliage bricks pad their AABB by one Voxel, once. Tier B is estimated at about 0.45 ms, so expect its fallbacks: a 51 m radius, fewer swaying Materials, or Tier A only.
+  - Tier B is a hardware-RT-only spike that shifts each nearest-LOD foliage brick's leaves by up to one Voxel inside the ray–brick test, with no per-frame BVH work. Foliage bricks pad their AABB by one Voxel, once. Tier B is estimated at about 0.45 ms, so expect its fallbacks: a 51 m radius, fewer swaying Materials, or Tier A only. Tier B is adopted only if it holds the line, keeps Primary's FLIP against the Reference at a frozen wind time no worse than wind-off, and reads as sway in #148. If #50's bench makes compute the default, M1b ships Tier A alone.
   - Hardware RT `trace()`'s goldens run with Tier B off.
   - The wind clock is client-only and freezes while the Reference accumulates. The freeze covers **sway only**; wind audio keeps playing.
   - The TAAU and the denoiser take per-pixel object motion, so swaying leaves do not smear.
-- Volumetric clouds are not scheduled. They wait for research and a cost spike at ground level, inside a cloud and in orbit (#136).
 
 **M1b-3: Audio**
 - Positional audio: footsteps by Material, dig and place, biome ambience, water and wind. This is the floor, built first, on kira in a new client-only audio crate with no middleware (#153).
 - Ray-traced occlusion and reverb behind a toggle, after the floor and only if it fits its CPU budget (#153): per-emitter occlusion (9 rays at 5 Hz, up to 32 emitters) and listener reverb (32 rays of 4 bounces at 10 Hz), through the existing CPU `trace()`. The look-dev listening pass gates it. Steam Audio is deferred to a spike after M1b.
-- Audio's budget is **≤ 0.5 ms of frame-thread CPU per frame, ≤ 1.0 ms at p99**, and no GPU. It is the first CPU budget line. The ray-traced layer is estimated at 0.14–0.47 ms at 5 cm.
+- Audio's budget is **≤ 0.5 ms of frame-thread CPU per frame, ≤ 1.0 ms at p99**, and no GPU. It is the first per-system CPU line. The ray-traced layer is estimated at 0.14–0.47 ms at 5 cm.
 - Every sound asset needs a recorded licence.
 
 **Acceptance**
@@ -226,10 +225,10 @@ A headless bot soak against the in-process server runs from M1a on (tick time an
 - The cellular automaton: fill levels for water and lava, granular sand, 26-direction down.
 - Rivers and the ocean surface simulate near players (~500 m), sleeping elsewhere; the ocean is an infinite source.
 - Interactions: lava + water → rock, sand sinking, currents, and Debris buoyancy and pushing.
-- Path-traced water and lava surfaces, with foam shading on water that is falling or has just changed (#133, #136).
+- Path-traced water and lava surfaces.
 - **Spring and sink cells**: world-map river heads are infinite sources and river mouths drain into the ocean. Placed water is always finite.
 - Water never flows into a brick that is not simulated: at the edge of the active set such bricks act as walls, and the cell is woken later, never dropped.
-- Fluid debug views (active, asleep, source and sink, flow direction), and parallel per-brick steps with a small serial merge for transfers between bricks.
+- Fluid debug views (active, asleep, source and sink, flow direction), and, as design guidance, parallel per-brick steps with a small serial merge for transfers between bricks.
 - The client particle system adds spray and foam (#138).
 - A measured spike for **momentum** ("flux memory") in the CA, against the ≤ 4 ms budget, adopted only if 20 Hz water looks wrong without it.
 - Delta replication.
@@ -259,7 +258,11 @@ Decided 2026-11-11. These are ordered but not designed; each is grilled when it 
 - **M6: Moving Pieces.** Doors and hatches, on Debris's moving bodies.
 - **M7: Survival and Tools.** Gathering, an inventory, health. A Tool is what a character holds; it owns the Brushes its holder can use, and replaces free Brush choice.
 - **M8: Solar system.** More than one Planet, and travel between them.
-- **Deferred from the inspirations** (#137, #138): scorch and paint marks, seasons, a spline-camera photo mode, and a gamepad.
+- **Deferred from the inspirations** (#136, #137, #138):
+  - Scorch and paint marks, snow build-up, moss growth and seasons, a spline-camera photo mode, and a gamepad.
+  - Lumpy, rock-like Brush shapes: deferred to Edit-tool polish after M1b, with a prototype for the dev first.
+  - Two-way Fluid coupling (objects displacing water), past M4.
+  - **Volumetric clouds**, past M1b: only after research plus a 4090 cost spike covering ground level, inside a cloud and orbit during Zoom. Not scheduled.
 
 Two seams are kept open for them now, and nothing else is built:
 

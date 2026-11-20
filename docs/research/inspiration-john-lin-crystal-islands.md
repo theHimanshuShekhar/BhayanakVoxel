@@ -1,6 +1,6 @@
 # Research: John Lin's Crystal Islands engine reveal
 
-Resolves issue [#134](https://github.com/theHimanshuShekhar/bhayanakvoxel/issues/134), part of the inspirations map [#130](https://github.com/theHimanshuShekhar/bhayanakvoxel/issues/130). Researched November 2026. Terms in **bold** follow [`CONTEXT.md`](../../CONTEXT.md). This builds on the John Lin section of [voxel-path-tracing.md](voxel-path-tracing.md) §1 and on [inspiration-john-lin-water.md](https://github.com/theHimanshuShekhar/bhayanakvoxel/blob/research/inspiration-john-lin-water/docs/research/inspiration-john-lin-water.md) (his older engine), and does not repeat them.
+Resolves issue [#134](https://github.com/theHimanshuShekhar/bhayanakvoxel/issues/134), part of the inspirations map [#130](https://github.com/theHimanshuShekhar/bhayanakvoxel/issues/130). Researched November 2026. Terms in **bold** follow [`CONTEXT.md`](../../CONTEXT.md). This builds on the John Lin section of [voxel-path-tracing.md](voxel-path-tracing.md) §1 and on [inspiration-john-lin-water.md](https://github.com/theHimanshuShekhar/bhayanakvoxel/blob/main/docs/research/inspiration-john-lin-water.md) (his older engine), and does not repeat them.
 
 ## TL;DR
 
@@ -66,7 +66,7 @@ Timestamps `[m:ss]` are S1. They come from 1 fps contact sheets and are accurate
   - On 6 June 2021 Lin shelved micro-voxels. He moved the optimisations to the coarser "pixel art" style and started a new C/C++ plus C#/.NET 5.0 codebase "designed around these realigned goals".
   - He gave his reasons: gameplay possibilities, end-user experience, and that "prioritizing one style dictates the features that are possible in the engine".
   - The faster engine makes it "significantly less costly to store and trace individual voxels". He lists "procedural snow build-up, mossy vegetation to grow on user builds … seasonal vegetation with growth stages" as what that enables.
-  - The channel has posted nothing since S1 (the [water research](https://github.com/theHimanshuShekhar/bhayanakvoxel/blob/research/inspiration-john-lin-water/docs/research/inspiration-john-lin-water.md) §1).
+  - The channel has posted nothing since S1 (the [water research](https://github.com/theHimanshuShekhar/bhayanakvoxel/blob/main/docs/research/inspiration-john-lin-water.md) §1).
 - **Viewer reception is split** (S8). The most-liked comments praise the detail, while a visible minority preferred the old engine's "charm", which is the feedback Lin acted on.
 
 ## 2. Techniques
@@ -182,7 +182,7 @@ Judged from the frames named.
   - It flies through foliage and through crystals without collision. A crystal fills the screen at 1:08–1:09 and 1:18–1:19.
   - It drifts at a slow, steady, drone-like pace for one continuous take, ending in a vertical pull-out to the whole island [4:45–5:04].
   - Whether it is hand-flown or a recorded path cannot be told.
-- **No Edit controls, no Brush, no Ghost, no crosshair, no cursor, no avatar.** The video shows nothing about how Edits are driven. For his Edit UI, see the old engine's Brush panel in the [water research](https://github.com/theHimanshuShekhar/bhayanakvoxel/blob/research/inspiration-john-lin-water/docs/research/inspiration-john-lin-water.md) §3.
+- **No Edit controls, no Brush, no Ghost, no crosshair, no cursor, no avatar.** The video shows nothing about how Edits are driven. For his Edit UI, see the old engine's Brush panel in the [water research](https://github.com/theHimanshuShekhar/bhayanakvoxel/blob/main/docs/research/inspiration-john-lin-water.md) §3.
 
 ## 5. Features, and what is demo versus planned
 

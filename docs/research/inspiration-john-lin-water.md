@@ -182,7 +182,7 @@ Nothing is shipped. The project was never released, and Lin hoped "to eventually
 | Dam break and flooding through a building's doorways | **Demo** | [2:02–2:09] |
 | Water against players and objects | **Planned** in S1; one-way coupling and buoyancy shown 10 days later | S1, S3 |
 | Water wheels driving a gate (constraints, motor) | **Demo** | S4 |
-| Water audio (spatial) | **Stated as unfinished**: "sound calculations" are still to improve (S1). The ray-traced audio is a separate March 2020 RTX + OpenAL video (S11), not tied to water; ray-traced *water* audio is an inference | S1, S11 |
+| Water audio (spatial) | **Demo, WIP** ("sound calculations" to improve; the video has a sound track and S10 reports audible panning). *Ray-traced* water audio is an inference: Lin's ray-traced audio is a separate March 2020 RTX + OpenAL video (S11) | S1, S10, S11 |
 | Evaporation or rain cycle | **Not planned**: "I still don't have a good idea" | S1 |
 | Water in the rewritten engine (our visual reference) | **Not shown**: "fluid dynamics eventually" | S5 |
 

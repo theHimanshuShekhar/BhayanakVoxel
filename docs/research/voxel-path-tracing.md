@@ -62,7 +62,7 @@ Hide all of this behind one shader function, `trace(ray) -> hit`. The tracing ba
 - Mar 2020: path tracing made "noiseless" and "20x faster (60fps HD!)".
 - May 2021: "Rendering is now 10x faster on average", with ray-traced soft shadows, AO and specular.
 
-Source: [x.com/ProgrammerLin](https://x.com/programmerlin), access blocked (HTTP 402) for x.com pages. Treat these as **unverified**. (The March and 12 May 2021 posts above were later read through the syndication endpoint and moved to the confirmed list. The "Gentle breeze animations" post sometimes attributed to Lin is @voxelbee's; see [vegetation-wind.md](vegetation-wind.md).)
+Source: [x.com/ProgrammerLin](https://x.com/programmerlin), access blocked (HTTP 402) for x.com pages. Treat these as **unverified**. (The 12 March and 12 May 2021 posts, which were never in this list, were read through the syndication endpoint and are confirmed above; the March 2020 post here is still unverified. The "Gentle breeze animations" post sometimes attributed to Lin is @voxelbee's; see [vegetation-wind.md](vegetation-wind.md).)
 
 ### Unknown
 
