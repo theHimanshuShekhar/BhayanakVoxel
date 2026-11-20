@@ -136,7 +136,9 @@ use super::stream::StreamReport;
 /// report lists passes generically). Each real-time path has `frame_parts` (the frame thread's
 /// recentre, update, encode, submit and wait, the passes' GPU total and the wait that no pass
 /// accounts for) and `gpu_passes` (the GPU time of every timed pass), and a real-time run has
-/// `unpaced_control` (standing frames with no pacing sleep). Nothing else is changed.
+/// `unpaced_control` (standing frames with no pacing sleep); the real-time gates have `gi_mean_ms`, `gi_p99_ms`
+/// and `gi_paths_timed` (`over` may name `gi`), and the budgets file's `[streaming]` the keys `gi_mean_ms`
+/// and `gi_p99_ms`. Nothing else is changed.
 pub const SCHEMA_VERSION: u32 = 28;
 
 /// One timed thing (a pass, or the GPU total of a profiler frame) in one mode, against its

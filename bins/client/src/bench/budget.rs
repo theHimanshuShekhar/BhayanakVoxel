@@ -65,6 +65,13 @@ pub struct StreamingBudgets {
     /// at the camera, has no soft miss and nothing left to look at again for the bands: main's
     /// 47.8 s on the 4090 plus 15%.
     pub settle_s: f64,
+    /// Primary's `gi` pass in the real-time run (#54), on the full-size Planet where the GPU bench's
+    /// small one cannot show it: the mean GPU milliseconds of the worst path (the pass's own
+    /// budget, 1.5 ms, which the stepped bench holds on its small flight) ...
+    pub gi_mean_ms: f64,
+    /// ... and its 99th percentile in the worst path, **well under 3 ms**: the bursts of the cache's
+    /// misses are what make a frame long, and a mean cannot see them.
+    pub gi_p99_ms: f64,
 }
 
 impl Budgets {
@@ -79,6 +86,8 @@ impl Budgets {
                 ("spawn_ring_s", s.spawn_ring_s),
                 ("time_to_control_s", s.time_to_control_s),
                 ("settle_s", s.settle_s),
+                ("gi_mean_ms", s.gi_mean_ms),
+                ("gi_p99_ms", s.gi_p99_ms),
             ] {
                 if !(value.is_finite() && value > 0.0) {
                     return Err(format!(
@@ -236,6 +245,8 @@ mod tests {
                 spawn_ring_s: 2.0,
                 time_to_control_s: 10.0,
                 settle_s: 55.0,
+                gi_mean_ms: 1.5,
+                gi_p99_ms: 3.0,
             })
         );
     }
@@ -243,7 +254,7 @@ mod tests {
     #[test]
     fn the_streaming_table_needs_every_key_and_positive_numbers_and_is_optional() {
         let table = |body: &str| format!("[streaming]\n{body}");
-        let all = "frame_time_p99_ms = 16.7\nframe_cpu_p99_ms = 8\nholes = 0\nscene_mib = 512\ncamera_soft_miss_frames = 0\nscene_lag_d0_max = 8\nspawn_ring_s = 2\ntime_to_control_s = 10\nsettle_s = 30\n";
+        let all = "frame_time_p99_ms = 16.7\nframe_cpu_p99_ms = 8\nholes = 0\nscene_mib = 512\ncamera_soft_miss_frames = 0\nscene_lag_d0_max = 8\nspawn_ring_s = 2\ntime_to_control_s = 10\nsettle_s = 30\ngi_mean_ms = 1.5\ngi_p99_ms = 3\n";
         let parsed = Budgets::parse(&table(all)).unwrap().streaming.unwrap();
         assert_eq!((parsed.frame_cpu_p99_ms, parsed.holes), (8.0, 0));
         // Without the table there is no gate to hold, which the real-time mode refuses to run on.
@@ -259,6 +270,8 @@ mod tests {
             "spawn_ring_s",
             "time_to_control_s",
             "settle_s",
+            "gi_mean_ms",
+            "gi_p99_ms",
         ] {
             let without: String = all
                 .lines()

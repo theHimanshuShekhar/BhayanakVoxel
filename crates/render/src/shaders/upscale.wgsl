@@ -67,7 +67,7 @@ const CLAMP_REJECT = 0.1;
 // How far beyond the range of the traced samples (a share of the range's width, each side) the
 // history is allowed: a pixel of noisy samples (GI) has a range that the mean of its light is
 // often outside of, and a hard clamp to it takes the light away.
-const CLAMP_SLACK = 0.5;
+const CLAMP_SLACK = 1.5;
 // Keep in step with DebugView in debug_view.rs.
 const VIEW_HISTORY_LENGTH = 5u;
 

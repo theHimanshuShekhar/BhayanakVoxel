@@ -1092,8 +1092,15 @@ pub struct Gates {
     /// The settle time after the stop, at the most of the runs (the cap's if one did not settle,
     /// which is over whatever the limit): the scene at the camera, no soft miss, nothing waiting.
     pub settle_s: Limit,
+    /// The `gi` pass's GPU time (#54), mean and 99th percentile, of the worst path of the worst run:
+    /// the pass's own 1.5 ms in the run on the full-size Planet.
+    pub gi_mean_ms: Limit,
+    pub gi_p99_ms: Limit,
+    /// How many paths of the runs had a time for the `gi` pass. **0 is over**: a gate that looked at
+    /// nothing has not passed (a GPU with no timers has no pass times).
+    pub gi_paths_timed: u64,
     /// The gates that are over: `frame_time`, `frame_cpu`, `holes`, `memory`, `soft_misses`,
-    /// `scene_lag`, `spawn_ring`, `time_to_control`, `settle`.
+    /// `scene_lag`, `spawn_ring`, `time_to_control`, `settle`, `gi`.
     pub over: Vec<&'static str>,
 }
 
@@ -1172,6 +1179,19 @@ pub fn gates(runs: &[RunReport], budgets: &StreamingBudgets) -> Gates {
         worst: worst(&mut paths().filter_map(|p| p.settle.map(|s| s.seconds))),
         limit: budgets.settle_s,
     };
+    let gi_times: Vec<&Spread> = paths()
+        .filter_map(|p| p.gpu_passes.get("gi"))
+        .filter(|s| s.samples > 0)
+        .collect();
+    let gi_paths_timed = gi_times.len() as u64;
+    let gi_mean_ms = Limit {
+        worst: worst(&mut gi_times.iter().map(|s| s.mean_ms)),
+        limit: budgets.gi_mean_ms,
+    };
+    let gi_p99_ms = Limit {
+        worst: worst(&mut gi_times.iter().map(|s| s.p99_ms)),
+        limit: budgets.gi_p99_ms,
+    };
     let over = [
         ("frame_time", frame_time_p99_ms.over()),
         ("frame_cpu", frame_cpu_p99_ms.over()),
@@ -1183,6 +1203,10 @@ pub fn gates(runs: &[RunReport], budgets: &StreamingBudgets) -> Gates {
         ("time_to_control", time_to_control_s.over()),
         // A run that was still unsettled at the cap is over, whatever the cap is.
         ("settle", settle_s.over() || unsettled),
+        (
+            "gi",
+            gi_mean_ms.over() || gi_p99_ms.over() || (!runs.is_empty() && gi_paths_timed == 0),
+        ),
     ]
     .into_iter()
     .filter_map(|(name, over)| over.then_some(name))
@@ -1201,6 +1225,9 @@ pub fn gates(runs: &[RunReport], budgets: &StreamingBudgets) -> Gates {
         spawn_ring_s,
         time_to_control_s,
         settle_s,
+        gi_mean_ms,
+        gi_p99_ms,
+        gi_paths_timed,
         over,
     }
 }
@@ -3020,6 +3047,8 @@ mod tests {
         spawn_ring_s: 2.0,
         time_to_control_s: 10.0,
         settle_s: 30.0,
+        gi_mean_ms: 1.5,
+        gi_p99_ms: 3.0,
     };
 
     fn path(name: &'static str, frame_p99: f64, cpu_p99: f64, holes: u64) -> PathReport {
@@ -3040,7 +3069,17 @@ mod tests {
                 worst_ms: cpu_p99 * 2.0,
             },
             frame_parts: FrameParts::default(),
-            gpu_passes: Default::default(),
+            // A `gi` pass well inside its gate.
+            gpu_passes: [(
+                "gi".to_string(),
+                Spread {
+                    samples: 600,
+                    mean_ms: 1.0,
+                    p99_ms: 2.0,
+                    worst_ms: 3.0,
+                },
+            )]
+            .into(),
             frame_cycle: Spread::default(),
             sleep_overshoot: Spread::default(),
             frames_over_limit: 0,
@@ -3431,6 +3470,39 @@ mod tests {
     }
 
     #[test]
+    fn the_gi_gate_fires_alone_for_a_pass_over_its_mean_or_its_p99_or_with_no_times() {
+        let gi = |mean_ms: f64, p99_ms: f64| {
+            run_with(|r| {
+                for p in &mut r.paths {
+                    p.gpu_passes.insert(
+                        "gi".to_string(),
+                        Spread {
+                            samples: 600,
+                            mean_ms,
+                            p99_ms,
+                            worst_ms: p99_ms * 2.0,
+                        },
+                    );
+                }
+            })
+        };
+        assert!(over(&[gi(1.5, 3.0)]).is_empty());
+        assert_eq!(over(&[gi(1.51, 2.0)]), ["gi"]);
+        assert_eq!(over(&[gi(1.0, 3.01)]), ["gi"]);
+        // The worst path counts, and the worst run.
+        let mut one_path = gi(1.0, 2.0);
+        one_path.paths[1]
+            .gpu_passes
+            .get_mut("gi")
+            .expect("a gi pass")
+            .mean_ms = 4.6;
+        assert_eq!(over(&[gi(1.0, 2.0), one_path]), ["gi"]);
+        // A run with no pass times looked at nothing: over.
+        let untimed = run_with(|r| r.paths.iter_mut().for_each(|p| p.gpu_passes.clear()));
+        assert_eq!(over(&[untimed]), ["gi"]);
+    }
+
+    #[test]
     fn the_settle_gate_fires_alone_for_a_stop_that_takes_longer_than_its_limit_or_never_settles() {
         let settle = |seconds: f64, settled: bool| {
             run_with(|r| {
@@ -3813,6 +3885,9 @@ mod tests {
                 "camera_soft_miss_frames",
                 "frame_cpu_p99_ms",
                 "frame_time_p99_ms",
+                "gi_mean_ms",
+                "gi_p99_ms",
+                "gi_paths_timed",
                 "hole_looks_fewest_in_a_path",
                 "hole_looks_fewest_in_a_run",
                 "holes",

@@ -753,8 +753,12 @@ camera, and `holes_after_catch_up` the holes the look after it found, which must
 
 `gates` holds, for each measure, the `worst` over every run (and path) and the `limit`, and `over`
 lists the gates that are over: `frame_time`, `frame_cpu`, `holes`, `memory`, `soft_misses`
-(under the camera), `scene_lag`, `spawn_ring`, `time_to_control`, `settle`. For the holes it also
-has `hole_looks_fewest_in_a_run` and `hole_looks_fewest_in_a_path`.
+(under the camera), `scene_lag`, `spawn_ring`, `time_to_control`, `settle`, `gi`. For the holes it also
+has `hole_looks_fewest_in_a_run` and `hole_looks_fewest_in_a_path`. **`gi`** (#54, schema 28) holds Primary's
+`gi` pass in this run, on the full-size Planet, which the stepped bench's small flight understated by
+about 15 times (0.3 ms there, 4 to 5 ms here in the first run): the worst path's mean (`gi_mean_ms`, the
+pass's own 1.5 ms) and 99th percentile (`gi_p99_ms`, 3 ms), from `paths[].gpu_passes.gi`; with no
+timed path (`gi_paths_timed` 0) the gate is over, since a gate that looked at nothing has not passed.
 
 **Edit latency is measured in this mode**, as ADR 0006's bound needs the real scene thread and the
 stepped mode cannot show it (its `residency.edit_latency_frames` is 0 by construction, see above).
@@ -1580,7 +1584,7 @@ they run in a Primary frame:
 | `normals` | the smooth normal of every hit (the cost of the smooth normals, alone) | none yet |
 | `atmosphere` | the tables of the atmosphere (#53): the sky-view table and the aerial-perspective volumes every frame, and the transmittance, multiple-scattering and sun-free tables only when the air or the sun's height changes. It runs first, in both views, and is a pass of its own, so it adds a line to `passes[]` and no field (no schema bump). The 0.3 ms budget is the issue's, **for the 4090**: the orchestrator measures it | 0.3 |
 | `shadows` | the sun's shadow: two shadow rays a pixel from the G-buffer (#52, **schema 24**; `--shadow-rays N` in the bench) | 0.4 |
-| `gi` | Primary's global illumination (#54, **schema 28**): one bounce and an emitter sample a pixel from the G-buffer, the world-space radiance cache that supplies the bounces after it, and the cache's per-frame resolve | 1.5 |
+| `gi` | Primary's global illumination (#54, **schema 28**): one bounce and an emitter sample for **one pixel of every 2 x 2 block** (a different one each frame; the rest of the block is reconstructed in `shade_pass`) from the G-buffer, the world-space radiance cache that supplies the bounces after it, and the cache's per-frame resolve | 1.5 |
 | `shade` | the lit image, as linear light, from the G-buffer, the shadows and the GI | none yet |
 | `exposure`, `exposure_adapt` | the log-average luminance and the adapted exposure | none yet |
 | `bloom_down`, `bloom_h`, `bloom_v` | the bloom, at a quarter of the size | none yet |

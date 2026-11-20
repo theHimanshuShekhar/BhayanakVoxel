@@ -344,6 +344,13 @@ fn hit_level(ray: Ray, w: Walk, level: u32, t_from: f32, limit: f32) -> Hit {
 
 // The first solid Voxel along the ray, or a miss.
 fn trace(ray: Ray) -> Hit {
+    return trace_within(ray, 3.4e38);
+}
+
+// `trace`, looking no further than `reach` along the ray: what is past it is not found (a miss), and
+// the levels that only have such space to look in are skipped at once. For the rays of Primary's GI,
+// which are the long incoherent ones (gi.wgsl, `GI_REACH`).
+fn trace_within(ray: Ray, reach_t: f32) -> Hit {
     var w: Walk;
     w.d = select(ray.dir, vec3<f32>(TINY), abs(ray.dir) < vec3<f32>(TINY));
     w.inv = 1.0 / w.d;
@@ -352,7 +359,7 @@ fn trace(ray: Ray) -> Hit {
 
     // Clip the ray to the ball that has the whole Planet in it: nothing is found outside it.
     var t_from = 0.0;
-    var limit = 3.4e38;
+    var limit = reach_t;
     if scene.bound_radius > 0.0 {
         let oc = vec3<f32>(scene.bound_centre - ray.cell) - ray.origin;
         // Summed in the order that reference.rs does; whether the driver fuses them is its own.
@@ -367,7 +374,7 @@ fn trace(ray: Ray) -> Hit {
             return miss();
         }
         t_from = max(along - h, 0.0);
-        limit = along + h;
+        limit = min(along + h, reach_t);
     }
 
     // Every level is a part of space of its own, so the nearest hit of all is the one that is

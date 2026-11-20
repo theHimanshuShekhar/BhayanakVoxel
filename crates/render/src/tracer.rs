@@ -1139,6 +1139,7 @@ impl Tracer {
                 layout_entry(4, buffer_binding(STORAGE_READ)),
                 texture(5, uint),
                 texture(6, uint),
+                texture(8, loaded),
                 texture(10, loaded),
                 layout_entry(GI_CACHE_BINDING, buffer_binding(STORAGE_WRITE)),
                 texture(21, loaded),
@@ -2251,7 +2252,12 @@ impl Tracer {
         pass.set_pipeline(&self.gi);
         pass.set_bind_group(0, &self.scene.group, &[]);
         pass.set_bind_group(1, &group, &[]);
-        pass.dispatch_workgroups(width.div_ceil(8), height.div_ceil(8), 1);
+        // One pixel of each 2 x 2 block (`gi_lattice_offset`): a quarter of the threads.
+        pass.dispatch_workgroups(
+            width.div_ceil(2).div_ceil(8),
+            height.div_ceil(2).div_ceil(8),
+            1,
+        );
         pass.set_pipeline(&self.gi_resolve);
         pass.set_bind_group(0, &self.scene.group, &[]);
         pass.set_bind_group(1, &resolve, &[]);
@@ -2287,6 +2293,7 @@ impl Tracer {
                 },
                 view(5, &target.gbuffer),
                 view(6, &target.surface),
+                view(8, &target.normals),
                 view(10, &target.sun_weights),
                 buffer_entry(GI_CACHE_BINDING, &self.gi_cache),
                 view(21, &target.gi_light),

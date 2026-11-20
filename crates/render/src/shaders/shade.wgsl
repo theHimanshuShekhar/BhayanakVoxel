@@ -177,7 +177,7 @@ fn shade_pass(@builtin(global_invocation_id) id: vec3<u32>) {
         // lighting: Sun and shadows
         sun = textureLoad(sun_weights, id.xy, 0).x;
         // lighting: Bounce light
-        gi = textureLoad(gi_light, id.xy, 0).xyz;
+        gi = gi_reconstruct(id.xy, hit, size);
     }
     let uv = (vec2<f32>(id.xy) + 0.5) / vec2<f32>(size);
     textureStore(output, id.xy, vec4<f32>(shade(ray, hit, colour, sun, gi, uv), 1.0));

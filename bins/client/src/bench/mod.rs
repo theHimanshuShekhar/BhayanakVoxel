@@ -1005,6 +1005,8 @@ fn print_real_time(r: &realtime::RealTimeReport) {
         ("spawn ring (s)", g.spawn_ring_s),
         ("time to control (s)", g.time_to_control_s),
         ("settle (s)", g.settle_s),
+        ("gi pass mean (ms)", g.gi_mean_ms),
+        ("gi pass p99 (ms)", g.gi_p99_ms),
     ] {
         eprintln!(
             "  gate {name:<20} worst {:>12.2} limit {:>12.2}{}",
