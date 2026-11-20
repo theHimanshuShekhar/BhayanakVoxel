@@ -41,7 +41,7 @@
 //! steps; a stepped loader is one more field, which is `None` there.
 
 use std::cmp::Ordering;
-use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering as Atomic};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, TryLockError};
@@ -78,6 +78,92 @@ pub fn hold_guard(
     }
     store.stream_from(first);
     held
+}
+
+/// How many of the loader's workers at most make cells of the Guard while there is other work to do
+/// (#220): the rest of the Guard is made in the background, 2 of the 6 workers at eight cores, and
+/// the ring's children are not made later for it. Never more than all but one of the workers
+/// ([`guard_may_start`]), so that the streaming queue always has one: with 4 or 5 cores that is 1
+/// of 2 or 3 workers.
+pub const GUARD_WORKERS: usize = 2;
+
+/// With a single worker (three cores or fewer) the Guard has no share while there is other work, so
+/// it is given a cell after this many of the queue's jobs, not to wait for a fill that takes
+/// minutes.
+const GUARD_EVERY: usize = 16;
+
+/// Whether a worker may take a cell of the Guard now, with `workers` threads, `guarding` of them on
+/// cells, the queue's jobs `queue_empty` or not, and `since` jobs of the queue taken since the last
+/// cell (#220). With other work to do the Guard has [`GUARD_WORKERS`] of the workers and at most
+/// all but one, so that streaming is never left with none (a single worker has a cell in
+/// [`GUARD_EVERY`] jobs instead). With none, it has all but one too: a job that comes in does not
+/// wait behind a cell on every worker, and a single worker has the lot.
+fn guard_may_start(workers: usize, guarding: usize, queue_empty: bool, since: usize) -> bool {
+    let all_but_one = workers.saturating_sub(1);
+    if queue_empty {
+        guarding < all_but_one.max(1)
+    } else {
+        let share = GUARD_WORKERS.min(all_but_one);
+        guarding < share || (share == 0 && since >= GUARD_EVERY)
+    }
+}
+
+/// The Guard, in part (#220): the cells `now` of the Guard (bricks of the top level of the store's
+/// pyramid, see [`plan_guard`]) held in `store` and the cells `later` said to be pending
+/// ([`BrickStore::defer_guard`]), and the store made to stream from `first`, so that a brick of the
+/// level `first` is split when its children are resident. The bricks of the cells are worked out
+/// on all the cores. Returns how many bricks it holds. [`Loader::request_guard`] asks for the
+/// cells that are pending.
+pub fn hold_guard_cells(
+    store: &mut BrickStore,
+    planet: &planet_gen::planet::Planet,
+    first: usize,
+    now: &[BrickCoord],
+    later: &[BrickCoord],
+) -> usize {
+    let top = store.level_count() - 1;
+    let guard = planet.guard_in(first..=top, top, now);
+    let held = guard.len();
+    for (level, coord, brick, solid) in guard {
+        store.hold(level, coord, brick, solid);
+    }
+    store.defer_guard(later.iter().copied());
+    store.stream_from(first);
+    held
+}
+
+/// What a coarse voxel of the Guard that is drawn may be out by, in Voxels, in judging what a
+/// camera could see of it: one voxel of the Guard's finest level, 8 192 Voxels (410 m). Such a
+/// voxel can stand about that far over the Planet's highest radius, and the sea's sphere, which
+/// hides what is behind it, about that far under its radius.
+pub const GUARD_MARGIN: f64 = (1u64 << GUARD_FIRST) as f64;
+
+/// The Guard's cells that lie in what a camera within `reach` Voxels of `spawn` could see, and the
+/// others: the cells of `planet` (bricks of the top level of a pyramid of `levels` levels, see
+/// [`planet_gen::planet::Planet::guard_cells`]) split by [`render::lod::Horizon::could_see`], seen
+/// at the Planet's highest radius with `margin` Voxels to spare (a coarse voxel that is drawn can
+/// stand that far over it, or under the sea's sphere: [`GUARD_MARGIN`]), each in the order of the
+/// distance from `spawn` to its box. The first part is what the window waits for (#220), the
+/// second is made in the background.
+pub fn plan_guard(
+    planet: &planet_gen::planet::Planet,
+    levels: usize,
+    spawn: [f64; 3],
+    reach: f64,
+    margin: f64,
+) -> (Vec<BrickCoord>, Vec<BrickCoord>) {
+    let top = levels - 1;
+    let horizon = render::lod::Horizon::new(planet.sea_radius());
+    let highest = f64::from(planet.max_radius());
+    let mut cells = planet.guard_cells(top);
+    cells.sort_by(|&a, &b| {
+        brick_distance(spawn, top, a)
+            .total_cmp(&brick_distance(spawn, top, b))
+            .then(a.cmp(&b))
+    });
+    cells
+        .into_iter()
+        .partition(|&cell| horizon.could_see(spawn, reach, top, cell, highest, margin))
 }
 
 /// One brick's children to generate.
@@ -138,10 +224,27 @@ struct State {
     /// job that had gone to a worker already stays until the queue is empty.
     cancelled: HashSet<u64>,
     shutdown: bool,
+    /// The cells of the Guard that nothing has taken yet, the nearest first.
+    guard: VecDeque<GuardJob>,
+    /// Jobs of the queue taken since the last cell of the Guard ([`GUARD_EVERY`]).
+    since_guard: usize,
+}
+
+/// One cell of the Guard to generate (#220).
+#[derive(Clone, Copy)]
+struct GuardJob {
+    cell: BrickCoord,
+    ticket: u64,
+    /// The Guard's finest level, and the top of the pyramid.
+    first: usize,
+    top: usize,
 }
 
 struct Shared {
     state: Mutex<State>,
+    /// How many threads make the loader's jobs (a stepped loader's `GUARD_WORKERS + 1`: as many as
+    /// the Guard may have, and one more).
+    workers: usize,
     wake: Condvar,
     source: Arc<dyn BrickSource>,
     /// Bricks the workers have asked the generator for.
@@ -150,6 +253,9 @@ struct Shared {
     ahead: AtomicUsize,
     /// Jobs a worker has taken and not yet sent the arrival of: the ones that are in flight.
     working: AtomicUsize,
+    /// Jobs of the Guard that a worker has taken and not yet sent the arrival of (see
+    /// [`GUARD_WORKERS`]).
+    guarding: AtomicUsize,
     /// Nanoseconds the workers have spent generating (summed over them), and waiting with jobs
     /// queued because they were [`MAX_AHEAD`] ahead: how much of their time the frame thread's
     /// taking in is what limits (see [`Loader::busy`]).
@@ -174,6 +280,13 @@ pub enum Arrival {
     },
     /// The camera went before the children of `key` were generated: they were not.
     Dropped(Key),
+    /// The Guard under `cell`, a brick of the top level, as
+    /// [`brick_store::BrickSource::guard_cell`] makes it, which
+    /// [`brick_store::BrickStore::hold_guard_cell`] takes (#220).
+    Guard {
+        cell: BrickCoord,
+        bricks: Vec<(usize, BrickCoord, Brick, bool)>,
+    },
 }
 
 /// What a loader is made of before it has workers: the state they share and the two ends of the
@@ -198,6 +311,10 @@ pub struct Loader {
     cancels: Vec<u64>,
     /// Bricks asked for whose children have not been received, and the request.
     requested: HashMap<Key, u64>,
+    /// Cells of the Guard not handed to the workers yet.
+    guard_outbox: Vec<GuardJob>,
+    /// Cells of the Guard asked for whose bricks have not been received (#220).
+    guard_asked: HashSet<BrickCoord>,
     next_ticket: u64,
     /// The bands and reach that jobs are classed by (the workers' are in their state).
     bands: Bands,
@@ -222,8 +339,9 @@ impl Loader {
         bands: Bands,
         workers: usize,
     ) -> Self {
-        let (shared, sender, arrivals) = Self::parts(source, camera, bands);
-        let workers = (0..workers.max(1))
+        let workers = workers.max(1);
+        let (shared, sender, arrivals) = Self::parts(source, camera, bands, workers);
+        let workers = (0..workers)
             .map(|n| {
                 let (shared, sender) = (Arc::clone(&shared), sender.clone());
                 std::thread::Builder::new()
@@ -239,7 +357,17 @@ impl Loader {
     /// step at a time ([`Loader::step`]), by the code that the threads run, so the same bricks come
     /// in the same order every time.
     pub fn stepped(source: Arc<dyn BrickSource>, camera: [f64; 3], bands: Bands) -> Self {
-        let (shared, sender, arrivals) = Self::parts(source, camera, bands);
+        Self::stepped_for(source, camera, bands, GUARD_WORKERS + 1)
+    }
+
+    /// [`Loader::stepped`] that the Guard's share is worked out for `workers` threads of.
+    fn stepped_for(
+        source: Arc<dyn BrickSource>,
+        camera: [f64; 3],
+        bands: Bands,
+        workers: usize,
+    ) -> Self {
+        let (shared, sender, arrivals) = Self::parts(source, camera, bands, workers);
         let mut loader = Self::with(shared, arrivals, Vec::new(), bands);
         // Kept, so that the channel is open for as long as the loader is.
         loader.stepper = Some(sender);
@@ -256,18 +384,31 @@ impl Loader {
         };
         let mut done = 0;
         while done < most {
-            let Next::Job(job, camera, bands, reach) = poll(&self.shared, self.shared.lock())
-            else {
-                break;
-            };
-            let arrival = generate(&self.shared, &job, camera, bands, reach);
-            complete(&self.shared, arrivals, job.ticket, arrival);
+            match poll(&self.shared, self.shared.lock()) {
+                Next::Job(job, camera, bands, reach) => {
+                    let arrival = generate(&self.shared, &job, camera, bands, reach);
+                    complete(&self.shared, arrivals, job.ticket, arrival);
+                }
+                // Nothing is made beside it here: the Guard's cells come before the queue's jobs,
+                // which a loader with threads does only while less than [`GUARD_WORKERS`] are on
+                // them.
+                Next::Guard(job) => {
+                    let arrival = guard_cell(&self.shared, job);
+                    complete(&self.shared, arrivals, job.ticket, arrival);
+                }
+                Next::Idle(_) | Next::Shutdown => break,
+            }
             done += 1;
         }
         done
     }
 
-    fn parts(source: Arc<dyn BrickSource>, camera: [f64; 3], bands: Bands) -> Parts {
+    fn parts(
+        source: Arc<dyn BrickSource>,
+        camera: [f64; 3],
+        bands: Bands,
+        workers: usize,
+    ) -> Parts {
         let shared = Arc::new(Shared {
             state: Mutex::new(State {
                 queue: BinaryHeap::new(),
@@ -279,7 +420,10 @@ impl Loader {
                 reordering: false,
                 cancelled: HashSet::new(),
                 shutdown: false,
+                guard: VecDeque::new(),
+                since_guard: 0,
             }),
+            workers,
             wake: Condvar::new(),
             source,
             generated: AtomicU64::new(0),
@@ -287,6 +431,7 @@ impl Loader {
             generating_ns: AtomicU64::new(0),
             held_back_ns: AtomicU64::new(0),
             working: AtomicUsize::new(0),
+            guarding: AtomicUsize::new(0),
         });
         let (sender, arrivals) = mpsc::channel();
         (shared, sender, arrivals)
@@ -306,6 +451,8 @@ impl Loader {
             outbox: Vec::new(),
             cancels: Vec::new(),
             requested: HashMap::new(),
+            guard_outbox: Vec::new(),
+            guard_asked: HashSet::new(),
             next_ticket: 0,
             bands,
             reach: Reach::NONE,
@@ -390,6 +537,32 @@ impl Loader {
         }
     }
 
+    /// Asks for the Guard under each of `cells` (bricks of the top level, `top`, of a pyramid
+    /// whose Guard starts at level `first`), in the order given, which the workers keep to: the
+    /// cells of a Guard that is held in part (#220, [`brick_store::BrickStore::defer_guard`]).
+    /// They make them beside the queue's jobs ([`GUARD_WORKERS`]); each comes back as
+    /// [`Arrival::Guard`]. A cell asked for already is not asked for again.
+    pub fn request_guard(
+        &mut self,
+        first: usize,
+        top: usize,
+        cells: impl IntoIterator<Item = BrickCoord>,
+    ) {
+        for cell in cells {
+            if !self.guard_asked.insert(cell) {
+                continue;
+            }
+            let ticket = self.next_ticket;
+            self.next_ticket += 1;
+            self.guard_outbox.push(GuardJob {
+                cell,
+                ticket,
+                first,
+                top,
+            });
+        }
+    }
+
     /// Gives up on the children of `keys`, bricks of [`render::Scene::take_cancelled`]: they are
     /// not generated if they have not been started. They may be asked for again.
     pub fn cancel(&mut self, keys: impl IntoIterator<Item = Key>) {
@@ -447,8 +620,9 @@ impl Loader {
             queue.retain(|job| !cancelled.contains(&job.ticket));
             cancelled.clear();
         }
-        let pushed = !self.outbox.is_empty();
+        let pushed = !self.outbox.is_empty() || !self.guard_outbox.is_empty();
         state.queue.extend(self.outbox.drain(..));
+        state.guard.extend(self.guard_outbox.drain(..));
         drop(state);
         if pushed {
             self.shared.wake.notify_all();
@@ -484,6 +658,11 @@ impl Loader {
                                 out.push(Arrival::Dropped(key));
                             }
                         }
+                        Arrival::Guard { cell, bricks } => {
+                            counted += 1;
+                            self.guard_asked.remove(&cell);
+                            out.push(Arrival::Guard { cell, bricks });
+                        }
                     }
                 }
                 Err(TryRecvError::Empty) => break,
@@ -499,10 +678,17 @@ impl Loader {
         out
     }
 
-    /// Bricks asked for whose children have not been received: queued, being generated, or
-    /// waiting to be taken in. Nothing is queued once it is zero and the scene waits for nothing.
+    /// Bricks asked for whose children have not been received, and cells of the Guard asked for
+    /// whose bricks have not: queued, being generated, or waiting to be taken in. Nothing is queued
+    /// once it is zero and the scene waits for nothing.
     pub fn pending(&self) -> usize {
-        self.requested.len()
+        self.requested.len() + self.guard_asked.len()
+    }
+
+    /// Cells of the Guard asked for whose bricks have not been received (#220): part of
+    /// [`Loader::pending`].
+    pub fn guard_pending(&self) -> usize {
+        self.guard_asked.len()
     }
 
     /// Whether the children of `key` are asked for and not received (see [`Loader::pending`]).
@@ -597,6 +783,8 @@ enum Next<'a> {
     /// A job it has taken (it is counted in flight and ahead), and the camera, bands and reach to
     /// do it for.
     Job(Job, [f64; 3], Bands, Reach),
+    /// A cell of the Guard it has taken (counted in flight, ahead and guarding).
+    Guard(GuardJob),
     /// Nothing that it may do now: a thread waits for a change, a stepped loader stops.
     Idle(MutexGuard<'a, State>),
     Shutdown,
@@ -628,10 +816,32 @@ fn poll<'a>(shared: &'a Shared, mut state: MutexGuard<'a, State>) -> Next<'a> {
             state.reordering = false;
             shared.wake.notify_all();
             continue;
-        } else if state.queue.is_empty() {
+        } else if state.queue.is_empty() && state.guard.is_empty() {
             // Whatever is left was for jobs that are gone.
             state.cancelled.clear();
         } else if shared.ahead.load(Atomic::Relaxed) < MAX_AHEAD {
+            // The Guard has [`GUARD_WORKERS`] while there is other work, and all but one when
+            // there is not ([`guard_may_start`]).
+            if !state.guard.is_empty()
+                && guard_may_start(
+                    shared.workers,
+                    shared.guarding.load(Atomic::Relaxed),
+                    state.queue.is_empty(),
+                    state.since_guard,
+                )
+            {
+                let job = state.guard.pop_front().expect("it is not empty");
+                state.since_guard = 0;
+                shared.working.fetch_add(1, Atomic::AcqRel);
+                shared.guarding.fetch_add(1, Atomic::AcqRel);
+                shared.ahead.fetch_add(1, Atomic::AcqRel);
+                return Next::Guard(job);
+            }
+            if state.queue.is_empty() {
+                // Only cells of the Guard are left, and the workers it may have are on them.
+                return Next::Idle(state);
+            }
+            state.since_guard += 1;
             let job = state.queue.pop().expect("it is not empty");
             if state.cancelled.remove(&job.ticket) {
                 continue;
@@ -682,9 +892,21 @@ fn complete(
     ticket: u64,
     arrival: Arrival,
 ) -> bool {
+    let guard = matches!(arrival, Arrival::Guard { .. });
     let sent = arrivals.send((ticket, arrival));
+    if guard {
+        shared.guarding.fetch_sub(1, Atomic::Release);
+    }
     shared.working.fetch_sub(1, Atomic::Release);
     sent.is_ok()
+}
+
+/// What a worker makes of a cell of the Guard: its bricks. Runs with no lock held.
+fn guard_cell(shared: &Shared, job: GuardJob) -> Arrival {
+    Arrival::Guard {
+        cell: job.cell,
+        bricks: shared.source.guard_cell(job.first, job.top, job.cell),
+    }
 }
 
 /// Nanoseconds since `began`.
@@ -702,6 +924,18 @@ fn work(shared: &Shared, arrivals: &Sender<(u64, Arrival)>) {
             loop {
                 match poll(shared, state) {
                     Next::Job(job, camera, bands, reach) => break (job, camera, bands, reach),
+                    Next::Guard(job) => {
+                        let began = std::time::Instant::now();
+                        let arrival = guard_cell(shared, job);
+                        shared
+                            .generating_ns
+                            .fetch_add(nanos(began), Atomic::Relaxed);
+                        if !complete(shared, arrivals, job.ticket, arrival) {
+                            return;
+                        }
+                        state = shared.lock();
+                        continue;
+                    }
                     Next::Shutdown => return,
                     Next::Idle(idle) => {
                         // Waiting with jobs queued is waiting for the frame thread to take in.
@@ -755,6 +989,8 @@ mod tests {
             reordering: false,
             cancelled: HashSet::new(),
             shutdown: false,
+            guard: VecDeque::new(),
+            since_guard: 0,
         };
         let order: Vec<i32> = state
             .queue
@@ -852,9 +1088,157 @@ mod tests {
             .map(|arrival| match arrival {
                 Arrival::Children { key, .. } => key,
                 Arrival::Dropped(key) => panic!("{key:?} was dropped"),
+                Arrival::Guard { .. } => panic!("no Guard was asked for"),
             })
             .collect();
         assert_eq!(got, keys[..100]);
+    }
+
+    fn cell(x: i32) -> BrickCoord {
+        BrickCoord([x, 0, 0])
+    }
+
+    #[test]
+    fn the_cells_of_the_guard_come_in_the_order_asked_once_each_and_before_the_queues_jobs() {
+        let source = Arc::new(Counting::default());
+        let mut loader = new_loader(source.clone());
+        let keys = near_the_origin();
+        loader.request(&BrickStore::new(), keys.iter().copied().take(5), [0.0; 3]);
+        loader.request_guard(11, 13, [cell(7), cell(3), cell(5)]);
+        // A cell asked for again is not made twice.
+        loader.request_guard(11, 13, [cell(3), cell(9)]);
+        assert_eq!(loader.guard_pending(), 4);
+        assert_eq!(loader.pending(), 9, "the cells are pending work too");
+        loader.sync([0.0; 3], bands());
+        assert_eq!(loader.step(100), 9);
+        let got = loader.receive(100);
+        let cells: Vec<BrickCoord> = got
+            .iter()
+            .take(4)
+            .map(|arrival| match arrival {
+                Arrival::Guard { cell, bricks } => {
+                    assert_eq!(bricks.len(), 1, "the source's answer is passed on");
+                    *cell
+                }
+                _ => panic!("a job of the queue came before the Guard"),
+            })
+            .collect();
+        assert_eq!(cells, [cell(7), cell(3), cell(5), cell(9)]);
+        assert_eq!(got.len(), 9);
+        assert_eq!(source.cells.load(Atomic::Relaxed), 4);
+        assert_eq!((loader.guard_pending(), loader.pending()), (0, 0));
+    }
+
+    #[test]
+    fn the_guard_has_two_workers_while_there_is_other_work_and_never_the_last_one() {
+        // (workers, guarding, queue is empty, jobs since a cell) -> may a worker take a cell?
+        for (workers, guarding, empty, since, may) in [
+            // 6 workers (8 cores): 2 beside the queue, 5 when it is empty.
+            (6, 0, false, 0, true),
+            (6, 1, false, 0, true),
+            (6, 2, false, 0, false),
+            (6, 4, true, 0, true),
+            (6, 5, true, 0, false),
+            // 3 workers: 2 beside the queue, and one free with it empty.
+            (3, 1, false, 0, true),
+            (3, 2, false, 0, false),
+            (3, 2, true, 0, false),
+            // 2 workers (4 cores): one beside the queue, which keeps the other, and one with it
+            // empty.
+            (2, 0, false, 0, true),
+            (2, 1, false, 0, false),
+            (2, 1, false, 1000, false),
+            (2, 0, true, 0, true),
+            (2, 1, true, 0, false),
+            // A single worker: a cell in GUARD_EVERY jobs beside the queue, all when it is empty.
+            (1, 0, false, 0, false),
+            (1, 0, false, GUARD_EVERY - 1, false),
+            (1, 0, false, GUARD_EVERY, true),
+            (1, 0, true, 0, true),
+            (1, 1, true, 0, false),
+        ] {
+            assert_eq!(
+                guard_may_start(workers, guarding, empty, since),
+                may,
+                "{workers} workers, {guarding} on cells, queue empty {empty}, {since} jobs since"
+            );
+        }
+    }
+
+    #[test]
+    fn the_guard_gets_its_share_beside_the_queue_and_a_single_worker_a_cell_now_and_then() {
+        let keys = near_the_origin();
+        let loader_for = |workers: usize| {
+            let mut loader =
+                Loader::stepped_for(Arc::new(Counting::default()), [0.0; 3], bands(), workers);
+            loader.request(&BrickStore::new(), keys.iter().copied().take(40), [0.0; 3]);
+            loader.request_guard(11, 13, (0..4).map(cell));
+            loader.sync([0.0; 3], bands());
+            loader
+        };
+        // Three workers: the Guard has two. With them on cells, the next takes the queue's nearest.
+        let loader = loader_for(3);
+        let shared = loader.shared.clone();
+        shared.guarding.store(GUARD_WORKERS, Atomic::Relaxed);
+        assert!(matches!(poll(&shared, shared.lock()), Next::Job(..)));
+        // Under its share, it is the Guard's.
+        shared.guarding.store(GUARD_WORKERS - 1, Atomic::Relaxed);
+        assert!(matches!(poll(&shared, shared.lock()), Next::Guard(job) if job.cell == cell(0)));
+        // With nothing else queued the Guard has all but one of the workers.
+        shared.lock().queue.clear();
+        shared.guarding.store(GUARD_WORKERS - 1, Atomic::Relaxed);
+        assert!(matches!(poll(&shared, shared.lock()), Next::Guard(job) if job.cell == cell(1)));
+        shared.guarding.store(GUARD_WORKERS, Atomic::Relaxed);
+        assert!(matches!(poll(&shared, shared.lock()), Next::Idle(_)));
+        // Two workers (four cores): one, whatever is asked, beside the queue.
+        let loader = loader_for(2);
+        let shared = loader.shared.clone();
+        shared.guarding.store(1, Atomic::Relaxed);
+        assert!(matches!(poll(&shared, shared.lock()), Next::Job(..)));
+        // One worker: the queue's jobs, and a cell after GUARD_EVERY of them.
+        let loader = loader_for(1);
+        let shared = loader.shared.clone();
+        for _ in 0..GUARD_EVERY {
+            assert!(matches!(poll(&shared, shared.lock()), Next::Job(..)));
+        }
+        assert!(matches!(poll(&shared, shared.lock()), Next::Guard(job) if job.cell == cell(0)));
+        assert!(matches!(poll(&shared, shared.lock()), Next::Job(..)));
+        // It does the lot of the cells when the queue is empty.
+        shared.lock().queue.clear();
+        shared.guarding.store(0, Atomic::Relaxed);
+        assert!(matches!(poll(&shared, shared.lock()), Next::Guard(job) if job.cell == cell(1)));
+    }
+
+    #[test]
+    fn a_guard_that_is_made_costs_the_queue_nothing_whatever_the_workers() {
+        // The cells of the Guard are made in the first seconds, and what is streamed after (a
+        // flight at 2 m, #220) must go as it did before there was a Guard: every poll is the
+        // queue's nearest job of the most urgent class, never a cell and never idle, whatever the
+        // workers and the cells' count of `guarding`.
+        let keys = near_the_origin();
+        for workers in [1, 2, 3, 6] {
+            let mut loader =
+                Loader::stepped_for(Arc::new(Counting::default()), [0.0; 3], bands(), workers);
+            loader.request(&BrickStore::new(), keys.iter().copied().take(200), [0.0; 3]);
+            loader.sync([0.0; 3], bands());
+            let shared = loader.shared.clone();
+            let mut expected = shared.lock().queue.clone().into_sorted_vec();
+            expected.reverse();
+            assert!(!expected.is_empty());
+            for (n, job) in expected.iter().enumerate() {
+                shared.guarding.store(n % (workers + 1), Atomic::Relaxed);
+                match poll(&shared, shared.lock()) {
+                    Next::Job(taken, ..) => {
+                        assert_eq!(taken.key, job.key, "{workers} workers, the {n}th job");
+                    }
+                    Next::Guard(_) => panic!("{workers} workers: a cell with no Guard"),
+                    _ => panic!(
+                        "{workers} workers: idle with {} jobs queued",
+                        expected.len() - n
+                    ),
+                }
+            }
+        }
     }
 
     #[test]
@@ -869,12 +1253,24 @@ mod tests {
     #[derive(Debug, Default)]
     struct Counting {
         made: AtomicUsize,
+        cells: AtomicUsize,
     }
 
     impl BrickSource for Counting {
         fn brick(&self, _: usize, _: BrickCoord) -> Brick {
             self.made.fetch_add(1, Atomic::Relaxed);
             Brick::solid(brick_store::Material(1))
+        }
+
+        /// One brick, at the first level, for the cell.
+        fn guard_cell(
+            &self,
+            first: usize,
+            _: usize,
+            cell: BrickCoord,
+        ) -> Vec<(usize, BrickCoord, Brick, bool)> {
+            self.cells.fetch_add(1, Atomic::Relaxed);
+            vec![(first, cell, Brick::solid(brick_store::Material(1)), true)]
         }
     }
 
@@ -1111,6 +1507,7 @@ mod tests {
                 match arrival {
                     Arrival::Dropped(_) => dropped += 1,
                     Arrival::Children { .. } => children += 1,
+                    Arrival::Guard { .. } => panic!("no Guard was asked for"),
                 }
             }
             steps += 1;

@@ -699,6 +699,11 @@ pub fn top_bricks(
             }
         }
     }
+    // The cells of a Guard that is not held yet are not there to walk (see
+    // [`BrickStore::defer_guard`]): they are added when they are ([`Selection::add_roots`]).
+    if top + 1 == store.level_count() {
+        roots.retain(|&coord| !store.is_guard_cell_pending(coord));
+    }
     roots.into_iter().collect()
 }
 
@@ -1890,6 +1895,69 @@ impl Selection {
         node_slack(self.bands, self.placed, key, distance, false, margin)
     }
 
+    /// Takes in the bricks `cells` of the coarsest level, which are held now (the cells of a Guard
+    /// that was not, [`BrickStore::hold_guard_cell`]): each is a root of the tree, and what is
+    /// under it is built as the bands say, as it is for a root that was there at the start. No root
+    /// and no node that was there is changed, except the bricks beside the new ones that a brick of
+    /// theirs buries, as the arrival of a brick's children looks at them ([`Selection::arrived`]).
+    /// A cell that is not air is a brick of the Planet, and a cell that is is one only if ground
+    /// pokes up into it (see [`classify`]). So the selection is what [`Selection::new`] makes once
+    /// every cell is held, whatever the order they came in.
+    pub fn add_roots(
+        &mut self,
+        store: &BrickStore,
+        cells: impl IntoIterator<Item = BrickCoord>,
+    ) -> Diff {
+        let mut diff = Diff::default();
+        let top = self.top;
+        let mut added = Vec::new();
+        for coord in cells {
+            if self.roots.contains(&coord) {
+                continue;
+            }
+            self.roots.push(coord);
+            added.push(coord);
+            let p = probe(store, top, coord);
+            if p.present {
+                self.build(store, (top, coord), p, &mut diff);
+            }
+        }
+        // The bricks beside the new cells, at the Guard's levels (there is nothing of them below),
+        // were told that a brick across the border was not known to be full, which it may be now.
+        let mut beside = BTreeSet::new();
+        for &cell in &added {
+            for level in store.stream_floor().unwrap_or(top).min(top)..=top {
+                let span = 1i32 << (top - level);
+                let low = cell.0.map(|c| c * span);
+                for face in 0..6 {
+                    let axis = face / 2;
+                    let outside = if face % 2 == 0 {
+                        low[axis] - 1
+                    } else {
+                        low[axis] + span
+                    };
+                    let (a, b) = ((axis + 1) % 3, (axis + 2) % 3);
+                    for u in low[a]..low[a] + span {
+                        for v in low[b]..low[b] + span {
+                            let mut at = [0; 3];
+                            (at[axis], at[a], at[b]) = (outside, u, v);
+                            let key = (level, BrickCoord(at));
+                            if self.nodes.contains_key(&key) {
+                                beside.insert(key);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        for key in beside {
+            if store.is_full_known(key.0, key.1) {
+                self.recheck(store, key, &mut diff);
+            }
+        }
+        diff
+    }
+
     /// Splits the bricks `parents` that were waiting, now that the bricks under them are resident.
     /// Returns what changed in what is drawn.
     pub fn arrived(&mut self, store: &BrickStore, parents: impl IntoIterator<Item = Key>) -> Diff {
@@ -2621,6 +2689,189 @@ mod tests {
             // Within a brick of the ball's skin.
             assert!(radius > 400.0 - 2.0 * size, "{level} {c:?} {radius}");
         }
+    }
+
+    fn first_batch(cells: &[BrickCoord]) -> &[BrickCoord] {
+        &cells[..cells.len() / 3]
+    }
+
+    fn second_batch(cells: &[BrickCoord]) -> &[BrickCoord] {
+        &cells[cells.len() / 3..]
+    }
+
+    #[test]
+    fn cells_that_come_late_are_taken_in_without_a_rebuild_and_leave_a_selection_of_all_of_them() {
+        let (mut store, top, roots) = ball();
+        let (camera, bands) = ([0.0, 420.0, 0.0], Bands::with_d0(256.0));
+        let (whole, _) = Selection::new(&store, camera, bands, top, roots.clone());
+        assert!(roots.len() > 40, "{}", roots.len());
+        // The cells with x over 0 are not held yet: not roots, and not drawn.
+        let later: Vec<BrickCoord> = roots.iter().copied().filter(|c| c.0[0] > 0).collect();
+        assert!(later.len() > 10 && later.len() < roots.len() - 10);
+        store.defer_guard(later.iter().copied());
+        let now = top_bricks(&store, top, Some(([0; 3], 450)));
+        assert!(now.iter().all(|c| c.0[0] <= 0) && now.len() + later.len() == roots.len());
+        let (mut partial, _) = Selection::new(&store, camera, bands, top, now);
+        let drawn_in = |selection: &Selection, x: std::ops::RangeInclusive<i32>| {
+            selection
+                .bricks()
+                .filter(|&(level, coord)| x.contains(&(coord.0[0] >> (top - level))))
+                .count()
+        };
+        assert_eq!(
+            drawn_in(&partial, 1..=i32::MAX),
+            0,
+            "nothing under a late cell"
+        );
+        assert!(drawn_in(&partial, i32::MIN..=0) > 100);
+        assert!(partial.nodes() < whole.nodes());
+        is_a_cut(&partial);
+        // They come in two batches, and a cell that is told of again is not made twice.
+        for batch in [first_batch(&later), second_batch(&later)] {
+            for &cell in batch {
+                store.hold_guard_cell(cell, []);
+            }
+            assert!(!partial.add_roots(&store, batch.iter().copied()).is_empty());
+            is_a_cut(&partial);
+        }
+        let again = partial.add_roots(&store, first_batch(&later).iter().copied());
+        assert!(again.is_empty(), "told twice");
+        assert_eq!(store.guard_pending(), 0);
+        assert_eq!(
+            partial.bricks().collect::<BTreeSet<_>>(),
+            whole.bricks().collect::<BTreeSet<_>>()
+        );
+        assert_eq!(partial.nodes(), whole.nodes());
+        assert_eq!(partial.roots.len(), whole.roots.len());
+        // What it follows the camera as is what a whole one does.
+        let mut elsewhere = whole.clone();
+        let there = [300.0, -100.0, 250.0];
+        partial.update(&store, there);
+        elsewhere.update(&store, there);
+        assert_eq!(
+            partial.bricks().collect::<BTreeSet<_>>(),
+            elsewhere.bricks().collect::<BTreeSet<_>>()
+        );
+    }
+
+    /// The ball's rock, as a source that does not say what is solid under a brick it does not hold,
+    /// as the Planet's does not: a brick across a border is known to be full only once it is held.
+    #[derive(Debug)]
+    struct Opaque(Interior);
+
+    impl brick_store::BrickSource for Opaque {
+        fn brick(&self, level: usize, coord: BrickCoord) -> Brick {
+            self.0.brick(level, coord)
+        }
+    }
+
+    /// The Guard of a store that streams from level 2, of a pyramid of four levels over `Opaque`
+    /// rock: every brick of levels 2 and 3 that is not air is held when its cell is, which is what
+    /// [`BrickStore::hold_guard_cell`] is given, and the cells are the roots.
+    fn streaming_ball() -> (BrickStore, usize, Vec<BrickCoord>) {
+        let mut store = BrickStore::new();
+        store.set_source(Opaque(Interior {
+            radius: 400,
+            material: ROCK,
+        }));
+        store.build_lod(3);
+        store.stream_from(2);
+        let top = top_level(&store);
+        let roots = top_bricks(&store, top, Some(([0; 3], 450)));
+        (store, top, roots)
+    }
+
+    /// The bricks of the Guard under `cell`, as a source makes them.
+    fn the_guard_under(
+        store: &BrickStore,
+        top: usize,
+        cell: BrickCoord,
+    ) -> Vec<(usize, BrickCoord, Brick, bool)> {
+        let source = store.source().expect("it has a source");
+        let mut out = Vec::new();
+        for level in (2..=top).rev() {
+            let span = 1i32 << (top - level);
+            let low = cell.0.map(|c| c * span);
+            for x in 0..span {
+                for y in 0..span {
+                    for z in 0..span {
+                        let coord = BrickCoord([low[0] + x, low[1] + y, low[2] + z]);
+                        let brick = source.brick(level, coord);
+                        if brick != Brick::AIR {
+                            out.push((level, coord, brick, false));
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn late_cells_bury_the_bricks_beside_them_and_leave_a_selection_of_all_of_them_in_any_order() {
+        let (camera, bands) = ([0.0, 420.0, 0.0], Bands::with_d0(256.0));
+        let (mut whole_store, top, roots) = streaming_ball();
+        for &cell in &roots {
+            whole_store.hold_guard_cell(cell, the_guard_under(&whole_store, top, cell));
+        }
+        let (whole, _) = Selection::new(&whole_store, camera, bands, top, roots.clone());
+        let later: Vec<BrickCoord> = roots.iter().copied().filter(|c| c.0[0] > 0).collect();
+        assert!(later.len() > 10 && later.len() < roots.len() - 10);
+        let orders: [(&str, Vec<Vec<BrickCoord>>); 3] = [
+            (
+                "two batches",
+                vec![first_batch(&later).to_vec(), second_batch(&later).to_vec()],
+            ),
+            (
+                "one at a time, the last first",
+                later.iter().rev().map(|&c| vec![c]).collect(),
+            ),
+            (
+                "one at a time, every third first",
+                (0..3)
+                    .flat_map(|n| later.iter().skip(n).step_by(3).map(|&c| vec![c]))
+                    .collect(),
+            ),
+        ];
+        let mut buried_by_arrival = 0;
+        for (name, batches) in orders {
+            let (mut store, _, _) = streaming_ball();
+            for &cell in roots.iter().filter(|c| c.0[0] <= 0) {
+                store.hold_guard_cell(cell, the_guard_under(&store, top, cell));
+            }
+            store.defer_guard(later.iter().copied());
+            let now = top_bricks(&store, top, Some(([0; 3], 450)));
+            assert!(now.iter().all(|c| c.0[0] <= 0));
+            let (mut partial, _) = Selection::new(&store, camera, bands, top, now);
+            let before: BTreeSet<Key> = partial.bricks().collect();
+            for batch in batches {
+                for &cell in &batch {
+                    store.hold_guard_cell(cell, the_guard_under(&store, top, cell));
+                }
+                partial.add_roots(&store, batch.iter().copied());
+                is_a_cut(&partial);
+            }
+            assert_eq!(store.guard_pending(), 0);
+            let after: BTreeSet<Key> = partial.bricks().collect();
+            let of_all: BTreeSet<Key> = whole.bricks().collect();
+            assert!(
+                after == of_all,
+                "{name}: what is drawn: {} bricks drawn that a selection of all of them does not, \
+                 {} not drawn that it does",
+                after.difference(&of_all).count(),
+                of_all.difference(&after).count()
+            );
+            assert_eq!(partial.nodes(), whole.nodes(), "{name}: the nodes");
+            assert_eq!(partial.waiting, whole.waiting, "{name}: the bricks waiting");
+            assert_eq!(partial.roots.len(), whole.roots.len(), "{name}: the roots");
+            // The bricks of the cells that were there, across the border, which were drawn since a
+            // brick beside them was not known to be full, and are not now.
+            buried_by_arrival += before.difference(&after).count();
+        }
+        assert!(
+            buried_by_arrival > 0,
+            "the cells that came late buried bricks beside them (what the recheck is for)"
+        );
     }
 
     /// A ball of rock of 400 Voxels, whose skin is what is seen (like the Planet, with the sea at

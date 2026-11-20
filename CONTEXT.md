@@ -109,7 +109,7 @@ One level's part of the shell.
 _Avoid_: LOD level (the level is the data; the ring is the residency)
 
 **Guard**:
-The always-resident coarse copy of the whole Planet, kept so a late fine brick is a coarser frame rather than a hole. Never the target LOD.
+The always-resident coarse copy of the whole Planet, kept so a late fine brick is a coarser frame rather than a hole. Never the target LOD. At the start the part of it that a camera within 2 km of the Spawn could see is made before the window opens, and the rest in the background, a **cell** (a brick of its top level and what is under it) at a time; until it is whole a flying camera is held to that ball.
 _Avoid_: Fallback LOD, backup
 
 **Soft miss**:

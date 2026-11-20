@@ -915,15 +915,23 @@ pub struct ColdStart {
     pub world_map_s: Option<f64>,
     /// [`crate::load`]: the spawn ring, the Guard, and the first scene.
     pub load_s: f64,
-    /// The spawn ring (20 m, #168), which is when the player has control (ADR 0009), and the Guard
-    /// after it, which the window waits for as well so that nothing past the ring is sky. Both
-    /// are in `load_s`. **The `spawn_ring_s` gate is on the ring.**
+    /// The spawn ring (20 m, #168), which is when the player has control (ADR 0009), and the part
+    /// of the Guard after it that a camera within 2 km of the Spawn could see (#220:
+    /// `guard_cells_at_control` of the `guard_cells` cells of the Guard, as
+    /// [`crate::loader::plan_guard`] says), which the window waits for as well so that nothing
+    /// visible past the ring is sky. Both are in
+    /// `load_s`. **The `spawn_ring_s` gate is on the ring.**
     pub spawn_ring_s: f64,
     pub guard_s: f64,
+    /// The cells of the Guard, in all (the bricks of the pyramid's top level that hold it, see
+    /// `Planet::guard_cells`), and how many of them were made before the window opened (#220). The
+    /// rest are made by the loader's workers in the background, `GUARD_WORKERS` of them at a time
+    /// while there is other work. 0 for the test Planet's, whose Guard is whole at the start.
+    pub guard_cells: u32,
+    pub guard_cells_at_control: u32,
     /// The real time to control: from the world map being ready to the window opening (`load`
-    /// returning: the ring and the Guard and the first scene, which is when `main` opens it).
-    /// "Control in 2 s with nothing sky" is not met: it is #220. **The `time_to_control_s` gate is
-    /// on this.**
+    /// returning: the ring, the Guard's visible part and the first scene, which is when `main`
+    /// opens it). **The `time_to_control_s` gate is on this**, 2 s since #220.
     pub time_to_control_s: f64,
     /// From the start of the load to the first frame with level 0 under the camera: one ray from
     /// the camera straight down hits the ground at level 0. This is **not** the spec's time to
@@ -931,6 +939,11 @@ pub struct ColdStart {
     /// the bench has no server). The spawn ring is made inside [`crate::load`], so this is the
     /// load time and about a frame.
     pub time_to_level_0_under_camera_s: f64,
+    /// From the start of the load to the Guard being complete: the last cell taken in by the scene
+    /// thread, seen by the first frame after it (#220). Reported, not gated; the camera's flights
+    /// start after the fill, which waits for it, and until then a flying camera is held to 2 km of
+    /// the Spawn ([`World::hold_to_guard`]).
+    pub guard_complete_s: f64,
     /// From the start of the load to the resident set being complete.
     pub fill_s: f64,
     /// An Edit made at the Spawn while the loader was filling the resident set (#168: a long
@@ -938,7 +951,8 @@ pub struct ColdStart {
     /// end or for the slice to give way), timed as the one after the paths is. Null if the fill
     /// was over before one could be made. Reported, not gated.
     pub edit_during_fill: Option<EditLatency>,
-    /// The bricks that the loader had been asked for and not taken in when that Edit was made.
+    /// The bricks that the loader had been asked for and not taken in when that Edit was made: the
+    /// streaming's, not the cells of the Guard, which are made beside them (#220).
     pub edit_during_fill_pending: usize,
 }
 
@@ -1390,9 +1404,11 @@ struct Setup {
     constants: Constants,
     world_map_s: Option<f64>,
     load: Duration,
-    /// The spawn ring and the Guard, in `load` ([`ColdStart::ring_s`]); 0 for the test Planet's.
+    /// The spawn ring and the Guard's visible part, in `load` ([`ColdStart::spawn_ring_s`]); 0 for
+    /// the test Planet's. And the Guard's cells: in all, and made before the window opened.
     ring: Duration,
     guard: Duration,
+    guard_cells: (usize, usize),
 }
 
 /// The Planet of the client, at full size: made as `main.rs` makes it.
@@ -1435,6 +1451,10 @@ fn build_full() -> Result<Built, Box<dyn Error>> {
             load,
             ring: loaded.ring_took,
             guard: loaded.guard_took,
+            guard_cells: (
+                loaded.guard_cells.0 + loaded.guard_cells.1,
+                loaded.guard_cells.0,
+            ),
         },
     })
 }
@@ -1479,6 +1499,7 @@ fn build_test() -> Result<Built, Box<dyn Error>> {
             load: began.elapsed(),
             ring: Duration::ZERO,
             guard: Duration::ZERO,
+            guard_cells: (0, 0),
         },
     })
 }
@@ -2208,7 +2229,10 @@ impl<'a> Session<'a> {
             at_camera: self.world.lag(camera.position) == 0.0,
             scene_used_bytes: self.world.used_bytes(),
             throttled: self.world.stats().throttled,
-            loader_queue: self.world.stats().loader.pending,
+            loader_queue: {
+                let loader = self.world.stats().loader;
+                loader.pending - loader.guard_pending
+            },
             lag: self.world.lag(camera.position),
             edit_taken,
             taken_at,
@@ -2332,6 +2356,7 @@ impl<'a> Session<'a> {
         self.last_ended = None;
         let mut capture = Capture::start("cold start", &self.world, self.limit_ms);
         let mut control = None;
+        let mut guard_complete = None;
         let mut edit_during_fill = None;
         let mut edit_pending = 0;
         while !self.idle() || control.is_none() {
@@ -2340,9 +2365,16 @@ impl<'a> Session<'a> {
             if control.is_none() && level_0_under(self.world.scene(), &setup.spawn) {
                 control = Some(setup.load + began.elapsed());
             }
+            if guard_complete.is_none() && self.world.guard_complete() {
+                guard_complete = Some(setup.load + began.elapsed());
+            }
             // One Edit, in the fill, once the loader has a queue (its workers are ahead, and the
             // scene thread takes in for a long slice): its time is not the next frame's wait.
-            let pending = self.world.loader().map_or(0, |l| l.pending);
+            // The streaming's bricks, not the cells of the Guard that are made beside them (#220).
+            let pending = self
+                .world
+                .loader()
+                .map_or(0, |l| l.pending - l.guard_pending);
             if control.is_some() && edit_during_fill.is_none() && pending > 0 {
                 if let Edit::Taken(latency) = self.edit(&setup.spawn)? {
                     edit_during_fill = Some(latency);
@@ -2364,9 +2396,14 @@ impl<'a> Session<'a> {
             load_s: setup.load.as_secs_f64(),
             spawn_ring_s: setup.ring.as_secs_f64(),
             guard_s: setup.guard.as_secs_f64(),
+            guard_cells: setup.guard_cells.0 as u32,
+            guard_cells_at_control: setup.guard_cells.1 as u32,
             time_to_control_s: setup.load.as_secs_f64(),
             time_to_level_0_under_camera_s: control
                 .expect("the loop ends with control")
+                .as_secs_f64(),
+            guard_complete_s: guard_complete
+                .expect("the loop ends with the Guard complete")
                 .as_secs_f64(),
             fill_s: (setup.load + began.elapsed()).as_secs_f64(),
             edit_during_fill,
@@ -3045,7 +3082,7 @@ mod tests {
         camera_soft_miss_frames: 0,
         scene_lag_d0_max: 8.0,
         spawn_ring_s: 2.0,
-        time_to_control_s: 10.0,
+        time_to_control_s: 2.0,
         settle_s: 30.0,
         gi_mean_ms: 1.5,
         gi_p99_ms: 3.0,
@@ -3202,9 +3239,12 @@ mod tests {
                 world_map_s: Some(25.0),
                 load_s: 6.0,
                 spawn_ring_s: 1.0,
-                guard_s: 4.0,
-                time_to_control_s: 6.0,
+                guard_s: 0.2,
+                guard_cells: 600,
+                guard_cells_at_control: 30,
+                time_to_control_s: 1.5,
                 time_to_level_0_under_camera_s: 61.0,
+                guard_complete_s: 20.0,
                 fill_s: 200.0,
                 edit_during_fill: None,
                 edit_during_fill_pending: 0,
@@ -3450,15 +3490,15 @@ mod tests {
         let slow = run_with(|r| r.cold_start.spawn_ring_s = 2.01);
         assert_eq!(over(std::slice::from_ref(&slow)), ["spawn_ring"]);
         assert!(over(&[run_with(|r| r.cold_start.spawn_ring_s = 2.0)]).is_empty());
-        // The Guard after the ring is in the time to control, not in this.
-        assert!(over(&[run_with(|r| r.cold_start.guard_s = 6.0)]).is_empty());
+        // The Guard's visible part after the ring is in the time to control, not in this.
+        assert!(over(&[run_with(|r| r.cold_start.guard_s = 1.0)]).is_empty());
     }
 
     #[test]
     fn the_time_to_control_gate_fires_alone_for_a_load_to_the_window_over_its_limit() {
-        let slow = run_with(|r| r.cold_start.time_to_control_s = 10.01);
+        let slow = run_with(|r| r.cold_start.time_to_control_s = 2.01);
         assert_eq!(over(std::slice::from_ref(&slow)), ["time_to_control"]);
-        assert!(over(&[run_with(|r| r.cold_start.time_to_control_s = 10.0)]).is_empty());
+        assert!(over(&[run_with(|r| r.cold_start.time_to_control_s = 2.0)]).is_empty());
         // The rest of the cold start is reported, not gated.
         assert!(
             over(&[run_with(|r| {
@@ -3871,6 +3911,9 @@ mod tests {
                 "edit_during_fill",
                 "edit_during_fill_pending",
                 "fill_s",
+                "guard_cells",
+                "guard_cells_at_control",
+                "guard_complete_s",
                 "guard_s",
                 "load_s",
                 "spawn_ring_s",

@@ -1219,6 +1219,22 @@ impl Planet {
         near >= self.shape.sea + highest + SLACK
     }
 
+    /// A brick of the Guard, if `coord` of `level` is one: as [`Planet::coarse_brick`] makes it,
+    /// with whether it is solid all the way down; `None` for air, for a brick out of the ball the
+    /// Planet is in, and for one wholly in the interior (a source gives those).
+    fn guard_brick(&self, level: usize, coord: BrickCoord) -> Option<(Brick, bool)> {
+        let size = f64::from(BRICK_SIZE) * f64::from(1u32 << level);
+        let low = coord.0.map(|c| f64::from(c) * size);
+        let high = low.map(|l| l + size);
+        if radii_of_box(low, high).0 >= f64::from(self.shape.max)
+            || self.shape.inside_interior(level, coord)
+        {
+            return None;
+        }
+        let brick = self.coarse_brick(level, coord);
+        (!brick.is_air()).then(|| (brick, self.solid_below(level, coord)))
+    }
+
     /// The Guard: the bricks of the whole Planet at the mip levels `levels` (8 to 12, the top of
     /// the pyramid, in the client), each as [`Planet::coarse_brick`] makes it, except air and the
     /// bricks wholly in the interior (a source gives those; see [`PlanetSource`]). Generated on
@@ -1235,15 +1251,7 @@ impl Planet {
             let size = f64::from(BRICK_SIZE) * f64::from(1u32 << level);
             let reach = (f64::from(self.shape.max) / size).floor() as i32 + 1;
             let found = par_bricks(BrickCoord([-reach; 3]), BrickCoord([reach; 3]), |coord| {
-                let low = coord.0.map(|c| f64::from(c) * size);
-                let high = low.map(|l| l + size);
-                if radii_of_box(low, high).0 >= f64::from(self.shape.max)
-                    || self.shape.inside_interior(level, coord)
-                {
-                    return None;
-                }
-                let brick = self.coarse_brick(level, coord);
-                (!brick.is_air()).then(|| (brick, self.solid_below(level, coord)))
+                self.guard_brick(level, coord)
             });
             out.extend(
                 found
@@ -1252,6 +1260,96 @@ impl Planet {
             );
         }
         out
+    }
+
+    /// The cells of the Guard (#220): the bricks of the pyramid's top level `top` that the ball
+    /// the Planet is in touches, in coordinate order. The Guard is made a cell at a time, a cell
+    /// being the bricks of its levels that lie under one of these ([`Planet::guard_cell`]): the
+    /// cells together are [`Planet::guard`] and nothing else, and one that holds no brick (all
+    /// air, or all interior) is still a cell.
+    pub fn guard_cells(&self, top: usize) -> Vec<BrickCoord> {
+        let size = f64::from(BRICK_SIZE) * f64::from(1u32 << top);
+        let reach = (f64::from(self.shape.max) / size).floor() as i32 + 1;
+        let mut cells = Vec::new();
+        for x in -reach..=reach {
+            for y in -reach..=reach {
+                for z in -reach..=reach {
+                    let low = [x, y, z].map(|c| f64::from(c) * size);
+                    let high = low.map(|l| l + size);
+                    if radii_of_box(low, high).0 < f64::from(self.shape.max) {
+                        cells.push(BrickCoord([x, y, z]));
+                    }
+                }
+            }
+        }
+        cells
+    }
+
+    /// The part of [`Planet::guard`] that lies under `cell`, a brick of level `top`: the bricks of
+    /// `levels` (the levels up to `top`) whose ancestor at `top` is `cell`, as `(level,
+    /// coordinate, brick, solid_below)`, coarsest level first. On the calling thread alone: the
+    /// loader's workers each make a cell, and [`Planet::guard_in`] shares cells among the cores.
+    pub fn guard_cell(
+        &self,
+        levels: std::ops::RangeInclusive<usize>,
+        top: usize,
+        cell: BrickCoord,
+    ) -> Vec<(usize, BrickCoord, Brick, bool)> {
+        let mut out = Vec::new();
+        for level in levels.rev() {
+            assert!(
+                level > 0 && level <= top,
+                "level {level} of a Guard to {top}"
+            );
+            let span = 1i32 << (top - level);
+            let low = cell.0.map(|c| c * span);
+            for x in low[0]..low[0] + span {
+                for y in low[1]..low[1] + span {
+                    for z in low[2]..low[2] + span {
+                        let coord = BrickCoord([x, y, z]);
+                        if let Some((brick, solid)) = self.guard_brick(level, coord) {
+                            out.push((level, coord, brick, solid));
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// [`Planet::guard_cell`] of each of `cells`, worked out on all the cores a cell at a time,
+    /// and returned in the order of `cells`.
+    pub fn guard_in(
+        &self,
+        levels: std::ops::RangeInclusive<usize>,
+        top: usize,
+        cells: &[BrickCoord],
+    ) -> Vec<(usize, BrickCoord, Brick, bool)> {
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+        let parts: Vec<Vec<(usize, Vec<_>)>> = std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..threads.min(cells.len().max(1)))
+                .map(|_| {
+                    scope.spawn(|| {
+                        let mut made = Vec::new();
+                        loop {
+                            let at = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            let Some(&cell) = cells.get(at) else {
+                                return made;
+                            };
+                            made.push((at, self.guard_cell(levels.clone(), top, cell)));
+                        }
+                    })
+                })
+                .collect();
+            workers
+                .into_iter()
+                .map(|worker| worker.join().expect("generator thread panicked"))
+                .collect()
+        });
+        let mut by_cell: Vec<_> = parts.into_iter().flatten().collect();
+        by_cell.sort_by_key(|&(at, _)| at);
+        by_cell.into_iter().flat_map(|(_, made)| made).collect()
     }
 }
 
@@ -1294,6 +1392,15 @@ impl BrickSource for PlanetSource {
 
     fn air_below(&self, level: usize, coord: BrickCoord) -> bool {
         self.planet.air_below(level, coord)
+    }
+
+    fn guard_cell(
+        &self,
+        first: usize,
+        top: usize,
+        cell: BrickCoord,
+    ) -> Vec<(usize, BrickCoord, Brick, bool)> {
+        self.planet.guard_cell(first..=top, top, cell)
     }
 }
 
@@ -2691,6 +2798,55 @@ mod tests {
                 }
             }
             assert!(expected > 100, "level {level} has {expected}");
+        }
+    }
+
+    #[test]
+    fn the_guard_made_a_cell_at_a_time_is_the_guard_made_whole() {
+        let top = 14;
+        let whole: std::collections::BTreeMap<_, _> = planet()
+            .guard(12..=top)
+            .into_iter()
+            .map(|(level, coord, brick, solid)| ((level, coord), (brick, solid)))
+            .collect();
+        let cells = planet().guard_cells(top);
+        assert!(cells.windows(2).all(|w| w[0] < w[1]), "in coordinate order");
+        let mut by_cell = std::collections::BTreeMap::new();
+        let mut with_bricks = 0;
+        for &cell in &cells {
+            let made = planet().guard_cell(12..=top, top, cell);
+            with_bricks += usize::from(!made.is_empty());
+            for (level, coord, brick, solid) in made {
+                // The brick is under the cell it was made for, and in no other.
+                let up = top - level;
+                assert_eq!(BrickCoord(coord.0.map(|c| c >> up)), cell);
+                assert!(by_cell.insert((level, coord), (brick, solid)).is_none());
+            }
+        }
+        assert_eq!(by_cell, whole, "the cells' bricks are the Guard's");
+        assert!(with_bricks > 1 && with_bricks <= cells.len());
+        // Sharing the cells among the cores is the same, in the order of the cells.
+        let shared = planet().guard_in(12..=top, top, &cells);
+        let alone: Vec<_> = cells
+            .iter()
+            .flat_map(|&cell| planet().guard_cell(12..=top, top, cell))
+            .collect();
+        assert_eq!(shared, alone);
+        // A cell that is the ball's: every brick of the top level that the ball touches is one,
+        // and the others are not.
+        let size = f64::from(BRICK_SIZE << top);
+        let reach = (f64::from(planet().max_radius()) / size).floor() as i32 + 3;
+        for x in -reach..=reach {
+            for y in -reach..=reach {
+                for z in -reach..=reach {
+                    let low = [x, y, z].map(|c| f64::from(c) * size);
+                    let near = radii_of_box(low, low.map(|l| l + size)).0;
+                    assert_eq!(
+                        cells.contains(&BrickCoord([x, y, z])),
+                        near < f64::from(planet().max_radius())
+                    );
+                }
+            }
         }
     }
 

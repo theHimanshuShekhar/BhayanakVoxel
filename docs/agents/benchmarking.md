@@ -358,17 +358,23 @@ camera, and `holes_after_catch_up` the holes the look after it found, which must
   the start of the load to the first frame in which one ray from the camera straight down hits the
   ground at level 0) and `fill_s` (from the start of the load to the resident set being complete).
   `time_to_level_0_under_camera_s` is not gated, and **is not the spec's "time to control"**: the
-  field is named for the ray that it uses, and the window waits for the Guard too, so it reads the
-  load time. **`spawn_ring_s`, `guard_s` and `time_to_control_s`** (#168) are the parts of the load,
-  from `crate::load`: the 20 m spawn ring (`SPAWN_REACH`), which is the player's control (ADR
-  0009: the character stands in it, and the bench has no server), the Guard after it, and the real
-  time from the world map being ready to the window opening (the ring, the Guard and the first
-  scene: the window waits for the Guard so that nothing past the ring is sky). **Two gates**, each
-  the worst over the runs: `spawn_ring_s` (2 s) on the ring, and `time_to_control_s` on the real
-  time, held at what it measures now plus a margin (10 s; 4.3 s on the 4090, 7 s on the loaded dev
-  box). **"Control in 2 s with nothing beyond the ring sky" is not met**: it is #220, a
-  background Guard.
-- `frame_parts` and `gpu_passes` (#54, schema 28; in each path), to find where a frame's
+  field is named for the ray that it uses, and the window opens at the end of the load, so it reads
+  the load time. **`spawn_ring_s`, `guard_s` and `time_to_control_s`** (#168, #220) are the parts of the
+  load, from `crate::load`: the 20 m spawn ring (`SPAWN_REACH`), which is the player's control (ADR
+  0009: the character stands in it, and the bench has no server), the part of the Guard after it that
+  a camera within 2 km of the Spawn could see (`guard_s`: the cells that `plan_guard` says are
+  visible, judged at the Planet's highest radius), and the real time from the world map being ready
+  to the window opening (the ring, that part of the Guard and the first scene). The rest of the Guard
+  is made by the loader's workers in the background (#220, schema 28): **`guard_cells`** is how many
+  cells it has (bricks of the pyramid's top level; 0 on the test Planet, whose Guard is whole),
+  **`guard_cells_at_control`** how many of them were made before the window opened, and
+  **`guard_complete_s`** the time from the start of the load to the last of them being taken in
+  (reported, not gated). Until then a flying camera is held to a ball of 2 km round the Spawn
+  (`World::hold_to_guard`; the character is not held). **Two gates**, each the worst over the runs:
+  `spawn_ring_s` (2 s) on the ring, and **`time_to_control_s` (2 s since #220)**, which is the
+  acceptance of "control in 2 s with nothing visible from the Spawn sky". It was 10 s while the
+  window waited for the whole Guard (4.3 s on the 4090, 7 s on the loaded dev box).
+- `frame_parts` and `gpu_passes` (#54, schema 29; in each path), to find where a frame's
   time goes: `frame_parts` is `{recentre, update, encode, submit, wait, gpu_total, wait_not_passes}`,
   each a `Spread` (`samples, mean_ms, p99_ms, worst_ms`) of the frame thread's parts of one frame
   (`wait` is the wait for the GPU after submitting; `gpu_total` the GPU's own time of the passes;
@@ -377,7 +383,7 @@ camera, and `holes_after_catch_up` the holes the look after it found, which must
   from the name of each timed pass (`primary`, `normals`, `shadows`, `gi`, `shade`, `atmosphere`,
   `bloom_*`, `exposure*`, `tone`, `upscale`) to the `Spread` of its GPU time, so a pass that costs
   more in the game than in the GPU bench is visible. The summary prints both per path.
-- `unpaced_control` (#54, schema 28; a run's, a path's form, not gated and not in `paths`): 180 frames with the
+- `unpaced_control` (#54, schema 29; a run's, a path's form, not gated and not in `paths`): 180 frames with the
   camera standing at the Spawn **and no pacing sleep**, each frame following the one before as the
   GPU bench's do. Set its `frame_time` and `gpu_passes` beside a paced path's: a frame that is much
   longer paced than unpaced is the GPU idling between frames (clocks dropping, the driver), which no
@@ -754,7 +760,7 @@ camera, and `holes_after_catch_up` the holes the look after it found, which must
 `gates` holds, for each measure, the `worst` over every run (and path) and the `limit`, and `over`
 lists the gates that are over: `frame_time`, `frame_cpu`, `holes`, `memory`, `soft_misses`
 (under the camera), `scene_lag`, `spawn_ring`, `time_to_control`, `settle`, `gi`. For the holes it also
-has `hole_looks_fewest_in_a_run` and `hole_looks_fewest_in_a_path`. **`gi`** (#54, schema 28) holds Primary's
+has `hole_looks_fewest_in_a_run` and `hole_looks_fewest_in_a_path`. **`gi`** (#54, schema 29) holds Primary's
 `gi` pass in this run, on the full-size Planet, which the stepped bench's small flight understated by
 about 15 times (0.3 ms there, 4 to 5 ms here in the first run): the worst path's mean (`gi_mean_ms`, the
 pass's own 1.5 ms) and 99th percentile (`gi_p99_ms`, 3 ms), from `paths[].gpu_passes.gi`; with no
@@ -1355,7 +1361,7 @@ run without it (0.178 ms at 1 ray on the 4090, 1440p) or from `--diag` runs of a
   unshadowed image at 1440p, which have no bounce rays and cost a fraction of the pit's.
 
 **Primary's GI against truth, the dig and the gates** (#54, `report.convergence.views[].gi`,
-`report.convergence.gi`, **schema 28**). The phase has a third view, **`room`**, the emissive
+`report.convergence.gi`, **schema 29**). The phase has a third view, **`room`**, the emissive
 room (a closed box of rock, 40 by 16 by 40 Voxels inside, with one block of warm light on the floor,
 seen from the opposite corner: `views::room`), which converges like the other two, with truths,
 the curve and the still run. In **each** view Primary is also drawn as the window draws it (traced at
@@ -1437,7 +1443,7 @@ views' Reference images do not depend on it.
 
 ```
 {
-  "schema_version": 28,
+  "schema_version": 29,
   "build":   { "version", "commit" },          // commit: CI builds only, else null; on a PR
                                                // build it is GitHub's merge commit, not the head
   "machine": { "gpu", "device_type", "driver", "driver_info", "backend", "os", "arch",
@@ -1586,7 +1592,7 @@ they run in a Primary frame:
 | `normals` | the smooth normal of every hit (the cost of the smooth normals, alone) | none yet |
 | `atmosphere` | the tables of the atmosphere (#53): the sky-view table and the aerial-perspective volumes every frame, and the transmittance, multiple-scattering and sun-free tables only when the air or the sun's height changes. It runs first, in both views, and is a pass of its own, so it adds a line to `passes[]` and no field (no schema bump). The 0.3 ms budget is the issue's, **for the 4090**: the orchestrator measures it | 0.3 |
 | `shadows` | the sun's shadow: two shadow rays a pixel from the G-buffer (#52, **schema 24**; `--shadow-rays N` in the bench) | 0.4 |
-| `gi` | Primary's global illumination (#54, **schema 28**): one bounce and an emitter sample for **one pixel of every 2 x 2 block** (a different one each frame; the rest of the block is reconstructed in `shade_pass`) from the G-buffer, the world-space radiance cache that supplies the bounces after it, and the cache's per-frame resolve | 1.5 |
+| `gi` | Primary's global illumination (#54, **schema 29**): one bounce and an emitter sample for **one pixel of every 2 x 2 block** (a different one each frame; the rest of the block is reconstructed in `shade_pass`) from the G-buffer, the world-space radiance cache that supplies the bounces after it, and the cache's per-frame resolve | 1.5 |
 | `shade` | the lit image, as linear light, from the G-buffer, the shadows and the GI | none yet |
 | `exposure`, `exposure_adapt` | the log-average luminance and the adapted exposure | none yet |
 | `bloom_down`, `bloom_h`, `bloom_v` | the bloom, at a quarter of the size | none yet |

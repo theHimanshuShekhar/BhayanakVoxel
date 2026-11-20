@@ -57,9 +57,9 @@ pub struct StreamingBudgets {
     /// is where the player has control (ADR 0009).
     pub spawn_ring_s: f64,
     /// Time to control as the player sees it: seconds from the world map being ready to the window
-    /// opening, which is the spawn ring and the Guard, since the window waits for both so that
-    /// nothing past the ring is sky. "Control in 2 s with nothing sky" is not met yet (#220, a
-    /// background Guard); this is held at what it measures, plus a margin.
+    /// opening, which is the spawn ring, the part of the Guard that a camera within 2 km of the
+    /// Spawn could see (so that nothing visible past the ring is sky) and the first scene: 2 s
+    /// since #220, which makes the rest of the Guard in the background.
     pub time_to_control_s: f64,
     /// Settle time: seconds from the camera stopping after a flight of 50 m/s to a scene that is
     /// at the camera, has no soft miss and nothing left to look at again for the bands: main's
@@ -243,7 +243,7 @@ mod tests {
                 camera_soft_miss_frames: 0,
                 scene_lag_d0_max: 8.0,
                 spawn_ring_s: 2.0,
-                time_to_control_s: 10.0,
+                time_to_control_s: 2.0,
                 settle_s: 55.0,
                 gi_mean_ms: 1.5,
                 gi_p99_ms: 3.0,

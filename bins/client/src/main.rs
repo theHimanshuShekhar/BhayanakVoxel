@@ -64,6 +64,12 @@ const SPAWN_HEIGHT: f64 = 4.0 * VOXELS_PER_METRE;
 /// does not walk on the ring: it walks on the ground that the predictor makes around it (see
 /// [`sim::Ground`]), which the Leash confines it to.
 const SPAWN_REACH: i32 = (20.0 * VOXELS_PER_METRE) as i32;
+/// How far from the Spawn a camera may go before the Guard is complete, in Voxels (#220): 2 km. The
+/// part of the Guard that the window waits for is every cell that a camera anywhere within this
+/// of the Spawn could see (the horizon of the camera at 2 km up is 36 km), and until the rest has
+/// been made the flying camera is held to it ([`World::hold_to_guard`]); the character, which
+/// cannot walk 2 km in the seconds that the rest takes, is not.
+const GUARD_REACH: f64 = 2000.0 * VOXELS_PER_METRE;
 
 /// How far above the ground the character is set down, in Voxels (30 cm): it drops the last few.
 const DROP_HEIGHT: f64 = 0.3 * VOXELS_PER_METRE;
@@ -387,11 +393,15 @@ struct Loaded {
     camera: Camera,
     /// A point on the ground to put the character down on.
     ground: [f64; 3],
-    /// How long the spawn ring and the Guard took: the player has control when the ring is there
-    /// (ADR 0009), and the window waits for the Guard as well, so that nothing past the ring is
-    /// sky.
+    /// How long the spawn ring and the part of the Guard that can be seen from the Spawn took: the
+    /// player has control when the ring is there (ADR 0009), and the window waits for that part as
+    /// well, so that nothing visible past the ring is sky. The rest of the Guard is made after
+    /// (#220).
     ring_took: Duration,
     guard_took: Duration,
+    /// How many of the Guard's cells were made before the window opened and how many are made after
+    /// it (#220, [`loader::plan_guard`]).
+    guard_cells: (usize, usize),
     /// Sea level's distance from the centre, in Voxels (the horizon cap's sphere).
     sea: f64,
 }
@@ -515,13 +525,26 @@ fn load(map: WorldMap, reach: i32) -> Result<Loaded, RingsFull> {
     store.reserve_resident(room.resident);
     store.set_budget(budget_for(bands));
     let guarded = Instant::now();
-    let held = loader::hold_guard(&mut store, &planet, GUARD_FIRST);
+    // The Guard is made in two parts (#220): the cells that a camera within `GUARD_REACH` of the
+    // Spawn could see, which the window waits for, and the rest, which the loader makes while
+    // the player plays, two of its workers at a time while there is other work.
+    let (visible, later) = loader::plan_guard(
+        &planet,
+        RING_LEVELS,
+        camera.position,
+        GUARD_REACH,
+        loader::GUARD_MARGIN,
+    );
+    let held = loader::hold_guard_cells(&mut store, &planet, GUARD_FIRST, &visible, &later);
     let guard_took = guarded.elapsed();
     eprintln!(
-        "Guard (levels {GUARD_FIRST} to {}, the whole Planet): {held} bricks in {:.2?}",
+        "Guard (levels {GUARD_FIRST} to {}), the {} cells that could be seen from the Spawn of its {}: {held} bricks in {:.2?}; the rest are made in the background",
         RING_LEVELS - 1,
+        visible.len(),
+        visible.len() + later.len(),
         guarded.elapsed()
     );
+    let guard_cells = (visible.len(), later.len());
     let selected = Instant::now();
     let mut scene = planet_scene(&store, camera.position, bands, planet.max_radius())?;
     let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
@@ -537,6 +560,7 @@ fn load(map: WorldMap, reach: i32) -> Result<Loaded, RingsFull> {
         loader::workers_for(cores),
     );
     loader.reserve(room.waiting);
+    loader.request_guard(GUARD_FIRST, RING_LEVELS - 1, later);
     // The bricks the Guard leaves to split are asked for here, as load time, and not in the first
     // frame: there are 5 085 at 320 km (the log's "asked for the children of" line).
     let asked = Instant::now();
@@ -585,6 +609,7 @@ fn load(map: WorldMap, reach: i32) -> Result<Loaded, RingsFull> {
         ground,
         ring_took,
         guard_took,
+        guard_cells,
         sea: planet.sea_radius(),
     })
 }
@@ -803,6 +828,7 @@ impl App {
                     vec![server_end],
                 ));
                 let mut world = World::new(loaded.scene, Predictor::new(loaded.store), client_end)
+                    .with_guard_hold(loaded.camera.position, GUARD_REACH)
                     .with_loader(loaded.loader);
                 if let Some(renderer) = &self.renderer {
                     world.set_buffer_limit(renderer.buffer_limit_words());
@@ -1395,6 +1421,15 @@ impl ApplicationHandler for App {
                     }
                 } else {
                     self.fly.update(&mut self.camera, dt);
+                    // Until the whole Guard is made the flying camera stays where the part that
+                    // is made covers (#220); the walking one cannot get out of it in time.
+                    if let Some(world) = &self.world {
+                        let held = world.hold_to_guard(self.camera.position);
+                        if held != self.camera.position {
+                            self.camera.position = held;
+                            self.camera.carry_up(held);
+                        }
+                    }
                 }
                 let span = self.cpu.start();
                 if let Err(err) = self.dig_step(dt) {

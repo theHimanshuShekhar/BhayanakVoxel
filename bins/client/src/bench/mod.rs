@@ -857,12 +857,16 @@ fn print_real_time(r: &realtime::RealTimeReport) {
     for (n, run) in r.runs.iter().enumerate() {
         let c = &run.cold_start;
         eprintln!(
-            "  run {}: level 0 under the camera {:.1} s after the load began (load {:.1} s: spawn ring {:.2} s, Guard {:.1} s), resident set complete after {:.1} s",
+            "  run {}: control {:.2} s after the world map (load {:.1} s: spawn ring {:.2} s, {} of {} cells of the Guard {:.1} s), level 0 under the camera {:.1} s after the load began, Guard complete after {:.1} s, resident set complete after {:.1} s",
             n + 1,
-            c.time_to_level_0_under_camera_s,
+            c.time_to_control_s,
             c.load_s,
             c.spawn_ring_s,
+            c.guard_cells_at_control,
+            c.guard_cells,
             c.guard_s,
+            c.time_to_level_0_under_camera_s,
+            c.guard_complete_s,
             c.fill_s
         );
         for p in run.paths.iter().chain([&run.unpaced_control]) {
