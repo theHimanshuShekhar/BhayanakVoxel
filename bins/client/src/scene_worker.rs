@@ -1025,7 +1025,6 @@ impl SceneWorker {
             ahead: [None; AHEAD],
             velocity: [0.0; 3],
             speed_in: 0.0,
-            depth_kept: false,
             speed_epoch: clock.now(),
             idle: false,
             throttled: false,
@@ -1116,18 +1115,6 @@ impl SceneWorker {
     #[cfg(test)]
     pub fn speed_scale(&self, on: bool) {
         self.shared.no_speed_scale.store(!on, Ordering::Release);
-    }
-
-    /// Whether the horizon cap of the selection of a stepped thread is off (see
-    /// [`Scene::cap_is_off`]).
-    #[cfg(test)]
-    pub fn selection_cap_is_off(&self) -> bool {
-        let engine = self.stepped.as_ref().expect("only a stepped thread");
-        engine
-            .lock()
-            .expect("the engine is not poisoned")
-            .scene
-            .cap_is_off()
     }
 
     /// The nodes of the selection of a stepped thread (see [`Scene::nodes`]).
@@ -1678,9 +1665,6 @@ struct Engine {
     /// The camera's speed for the bands that was looked at last, and the time the speed's release
     /// hold is told in seconds from.
     speed_in: f64,
-    /// The speed has fallen under the depth's step but the depth is kept, as the horizon cap is
-    /// off (see [`Engine::rescale`]): the thread looks at the clock until the cap is on.
-    depth_kept: bool,
     speed_epoch: Instant,
     /// The last round did nothing, so a thread waits to be told (see [`Engine::await_work`]).
     idle: bool,
@@ -1914,7 +1898,7 @@ impl Engine {
             };
             // A step of the speed scale that is to be given back when the camera has been slow for
             // a time (see [`SpeedScale::observe`]) needs the clock looked at as well.
-            let held = if self.speed.releasing() || self.depth_kept {
+            let held = if self.speed.releasing() {
                 if held.is_zero() {
                     RELEASE_TICK
                 } else {
@@ -2287,22 +2271,20 @@ impl Engine {
             // A camera that was put somewhere is no flight: the depth is its speed's, at once. A
             // release that was pending is over, so that it does not come after the scene is made
             // again there and list the whole of it to look at.
-            self.depth_kept = false;
             self.speed.settle_to(speed)
         } else {
             // The hold of a release is from when the speed first fell, by the clock: not from the
             // time that each look saw, which a busy thread makes too short.
             let now = self.clock.since(self.speed_epoch).as_secs_f64();
-            // While the horizon cap is off, or would be for the camera (a release makes the scene
-            // again there, and a scene follows a camera that goes through the ground slowly), the
-            // depth is not given back: a scene made with the cap off at rest bands is the wide one
-            // (the planet's shell out to the top level), 552 to 572 MiB at full size against the
-            // 512 MiB of the gate, and a release that found the camera under the sea (the hold at
-            // the bottom of a dive) made all of it at once. It is given back when the cap is on
-            // again, which the idle thread looks for on a tick (`depth_kept`).
-            self.depth_kept = (self.scene.cap_is_off() || self.scene.cap_is_off_at(camera))
-                && self.speed.wants_less(speed);
-            if self.depth_kept {
+            // While the camera itself is under the sea's sphere the depth is not given back: a
+            // release makes the scene again at the camera, and one made there has the horizon cap
+            // off, which at rest bands is the wide scene (the planet's shell out to the top level),
+            // 552 to 572 MiB at full size against the 512 MiB of the gate; the hold at the bottom
+            // of a dive made all of it at once. Over the sphere (the camera's own height, not the
+            // cap's hysteresis: a scene made again there has the cap on) the release goes the way it
+            // does anywhere. Nothing needs the clock for this: the camera's height changes only
+            // when the camera moves, which wakes the thread.
+            if self.scene.camera_under_horizon(camera) && self.speed.wants_less(speed) {
                 self.speed.observe_keeping(speed)
             } else {
                 self.speed.observe(speed, now)

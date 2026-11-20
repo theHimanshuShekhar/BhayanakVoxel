@@ -595,6 +595,7 @@ camera, and `holes_after_catch_up` the holes the look after it found, which must
     (`SceneWorker::look_now`), so no path has 0 looks. The report has how many looks there were in
     the path and what they found.
   - `scene_used_peak_mib` (#213): the most MiB of the scene in use at the end of one of the path's frames (the run's `memory.scene_used_peak_mib`, which is the gate, is the most of these and of the looks between frames; this says which path holds it).
+  - `scene_used_end_mib` and `scene_level_bricks_end` (#168, schema 27): the scene's buffers in use (MiB) and the bricks drawn at each level when the path ended, to be read against `scene_used_peak_mib` and the bricks at each level at that peak (`memory.scene_used_peak_level_bricks`): a peak far over the end is a transient, and the levels say what it was made of (the crossing's 552 to 572 MiB was 251 K bricks at level 13). Reported, not gated.
   - `scene_round_max_ms`, `scene_update_max_ms`, `cap_flips`, `cap_flip_max_ms`, `backlog_peak`,
     `absorb_updates`, `absorb_ms` (#213, schema 26): the longest round of the scene thread in the
     path's frames (without the look for holes), the longest single update of the scene to a camera in

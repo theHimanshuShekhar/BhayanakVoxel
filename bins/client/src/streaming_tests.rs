@@ -3686,86 +3686,74 @@ fn the_update_where_the_cap_goes_off_and_on_at_sea_level_is_measured() {
     assert_eq!(holes, 0, "the cap going off and on left holes");
 }
 
-/// The depth of a flight is not given back while the horizon cap is off (#168, #213): a camera
-/// that dives under the sea at 50 m/s and stops there keeps the bands of the flight, and no release
-/// rebuilds the scene as the wide one, which is over the memory gate at full size (555 to 572 MiB
-/// against 512). It is given back once the cap is on again and the camera stands.
+/// The depth of a flight is not given back while the camera itself is under the sea's sphere
+/// (#168, #213): a camera that dives under the sea at 50 m/s and stops there keeps the bands of
+/// the flight, and no release rebuilds the scene as the wide one (a scene made again there has the
+/// horizon cap off), which is over the memory gate at full size (555 to 572 MiB against 512). Once
+/// the raised camera is over the sphere, **even inside the 50 m that the cap's hysteresis holds it
+/// off for**, the release goes through: a scene made again there has the cap on.
 #[test]
-fn the_depth_of_a_flight_is_kept_under_the_sea_and_given_back_once_the_cap_is_on() {
+fn the_depth_of_a_flight_is_kept_while_the_camera_is_under_the_sea_and_given_back_over_it() {
     let (mut world, _server, camera) = margined_world_under(Run::Stepped, None, true);
     world.worker().speed_scale(true);
     world.worker().set_release_rebuild_over(0);
     world.count_exactly();
     fill(&mut world, camera.position);
     let sea = planet().sea_radius();
+    let raise = render::lod::Margins::standard().vertical;
     let radius = |p: [f64; 3]| p.iter().map(|c| c * c).sum::<f64>().sqrt();
     let up = camera.position.map(|c| c / radius(camera.position));
     let at = |r: f64| up.map(|u| u * r);
     let step = FIFTY_METRES_A_SECOND;
     let scale = |world: &World| world.stats().bands.expect("a scene with bands").scale();
-    // Down through the sea and a way under it, at 50 m/s.
-    let bottom = sea - 30.0 * VOXELS_PER_METRE;
+    // The radius at which the raised camera is `height` Voxels over the sea's sphere.
+    let radius_at = |height: f64| sea + height - raise;
     let mut r = radius(camera.position);
-    while r > bottom {
-        r -= step;
-        let velocity = up.map(|u| -u * step * 60.0);
-        world.recentre_moving(at(r), velocity).unwrap();
-        pace(&world, FRAME);
-    }
+    // Flies the camera to the radius `to` at 50 m/s, and stands there for `frames`.
+    let fly = |world: &mut World, r: &mut f64, to: f64, frames: usize| {
+        let sign = if to > *r { 1.0 } else { -1.0 };
+        while (to - *r) * sign > 0.0 {
+            *r += sign * step.min((to - *r).abs());
+            let velocity = up.map(|u| u * sign * step * 60.0);
+            world.recentre_moving(at(*r), velocity).unwrap();
+            pace(world, FRAME);
+        }
+        for _ in 0..frames {
+            world.recentre_moving(at(*r), [0.0; 3]).unwrap();
+            pace(world, FRAME);
+        }
+    };
+    // Down through the sea and a way under it.
+    fly(&mut world, &mut r, radius_at(-30.0 * VOXELS_PER_METRE), 0);
     let deep = scale(&world);
     assert!(deep < 0.5, "the dive is at depth: {deep}");
-    // Stopped there, with the scene still on its way (it follows a camera that goes through the
-    // ground slowly, so its cap is on yet): the release would make the scene again at the camera,
-    // under the sea, with the cap off. A second is twice the hold.
-    for _ in 0..60 {
+    // Stopped at the bottom for several seconds (the hold is half of one): kept, nothing waits.
+    for _ in 0..300 {
         world.recentre_moving(at(r), [0.0; 3]).unwrap();
         pace(&world, FRAME);
     }
-    assert_eq!(
-        scale(&world),
-        deep,
-        "the depth was given back at the bottom"
-    );
-    assert_eq!(world.stats().work.release_rebuilds, 0);
-    // Held until the scene's cap is off, and for a time after.
-    let mut frames = 0;
-    while !world.worker().selection_cap_is_off() {
-        world.recentre_moving(at(r), [0.0; 3]).unwrap();
-        pace(&world, FRAME);
-        frames += 1;
-        assert!(frames < 20_000, "the cap never went off");
-    }
-    for _ in 0..120 {
-        world.recentre_moving(at(r), [0.0; 3]).unwrap();
-        pace(&world, FRAME);
-    }
-    assert!(world.worker().selection_cap_is_off());
-    assert_eq!(
-        scale(&world),
-        deep,
-        "the depth was given back under the sea"
-    );
+    assert_eq!(scale(&world), deep, "given back at the bottom");
     assert_eq!(world.stats().work.release_rebuilds, 0);
     assert!(
         !world.reband_pending(),
         "nothing is waited for: no release is pending"
     );
-    // Up over the sea (the cap is on 50 m over it) and stopped: the depth is given back.
-    let top = sea + 80.0 * VOXELS_PER_METRE;
-    while r < top {
-        r += step;
-        let velocity = up.map(|u| u * step * 60.0);
-        world.recentre_moving(at(r), velocity).unwrap();
-        pace(&world, FRAME);
-    }
+    // Up to just under the sphere, and stopped: still kept.
+    fly(&mut world, &mut r, radius_at(-2.0 * VOXELS_PER_METRE), 300);
+    assert_eq!(scale(&world), deep, "given back under the sphere");
+    assert_eq!(world.stats().work.release_rebuilds, 0);
+    // 10 m over it, inside the hysteresis band of the cap's coming on (50 m), and stopped: given
+    // back, as a rebuild (the scene made again there has the cap on).
+    fly(&mut world, &mut r, radius_at(10.0 * VOXELS_PER_METRE), 0);
     let mut frames = 0;
-    while world.worker().selection_cap_is_off() || scale(&world) < 1.0 || world.reband_pending() {
+    while scale(&world) < 1.0 || world.reband_pending() {
         world.recentre_moving(at(r), [0.0; 3]).unwrap();
         pace(&world, FRAME);
         frames += 1;
         assert!(frames < 20_000, "never given back: depth {}", scale(&world));
     }
-    assert_eq!(scale(&world), 1.0);
+    assert_eq!(world.stats().work.release_rebuilds, 1);
+    assert!(radius_at(10.0 * VOXELS_PER_METRE) + raise - sea < CAP_ON_VOXELS);
 }
 
 /// The height over the sea at which the cap comes back on (`select::CAP_ON`), 50 m.

@@ -1621,20 +1621,19 @@ impl Selection {
         self.reach.horizon != was
     }
 
-    /// Whether the cap was asked for and would be off for a camera at `camera`, as [`Selection::place`]
-    /// works it out for the selection's own: off while the raised camera is under the sea's sphere,
-    /// and until it is [`CAP_ON`] over it if it was off. What a scene made again at `camera` has.
-    pub fn cap_is_off_at(&self, camera: [f64; 3]) -> bool {
+    /// Whether the cap was asked for and the raised camera at `camera` is under the sea's sphere
+    /// itself: no hysteresis, as [`Selection::place`] has for a cap that is on. A selection made
+    /// again at such a camera has the cap off; at any camera over the sphere it has it on.
+    pub fn camera_under_horizon(&self, camera: [f64; 3]) -> bool {
         let Some(horizon) = self.horizon else {
             return false;
         };
-        let was = self.reach.horizon;
         let height = Reach {
             horizon: Some(horizon),
             ..self.reach
         }
         .height(camera);
-        !height.is_some_and(|h| h > if was.is_some() { 0.0 } else { CAP_ON })
+        height.is_some_and(|h| h <= 0.0)
     }
 
     /// Looks at every node at the next [`Selection::update`], for a change of the cap.
@@ -2729,6 +2728,12 @@ mod tests {
         selection.set_margins(&store, margins);
         assert!(selection.reach().horizon.is_none());
         assert_eq!(selection.horizon(), Some(Horizon::new(SEA)));
+        // A camera is under the sphere when its raised height is: no hysteresis (a scene made
+        // again over it has the cap on), though the cap here is off until 50 m over it.
+        assert!(selection.camera_under_horizon([0.0, SEA - 101.0, 0.0]));
+        assert!(!selection.camera_under_horizon([0.0, SEA - 99.0, 0.0]));
+        assert!(!selection.camera_under_horizon([0.0, SEA + 500.0, 0.0]));
+        assert!(selection.reach().horizon.is_none());
         let (_, free) = capped_ball([0.0, 150.0, 0.0], false);
         assert_eq!(
             selection.bricks().collect::<BTreeSet<_>>(),
