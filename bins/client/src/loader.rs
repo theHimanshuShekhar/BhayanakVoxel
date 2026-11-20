@@ -1210,6 +1210,38 @@ mod tests {
     }
 
     #[test]
+    fn a_guard_that_is_made_costs_the_queue_nothing_whatever_the_workers() {
+        // The cells of the Guard are made in the first seconds, and what is streamed after (a
+        // flight at 2 m, #220) must go as it did before there was a Guard: every poll is the
+        // queue's nearest job of the most urgent class, never a cell and never idle, whatever the
+        // workers and the cells' count of `guarding`.
+        let keys = near_the_origin();
+        for workers in [1, 2, 3, 6] {
+            let mut loader =
+                Loader::stepped_for(Arc::new(Counting::default()), [0.0; 3], bands(), workers);
+            loader.request(&BrickStore::new(), keys.iter().copied().take(200), [0.0; 3]);
+            loader.sync([0.0; 3], bands());
+            let shared = loader.shared.clone();
+            let mut expected = shared.lock().queue.clone().into_sorted_vec();
+            expected.reverse();
+            assert!(!expected.is_empty());
+            for (n, job) in expected.iter().enumerate() {
+                shared.guarding.store(n % (workers + 1), Atomic::Relaxed);
+                match poll(&shared, shared.lock()) {
+                    Next::Job(taken, ..) => {
+                        assert_eq!(taken.key, job.key, "{workers} workers, the {n}th job");
+                    }
+                    Next::Guard(_) => panic!("{workers} workers: a cell with no Guard"),
+                    _ => panic!(
+                        "{workers} workers: idle with {} jobs queued",
+                        expected.len() - n
+                    ),
+                }
+            }
+        }
+    }
+
+    #[test]
     fn a_loader_has_two_fewer_workers_than_cores_and_at_least_one() {
         assert_eq!(workers_for(8), 6);
         assert_eq!(workers_for(3), 1);
