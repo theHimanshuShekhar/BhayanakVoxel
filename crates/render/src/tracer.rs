@@ -2,6 +2,7 @@
 //! Windowed and offscreen rendering share this, so the golden image test exercises the same
 //! code path the window does.
 
+use brick_store::BrickCoord;
 use bytemuck::{Pod, Zeroable};
 use materials::MaterialTable;
 use wgpu::util::DeviceExt;
@@ -11,6 +12,7 @@ use crate::atmosphere::{AtmosphereTables, AtmosphereView};
 use crate::batch::max_samples;
 use crate::camera::{Camera, CameraUniform};
 use crate::debug_view::DebugView;
+use crate::emitters::{Applied, EmitterIndex, Emitters, emissive_materials};
 use crate::gpu_materials;
 use crate::look::{Look, LookUniform};
 use crate::post::{self, Exposed, HDR_FORMAT, Metering, Post, Scratch, Stages};
@@ -44,6 +46,35 @@ pub const NORMALS_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float
 
 /// The format of the sun's light at each hit (`sun_weights` in `shade.wgsl`): one float a pixel.
 pub const SUN_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R32Float;
+
+/// The format of the incident light that Primary's GI finds at each hit (`gi_light` in `gi.wgsl`):
+/// linear light, three half floats a pixel (and one unused).
+pub const GI_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
+
+/// The slots of Primary's radiance cache, a power of two, and the words of a slot (`cache.wgsl`
+/// holds the layout; keep `CACHE_SLOTS` and `SLOT_WORDS` there in step): 24 MiB of storage
+/// buffer for a table that a frame fills a tenth of at most.
+pub const GI_CACHE_SLOTS: u64 = 1 << 19;
+const GI_SLOT_WORDS: u64 = 12;
+
+/// The frames after an Edit (or a change of the sun) in which the cache forgets faster, in the cells
+/// of the boost's box (`frame.gi.y`, `frame.boost_min` and `boost_max`): half a second at 60 Hz,
+/// which is the time that the lit result has to settle in after a dig.
+const GI_BOOST_FRAMES: u32 = 30;
+/// How far round the regions an Edit wrote the boost reaches, in Voxels: the light that an Edit lets
+/// in or shuts out changes the cells about it most (two regions, 6.4 m).
+const GI_BOOST_MARGIN: i32 = 128;
+/// The most that the box of cells which forget fast may grow to along an axis, in Voxels (100 m),
+/// by Edits that come while another is settling: past it one of the two boxes is kept, the one near
+/// the camera (the newest if both or neither are), so that a stream of Edits (a server's, round the
+/// world) does not make the whole world forget fast ([`merged_boost_box`]).
+const GI_BOOST_MAX_EXTENT: i32 = 2048;
+/// How near an Edit's box must be to the camera, in Voxels (200 m), for the upscaler to keep a short
+/// history for it (`edit_settling`): the history cap is for the whole image, so an Edit that is
+/// not near what the camera sees does not take it.
+const EDIT_SETTLING_REACH: f64 = 4096.0;
+/// A box that holds every Voxel, for a change of the sun.
+const EVERYWHERE: ([i32; 3], [i32; 3]) = ([i32::MIN / 2; 3], [i32::MAX / 2; 3]);
 
 /// Format of the upscaler's history: encoded colour, and in alpha the frames it has been through.
 pub const HISTORY_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
@@ -140,6 +171,26 @@ pub struct ReferenceOptions {
     /// Haze on the bounce rays, as an upper bound of it: for the test that measures what ADR 0005's
     /// leaving it off is worth (#53). Never on in a view that is shown.
     pub bounce_haze: bool,
+    /// How the emissive Voxels are estimated (#54).
+    pub emitters: EmitterEstimator,
+}
+
+/// How the Reference estimates the light of emissive Voxels on a surface. The player's view is
+/// [`EmitterEstimator::Both`]; the other two are for the test that shows that the weights of the two
+/// estimators add up to 1, which is that all three have the same expected value (where every
+/// emitter is in the list of every surface that sees it).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum EmitterEstimator {
+    /// One emitter chosen from the cell's list and a direction over the solid angle it covers, and
+    /// the bounce ray that finds an emitter, weighed against each other (multiple importance
+    /// sampling).
+    #[default]
+    Both,
+    /// The bounce rays alone.
+    BounceOnly,
+    /// The emitters' own samples alone (an emitter that is not in the list of a surface is still
+    /// found by the bounce ray that hits it).
+    SamplesOnly,
 }
 
 /// How the Reference estimates the light of the atmosphere's sky on a surface. The player's view
@@ -172,11 +223,13 @@ pub enum Fault {
     ShortCap,
     /// The sky counted in full by both of its estimators: the weights add up to 2, not 1.
     SkyDoubleCount,
+    /// The emissive Voxels counted in full by both of theirs.
+    EmitterDoubleCount,
 }
 
 impl ReferenceOptions {
     /// The pipeline constants these are, as `pathtrace.wgsl` declares them.
-    fn constants(self) -> [(&'static str, f64); 6] {
+    fn constants(self) -> [(&'static str, f64); 7] {
         [
             ("NO_SHADOW_RAYS", f64::from(u8::from(self.no_shadow_rays))),
             ("FLAT_COLOURS", f64::from(u8::from(self.flat_colours))),
@@ -189,6 +242,7 @@ impl ReferenceOptions {
                     Fault::NoRescale => 2.0,
                     Fault::ShortCap => 3.0,
                     Fault::SkyDoubleCount => 4.0,
+                    Fault::EmitterDoubleCount => 5.0,
                 },
             ),
             (
@@ -200,6 +254,14 @@ impl ReferenceOptions {
                 },
             ),
             ("BOUNCE_HAZE", f64::from(u8::from(self.bounce_haze))),
+            (
+                "EMITTER_MODE",
+                match self.emitters {
+                    EmitterEstimator::Both => 0.0,
+                    EmitterEstimator::BounceOnly => 1.0,
+                    EmitterEstimator::SamplesOnly => 2.0,
+                },
+            ),
         ]
     }
 }
@@ -222,9 +284,17 @@ struct FrameUniform {
     /// 1 if natural Materials are shaded with smooth computed normals; the end of the smooth range
     /// in Voxels and the face normal's weight in it (both an f32's bits); one unused.
     flags: [u32; 4],
-    /// The frame of Primary's sun samples; 1 if the view has GI (the ambient term, for Primary);
-    /// 1 if it has emitted light; the number of shadow rays a pixel casts.
+    /// The frame of Primary's sun samples; whether the view has GI (0 no, 1 yes, 2 Primary's flat
+    /// ambient, see [`Tracer::set_flat_ambient`]); 1 if it has emitted light; the number of shadow
+    /// rays a pixel casts.
     light: [u32; 4],
+    /// Primary's radiance cache: the frame's number, 1 if an Edit or the sun changed lately (in the
+    /// cells of the box below), and two unused.
+    gi: [u32; 4],
+    /// The first Voxel of the box that the cache forgets faster in, and one past its last (the
+    /// fourth word of each is unused).
+    boost_min: [i32; 4],
+    boost_max: [i32; 4],
 }
 
 /// Where primary visibility traces when nothing moves it: the centre of the pixel.
@@ -318,6 +388,9 @@ pub struct Target {
     normals: Plane,
     /// The sun's light at each hit (`shadows`), read by the lit image's pass.
     sun_weights: Plane,
+    /// The light from the bounce, the sky and the emitters at each hit (`gi_trace`), read by the lit
+    /// image's pass.
+    gi_light: Plane,
     reference_size: (u32, u32),
     /// The reference path tracer's mean as linear light, and the display transform's images for it.
     reference_hdr: Plane,
@@ -357,6 +430,7 @@ impl Target {
             surface: Plane::new(device, "surface", internal, SURFACE_FORMAT),
             normals: Plane::new(device, "smooth normals", internal, NORMALS_FORMAT),
             sun_weights: Plane::new(device, "sun weights", internal, SUN_FORMAT),
+            gi_light: Plane::new(device, "gi light", internal, GI_FORMAT),
             reference_size,
             reference_hdr: Plane::new(
                 device,
@@ -457,6 +531,11 @@ pub struct Tracer {
     frame_buffer: wgpu::Buffer,
     /// The Material table (see [`gpu_materials`]), which nothing changes after the upload.
     materials: wgpu::Buffer,
+    /// The emissive Voxels of the scene as lights (see [`crate::emitters`]): which Materials give
+    /// off light, the emitters of the scene as they were last found, and their buffer.
+    emissive: Vec<bool>,
+    emitters: Emitters,
+    emitter_buffer: wgpu::Buffer,
     camera_layout: wgpu::BindGroupLayout,
     primary: wgpu::ComputePipeline,
     reference: wgpu::ComputePipeline,
@@ -466,6 +545,29 @@ pub struct Tracer {
     normals: wgpu::ComputePipeline,
     shadows_layout: wgpu::BindGroupLayout,
     shadows: wgpu::ComputePipeline,
+    gi_layout: wgpu::BindGroupLayout,
+    gi: wgpu::ComputePipeline,
+    gi_resolve_layout: wgpu::BindGroupLayout,
+    gi_resolve: wgpu::ComputePipeline,
+    /// Primary's radiance cache (`cache.wgsl`): a hash table in world space of the light on the
+    /// faces of the world, which `gi_trace` fills and reads.
+    gi_cache: wgpu::Buffer,
+    /// The number of the frame of Primary being drawn (from 1), which the cache ages by.
+    gi_frame: u32,
+    /// How many more frames the cache forgets fast in, after an Edit or the sun changed, and in
+    /// which cells (the first Voxel and one past the last, of level 0).
+    gi_boost: u32,
+    /// Frames left in which the upscaler keeps a short history, after an Edit (not a new sun, which
+    /// starts the history over anyway).
+    edit_settling: u32,
+    gi_boost_box: ([i32; 3], [i32; 3]),
+    /// Where the camera of the frame last drawn was (an Edit's box is judged by its nearness).
+    camera_position: [f64; 3],
+    /// The emitters of level 0 by region, which an update of the scene takes in region by region.
+    emitter_index: EmitterIndex,
+    /// Whether Primary's light has the flat ambient of before #54 in place of its GI (see
+    /// [`Tracer::set_flat_ambient`]).
+    flat_ambient: bool,
     shade_layout: wgpu::BindGroupLayout,
     shade: wgpu::ComputePipeline,
     /// The display transform and the exposure it keeps from frame to frame.
@@ -534,6 +636,27 @@ pub struct Tracer {
 /// The size of a chunk of the staging belt, in bytes: a patch is written to a few of them.
 const BELT_CHUNK: u64 = 4 << 20;
 
+/// Where the emitters' buffer is bound, in group 1 of the kernels that sample them (`emitters` in
+/// `emitters.wgsl`).
+pub(crate) const EMITTERS_BINDING: u32 = 18;
+
+/// The radiance cache's table, for tests (`Offscreen::read_radiance_cache`).
+pub(crate) fn radiance_cache_buffer(tracer: &Tracer) -> &wgpu::Buffer {
+    &tracer.gi_cache
+}
+
+/// Where the radiance cache is bound (`gi_cache` in `cache.wgsl`).
+const GI_CACHE_BINDING: u32 = 19;
+
+/// The GPU buffer for `emitters`.
+fn emitter_buffer(device: &wgpu::Device, emitters: &Emitters) -> wgpu::Buffer {
+    device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("emitters"),
+        contents: bytemuck::cast_slice(&emitters.words),
+        usage: wgpu::BufferUsages::STORAGE,
+    })
+}
+
 pub(crate) fn layout_entry(binding: u32, ty: wgpu::BindingType) -> wgpu::BindGroupLayoutEntry {
     wgpu::BindGroupLayoutEntry {
         binding,
@@ -553,6 +676,8 @@ pub(crate) fn buffer_binding(ty: wgpu::BufferBindingType) -> wgpu::BindingType {
 
 pub(crate) const STORAGE_READ: wgpu::BufferBindingType =
     wgpu::BufferBindingType::Storage { read_only: true };
+const STORAGE_WRITE: wgpu::BufferBindingType =
+    wgpu::BufferBindingType::Storage { read_only: false };
 
 fn compute_pipeline(
     device: &wgpu::Device,
@@ -952,6 +1077,7 @@ impl Tracer {
                 layout_entry(4, buffer_binding(STORAGE_READ)),
                 layout_entry(5, storage_texture(GBUFFER_FORMAT)),
                 layout_entry(6, storage_texture(SURFACE_FORMAT)),
+                layout_entry(EMITTERS_BINDING, buffer_binding(STORAGE_READ)),
             ]
             .into_iter()
             .chain(AtmosphereTables::layout_entries())
@@ -990,6 +1116,31 @@ impl Tracer {
                 layout_entry(9, storage_texture(SUN_FORMAT)),
             ],
         });
+        let gi_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("gi"),
+            entries: &[
+                layout_entry(0, buffer_binding(wgpu::BufferBindingType::Uniform)),
+                layout_entry(2, buffer_binding(wgpu::BufferBindingType::Uniform)),
+                layout_entry(4, buffer_binding(STORAGE_READ)),
+                texture(5, uint),
+                texture(6, uint),
+                texture(8, loaded),
+                texture(10, loaded),
+                layout_entry(EMITTERS_BINDING, buffer_binding(STORAGE_READ)),
+                layout_entry(GI_CACHE_BINDING, buffer_binding(STORAGE_WRITE)),
+                layout_entry(20, storage_texture(GI_FORMAT)),
+            ]
+            .into_iter()
+            .chain(AtmosphereTables::layout_entries())
+            .collect::<Vec<_>>(),
+        });
+        let gi_resolve_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("gi resolve"),
+            entries: &[
+                layout_entry(2, buffer_binding(wgpu::BufferBindingType::Uniform)),
+                layout_entry(GI_CACHE_BINDING, buffer_binding(STORAGE_WRITE)),
+            ],
+        });
         let shade_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("shade"),
             entries: &[
@@ -999,7 +1150,10 @@ impl Tracer {
                 layout_entry(4, buffer_binding(STORAGE_READ)),
                 texture(5, uint),
                 texture(6, uint),
+                texture(8, loaded),
                 texture(10, loaded),
+                layout_entry(GI_CACHE_BINDING, buffer_binding(STORAGE_WRITE)),
+                texture(21, loaded),
             ]
             .into_iter()
             .chain(AtmosphereTables::layout_entries())
@@ -1058,6 +1212,32 @@ impl Tracer {
             &scene_layout,
             &[],
         );
+        let gi = compute_pipeline(
+            device,
+            "gi",
+            shaders::SHADE,
+            "gi_trace",
+            &gi_layout,
+            &scene_layout,
+            &[],
+        );
+        let gi_resolve = compute_pipeline(
+            device,
+            "gi resolve",
+            shaders::SHADE,
+            "gi_resolve",
+            &gi_resolve_layout,
+            &scene_layout,
+            &[],
+        );
+        let gi_cache = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("radiance cache"),
+            size: GI_CACHE_SLOTS * GI_SLOT_WORDS * 4,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
         let shade = compute_pipeline(
             device,
             "shade",
@@ -1067,12 +1247,19 @@ impl Tracer {
             &scene_layout,
             &[],
         );
+        let emissive = emissive_materials(table);
+        let emitter_index = EmitterIndex::scan(scene, &emissive);
+        let emitters = emitter_index.emitters();
+        let emitter_buffer = emitter_buffer(device, &emitters);
         Ok(Self {
             scene: scene_buffers,
             scene_layout,
             camera_buffer,
             frame_buffer,
             materials,
+            emissive,
+            emitters,
+            emitter_buffer,
             camera_layout,
             primary,
             reference,
@@ -1080,6 +1267,18 @@ impl Tracer {
             normals,
             shadows_layout,
             shadows,
+            gi_layout,
+            gi,
+            gi_resolve_layout,
+            gi_resolve,
+            gi_cache,
+            gi_frame: 0,
+            gi_boost: 0,
+            edit_settling: 0,
+            gi_boost_box: EVERYWHERE,
+            camera_position: [0.0; 3],
+            emitter_index,
+            flat_ambient: false,
             shade_layout,
             shade,
             post: Post::new(device),
@@ -1112,6 +1311,35 @@ impl Tracer {
         })
     }
 
+    /// Finds the emitters of `scene` again, and makes a new buffer of them if they are not what the
+    /// last buffer held. The scan reads the packed level 0 (a few thousand words in most scenes) and
+    /// is made on every update of the scene, so a dig that opens an emitter to the room is seen by
+    /// the next frame.
+    fn update_emitters(&mut self, device: &wgpu::Device, scene: &Scene, update: &SceneUpdate) {
+        let Applied {
+            emitters_changed, ..
+        } = self.emitter_index.apply(scene, &self.emissive, update);
+        if emitters_changed {
+            let emitters = self.emitter_index.emitters();
+            if emitters != self.emitters {
+                self.emitter_buffer = emitter_buffer(device, &emitters);
+                self.emitters = emitters;
+            }
+        }
+        // What an update takes in is what a scan of all of level 0 would find (a scan is the cost
+        // that it avoids; this is checked where it is cheap, which is everywhere but a scene
+        // of thousands of boxes).
+        debug_assert!(
+            self.emitters.boxes > 2048 || self.emitters == Emitters::of(scene, &self.emissive),
+            "the emitters of an update are not those of the scene"
+        );
+    }
+
+    /// The emitters of the scene as the shaders have them, for tests.
+    pub fn emitters(&self) -> &Emitters {
+        &self.emitters
+    }
+
     /// Records the primary visibility pass: one ray per pixel of the lit image of `target`, through
     /// the centre of the pixel, from `camera`, lit by `sun`. Nothing carries over from one call
     /// to the next. The passes are timed by `profiler`.
@@ -1126,6 +1354,8 @@ impl Tracer {
         sun: &Sun,
         target: &Target,
     ) {
+        self.gi_frame += 1;
+        self.camera_position = camera.position;
         self.write_uniforms(queue, camera, sun, (0, CENTRE, 0), 0);
         self.encode_atmosphere(
             device,
@@ -1137,8 +1367,9 @@ impl Tracer {
             target.resolution.internal,
         );
         // Nothing carries over from one call to the next, the exposure included: it settles at
-        // once, on this image.
+        // once, on this image. (The radiance cache does: it is the world's, not the image's.)
         self.dispatch_primary(device, queue, profiler, encoder, target, 1.0);
+        self.gi_boost = self.gi_boost.saturating_sub(1);
     }
 
     /// Records a frame of primary visibility from `camera`, lit by `sun`: the primary pass, one ray
@@ -1187,9 +1418,12 @@ impl Tracer {
             self.history.reset();
             self.history_sun_epoch = self.sun_epoch;
         }
-        let frame = self
+        let mut frame = self
             .history
             .begin(target.resolution(), camera, self.debug_view);
+        frame.light_settling(self.edit_settling > 0);
+        self.gi_frame += 1;
+        self.camera_position = camera.position;
         self.write_uniforms(
             queue,
             camera,
@@ -1207,6 +1441,8 @@ impl Tracer {
             target.resolution.internal,
         );
         self.dispatch_primary(device, queue, profiler, encoder, target, rate);
+        self.gi_boost = self.gi_boost.saturating_sub(1);
+        self.edit_settling = self.edit_settling.saturating_sub(1);
         self.upscale
             .encode(device, queue, profiler, encoder, &frame, target);
     }
@@ -1306,7 +1542,8 @@ impl Tracer {
             &target.reference_scratch,
             &target.reference,
             self.stages,
-            self.debug_view != DebugView::Lit,
+            // The Reference has no cache: it shows its lit image for that view.
+            !matches!(self.debug_view, DebugView::Lit | DebugView::CacheCells),
             Exposed::Reference,
             metering,
         );
@@ -1400,6 +1637,7 @@ impl Tracer {
     ) -> Result<()> {
         self.restart_reference();
         self.smooth_end = smooth_end(scene);
+        self.update_emitters(device, scene, update);
         // Counted where each write is made, not summed from the patch's cost: [`upload_cost`] is
         // the other count, and the two are compared. Both go over `RingPatch::copies()`, so the
         // comparison does not check that list (the stepped tests' `GpuCopy::assert_is` does).
@@ -1653,6 +1891,39 @@ impl Tracer {
     /// camera: the next frame of Primary starts the upscaler's history over (#52).
     pub fn sun_changed(&mut self) {
         self.sun_epoch += 1;
+        self.gi_boost = GI_BOOST_FRAMES;
+        self.gi_boost_box = EVERYWHERE;
+    }
+
+    /// Says that an Edit changed `bricks` (and not the scene thread's streaming, which changes the
+    /// world far from where anyone looks and must not make the cache forget): for
+    /// [`GI_BOOST_FRAMES`] frames the cells within [`GI_BOOST_MARGIN`] Voxels of the bricks follow
+    /// the new light faster, and the upscaler keeps a short history for as long (it takes the new
+    /// light at a fourth of a pixel a frame and not a sixteenth). Called when the Edit is made, which is not when its patch reaches
+    /// the GPU (the scene thread packs it a frame or more later): the cache forgets from the Edit.
+    pub fn edit_made(&mut self, bricks: &[BrickCoord]) {
+        let Some(first) = bricks.first() else {
+            return;
+        };
+        let (mut lo, mut hi) = (first.0, first.0);
+        for b in bricks {
+            lo = std::array::from_fn(|a| lo[a].min(b.0[a]));
+            hi = std::array::from_fn(|a| hi[a].max(b.0[a]));
+        }
+        let reach = (
+            lo.map(|k| k * 8 - GI_BOOST_MARGIN),
+            hi.map(|k| (k + 1) * 8 + GI_BOOST_MARGIN),
+        );
+        (self.gi_boost, self.gi_boost_box) = boost_after_edit(
+            self.gi_boost,
+            self.gi_boost_box,
+            reach,
+            self.camera_position,
+        );
+        // The upscaler's short history is for the whole image: only for an Edit near the camera.
+        if box_near(reach, self.camera_position) {
+            self.edit_settling = GI_BOOST_FRAMES;
+        }
     }
 
     /// Sets the light's palette (see [`Look`]). The sun's and the sky's light are part of what the
@@ -1693,6 +1964,17 @@ impl Tracer {
         if only != self.sun_and_sky_only {
             self.sun_and_sky_only = only;
             self.restart_reference();
+            self.history.reset();
+        }
+    }
+
+    /// Puts the flat ambient of before #54 (0.25 of the surface's colour, on every lit surface) in
+    /// place of Primary's GI. It is the bench's "before": a view's Primary-against-truth score with
+    /// it is what the radiance cache must not be further from the Reference than. The Reference has
+    /// its bounce light either way. The upscaler's history starts over.
+    pub fn set_flat_ambient(&mut self, flat: bool) {
+        if flat != self.flat_ambient {
+            self.flat_ambient = flat;
             self.history.reset();
         }
     }
@@ -1793,9 +2075,29 @@ impl Tracer {
             ],
             light: [
                 sun_sample,
-                u32::from(!self.sun_and_sky_only),
+                // 0 without GI, 1 with the bounce and the cache, 2 with the flat ambient.
+                if self.sun_and_sky_only {
+                    0
+                } else if self.flat_ambient {
+                    2
+                } else {
+                    1
+                },
                 u32::from(!self.sun_and_sky_only),
                 self.shadow_rays,
+            ],
+            gi: [self.gi_frame, u32::from(self.gi_boost > 0), 0, 0],
+            boost_min: [
+                self.gi_boost_box.0[0],
+                self.gi_boost_box.0[1],
+                self.gi_boost_box.0[2],
+                0,
+            ],
+            boost_max: [
+                self.gi_boost_box.1[0],
+                self.gi_boost_box.1[1],
+                self.gi_boost_box.1[2],
+                0,
             ],
         };
         queue.write_buffer(&self.frame_buffer, 0, bytemuck::bytes_of(&frame));
@@ -1825,12 +2127,20 @@ impl Tracer {
             &target.lit_hdr.view,
             target,
         );
+        // A debug view that primary visibility drew skips the lighting: it is the colours as they
+        // are. The history length is the upscaler's, over the lit image; the cache's cells are
+        // drawn by the lit image's pass, from the same GI as the lit image has.
+        let drawn_early = !matches!(
+            self.debug_view,
+            DebugView::Lit | DebugView::HistoryLength | DebugView::CacheCells
+        );
         let debug = !matches!(self.debug_view, DebugView::Lit | DebugView::HistoryLength);
-        if !debug {
+        if !drawn_early {
             if self.stages.smooth_normals {
                 self.dispatch_normals(device, profiler, encoder, target);
             }
             self.dispatch_shadows(device, profiler, encoder, target);
+            self.dispatch_gi(device, profiler, encoder, target);
             self.dispatch_shade(device, profiler, encoder, target);
         }
         self.post.encode(
@@ -1912,6 +2222,61 @@ impl Tracer {
         pass.dispatch_workgroups(width.div_ceil(8), height.div_ceil(8), 1);
     }
 
+    /// The light from the bounce, the sky and the emitters at every hit of the G-buffer (`gi_trace`
+    /// in `gi.wgsl`), and the radiance cache's fold of the frame's samples (`gi_resolve` in
+    /// `cache.wgsl`), in one timed pass called `gi`.
+    fn dispatch_gi(
+        &self,
+        device: &wgpu::Device,
+        profiler: &mut Profiler,
+        encoder: &mut wgpu::CommandEncoder,
+        target: &Target,
+    ) {
+        let view = plane_entry;
+        let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("gi"),
+            layout: &self.gi_layout,
+            entries: &[
+                buffer_entry(0, &self.camera_buffer),
+                buffer_entry(2, &self.frame_buffer),
+                buffer_entry(4, &self.materials),
+                view(5, &target.gbuffer),
+                view(6, &target.surface),
+                view(8, &target.normals),
+                view(10, &target.sun_weights),
+                buffer_entry(EMITTERS_BINDING, &self.emitter_buffer),
+                buffer_entry(GI_CACHE_BINDING, &self.gi_cache),
+                view(20, &target.gi_light),
+            ]
+            .into_iter()
+            .chain(self.atmosphere.entries())
+            .collect::<Vec<_>>(),
+        });
+        let resolve = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("gi resolve"),
+            layout: &self.gi_resolve_layout,
+            entries: &[
+                buffer_entry(2, &self.frame_buffer),
+                buffer_entry(GI_CACHE_BINDING, &self.gi_cache),
+            ],
+        });
+        let (width, height) = target.resolution.internal;
+        let mut pass = profiler.compute_pass(encoder, "gi");
+        pass.set_pipeline(&self.gi);
+        pass.set_bind_group(0, &self.scene.group, &[]);
+        pass.set_bind_group(1, &group, &[]);
+        // One pixel of each 2 x 2 block (`gi_lattice_offset`): a quarter of the threads.
+        pass.dispatch_workgroups(
+            width.div_ceil(2).div_ceil(8),
+            height.div_ceil(2).div_ceil(8),
+            1,
+        );
+        pass.set_pipeline(&self.gi_resolve);
+        pass.set_bind_group(0, &self.scene.group, &[]);
+        pass.set_bind_group(1, &resolve, &[]);
+        pass.dispatch_workgroups(GI_CACHE_SLOTS.div_ceil(64) as u32, 1, 1);
+    }
+
     /// The lit image as linear light, from the G-buffer and the sun's light at each hit
     /// (`shade_pass` in `shade.wgsl`).
     fn dispatch_shade(
@@ -1941,7 +2306,10 @@ impl Tracer {
                 },
                 view(5, &target.gbuffer),
                 view(6, &target.surface),
+                view(8, &target.normals),
                 view(10, &target.sun_weights),
+                buffer_entry(GI_CACHE_BINDING, &self.gi_cache),
+                view(21, &target.gi_light),
             ]
             .into_iter()
             .chain(self.atmosphere.entries())
@@ -2000,6 +2368,7 @@ impl Tracer {
                     binding: 6,
                     resource: wgpu::BindingResource::TextureView(&target.surface.view),
                 },
+                buffer_entry(EMITTERS_BINDING, &self.emitter_buffer),
             ]
             .into_iter()
             .chain(self.atmosphere.entries())
@@ -2137,8 +2506,204 @@ fn batch_of(samples: u32, size: (u32, u32)) -> u32 {
     samples.clamp(1, max_samples(pixels(size)))
 }
 
+/// Whether `bx` is within [`EDIT_SETTLING_REACH`] Voxels of `camera` along every axis.
+fn box_near(bx: ([i32; 3], [i32; 3]), camera: [f64; 3]) -> bool {
+    (0..3).all(|a| {
+        let (lo, hi) = (f64::from(bx.0[a]), f64::from(bx.1[a]));
+        (camera[a].clamp(lo, hi) - camera[a]).abs() <= EDIT_SETTLING_REACH
+    })
+}
+
+/// Whether `outer` holds all of `inner`.
+fn box_holds(outer: ([i32; 3], [i32; 3]), inner: ([i32; 3], [i32; 3])) -> bool {
+    (0..3).all(|a| outer.0[a] <= inner.0[a] && outer.1[a] >= inner.1[a])
+}
+
+/// The frames left of the boost and its box after an Edit with box `reach`, when `frames` were left
+/// with the box `current` (`frames` is 0 when none is settling):
+/// - no boost is settling: the Edit's box for [`GI_BOOST_FRAMES`];
+/// - otherwise the boxes merge ([`merged_boost_box`]) and the frames start over, **except** that
+///   a box that the Edit did not change keeps the frames it had: the whole world's after a sun
+///   change (an Edit, a server's from anywhere, does not make it forget fast for longer than the
+///   sun's change did), and a dig's, kept against Edits far off that it does not hold.
+fn boost_after_edit(
+    frames: u32,
+    current: ([i32; 3], [i32; 3]),
+    reach: ([i32; 3], [i32; 3]),
+    camera: [f64; 3],
+) -> (u32, ([i32; 3], [i32; 3])) {
+    if frames == 0 {
+        return (GI_BOOST_FRAMES, reach);
+    }
+    let merged = merged_boost_box(current, reach, camera);
+    if merged == EVERYWHERE || (merged == current && !box_holds(current, reach)) {
+        return (frames, merged);
+    }
+    (GI_BOOST_FRAMES, merged)
+}
+
+/// The box of cells that forget fast after an Edit whose box is `reach`, while the box `current`
+/// (of a sun change, [`EVERYWHERE`], or of an Edit) is still settling:
+/// - a sun change's whole-world box stays the whole world (every cell's light is the old sun's);
+/// - two Edits' boxes are merged, while the merge is at most [`GI_BOOST_MAX_EXTENT`] Voxels across
+///   on each axis;
+/// - past that one of the two is kept: the one near the camera (`camera`), the newest if both or
+///   neither are (so a server's Edit from the far side of the world does not take the box from the
+///   dig the player is watching settle).
+fn merged_boost_box(
+    current: ([i32; 3], [i32; 3]),
+    reach: ([i32; 3], [i32; 3]),
+    camera: [f64; 3],
+) -> ([i32; 3], [i32; 3]) {
+    if current == EVERYWHERE {
+        return EVERYWHERE;
+    }
+    let both: ([i32; 3], [i32; 3]) = (
+        std::array::from_fn(|a| current.0[a].min(reach.0[a])),
+        std::array::from_fn(|a| current.1[a].max(reach.1[a])),
+    );
+    let small = (0..3)
+        .all(|a| i64::from(both.1[a]) - i64::from(both.0[a]) <= i64::from(GI_BOOST_MAX_EXTENT));
+    if small {
+        both
+    } else if !box_near(reach, camera) && box_near(current, camera) {
+        current
+    } else {
+        reach
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_sun_change_then_an_edit_keeps_the_whole_world_box() {
+        let reach = ([0, 0, 0], [200, 200, 200]);
+        assert_eq!(merged_boost_box(EVERYWHERE, reach, [0.0; 3]), EVERYWHERE);
+        // Far from the camera too.
+        assert_eq!(
+            merged_boost_box(EVERYWHERE, reach, [1.0e6, 0.0, 0.0]),
+            EVERYWHERE
+        );
+    }
+
+    #[test]
+    fn edits_that_come_while_one_settles_merge_up_to_the_cap_and_no_further() {
+        let a = ([0, 0, 0], [400, 400, 400]);
+        let near = ([1000, 0, 0], [1400, 400, 400]);
+        let merged = merged_boost_box(a, near, [0.0; 3]);
+        assert_eq!(
+            merged,
+            ([0, 0, 0], [1400, 400, 400]),
+            "within the cap: both"
+        );
+        // Past the cap (2048 along x): the one near the camera, and the newest of two near ones.
+        let past = ([2000, 0, 0], [2400, 400, 400]);
+        let camera = [0.0; 3];
+        assert_eq!(
+            merged_boost_box(a, past, camera),
+            past,
+            "the newest of two near"
+        );
+        // The camera is at the origin; this one is 100 km away along x.
+        let far = ([2_000_000, 0, 0], [2_000_400, 400, 400]);
+        assert_eq!(
+            merged_boost_box(a, far, camera),
+            a,
+            "a far Edit does not take the dig's box"
+        );
+        assert_eq!(
+            merged_boost_box(far, a, camera),
+            a,
+            "the one near the camera, the newest"
+        );
+        let far_too = ([3_000_000, 0, 0], [3_000_400, 400, 400]);
+        assert_eq!(
+            merged_boost_box(far, far_too, camera),
+            far_too,
+            "neither near: the newest"
+        );
+    }
+
+    #[test]
+    fn an_edit_shortens_the_upscalers_history_only_within_its_reach_of_the_camera() {
+        let bx = ([0, 0, 0], [400, 400, 400]);
+        assert!(box_near(bx, [0.0, 0.0, 0.0]));
+        assert!(
+            box_near(bx, [400.0 + EDIT_SETTLING_REACH, 0.0, 0.0]),
+            "at the reach"
+        );
+        assert!(
+            !box_near(bx, [400.0 + EDIT_SETTLING_REACH + 1.0, 0.0, 0.0]),
+            "past it"
+        );
+        assert!(!box_near(bx, [0.0, -EDIT_SETTLING_REACH - 1.0, 0.0]));
+    }
+
+    /// A tracer of an empty scene, with the camera at `camera` as of its last frame (Needs a Vulkan
+    /// device).
+    fn tracer_at(camera: [f64; 3]) -> Tracer {
+        let (_, device, _) = request_gpu(shared_instance(), None, false).unwrap();
+        let scene = Scene::new(&brick_store::BrickStore::new(), None);
+        let mut tracer = Tracer::new(&device, &scene).unwrap();
+        tracer.camera_position = camera;
+        tracer
+    }
+
+    fn brick_at(x: i32) -> BrickCoord {
+        BrickCoord([x, 0, 0])
+    }
+
+    /// The box that an Edit of `brick` alone boosts.
+    fn reach_of(brick: BrickCoord) -> ([i32; 3], [i32; 3]) {
+        (
+            brick.0.map(|k| k * 8 - GI_BOOST_MARGIN),
+            brick.0.map(|k| (k + 1) * 8 + GI_BOOST_MARGIN),
+        )
+    }
+
+    #[test]
+    fn edits_through_the_tracer_boost_their_box_and_leave_a_sun_changes_box_and_frames_alone() {
+        // Needs a Vulkan device.
+        let mut tracer = tracer_at([0.0; 3]);
+        // No boost settling: the Edit's box alone, for the frames (and not the initial EVERYWHERE
+        // merged with it).
+        tracer.edit_made(&[brick_at(3)]);
+        assert_eq!(tracer.gi_boost_box, reach_of(brick_at(3)));
+        assert_eq!(tracer.gi_boost, GI_BOOST_FRAMES);
+        // A sun change: the whole world, and an Edit that comes 10 frames later (a server's, from
+        // anywhere) leaves both the box and the 20 frames that were left.
+        tracer.sun_changed();
+        assert_eq!(tracer.gi_boost_box, EVERYWHERE);
+        tracer.gi_boost = 20;
+        tracer.edit_made(&[brick_at(900_000)]);
+        assert_eq!(tracer.gi_boost_box, EVERYWHERE, "still the whole world");
+        assert_eq!(
+            tracer.gi_boost, 20,
+            "and its frames are the sun's, not the Edit's"
+        );
+    }
+
+    #[test]
+    fn a_dig_kept_against_far_edits_does_not_have_its_frames_extended_by_them() {
+        // Needs a Vulkan device.
+        let mut tracer = tracer_at([0.0; 3]);
+        tracer.edit_made(&[brick_at(3)]);
+        let dig = tracer.gi_boost_box;
+        tracer.gi_boost = 12;
+        // Edits 100 km off, one after another: the dig's box and its 12 frames stay.
+        for far in [250_000, 260_000, 270_000] {
+            tracer.edit_made(&[brick_at(far)]);
+            assert_eq!(tracer.gi_boost_box, dig);
+            assert_eq!(tracer.gi_boost, 12);
+        }
+        // An Edit inside the dig's box (the next brick) does change what is settling there: the
+        // frames start over, in a box that holds both.
+        tracer.edit_made(&[brick_at(4)]);
+        assert_eq!(tracer.gi_boost, GI_BOOST_FRAMES);
+        assert!(box_holds(tracer.gi_boost_box, reach_of(brick_at(3))));
+        assert!(box_holds(tracer.gi_boost_box, reach_of(brick_at(4))));
+    }
+
     #[test]
     fn a_batch_is_clamped_by_the_size_of_the_image_it_is_of() {
         use crate::batch::MAX_BATCH_SAMPLES;

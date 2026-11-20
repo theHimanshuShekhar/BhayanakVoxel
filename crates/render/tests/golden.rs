@@ -48,6 +48,27 @@ fn the_test_planet_matches_the_approved_golden_image() {
     check_golden("planet_256x144.png", &render_view(), &PRIMARY);
 }
 
+/// The same view as the game draws it since #54: with the radiance cache's GI instead of the flat
+/// ambient that an `Offscreen` starts with (so the golden above shows a light the game no longer
+/// draws), after 40 frames, for the cache to have settled. GI is deterministic: the same frames
+/// give the same image.
+fn render_view_with_gi() -> Image {
+    let camera = Camera::looking_at([0.0, 1548.0, 250.0], [0.0, 1535.0, -300.0]);
+    let mut offscreen = Offscreen::new(WIDTH, HEIGHT, &planet_patch()).unwrap();
+    offscreen.set_ground_level(GROUND_LEVEL);
+    offscreen.set_flat_ambient(false);
+    let mut image = offscreen.render(&camera);
+    for _ in 1..40 {
+        image = offscreen.render(&camera);
+    }
+    image
+}
+
+#[test]
+fn the_test_planet_with_the_radiance_caches_gi_matches_the_approved_golden_image() {
+    check_golden("planet_gi_256x144.png", &render_view_with_gi(), &PRIMARY);
+}
+
 /// The upscaler's view: the same as the primary visibility golden's, traced at 128x72 and
 /// upscaled to the golden's 256x144.
 fn upscaling() -> Offscreen {

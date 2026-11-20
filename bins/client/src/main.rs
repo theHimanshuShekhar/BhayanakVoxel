@@ -858,6 +858,7 @@ impl App {
         let resim = world.take_resim().as_secs_f64() * 1e3;
         self.cpu.add(Row::Resim, resim);
         let shown = self.show(update);
+        self.edits_to_the_cache();
         self.cpu.finish(Row::Poll, span, resim);
         shown
     }
@@ -873,7 +874,22 @@ impl App {
             return Ok(());
         }
         let update = world.edit(&self.camera, &self.editor.tool)?;
-        self.show(update)
+        self.show(update)?;
+        self.edits_to_the_cache();
+        Ok(())
+    }
+
+    /// Tells the radiance cache which bricks Edits changed, from the Edit and not from the patch
+    /// that the scene thread makes of it later: the cache follows the light there faster, and
+    /// streaming, which is not an Edit, does not make it forget.
+    fn edits_to_the_cache(&mut self) {
+        if let Some(world) = &mut self.world {
+            // Taken with no renderer too, so that the list does not grow with nothing to read it.
+            let bricks = world.take_edited();
+            if let (Some(renderer), false) = (&mut self.renderer, bricks.is_empty()) {
+                renderer.edit_made(&bricks);
+            }
+        }
     }
 
     /// Holds a Dig for `dt` seconds, while the button is down on one: it is made, as an ordinary

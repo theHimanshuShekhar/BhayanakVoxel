@@ -48,8 +48,13 @@ shadows = 0.4
 # sun-free tables only when the air or the sun's height changes).
 atmosphere = 0.3
 
+# GI (#54): the `gi` pass, one bounce and an emitter sample for one pixel in four (a lattice of
+# one pixel in every 2 x 2 block, filled in to the others) from the G-buffer, and the
+# world-space radiance cache that supplies the bounces after it (the cache's fill and its resolve
+# are in it).
+gi = 1.5
+
 # M1 stages from #10, for when the passes exist (the names are suggestions):
-# gi           = 1.5   # GI bounce and radiance cache
 # reflections  = 0.7
 # glass        = 0.7
 # volumetrics  = 1.0
@@ -95,6 +100,13 @@ time_to_control_s = 2.0
 # the 4090 is 47.8 s; this is that plus 15%. A run that has not settled at the cap (120 s) is over
 # whatever this is.
 settle_s = 55.0
+# Primary's `gi` pass in the real-time run (#54), of the worst path: its GPU milliseconds, mean and
+# 99th percentile. The GPU bench's small flight holds the pass to 1.5 ms (`[passes] gi`), and the
+# full-size Planet cost 4 to 5 ms in the first run of the real-time mode, which the bench's flight
+# did not show: this holds the pass in the run that does. A run with no pass times is over (a gate
+# that looked at nothing has not passed).
+gi_mean_ms = 1.5
+gi_p99_ms = 3.0
 
 # The GPU time of one profiler frame, by mode: from the start of its first pass to the end of
 # its last. In primary mode that is one frame of the path. In reference mode every sample is a

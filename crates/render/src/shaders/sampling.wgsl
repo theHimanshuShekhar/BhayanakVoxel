@@ -17,13 +17,13 @@ fn pcg(v: u32) -> u32 {
 // give the same bits on every device. A path asks for its dimensions by number, in any order,
 // and a path that ends early simply never asks for the later ones.
 //
-// The first SOBOL_GROUPS * 4 = 72 dimensions are Sobol, in groups of four. Each group has its own scramble,
+// The first SOBOL_GROUPS * 4 = 88 dimensions are Sobol, in groups of four. Each group has its own scramble,
 // so the groups are not correlated with each other (Burley, section 4), and within a group the
 // four dimensions keep Sobol's stratification: the first two are a (0,2)-sequence, so 4^k
 // consecutive samples put one point in each cell of every 2^i by 2^(k-i) grid. Dimensions past
 // those are hashed random numbers. `white` replaces all of them by hashed random numbers:
 // white noise, which tests use as the plain Monte Carlo baseline.
-const SOBOL_GROUPS = 18u;
+const SOBOL_GROUPS = 22u;
 
 // The scramble of one pixel under one seed. Whole numbers, so it is the same on every device.
 fn pixel_hash(pixel: vec2<u32>, seed: u32) -> u32 {
@@ -160,6 +160,19 @@ fn cosine_hemisphere(n: vec3<f32>, u: vec2<f32>) -> vec3<f32> {
     return basis(n) * local;
 }
 
+// The density, over solid angle, with which the bounce at a surface with shading normal `normal` and
+// geometric normal `face` chooses `dir` (above the face): the cosine-weighted direction about the
+// shading normal where it is above the face, and the mirror image of the one that was below it. Both
+// are the same density where the two normals are one.
+fn bounce_pdf(normal: vec3<f32>, face: vec3<f32>, dir: vec3<f32>) -> f32 {
+    let above = dot(dir, face);
+    if above < 0.0 {
+        return 0.0;
+    }
+    let mirrored = dir - 2.0 * above * face;
+    return (max(dot(normal, dir), 0.0) + max(dot(normal, mirrored), 0.0)) / PI;
+}
+
 // A unit vector uniform over the cone of directions within `acos(cos_max)` of the unit vector
 // `axis`. With cos_max = 1 it is exactly `axis`.
 fn sample_cone(axis: vec3<f32>, cos_max: f32, u: vec2<f32>) -> vec3<f32> {
@@ -168,4 +181,89 @@ fn sample_cone(axis: vec3<f32>, cos_max: f32, u: vec2<f32>) -> vec3<f32> {
     let phi = 2.0 * PI * u.y;
     let local = vec3<f32>(sin_theta * cos(phi), sin_theta * sin(phi), cos_theta);
     return basis(axis) * local;
+}
+
+// ---- A rectangle, sampled over the solid angle it covers.
+//
+// Ureña, Fajardo and King, "An Area-Preserving Parametrization for Spherical Rectangles" (EGSR
+// 2013). The rectangle is `[x0, x1] x [y0, y1]` in the plane `z = z0` of a frame whose origin is
+// the point it is seen from, with `z0 < 0` (the caller flips the frame so). `sph_quad` is
+// the work that is done once for a rectangle and a point (its solid angle too), `sph_quad_sample`
+// takes a point of it, in `(x, y)`, for two numbers in 0..1: every part of the solid angle is as
+// likely as every other, so the density over solid angle is 1 / `solid_angle` wherever the
+// direction points. A rectangle that is edge-on (`|z0|` under 1e-4) or too small to matter has a
+// solid angle of 0, and is never sampled. Whoever samples and whoever works out a density must
+// use these two functions, or the two will not agree on what has a solid angle.
+
+struct SphQuad {
+    x0: f32,
+    y0: f32,
+    z0: f32,
+    x1: f32,
+    y1: f32,
+    // The z of the normals of two edges and the angle that the first sample number starts from.
+    b0: f32,
+    b1: f32,
+    k: f32,
+    solid_angle: f32,
+}
+
+// Rectangles that cover less than this many steradians are not sampled (a pixel of a 4K screen is
+// 1e-6 or so): the light that is left out is under a thousandth of what a surface of that
+// emitter gets, and the bounce rays count it.
+const QUAD_MIN_SOLID_ANGLE = 1e-7;
+
+fn safe_acos(x: f32) -> f32 {
+    return acos(clamp(x, -1.0, 1.0));
+}
+
+fn sph_quad(x0: f32, y0: f32, z0: f32, x1: f32, y1: f32) -> SphQuad {
+    var q: SphQuad;
+    q.x0 = x0;
+    q.y0 = y0;
+    q.z0 = z0;
+    q.x1 = x1;
+    q.y1 = y1;
+    q.solid_angle = 0.0;
+    if abs(z0) < 1e-4 {
+        return q;
+    }
+    let v00 = vec3<f32>(x0, y0, z0);
+    let v01 = vec3<f32>(x0, y1, z0);
+    let v10 = vec3<f32>(x1, y0, z0);
+    let v11 = vec3<f32>(x1, y1, z0);
+    let n0 = normalize(cross(v00, v10));
+    let n1 = normalize(cross(v10, v11));
+    let n2 = normalize(cross(v11, v01));
+    let n3 = normalize(cross(v01, v00));
+    let g0 = safe_acos(-dot(n0, n1));
+    let g1 = safe_acos(-dot(n1, n2));
+    let g2 = safe_acos(-dot(n2, n3));
+    let g3 = safe_acos(-dot(n3, n0));
+    q.b0 = n0.z;
+    q.b1 = n2.z;
+    q.k = 2.0 * PI - g2 - g3;
+    let area = g0 + g1 - q.k;
+    if area >= QUAD_MIN_SOLID_ANGLE {
+        q.solid_angle = area;
+    }
+    return q;
+}
+
+// The point `(x, y)` of the rectangle for `u` in 0..1 x 0..1.
+fn sph_quad_sample(q: SphQuad, u: vec2<f32>) -> vec2<f32> {
+    // The first number places the point along x.
+    let au = u.x * q.solid_angle + q.k;
+    let fu = (cos(au) * q.b0 - q.b1) / sin(au);
+    let cu = clamp(select(-1.0, 1.0, fu > 0.0) / sqrt(fu * fu + q.b0 * q.b0), -1.0, 1.0);
+    var xu = -(cu * q.z0) / sqrt(max(1.0 - cu * cu, 1e-12));
+    xu = clamp(xu, q.x0, q.x1);
+    // The second places it along y, for that x.
+    let d = sqrt(xu * xu + q.z0 * q.z0);
+    let h0 = q.y0 / sqrt(d * d + q.y0 * q.y0);
+    let h1 = q.y1 / sqrt(d * d + q.y1 * q.y1);
+    let hv = h0 + u.y * (h1 - h0);
+    let hv2 = hv * hv;
+    let yv = select(q.y1, (hv * d) / sqrt(1.0 - hv2), hv2 < 1.0 - 1e-6);
+    return vec2<f32>(xu, yv);
 }

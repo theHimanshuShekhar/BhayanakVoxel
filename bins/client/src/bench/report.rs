@@ -132,7 +132,25 @@ use super::stream::StreamReport;
 /// opened) and `guard_complete_s` (from the start of the load to the last cell being taken in);
 /// `guard_s` is now the time of the first part only, `time_to_control_s` no longer waits for the
 /// whole Guard, and its gate is 2 s in the budgets file (it was 10). Nothing else is changed.
-pub const SCHEMA_VERSION: u32 = 28;
+///
+/// 29 (#54; 27 is #168's, 28 is #220's) added the emissive room to the convergence phase (`convergence.views[]`
+/// has a third view, `room`), and Primary's GI against truth: each view's `gi` (Primary's FLIP
+/// mean and 99th percentile against truth A and its luminance over truth's, for the first frame
+/// and the settled one, with the flat ambient of before the radiance cache (`flat`) and with it
+/// (`gi`), and whether GI is no further from truth), and `convergence.gi`: the dig of the room's
+/// wall (the time its lit result takes to settle, with the frames) and the gates of the ticket
+/// (the room's FLIP, no view further from truth, the settling time, the Reference's room within
+/// 0.3 s of GPU time: `gi.gates.reference_room_within_s`, held on the Reference line's `gpu_s`), with
+/// the names of those that are over. Every view's `still.marks[]` has a 0.3 s mark, and
+/// `still.flip_within_s` says which mark the still run's wall-clock acceptance is of (0.3 s in the
+/// room, where it is reported and not gated, 0.25 s elsewhere). A new pass line `gi` is in `passes[]` (the
+/// report lists passes generically). Each real-time path has `frame_parts` (the frame thread's
+/// recentre, update, encode, submit and wait, the passes' GPU total and the wait that no pass
+/// accounts for) and `gpu_passes` (the GPU time of every timed pass), and a real-time run has
+/// `unpaced_control` (standing frames with no pacing sleep); the real-time gates have `gi_mean_ms`, `gi_p99_ms`
+/// and `gi_paths_timed` (`over` may name `gi`), and the budgets file's `[streaming]` the keys `gi_mean_ms`
+/// and `gi_p99_ms`. Nothing else is changed than what this note lists.
+pub const SCHEMA_VERSION: u32 = 29;
 
 /// One timed thing (a pass, or the GPU total of a profiler frame) in one mode, against its
 /// budget. In reference mode a profiler frame is one sample, so the entries of that mode have
@@ -634,7 +652,7 @@ mod tests {
                 "streaming_real_time"
             ]
         );
-        assert_eq!(json["schema_version"], 28);
+        assert_eq!(json["schema_version"], 29);
         assert_eq!(json["convergence"], serde_json::Value::Null);
         assert_eq!(json["streaming"], serde_json::Value::Null);
         assert_eq!(json["streaming_real_time"], serde_json::Value::Null);

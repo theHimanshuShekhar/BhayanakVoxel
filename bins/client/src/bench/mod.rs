@@ -207,6 +207,9 @@ fn run(args: &Args) -> Result<u8, Box<dyn Error>> {
         output: (plan.width * 2, plan.height * 2),
     };
     let mut gpu = Offscreen::with_resolution(resolution, &flight.scene)?;
+    // The flight times what the player's frame costs, and the player's Primary has the radiance
+    // cache's GI (#54): an `Offscreen` starts with the flat ambient of before it.
+    gpu.set_flat_ambient(false);
     if !plan.patch {
         // The atmosphere measures the camera's height from the Planet's sea level.
         gpu.set_ground_level(f64::from(planet_gen::world_map::WORLD_RADIUS));
@@ -318,6 +321,7 @@ fn run(args: &Args) -> Result<u8, Box<dyn Error>> {
             !plan.patch,
             args.runs,
             resolution,
+            args.flat_ambient,
             &budgets,
             stream_slice,
         )),
@@ -413,7 +417,20 @@ fn run(args: &Args) -> Result<u8, Box<dyn Error>> {
             r.gates.over.join(", ")
         );
     }
-    let code = code.max(streaming_code).max(real_time_code);
+    // A gate of the GI (#54) is a failure whatever `--diag` said: it holds Primary to the Reference.
+    let gi_code = report
+        .convergence
+        .as_ref()
+        .map_or(0, |c| convergence::gi_exit_code(c, args.no_fail));
+    if gi_code != 0
+        && let Some(c) = &report.convergence
+    {
+        eprintln!(
+            "convergence: over its gates: {}",
+            c.gi.gates.over.join(", ")
+        );
+    }
+    let code = code.max(streaming_code).max(real_time_code).max(gi_code);
     // An error of the real-time mode is exit status 1, not 2 (a gate that is over): nothing says
     // whether its gates would have held.
     let code = match &report.streaming_real_time {
@@ -441,6 +458,7 @@ fn run_streaming(
     eprintln!("streaming: making the test Planet's world (this takes a while)...");
     let streamer = stream::Streamer::new();
     let mut gpu = Offscreen::with_resolution(resolution, streamer.scene())?;
+    gpu.set_flat_ambient(false);
     gpu.set_ground_level(f64::from(planet_gen::world_map::TEST_RADIUS));
     streamer.set_buffer_limit(gpu.buffer_limit_words());
     // A frame is drawn every frame in a measurement, and every tenth in a smoke test, where a
@@ -851,7 +869,7 @@ fn print_real_time(r: &realtime::RealTimeReport) {
             c.guard_complete_s,
             c.fill_s
         );
-        for p in &run.paths {
+        for p in run.paths.iter().chain([&run.unpaced_control]) {
             eprintln!(
                 "    {:<20} {:>5} frames: frame p99 {:>6.2} worst {:>7.2} ms, cpu p99 {:>6.2} worst {:>7.2} ms, soft misses {:.2} a frame, holes {} in {} looks ({:.0} ms, {:.0}% of the scene thread's busy time; the end look {:.0} ms), {} frames over the limit{}",
                 p.name,
@@ -877,6 +895,27 @@ fn print_real_time(r: &realtime::RealTimeReport) {
                     }
                 ))
             );
+            // What the mean frame is made of, and the GPU's own time of each pass (means).
+            let m = &p.frame_parts;
+            eprintln!(
+                "        mean frame {:.2} ms = recentre {:.2} + update {:.2} + encode {:.2} + submit {:.2} + wait {:.2} (GPU passes {:.2}, the rest of the wait {:.2})",
+                p.frame_time.mean_ms,
+                m.recentre.mean_ms,
+                m.update.mean_ms,
+                m.encode.mean_ms,
+                m.submit.mean_ms,
+                m.wait.mean_ms,
+                m.gpu_total.mean_ms,
+                m.wait_not_passes.mean_ms,
+            );
+            if !p.gpu_passes.is_empty() {
+                let passes: Vec<String> = p
+                    .gpu_passes
+                    .iter()
+                    .map(|(name, s)| format!("{name} {:.3}", s.mean_ms))
+                    .collect();
+                eprintln!("        GPU passes, mean ms: {}", passes.join(", "));
+            }
             eprintln!(
                 "        loader: {} bricks generated, {} arrived, queue max {} mean {:.0}; scene thread reband {:.0} ms{}",
                 p.generated_bricks,
@@ -970,6 +1009,8 @@ fn print_real_time(r: &realtime::RealTimeReport) {
         ("spawn ring (s)", g.spawn_ring_s),
         ("time to control (s)", g.time_to_control_s),
         ("settle (s)", g.settle_s),
+        ("gi pass mean (ms)", g.gi_mean_ms),
+        ("gi pass p99 (ms)", g.gi_p99_ms),
     ] {
         eprintln!(
             "  gate {name:<20} worst {:>12.2} limit {:>12.2}{}",

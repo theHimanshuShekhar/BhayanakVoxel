@@ -242,6 +242,9 @@ impl StillCuts {
 /// time on it, whatever the Brush, while the cursor moves.
 const GHOST_BACKOFF: u32 = 8;
 
+/// The bricks that [`World::take_edited`] keeps, the newest.
+const EDITED_KEPT: usize = 1 << 16;
+
 /// How far the player aims an Edit, in Voxels: 7.5 m, which leaves half a metre of the server's
 /// reach ([`sim::EDIT_REACH`], measured from where the server has the character) for the character
 /// to have moved on from where the client saw it.
@@ -364,6 +367,10 @@ pub struct World {
     /// Edits made so far: those that the client did not know the server would turn down (see
     /// [`World::edits_made`]).
     edits_made: u64,
+    /// The bricks that Edits changed since [`World::take_edited`]: the Edit the player made (known
+    /// when it is made, a frame or more before the scene thread's patch of it arrives) and what
+    /// the server sent of Edits (others', and corrections).
+    edited: Vec<brick_store::BrickCoord>,
     /// The longest a result that the scene thread published waited, since it was last asked for,
     /// when the counts are exact (see [`World::take_outbox_wait`]).
     outbox_wait: std::time::Duration,
@@ -495,6 +502,7 @@ impl World {
             unshown_edit: None,
             edit_ticket: 0,
             edits_made: 0,
+            edited: Vec::new(),
             taken_done: 0,
             outbox_wait: std::time::Duration::ZERO,
             lengthened: std::time::Duration::ZERO,
@@ -579,6 +587,23 @@ impl World {
     #[cfg(test)]
     pub fn is_stepped(&self) -> bool {
         self.clock.is_stepped()
+    }
+
+    /// The bricks that Edits changed since the last call (this player's, when they were made, and
+    /// what the server sent), for the renderer's radiance cache to follow the light there faster.
+    pub fn take_edited(&mut self) -> Vec<brick_store::BrickCoord> {
+        std::mem::take(&mut self.edited)
+    }
+
+    /// Notes that `bricks` were changed by an Edit, for [`World::take_edited`]. The list is kept to
+    /// [`EDITED_KEPT`] bricks, the newest: a world that nothing takes it from (a bench's, with no
+    /// renderer) does not grow it without end.
+    fn note_edited(&mut self, bricks: &[brick_store::BrickCoord]) {
+        self.edited.extend_from_slice(bricks);
+        if self.edited.len() > EDITED_KEPT {
+            let drop = self.edited.len() - EDITED_KEPT;
+            self.edited.drain(..drop);
+        }
     }
 
     /// Edits made in this world so far. [`World::edit`] makes none when nothing is aimed at or when
@@ -1272,6 +1297,7 @@ impl World {
             return Ok(None);
         };
         self.edits_made += 1;
+        self.note_edited(&changed);
         self.link.send(request)?;
         let Some(worker) = &self.worker else {
             return Ok(self.refresh(&changed)?);
@@ -1320,6 +1346,7 @@ impl World {
         if changed.is_empty() {
             return Ok(None);
         }
+        self.note_edited(changed);
         // What the ghost would change has changed with them, if they are where it reads.
         if let Some(ghost) = &mut self.ghost {
             ghost.dirty |= ghost.touches(changed);
@@ -1366,6 +1393,34 @@ mod tests {
     /// Looking at the wall's middle from in front of it.
     fn camera() -> Camera {
         Camera::looking_at([4016.5, 16.5, 20.5], [4016.5, 16.5, 0.0])
+    }
+
+    #[test]
+    fn the_edited_list_keeps_the_newest_bricks_and_is_emptied_by_taking_it() {
+        let (mut world, _server) = world();
+        let brick = |n: i32| BrickCoord([n, 0, 0]);
+        let first: Vec<BrickCoord> = (0..EDITED_KEPT as i32).map(brick).collect();
+        world.note_edited(&first);
+        assert_eq!(
+            world.edited.len(),
+            EDITED_KEPT,
+            "up to the limit: all of them"
+        );
+        // Ten more: the ten oldest are dropped.
+        let more: Vec<BrickCoord> = (EDITED_KEPT as i32..EDITED_KEPT as i32 + 10)
+            .map(brick)
+            .collect();
+        world.note_edited(&more);
+        assert_eq!(world.edited.len(), EDITED_KEPT);
+        assert_eq!(
+            world.edited[0],
+            brick(10),
+            "the oldest are the ones dropped"
+        );
+        assert_eq!(world.edited[EDITED_KEPT - 1], brick(EDITED_KEPT as i32 + 9));
+        // Taking them (what the client does with no renderer too) empties the list.
+        assert_eq!(world.take_edited().len(), EDITED_KEPT);
+        assert!(world.take_edited().is_empty());
     }
 
     fn world() -> (World, ServerEnd) {

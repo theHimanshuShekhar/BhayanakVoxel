@@ -436,7 +436,10 @@ fn a_frame_runs_the_primary_pass_then_the_upscale_pass_and_times_both() {
     let names: Vec<_> = gpu.timings().passes().iter().map(|p| &*p.name).collect();
     // The light is drawn from the G-buffer by its own pass and the display transform makes the
     // image (#202); with its stages off (this test's light) only the tone pass's copy is left.
-    assert_eq!(names, ["primary", "shadows", "shade", "tone", "upscale"]);
+    assert_eq!(
+        names,
+        ["primary", "shadows", "gi", "shade", "tone", "upscale"]
+    );
     if gpu.timers_supported() {
         for pass in gpu.timings().passes() {
             assert!(

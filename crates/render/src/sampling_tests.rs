@@ -187,6 +187,93 @@ fn a_zero_radius_cone_is_exactly_the_axis() {
     );
 }
 
+/// The solid angle of the rectangle `[x0, x1] x [y0, y1]` on the plane at z = `z`, seen from the
+/// origin, by midpoint integration of `z / r^3` over it (the CPU's second writing of what
+/// `sph_quad` computes with spherical trigonometry).
+fn rectangle_solid_angle(x0: f64, x1: f64, y0: f64, y1: f64, z: f64) -> f64 {
+    let n = 400;
+    let (dx, dy) = ((x1 - x0) / n as f64, (y1 - y0) / n as f64);
+    let mut sum = 0.0;
+    for i in 0..n {
+        for j in 0..n {
+            let (x, y) = (x0 + (i as f64 + 0.5) * dx, y0 + (j as f64 + 0.5) * dy);
+            sum += z.abs() / (x * x + y * y + z * z).powf(1.5) * dx * dy;
+        }
+    }
+    sum
+}
+
+#[test]
+fn rectangle_samples_stay_on_the_rectangle_and_are_uniform_over_its_solid_angle() {
+    // (`z0` is negative, the rectangle behind the origin's z, as the shader's callers give it.)
+    // A rectangle at z = -2 that the origin is not over the middle of, and one it is just under a
+    // corner of: both are what an emitter's face looks like from a shaded voxel.
+    let cases = [
+        (-1.0f32, 2.0f32, -0.5f32, 1.5f32, -2.0f32),
+        (0.0, 3.0, 0.0, 0.5, -0.75),
+    ];
+    for (x0, x1, y0, y1, z0) in cases {
+        let body = r#"
+@compute @workgroup_size(64)
+fn probe(@builtin(global_invocation_id) id: vec3<u32>) {
+    THREAD
+    if t >= 16384u {
+        return;
+    }
+    let q = sph_quad(X0, Y0, Z0, X1, Y1);
+    let pixel_seed = pixel_hash(vec2<u32>(t, 3u), 5u);
+    let u = vec2<f32>(hashed_f32(pixel_seed, t, 0u), hashed_f32(pixel_seed, t, 1u));
+    let p = sph_quad_sample(q, u);
+    out[t * 4u] = bitcast<u32>(p.x);
+    out[t * 4u + 1u] = bitcast<u32>(p.y);
+    out[t * 4u + 2u] = bitcast<u32>(q.solid_angle);
+}
+"#
+        .replace("THREAD", THREAD)
+        .replace("X0", &format!("{x0:?}"))
+        .replace("X1", &format!("{x1:?}"))
+        .replace("Y0", &format!("{y0:?}"))
+        .replace("Y1", &format!("{y1:?}"))
+        .replace("Z0", &format!("{z0:?}"));
+        let out = floats(&run(&body, 16384, 16384 * 4));
+        let expected = rectangle_solid_angle(
+            f64::from(x0),
+            f64::from(x1),
+            f64::from(y0),
+            f64::from(y1),
+            f64::from(z0),
+        );
+        let solid_angle = f64::from(out[2]);
+        assert!(
+            (solid_angle - expected).abs() < 2e-3 * expected,
+            "solid angle {solid_angle}, integrated {expected}"
+        );
+        // Uniform over the solid angle: the share of samples left of a line is that part's share.
+        let split = x0 + (x1 - x0) * 0.3;
+        let share = rectangle_solid_angle(
+            f64::from(x0),
+            f64::from(split),
+            f64::from(y0),
+            f64::from(y1),
+            f64::from(z0),
+        ) / expected;
+        let mut left = 0usize;
+        for t in 0..16384 {
+            let (x, y) = (out[t * 4], out[t * 4 + 1]);
+            assert!(
+                x >= x0 - 1e-3 && x <= x1 + 1e-3 && y >= y0 - 1e-3 && y <= y1 + 1e-3,
+                "({x}, {y}) is off the rectangle"
+            );
+            left += usize::from(x < split);
+        }
+        let measured = left as f64 / 16384.0;
+        assert!(
+            (measured - share).abs() < 0.02,
+            "{measured} of the samples are left of the line; the solid angle says {share}"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------------------------
 // The sample sequence.
 //

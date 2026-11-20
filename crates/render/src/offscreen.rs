@@ -184,6 +184,7 @@ pub struct Offscreen {
     flush_scene_updates: bool,
     last_update: UpdateTimes,
     last_draw: DrawTimes,
+    last_passes: Vec<(String, f64)>,
     presenter: Option<Presenter>,
 }
 
@@ -242,10 +243,15 @@ impl Offscreen {
             driver_info: info.driver_info,
             backend: format!("{:?}", info.backend),
         };
-        let tracer = match table {
+        let mut tracer = match table {
             Some(table) => Tracer::with_materials(&device, scene, table)?,
             None => Tracer::new(&device, scene)?,
         };
+        // The flat ambient, not Primary's GI (#54), until a caller asks for GI: most of what
+        // renders here is a test of geometry, colours or the sun, whose frames must be a function of
+        // the scene alone (GI is a noisy sample that depends on the cache's history), and goldens
+        // of them stay as they were. The bench and the look-dev sheet turn GI on.
+        tracer.set_flat_ambient(true);
         let profiler = Profiler::new(&device, &queue);
         let target = if full_reference {
             Target::with_full_reference(&device, resolution)
@@ -264,6 +270,7 @@ impl Offscreen {
             flush_scene_updates: true,
             last_update: UpdateTimes::default(),
             last_draw: DrawTimes::default(),
+            last_passes: Vec::new(),
             presenter: None,
         })
     }
@@ -288,6 +295,12 @@ impl Offscreen {
         Ok(())
     }
 
+    /// Says that an Edit changed `bricks`, so that the radiance cache follows the light round them
+    /// faster (see [`Tracer::edit_made`]).
+    pub fn edit_made(&mut self, bricks: &[brick_store::BrickCoord]) {
+        self.tracer.edit_made(bricks);
+    }
+
     /// The parts of the CPU's time in the last [`Offscreen::update_scene`].
     pub fn last_update_times(&self) -> UpdateTimes {
         self.last_update
@@ -296,6 +309,13 @@ impl Offscreen {
     /// The parts of the last [`Offscreen::draw_upscaled_timed`].
     pub fn last_draw_times(&self) -> DrawTimes {
         self.last_draw
+    }
+
+    /// The GPU's time of each pass of the last [`Offscreen::draw_upscaled_timed`], by the pass's
+    /// name (`primary`, `normals`, `shadows`, `gi`, `shade`, `upscale`, ...), in milliseconds:
+    /// empty where the device has no timers or this frame's own times did not come in.
+    pub fn last_draw_pass_times(&self) -> &[(String, f64)] {
+        &self.last_passes
     }
 
     /// Whether [`Offscreen::update_scene`] sends the writes to the GPU at once (the default), or
@@ -365,6 +385,14 @@ impl Offscreen {
     /// shadows view uses it (#52).
     pub fn set_sun_and_sky_only(&mut self, only: bool) {
         self.tracer.set_sun_and_sky_only(only);
+    }
+
+    /// Puts the flat ambient of before #54 in place of Primary's GI, or takes it out (see
+    /// [`Tracer::set_flat_ambient`]). **An `Offscreen` starts with it in**: a caller that looks at
+    /// GI (the bench, the look-dev sheet, the tests of the cache) calls `set_flat_ambient(false)`.
+    /// The window's tracer has GI from the start.
+    pub fn set_flat_ambient(&mut self, flat: bool) {
+        self.tracer.set_flat_ambient(flat);
     }
 
     /// Sets how many shadow rays a pixel of Primary casts towards the sun's disc (see
@@ -534,6 +562,23 @@ impl Offscreen {
             .collect()
     }
 
+    /// The radiance cache's table as it stands, `GI_SLOT_WORDS` (12) words a slot, for tests of
+    /// how the table is kept (`cache.wgsl` has the layout).
+    pub fn read_radiance_cache(&mut self) -> Vec<u32> {
+        let buffer = crate::tracer::radiance_cache_buffer(&self.tracer).clone();
+        let encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        let size = crate::tracer::GI_CACHE_SLOTS * 12 * 4;
+        let bytes = crate::read_buffer(&self.device, &self.queue, encoder, &buffer, size);
+        bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|w| u32::from_le_bytes(*w))
+            .collect()
+    }
+
     /// Keeps every pass time from now on, for a report over many frames.
     pub fn set_keep_history(&mut self, keep: bool) {
         self.profiler.set_keep_history(keep);
@@ -623,6 +668,18 @@ impl Offscreen {
             .poll(wgpu::PollType::wait_indefinitely())
             .expect("device poll failed");
         let waited = began.elapsed() - submitted;
+        self.last_passes = self
+            .profiler
+            .times_of_this_frame()
+            .map(|frame| {
+                let timings = self.profiler.timings();
+                frame
+                    .passes
+                    .iter()
+                    .map(|&(pass, ms)| (timings.passes()[pass].name.to_string(), ms))
+                    .collect()
+            })
+            .unwrap_or_default();
         let gpu = self.profiler.times_of_this_frame().map(|frame| {
             let timings = self.profiler.timings();
             let named = |name: &str| {

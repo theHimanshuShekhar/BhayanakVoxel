@@ -24,6 +24,7 @@ pub mod camera;
 mod composite;
 pub mod cpu;
 mod debug_view;
+pub mod emitters;
 mod gpu_materials;
 pub mod lod;
 pub mod look;
@@ -56,7 +57,9 @@ pub use scene::{
 };
 pub use sun::Sun;
 pub use timing::Timings;
-pub use tracer::{DEFAULT_SHADOW_RAYS, Fault, MAX_SHADOW_RAYS, ReferenceOptions, SkyEstimator};
+pub use tracer::{
+    DEFAULT_SHADOW_RAYS, EmitterEstimator, Fault, MAX_SHADOW_RAYS, ReferenceOptions, SkyEstimator,
+};
 pub use upscale::Resolution;
 pub use window::{Mode, Renderer};
 

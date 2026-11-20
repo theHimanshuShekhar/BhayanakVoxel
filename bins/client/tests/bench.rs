@@ -90,7 +90,7 @@ fn check_convergence(convergence: &Value, out: &Path) {
         convergence["height"].as_u64().unwrap(),
     );
     let views = convergence["views"].as_array().expect("views");
-    // The golden and pit views are drawn under the legacy sun (about 54 degrees up, 0.04 wide),
+    // The views are drawn under the legacy sun (about 54 degrees up, 0.04 wide),
     // and the report names that one.
     for view in views {
         assert!(number(&view["sun_elevation"]) > 0.9, "{view}");
@@ -100,7 +100,7 @@ fn check_convergence(convergence: &Value, out: &Path) {
         );
     }
     let names: Vec<&str> = views.iter().map(|v| string(&v["name"])).collect();
-    assert_eq!(names, ["golden", "pit"]);
+    assert_eq!(names, ["golden", "pit", "room"]);
     for view in views {
         let name = string(&view["name"]);
         check_stats(&view["reference"]);
@@ -156,6 +156,34 @@ fn check_convergence(convergence: &Value, out: &Path) {
             assert!(mark["samples"].as_u64().unwrap() >= 1);
             assert!(number(&mark["mse_linear"]) >= 0.0);
         }
+        // Primary against truth (#54): the flat ambient and the cache's GI, each in its first frame
+        // and its settled one, with no FLIP in a short run but the images' brightness.
+        let gi = &view["gi"];
+        for variant in ["flat", "gi"] {
+            for when in ["first_frame", "settled"] {
+                let score = &gi[variant][when];
+                assert!(score["flip"].is_null(), "no FLIP: {name} {variant} {when}");
+                assert!(
+                    number(&score["luminance_ratio"]) > 0.0,
+                    "{name} {variant} {when}"
+                );
+            }
+        }
+        assert!(gi["gi_not_further"].is_null(), "no FLIP: {name}");
+        for file in [
+            "primary-flat-first-frame.png",
+            "primary-flat-settled.png",
+            "primary-gi-first-frame.png",
+            "primary-gi-settled.png",
+        ] {
+            assert!(
+                out.join(string(&convergence["folder"]))
+                    .join(name)
+                    .join(file)
+                    .is_file(),
+                "{name}/{file}"
+            );
+        }
         // The truths with their inputs, and a picture of every checkpoint, are in the folder.
         let folder = out.join(string(&convergence["folder"])).join(name);
         for file in [
@@ -186,8 +214,26 @@ fn check_convergence(convergence: &Value, out: &Path) {
     }
     // The curve as CSV, one row for each checkpoint of each view.
     let csv = std::fs::read_to_string(out.join(string(&convergence["csv"]))).unwrap();
-    assert_eq!(csv.lines().count(), 1 + 2 * 3, "{csv}");
+    assert_eq!(csv.lines().count(), 1 + 3 * 3, "{csv}");
     assert!(csv.starts_with("view,samples,gpu_s,flip_mean,"), "{csv}");
+
+    // The dig and the gates (#54): in a short run the dig is drawn and its frames are there, and no
+    // gate is held (no FLIP says nothing of the images).
+    let dig = &convergence["gi"]["edit"];
+    assert!(number(&dig["voxels_dug"]) > 0.0);
+    assert!(number(&dig["update_ms"]) >= 0.0);
+    assert_eq!(dig["frame_ms"].as_array().unwrap().len(), 12);
+    assert_eq!(dig["luminance"].as_array().unwrap().len(), 12);
+    let gates = &convergence["gi"]["gates"];
+    assert_eq!(gates["held"], false);
+    assert_eq!(gates["over"], serde_json::json!([]));
+    assert_eq!(number(&gates["room_target_flip"]), 0.10);
+    assert_eq!(number(&gates["settle_within_ms"]), 500.0);
+    assert!(
+        out.join(string(&convergence["folder"]))
+            .join("dig/after.png")
+            .is_file()
+    );
 
     // The sun-and-sky view (#52): Primary's shadows against the Reference's direct-sun image.
     let sun = &convergence["shadows"];
@@ -235,7 +281,7 @@ fn check_convergence(convergence: &Value, out: &Path) {
 }
 
 fn check_schema(report: &Value, out: &Path) {
-    assert_eq!(report["schema_version"], 28);
+    assert_eq!(report["schema_version"], 29);
     // The Edit stress is of the whole Planet, which the patch is not.
     assert!(report["edits"].is_null());
     // The streaming mode is asked for (see its own test); the other tests do not. The real-time

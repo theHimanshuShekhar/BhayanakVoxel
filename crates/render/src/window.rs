@@ -146,6 +146,13 @@ impl Renderer {
             .update_scene(&self.device, &self.queue, scene, update)
     }
 
+    /// Says that the player's Edit changed `bricks` (when it was made, not when the scene thread's
+    /// patch of it arrives), so that the radiance cache follows the light round them faster (see
+    /// [`Tracer::edit_made`]); streaming loads and moves of the scene are not Edits.
+    pub fn edit_made(&mut self, bricks: &[brick_store::BrickCoord]) {
+        self.tracer.edit_made(bricks);
+    }
+
     /// Bytes of GPU memory that the Planet's bricks take.
     pub fn scene_bytes(&self) -> u64 {
         self.tracer.scene_bytes()

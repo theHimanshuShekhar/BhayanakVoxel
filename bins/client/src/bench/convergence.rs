@@ -31,12 +31,14 @@
 //! see that it runs and that the report has the right shape. FLIP is run by `client bench` on a
 //! real GPU only, and by one ignored test.
 
+mod gi;
 mod score;
 mod shadows;
 mod still;
 mod views;
 
 pub use views::patch_store;
+pub use views::room as emissive_room;
 
 use std::error::Error;
 use std::fs;
@@ -70,6 +72,12 @@ pub const CHECKPOINTS: [u32; 6] = [1, 4, 16, 64, 256, 1024];
 /// How many samples a truth has when `--truth-spp` does not say: the last checkpoint. ADR 0005's
 /// is 8192, which takes eight times as long.
 pub const DEFAULT_TRUTH_SPP: u32 = 1024;
+/// How many samples the room's truths have at least when FLIP is run (#54): a 0.05 line counts only
+/// where it is four times the floor (0.0125). The room's floor was 0.0211 at 1024 samples and
+/// 0.0137 at 4096 on the 4090: it falls slower than one over the square root of the samples (the
+/// two fit floor² = 1.0e-4 + 0.35 / samples, the first term being what more samples do not take
+/// away), which gives about 0.0120 at 8192.
+pub const ROOM_TRUTH_SPP: u32 = 8192;
 
 /// Where the pictures and truths go, in the output folder.
 const FOLDER: &str = "convergence";
@@ -93,6 +101,8 @@ pub struct Settings {
     pub still: still::Settings,
     /// The sun-and-sky view (#52): Primary's shadows against the Reference's.
     pub shadows: shadows::Settings,
+    /// Primary's GI against the Reference's truth in each view, and the dig (#54).
+    pub gi: gi::Settings,
 }
 
 impl Settings {
@@ -110,6 +120,7 @@ impl Settings {
                 (traced.0 * 2, traced.1 * 2),
                 truth_spp.unwrap_or(DEFAULT_TRUTH_SPP),
             ),
+            gi: gi::Settings::full((traced.0 * 2, traced.1 * 2)),
         }
     }
 
@@ -127,6 +138,17 @@ impl Settings {
                 ((traced.0 / 2).max(1), (traced.1 / 2).max(1)),
                 truth_spp.unwrap_or(16),
             ),
+            gi: gi::Settings::short(((traced.0 / 2).max(1), (traced.1 / 2).max(1))),
+        }
+    }
+
+    /// How many samples each of a view's truths has: the room's has more where FLIP is run, for
+    /// a floor that the 0.05 line is four times (the room is dim, so its truth is noisier).
+    pub fn truth_spp_for(&self, view: &str) -> u32 {
+        if self.flip && view == "room" {
+            self.truth_spp.max(ROOM_TRUTH_SPP)
+        } else {
+            self.truth_spp
         }
     }
 
@@ -142,9 +164,11 @@ pub struct ConvergenceReport {
     /// The Reference view's size, traced and presented.
     pub width: u32,
     pub height: u32,
-    /// The scene the views are on: the patch of the test Planet, not the 320 km Planet.
+    /// The scene the views are on: the patch of the test Planet, not the 320 km Planet (the `room`
+    /// view's own scene is a box of rock; see its `what`).
     pub scene: &'static str,
     pub checkpoints: Vec<u32>,
+    /// The samples of each truth by default; a view may have more (`views[].truth_spp`).
     pub truth_spp: u32,
     pub seeds: Seeds,
     /// How the images were scored; null where FLIP was not run (`--short`).
@@ -164,6 +188,8 @@ pub struct ConvergenceReport {
     pub views: Vec<ViewReport>,
     /// The sun-and-sky view (#52): Primary's shadows against the Reference's direct-sun image.
     pub shadows: shadows::ShadowsReport,
+    /// Primary's GI against truth in each of `views` (their `gi`), the dig, and the gates of #54.
+    pub gi: gi::GiReport,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -186,6 +212,10 @@ pub struct ViewReport {
     pub name: &'static str,
     #[serde(flatten)]
     pub description: Description,
+    /// The samples of each of this view's truths: the report's `truth_spp`, or more where the view
+    /// asks for it (the room's, [`ROOM_TRUTH_SPP`], so that its floor is low enough for the 0.05
+    /// line to count).
+    pub truth_spp: u32,
     /// The GPU time of one sample (the `reference` pass) and of the whole frame of it
     /// (`gpu_total`), in the run that is scored: as the flight's reference mode reports them.
     pub reference: Stats,
@@ -202,6 +232,9 @@ pub struct ViewReport {
     pub files: Vec<String>,
     /// The Reference view with the still-frame policy on, from the stop (#189).
     pub still: still::StillReport,
+    /// Primary against this view's truth A, with the flat ambient of before #54 and with the
+    /// radiance cache (#54).
+    pub gi: gi::ViewGi,
 }
 
 /// How bright a view's converged image is, in linear light before the display encoding, over all
@@ -314,10 +347,40 @@ pub fn run(settings: &Settings, out: &Path) -> Result<ConvergenceReport, Box<dyn
         if settings.flip { "on" } else { "off" }
     );
     let mut views = Vec::new();
-    for view in [views::golden(), views::pit()] {
+    for view in [views::golden(), views::pit(), views::room()] {
         views.push(run_view(view, settings, out)?);
     }
     let shadows = shadows::run(&settings.shadows, out)?;
+    eprintln!("convergence: the dig...");
+    let edit = gi::dig(&settings.gi, out)?;
+    let gi = {
+        let scored: Vec<_> = views
+            .iter()
+            .map(|v| {
+                // The 0.05 line counts in a view where it is four times the floor.
+                let counts = v
+                    .lines
+                    .iter()
+                    .find(|l| l.flip == still::FLIP_TARGET)
+                    .is_none_or(|l| l.counts);
+                let gpu_s = v
+                    .lines
+                    .iter()
+                    .find(|l| l.flip == still::FLIP_TARGET)
+                    .and_then(|l| l.gpu_s);
+                (
+                    v.name,
+                    &v.gi,
+                    reference_within(v.name, v.still.flip_within_target, gpu_s),
+                    counts,
+                )
+            })
+            .collect();
+        gi::GiReport {
+            gates: gi::gates(&settings.gi, &scored, &edit),
+            edit,
+        }
+    };
     let mut report = ConvergenceReport {
         width,
         height,
@@ -342,11 +405,17 @@ pub fn run(settings: &Settings, out: &Path) -> Result<ConvergenceReport, Box<dyn
         wall_s: 0.0,
         views,
         shadows,
+        gi,
     };
     let csv = out.join(CSV_FILE);
     fs::write(&csv, csv_of(&report)).map_err(|e| format!("cannot write {}: {e}", csv.display()))?;
     report.wall_s = started.elapsed().as_secs_f64();
     Ok(report)
+}
+
+/// The exit status of the phase's gates (#54): 2 if one is over, unless `no_fail`.
+pub fn gi_exit_code(report: &ConvergenceReport, no_fail: bool) -> u8 {
+    gi::exit_code(&report.gi, no_fail)
 }
 
 /// Draws `samples` more samples of the reference image, timing each as the flight's reference mode
@@ -387,18 +456,13 @@ fn run_view(view: View, settings: &Settings, out: &Path) -> Result<ViewReport, B
     let folder = out.join(FOLDER).join(name);
     fs::create_dir_all(&folder).map_err(|e| format!("cannot create {}: {e}", folder.display()))?;
     let last = settings.checkpoints.last().copied().unwrap_or(0);
+    let truth_spp = settings.truth_spp_for(name);
 
     // The truths first: they warm the GPU's clocks and caches, and they are not timed.
     let truth = |gpu: &mut Offscreen, seed| {
-        draw(
-            gpu,
-            &view.camera,
-            seed,
-            &[settings.truth_spp],
-            settings.truth_spp,
-        )
-        .pop()
-        .expect("a truth has samples")
+        draw(gpu, &view.camera, seed, &[truth_spp], truth_spp)
+            .pop()
+            .expect("a truth has samples")
     };
     let truth_a = truth(&mut gpu, TRUTH_SEEDS[0]);
     let truth_b = truth(&mut gpu, TRUTH_SEEDS[1]);
@@ -532,9 +596,11 @@ fn run_view(view: View, settings: &Settings, out: &Path) -> Result<ViewReport, B
         )?);
         still_mse.push(score::mse(&capture.linear, &truth_a.linear));
     }
+    let gi = gi::score_view(&view, &settings.gi, &truth_a.image, &truth_a_rgb, &folder)?;
     let still = still::report(
         batching_exact,
         max_batch_samples,
+        still::within_s_for(name),
         &settings.still,
         &still_run,
         &still_scores,
@@ -552,11 +618,13 @@ fn run_view(view: View, settings: &Settings, out: &Path) -> Result<ViewReport, B
         &checkpoints,
         &still_run,
     )?;
+    files.extend(gi.files.iter().cloned());
     files.sort();
     let megapixels = f64::from(settings.size.0) * f64::from(settings.size.1) / 1e6;
     Ok(ViewReport {
         name,
         description: view.description,
+        truth_spp,
         ms_per_mpix_per_sample: reference.mean_ms.map(|ms| ms / megapixels),
         converged: Converged::of(&truth_a.linear, &truth_b.linear),
         reference,
@@ -566,6 +634,7 @@ fn run_view(view: View, settings: &Settings, out: &Path) -> Result<ViewReport, B
         lines,
         files,
         still,
+        gi,
     })
 }
 
@@ -637,7 +706,7 @@ fn write_files(
                 height: settings.size.1,
                 f32_format: "f32 little-endian, interleaved RGB, rows from the top, linear \
                              radiance (the running mean, before the display encoding)",
-                scene: "patch of the test Planet",
+                scene: view.scene_name,
                 generator_version: planet_gen::GENERATOR_VERSION,
                 gpu: &info.name,
                 device_type: &info.device_type,
@@ -708,10 +777,11 @@ pub fn print_summary(report: &ConvergenceReport) {
         |v: Option<f64>, digits: usize| v.map_or("n/a".to_string(), |v| format!("{v:.digits$}"));
     for view in &report.views {
         eprintln!(
-            "convergence, {} ({}x{}): one sample {} ms (p95 {}), {} ms per megapixel; floor FLIP {} (mse {:.3e})",
+            "convergence, {} ({}x{}, truths of {} samples): one sample {} ms (p95 {}), {} ms per megapixel; floor FLIP {} (mse {:.3e})",
             view.name,
             report.width,
             report.height,
+            view.truth_spp,
             num(view.reference.mean_ms, 3),
             num(view.reference.p95_ms, 3),
             num(view.ms_per_mpix_per_sample, 3),
@@ -758,11 +828,97 @@ pub fn print_summary(report: &ConvergenceReport) {
         }
     }
     shadows::print_summary(&report.shadows);
+    let scored: Vec<_> = report.views.iter().map(|v| (v.name, &v.gi)).collect();
+    gi::print_summary(&scored, &report.gi);
+    // The room's Reference gate is on the line's GPU time; the wall-clock result is shown beside it.
+    for v in report.views.iter().filter(|v| v.name == "room") {
+        eprintln!("{}", room_clocks(v));
+    }
+}
+
+/// Whether a view's Reference was within its target, for the gate: the room's is **on GPU time**
+/// (the owner's decision of 2026-11-20: the line's `gpu_s`, samples times the Reference pass's mean
+/// GPU time, within [`still::ROOM_WITHIN_S`]; null where there are no timers or no line), and the
+/// other views' the still run's FLIP at their mark on the wall clock (`flip_within_target`). The
+/// room's wall-clock result stays in the report (`still.flip_within_target` and
+/// `still.to_line[].seconds`) and in the summary, and is not gated.
+fn reference_within(
+    name: &str,
+    flip_within_target: Option<bool>,
+    gpu_s: Option<f64>,
+) -> Option<bool> {
+    if name == "room" {
+        gpu_s.map(|s| s <= still::ROOM_WITHIN_S)
+    } else {
+        flip_within_target
+    }
+}
+
+/// The two clocks of the room's Reference gate, side by side. **The gate (`reference-room`) is the
+/// line's `gpu_s`**, its samples times the Reference pass's mean GPU time, within
+/// [`still::ROOM_WITHIN_S`] (the owner's decision of 2026-11-20). The wall clock of the 60 Hz still
+/// run (the FLIP at that mark after the stop, and the line's seconds from the stop, with the first
+/// still frames, the batch budget and the vsyncs in them) is reported beside it and is not gated.
+fn room_clocks(view: &ViewReport) -> String {
+    let num =
+        |v: Option<f64>, digits: usize| v.map_or("n/a".to_string(), |v| format!("{v:.digits$}"));
+    let at_mark = view
+        .still
+        .marks
+        .iter()
+        .find(|m| (m.seconds - still::ROOM_WITHIN_S).abs() < 1e-9);
+    let line = view
+        .lines
+        .iter()
+        .find(|l| l.flip == still::FLIP_TARGET)
+        .zip(
+            view.still
+                .to_line
+                .iter()
+                .find(|l| l.flip == still::FLIP_TARGET),
+        );
+    format!(
+        "  room Reference gate (FLIP <= {}, the line's GPU time within {} s): {} samples, {} s of GPU time (gated); not gated, on the 60 Hz wall clock: {} s from the stop, FLIP {} at the {} s mark ({} samples)",
+        still::FLIP_TARGET,
+        still::ROOM_WITHIN_S,
+        num(line.and_then(|(l, _)| l.samples), 1),
+        num(line.and_then(|(l, _)| l.gpu_s), 3),
+        num(line.and_then(|(_, s)| s.seconds), 3),
+        num(at_mark.and_then(|m| m.flip_mean), 4),
+        still::ROOM_WITHIN_S,
+        at_mark.map_or("n/a".to_string(), |m| m.samples.to_string()),
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_rooms_reference_gate_is_on_gpu_time_and_the_outdoor_views_on_their_wall_clock_mark() {
+        // The room: the line's GPU seconds, whatever the wall clock's FLIP at the mark said.
+        assert_eq!(
+            reference_within("room", Some(false), Some(0.292)),
+            Some(true)
+        );
+        assert_eq!(
+            reference_within("room", Some(true), Some(0.301)),
+            Some(false)
+        );
+        assert_eq!(reference_within("room", Some(false), Some(0.3)), Some(true));
+        // No timers or no line: nothing to say, which the gate counts as over.
+        assert_eq!(reference_within("room", Some(true), None), None);
+        // The outdoor views keep the still run's mark, and the GPU time does not enter.
+        assert_eq!(
+            reference_within("golden", Some(true), Some(9.0)),
+            Some(true)
+        );
+        assert_eq!(
+            reference_within("pit", Some(false), Some(0.01)),
+            Some(false)
+        );
+        assert_eq!(reference_within("pit", None, Some(0.01)), None);
+    }
 
     fn point(samples: u32, flip_mean: Option<f64>) -> Point {
         Point {
@@ -797,6 +953,7 @@ mod tests {
             samples_per_s: Some(100.0),
             marks: Vec::new(),
             flip_within_target: None,
+            flip_within_s: still::WITHIN_S,
             frame_p99_within_target: Some(true),
             to_line: Vec::new(),
             cuts: still::CutsReport::default(),
@@ -810,6 +967,7 @@ mod tests {
             ViewReport {
                 name,
                 description: view,
+                truth_spp: 16,
                 reference: Stats::of(&[2.0, 3.0]),
                 gpu_total: Stats::of(&[2.5, 3.5]),
                 ms_per_mpix_per_sample: Some(0.7),
@@ -830,6 +988,7 @@ mod tests {
                 lines: Vec::new(),
                 files: vec!["spp0001.png".into()],
                 still: still_report(),
+                gi: gi_view(flip),
             }
         };
         ConvergenceReport {
@@ -852,6 +1011,53 @@ mod tests {
             csv: CSV_FILE,
             views: vec![view("golden"), view("pit")],
             shadows: shadows_report(flip),
+            gi: gi::GiReport {
+                edit: gi::EditSettle {
+                    width: 64,
+                    height: 36,
+                    voxels_dug: 160,
+                    update_ms: 1.0,
+                    before: 0.1,
+                    after: 0.2,
+                    frame_ms: vec![16.7, 33.3],
+                    luminance: vec![0.15, 0.2],
+                    settle_ms: flip.then_some(33.3),
+                    slow_frames: 0,
+                    within_target: flip.then_some(true),
+                    game_path: flip,
+                },
+                gates: gi::Gates {
+                    room_target_flip: gi::ROOM_TARGET_FLIP,
+                    settle_within_ms: gi::SETTLE_WITHIN_MS,
+                    reference_flip: still::FLIP_TARGET,
+                    reference_within_s: still::WITHIN_S,
+                    reference_room_within_s: still::ROOM_WITHIN_S,
+                    held: flip,
+                    over: Vec::new(),
+                    not_counted: Vec::new(),
+                },
+            },
+        }
+    }
+
+    fn gi_view(flip: bool) -> gi::ViewGi {
+        let score = |mean: f64| gi::Score {
+            flip: flip.then_some(shadows::Scores {
+                flip_mean: mean,
+                flip_p99: mean * 4.0,
+            }),
+            luminance_ratio: 1.0,
+        };
+        let variant = |first: f64, settled: f64| gi::Variant {
+            first_frame: score(first),
+            settled: score(settled),
+        };
+        gi::ViewGi {
+            flat: variant(0.2, 0.2),
+            gi: variant(0.2, 0.1),
+            settle_frames: 4,
+            gi_not_further: flip.then_some(true),
+            files: vec!["primary-gi-settled.png".into()],
         }
     }
 
@@ -1009,6 +1215,7 @@ mod tests {
                 seconds: 0.3,
             },
             shadows: sun,
+            gi: gi::Settings::full(size),
         };
         let out = std::env::temp_dir().join(format!("bhayanak-convergence-{}", std::process::id()));
         let _ = fs::remove_dir_all(&out);
@@ -1018,7 +1225,7 @@ mod tests {
         eprintln!("the phase took {:.1?}", began.elapsed());
         print_summary(&report);
         assert_eq!(report.flip.as_ref().map(|f| f.ppd), Some(67.02));
-        assert_eq!(report.views.len(), 2);
+        assert_eq!(report.views.len(), 3);
         for view in &report.views {
             // The curve falls: more samples are closer to the truth, by every score.
             let flips: Vec<f64> = view.curve.iter().map(|p| p.flip_mean.unwrap()).collect();
