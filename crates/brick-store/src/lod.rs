@@ -48,6 +48,19 @@ pub trait BrickSource: Debug + Send + Sync {
     fn air_below(&self, _level: usize, _coord: BrickCoord) -> bool {
         false
     }
+
+    /// The part of the Guard that lies under `cell`, a brick of level `top`, for a source that
+    /// makes it a cell at a time (#220): `(level, coordinate, brick, solid_below)` of each brick
+    /// of the levels `first` to `top` under it that is held, as [`crate::BrickStore::hold`] takes
+    /// them. The default is none: a source that does not make a Guard has no cells.
+    fn guard_cell(
+        &self,
+        _first: usize,
+        _top: usize,
+        _cell: BrickCoord,
+    ) -> Vec<(usize, BrickCoord, Brick, bool)> {
+        Vec::new()
+    }
 }
 
 /// The children of the brick at `coord` of mip `level` (at least 1), in [`BrickCoord::children`]

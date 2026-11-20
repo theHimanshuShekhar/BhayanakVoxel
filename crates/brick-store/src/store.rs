@@ -48,6 +48,9 @@ pub struct BrickStore {
     /// The bricks of level 0 that an Edit changed after the store began to stream, which eviction
     /// keeps (see [`Self::evict_children`]).
     diverged: Diverged,
+    /// The cells of a Guard that is not held yet (see [`Self::defer_guard`]): bricks of the top
+    /// level of the pyramid, each the root of the bricks of the Guard's levels under it.
+    guard_pending: HashSet<BrickCoord>,
 }
 
 /// How much a store that streams may hold, counted as [`BrickStore::streamed_len`] does. Eviction
@@ -689,12 +692,67 @@ impl BrickStore {
         });
     }
 
+    /// The level the store streams from, the Guard's finest ([`Self::stream_from`]), if it streams.
+    pub fn stream_floor(&self) -> Option<usize> {
+        self.streaming.as_ref().map(|s| s.floor)
+    }
+
     /// Whether the eight bricks under the brick at `coord` of `level` are resident, so that they
-    /// can be read without generating anything. Always true unless the store streams.
+    /// can be read without generating anything. Always true unless the store streams. The Guard's
+    /// are, but not those of a brick in a cell of the Guard that is not held yet
+    /// ([`Self::defer_guard`]).
     pub fn children_resident(&self, level: usize, coord: BrickCoord) -> bool {
-        self.streaming
-            .as_ref()
-            .is_none_or(|s| level > s.floor || s.resident.contains(&(level, coord)))
+        self.streaming.as_ref().is_none_or(|s| {
+            if level > s.floor {
+                !self.guard_cell_pending(level, coord)
+            } else {
+                s.resident.contains(&(level, coord))
+            }
+        })
+    }
+
+    /// Says that the Guard's bricks under each of `cells` (bricks of the top level of the pyramid)
+    /// are not held yet and will be, a cell at a time ([`Self::hold_guard_cell`]), so that the
+    /// store is partly a Guard (#220). Until a cell is held it is not a brick of the tree that a
+    /// renderer walks ([`Self::guard_cell_pending`]), and a brick under it is not one whose
+    /// children are resident ([`Self::children_resident`]), so a hole check finds a brick that is
+    /// split over a cell that is not there. Bricks that are held already are not touched.
+    pub fn defer_guard(&mut self, cells: impl IntoIterator<Item = BrickCoord>) {
+        self.guard_pending.extend(cells);
+    }
+
+    /// Holds `bricks`, the Guard under `cell` as [`crate::BrickSource::guard_cell`] makes them, and
+    /// ends the cell's being pending, in one call: a reader never finds a cell that is half held.
+    pub fn hold_guard_cell(
+        &mut self,
+        cell: BrickCoord,
+        bricks: impl IntoIterator<Item = (usize, BrickCoord, Brick, bool)>,
+    ) {
+        for (level, coord, brick, solid) in bricks {
+            self.hold(level, coord, brick, solid);
+        }
+        self.guard_pending.remove(&cell);
+    }
+
+    /// How many cells of the Guard are not held yet (see [`Self::defer_guard`]); zero for a store
+    /// that holds its Guard whole.
+    pub fn guard_pending(&self) -> usize {
+        self.guard_pending.len()
+    }
+
+    /// Whether `cell`, a brick of the top level, is a cell of the Guard that is not held yet.
+    pub fn is_guard_cell_pending(&self, cell: BrickCoord) -> bool {
+        self.guard_pending.contains(&cell)
+    }
+
+    /// Whether the brick at `coord` of `level` is under a cell of the Guard that is not held yet.
+    pub fn guard_cell_pending(&self, level: usize, coord: BrickCoord) -> bool {
+        if self.guard_pending.is_empty() {
+            return false;
+        }
+        let up = self.level_count().saturating_sub(1).saturating_sub(level);
+        self.guard_pending
+            .contains(&BrickCoord(coord.0.map(|c| c >> up)))
     }
 
     /// Records that the eight bricks under the brick at `coord` of `level` are resident: the ones
@@ -2398,6 +2456,34 @@ mod tests {
         store.hold_children(first.0, first.1, kids);
         assert_eq!(store.evict_children(first.0, first.1, NEVER), Some(8));
         assert!(top.children().iter().all(|&c| store.holds(3, c)));
+    }
+
+    #[test]
+    fn a_cell_of_the_guard_that_is_not_held_yet_has_no_children_resident_under_it_and_is_held_in_one_call()
+     {
+        // Levels 2 to 4 are the Guard of a store of five levels that streams from 2, and the top
+        // level, 4, holds the cells.
+        let mut store = resident(5, 2, &[]);
+        let (here, there) = (BrickCoord([0, -1, 0]), BrickCoord([1, 0, 0]));
+        let under = |cell: BrickCoord| cell.children()[5];
+        assert!(store.children_resident(4, here) && store.children_resident(4, there));
+        assert_eq!(store.guard_pending(), 0);
+        store.defer_guard([there]);
+        assert_eq!(store.guard_pending(), 1);
+        assert!(store.is_guard_cell_pending(there) && !store.is_guard_cell_pending(here));
+        // The cell's top brick and the bricks of the level under it are not split-able: a hole
+        // check finds a node that is split over them.
+        assert!(!store.children_resident(4, there));
+        assert!(!store.children_resident(3, under(there)));
+        assert!(store.guard_cell_pending(3, under(there)));
+        // Other cells, and the levels that are streamed in, are as they were.
+        assert!(store.children_resident(4, here) && store.children_resident(3, under(here)));
+        // Held, it is no longer pending, with the bricks in the store.
+        store.hold_guard_cell(there, [(4, there, Brick::solid(ROCK), true)]);
+        assert_eq!(store.guard_pending(), 0);
+        assert!(store.holds(4, there));
+        assert!(store.children_resident(4, there) && store.children_resident(3, under(there)));
+        assert_eq!(store.stream_floor(), Some(2));
     }
 
     #[test]

@@ -84,11 +84,12 @@ scene_lag_d0_max = 8.0
 # The spawn ring (#168): seconds to make the 20 m of full detail round the Spawn, where the player
 # has control (ADR 0009).
 spawn_ring_s = 2.0
-# Time to control as the player sees it: seconds from the world map being ready to the window
-# opening, the ring and the Guard both (the window waits for the Guard so that nothing past the ring
-# is sky). "Control in 2 s with no sky" is NOT met: it is #220 (a background Guard). Held at what it
-# measures now (4.3 s on the 4090, 7 s on the loaded dev box) plus a margin.
-time_to_control_s = 10.0
+# Time to control as the player sees it (#220): seconds from the world map being ready to the window
+# opening: the ring, the part of the Guard that a camera within 2 km of the Spawn could see (so that
+# nothing visible past the ring is sky), and the first scene. The rest of the Guard is made after
+# the window is open. 2 s is the owner's number for the 4090 at full size (it was 4.3 s with the
+# whole Guard: #168).
+time_to_control_s = 2.0
 # Settle time (#168): seconds from the camera stopping after a flight at 50 m/s to a scene that is at
 # the camera, has no soft miss and has nothing left to look at again for the bands. Main's value on
 # the 4090 is 47.8 s; this is that plus 15%. A run that has not settled at the cap (120 s) is over

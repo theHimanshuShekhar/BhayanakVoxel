@@ -552,6 +552,28 @@ impl Horizon {
     pub fn tangent(&self, r: f64) -> f64 {
         (r * r - self.radius * self.radius).max(0.0).sqrt()
     }
+
+    /// Whether a camera anywhere within `reach` Voxels of `spawn` could see a part of the Planet
+    /// that lies in the box of the brick at `coord` of `level`, when nothing of the Planet is more
+    /// than `highest` from its centre (#220). This is the cap's test, made for the Guard's cells,
+    /// which are bigger than the Planet's relief: the farthest point of the box is clamped to
+    /// `highest`, since the Planet has no ground above it, and the camera is taken as far from the
+    /// centre as the ball allows (the horizon grows with height) and as near the box as it allows.
+    /// Not seeing is exact for a sphere: what this leaves out cannot be seen from any camera in the
+    /// ball, so it can be left out of what a scene is built from.
+    pub fn could_see(
+        &self,
+        spawn: [f64; 3],
+        reach: f64,
+        level: usize,
+        coord: BrickCoord,
+        highest: f64,
+    ) -> bool {
+        let from_centre = spawn.iter().map(|c| c * c).sum::<f64>().sqrt();
+        let top = brick_top(level, coord).min(highest);
+        brick_distance(spawn, level, coord) - reach
+            <= self.tangent(from_centre + reach) + self.tangent(top)
+    }
 }
 
 /// The horizon cap seen from one camera, for one of the two reaches that [`Placed`] gives it (what is
@@ -1216,6 +1238,36 @@ mod tests {
         assert!((metres(2.0) - 1131.4).abs() < 0.5, "{}", metres(2.0));
         assert!((metres(20.0) - 3577.7).abs() < 1.0, "{}", metres(20.0));
         assert_eq!(horizon.tangent(SEA - 10.0), 0.0);
+    }
+
+    #[test]
+    fn a_cell_can_be_seen_from_a_ball_by_the_horizon_of_its_highest_point_and_of_the_ball_raised() {
+        // Cells of level 17 (52 km across) on the +y axis over the pole, the Spawn 2 m up and the
+        // Planet's ground no higher than 8 km over the sea.
+        let horizon = Horizon::new(SEA);
+        let spawn = [0.0, SEA + 2.0 * VOXELS_PER_METRE, 0.0];
+        let highest = SEA + 8_000.0 * VOXELS_PER_METRE;
+        let cell = |x: i32| BrickCoord([x, 6, 0]);
+        let sees = |reach_m: f64, x: i32| {
+            horizon.could_see(spawn, reach_m * VOXELS_PER_METRE, 17, cell(x), highest)
+        };
+        // The cell the Spawn is over, and the next, are in whatever the reach is.
+        assert!(sees(0.0, 0) && sees(0.0, -1) && sees(0.0, 1));
+        // A cell far round the Planet is not: 2 km up sees 36 km, and
+        // a peak of 8 km another 71 km: 107 km at the most, two cells and a half.
+        assert!(!sees(2_000.0, 4) && !sees(2_000.0, -4));
+        // A ball that reaches higher sees further, and a cell is in a ball that it is not in at a
+        // point, as the camera can be nearer to it and higher.
+        let at_0 = (0..8).filter(|&x| sees(0.0, x)).count();
+        let at_2000 = (0..8).filter(|&x| sees(2_000.0, x)).count();
+        assert!(at_2000 > at_0, "{at_0} {at_2000}");
+        assert!(sees(200_000.0, 7));
+        // The cell's own height is clamped to the Planet's highest point: a cell whose far corner
+        // is a long way up sees no further than the Planet's peaks do.
+        let tall = |highest: f64| {
+            horizon.could_see(spawn, 0.0, 17, cell(1), SEA + highest * VOXELS_PER_METRE)
+        };
+        assert!(tall(8_000.0) && !tall(8.0));
     }
 
     #[test]

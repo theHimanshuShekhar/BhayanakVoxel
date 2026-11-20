@@ -358,15 +358,21 @@ camera, and `holes_after_catch_up` the holes the look after it found, which must
   ground at level 0) and `fill_s` (from the start of the load to the resident set being complete).
   `time_to_level_0_under_camera_s` is not gated, and **is not the spec's "time to control"**: the
   field is named for the ray that it uses, and the window waits for the Guard too, so it reads the
-  load time. **`spawn_ring_s`, `guard_s` and `time_to_control_s`** (#168) are the parts of the load,
-  from `crate::load`: the 20 m spawn ring (`SPAWN_REACH`), which is the player's control (ADR
-  0009: the character stands in it, and the bench has no server), the Guard after it, and the real
-  time from the world map being ready to the window opening (the ring, the Guard and the first
-  scene: the window waits for the Guard so that nothing past the ring is sky). **Two gates**, each
-  the worst over the runs: `spawn_ring_s` (2 s) on the ring, and `time_to_control_s` on the real
-  time, held at what it measures now plus a margin (10 s; 4.3 s on the 4090, 7 s on the loaded dev
-  box). **"Control in 2 s with nothing beyond the ring sky" is not met**: it is #220, a
-  background Guard.
+  load time. **`spawn_ring_s`, `guard_s` and `time_to_control_s`** (#168, #220) are the parts of the
+  load, from `crate::load`: the 20 m spawn ring (`SPAWN_REACH`), which is the player's control (ADR
+  0009: the character stands in it, and the bench has no server), the part of the Guard after it that
+  a camera within 2 km of the Spawn could see (`guard_s`: the cells that `plan_guard` says are
+  visible, judged at the Planet's highest radius), and the real time from the world map being ready
+  to the window opening (the ring, that part of the Guard and the first scene). The rest of the Guard
+  is made by the loader's workers in the background (#220, schema 28): **`guard_cells`** is how many
+  cells it has (bricks of the pyramid's top level; 0 on the test Planet, whose Guard is whole),
+  **`guard_cells_at_control`** how many of them were made before the window opened, and
+  **`guard_complete_s`** the time from the start of the load to the last of them being taken in
+  (reported, not gated). Until then a flying camera is held to a ball of 2 km round the Spawn
+  (`World::hold_to_guard`; the character is not held). **Two gates**, each the worst over the runs:
+  `spawn_ring_s` (2 s) on the ring, and **`time_to_control_s` (2 s since #220)**, which is the
+  acceptance of "control in 2 s with nothing visible from the Spawn sky". It was 10 s while the
+  window waited for the whole Guard (4.3 s on the 4090, 7 s on the loaded dev box).
 - `still_after_flight` (#217, schema 22; a run's, not a path's): the view held Still after a flight, with
   the game's policy ("The still hold", above):
   - `before_hold`: the catch-up before the hold. `lag_when_still_voxels` is how far the scene was behind
@@ -1339,7 +1345,7 @@ run without it (0.178 ms at 1 ray on the 4090, 1440p) or from `--diag` runs of a
 
 ```
 {
-  "schema_version": 27,
+  "schema_version": 28,
   "build":   { "version", "commit" },          // commit: CI builds only, else null; on a PR
                                                // build it is GitHub's merge commit, not the head
   "machine": { "gpu", "device_type", "driver", "driver_info", "backend", "os", "arch",

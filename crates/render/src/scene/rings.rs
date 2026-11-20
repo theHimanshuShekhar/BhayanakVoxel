@@ -1463,6 +1463,21 @@ impl Scene {
         self.show_diff(store, &diff)
     }
 
+    /// Takes in the cells of the Guard that were held after the scene was made, bricks of the
+    /// coarsest level (see [`Selection::add_roots`]): the bricks under them are listed as the
+    /// bands say, without making the scene again. Returns what changed, or `None` if nothing did.
+    pub fn add_roots(
+        &mut self,
+        store: &BrickStore,
+        cells: &[BrickCoord],
+    ) -> Result<Option<SceneUpdate>, RingsFull> {
+        let Some(rings) = &mut self.rings else {
+            return Ok(None);
+        };
+        let diff = rings.selection.add_roots(store, cells.iter().copied());
+        self.show_diff(store, &diff)
+    }
+
     /// Packs again the regions of `by_region`, in the bricks it lists, and brings the header up
     /// to date, and hands out the patch.
     fn apply(&mut self, store: &BrickStore, by_region: ByRegion) -> Result<RingPatch, RingsFull> {
