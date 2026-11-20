@@ -65,8 +65,9 @@ const GI_BOOST_FRAMES: u32 = 30;
 /// in or shuts out changes the cells about it most (two regions, 6.4 m).
 const GI_BOOST_MARGIN: i32 = 128;
 /// The most that the box of cells which forget fast may grow to along an axis, in Voxels (100 m),
-/// by Edits that come while another is settling: past it the newest Edit's box replaces it, so
-/// that a stream of Edits (a server's, round the world) does not make the whole world forget fast.
+/// by Edits that come while another is settling: past it one of the two boxes is kept, the one near
+/// the camera (the newest if both or neither are), so that a stream of Edits (a server's, round the
+/// world) does not make the whole world forget fast ([`merged_boost_box`]).
 const GI_BOOST_MAX_EXTENT: i32 = 2048;
 /// How near an Edit's box must be to the camera, in Voxels (200 m), for the upscaler to keep a short
 /// history for it (`edit_settling`): the history cap is for the whole image, so an Edit that is
@@ -1913,12 +1914,12 @@ impl Tracer {
             lo.map(|k| k * 8 - GI_BOOST_MARGIN),
             hi.map(|k| (k + 1) * 8 + GI_BOOST_MARGIN),
         );
-        self.gi_boost_box = if self.gi_boost > 0 {
-            merged_boost_box(self.gi_boost_box, reach, self.camera_position)
-        } else {
-            reach
-        };
-        self.gi_boost = GI_BOOST_FRAMES;
+        (self.gi_boost, self.gi_boost_box) = boost_after_edit(
+            self.gi_boost,
+            self.gi_boost_box,
+            reach,
+            self.camera_position,
+        );
         // The upscaler's short history is for the whole image: only for an Edit near the camera.
         if box_near(reach, self.camera_position) {
             self.edit_settling = GI_BOOST_FRAMES;
@@ -2513,6 +2514,34 @@ fn box_near(bx: ([i32; 3], [i32; 3]), camera: [f64; 3]) -> bool {
     })
 }
 
+/// Whether `outer` holds all of `inner`.
+fn box_holds(outer: ([i32; 3], [i32; 3]), inner: ([i32; 3], [i32; 3])) -> bool {
+    (0..3).all(|a| outer.0[a] <= inner.0[a] && outer.1[a] >= inner.1[a])
+}
+
+/// The frames left of the boost and its box after an Edit with box `reach`, when `frames` were left
+/// with the box `current` (`frames` is 0 when none is settling):
+/// - no boost is settling: the Edit's box for [`GI_BOOST_FRAMES`];
+/// - otherwise the boxes merge ([`merged_boost_box`]) and the frames start over, **except** that
+///   a box that the Edit did not change keeps the frames it had: the whole world's after a sun
+///   change (an Edit, a server's from anywhere, does not make it forget fast for longer than the
+///   sun's change did), and a dig's, kept against Edits far off that it does not hold.
+fn boost_after_edit(
+    frames: u32,
+    current: ([i32; 3], [i32; 3]),
+    reach: ([i32; 3], [i32; 3]),
+    camera: [f64; 3],
+) -> (u32, ([i32; 3], [i32; 3])) {
+    if frames == 0 {
+        return (GI_BOOST_FRAMES, reach);
+    }
+    let merged = merged_boost_box(current, reach, camera);
+    if merged == EVERYWHERE || (merged == current && !box_holds(current, reach)) {
+        return (frames, merged);
+    }
+    (GI_BOOST_FRAMES, merged)
+}
+
 /// The box of cells that forget fast after an Edit whose box is `reach`, while the box `current`
 /// (of a sun change, [`EVERYWHERE`], or of an Edit) is still settling:
 /// - a sun change's whole-world box stays the whole world (every cell's light is the old sun's);
@@ -2608,6 +2637,71 @@ mod tests {
             "past it"
         );
         assert!(!box_near(bx, [0.0, -EDIT_SETTLING_REACH - 1.0, 0.0]));
+    }
+
+    /// A tracer of an empty scene, with the camera at `camera` as of its last frame (Needs a Vulkan
+    /// device).
+    fn tracer_at(camera: [f64; 3]) -> Tracer {
+        let (_, device, _) = request_gpu(shared_instance(), None, false).unwrap();
+        let scene = Scene::new(&brick_store::BrickStore::new(), None);
+        let mut tracer = Tracer::new(&device, &scene).unwrap();
+        tracer.camera_position = camera;
+        tracer
+    }
+
+    fn brick_at(x: i32) -> BrickCoord {
+        BrickCoord([x, 0, 0])
+    }
+
+    /// The box that an Edit of `brick` alone boosts.
+    fn reach_of(brick: BrickCoord) -> ([i32; 3], [i32; 3]) {
+        (
+            brick.0.map(|k| k * 8 - GI_BOOST_MARGIN),
+            brick.0.map(|k| (k + 1) * 8 + GI_BOOST_MARGIN),
+        )
+    }
+
+    #[test]
+    fn edits_through_the_tracer_boost_their_box_and_leave_a_sun_changes_box_and_frames_alone() {
+        // Needs a Vulkan device.
+        let mut tracer = tracer_at([0.0; 3]);
+        // No boost settling: the Edit's box alone, for the frames (and not the initial EVERYWHERE
+        // merged with it).
+        tracer.edit_made(&[brick_at(3)]);
+        assert_eq!(tracer.gi_boost_box, reach_of(brick_at(3)));
+        assert_eq!(tracer.gi_boost, GI_BOOST_FRAMES);
+        // A sun change: the whole world, and an Edit that comes 10 frames later (a server's, from
+        // anywhere) leaves both the box and the 20 frames that were left.
+        tracer.sun_changed();
+        assert_eq!(tracer.gi_boost_box, EVERYWHERE);
+        tracer.gi_boost = 20;
+        tracer.edit_made(&[brick_at(900_000)]);
+        assert_eq!(tracer.gi_boost_box, EVERYWHERE, "still the whole world");
+        assert_eq!(
+            tracer.gi_boost, 20,
+            "and its frames are the sun's, not the Edit's"
+        );
+    }
+
+    #[test]
+    fn a_dig_kept_against_far_edits_does_not_have_its_frames_extended_by_them() {
+        // Needs a Vulkan device.
+        let mut tracer = tracer_at([0.0; 3]);
+        tracer.edit_made(&[brick_at(3)]);
+        let dig = tracer.gi_boost_box;
+        tracer.gi_boost = 12;
+        // Edits 100 km off, one after another: the dig's box and its 12 frames stay.
+        for far in [250_000, 260_000, 270_000] {
+            tracer.edit_made(&[brick_at(far)]);
+            assert_eq!(tracer.gi_boost_box, dig);
+            assert_eq!(tracer.gi_boost, 12);
+        }
+        // An Edit inside the dig's box (the next brick) does change what is settling there: the
+        // frames start over, in a box that holds both.
+        tracer.edit_made(&[brick_at(4)]);
+        assert_eq!(tracer.gi_boost, GI_BOOST_FRAMES);
+        assert!(box_holds(tracer.gi_boost_box, reach_of(brick_at(3))));
+        assert!(box_holds(tracer.gi_boost_box, reach_of(brick_at(4))));
     }
 
     #[test]
