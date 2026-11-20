@@ -3028,11 +3028,24 @@ mod tests {
         // The update that found the flip looked at a batch, and not at every node.
         let nodes = selection.nodes();
         let mut updates = 1;
-        while selection.rewanted() {
+        while selection.absorbing() {
             selection.update(&store, [0.0, y, 0.0]);
             is_a_cut(&selection);
             updates += 1;
             assert!(updates <= nodes, "the sweep does not end");
+        }
+        // The tidying of the queue goes on after the sweep, and is not what this counts: it
+        // changes nothing that is drawn (+0 -0), and takes as many updates as the stale entries
+        // are many over `TIDY`. In this small tree the queue has 4 entries for each node when the
+        // flip comes (32 053 for 7 909 nodes, 4 updates of tidying), where it had 1.2 (9 834 for
+        // 8 117) before #226: `set_margins` now looks at every node again with the cap off too
+        // (the cap under the sea depends on the margins), and what that leaves hot (22 000 entries
+        // after the first step, 212 at the flip before) is looked at again at each step of the
+        // climb, each look leaving a stale entry. Measured with the under-sea cap off as well: it
+        // is the look again, not the cap.
+        while selection.tidying() {
+            selection.update(&store, [0.0, y, 0.0]);
+            assert_eq!(selection.rewanted(), selection.tidying());
         }
         is_as_the_rule_says(&selection, "after the sweep");
         (updates, selection.bricks().collect())
@@ -3043,12 +3056,9 @@ mod tests {
         for climbing in [true, false] {
             let (at_once, drawn) = flip_in_updates(usize::MAX, usize::MAX, climbing);
             // One update looks at every node; the children of the nodes it splits are looked at
-            // by the next (they are the sweep's too), and no more. A cap that comes on over a
-            // camera under the sea grows from the sea's own (#226: `Reach::under`) to the
-            // camera's, so it splits what it newly reaches a level in each update (5 updates in
-            // this tree). One that goes off shrinks, and merges.
-            let most = if climbing { 5 } else { 2 };
-            assert!(at_once <= most, "{at_once} updates (climbing: {climbing})");
+            // by the next (they are the sweep's too), and no more. (The tidying of the queue,
+            // which follows, is not counted: see `flip_in_updates`.)
+            assert!(at_once <= 2, "{at_once} updates (climbing: {climbing})");
             let (spread, spread_drawn) = flip_in_updates(50, 20, climbing);
             // The tree has some thousands of nodes: a batch of 50 takes many updates.
             assert!(spread > 20, "{spread} updates (climbing: {climbing})");

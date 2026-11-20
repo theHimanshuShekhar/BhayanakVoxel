@@ -3687,10 +3687,10 @@ fn the_update_where_the_cap_goes_off_and_on_at_sea_level_is_measured() {
 }
 
 /// A camera held under the sea has a cap of its own, not none (#226): it dives to 30 m under the
-/// sea at 50 m/s and stands there for 600 frames (10 s), with the cap and the margins, and the scene
-/// it holds is a camera in a cave's: the bricks drawn are fewer than the uncapped scene's (the
-/// whole Planet to its far side), there is no hole on the way down or in the hold, and everything a
-/// camera at the mouth of a cave within the cave's reach could see is in the resident set.
+/// sea at 50 m/s and stands there for 600 frames (10 s), with the cap and the margins. The cap is
+/// off there and the selection has the sea's cap in its place (`Reach::under`), so the bricks drawn
+/// are fewer than the uncapped scene's (the whole Planet to its far side), and there is no hole on
+/// the way down, in the hold, or when the resident set is complete.
 #[test]
 fn a_camera_held_under_the_sea_has_a_scene_of_its_own_and_no_hole() {
     let held = |capped: bool| {
@@ -3731,8 +3731,8 @@ fn a_camera_held_under_the_sea_has_a_scene_of_its_own_and_no_hole() {
         reach.horizon.is_none() && reach.under.is_some(),
         "{reach:?}"
     );
-    // The cap has to be there, not only to be asked for: 13 637 bricks against 15 527 with it,
-    // 15 383 without it (the horizon asked for and no viewpoint to cap from).
+    // The cap has to be there, not only asked for: with no viewpoint to cap from the scene is as
+    // the uncapped one's, 15 383 bricks against 15 527; with the sea's cap it is 12 294.
     assert!(
         drawn * 100 < uncapped * 95,
         "{drawn} bricks drawn, {uncapped} with no cap"

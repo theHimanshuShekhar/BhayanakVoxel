@@ -721,9 +721,14 @@ impl Reach {
     /// and a camera that stands on the beach is what the 512 MiB scene gate is met with (466 MiB at
     /// 2 m); with no cap at all the scene is the whole Planet to its far side, 774 MiB at full
     /// size. What the cap leaves out is not a hole or the sky: it stays whole at the coarse level
-    /// that holds it, as it does beyond the horizon of a camera over the sea. (A mouth that is
-    /// high over the sea, on a mountain, sees further than this: it is drawn coarser.) A camera
-    /// over the sphere is raised by the margin, which is this too.
+    /// that holds it, as it does beyond the horizon of a camera over the sea. The cap reaches
+    /// `sqrt(2 R · margin)` (3.6 km for 20 m on the 320 km Planet) further than what a sight line
+    /// that leaves the camera's place at sea level sees, so every pit and every cave of the
+    /// Planet (at most 980 m across) is in it, including one whose mouth is high on a mountain;
+    /// what it does not reach is what is seen along a straight air passage below sea level that is
+    /// longer than that, and that is drawn coarse. A camera over the sphere is raised by the
+    /// margin, which is this too: so while the cap is off over the sphere (up to 50 m over it,
+    /// `select::CAP_ON`) the scene is the horizon cap's.
     fn caps(&self, camera: [f64; 3]) -> (Option<Cap>, Option<Cap>) {
         let Some(horizon) = self.horizon.or(self.under) else {
             return (None, None);
@@ -1711,6 +1716,33 @@ mod tests {
         }
         // With no sphere there is no cap at all.
         assert!(!Reach::NONE.from([0.0, SEA - 30.0, 0.0]).has_cap());
+    }
+
+    #[test]
+    fn a_camera_over_the_sea_with_the_cap_off_has_the_horizon_cap_exactly() {
+        // The cap is off up to 50 m over the sphere (`select::CAP_ON`): there `under` has the
+        // sphere, and the camera raised by the margin is over it, so the viewpoint is what the
+        // horizon cap's is (the place `extra` is a little larger: the slack is less, and the cap
+        // the same). Only under the sphere is the viewpoint the sphere's surface raised.
+        let on = capped(20.0 * VOXELS_PER_METRE);
+        let off = under_the_sea();
+        for metres in [0.0, 1.0, 10.0, 30.0, 50.0, 400.0] {
+            let camera = [0.0, SEA + metres * VOXELS_PER_METRE, 0.0];
+            let (on, off) = (on.from(camera), off.from(camera));
+            for (a, b) in [(on.drawn, off.drawn), (on.wanted, off.wanted)] {
+                let (a, b) = (a.expect("a cap"), b.expect("a cap"));
+                assert_eq!(
+                    (a.radius, a.radial, a.a, a.low),
+                    (b.radius, b.radial, b.a, b.low),
+                    "{metres} m"
+                );
+                assert!(b.extra >= a.extra && b.extra < a.extra + 1e-3, "{metres} m");
+            }
+        }
+        // Just under the sphere it is not: the sea's surface raised is higher than the camera
+        // raised.
+        let camera = [0.0, SEA - 10.0 * VOXELS_PER_METRE, 0.0];
+        assert!(under_the_sea().from(camera).drawn.unwrap().a > on.from(camera).drawn.unwrap().a);
     }
 
     #[test]
