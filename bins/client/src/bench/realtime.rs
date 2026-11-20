@@ -90,6 +90,10 @@ pub struct Script {
     /// The most that the cold start and the catching up between paths wait for the loader.
     pub fill_cap: Duration,
     pub between_cap: Duration,
+    /// How long the scene thread takes in what the loader made for while the loader's workers are
+    /// as far ahead as they may be ([`crate::scene_worker::BACKED_UP_SLICE`], or what
+    /// `--stream-slice-ms` said).
+    pub stream_slice: Duration,
 }
 
 impl Script {
@@ -104,6 +108,7 @@ impl Script {
             settle_cap: Duration::from_secs(120),
             fill_cap: Duration::from_secs(5400),
             between_cap: Duration::from_secs(1200),
+            stream_slice: crate::scene_worker::BACKED_UP_SLICE,
         }
     }
 
@@ -118,6 +123,7 @@ impl Script {
             settle_cap: Duration::from_secs(20),
             fill_cap: Duration::from_secs(600),
             between_cap: Duration::from_secs(300),
+            stream_slice: crate::scene_worker::BACKED_UP_SLICE,
         }
     }
 }
@@ -349,7 +355,7 @@ fn over_budget_cause(
     Some(if update == "rebuild" {
         // (None is not expected for a rebuild: it is counted as a jump.)
         match rebuilt {
-            Some(Rebuild::Bands) => "bands",
+            Some(Rebuild::Bands | Rebuild::Release) => "bands",
             _ => "jump",
         }
     } else if took_edit {
@@ -364,7 +370,9 @@ fn over_budget_cause(
 /// How long the scene thread spent on each part of its rounds, in milliseconds, over a path or a
 /// run (`Spent`): following the camera (selecting again and packing what changed), packing what the
 /// loader made, publishing (copying what changed out for the frame thread, which copies it to the
-/// GPU: the upload), eviction, remaking the coarse levels over an Edit, and the looks for holes.
+/// GPU: the upload), eviction, remaking the coarse levels over an Edit, the looks for holes, and
+/// the change of the bands for the camera's speed (`reband_ms`: looking again at the nodes that a
+/// change of depth listed, which is not part of `follow_ms`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize)]
 pub struct SceneThread {
     pub follow_ms: f64,
@@ -373,6 +381,11 @@ pub struct SceneThread {
     pub evict_ms: f64,
     pub coarse_ms: f64,
     pub hole_scan_ms: f64,
+    pub reband_ms: f64,
+    /// Making the scene again for a finer depth, at a flight's end (#168, `Rebuild::Release`): the
+    /// scene thread's time in the rebuild, which the frame thread does not wait for, against
+    /// #217's cap on the catch-up (12 s). The copy for the frame thread is in `upload_ms`.
+    pub release_ms: f64,
     /// The looks for holes' share of the scene thread's **busy** time above (0 to 1): the sum of
     /// the parts, not wall time, so a thread that is idle most of the time can still read high. A
     /// path's figure is of its frames only: the look that is forced after them is not in it (see
@@ -391,6 +404,8 @@ impl SceneThread {
             evict_ms: ms(now.evict, then.evict),
             coarse_ms: ms(now.coarse, then.coarse),
             hole_scan_ms: ms(now.hole_scan, then.hole_scan),
+            reband_ms: ms(now.reband, then.reband),
+            release_ms: ms(now.release, then.release),
             hole_scan_share: 0.0,
         };
         let all = parts.follow_ms
@@ -398,7 +413,9 @@ impl SceneThread {
             + parts.upload_ms
             + parts.evict_ms
             + parts.coarse_ms
-            + parts.hole_scan_ms;
+            + parts.hole_scan_ms
+            + parts.reband_ms
+            + parts.release_ms;
         Self {
             hole_scan_share: if all > 0.0 {
                 parts.hole_scan_ms / all
@@ -590,8 +607,28 @@ const OVER_LIMIT_INDEXES: usize = 200;
 /// How long the camera stood after a flight before the scene had no soft misses.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize)]
 pub struct Settle {
-    /// From the frame the camera stopped in, to the first frame with no soft misses: or to the cap,
-    /// if there were still some.
+    /// From the frame the camera stopped in, to the first frame in which the scene is at the
+    /// camera (the drawn scene's camera is the frame's) and has no soft misses and nothing waiting:
+    /// or to the cap, if it was not. `walk_s`, `reband_s` and `fill_s` are its three parts and add
+    /// up to it.
+    pub seconds: f64,
+    pub settled: bool,
+    /// The first part: from the stop to the scene's camera being the frame's (the scene thread
+    /// walking to where the camera stopped, with the bands as they are then). The whole of
+    /// `seconds` if it never was.
+    pub walk_s: f64,
+    /// The second part: from there until the scene thread has looked at every node that the
+    /// change of the bands for the stop listed (the finer bands' bricks being made round the
+    /// stop: the scene thread's own work, `SceneThread::reband_ms`), 0 if it was done by then.
+    pub reband_s: f64,
+    /// The third part: from there to settled (what is left is the loader's bricks being waited
+    /// for, and made into the scene).
+    pub fill_s: f64,
+}
+
+/// How long what a hold had held back took to catch up (#217).
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+pub struct CatchUp {
     pub seconds: f64,
     pub settled: bool,
 }
@@ -617,6 +654,7 @@ pub struct CutCauses {
     pub follow: u64,
     pub arrival: u64,
     pub coarsen: u64,
+    pub reband: u64,
 }
 
 impl From<StillCuts> for StillCutsReport {
@@ -631,6 +669,7 @@ impl From<StillCuts> for StillCutsReport {
                 follow: cuts.of(Cause::Follow),
                 arrival: cuts.of(Cause::Arrival),
                 coarsen: cuts.of(Cause::Coarsen),
+                reband: cuts.of(Cause::Reband),
             },
         }
     }
@@ -668,7 +707,7 @@ pub struct StillAfterFlight {
     pub cuts: StillCutsReport,
     /// From the frame that ended the hold (the view changes, loading goes on) to the first frame
     /// with no soft misses and nothing waiting: the catch-up of what was held back.
-    pub catch_up: Settle,
+    pub catch_up: CatchUp,
     /// What the look at every split brick found after the catch-up. Must be 0: nothing held back
     /// leaves a hole.
     pub holes_after_catch_up: u64,
@@ -723,12 +762,73 @@ pub struct PathReport {
     pub scene_lag_d0_max: f64,
     pub scene_lag_voxels_p99: f64,
     pub scene_lag_d0_p99: f64,
+    /// The mean of the drawn scene's lag over the frames of the path, in `d0` (#168: how far
+    /// behind the camera the scene is for most of a flight, which the maximum and the 99th
+    /// percentile do not say). Reported, not gated.
+    pub scene_lag_d0_mean: f64,
+    /// Rounds in which the scene thread moved the scene to the camera, and in which it held work
+    /// back for the upload budget (`Done::follow_steps` and `budget_cuts`), and the frames that
+    /// scored a camera soft miss in each second of the path (the flights only; empty for the
+    /// others): whether they are at the start of a flight, or all along it.
+    pub scene_follow_steps: u64,
+    pub scene_budget_cuts: u64,
+    /// Times the camera's speed gave a depth back and the scene was made again at it
+    /// (`Rebuild::Release`; `SceneThread::release_ms` is the scene thread's time in it) instead of
+    /// the nodes being looked at again, and the frame thread's cost of taking one: the longest
+    /// frame that had it, and the longest of those frames' update (the copy to the GPU). 0 if
+    /// none was in the path's frames.
+    pub scene_release_rebuilds: u64,
+    pub release_frame_ms_max: f64,
+    pub release_update_ms_max: f64,
+    /// The frames with a camera soft miss in each second of the path (the second a frame began in,
+    /// counted from the path's first frame): one entry for every second the path's frames cover,
+    /// so a path of 10 s has 10, and a last entry of 0 is a second without a miss (an array that
+    /// ended at the last second with one made a miss at 5 to 6 s look like a path of 6 s).
+    pub camera_soft_miss_per_second: Vec<u32>,
+    /// The camera misses split by what can have caused them (#168): a frame whose drawn scene is
+    /// further from the camera than level 0 reaches (`floor(1)` less the hysteresis: the miss
+    /// score asks for level 0 within it of the frame's camera) is a miss by construction, whatever
+    /// the loader has made, so the frames over that lag are counted (`lag_over_floor_frames`,
+    /// misses or not), and the misses are the **lag side** (the frame was over it: the scene
+    /// thread's following, P1) or the **loader side** (it was not: a brick that the bands ask for
+    /// is not there, which is decision A's). They add up to `camera_soft_miss_frames`.
+    pub camera_soft_miss_lag_side: usize,
+    pub camera_soft_miss_loader_side: usize,
+    pub lag_over_floor_frames: usize,
+    /// The scene's buffers in use and the bricks drawn at each level when the path ended (to be
+    /// read against `scene_used_peak_mib`: a peak over it is a transient).
+    pub scene_used_end_mib: f64,
+    pub scene_level_bricks_end: Vec<usize>,
     /// What the frames' uploads came to, and how often the budget cut them.
     pub upload: PathUpload,
     /// Soft misses a frame reported (counted by the scene thread a few times a second, so a frame
     /// reports the last count).
     pub soft_misses: Series,
     pub soft_misses_per_frame: f64,
+    /// Frames in which the ground straight below **the frame's camera** (one ray down from it) was
+    /// drawn coarser than the bands ask at its distance, with the bands' hysteresis: the soft miss
+    /// of what the player sees, which the scene thread's own count (`soft_misses`, against the
+    /// scene's camera, which lags the frame's) does not say. **This is what is gated**, on the
+    /// flights (ADR 0009, #168).
+    pub camera_soft_miss_frames: usize,
+    /// What the loader did in the path (and in the forced look after its frames): the bricks the
+    /// generator was asked for, and the bricks of the arrivals that the scene thread took in, so
+    /// that a flight that falls short can be read as limited by the generator (few generated, many
+    /// waiting) or not. And the loader's queue (the bricks asked for and not yet taken in, as of
+    /// each frame): its most and its mean over the frames.
+    pub generated_bricks: u64,
+    pub arrived_bricks: u64,
+    pub loader_queue_max: usize,
+    pub loader_queue_mean: f64,
+    /// What the loader's workers did with their time in the path, summed over them, in seconds:
+    /// generating, and waiting with jobs queued because they were as far ahead as they may be (the
+    /// scene thread's taking in is what limits the loader when this is most of it, #168); and how
+    /// many times the scene thread took in what the loader made (the time of that is
+    /// `scene_thread.pack_ms`), and in how many it stopped because its slice was used up.
+    pub loader_generating_s: f64,
+    pub loader_held_back_s: f64,
+    pub stream_calls: u64,
+    pub stream_slices_used: u64,
     /// Looks of the scene thread at every split brick (every few seconds, and one forced at the end
     /// of the path), the holes they found in all, and those per frame of the path. Never 0 looks.
     pub hole_looks: u64,
@@ -779,6 +879,16 @@ pub struct ColdStart {
     pub world_map_s: Option<f64>,
     /// [`crate::load`]: the spawn ring, the Guard, and the first scene.
     pub load_s: f64,
+    /// The spawn ring (20 m, #168), which is when the player has control (ADR 0009), and the Guard
+    /// after it, which the window waits for as well so that nothing past the ring is sky. Both
+    /// are in `load_s`. **The `spawn_ring_s` gate is on the ring.**
+    pub spawn_ring_s: f64,
+    pub guard_s: f64,
+    /// The real time to control: from the world map being ready to the window opening (`load`
+    /// returning: the ring and the Guard and the first scene, which is when `main` opens it).
+    /// "Control in 2 s with nothing sky" is not met: it is #220. **The `time_to_control_s` gate is
+    /// on this.**
+    pub time_to_control_s: f64,
     /// From the start of the load to the first frame with level 0 under the camera: one ray from
     /// the camera straight down hits the ground at level 0. This is **not** the spec's time to
     /// control (the ring of 20 m round the Spawn at full detail, and the character standing in it:
@@ -787,10 +897,17 @@ pub struct ColdStart {
     pub time_to_level_0_under_camera_s: f64,
     /// From the start of the load to the resident set being complete.
     pub fill_s: f64,
+    /// An Edit made at the Spawn while the loader was filling the resident set (#168: a long
+    /// slice of taking in is on the scene thread at the time, and the Edit waits for the round to
+    /// end or for the slice to give way), timed as the one after the paths is. Null if the fill
+    /// was over before one could be made. Reported, not gated.
+    pub edit_during_fill: Option<EditLatency>,
+    /// The bricks that the loader had been asked for and not taken in when that Edit was made.
+    pub edit_during_fill_pending: usize,
 }
 
 /// What the run held, at the most.
-#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct Memory {
     /// The largest resident set of the samples taken during the run, where the system says: the
     /// working set on Windows, `VmRSS` on Linux. A sample is taken every 30 frames of the paths and
@@ -807,6 +924,11 @@ pub struct Memory {
     /// which it works out every 250 ms: not a value per frame. **The memory gate is on this**, not
     /// on what the GPU reserves.
     pub scene_used_peak_mib: f64,
+    /// What the run was doing when `scene_used_peak_mib` was reached (a path's name, or the wait
+    /// between paths, "the loader's catch-up after ..."; #168). Reported.
+    pub scene_used_peak_in: String,
+    /// The bricks drawn at each level when `scene_used_peak_mib` was reached.
+    pub scene_used_peak_level_bricks: Vec<usize>,
     /// The scene's buffers as the GPU reserves them, used or not (`Scene::reserved_bytes`): this
     /// is the VRAM the scene takes, after its growths (a buffer that fills grows, #145: the most
     /// of the frames' is given). Reported; not gated.
@@ -909,7 +1031,27 @@ pub struct Gates {
     /// the store.
     pub scene_mib: Limit,
     pub store_bricks: Limit,
-    /// The gates that are over: `frame_time`, `frame_cpu`, `holes`, `memory`.
+    /// Frames on the flights (the flights at 2 m and 50 m, the take-off and the turn) in which the
+    /// ground below the frame's camera was drawn coarser than the speed-scaled bands ask
+    /// ([`PathReport::camera_soft_miss_frames`]), at the most of a run. The speed-scaled level is
+    /// not a soft miss (#168).
+    pub camera_soft_miss_frames: Limit,
+    /// The scene thread's own soft-miss frames on the same flights (against the scene's camera,
+    /// which lags the frame's), at the most of a run: **reported, not gated**.
+    pub scene_soft_miss_frames: u64,
+    /// The drawn scene's lag behind the camera, in `d0`, at the most over the four flights of the
+    /// worst run. Main's value plus a margin for now; it tightens once the follow fixes land.
+    pub scene_lag_d0_max: Limit,
+    /// The spawn ring's generation (ADR 0009), at the most of the runs.
+    pub spawn_ring_s: Limit,
+    /// From the world map being ready to the window opening (the ring and the Guard), at the most
+    /// of the runs.
+    pub time_to_control_s: Limit,
+    /// The settle time after the stop, at the most of the runs (the cap's if one did not settle,
+    /// which is over whatever the limit): the scene at the camera, no soft miss, nothing waiting.
+    pub settle_s: Limit,
+    /// The gates that are over: `frame_time`, `frame_cpu`, `holes`, `memory`, `soft_misses`,
+    /// `scene_lag`, `spawn_ring`, `time_to_control`, `settle`.
     pub over: Vec<&'static str>,
 }
 
@@ -946,11 +1088,59 @@ pub fn gates(runs: &[RunReport], budgets: &StreamingBudgets) -> Gates {
             .reduce(f64::min)
             .unwrap_or(0.0),
     };
+    let camera_soft_miss_frames = Limit {
+        worst: worst(&mut runs.iter().map(|r| {
+            r.paths
+                .iter()
+                .filter(|p| FLIGHTS.contains(&p.name))
+                .map(|p| p.camera_soft_miss_frames as f64)
+                .sum::<f64>()
+        })),
+        limit: budgets.camera_soft_miss_frames as f64,
+    };
+    let scene_soft_miss_frames = runs
+        .iter()
+        .map(|r| {
+            r.paths
+                .iter()
+                .filter(|p| FLIGHTS.contains(&p.name))
+                .map(|p| p.soft_misses.frames_with as u64)
+                .sum::<u64>()
+        })
+        .max()
+        .unwrap_or(0);
+    let scene_lag_d0_max = Limit {
+        worst: worst(
+            &mut paths()
+                .filter(|p| FLIGHTS.contains(&p.name))
+                .map(|p| p.scene_lag_d0_max),
+        ),
+        limit: budgets.scene_lag_d0_max,
+    };
+    let spawn_ring_s = Limit {
+        worst: worst(&mut runs.iter().map(|r| r.cold_start.spawn_ring_s)),
+        limit: budgets.spawn_ring_s,
+    };
+    let time_to_control_s = Limit {
+        worst: worst(&mut runs.iter().map(|r| r.cold_start.time_to_control_s)),
+        limit: budgets.time_to_control_s,
+    };
+    let unsettled = paths().any(|p| p.settle.is_some_and(|s| !s.settled));
+    let settle_s = Limit {
+        worst: worst(&mut paths().filter_map(|p| p.settle.map(|s| s.seconds))),
+        limit: budgets.settle_s,
+    };
     let over = [
         ("frame_time", frame_time_p99_ms.over()),
         ("frame_cpu", frame_cpu_p99_ms.over()),
         ("holes", holes.over() || !looked),
         ("memory", scene_mib.over() || store_bricks.over()),
+        ("soft_misses", camera_soft_miss_frames.over()),
+        ("scene_lag", scene_lag_d0_max.over()),
+        ("spawn_ring", spawn_ring_s.over()),
+        ("time_to_control", time_to_control_s.over()),
+        // A run that was still unsettled at the cap is over, whatever the cap is.
+        ("settle", settle_s.over() || unsettled),
     ]
     .into_iter()
     .filter_map(|(name, over)| over.then_some(name))
@@ -963,6 +1153,12 @@ pub fn gates(runs: &[RunReport], budgets: &StreamingBudgets) -> Gates {
         hole_looks_fewest_in_a_path,
         scene_mib,
         store_bricks,
+        camera_soft_miss_frames,
+        scene_soft_miss_frames,
+        scene_lag_d0_max,
+        spawn_ring_s,
+        time_to_control_s,
+        settle_s,
         over,
     }
 }
@@ -1125,6 +1321,9 @@ struct Setup {
     constants: Constants,
     world_map_s: Option<f64>,
     load: Duration,
+    /// The spawn ring and the Guard, in `load` ([`ColdStart::ring_s`]); 0 for the test Planet's.
+    ring: Duration,
+    guard: Duration,
 }
 
 /// The Planet of the client, at full size: made as `main.rs` makes it.
@@ -1165,6 +1364,8 @@ fn build_full() -> Result<Built, Box<dyn Error>> {
             },
             world_map_s: Some(world_map.as_secs_f64()),
             load,
+            ring: loaded.ring_took,
+            guard: loaded.guard_took,
         },
     })
 }
@@ -1207,6 +1408,8 @@ fn build_test() -> Result<Built, Box<dyn Error>> {
             constants: Constants::of_the_client(),
             world_map_s: None,
             load: began.elapsed(),
+            ring: Duration::ZERO,
+            guard: Duration::ZERO,
         },
     })
 }
@@ -1242,10 +1445,24 @@ struct Frame {
     /// The parts of the frame; its `index` and `at_ms` are set by the path that takes it in.
     parts: SlowFrame,
     soft_misses: usize,
+    /// Whether the ground below the frame's camera is drawn coarser than the bands ask
+    /// ([`PathReport::camera_soft_miss_frames`]).
+    camera_soft_miss: bool,
+    /// Whether the drawn scene's lag was over what level 0 reaches (see
+    /// [`PathReport::lag_over_floor_frames`]); false when nothing is scored.
+    lag_over_floor: bool,
+    /// Whether the frame's update was the scene made again for a depth that was given back
+    /// ([`Rebuild::Release`]).
+    release_rebuild: bool,
+    /// Whether the scene the frame draws is at the frame's camera ([`Settle`]).
+    at_camera: bool,
     /// The words of the scene in use at the end of the frame, in bytes.
     scene_used_bytes: u64,
     /// Whether the scene thread held work back in this frame for the upload budget.
     throttled: bool,
+    /// The bricks the loader had been asked for and not yet taken in, as of the frame's look at the
+    /// scene (the loader's queue and what its workers have, see [`PathReport::loader_queue_max`]).
+    loader_queue: usize,
     /// The drawn scene's lag behind the camera in Voxels (see [`PathReport::scene_lag_voxels_max`]).
     lag: f64,
     /// Whether the look at the scene in this frame has the newest Edit in it (from this frame or an
@@ -1264,6 +1481,22 @@ struct Capture {
     spent: Spent,
     scans: u64,
     holes: u64,
+    /// The bricks the generator had been asked for and the arrivals the scene thread had taken in
+    /// when the path began.
+    generated: u64,
+    arrived: u64,
+    /// The loader's workers' time (generating, held back, in microseconds) and the scene thread's
+    /// calls to take in, when the path began.
+    busy: (u64, u64),
+    streams: (u64, u64),
+    /// The loader's queue at each frame: the most and the sum, for the mean.
+    queue_max: usize,
+    queue_sum: u64,
+    /// The most the scene's buffers in use were, in bytes.
+    /// The scene thread's follow rounds and budget cuts when the path began.
+    follow: (u64, u64, u64),
+    /// Frames with a camera soft miss, by second of the path.
+    miss_seconds: Vec<u32>,
     /// What the scene thread had spent when the path's frames were done, before the forced look.
     frames_done: Option<Spent>,
     /// The scene thread's longest round in the path's frames, taken when they were done.
@@ -1279,6 +1512,11 @@ struct Capture {
     cycles: Vec<f64>,
     sleep_over_ms: Vec<f64>,
     soft_misses: Series,
+    camera_soft_miss_frames: usize,
+    camera_soft_miss_lag_side: usize,
+    lag_over_floor_frames: usize,
+    release_frame_ms: f64,
+    release_update_ms: f64,
     /// The update of each frame that had one: its time, bytes and copies.
     update_ms: Vec<f64>,
     update_bytes: Vec<u64>,
@@ -1336,12 +1574,28 @@ impl Capture {
             spent: world.scene_thread_time(),
             scans: work.hole_scans,
             holes: work.holes_found,
+            generated: world.stats().loader.generated,
+            arrived: work.arrived_bricks,
+            busy: (
+                world.stats().loader.generating_us,
+                world.stats().loader.held_back_us,
+            ),
+            streams: (work.stream_calls, work.stream_slices_used),
+            queue_max: 0,
+            queue_sum: 0,
+            follow: (work.follow_steps, work.budget_cuts, work.release_rebuilds),
+            miss_seconds: Vec::new(),
             frame_ms: Vec::new(),
             cpu_ms: Vec::new(),
             started: Vec::new(),
             cycles: Vec::new(),
             sleep_over_ms: Vec::new(),
             soft_misses: Series::default(),
+            camera_soft_miss_frames: 0,
+            camera_soft_miss_lag_side: 0,
+            lag_over_floor_frames: 0,
+            release_frame_ms: 0.0,
+            release_update_ms: 0.0,
             update_ms: Vec::new(),
             update_bytes: Vec::new(),
             update_writes: Vec::new(),
@@ -1361,6 +1615,8 @@ impl Capture {
             self.over_by_update.add(frame.parts.update);
         }
         self.lags.push(frame.lag);
+        self.queue_max = self.queue_max.max(frame.loader_queue);
+        self.queue_sum += frame.loader_queue as u64;
         self.over_budget.add(frame.parts.over_budget);
         if frame.parts.grown_bytes > 0 {
             self.growth_frames += 1;
@@ -1394,6 +1650,21 @@ impl Capture {
             self.sleep_over_ms.push(frame.parts.sleep_over_ms);
         }
         self.soft_misses.add(frame.soft_misses as u64);
+        self.camera_soft_miss_frames += usize::from(frame.camera_soft_miss);
+        self.camera_soft_miss_lag_side +=
+            usize::from(frame.camera_soft_miss && frame.lag_over_floor);
+        self.lag_over_floor_frames += usize::from(frame.lag_over_floor);
+        if frame.release_rebuild {
+            self.release_frame_ms = self.release_frame_ms.max(frame.time_ms);
+            self.release_update_ms = self.release_update_ms.max(frame.parts.update_ms);
+        }
+        if frame.camera_soft_miss {
+            let second = frame.began.saturating_duration_since(self.began).as_secs() as usize;
+            if self.miss_seconds.len() <= second {
+                self.miss_seconds.resize(second + 1, 0);
+            }
+            self.miss_seconds[second] += 1;
+        }
         if frame.parts.update != "none" {
             self.update_ms.push(frame.parts.update_ms);
             self.update_bytes.push(frame.parts.upload_bytes);
@@ -1454,6 +1725,27 @@ impl Capture {
             scene_lag_d0_max: d0.map_or(0.0, |d0| lag_max / d0),
             scene_lag_voxels_p99: lag_p99,
             scene_lag_d0_p99: d0.map_or(0.0, |d0| lag_p99 / d0),
+            scene_lag_d0_mean: d0.map_or(0.0, |d0| {
+                self.lags.iter().sum::<f64>() / self.lags.len().max(1) as f64 / d0
+            }),
+            scene_follow_steps: work.follow_steps - self.follow.0,
+            scene_budget_cuts: work.budget_cuts - self.follow.1,
+            scene_release_rebuilds: work.release_rebuilds - self.follow.2,
+            release_frame_ms_max: self.release_frame_ms,
+            release_update_ms_max: self.release_update_ms,
+            camera_soft_miss_per_second: misses_by_second(
+                &self.miss_seconds,
+                self.started.last().copied(),
+                self.began,
+            ),
+            camera_soft_miss_lag_side: self.camera_soft_miss_lag_side,
+            camera_soft_miss_loader_side: self.camera_soft_miss_frames
+                - self.camera_soft_miss_lag_side,
+            lag_over_floor_frames: self.lag_over_floor_frames,
+            scene_used_end_mib: world.used_bytes() as f64 / MIB,
+            scene_level_bricks_end: (0..render::lod::LEVELS)
+                .map(|l| world.level_bricks(l))
+                .collect(),
             upload: PathUpload {
                 updates: self.update_ms.len(),
                 time: Spread::of(&self.update_ms),
@@ -1472,6 +1764,29 @@ impl Capture {
             },
             soft_misses_per_frame: per_frame(self.soft_misses.total),
             soft_misses: self.soft_misses,
+            camera_soft_miss_frames: self.camera_soft_miss_frames,
+            generated_bricks: world
+                .stats()
+                .loader
+                .generated
+                .saturating_sub(self.generated),
+            arrived_bricks: work.arrived_bricks - self.arrived,
+            loader_queue_max: self.queue_max,
+            loader_queue_mean: self.queue_sum as f64 / frames.max(1) as f64,
+            loader_generating_s: world
+                .stats()
+                .loader
+                .generating_us
+                .saturating_sub(self.busy.0) as f64
+                * 1e-6,
+            loader_held_back_s: world
+                .stats()
+                .loader
+                .held_back_us
+                .saturating_sub(self.busy.1) as f64
+                * 1e-6,
+            stream_calls: work.stream_calls - self.streams.0,
+            stream_slices_used: work.stream_slices_used - self.streams.1,
             hole_looks: work.hole_scans - self.scans,
             holes,
             holes_per_frame: per_frame(holes),
@@ -1541,15 +1856,62 @@ fn level_0_under(scene: &Scene, camera: &Camera) -> bool {
     trace(scene, &Ray { cell, origin, dir }).is_some_and(|hit| scene.level_at(hit.voxel) == Some(0))
 }
 
+// The paths that are flown at speed, whose scene is drawn at the level the speed asks for.
+pub const FLIGHTS: [&str; 4] = [
+    "flight at 2 m",
+    "flight at 50 m",
+    "vertical take-off",
+    "180 degree turn",
+];
+
+/// Whether the ground straight below `camera` is drawn coarser than `bands` ask for it: the brick
+/// that one ray down hits is of a level whose band has not begun at the brick's distance (less
+/// the hysteresis, which is how far in a brick is kept whole). This is a soft miss of what the
+/// frame shows, the speed-scaled level and the camera's own place in it: the scene thread counts
+/// against the scene's camera, which is behind the frame's when the scene lags.
+///
+/// The alternative, re-scoring every brick at the frame's camera, is the same count for what is
+/// under the player and a pass over every node a frame; a ray is the player's view of what they
+/// stand on, which is what the ticket's "no soft miss" is for.
+fn soft_miss_under(scene: &Scene, camera: &Camera, bands: Option<render::lod::Bands>) -> bool {
+    let Some(bands) = bands else {
+        return false;
+    };
+    let (cell, origin) = camera::split(camera.position);
+    let dir = camera.horizon_up.map(|c| -(c as f32));
+    let Some(hit) = trace(scene, &Ray { cell, origin, dir }) else {
+        return false;
+    };
+    let Some(level) = scene.level_at(hit.voxel) else {
+        return false;
+    };
+    let size = 8i64 << level;
+    let distance = (0..3)
+        .map(|a| {
+            let low = i64::from(hit.voxel[a]).div_euclid(size) * size;
+            let (c, low, high) = (camera.position[a], low as f64, (low + size) as f64);
+            (low - c).max(c - high).max(0.0).powi(2)
+        })
+        .sum::<f64>()
+        .sqrt();
+    level > 0 && distance < bands.floor(level) * (1.0 - render::lod::HYSTERESIS)
+}
+
 /// What the frame thread has on the world and the GPU, and the peaks over the frames.
 struct Session<'a> {
     world: World,
     gpu: &'a mut dyn Gpu,
     /// What the run was doing when it last started on something: for the error of a run that stops.
     step: String,
+    /// Whether [`Frame::camera_soft_miss`] is scored: on the flights, where the scene is drawn at
+    /// the speed-scaled level (a ray a frame, not worth it on a fill of 19 000 frames).
+    score_camera: bool,
     /// What the scene thread had done when the measuring began.
     work_before: Done,
     scene_used_peak_bytes: u64,
+    /// What the run was doing when that was reached.
+    scene_used_peak_in: String,
+    scene_used_peak_levels: Vec<usize>,
     scene_reserved_bytes: u64,
     /// The most the frame thread's copy of the scene reserved, with the old words of a buffer
     /// that grew in that frame added (see [`Memory::scene_host_peak_growth_mib`]).
@@ -1595,7 +1957,10 @@ impl<'a> Session<'a> {
             last_ended: None,
             step: "starting".to_string(),
             work_before,
+            score_camera: false,
             scene_used_peak_bytes: 0,
+            scene_used_peak_in: String::new(),
+            scene_used_peak_levels: Vec::new(),
             scene_reserved_bytes: 0,
             scene_host_peak_bytes: 0,
             resident_peak: None,
@@ -1708,8 +2073,19 @@ impl<'a> Session<'a> {
             cpu_ms: parts.cpu_ms,
             parts,
             soft_misses: self.world.stats().soft_misses,
+            camera_soft_miss: self.score_camera
+                && soft_miss_under(self.world.scene(), camera, self.world.bands()),
+            release_rebuild: kind == "rebuild"
+                && self.world.scene().rebuild_reason() == Some(Rebuild::Release),
+            lag_over_floor: self.score_camera
+                && self.world.bands().is_some_and(|bands| {
+                    self.world.lag(camera.position)
+                        > bands.floor(1) * (1.0 - render::lod::HYSTERESIS)
+                }),
+            at_camera: self.world.lag(camera.position) == 0.0,
             scene_used_bytes: self.world.used_bytes(),
             throttled: self.world.stats().throttled,
+            loader_queue: self.world.stats().loader.pending,
             lag: self.world.lag(camera.position),
             edit_taken,
             taken_at,
@@ -1720,7 +2096,14 @@ impl<'a> Session<'a> {
     /// that did not take it).
     fn look_at_memory(&mut self) -> Duration {
         let mut lock_wait = Duration::ZERO;
-        self.scene_used_peak_bytes = self.scene_used_peak_bytes.max(self.world.used_bytes());
+        let used = self.world.used_bytes();
+        if used > self.scene_used_peak_bytes {
+            self.scene_used_peak_bytes = used;
+            self.scene_used_peak_in.clone_from(&self.step);
+            self.scene_used_peak_levels = (0..render::lod::LEVELS)
+                .map(|l| self.world.level_bricks(l))
+                .collect();
+        }
         self.scene_reserved_bytes = self.scene_reserved_bytes.max(self.world.reserved_bytes());
         self.frames += 1;
         if self.frames.is_multiple_of(STORE_EVERY) {
@@ -1773,10 +2156,20 @@ impl<'a> Session<'a> {
         self.world.waiting() == 0 && self.world.loader().is_some_and(|l| l.pending == 0)
     }
 
-    /// Frames at `camera`, not recorded, until the loader has caught up, and then a look at every
-    /// split brick: whatever the scene thread found between paths is in the run's holes. The
-    /// camera's jump to it is not a flight: the scene thread is told it is not moving. `after`
-    /// names what came before, for an error.
+    /// Whether the resident set is complete and the drawn scene is at `camera`.
+    fn at_rest_at(&self, camera: &Camera) -> bool {
+        self.idle() && self.world.lag(camera.position) == 0.0
+    }
+
+    /// Frames at `camera`, not recorded, until the loader has caught up **and the scene is at the
+    /// camera**, and then a look at every split brick: whatever the scene thread found between
+    /// paths is in the run's holes. The camera's jump to it is not a flight: the scene thread is
+    /// told it is not moving. `after` names what came before, for an error.
+    ///
+    /// The scene's camera is read as well as `idle`, which reads the stats of the last publish: the
+    /// scene thread has not learnt that the camera is back at the Spawn until a frame has been run
+    /// at it, so `idle` can be true from the stats of the path before (the 180 degree turn was
+    /// left about 300 m up).
     fn settle(
         &mut self,
         camera: &Camera,
@@ -1785,8 +2178,12 @@ impl<'a> Session<'a> {
     ) -> Result<(), Box<dyn Error>> {
         self.step = format!("the loader's catch-up after {after}");
         let began = Instant::now();
-        while !self.idle() {
+        // At least one frame, at the target camera, before the stats are believed.
+        loop {
             self.frame(camera, false)?;
+            if self.at_rest_at(camera) {
+                break;
+            }
             if began.elapsed() > cap {
                 return Err(format!(
                     "the loader has not caught up after {:.0?}: {} bricks wait",
@@ -1812,11 +2209,24 @@ impl<'a> Session<'a> {
         self.last_ended = None;
         let mut capture = Capture::start("cold start", &self.world, self.limit_ms);
         let mut control = None;
+        let mut edit_during_fill = None;
+        let mut edit_pending = 0;
         while !self.idle() || control.is_none() {
             let frame = self.frame(&setup.spawn, true)?;
             capture.add(&frame);
             if control.is_none() && level_0_under(self.world.scene(), &setup.spawn) {
                 control = Some(setup.load + began.elapsed());
+            }
+            // One Edit, in the fill, once the loader has a queue (its workers are ahead, and the
+            // scene thread takes in for a long slice): its time is not the next frame's wait.
+            let pending = self.world.loader().map_or(0, |l| l.pending);
+            if control.is_some() && edit_during_fill.is_none() && pending > 0 {
+                if let Edit::Taken(latency) = self.edit(&setup.spawn)? {
+                    edit_during_fill = Some(latency);
+                    edit_pending = pending;
+                }
+                self.last_ended = None;
+                self.step = "cold start".to_string();
             }
             if began.elapsed() > script.fill_cap {
                 return Err(format!(
@@ -1829,10 +2239,15 @@ impl<'a> Session<'a> {
         let cold = ColdStart {
             world_map_s: setup.world_map_s,
             load_s: setup.load.as_secs_f64(),
+            spawn_ring_s: setup.ring.as_secs_f64(),
+            guard_s: setup.guard.as_secs_f64(),
+            time_to_control_s: setup.load.as_secs_f64(),
             time_to_level_0_under_camera_s: control
                 .expect("the loop ends with control")
                 .as_secs_f64(),
             fill_s: (setup.load + began.elapsed()).as_secs_f64(),
+            edit_during_fill,
+            edit_during_fill_pending: edit_pending,
         };
         Ok((cold, self.end_path(capture, &setup.spawn, None, None)?))
     }
@@ -1861,6 +2276,7 @@ impl<'a> Session<'a> {
         self.last_ended = None;
         let mut capture = Capture::start(name, &self.world, self.limit_ms);
         let began = Instant::now();
+        self.score_camera = FLIGHTS.contains(&name);
         let camera = loop {
             let t = began.elapsed().as_secs_f64();
             let camera = at(&self.world, t);
@@ -1871,6 +2287,7 @@ impl<'a> Session<'a> {
                 break camera;
             }
         };
+        self.score_camera = false;
         self.end_path(capture, &camera, None, None)
     }
 
@@ -1996,6 +2413,10 @@ impl<'a> Session<'a> {
         // (`harness_ms`), so it is not taken for a slow frame cycle.
         self.look(&camera, false)?;
         self.harness_wait = stopped.elapsed();
+        // The scene has to be at the camera too: a count made while it is still walking to where the
+        // camera stopped, with the bands as they were for the flight, is a count for another place.
+        let mut walked = None;
+        let mut rebanded = None;
         // The view is Still from the frame the camera has stood for STILL_FRAMES frames. That is
         // only marked: nothing is held back here, the settle time is of the scene thread at work.
         let mut stillness = Stillness::default();
@@ -2005,16 +2426,27 @@ impl<'a> Session<'a> {
             self.world.mark_still(standing >= STILL_FRAMES);
             let frame = self.frame(&camera, true)?;
             capture.add(&frame);
-            if frame.soft_misses == 0 && self.world.waiting() == 0 {
-                break Settle {
-                    seconds: stopped.elapsed().as_secs_f64(),
-                    settled: true,
-                };
+            if frame.at_camera && walked.is_none() {
+                walked = Some(stopped.elapsed().as_secs_f64());
             }
-            if stopped.elapsed() >= script.settle_cap {
+            // The last frame that still has nodes to look at for the bands (the release of the depth
+            // comes half a second after the stop, so the first frames have none yet).
+            if walked.is_some() && self.world.rebanding() > 0 {
+                rebanded = Some(stopped.elapsed().as_secs_f64());
+            }
+            let seconds = stopped.elapsed().as_secs_f64();
+            let settled = frame.at_camera && frame.soft_misses == 0 && self.world.waiting() == 0;
+            if settled || stopped.elapsed() >= script.settle_cap {
+                let walk_s = walked.unwrap_or(seconds);
+                let reband_s = (rebanded.unwrap_or(walk_s) - walk_s)
+                    .max(0.0)
+                    .min(seconds - walk_s);
                 break Settle {
-                    seconds: stopped.elapsed().as_secs_f64(),
-                    settled: false,
+                    seconds,
+                    settled,
+                    walk_s,
+                    reband_s,
+                    fill_s: seconds - walk_s - reband_s,
                 };
             }
         };
@@ -2088,13 +2520,13 @@ impl<'a> Session<'a> {
                 && self.world.waiting() == 0
                 && self.world.caught_up(camera.position)
             {
-                break Settle {
+                break CatchUp {
                     seconds: left.elapsed().as_secs_f64(),
                     settled: true,
                 };
             }
             if left.elapsed() >= script.settle_cap {
-                break Settle {
+                break CatchUp {
                     seconds: left.elapsed().as_secs_f64(),
                     settled: false,
                 };
@@ -2232,6 +2664,8 @@ impl<'a> Session<'a> {
             resident_peak_mib: self.resident_peak.map(mib),
             whole_process_peak_mib: self.whole_process_peak.map(mib),
             scene_used_peak_mib: mib(self.scene_used_peak_bytes),
+            scene_used_peak_in: self.scene_used_peak_in.clone(),
+            scene_used_peak_level_bricks: self.scene_used_peak_levels.clone(),
             scene_reserved_mib: mib(self.scene_reserved_bytes),
             scene_gpu_peak_growth_mib: mib(self.gpu.peak_growth_bytes()),
             scene_gpu_peak_rebuild_mib: mib(self.gpu.peak_rebuild_bytes()),
@@ -2268,6 +2702,7 @@ fn one_run(
     limit_ms: f64,
 ) -> Result<RunReport, Stopped> {
     let Built { world, setup, .. } = built;
+    world.set_backed_up_slice(script.stream_slice);
     world.count_soft_misses();
     world.measure_scene_thread();
     // The work the scene thread had done before it was told to measure is the run's baseline.
@@ -2359,12 +2794,16 @@ pub fn run(
     runs: u32,
     resolution: Resolution,
     budgets: &StreamingBudgets,
+    stream_slice: Option<Duration>,
 ) -> RealTimeReport {
-    let script = if full {
+    let mut script = if full {
         Script::full()
     } else {
         Script::short()
     };
+    if let Some(slice) = stream_slice {
+        script.stream_slice = slice;
+    }
     let mut reports = Vec::new();
     let mut d0 = 0.0;
     let mut failure = None;
@@ -2403,16 +2842,49 @@ pub fn run(
 
 const MIB: f64 = 1024.0 * 1024.0;
 
+/// [`PathReport::camera_soft_miss_per_second`]: the misses by second, with an entry for every
+/// second that the path's frames began in (`last` is the start of the last of them).
+fn misses_by_second(miss_seconds: &[u32], last: Option<Instant>, began: Instant) -> Vec<u32> {
+    let mut seconds = miss_seconds.to_vec();
+    if let Some(last) = last {
+        let covered = last.saturating_duration_since(began).as_secs() as usize + 1;
+        if seconds.len() < covered {
+            seconds.resize(covered, 0);
+        }
+    }
+    seconds
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::stream::Measured;
     use super::*;
+
+    #[test]
+    fn the_misses_by_second_cover_every_second_the_path_had() {
+        let began = Instant::now();
+        let at = |s: f64| Some(began + Duration::from_secs_f64(s));
+        // A miss in the sixth second of a path of ten: the array is ten long, not six.
+        let mut recorded = vec![0; 6];
+        recorded[5] = 17;
+        let by_second = misses_by_second(&recorded, at(9.99), began);
+        assert_eq!(by_second, [0, 0, 0, 0, 0, 17, 0, 0, 0, 0]);
+        // No miss at all: a zero for each second.
+        assert_eq!(misses_by_second(&[], at(2.5), began), [0, 0, 0]);
+        // A path with no frames has no seconds.
+        assert!(misses_by_second(&[], None, began).is_empty());
+    }
 
     const BUDGETS: StreamingBudgets = StreamingBudgets {
         frame_time_p99_ms: 16.7,
         frame_cpu_p99_ms: 8.0,
         holes: 0,
         scene_mib: 512.0,
+        camera_soft_miss_frames: 0,
+        scene_lag_d0_max: 8.0,
+        spawn_ring_s: 2.0,
+        time_to_control_s: 10.0,
+        settle_s: 30.0,
     };
 
     fn path(name: &'static str, frame_p99: f64, cpu_p99: f64, holes: u64) -> PathReport {
@@ -2444,9 +2916,31 @@ mod tests {
             scene_lag_d0_max: 0.0,
             scene_lag_voxels_p99: 0.0,
             scene_lag_d0_p99: 0.0,
+            scene_lag_d0_mean: 0.0,
+            scene_used_peak_mib: 0.0,
+            scene_follow_steps: 0,
+            scene_budget_cuts: 0,
+            scene_release_rebuilds: 0,
+            release_frame_ms_max: 0.0,
+            release_update_ms_max: 0.0,
+            camera_soft_miss_per_second: Vec::new(),
+            camera_soft_miss_lag_side: 0,
+            camera_soft_miss_loader_side: 0,
+            lag_over_floor_frames: 0,
+            scene_used_end_mib: 0.0,
+            scene_level_bricks_end: Vec::new(),
             upload: PathUpload::default(),
             soft_misses: Series::default(),
             soft_misses_per_frame: 0.0,
+            camera_soft_miss_frames: 0,
+            generated_bricks: 0,
+            arrived_bricks: 0,
+            loader_queue_max: 0,
+            loader_queue_mean: 0.0,
+            loader_generating_s: 0.0,
+            loader_held_back_s: 0.0,
+            stream_calls: 0,
+            stream_slices_used: 0,
             hole_looks: 2,
             holes,
             holes_per_frame: 0.0,
@@ -2455,7 +2949,6 @@ mod tests {
             scene_update_max_ms: 0.0,
             cap_flips: 0,
             cap_flip_max_ms: 0.0,
-            scene_used_peak_mib: 0.0,
             backlog_peak: 0,
             absorb_updates: 0,
             absorb_ms: 0.0,
@@ -2531,9 +3024,14 @@ mod tests {
         let mut run = RunReport {
             cold_start: ColdStart {
                 world_map_s: Some(25.0),
-                load_s: 60.0,
+                load_s: 6.0,
+                spawn_ring_s: 1.0,
+                guard_s: 4.0,
+                time_to_control_s: 6.0,
                 time_to_level_0_under_camera_s: 61.0,
                 fill_s: 200.0,
+                edit_during_fill: None,
+                edit_during_fill_pending: 0,
             },
             paths: vec![
                 path("cold start", 12.0, 5.0, 0),
@@ -2552,6 +3050,8 @@ mod tests {
                 resident_peak_mib: Some(8000.0),
                 whole_process_peak_mib: Some(9000.0),
                 scene_used_peak_mib: 474.0,
+                scene_used_peak_in: String::new(),
+                scene_used_peak_level_bricks: Vec::new(),
                 scene_reserved_mib: 560.0,
                 scene_gpu_peak_growth_mib: 600.0,
                 scene_gpu_peak_rebuild_mib: 0.0,
@@ -2569,7 +3069,7 @@ mod tests {
                 },
                 hold_s: 3.0,
                 cuts: StillCutsReport::default(),
-                catch_up: Settle {
+                catch_up: CatchUp {
                     seconds: 0.5,
                     settled: true,
                 },
@@ -2704,17 +3204,120 @@ mod tests {
         let gates = gates(&runs, &BUDGETS);
         assert_eq!(gates.frame_time_p99_ms.worst, 20.0);
         assert_eq!(gates.over, ["frame_time"]);
-        // Soft misses, time to control and settle time are reported and not gated: a run with
-        // many, and a long time to control, is still within.
-        let slow_to_settle = run_with(|r| {
-            r.cold_start.time_to_level_0_under_camera_s = 600.0;
-            r.paths[1].soft_misses_per_frame = 5000.0;
-            r.paths[1].settle = Some(Settle {
-                seconds: 120.0,
-                settled: false,
-            });
-        });
-        assert!(over(&[slow_to_settle]).is_empty());
+    }
+
+    /// A path of `name` with a soft miss in `frames` of its frames: the scene thread's count, and
+    /// the camera's.
+    fn soft_misses_in(run: &mut RunReport, name: &str, frames: usize) {
+        let path = run.paths.iter_mut().find(|p| p.name == name).unwrap();
+        path.soft_misses = Series {
+            frames: 100,
+            total: frames as u64 * 10,
+            max: 10,
+            frames_with: frames,
+        };
+    }
+
+    fn camera_soft_misses_in(run: &mut RunReport, name: &str, frames: usize) {
+        let path = run.paths.iter_mut().find(|p| p.name == name).unwrap();
+        path.camera_soft_miss_frames = frames;
+    }
+
+    #[test]
+    fn the_soft_miss_gate_fires_alone_for_one_frame_with_one_under_the_camera_on_a_flight() {
+        let one = run_with(|r| camera_soft_misses_in(r, "flight at 2 m", 1));
+        assert_eq!(over(std::slice::from_ref(&one)), ["soft_misses"]);
+        // Frames are summed over the flights, and the worst run is the one that counts.
+        let report = RealTimeReport::new("test".into(), 64.0, vec![one], &BUDGETS);
+        assert_eq!(report.gates.camera_soft_miss_frames.worst, 1.0);
+        assert_eq!(exit_code(&report, false), 2);
+        // The cold start and the stop are not flights: they fill and refine, and have soft misses.
+        let cold = run_with(|r| camera_soft_misses_in(r, "cold start", 9000));
+        assert!(over(&[cold]).is_empty());
+    }
+
+    #[test]
+    fn the_scene_threads_own_soft_misses_are_reported_and_not_gated() {
+        let run = run_with(|r| soft_misses_in(r, "flight at 2 m", 482));
+        assert!(over(std::slice::from_ref(&run)).is_empty());
+        let report = RealTimeReport::new("test".into(), 64.0, vec![run], &BUDGETS);
+        assert_eq!(report.gates.scene_soft_miss_frames, 482);
+        assert_eq!(report.gates.camera_soft_miss_frames.worst, 0.0);
+        assert_eq!(exit_code(&report, false), 0);
+    }
+
+    #[test]
+    fn the_scene_lag_gate_fires_alone_for_a_flight_that_lags_over_its_limit() {
+        let lag = |name: &str, d0: f64| {
+            run_with(|r| {
+                let path = r.paths.iter_mut().find(|p| p.name == name).unwrap();
+                path.scene_lag_d0_max = d0;
+            })
+        };
+        assert_eq!(over(&[lag("flight at 2 m", 8.01)]), ["scene_lag"]);
+        assert!(over(&[lag("flight at 2 m", 8.0)]).is_empty());
+        // Not a flight: the cold start has no camera to lag.
+        assert!(over(&[lag("cold start", 50.0)]).is_empty());
+        let report = RealTimeReport::new(
+            "test".into(),
+            64.0,
+            vec![lag("flight at 2 m", 9.2)],
+            &BUDGETS,
+        );
+        assert_eq!(report.gates.scene_lag_d0_max.worst, 9.2);
+        assert_eq!(exit_code(&report, false), 2);
+    }
+
+    #[test]
+    fn the_spawn_ring_gate_fires_alone_for_a_ring_over_its_limit() {
+        let slow = run_with(|r| r.cold_start.spawn_ring_s = 2.01);
+        assert_eq!(over(std::slice::from_ref(&slow)), ["spawn_ring"]);
+        assert!(over(&[run_with(|r| r.cold_start.spawn_ring_s = 2.0)]).is_empty());
+        // The Guard after the ring is in the time to control, not in this.
+        assert!(over(&[run_with(|r| r.cold_start.guard_s = 6.0)]).is_empty());
+    }
+
+    #[test]
+    fn the_time_to_control_gate_fires_alone_for_a_load_to_the_window_over_its_limit() {
+        let slow = run_with(|r| r.cold_start.time_to_control_s = 10.01);
+        assert_eq!(over(std::slice::from_ref(&slow)), ["time_to_control"]);
+        assert!(over(&[run_with(|r| r.cold_start.time_to_control_s = 10.0)]).is_empty());
+        // The rest of the cold start is reported, not gated.
+        assert!(
+            over(&[run_with(|r| {
+                r.cold_start.load_s = 600.0;
+                r.cold_start.time_to_level_0_under_camera_s = 600.0;
+            })])
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn the_settle_gate_fires_alone_for_a_stop_that_takes_longer_than_its_limit_or_never_settles() {
+        let settle = |seconds: f64, settled: bool| {
+            run_with(|r| {
+                let flight = r
+                    .paths
+                    .iter_mut()
+                    .find(|p| p.name == "flight at 2 m")
+                    .unwrap();
+                flight.settle = Some(Settle {
+                    seconds,
+                    settled,
+                    walk_s: seconds / 3.0,
+                    reband_s: seconds / 3.0,
+                    fill_s: seconds / 3.0,
+                });
+            })
+        };
+        assert_eq!(over(&[settle(30.1, true)]), ["settle"]);
+        assert!(over(&[settle(30.0, true)]).is_empty());
+        // At the cap: over whatever the limit is.
+        assert_eq!(over(&[settle(20.0, false)]), ["settle"]);
+        // Reported, and not gated, for any other path: those have no settle.
+        let report = RealTimeReport::new("test".into(), 64.0, vec![settle(31.0, true)], &BUDGETS);
+        assert_eq!(report.gates.settle_s.worst, 31.0);
+        assert_eq!(exit_code(&report, false), 2);
     }
 
     #[test]
@@ -2888,6 +3491,8 @@ mod tests {
                 "scene_gpu_peak_rebuild_mib",
                 "scene_host_peak_growth_mib",
                 "scene_reserved_mib",
+                "scene_used_peak_in",
+                "scene_used_peak_level_bricks",
                 "scene_used_peak_mib",
                 "store_limit_bricks",
                 "store_peak_bricks",
@@ -2899,7 +3504,12 @@ mod tests {
             [
                 "absorb_ms",
                 "absorb_updates",
+                "arrived_bricks",
                 "backlog_peak",
+                "camera_soft_miss_frames",
+                "camera_soft_miss_lag_side",
+                "camera_soft_miss_loader_side",
+                "camera_soft_miss_per_second",
                 "cap_flip_max_ms",
                 "cap_flips",
                 "end_look_ms",
@@ -2909,19 +3519,33 @@ mod tests {
                 "frames",
                 "frames_over_limit",
                 "frames_over_limit_by_update",
+                "generated_bricks",
                 "hole_looks",
                 "holes",
                 "holes_per_frame",
+                "lag_over_floor_frames",
                 "largest_updates",
+                "loader_generating_s",
+                "loader_held_back_s",
+                "loader_queue_max",
+                "loader_queue_mean",
                 "name",
                 "over_limit_at",
+                "release_frame_ms_max",
+                "release_update_ms_max",
+                "scene_budget_cuts",
+                "scene_follow_steps",
                 "scene_lag_d0_max",
+                "scene_lag_d0_mean",
                 "scene_lag_d0_p99",
                 "scene_lag_voxels_max",
                 "scene_lag_voxels_p99",
+                "scene_level_bricks_end",
+                "scene_release_rebuilds",
                 "scene_round_max_ms",
                 "scene_thread",
                 "scene_update_max_ms",
+                "scene_used_end_mib",
                 "scene_used_peak_mib",
                 "seconds",
                 "settle",
@@ -2931,6 +3555,8 @@ mod tests {
                 "soft_misses",
                 "soft_misses_per_frame",
                 "still_cuts",
+                "stream_calls",
+                "stream_slices_used",
                 "upload"
             ]
         );
@@ -3009,14 +3635,21 @@ mod tests {
                 "hole_scan_ms",
                 "hole_scan_share",
                 "pack_ms",
+                "reband_ms",
+                "release_ms",
                 "upload_ms"
             ]
         );
         assert_eq!(
             keys(&json["runs"][0]["cold_start"]),
             [
+                "edit_during_fill",
+                "edit_during_fill_pending",
                 "fill_s",
+                "guard_s",
                 "load_s",
+                "spawn_ring_s",
+                "time_to_control_s",
                 "time_to_level_0_under_camera_s",
                 "world_map_s"
             ]
@@ -3024,14 +3657,20 @@ mod tests {
         assert_eq!(
             keys(&json["gates"]),
             [
+                "camera_soft_miss_frames",
                 "frame_cpu_p99_ms",
                 "frame_time_p99_ms",
                 "hole_looks_fewest_in_a_path",
                 "hole_looks_fewest_in_a_run",
                 "holes",
                 "over",
+                "scene_lag_d0_max",
                 "scene_mib",
-                "store_bricks"
+                "scene_soft_miss_frames",
+                "settle_s",
+                "spawn_ring_s",
+                "store_bricks",
+                "time_to_control_s"
             ]
         );
     }
@@ -3412,6 +4051,36 @@ mod tests {
         assert_eq!(Spread::of(&[3.0]).p99_ms, 3.0);
     }
 
+    /// The catch-up between paths ends with the scene at the camera: the scene thread has not
+    /// learnt that the camera is back until a frame has run at it, so stats from the path before
+    /// say "idle" while the scene is still where that path left it (the 180 degree turn was left
+    /// about 300 m up).
+    #[test]
+    fn the_catch_up_between_paths_ends_with_the_scene_at_the_camera() {
+        let built = build_test().expect("the test Planet builds");
+        let Built { world, setup, .. } = built;
+        let mut gpu = NoGpu;
+        let mut session = Session::new(world, &mut gpu, BUDGETS.frame_time_p99_ms);
+        let spawn = setup.spawn;
+        let cap = Duration::from_secs(120);
+        session.settle(&spawn, cap, "the start").expect("settles");
+        // The camera goes up and the scene follows it there and goes idle.
+        let mut away = spawn;
+        for a in 0..3 {
+            away.position[a] += spawn.horizon_up[a] * 300.0;
+        }
+        let began = Instant::now();
+        while session.world.lag(away.position) != 0.0 || !session.idle() {
+            session.frame(&away, false).expect("a frame");
+            assert!(began.elapsed() < cap, "the scene did not follow the camera");
+        }
+        assert!(session.world.lag(spawn.position) > 0.0);
+        // The catch-up at the Spawn does not return on the stats of the place it came from.
+        session.settle(&spawn, cap, "the flight").expect("settles");
+        assert_eq!(session.world.lag(spawn.position), 0.0);
+        assert!(session.idle());
+    }
+
     /// The real-time mode on the test Planet, with real workers and a real scene thread and no GPU:
     /// every path runs and the report has its fields. It asserts no time bound, only what was run and
     /// that the parts of a frame's cycle are inside it: how long anything took is not for a test
@@ -3467,6 +4136,16 @@ mod tests {
                 .any(|p| p.absorb_updates > 0 && p.absorb_ms > 0.0),
             "no path absorbed a flip"
         );
+        // The scene thread's longest round (#213) was timed: in the run, and in the crossing,
+        // where the thread works the whole time.
+        assert!(
+            run.paths.iter().any(|p| p.scene_round_max_ms > 0.0),
+            "no path timed a round of the scene thread"
+        );
+        assert!(
+            crossing.is_some_and(|p| p.scene_round_max_ms > 0.0),
+            "the crossing timed no round: {crossing:?}"
+        );
         let stop = run.paths.last().unwrap();
         assert!(stop.still_cuts.is_some());
         assert!(run.paths[..6].iter().all(|p| p.still_cuts.is_none()));
@@ -3474,8 +4153,10 @@ mod tests {
             assert!(path.frames > 0, "{}", path.name);
             assert_eq!(path.frame_time.samples, path.frames);
             assert_eq!(path.frame_cpu.samples, path.frames);
-            // The scene thread's longest round (#213) was timed.
-            assert!(path.scene_round_max_ms > 0.0, "{}", path.name);
+            // (That the scene thread's longest round was timed is asserted below for the run and
+            // for the crossing, not for each path: a thread on a runner that is slow to schedule
+            // may have no round end in the frames of a path, as the CI's Ubuntu runner had none in
+            // the turn and its Windows runner none in the 50 m flight.)
             // Not that the round is at least as long as the update: the counters are taken
             // between an update and the end of its round, so the longest update of the round that
             // straddles the end of a path is in this path and the round's time in the next.
@@ -3572,6 +4253,127 @@ mod tests {
         serde_json::to_string(&report).expect("the report serializes");
     }
 
+    /// One run of the paths at **full size with no GPU**: the real loader and scene thread on the
+    /// machine's clock, the frame thread's work without the copy and the draw. What the scene
+    /// thread does (soft misses, the drawn lag, the settle time, the time to level 0) is what a
+    /// run with a GPU has to within the machine's speed; the frame times are not (#168 chose the
+    /// speed-scaled curve from it, on a box with no GPU). `BENCH_RUNS` runs (default 1).
+    /// `cargo test --release -p client --bin client -- --ignored --nocapture a_full_size_run_with_no_gpu`
+    #[test]
+    #[ignore = "generates the full-size world map and takes about 15 minutes a run"]
+    fn a_full_size_run_with_no_gpu_reports_what_the_scene_thread_did() {
+        let runs: u32 = std::env::var("BENCH_RUNS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1);
+        // `STREAM_SLICE_MS`: another slice for taking in while the loader is backed up.
+        let mut script = Script::full();
+        if let Some(ms) = std::env::var("STREAM_SLICE_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+        {
+            script.stream_slice = Duration::from_millis(ms);
+        }
+        for run in 1..=runs {
+            let built = build_full().expect("the full-size Planet builds");
+            let report = one_run(built, &mut NoGpu, &script, BUDGETS.frame_time_p99_ms)
+                .unwrap_or_else(|stopped| {
+                    panic!("the run stopped at {}: {}", stopped.step, stopped.error)
+                });
+            eprintln!(
+                "RUN {run}: stream slice {:?}, load {:.1} s, level 0 under the camera {:.1} s, fill {:.0} s, holes {}, edit {:?}, edit in the fill {:?} with {} asked for, scene thread in the release rebuild {:.0} ms",
+                script.stream_slice,
+                report.cold_start.load_s,
+                report.cold_start.time_to_level_0_under_camera_s,
+                report.cold_start.fill_s,
+                report.holes,
+                report.edit_latency,
+                report.cold_start.edit_during_fill,
+                report.cold_start.edit_during_fill_pending,
+                report.scene_thread.release_ms,
+            );
+            for path in &report.paths {
+                eprintln!(
+                    "  {:>20}: {:>5} frames, soft misses/frame {:>9.0} (frames with {:>5}, max {:>7}; under the camera {:>4}: lag side {:>4}, loader side {:>4}; frames over the floor {:>4}), lag max {:>5.2} d0 mean {:>5.2}, scene used {:>6.1} MiB, \
+                     cpu p99 {:>5.2} ms, scene follow {:>7.0} ms pack {:>7.0} ms reband {:>7.0} ms, generated {:>9} arrived {:>9} \
+                     loader queue max {:>8} mean {:>9.0}, loader generating {:>6.1} s held back {:>6.1} s, \
+                     stream calls {:>6} slices used up {:>6}, settle (s, walk, reband, fill, settled) {:?}",
+                    path.name,
+                    path.frames,
+                    path.soft_misses_per_frame,
+                    path.soft_misses.frames_with,
+                    path.soft_misses.max,
+                    path.camera_soft_miss_frames,
+                    path.camera_soft_miss_lag_side,
+                    path.camera_soft_miss_loader_side,
+                    path.lag_over_floor_frames,
+                    path.scene_lag_d0_max,
+                    path.scene_lag_d0_mean,
+                    path.scene_used_peak_mib,
+                    path.frame_cpu.p99_ms,
+                    path.scene_thread.follow_ms,
+                    path.scene_thread.pack_ms,
+                    path.scene_thread.reband_ms,
+                    path.generated_bricks,
+                    path.arrived_bricks,
+                    path.loader_queue_max,
+                    path.loader_queue_mean,
+                    path.loader_generating_s,
+                    path.loader_held_back_s,
+                    path.stream_calls,
+                    path.stream_slices_used,
+                    path.settle
+                        .map(|s| (s.seconds, s.walk_s, s.reband_s, s.fill_s, s.settled)),
+                );
+            }
+            for path in &report.paths {
+                eprintln!(
+                    "  {:>20}: scene used peak {:.1} MiB, at the end {:.1} MiB, bricks at each level at the end {:?}",
+                    path.name,
+                    path.scene_used_peak_mib,
+                    path.scene_used_end_mib,
+                    path.scene_level_bricks_end,
+                );
+                if path.camera_soft_miss_frames > 0 {
+                    eprintln!(
+                        "  {:>20}: camera misses by second {:?}, follow rounds {}, budget cuts {}",
+                        path.name,
+                        path.camera_soft_miss_per_second,
+                        path.scene_follow_steps,
+                        path.scene_budget_cuts,
+                    );
+                }
+                if path.scene_release_rebuilds > 0 {
+                    eprintln!(
+                        "  {:>20}: {} release rebuilds, scene thread {:.0} ms, longest frame {:.1} ms with an update of {:.1} ms",
+                        path.name,
+                        path.scene_release_rebuilds,
+                        path.scene_thread.release_ms,
+                        path.release_frame_ms_max,
+                        path.release_update_ms_max,
+                    );
+                }
+            }
+            {
+                let still = &report.still_after_flight;
+                eprintln!(
+                    "  still after a flight: before the hold {:?}, held {:.1} s, cuts {:?}, catch up {:?}, holes {}",
+                    still.before_hold,
+                    still.hold_s,
+                    still.cuts,
+                    still.catch_up,
+                    still.holes_after_catch_up
+                );
+            }
+            eprintln!(
+                "  scene used peak {:.1} MiB in {:?}, bricks at each level then {:?}",
+                report.memory.scene_used_peak_mib,
+                report.memory.scene_used_peak_in,
+                report.memory.scene_used_peak_level_bricks
+            );
+        }
+    }
+
     /// The sea-level crossing at full size, without a GPU (#213): the scene thread's longest round
     /// in each path, and the flips' updates held against the others'. The scene thread's rounds are
     /// the same work as on the 4090 (a frame's time is not, with no GPU). It runs the whole
@@ -3645,10 +4447,23 @@ mod tests {
             crossing.cap_flips, crossing.scene_update_max_ms, crossing.scene_round_max_ms,
         );
         assert_eq!(crossing.holes, 0);
+        // The depth of the dive is kept under the sea (#168): a release that found the camera there
+        // made the scene as the wide one, 552 to 572 MiB.
+        assert!(
+            crossing.scene_used_peak_mib <= BUDGETS.scene_mib,
+            "the crossing's scene peaked at {:.1} MiB, over the {} MiB gate",
+            crossing.scene_used_peak_mib,
+            BUDGETS.scene_mib
+        );
         assert!(
             crossing.cap_flips >= 2,
             "the crossing flipped the cap both ways"
         );
+        // The bound is loose since #168: an "ordinary" update now includes the follow step right
+        // after a step of the speed scale's depth (550 to 718 ms on the 4090 at `0f5a936`, 504 to 665
+        // in the orchestrator's later runs, against 304 to 476 before it: millions of queue entries
+        // come due at once), so a regression in #213's flip
+        // update (214 to 284 ms there) of up to that much would not fail this.
         assert!(
             flip_update <= ordinary_update,
             "a flip's update is {flip_update:.2} ms, over the other paths' {ordinary_update:.2} ms"

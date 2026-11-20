@@ -91,6 +91,10 @@ fn streamed(store: BrickStore, scene: Scene, camera: [f64; 3], run: Run) -> (Wor
         Run::Stepped => world.with_stepped_loader(Loader::stepped(source, camera, bands())),
         Run::Threads(workers) => world.with_loader(Loader::new(source, camera, bands(), workers)),
     };
+    // The tests of following, the budget and eviction fly at speeds that the bands' speed scale
+    // (ADR 0009, #168) changes: they are of the bands as they are. The tests of the scale turn it
+    // on.
+    world.worker().speed_scale(false);
     (world, server)
 }
 
@@ -486,6 +490,59 @@ fn after_walking_at_5_m_per_s_the_loader_fills_in_and_the_ground_under_the_camer
     );
     let hit = trace(world.scene(), &down).expect("ground under the camera");
     assert_eq!(world.scene().level_at(hit.voxel), Some(0));
+}
+
+/// How many bricks the scene draws at each level, for the golden of
+/// [`standing_and_walking_under_10_m_per_s_draw_exactly_what_they_drew_before_speed_scaling`].
+fn drawn_by_level(world: &World) -> Vec<usize> {
+    (0..LEVELS).map(|level| world.level_bricks(level)).collect()
+}
+
+/// Standing and walking (under 10 m/s) draw exactly what they drew before the camera's speed
+/// scaled the bands (#168, ADR 0009: full detail up to 10 m/s). The golden is what the bricks
+/// drawn at each level came to on main before that change (`b309516`): a stand of a second
+/// and then a walk of six seconds at 6 m/s with the camera's velocity told to the scene thread (as
+/// the game does), each ended by the resident set being complete. It is a count at each of the
+/// 18 levels, a fingerprint of the cut of the pyramid that is drawn; the bands are also
+/// compared whole, for the scale the speed puts on them.
+#[test]
+fn standing_and_walking_under_10_m_per_s_draw_exactly_what_they_drew_before_speed_scaling() {
+    const STANDING: [usize; LEVELS] = [
+        1298, 1538, 1551, 1539, 1541, 1522, 1531, 1586, 1555, 1572, 1607, 1540, 1551, 1503, 404, 0,
+        0, 0,
+    ];
+    const WALKING: [usize; LEVELS] = [
+        1806, 1547, 1517, 1506, 1542, 1553, 1572, 1579, 1555, 1572, 1607, 1540, 1551, 1503, 404, 0,
+        0, 0,
+    ];
+    let (mut world, _server, mut camera) = spawned_world(Run::Stepped);
+    world.worker().speed_scale(true);
+    let (ahead, _) = tangents(camera.horizon_up);
+    let speed = 6.0 * VOXELS_PER_METRE;
+    let velocity = ahead.map(|c| c * speed);
+    for _ in 0..60 {
+        world.recentre_moving(camera.position, [0.0; 3]).unwrap();
+        stream(&mut world, camera.position);
+        pace(&world, FRAME);
+        assert_eq!(world.bands(), Some(bands()));
+    }
+    fill(&mut world, camera.position);
+    let standing = drawn_by_level(&world);
+    let mut walked = camera.position;
+    for _ in 0..360 {
+        walked = std::array::from_fn(|a| walked[a] + ahead[a] * speed / 60.0);
+        let position = over_the_ground(&world.store(), walked);
+        camera.position = position;
+        camera.carry_up(position);
+        world.recentre_moving(position, velocity).unwrap();
+        stream(&mut world, position);
+        pace(&world, FRAME);
+        assert_eq!(world.bands(), Some(bands()), "walking is not scaled");
+    }
+    fill(&mut world, camera.position);
+    let walking = drawn_by_level(&world);
+    assert_eq!(standing, STANDING);
+    assert_eq!(walking, WALKING);
 }
 
 #[test]
@@ -2139,6 +2196,41 @@ fn a_look_now_counts_the_soft_misses_and_looks_for_holes_whatever_the_clock_says
     assert_eq!(world.stats().work.holes_found, 0);
 }
 
+/// The look for holes that is only due (every 5 s of the world's clock) is not made while the
+/// bands are speed-scaled: on the 4090 it held the store's read lock for 90 ms in a flight and the
+/// camera had misses in the second after it (#168). It is made when the camera has slowed.
+#[test]
+fn a_look_for_holes_that_is_due_waits_for_a_camera_that_has_slowed() {
+    let (mut world, _server, camera) = spawned_world(Run::Stepped);
+    world.worker().speed_scale(true);
+    fill(&mut world, camera.position);
+    world.measure_scene_thread();
+    let looks = world.stats().work.hole_scans;
+    let step = 50.0 * brick_store::VOXELS_PER_METRE / 60.0;
+    let (ahead, _) = tangents(camera.horizon_up);
+    let mut moved = camera.position;
+    // 6 s of a flight at 50 m/s: the look is due after 5.
+    for _ in 0..360 {
+        moved = std::array::from_fn(|a| moved[a] + ahead[a] * step);
+        let at = over_the_ground(&world.store(), moved);
+        stream(&mut world, at);
+        pace(&world, FRAME);
+    }
+    assert_eq!(
+        world.stats().work.hole_scans,
+        looks,
+        "a look was made in the flight"
+    );
+    // Stopped: the depth is given back after its hold, and the look that was due is made.
+    let at = over_the_ground(&world.store(), moved);
+    let mut patience = Patience::new(Duration::from_secs(60));
+    while world.stats().work.hole_scans == looks {
+        stream(&mut world, at);
+        patience.wait(&world, || "no look for holes after the stop".into());
+    }
+    assert_eq!(world.stats().work.hole_scans, looks + 1);
+}
+
 #[test]
 fn a_prefetch_lead_makes_bricks_ahead_that_a_camera_without_one_does_not() {
     let (mut without, _s, camera) = spawned_world(Run::Stepped);
@@ -3243,6 +3335,9 @@ struct Flown {
     /// The most that the scene (as of the last update taken) was from the camera, in Voxels, in a
     /// frame of the flight.
     max_lag: f64,
+    /// Changes of the bands' speed scale in the flight, and the bricks they changed.
+    speed_changes: u64,
+    speed_bricks: u64,
 }
 
 /// The camera flown `frames` frames of `step` Voxels along the ground from the spawn, in a stepped
@@ -3349,6 +3444,8 @@ fn fly_counting_world(
     flown.follow_steps = after.follow_steps - before.follow_steps;
     flown.pack_steps = after.pack_steps - before.pack_steps;
     flown.arrived_bricks = after.arrived_bricks - before.arrived_bricks;
+    flown.speed_changes = after.speed_changes - before.speed_changes;
+    flown.speed_bricks = after.speed_bricks - before.speed_bricks;
     let mut patience = Patience::new(Duration::from_secs(180));
     loop {
         let cut = take(&mut world, position, &mut flown);
@@ -3589,6 +3686,94 @@ fn the_update_where_the_cap_goes_off_and_on_at_sea_level_is_measured() {
     assert_eq!(holes, 0, "the cap going off and on left holes");
 }
 
+/// The depth of a flight is not given back while the camera itself is under the sea's sphere
+/// (#168, #213): a camera that dives under the sea at 50 m/s and stops there keeps the bands of
+/// the flight, and no release rebuilds the scene as the wide one (a scene made again there has the
+/// horizon cap off), which is over the memory gate at full size (555 to 572 MiB against 512). Once
+/// the raised camera is over the sphere, **even inside the 50 m that the cap's hysteresis holds it
+/// off for**, the release goes through: a scene made again there has the cap on.
+#[test]
+fn the_depth_of_a_flight_is_kept_while_the_camera_is_under_the_sea_and_given_back_over_it() {
+    dive_and_release(0);
+}
+
+/// [`the_depth_of_a_flight_is_kept_while_the_camera_is_under_the_sea_and_given_back_over_it`] with a
+/// release that lists fewer nodes than the limit: it is made again all the same, because the scene's
+/// cap went off under the sea and a reband in place would keep it off (until 50 m over): the scene
+/// would be the wide one at rest bands for a camera that stopped 10 m over.
+#[test]
+fn a_release_over_the_sphere_under_the_rebuild_limit_still_makes_the_scene_again_while_the_cap_is_off()
+ {
+    dive_and_release(usize::MAX);
+}
+
+fn dive_and_release(rebuild_over: usize) {
+    let (mut world, _server, camera) = margined_world_under(Run::Stepped, None, true);
+    world.worker().speed_scale(true);
+    world.worker().set_release_rebuild_over(rebuild_over);
+    world.count_exactly();
+    fill(&mut world, camera.position);
+    let sea = planet().sea_radius();
+    let raise = render::lod::Margins::standard().vertical;
+    let radius = |p: [f64; 3]| p.iter().map(|c| c * c).sum::<f64>().sqrt();
+    let up = camera.position.map(|c| c / radius(camera.position));
+    let at = |r: f64| up.map(|u| u * r);
+    let step = FIFTY_METRES_A_SECOND;
+    let scale = |world: &World| world.stats().bands.expect("a scene with bands").scale();
+    // The radius at which the raised camera is `height` Voxels over the sea's sphere.
+    let radius_at = |height: f64| sea + height - raise;
+    let mut r = radius(camera.position);
+    // Flies the camera to the radius `to` at 50 m/s, and stands there for `frames`.
+    let fly = |world: &mut World, r: &mut f64, to: f64, frames: usize| {
+        let sign = if to > *r { 1.0 } else { -1.0 };
+        while (to - *r) * sign > 0.0 {
+            *r += sign * step.min((to - *r).abs());
+            let velocity = up.map(|u| u * sign * step * 60.0);
+            world.recentre_moving(at(*r), velocity).unwrap();
+            pace(world, FRAME);
+        }
+        for _ in 0..frames {
+            world.recentre_moving(at(*r), [0.0; 3]).unwrap();
+            pace(world, FRAME);
+        }
+    };
+    // Down through the sea and a way under it.
+    fly(&mut world, &mut r, radius_at(-30.0 * VOXELS_PER_METRE), 0);
+    let deep = scale(&world);
+    assert!(deep < 0.5, "the dive is at depth: {deep}");
+    // Stopped at the bottom for several seconds (the hold is half of one): kept, nothing waits.
+    for _ in 0..300 {
+        world.recentre_moving(at(r), [0.0; 3]).unwrap();
+        pace(&world, FRAME);
+    }
+    assert_eq!(scale(&world), deep, "given back at the bottom");
+    assert_eq!(world.stats().work.release_rebuilds, 0);
+    assert!(
+        !world.reband_pending(),
+        "nothing is waited for: no release is pending"
+    );
+    // Up to just under the sphere, and stopped: still kept.
+    fly(&mut world, &mut r, radius_at(-2.0 * VOXELS_PER_METRE), 300);
+    assert_eq!(scale(&world), deep, "given back under the sphere");
+    assert_eq!(world.stats().work.release_rebuilds, 0);
+    // The scene's cap went off under the sea, and stays off until 50 m over it.
+    assert!(world.worker().selection_cap_is_off());
+    // 10 m over it, inside the hysteresis band of the cap's coming on (50 m), and stopped: given
+    // back, as a rebuild (the scene made again there has the cap on).
+    fly(&mut world, &mut r, radius_at(10.0 * VOXELS_PER_METRE), 0);
+    let mut frames = 0;
+    while scale(&world) < 1.0 || world.reband_pending() {
+        world.recentre_moving(at(r), [0.0; 3]).unwrap();
+        pace(&world, FRAME);
+        frames += 1;
+        assert!(frames < 20_000, "never given back: depth {}", scale(&world));
+    }
+    assert_eq!(world.stats().work.release_rebuilds, 1);
+    assert!(radius_at(10.0 * VOXELS_PER_METRE) + raise - sea < CAP_ON_VOXELS);
+    // The scene made again at the camera has the cap on there.
+    assert!(!world.worker().selection_cap_is_off());
+}
+
 /// The height over the sea at which the cap comes back on (`select::CAP_ON`), 50 m.
 const CAP_ON_VOXELS: f64 = 50.0 * VOXELS_PER_METRE;
 
@@ -3689,6 +3874,139 @@ fn a_flight_over_ground_that_is_still_loading_has_follow_steps_within_the_budget
             "the throttled flight's update {frame}: {gaps} bytes between copies"
         );
     }
+}
+
+/// A flight at 50 m/s with the speed scale on (ADR 0009, #168), which coarsens the bands by a
+/// level and a half on the way: **a reband in a flight is inside the budget**. The camera goes
+/// from the spawn at 50 m/s (16.7 Voxels a frame) in a world that has filled in, so that the
+/// scene is to be selected again for the new `d0` while it follows. There is no hole, no jump, no
+/// update that is more than the budget and the operations that crossed it (the bound of
+/// `a_flight_over_ground_that_is_still_loading…`), and the scene follows the camera in every frame
+/// (the lag that a reband adds is the real-time bench's, `scene_lag_d0_max`).
+#[test]
+fn a_reband_in_a_flight_at_fifty_metres_a_second_has_no_hole_and_uploads_inside_the_budget() {
+    let (step, frames) = (50.0 * brick_store::VOXELS_PER_METRE / 60.0, 300);
+    let fly = |scale: bool| {
+        let (world, _server, camera) = spawned_world(Run::Stepped);
+        world.worker().speed_scale(scale);
+        let (ahead, _) = tangents(camera.horizon_up);
+        let mut moved = camera.position;
+        fly_counting_world(
+            world,
+            camera,
+            None,
+            frames,
+            true,
+            Duration::ZERO,
+            move |store, _| {
+                moved = std::array::from_fn(|a| moved[a] + ahead[a] * step);
+                over_the_ground(store, moved)
+            },
+        )
+    };
+    let off = fly(false);
+    let on = fly(true);
+    eprintln!("off {off:?}\non {on:?}");
+    assert_eq!(off.speed_changes, 0);
+    assert!(on.speed_changes >= 1, "the scale never changed: {on:?}");
+    assert!(on.speed_bricks > 0, "the reband changed nothing: {on:?}");
+    assert_eq!((on.rebuilds, on.holes), (0, 0), "{on:?}");
+    let budget = crate::scene_worker::UPLOAD_BUDGET;
+    // The budget, the operation that took what waits over it, and the first batch of the round.
+    let bound = (
+        budget.bytes + 2 * on.largest_batch.bytes.max(budget.bytes / 4),
+        budget.writes + 2 * on.largest_batch.writes.max(budget.writes / 4),
+    );
+    for (frame, &(listed, writes, _)) in on.uploads.0.iter().enumerate() {
+        assert!(
+            listed <= bound.0 && writes <= bound.1,
+            "update {frame}: {listed} bytes, {writes} copies, over {bound:?}"
+        );
+    }
+    // A stepped scene thread is at the camera after every round, so what lag a reband adds is the
+    // real-time bench's to measure (`scene_lag_d0_max`); the scene walked every frame of it here.
+    assert_eq!(on.follow_steps, frames as u64, "{on:?}");
+}
+
+/// A camera that is put somewhere is not at a speed (#168): after a flight at 50 m/s, a teleport
+/// makes the scene again for the depth of the speed it has now (none), and the release of the
+/// depth the flight had does not come half a second later and list the whole of the new scene to
+/// look at again.
+#[test]
+fn a_teleport_after_a_flight_has_the_depth_of_its_speed_at_once_and_no_release_after_it() {
+    let (mut world, _server, camera) = spawned_world(Run::Stepped);
+    world.worker().speed_scale(true);
+    world.count_exactly();
+    fill(&mut world, camera.position);
+    let (ahead, _) = tangents(camera.horizon_up);
+    let step = 50.0 * brick_store::VOXELS_PER_METRE / 60.0;
+    let mut moved = camera.position;
+    for _ in 0..240 {
+        moved = std::array::from_fn(|a| moved[a] + ahead[a] * step);
+        let at = over_the_ground(&world.store(), moved);
+        world.recentre(at).unwrap();
+        pace(&world, FRAME);
+    }
+    let bands = world.stats().bands.expect("a scene with bands");
+    assert!(
+        bands.scale() < 0.5,
+        "the flight is at depth: {}",
+        bands.scale()
+    );
+    // Put the camera far away, and keep it there for a second and a half, a frame at a time.
+    let there = over_the_ground(
+        &world.store(),
+        std::array::from_fn(|a| camera.position[a] - ahead[a] * 4.0 * render::scene::JUMP * D0),
+    );
+    let before = world.stats().work;
+    let mut rebuilds = 0;
+    let mut listed_after = 0;
+    for frame in 0..90 {
+        let update = world.recentre(there).unwrap();
+        rebuilds += usize::from(matches!(update, Some(SceneUpdate::Rebuilt)));
+        if frame > 0 {
+            listed_after = listed_after.max(world.rebanding());
+        }
+        pace(&world, FRAME);
+    }
+    let after = world.stats().work;
+    assert_eq!(rebuilds, 1, "the scene was made again once");
+    let bands = world.stats().bands.expect("a scene with bands");
+    assert_eq!(
+        bands.scale(),
+        1.0,
+        "the depth is the speed's, which is none"
+    );
+    assert_eq!(
+        listed_after, 0,
+        "nothing is listed to look at after the jump"
+    );
+    assert_eq!(
+        after.speed_bricks - before.speed_bricks,
+        0,
+        "no node was looked at again for the bands"
+    );
+    assert!(
+        after.speed_changes - before.speed_changes <= 1,
+        "one change of depth, at the jump: {}",
+        after.speed_changes - before.speed_changes
+    );
+}
+
+/// The scene thread notes the speed it was given whether or not it draws for it (the scale off, or
+/// no bands): a thread that is idle waits while the inbox has what it looked at, so a speed that it
+/// did not note would find the inbox different on every wake and the thread would never sleep.
+#[test]
+fn the_scene_thread_notes_the_speed_it_was_given_with_the_scale_off() {
+    let (mut world, _server, camera) = spawned_world(Run::Stepped);
+    world.worker().speed_scale(false);
+    let speed = 50.0 * brick_store::VOXELS_PER_METRE;
+    world.recentre_at(camera.position, [0.0; 3], speed).unwrap();
+    assert_eq!(world.worker().speed_looked_at(), speed);
+    // And with it on, as before.
+    world.worker().speed_scale(true);
+    world.recentre_at(camera.position, [0.0; 3], 0.0).unwrap();
+    assert_eq!(world.worker().speed_looked_at(), 0.0);
 }
 
 /// What `follow_with_an_outbox_that_is_not_taken` saw.
@@ -4513,6 +4831,327 @@ fn hold_still_catching_up(
     world.still_cuts().since(before)
 }
 
+/// How many batches of arrivals a round of the scene thread took in, and whether it ended because
+/// its slice was spent, from a world with a backlog that a backed-up loader is on (#168): a stepped
+/// thread whose every batch takes 5 ms of its clock (over an ordinary slice), a job from the frame
+/// thread waiting after `job_after` of them, if there is one. A stepped loader makes 256 jobs a
+/// round and a batch takes up to 128, so a round that is not cut has two.
+fn batches_in_a_backed_up_round(job_after: Option<u32>) -> (u64, u64) {
+    let (mut world, _server, camera) = spawned_world(Run::Stepped);
+    world.count_exactly();
+    world
+        .worker()
+        .back_up_arrivals(Duration::from_millis(5), job_after);
+    let before = world.stats().work;
+    world.recentre(camera.position).unwrap();
+    let work = world.stats().work;
+    (
+        work.pack_steps - before.pack_steps,
+        work.stream_slices_used - before.stream_slices_used,
+    )
+}
+
+/// The backed-up loader's long slice (`BACKED_UP_SLICE`, 32 ms) is cut short by a job from the frame
+/// thread (an Edit, a new camera's jobs) that waits for the round to end, once an ordinary slice
+/// has been spent: a long slice is not a delay on an Edit (#168). Without one, the round takes in
+/// all that waits, though a batch took the time of the ordinary slice and more.
+#[test]
+fn a_waiting_frame_thread_job_cuts_the_backed_up_slice_short() {
+    let (long, long_used) = batches_in_a_backed_up_round(None);
+    let (cut, cut_used) = batches_in_a_backed_up_round(Some(1));
+    assert_eq!((long, long_used), (2, 0), "no job waiting");
+    assert_eq!(
+        (cut, cut_used),
+        (1, 1),
+        "a job waiting after the first batch"
+    );
+}
+
+/// A loader that stops being backed up in the middle of a long slice makes it an ordinary one,
+/// which the time already spent is over: the slice was not used up (#168, P5), and a loader that
+/// is backed up all the round, whose slice runs out, is.
+#[test]
+fn a_loader_that_stops_being_backed_up_mid_slice_has_not_used_the_slice_up() {
+    let used = |catch_up: Option<u32>| {
+        let (mut world, _server, camera) = spawned_world(Run::Stepped);
+        world.count_exactly();
+        // 20 ms a batch: the 32 ms slice is used up by the second batch if the loader stays so.
+        world
+            .worker()
+            .back_up_arrivals(Duration::from_millis(20), None);
+        if let Some(after) = catch_up {
+            world.worker().catch_up_after(after);
+        }
+        let before = world.stats().work;
+        world.recentre(camera.position).unwrap();
+        let work = world.stats().work;
+        (
+            work.pack_steps - before.pack_steps,
+            work.stream_slices_used - before.stream_slices_used,
+        )
+    };
+    let (_, backed_up) = used(None);
+    let (_, caught_up) = used(Some(1));
+    assert_eq!((backed_up, caught_up), (1, 0));
+}
+
+/// The long slice gives way to a camera that has moved too (#168, P1): its lag rose with the
+/// slice, as the scene thread is out of the round that follows the camera while it takes in. A
+/// camera a quarter of the scaled `d0` from the scene is waited for, one that is nearer is not.
+#[test]
+fn a_camera_that_moves_cuts_the_backed_up_slice_short_and_one_that_hardly_moves_does_not() {
+    let round = |move_by: Option<f64>| {
+        let (mut world, _server, camera) = spawned_world(Run::Stepped);
+        world.count_exactly();
+        world
+            .worker()
+            .back_up_arrivals(Duration::from_millis(5), None);
+        let d0 = world.stats().bands.expect("bands").d0();
+        if let Some(by) = move_by {
+            let mut to = camera.position;
+            to[0] += by * d0;
+            world.worker().move_camera_after(1, to);
+        }
+        let before = world.stats().work;
+        world.recentre(camera.position).unwrap();
+        let work = world.stats().work;
+        work.pack_steps - before.pack_steps
+    };
+    assert_eq!(round(None), 2, "no camera moves");
+    assert_eq!(round(Some(0.1)), 2, "a camera that moved a tenth of d0");
+    assert_eq!(round(Some(0.5)), 1, "a camera that moved half of d0");
+}
+
+/// A reband that is pending at the stop is waited for before the hold (#168, #217): a flight at
+/// 50 m/s with the speed scale on leaves the bands a level and a half coarser, the camera stops,
+/// and the depth is given back half a second after (`RELEASE_HOLD`) and listed to be looked at
+/// again, which moves what every ring selects. The scene is at the camera from the first frame
+/// of the stop, so a hold that looked at the lag alone would begin at once and then be cut by the
+/// reband; the hold waits for the bands, and then gets at most 1 cut.
+fn stop_with_a_release_over(rebuild_over: usize) -> (World, bool) {
+    use crate::world::{CATCH_UP_CAP, CAUGHT_UP_LAG, Hold};
+    let (mut world, _server, camera) = spawned_world(Run::Stepped);
+    world.worker().speed_scale(true);
+    world.worker().set_release_rebuild_over(rebuild_over);
+    world.count_exactly();
+    fill(&mut world, camera.position);
+    let (ahead, _) = tangents(camera.horizon_up);
+    let step = 50.0 * brick_store::VOXELS_PER_METRE / 60.0;
+    let velocity: [f64; 3] = std::array::from_fn(|a| ahead[a] * step * 60.0);
+    let mut at = camera.position;
+    for _ in 0..240 {
+        at = over_the_ground(
+            &world.store(),
+            std::array::from_fn(|a| at[a] + ahead[a] * step),
+        );
+        world.recentre_moving(at, velocity).unwrap();
+        pace(&world, FRAME);
+    }
+    let deep = world.stats().bands.expect("a scene with bands").scale();
+    assert!(deep < 0.5, "the flight is at depth: {deep}");
+
+    // The stop: the scene is walked to the camera, and the view is Still after STILL_FRAMES frames.
+    let mut still = Stillness::default();
+    let mut lag_alone = 0;
+    let mut frames = 0;
+    let mut pending_at_hold = None;
+    while world.still_hold().began().is_none() {
+        let hold = world.hold_still(Mode::Reference, still.observe(at), at);
+        stream(&mut world, at);
+        pace(&world, FRAME);
+        // Frames in which the scene is at the camera and the view is Still, and the hold waits
+        // all the same: it is the reband that it waits for.
+        if hold == Hold::CatchingUp && world.lag(at) < CAUGHT_UP_LAG && world.reband_pending() {
+            lag_alone += 1;
+        }
+        pending_at_hold = Some(world.reband_pending());
+        frames += 1;
+        assert!(frames < 600, "never held: lag {:.0}", world.lag(at));
+    }
+    let began = world.still_hold().began().expect("the hold has begun");
+    assert!(
+        lag_alone >= 20,
+        "{lag_alone} frames waited for a reband that the lag did not ask for: {began:?}"
+    );
+    let _ = CATCH_UP_CAP;
+    // The hold began with nothing to reband, at the depth of a camera that stands.
+    assert_eq!(pending_at_hold, Some(false));
+    assert!(!world.reband_pending());
+    assert_eq!(world.stats().bands.expect("bands").scale(), 1.0);
+    (world, began.capped)
+}
+
+/// A release that would list more than the limit makes the scene again at the new depth, and the
+/// hold after a flight is not capped (#168, C1 and C2): the stop's catch-up waits for the rebuild,
+/// which is one update (`Rebuild::Release`) and a scene with nothing left to look at again, where
+/// listing the nodes (the control, a limit that is not reached) is a relook that goes on.
+#[test]
+fn a_release_over_the_limit_makes_the_scene_again_and_the_hold_after_it_is_not_capped() {
+    let (mut control, _) = stop_with_a_release_over(usize::MAX);
+    assert_eq!(control.stats().work.release_rebuilds, 0);
+    let (mut world, capped) = stop_with_a_release_over(0);
+    assert!(!capped);
+    // Both are let to fill in where the camera stands (the hold began with the scene at the
+    // camera, not with the loader done).
+    let at = world.stats().camera.expect("a camera");
+    let at_control = control.stats().camera.expect("a camera");
+    world.pause_loading(false);
+    control.pause_loading(false);
+    fill(&mut world, at);
+    fill(&mut control, at_control);
+    assert_eq!(
+        world.stats().work.release_rebuilds,
+        1,
+        "{:?}",
+        world.stats().work
+    );
+    assert_eq!(world.rebanding(), 0);
+    assert!(!world.reband_pending());
+    assert_eq!(
+        world.scene().rebuild_reason(),
+        Some(render::Rebuild::Release)
+    );
+    assert_eq!(world.stats().holes, 0);
+    // The scene is what the control's is once both have settled: the same cut of the tree.
+    for level in 0..LEVELS {
+        let (rebuilt, relooked) = (world.level_bricks(level), control.level_bricks(level));
+        assert!(
+            rebuilt.abs_diff(relooked) <= 8.max(relooked / 50),
+            "level {level}: {rebuilt} drawn after the rebuild, {relooked} after the relook"
+        );
+    }
+}
+
+/// A reband that is pending at the stop is waited for before the hold (#168, #217): a flight at
+/// 50 m/s with the speed scale on leaves the bands a level and a half coarser, the camera stops,
+/// and the depth is given back half a second after (`RELEASE_HOLD`) and listed to be looked at
+/// again, which moves what every ring selects. The scene is at the camera from the first frame
+/// of the stop, so a hold that looked at the lag alone would begin at once and then be cut by the
+/// reband; the hold waits for the bands, and then gets at most 1 cut.
+#[test]
+fn a_reband_pending_at_the_stop_delays_the_hold_and_the_hold_then_gets_at_most_one_cut() {
+    use crate::world::{CATCH_UP_CAP, CAUGHT_UP_LAG, Hold};
+    let (mut world, _server, camera) = spawned_world(Run::Stepped);
+    world.worker().speed_scale(true);
+    world.count_exactly();
+    fill(&mut world, camera.position);
+    let (ahead, _) = tangents(camera.horizon_up);
+    let step = 50.0 * brick_store::VOXELS_PER_METRE / 60.0;
+    let velocity: [f64; 3] = std::array::from_fn(|a| ahead[a] * step * 60.0);
+    let mut at = camera.position;
+    for _ in 0..240 {
+        at = over_the_ground(
+            &world.store(),
+            std::array::from_fn(|a| at[a] + ahead[a] * step),
+        );
+        world.recentre_moving(at, velocity).unwrap();
+        pace(&world, FRAME);
+    }
+    let deep = world.stats().bands.expect("a scene with bands").scale();
+    assert!(deep < 0.5, "the flight is at depth: {deep}");
+
+    // The stop: the scene is walked to the camera, and the view is Still after STILL_FRAMES frames.
+    let mut still = Stillness::default();
+    let mut lag_alone = 0;
+    let mut frames = 0;
+    let mut pending_at_hold = None;
+    while world.still_hold().began().is_none() {
+        let hold = world.hold_still(Mode::Reference, still.observe(at), at);
+        stream(&mut world, at);
+        pace(&world, FRAME);
+        // Frames in which the scene is at the camera and the view is Still, and the hold waits
+        // all the same: it is the reband that it waits for.
+        if hold == Hold::CatchingUp && world.lag(at) < CAUGHT_UP_LAG && world.reband_pending() {
+            lag_alone += 1;
+        }
+        pending_at_hold = Some(world.reband_pending());
+        frames += 1;
+        assert!(frames < 600, "never held: lag {:.0}", world.lag(at));
+    }
+    let began = world.still_hold().began().expect("the hold has begun");
+    assert!(
+        lag_alone >= 20,
+        "{lag_alone} frames waited for a reband that the lag did not ask for: {began:?}"
+    );
+    assert!(!began.capped, "{began:?} (the cap is {CATCH_UP_CAP:?})");
+    // The hold began with nothing to reband, at the depth of a camera that stands.
+    assert_eq!(pending_at_hold, Some(false));
+    assert!(!world.reband_pending());
+    assert_eq!(world.stats().bands.expect("bands").scale(), 1.0);
+    // And now the Reference view has a scene that stays.
+    let before = world.still_cuts();
+    for _ in 0..180 {
+        world.hold_still(Mode::Reference, still.observe(at), at);
+        stream(&mut world, at);
+        pace(&world, FRAME);
+    }
+    let cuts = world.still_cuts().since(before);
+    assert!(cuts.frames >= 150, "{cuts:?}");
+    assert!(cuts.cuts <= 1, "{cuts:?}");
+    assert_eq!(cuts.of(crate::scene_worker::Cause::Reband), 0, "{cuts:?}");
+}
+
+/// What a flight left to reband is not looked at while the view is Still, and is when it is not
+/// (#168, #217): a scene thread that holds the scene does not make a reband's patches either,
+/// and leaving Still catches up with no hole.
+#[test]
+fn a_reband_listed_while_the_scene_is_held_waits_for_the_view_to_leave_still() {
+    use crate::scene_worker::Cause;
+    let (mut world, _server, camera) = spawned_world(Run::Stepped);
+    world.worker().speed_scale(true);
+    world.count_exactly();
+    fill(&mut world, camera.position);
+    let (ahead, _) = tangents(camera.horizon_up);
+    let step = 50.0 * brick_store::VOXELS_PER_METRE / 60.0;
+    let velocity: [f64; 3] = std::array::from_fn(|a| ahead[a] * step * 60.0);
+    let mut at = camera.position;
+    for _ in 0..240 {
+        at = over_the_ground(
+            &world.store(),
+            std::array::from_fn(|a| at[a] + ahead[a] * step),
+        );
+        world.recentre_moving(at, velocity).unwrap();
+        pace(&world, FRAME);
+    }
+    // Held at once (the cap's case: no catching up), for two seconds, which is over the release.
+    let mut still = Stillness::default();
+    let before = world.still_cuts();
+    let looked = world.stats().work.speed_bricks;
+    for _ in 0..120 {
+        held(&mut world, &mut still, Mode::Reference, at);
+    }
+    let cuts = world.still_cuts().since(before);
+    assert!(cuts.of(Cause::Reband) == 0 && cuts.cuts <= 1, "{cuts:?}");
+    assert_eq!(
+        world.stats().work.speed_bricks,
+        looked,
+        "looked at while held"
+    );
+    let scale = world.stats().bands.expect("bands").scale();
+    assert!(
+        scale < 0.5,
+        "the depth was not given back while held: {scale}"
+    );
+    // Leaving Still: the depth is given back and what it lists is looked at.
+    let mut at_now = at;
+    let mut patience = Patience::new(Duration::from_secs(120));
+    loop {
+        at_now = std::array::from_fn(|a| at_now[a] + 1e-3 * (a as f64 + 1.0));
+        held(&mut world, &mut still, Mode::Reference, at_now);
+        assert!(!world.loading_paused());
+        if idle(&world) && !world.stats().throttled && !world.reband_pending() {
+            break;
+        }
+        patience.wait(&world, || "does not catch up".into());
+    }
+    assert_eq!(world.stats().bands.expect("bands").scale(), 1.0);
+    assert!(
+        world.stats().work.speed_bricks > looked,
+        "nothing was looked at"
+    );
+    assert_eq!(world.stats().holes, 0);
+}
+
 #[test]
 fn a_scene_that_cannot_catch_up_is_held_at_the_cap_and_the_hold_says_so() {
     use crate::world::{CATCH_UP_CAP, CAUGHT_UP_LAG, Hold};
@@ -4731,4 +5370,102 @@ fn updates_that_are_taken_while_the_view_is_not_still_are_not_cuts_and_an_edit_t
         cuts.of(Cause::Coarse) >= 1,
         "the coarse levels were remade: {cuts:?}"
     );
+}
+
+/// The bricks that the world's scene draws, in all.
+fn drawn_in_all(world: &World) -> usize {
+    (0..LEVELS).map(|level| world.level_bricks(level)).sum()
+}
+
+/// Flies `cycles` times at 50 m/s for `frames` frames and then stands until the scene has settled
+/// (nothing waits, nothing is listed to look at again, the depth is the camera's at rest), in a
+/// world that has filled in, with the speed scale on and the release made again once it would list
+/// more than `rebuild_over` nodes. Returns the bricks drawn at rest before the flights, those
+/// settled after each, the most drawn at any frame of each cycle, and the release rebuilds.
+fn stop_and_go(
+    cycles: usize,
+    frames: usize,
+    rebuild_over: usize,
+) -> (usize, Vec<usize>, Vec<usize>, u64) {
+    let (mut world, _server, camera) = spawned_world(Run::Stepped);
+    world.worker().speed_scale(true);
+    world.worker().set_release_rebuild_over(rebuild_over);
+    world.count_exactly();
+    fill(&mut world, camera.position);
+    let at_rest = drawn_in_all(&world);
+    let (ahead, _) = tangents(camera.horizon_up);
+    let step = 50.0 * brick_store::VOXELS_PER_METRE / 60.0;
+    let velocity: [f64; 3] = std::array::from_fn(|a| ahead[a] * step * 60.0);
+    let mut at = camera.position;
+    let (mut settled, mut peaks) = (Vec::new(), Vec::new());
+    for _ in 0..cycles {
+        let mut peak = 0;
+        for _ in 0..frames {
+            at = over_the_ground(
+                &world.store(),
+                std::array::from_fn(|a| at[a] + ahead[a] * step),
+            );
+            world.recentre_moving(at, velocity).unwrap();
+            peak = peak.max(drawn_in_all(&world));
+            pace(&world, FRAME);
+        }
+        let mut patience = Patience::new(Duration::from_secs(300));
+        loop {
+            world.recentre_moving(at, [0.0; 3]).unwrap();
+            peak = peak.max(drawn_in_all(&world));
+            pace(&world, FRAME);
+            if idle(&world)
+                && !world.reband_pending()
+                && !world.stats().throttled
+                && world.lag(at) < 1.0
+                && world
+                    .stats()
+                    .bands
+                    .is_some_and(|bands| bands.scale() == 1.0)
+            {
+                break;
+            }
+            patience.wait(&world, || {
+                format!(
+                    "does not settle: lag {:.0}, {} to reband",
+                    world.lag(at),
+                    world.rebanding()
+                )
+            });
+        }
+        settled.push(drawn_in_all(&world));
+        peaks.push(peak);
+    }
+    let rebuilds = world.stats().work.release_rebuilds;
+    (at_rest, settled, peaks, rebuilds)
+}
+
+/// Stop-and-go flights do not stack the scene (#168, C3): what a flight leaves is not held by a
+/// relook that has not reached it, and the release that would list more than the limit makes the
+/// scene again, so after each stop the scene is what a camera at rest has, and the most it drew in
+/// a cycle is no more than the first cycle's, which is at the rest set plus one band's worth.
+#[test]
+fn repeated_stop_and_go_flights_do_not_stack_the_scene_above_the_rest_set_plus_one_band() {
+    for (name, over) in [("relook", usize::MAX), ("rebuild", 0)] {
+        let (at_rest, settled, peaks, rebuilds) = stop_and_go(3, 240, over);
+        eprintln!(
+            "{name}: at rest {at_rest}, settled {settled:?}, peaks {peaks:?}, {rebuilds} rebuilds"
+        );
+        assert_eq!(rebuilds > 0, over == 0, "{name}: {rebuilds} rebuilds");
+        for (cycle, &drawn) in settled.iter().enumerate() {
+            assert!(
+                drawn <= at_rest + at_rest / 10,
+                "{name}: {drawn} drawn after stop {cycle}, {at_rest} at rest"
+            );
+        }
+        // One band: the most the first cycle drew over what is at rest. The others are no more
+        // than it (with a little for where the camera is).
+        let band = peaks[0].saturating_sub(at_rest);
+        for (cycle, &peak) in peaks.iter().enumerate().skip(1) {
+            assert!(
+                peak <= at_rest + band + at_rest / 20,
+                "{name}: cycle {cycle} drew {peak}, {at_rest} at rest and a band of {band}"
+            );
+        }
+    }
 }

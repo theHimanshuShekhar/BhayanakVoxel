@@ -57,10 +57,13 @@ const SPAWN_PITCH: f64 = -25.0;
 /// How far above the ground the client spawns, in Voxels: 4 m.
 const SPAWN_HEIGHT: f64 = 4.0 * VOXELS_PER_METRE;
 /// Voxels from the spawn point that the client generates the full crust to, along the ground (see
-/// [`Planet::crust_around`]): the spawn ring, 40 m, which takes about 7.7 s on eight cores at 5 cm (it was 1.5 s at 10 cm). The
-/// loader generates the rest of what the LOD bands draw (#86). The character does not walk on
-/// the ring: it walks on the ground that the predictor makes around it (see [`sim::Ground`]).
-const SPAWN_REACH: i32 = (40.0 * VOXELS_PER_METRE) as i32;
+/// [`Planet::crust_around`]): the spawn ring, 20 m (#168: it was 40 m, 3.4 s on the dev box's eight
+/// cores and 7.7 s on the first measure, at 5 cm; a ring of half the radius is a quarter of the
+/// bricks). The player has control when this ring is there (ADR 0009); the loader generates the
+/// rest of what the LOD bands draw, nearest first, to 40 m and then the shell (#86). The character
+/// does not walk on the ring: it walks on the ground that the predictor makes around it (see
+/// [`sim::Ground`]), which the Leash confines it to.
+const SPAWN_REACH: i32 = (20.0 * VOXELS_PER_METRE) as i32;
 
 /// How far above the ground the character is set down, in Voxels (30 cm): it drops the last few.
 const DROP_HEIGHT: f64 = 0.3 * VOXELS_PER_METRE;
@@ -384,6 +387,11 @@ struct Loaded {
     camera: Camera,
     /// A point on the ground to put the character down on.
     ground: [f64; 3],
+    /// How long the spawn ring and the Guard took: the player has control when the ring is there
+    /// (ADR 0009), and the window waits for the Guard as well, so that nothing past the ring is
+    /// sky.
+    ring_took: Duration,
+    guard_took: Duration,
     /// Sea level's distance from the centre, in Voxels (the horizon cap's sphere).
     sea: f64,
 }
@@ -396,6 +404,7 @@ struct Ground {
     server_store: BrickStore,
     camera: Camera,
     ground: [f64; 3],
+    took: Duration,
 }
 
 /// Generates the spawn ring on gentle land of the Planet of `map`: the full crust at level 0
@@ -412,6 +421,7 @@ fn generate_ground(map: WorldMap, reach: i32, levels: usize) -> Ground {
         store.len(),
         started.elapsed()
     );
+    let took = started.elapsed();
     // Generation is deterministic, so the server's Planet is what generating it again would
     // give; copying it is quicker. The server draws nothing, so it has no pyramid (an Edit there
     // would remake its coarse bricks for nothing, on the simulation thread), and it reads the
@@ -424,6 +434,7 @@ fn generate_ground(map: WorldMap, reach: i32, levels: usize) -> Ground {
         server_store,
         camera: spawn_camera(ground),
         ground,
+        took,
     }
 }
 
@@ -496,6 +507,7 @@ fn load(map: WorldMap, reach: i32) -> Result<Loaded, RingsFull> {
         server_store,
         camera,
         ground,
+        took: ring_took,
     } = generate_ground(map, reach, RING_LEVELS);
     let bands = Bands::standard(f64::from(DEFAULT_BIAS));
     let room = room_for(bands);
@@ -504,6 +516,7 @@ fn load(map: WorldMap, reach: i32) -> Result<Loaded, RingsFull> {
     store.set_budget(budget_for(bands));
     let guarded = Instant::now();
     let held = loader::hold_guard(&mut store, &planet, GUARD_FIRST);
+    let guard_took = guarded.elapsed();
     eprintln!(
         "Guard (levels {GUARD_FIRST} to {}, the whole Planet): {held} bricks in {:.2?}",
         RING_LEVELS - 1,
@@ -570,6 +583,8 @@ fn load(map: WorldMap, reach: i32) -> Result<Loaded, RingsFull> {
         loader,
         camera,
         ground,
+        ring_took,
+        guard_took,
         sea: planet.sea_radius(),
     })
 }
@@ -1445,6 +1460,8 @@ impl ApplicationHandler for App {
 }
 
 fn main() -> Result<ExitCode, Box<dyn Error>> {
+    // The threads that read and pack bricks for a scene made again run below the frame thread.
+    render::scene::select::set_worker_start(priority::lower_current_thread);
     let mut args = std::env::args().skip(1);
     match args.next().as_deref() {
         Some("bench") => return Ok(bench::main(args)),

@@ -235,7 +235,7 @@ fn check_convergence(convergence: &Value, out: &Path) {
 }
 
 fn check_schema(report: &Value, out: &Path) {
-    assert_eq!(report["schema_version"], 26);
+    assert_eq!(report["schema_version"], 27);
     // The Edit stress is of the whole Planet, which the patch is not.
     assert!(report["edits"].is_null());
     // The streaming mode is asked for (see its own test); the other tests do not. The real-time
@@ -279,6 +279,8 @@ fn check_schema(report: &Value, out: &Path) {
     assert!(config["keyframes"].as_u64().unwrap() >= 2);
     // The LOD bias is recorded (1 unless asked).
     assert_eq!(config["bias"], 1.0);
+    // The scene thread's slice for taking in while the loader is backed up is recorded.
+    assert_eq!(config["stream_slice_ms"], 32.0);
 
     check_convergence(&report["convergence"], out);
 

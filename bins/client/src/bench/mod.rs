@@ -310,10 +310,17 @@ fn run(args: &Args) -> Result<u8, Box<dyn Error>> {
     // The real-time mode runs after the stepped one, for the same reason: its own world and GPU. If
     // a run of it stops on an error, the report still has everything that was done before, and the
     // error: tens of minutes of the 4090's time are not thrown away for the last run's.
+    let stream_slice = args
+        .stream_slice_ms
+        .map(|ms| std::time::Duration::from_millis(u64::from(ms)));
     let streaming_real_time = match real_time_budgets {
-        Some(budgets) if args.real_time => {
-            Some(realtime::run(!plan.patch, args.runs, resolution, &budgets))
-        }
+        Some(budgets) if args.real_time => Some(realtime::run(
+            !plan.patch,
+            args.runs,
+            resolution,
+            &budgets,
+            stream_slice,
+        )),
         _ => None,
     };
 
@@ -342,6 +349,10 @@ fn run(args: &Args) -> Result<u8, Box<dyn Error>> {
             path: plan.path_name.to_string(),
             keyframes: plan.path.keyframes(),
             bias: args.bias,
+            stream_slice_ms: stream_slice
+                .unwrap_or(crate::scene_worker::BACKED_UP_SLICE)
+                .as_secs_f64()
+                * 1e3,
             diag: args.diag.switches(),
         },
         altitudes,
@@ -828,10 +839,12 @@ fn print_real_time(r: &realtime::RealTimeReport) {
     for (n, run) in r.runs.iter().enumerate() {
         let c = &run.cold_start;
         eprintln!(
-            "  run {}: level 0 under the camera {:.1} s after the load began (load {:.1} s), resident set complete after {:.1} s",
+            "  run {}: level 0 under the camera {:.1} s after the load began (load {:.1} s: spawn ring {:.2} s, Guard {:.1} s), resident set complete after {:.1} s",
             n + 1,
             c.time_to_level_0_under_camera_s,
             c.load_s,
+            c.spawn_ring_s,
+            c.guard_s,
             c.fill_s
         );
         for p in &run.paths {
@@ -858,6 +871,18 @@ fn print_real_time(r: &realtime::RealTimeReport) {
                     } else {
                         " (not settled: the cap)"
                     }
+                ))
+            );
+            eprintln!(
+                "        loader: {} bricks generated, {} arrived, queue max {} mean {:.0}; scene thread reband {:.0} ms{}",
+                p.generated_bricks,
+                p.arrived_bricks,
+                p.loader_queue_max,
+                p.loader_queue_mean,
+                p.scene_thread.reband_ms,
+                p.settle.map_or(String::new(), |s| format!(
+                    "; settle: walk {:.1} s, reband {:.1} s, fill {:.1} s",
+                    s.walk_s, s.reband_s, s.fill_s
                 ))
             );
             // Where the time of the slowest frames went, when there were frames over the limit.
@@ -890,8 +915,9 @@ fn print_real_time(r: &realtime::RealTimeReport) {
         }
         let t = &run.scene_thread;
         eprintln!(
-            "    scene thread: follow {:.0}, pack {:.0}, upload {:.0}, eviction {:.0}, coarse {:.0}, hole looks {:.0} ms; scene used peak {:.0} MiB (reserved {:.0} MiB), store peak {} of {} bricks, resident peak {} MiB (whole process {} MiB); {} looks, {} holes in the run; {}",
+            "    scene thread: follow {:.0}, reband {:.0}, pack {:.0}, upload {:.0}, eviction {:.0}, coarse {:.0}, hole looks {:.0} ms; scene used peak {:.0} MiB (reserved {:.0} MiB), store peak {} of {} bricks, resident peak {} MiB (whole process {} MiB); {} looks, {} holes in the run; {}",
             t.follow_ms,
+            t.reband_ms,
             t.pack_ms,
             t.upload_ms,
             t.evict_ms,
@@ -935,6 +961,11 @@ fn print_real_time(r: &realtime::RealTimeReport) {
         ("holes", g.holes),
         ("scene (MiB)", g.scene_mib),
         ("store (bricks)", g.store_bricks),
+        ("soft-miss frames, flights", g.camera_soft_miss_frames),
+        ("scene lag, flights (d0)", g.scene_lag_d0_max),
+        ("spawn ring (s)", g.spawn_ring_s),
+        ("time to control (s)", g.time_to_control_s),
+        ("settle (s)", g.settle_s),
     ] {
         eprintln!(
             "  gate {name:<20} worst {:>12.2} limit {:>12.2}{}",

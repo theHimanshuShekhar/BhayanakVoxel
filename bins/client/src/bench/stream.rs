@@ -1122,6 +1122,14 @@ pub fn counts() -> StreamReport {
         .expect("the stepped run completes")
 }
 
+/// [`counts`] with the bands' speed scale (ADR 0009, #168) off: the run as it was before it.
+#[cfg(test)]
+pub fn counts_without_speed_scale() -> StreamReport {
+    let streamer = Streamer::new();
+    streamer.world.worker().speed_scale(false);
+    streamer.run(&mut NoGpu).expect("the stepped run completes")
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::OnceLock;
@@ -1158,6 +1166,19 @@ mod tests {
         );
         assert_eq!(first.upload.bytes.total, first.work.upload_bytes);
         assert!(first.timing.is_none(), "a run with no GPU has no timing");
+    }
+
+    /// The counts' hash of the run as it was on `main` before the speed scale (#168), which the
+    /// scale off must still give: stepping, selection and following are those, bit for bit.
+    const BEFORE_SPEED_SCALING: &str = "2466f0700e79713a";
+
+    #[test]
+    fn with_the_speed_scale_off_the_counts_are_those_the_run_had_before_it() {
+        assert_eq!(
+            counts_without_speed_scale().counts_hash,
+            BEFORE_SPEED_SCALING,
+            "the speed scale off changed what the stepped run counts"
+        );
     }
 
     #[test]

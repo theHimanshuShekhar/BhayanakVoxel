@@ -29,12 +29,16 @@ pub fn loading_paused_for(mode: Mode, still_frames: u32) -> bool {
 }
 
 /// The longest a Still view waits for the scene to reach the camera before it holds the scene
-/// where it is (#217): 5 s. A Reference view that starts later costs nothing but the wait, and the
-/// Primary view is drawn meanwhile; one that starts on a scene that is behind the camera
-/// converges on ground coarser than Primary's, for as long as the camera stands. So the cap is
-/// for a scene that cannot get there (the loader far behind, say), not a time to be reached in
-/// the usual way: the bench reports a hold that began at the cap ([`HoldBegan::capped`]).
-pub const CATCH_UP_CAP: std::time::Duration = std::time::Duration::from_secs(5);
+/// where it is (#217): 12 s (it was 5 s; the owner raised it on 2026-11-17, #168). A Reference
+/// view that starts later costs nothing but the wait, and the Primary view is drawn meanwhile;
+/// one that starts on a scene that is behind the camera converges on ground coarser than
+/// Primary's, for as long as the camera stands. So the cap is for a scene that cannot get there
+/// (the loader far behind, say), not a time to be reached in the usual way: the bench reports a
+/// hold that began at the cap ([`HoldBegan::capped`]). 12 s is what lets the wait cover the
+/// release rebuild of a flight's end (#168: the scene made again at the finer depth, which
+/// ends 10.9 to 11.2 s after the view goes Still on the 4090, measured on `a7c6b72`: 12 s leaves
+/// little room); the dev box's is 24 to 37 s and still hits it.
+pub const CATCH_UP_CAP: std::time::Duration = std::time::Duration::from_secs(12);
 
 /// How far the scene may be behind the camera, in Voxels, for it to have caught up (#217): one
 /// (5 cm). The scene thread follows the camera to the exact place, and a still camera is the
@@ -381,6 +385,13 @@ pub struct World {
 struct Motion {
     last: Option<(std::time::Instant, [f64; 3])>,
     velocity: [f64; 3],
+    /// The speed the bands are drawn for (ADR 0009), in Voxels a second: a running mean as the
+    /// velocity is, but not cut at [`MOST_LEAD_SPEED`], since a Zoom's flight that fast is a camera
+    /// to draw coarse, though it is not one to look ahead along; a single frame's jump (a
+    /// teleport) is not a speed: it is 0 for it, and the speed is what the camera does after.
+    speed: f64,
+    /// Frames in a row that were over [`MOST_LEAD_SPEED`].
+    fast: u32,
 }
 
 /// Faster than this, in Voxels a second (400 m/s, several times the flight speed), the camera
@@ -388,7 +399,8 @@ struct Motion {
 const MOST_LEAD_SPEED: f64 = 400.0 * brick_store::VOXELS_PER_METRE;
 
 impl Motion {
-    /// The velocity after the camera was seen at `camera` at `now`.
+    /// The velocity after the camera was seen at `camera` at `now`. [`Motion::speed`] is the
+    /// bands' own.
     fn observe(&mut self, camera: [f64; 3], now: std::time::Instant) -> [f64; 3] {
         let before = self.last.replace((now, camera));
         let Some((then, from)) = before else {
@@ -400,14 +412,33 @@ impl Motion {
         }
         let raw: [f64; 3] = std::array::from_fn(|a| (camera[a] - from[a]) / dt);
         let speed = raw.iter().map(|v| v * v).sum::<f64>().sqrt();
+        let alpha = (dt / 0.1).min(1.0);
+        if dt > 0.25 {
+            self.speed = 0.0;
+            self.fast = 0;
+        } else if speed > MOST_LEAD_SPEED {
+            self.fast += 1;
+            // The second frame in a row is a flight, not a jump: at once the speed of the flight.
+            // The first is a jump (a teleport) and no speed: the speed the camera had before it
+            // would be given back a frame at a time after it, long after the scene has been made
+            // again at the camera's new place.
+            self.speed = if self.fast >= 2 { speed } else { 0.0 };
+        } else {
+            self.fast = 0;
+            self.speed += (speed - self.speed) * alpha;
+        }
         if dt > 0.25 || speed > MOST_LEAD_SPEED {
             self.velocity = [0.0; 3];
             return self.velocity;
         }
-        let alpha = (dt / 0.1).min(1.0);
         self.velocity =
             std::array::from_fn(|a| self.velocity[a] + (raw[a] - self.velocity[a]) * alpha);
         self.velocity
+    }
+
+    /// The speed the bands are drawn for, as of the last sighting.
+    fn speed(&self) -> f64 {
+        self.speed
     }
 }
 
@@ -629,6 +660,14 @@ impl World {
         }
     }
 
+    /// Tells the scene thread how long to take in what the loader made for while the loader's
+    /// workers are as far ahead as they may be (see [`SceneWorker::set_backed_up_slice`]).
+    pub fn set_backed_up_slice(&self, slice: std::time::Duration) {
+        if let Some(worker) = &self.worker {
+            worker.set_backed_up_slice(slice);
+        }
+    }
+
     /// Has the scene thread count the soft misses (by level) and the holes for every publish, so
     /// that the stats the world has are exact for each frame (see [`SceneWorker::count_exactly`]).
     pub fn count_exactly(&self) {
@@ -754,6 +793,12 @@ impl World {
         self.of_scene(|s| s.waiting, Scene::waiting)
     }
 
+    /// Nodes that the scene thread has yet to look at again for a change of the bands (ADR 0009):
+    /// zero once the scene is drawn as the speed's bands ask. (Also in [`World::waiting`].)
+    pub fn rebanding(&self) -> usize {
+        self.of_scene(|s| s.rebanding, Scene::rebanding)
+    }
+
     pub fn scene(&self) -> &Scene {
         &self.scene
     }
@@ -855,17 +900,16 @@ impl World {
     /// the rings are never half moved.
     pub fn recentre(&mut self, camera: [f64; 3]) -> Result<Option<SceneUpdate>, RingsFull> {
         let velocity = self.lead_velocity(camera, self.clock.now());
-        self.recentre_moving(camera, velocity)
+        // The bands' speed is the camera's own, whether or not it is looked ahead along.
+        let speed = self.motion.speed();
+        self.recentre_at(camera, velocity, speed)
     }
 
     /// The velocity [`World::recentre`] hands to the scene thread for the camera seen at `camera`
     /// at `now`: the measured one, or none if the lead is off.
     fn lead_velocity(&mut self, camera: [f64; 3], now: std::time::Instant) -> [f64; 3] {
-        if self.lead {
-            self.motion.observe(camera, now)
-        } else {
-            [0.0; 3]
-        }
+        let velocity = self.motion.observe(camera, now);
+        if self.lead { velocity } else { [0.0; 3] }
     }
 
     /// [`World::recentre`] with the camera's `velocity` given, in Voxels a second, for the lead
@@ -875,9 +919,22 @@ impl World {
         camera: [f64; 3],
         velocity: [f64; 3],
     ) -> Result<Option<SceneUpdate>, RingsFull> {
+        let speed = velocity.iter().map(|v| v * v).sum::<f64>().sqrt();
+        self.recentre_at(camera, velocity, speed)
+    }
+
+    /// [`World::recentre_moving`] with the `speed` the bands are drawn for given too (Voxels a
+    /// second), which is the camera's whether or not it has a lead: a Zoom (#58) is drawn for its
+    /// speed, along which prefetch does not look.
+    pub fn recentre_at(
+        &mut self,
+        camera: [f64; 3],
+        velocity: [f64; 3],
+        speed: f64,
+    ) -> Result<Option<SceneUpdate>, RingsFull> {
         match &self.worker {
             Some(worker) => {
-                worker.follow_moving(camera, velocity);
+                worker.follow_at(camera, velocity, speed);
                 // A stepped scene thread does its round now, with the camera it was just told.
                 worker.step();
                 let wait = self.edit_due()?;
@@ -955,12 +1012,15 @@ impl World {
         self.lag(camera) < CAUGHT_UP_LAG && !self.reband_pending() && !self.stats.absorbing
     }
 
-    /// Whether the bands are about to change (a reband), which moves what every ring selects and
-    /// so is not a scene to hold. Never yet: #168 (the reband after a change of `d0` or the
-    /// level count) makes this true while one is pending, and must read it here, so that a Still
-    /// view waits for it as it waits for the camera.
-    fn reband_pending(&self) -> bool {
-        false
+    /// Whether the bands have changed and nodes are yet to be looked at again for them, or the
+    /// camera's speed has fallen and the scene thread is about to change them (a reband, ADR
+    /// 0009): what every ring selects is about to change, so the scene is not one to hold, and
+    /// a Still view waits for it as it waits for the camera. The scene thread says when this
+    /// begins and ends with a publish (see `Stats::same_counts`); while the scene is held it does
+    /// not look at them (`Engine::round`), so a reband that is listed after the hold began is
+    /// pending until the view is not Still.
+    pub fn reband_pending(&self) -> bool {
+        self.rebanding() > 0 || (self.worker.is_some() && self.stats.speed_releasing)
     }
 
     /// An Edit that changes nothing: how long it takes the scene thread to come to it, and to
@@ -1277,6 +1337,15 @@ mod tests {
         (World::new(scene, Predictor::new(store), client), server)
     }
 
+    /// A world whose camera has been going 150 Voxels a second for 200 frames.
+    fn world_with_flight(base: std::time::Instant) -> (World, ServerEnd) {
+        let (mut world, server) = world();
+        for n in 0..=200 {
+            world.lead_velocity([0.75 * f64::from(n), 0.0, 0.0], frames(base, n));
+        }
+        (world, server)
+    }
+
     /// `n` frames of 5 ms after `base`.
     fn frames(base: std::time::Instant, n: u32) -> std::time::Instant {
         base + std::time::Duration::from_millis(5) * n
@@ -1323,6 +1392,45 @@ mod tests {
         world.set_lead(false);
         let off = world.lead_velocity([151.5, 0.0, 0.0], frames(base, 202));
         assert_eq!(off, [0.0; 3]);
+    }
+
+    #[test]
+    fn the_bands_get_the_cameras_speed_whether_or_not_there_is_a_lead_and_however_fast() {
+        let base = std::time::Instant::now();
+        let (mut world, _server) = world();
+        world.set_lead(false);
+        for n in 0..=200 {
+            let lead = world.lead_velocity([0.75 * f64::from(n), 0.0, 0.0], frames(base, n));
+            assert_eq!(lead, [0.0; 3]);
+        }
+        // No lead, and the bands still have the speed (150 Voxels a second).
+        assert!(
+            (world.motion.speed() - 150.0).abs() < 1.0,
+            "{}",
+            world.motion.speed()
+        );
+        // A Zoom faster than the lead is cut at: no lead (it is a jump), and the speed of a flight
+        // once it is two frames in, so that it is not drawn at full detail.
+        let step = MOST_LEAD_SPEED * 0.005 * 2.0;
+        let mut at = 150.0;
+        for n in 201..=205 {
+            at += step;
+            let lead = world.lead_velocity([at, 0.0, 0.0], frames(base, n));
+            assert_eq!(lead, [0.0; 3]);
+        }
+        assert!(
+            world.motion.speed() > MOST_LEAD_SPEED,
+            "{}",
+            world.motion.speed()
+        );
+        // A single jump in a flight is a teleport, not a speed: it is no speed (so that the depth
+        // the flight had is not given back a frame at a time after the scene is made again at the
+        // camera's new place; the bands hold a depth over a single sample of a lower speed), and
+        // a flight that goes on after it is a flight at once.
+        let (mut world, _server) = world_with_flight(base);
+        assert!((world.motion.speed() - 150.0).abs() < 1.0);
+        world.lead_velocity([1.0e9, 0.0, 0.0], frames(base, 203));
+        assert_eq!(world.motion.speed(), 0.0);
     }
 
     #[test]

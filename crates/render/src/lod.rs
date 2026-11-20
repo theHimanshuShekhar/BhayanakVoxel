@@ -35,6 +35,12 @@
 //!
 //! **Coarsening** ([`Bands::coarsened`]) is the last resort at the memory cap: the farthest bands
 //! use a larger bias, so that fewer bricks are drawn and wanted.
+//!
+//! **Speed** ([`SpeedScale`], [`Bands::speed_scaled`], ADR 0009, #168): `d0` shrinks as the camera
+//! moves faster, so that a fast camera selects coarser levels, on purpose and everywhere (the
+//! bands, the margins, the lead and the loader all use the scaled rule). The two compose by
+//! multiplication: a level's floor is `d0 · 2^-depth · 2^level`, nearer still by a coarsening's
+//! factor, so where both apply the coarser wins at every level, and the bands stay in order.
 
 use brick_store::{BrickCoord, VOXELS_PER_METRE};
 
@@ -67,6 +73,21 @@ pub const WEIGHTED_LEVELS: usize = 9;
 /// boundary's distance: out at `1 + HYSTERESIS` times it, back in at `1 - HYSTERESIS` times.
 pub const HYSTERESIS: f64 = 0.05;
 
+/// How much sooner than the hysteresis says a whole brick is split while the bands are speed-scaled
+/// (ADR 0009, #168), as a fraction of the boundary's distance: it is split at `1 - HYSTERESIS +
+/// SPLIT_LEAD` times it. The scene is a frame and a round behind the camera (34 to 54 Voxels at 50
+/// m/s, more when the scene thread is busy), and the brick under the camera is that much to the
+/// side of the scene's camera, so it is farther from it by `lag^2 / 2h` at a height `h`. A camera
+/// that flies at a height that a boundary is at (`floor(3)` is `d0`, the bench's 50 m flight is at
+/// 0.97 of it) had that brick drawn a level too coarse for 1 to 2 frames where the ground rose by a
+/// Voxel or two, at 9.6 s of the path on the 4090. 1% is 10 Voxels there: a lag of up to 140. It is
+/// not more because every whole brick that the bands split goes that far out, which is more to take
+/// in on a flight at the ground (2% was 3% more bricks followed in the stepped run, and the 2 m
+/// flight is at the loader's limit on the 4090, where 2% was followed by a queue half as large
+/// again). Not at rest, where there is no such lag to cover (and the
+/// bands are what they were).
+pub const SPLIT_LEAD: f64 = 0.01;
+
 /// Height in pixels of the image the bands are for: 1440p, the output that the frame budgets are
 /// for (the traced image is half of it, and TAAU upscales it).
 pub const OUTPUT_HEIGHT: u32 = 1440;
@@ -78,6 +99,10 @@ pub const VFOV: f64 = 70.0 * std::f64::consts::PI / 180.0;
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Bands {
     d0: f64,
+    /// `d0`'s factor for the camera's speed: 1 for a slow camera, `2^-depth` for a fast one (see
+    /// [`SpeedScale`]). [`Bands::d0`] is not scaled, so that what is measured in `d0` (a jump, a
+    /// step of following the camera, the room reserved) does not change with the speed.
+    scale: f64,
     coarsening: Option<Coarsening>,
 }
 
@@ -98,6 +123,7 @@ impl Bands {
         let focal = f64::from(output_height) / (2.0 * (vfov / 2.0).tan());
         Self {
             d0: focal / bias,
+            scale: 1.0,
             coarsening: None,
         }
     }
@@ -113,8 +139,50 @@ impl Bands {
         assert!(d0 > 0.0 && d0.is_finite(), "d0 is {d0}");
         Self {
             d0,
+            scale: 1.0,
             coarsening: None,
         }
+    }
+
+    /// These bands for a camera moving fast enough to be `depth` levels coarser (0 is the camera at
+    /// rest, and the bands as they are): `d0` is halved for each level, so every level starts where
+    /// the level `depth` below it did. See [`SpeedScale`] for the depth a speed has.
+    pub fn speed_scaled(self, depth: f64) -> Self {
+        assert!(depth >= 0.0 && depth.is_finite(), "depth is {depth}");
+        Self {
+            scale: if depth == 0.0 { 1.0 } else { (-depth).exp2() },
+            ..self
+        }
+    }
+
+    /// The factor on `d0` that the camera's speed puts on these bands: 1 at rest (see
+    /// [`Bands::speed_scaled`]).
+    pub fn scale(&self) -> f64 {
+        self.scale
+    }
+
+    /// The speed's factor on the floor of `level`: [`Bands::scale`] for the near levels (0 to
+    /// [`NEAR_LEVELS`]), and for the levels past them no less than that of [`FAR_DEPTH`] levels.
+    #[inline]
+    fn scale_at(&self, level: usize) -> f64 {
+        if level > NEAR_LEVELS {
+            self.scale.max((-FAR_DEPTH).exp2())
+        } else {
+            self.scale
+        }
+    }
+
+    /// The factor on what a step of the camera costs to follow: the scale of the levels past the
+    /// near ones, which is no less than that of [`FAR_DEPTH`] levels (the near levels are much
+    /// cheaper when deep, and a step is as long as the far levels' cost lets it be).
+    pub fn cost_scale(&self) -> f64 {
+        self.scale.max((-FAR_DEPTH).exp2())
+    }
+
+    /// `d0` as the bands use it, with the speed's factor: what a level-0 Voxel covering one pixel
+    /// means for the camera as it moves.
+    pub fn scaled_d0(&self) -> f64 {
+        self.d0 * self.scale
     }
 
     /// These bands with the levels from `from` up drawn coarser by `factor` (1 to 2, 1 is none).
@@ -144,10 +212,14 @@ impl Bands {
         if level == 0 {
             return 0.0;
         }
-        let floor = self.d0 * (1u64 << level) as f64;
+        let base = self.d0 * (1u64 << level) as f64;
+        let scale = self.scale_at(level);
         match self.coarsening {
-            Some(c) if level >= c.from => floor / c.factor,
-            _ => floor,
+            // The coarser of the two wins: the speed's factor and the memory cap's do not multiply
+            // (a camera fast enough to be drawn coarser already has the fewer bricks the cap is
+            // after, and both at once was 4 times fewer than either asked for).
+            Some(c) if level >= c.from && scale * c.factor > 1.0 => base / c.factor,
+            _ => base * scale,
         }
     }
 
@@ -165,7 +237,7 @@ impl Bands {
                 (to * to - from * from) / (across * across)
             })
             .sum::<f64>()
-            / (self.d0 * self.d0)
+            / (self.scaled_d0() * self.scaled_d0())
             * 64.0
     }
 
@@ -191,9 +263,26 @@ impl Bands {
         let floor = self.floor(level);
         match was_split {
             None => distance < floor,
-            Some(false) => distance < floor * (1.0 - HYSTERESIS),
+            Some(false) => distance < floor * self.split_within(),
             Some(true) => distance < floor * (1.0 + HYSTERESIS),
         }
+    }
+
+    /// The fraction of a boundary's distance that a whole brick is split within: `1 - HYSTERESIS`,
+    /// and [`SPLIT_LEAD`] more while the bands are speed-scaled.
+    #[inline]
+    fn split_within(&self) -> f64 {
+        if self.scale < 1.0 {
+            1.0 - HYSTERESIS + SPLIT_LEAD
+        } else {
+            1.0 - HYSTERESIS
+        }
+    }
+
+    /// The distance within which a whole brick of `level` is split (see [`SPLIT_LEAD`]).
+    #[inline]
+    pub fn split_edge(&self, level: usize) -> f64 {
+        self.floor(level) * self.split_within()
     }
 
     /// How far the camera can move before a brick of `level` at `distance`, which is `split`,
@@ -207,7 +296,7 @@ impl Bands {
         let edge = if split {
             floor * (1.0 + HYSTERESIS)
         } else {
-            floor * (1.0 - HYSTERESIS)
+            floor * self.split_within()
         };
         (distance - edge).abs()
     }
@@ -215,7 +304,176 @@ impl Bands {
     /// The radius of the ball about the camera that no brick of `level` is in: all of them are
     /// at least this far. Zero for level 0.
     pub fn clear_radius(&self, level: usize) -> f64 {
-        self.floor(level) * (1.0 - HYSTERESIS)
+        self.split_edge(level)
+    }
+}
+
+/// The speed, in metres a second, up to which the bands are what they are at rest: a walk (ADR
+/// 0009: "full detail up to 10 m/s").
+pub const FULL_DETAIL_UP_TO: f64 = 10.0;
+
+/// The speed, in metres a second, at which the bands are [`MOST_DEPTH`] coarser: the flight's.
+pub const FLIGHT_SPEED: f64 = 50.0;
+
+/// How many levels coarser than at rest the near levels' bands are at [`FLIGHT_SPEED`] and above
+/// (ADR 0009: three, from one and a half, #168: the 2 m flight's loader did not make the bricks of
+/// the level 0 it asked for at one and a half).
+pub const MOST_DEPTH: f64 = 3.0;
+
+/// The levels from 0 to this one have the whole depth ([`MOST_DEPTH`]); those past it have no more
+/// than [`FAR_DEPTH`]: what a flight makes at the near levels is what the loader is short of, and
+/// the far levels' bricks are few either way.
+pub const NEAR_LEVELS: usize = 4;
+
+/// The most levels coarser than at rest that a level past [`NEAR_LEVELS`] is drawn at: the first
+/// curve's, which the ADR kept for the far levels.
+pub const FAR_DEPTH: f64 = 1.5;
+
+/// The steps the depth moves in, in levels. A change of depth looks at every node of the
+/// selection once, so the curve is a few steps and not a slope: 0, 0.5, 1 ... and 3 levels.
+pub const DEPTH_STEP: f64 = 0.5;
+
+/// How far under a step's speed the camera must fall before the step is given back, as a factor
+/// on the speed: a step is given back when 1.1 times the camera's speed no longer asks for it (3 to
+/// 4 m/s under the step's, 1 m/s under the 10 m/s that begins the ramp), so that speed noise about
+/// a step's speed does not flip it.
+pub const RELEASE: f64 = 1.1;
+
+/// How long the camera's speed must stay under the release point before a step is given back, in
+/// seconds, from the first sample that was under it: a single sample of a speed that fell (the
+/// velocity is reset to zero on a hitch, see `Motion` in the client's world) does not give back
+/// the depth the flight is drawn at, as a sample above the release point starts the time again.
+pub const RELEASE_HOLD: f64 = 0.5;
+
+/// The depth, in levels coarser than at rest, that a speed asks for before the steps and the
+/// hysteresis: nothing up to [`FULL_DETAIL_UP_TO`], a ramp to [`MOST_DEPTH`] at [`FLIGHT_SPEED`].
+/// `speed` is in Voxels a second.
+pub fn depth_for(speed: f64) -> f64 {
+    depth_up_to(speed, MOST_DEPTH)
+}
+
+/// [`depth_for`] with a ramp that ends at `most` levels (what the bench's measurements of other
+/// curves are made with).
+pub fn depth_up_to(speed: f64, most: f64) -> f64 {
+    let metres = speed / VOXELS_PER_METRE;
+    ((metres - FULL_DETAIL_UP_TO) / (FLIGHT_SPEED - FULL_DETAIL_UP_TO)).clamp(0.0, 1.0) * most
+}
+
+/// The depth of the speed-scaled bands (ADR 0009, #168): how many levels coarser than at rest a
+/// camera of the speed it was last shown is drawn at, in steps of [`DEPTH_STEP`].
+///
+/// **It coarsens at once and refines when the camera has slowed**: a speed that asks for a deeper
+/// step takes it on the spot, rounded up, and a step is given back only when the speed is
+/// [`RELEASE`] under what the step below asks for. A camera at a steady speed therefore
+/// stays at one depth, whatever noise the speed has within that hysteresis.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SpeedScale {
+    /// The step: the depth in units of [`DEPTH_STEP`].
+    step: u32,
+    /// The depth the ramp ends at: [`MOST_DEPTH`].
+    most: f64,
+    /// When the speed first fell under the release point of the step, in the caller's seconds
+    /// (see [`SpeedScale::observe`]), while it has stayed under.
+    calm_since: Option<f64>,
+}
+
+impl Default for SpeedScale {
+    fn default() -> Self {
+        Self::AT_REST
+    }
+}
+
+impl SpeedScale {
+    /// The camera at rest: depth 0.
+    pub const AT_REST: SpeedScale = SpeedScale {
+        step: 0,
+        most: MOST_DEPTH,
+        calm_since: None,
+    };
+
+    /// A camera at rest whose ramp ends at `most` levels instead of [`MOST_DEPTH`]: for measuring
+    /// other curves. 0 is no speed scaling at all.
+    pub fn at_rest_up_to(most: f64) -> Self {
+        assert!(most >= 0.0 && most.is_finite(), "most is {most}");
+        Self {
+            step: 0,
+            most,
+            calm_since: None,
+        }
+    }
+
+    /// The depth now, in levels coarser than at rest.
+    pub fn depth(&self) -> f64 {
+        f64::from(self.step) * DEPTH_STEP
+    }
+
+    /// Whether a step is to be given back if the speed stays where it is: the thread keeps
+    /// looking at the clock while it is.
+    pub fn releasing(&self) -> bool {
+        self.calm_since.is_some()
+    }
+
+    /// Shows the camera's `speed`, in Voxels a second, as it is at `now`, in seconds from any
+    /// origin that does not change. Returns whether the depth changed. A deeper step is taken at
+    /// once; a step is given back only when the speed has been [`RELEASE`] under what it asks for
+    /// since [`RELEASE_HOLD`] before `now`: the time is from when the speed first fell under, and
+    /// a sample above the release point starts it again. The Zoom's hook: the speed it is given is
+    /// the camera's along the Zoom (#58), the same rule.
+    pub fn observe(&mut self, speed: f64, now: f64) -> bool {
+        let (up, down) = (self.steps(speed), self.steps(speed * RELEASE));
+        let step = if up > self.step {
+            self.calm_since = None;
+            up
+        } else if down < self.step {
+            let since = *self.calm_since.get_or_insert(now);
+            if now - since >= RELEASE_HOLD {
+                self.calm_since = None;
+                down
+            } else {
+                self.step
+            }
+        } else {
+            self.calm_since = None;
+            self.step
+        };
+        std::mem::replace(&mut self.step, step) != step
+    }
+
+    /// Whether the speed has been under what the step asks for long enough to begin giving it
+    /// back: a step is to be given back if the speed stays where it is, however the hold goes.
+    pub fn wants_less(&self, speed: f64) -> bool {
+        self.steps(speed * RELEASE) < self.step
+    }
+
+    /// [`SpeedScale::observe`] for a camera whose depth is **not to be given back** now (the
+    /// caller's reason: see the client's `Engine::rescale`): a deeper step is still taken at once,
+    /// and what falls under the step does not start the hold, nor keep one that had. Returns
+    /// whether the depth changed.
+    pub fn observe_keeping(&mut self, speed: f64) -> bool {
+        self.calm_since = None;
+        let up = self.steps(speed);
+        if up > self.step {
+            self.step = up;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// The depth for a camera that was **put** at the speed `speed` (a teleport is no flight): the
+    /// step the speed asks for, both ways, with no hold, and any release that was pending ended.
+    /// Returns whether the depth changed.
+    pub fn settle_to(&mut self, speed: f64) -> bool {
+        self.calm_since = None;
+        let step = self.steps(speed);
+        std::mem::replace(&mut self.step, step) != step
+    }
+
+    /// The step a speed asks for, rounded up.
+    fn steps(&self, speed: f64) -> u32 {
+        (depth_up_to(speed, self.most) / DEPTH_STEP - 1e-9)
+            .ceil()
+            .max(0.0) as u32
     }
 }
 
@@ -762,6 +1020,28 @@ mod tests {
     }
 
     #[test]
+    fn speed_scaled_bands_split_a_whole_brick_a_little_sooner_and_bands_at_rest_do_not() {
+        let rest = Bands::with_d0(100.0);
+        // Level 2 starts at 400: a whole brick splits at 380 at rest.
+        assert!(!rest.split(2, 381.0, Some(false)));
+        assert!(rest.split(2, 379.0, Some(false)));
+        assert_eq!(rest.split_edge(2), 380.0);
+        // At 1 level coarser the boundary is at 200 and the brick splits at 190 + 2 (1%).
+        let fast = rest.speed_scaled(1.0);
+        assert!((fast.split_edge(2) - 192.0).abs() < 1e-9);
+        assert!(fast.split(2, 191.0, Some(false)));
+        assert!(!fast.split(2, 193.0, Some(false)));
+        // What is split stays split to the same distance, and a new brick is split at the boundary.
+        assert!(fast.split(2, 209.0, Some(true)) && !fast.split(2, 211.0, Some(true)));
+        assert!(fast.split(2, 199.0, None) && !fast.split(2, 201.0, None));
+        // The slack is to the edge that splits it, and the clear radius is within it.
+        assert!((fast.slack(2, 254.0, false) - 62.0).abs() < 1e-9);
+        assert_eq!(fast.clear_radius(2), fast.split_edge(2));
+        // The lead is under the hysteresis: a brick that is split by it is not merged at once.
+        const { assert!(SPLIT_LEAD < 2.0 * HYSTERESIS) };
+    }
+
+    #[test]
     fn the_slack_is_how_far_the_camera_must_go_to_reach_the_edge_of_the_hysteresis() {
         let bands = Bands::with_d0(100.0);
         // Whole at 460 (level 2 starts at 400, and it is whole until 380 is crossed): 80 to go.
@@ -1145,5 +1425,249 @@ mod tests {
             }
         }
         assert!(seen > 5_000, "{seen}");
+    }
+
+    fn metres(speed: f64) -> f64 {
+        speed * VOXELS_PER_METRE
+    }
+
+    /// A frame's time, in seconds.
+    const DT: f64 = 1.0 / 60.0;
+
+    /// A speed scale and the clock it is shown speeds by, in seconds.
+    struct Timed {
+        scale: SpeedScale,
+        now: f64,
+    }
+
+    impl Timed {
+        fn at_rest() -> Self {
+            Self {
+                scale: SpeedScale::AT_REST,
+                now: 0.0,
+            }
+        }
+
+        /// One sample of `speed` m/s, a frame after the last. Whether the depth changed.
+        fn observe(&mut self, speed: f64) -> bool {
+            self.now += DT;
+            self.scale.observe(metres(speed), self.now)
+        }
+
+        /// Samples of `speed` m/s for `seconds`, a frame at a time. Whether any changed the depth.
+        fn hold(&mut self, speed: f64, seconds: f64) -> bool {
+            let frames = (seconds / DT).round() as usize;
+            (0..frames)
+                .map(|_| self.observe(speed))
+                .fold(false, |any, changed| any | changed)
+        }
+
+        /// No sample for `seconds`: the thread was busy, or the camera did not move.
+        fn wait(&mut self, seconds: f64) {
+            self.now += seconds;
+        }
+
+        fn depth(&self) -> f64 {
+            self.scale.depth()
+        }
+    }
+
+    #[test]
+    fn a_camera_under_ten_metres_a_second_is_at_full_detail_and_the_bands_are_the_plain_ones() {
+        let mut scale = Timed::at_rest();
+        for speed in [0.0, 1.0, 5.0, 9.0, 10.0] {
+            assert!(!scale.observe(speed), "{speed} m/s");
+            assert_eq!(scale.depth(), 0.0);
+        }
+        // Not a rounding of the bands: the same bands, bit for bit.
+        let bands = Bands::with_d0(1028.27);
+        assert_eq!(bands.speed_scaled(scale.depth()), bands);
+        assert_eq!(bands.speed_scaled(0.0).scale(), 1.0);
+    }
+
+    #[test]
+    fn the_ramp_reaches_three_levels_at_fifty_metres_a_second_and_stays() {
+        assert_eq!(depth_for(metres(10.0)), 0.0);
+        assert!((depth_for(metres(30.0)) - 1.5).abs() < 1e-12);
+        assert!((depth_for(metres(50.0)) - 3.0).abs() < 1e-12);
+        assert_eq!(depth_for(metres(400.0)), 3.0);
+        let mut scale = Timed::at_rest();
+        assert!(scale.observe(50.0));
+        assert_eq!(scale.depth(), 3.0);
+        let bands = Bands::with_d0(1000.0).speed_scaled(scale.depth());
+        // The near levels start where the level three finer did: 2^-3 of the distance; the levels
+        // past them where the level a level and a half finer did.
+        let plain = Bands::with_d0(1000.0);
+        for level in 1..12 {
+            let ratio = bands.floor(level) / plain.floor(level);
+            let depth: f64 = if level <= NEAR_LEVELS { 3.0 } else { FAR_DEPTH };
+            assert!((ratio - (-depth).exp2()).abs() < 1e-12, "{level}: {ratio}");
+            assert!(
+                bands.floor(level) > bands.floor(level - 1),
+                "in order at {level}"
+            );
+        }
+        // At the first curve's depth every level is the same.
+        let half = Bands::with_d0(1000.0).speed_scaled(FAR_DEPTH);
+        for level in 1..12 {
+            let ratio = half.floor(level) / plain.floor(level);
+            assert!((ratio - 2f64.powf(-1.5)).abs() < 1e-12, "{level}: {ratio}");
+        }
+        // What a step costs is by the far levels', and `d0` is the same for what is measured in
+        // it: a jump, a step, the room.
+        assert_eq!(bands.cost_scale(), 2f64.powf(-1.5));
+        assert_eq!(half.cost_scale(), half.scale());
+        assert_eq!(bands.d0(), 1000.0);
+    }
+
+    #[test]
+    fn a_camera_coarsens_at_once_and_refines_only_when_it_has_slowed() {
+        let mut scale = Timed::at_rest();
+        // At once, to the step that holds the speed (rounded up).
+        assert!(scale.observe(50.0));
+        assert_eq!(scale.depth(), 3.0);
+        // Slower, but within what the step holds and its release: no change, however long.
+        assert!(!scale.hold(47.0, 2.0));
+        assert!(!scale.hold(46.0, 2.0));
+        assert_eq!(scale.depth(), 3.0);
+        // Well under it, for as long as the hold: the step is given back, to the step the speed
+        // holds.
+        assert!(scale.hold(30.0, RELEASE_HOLD + 0.1));
+        assert_eq!(scale.depth(), 2.0);
+        assert!(scale.hold(15.0, RELEASE_HOLD + 0.1));
+        assert_eq!(scale.depth(), 0.5);
+        // Stopped: full detail.
+        assert!(scale.hold(0.0, RELEASE_HOLD + 0.1));
+        assert_eq!(scale.depth(), 0.0);
+    }
+
+    #[test]
+    fn one_slow_sample_in_a_flight_does_not_give_back_the_depth() {
+        // The camera's velocity is reset to zero on a hitch (a frame over a quarter of a second):
+        // one such sample, mid-flight, gave back every step at once.
+        let mut scale = Timed::at_rest();
+        scale.observe(50.0);
+        assert_eq!(scale.depth(), 3.0);
+        assert!(!scale.observe(0.0));
+        scale.wait(0.25);
+        assert!(!scale.observe(0.0));
+        assert_eq!(scale.depth(), 3.0);
+        // The flight goes on at its speed: the hold starts again after.
+        assert!(!scale.hold(50.0, 0.3));
+        scale.wait(0.25);
+        assert!(!scale.observe(0.0));
+        assert_eq!(scale.depth(), 3.0);
+        // Calm for the hold is a stop.
+        assert!(scale.hold(0.0, RELEASE_HOLD + 0.1));
+        assert_eq!(scale.depth(), 0.0);
+    }
+
+    #[test]
+    fn the_hold_is_from_when_the_speed_first_fell_whatever_the_samples_between() {
+        // A busy thread looks seldom: the hold is a time, not a count of looks or of the time
+        // each look saw.
+        let mut scale = Timed::at_rest();
+        scale.observe(50.0);
+        assert!(!scale.observe(0.0));
+        scale.wait(RELEASE_HOLD - 0.1);
+        assert!(!scale.observe(0.0), "under the hold");
+        scale.wait(0.2);
+        assert!(scale.observe(0.0), "over it");
+        assert_eq!(scale.depth(), 0.0);
+        assert!(!scale.scale.releasing());
+    }
+
+    #[test]
+    fn a_depth_that_is_kept_is_not_given_back_nor_held_for_a_release_but_still_deepens() {
+        let mut scale = SpeedScale::AT_REST;
+        scale.observe(metres(50.0), 0.0);
+        assert_eq!(scale.depth(), 3.0);
+        // Stopped, with the depth kept: it does not start the hold (so that nothing waits for it),
+        // and says that it would give it back.
+        assert!(scale.wants_less(0.0));
+        assert!(!scale.observe_keeping(0.0));
+        assert!(!scale.releasing());
+        assert_eq!(scale.depth(), 3.0);
+        // Not kept any more: the hold is from the first look at it, not from before.
+        assert!(!scale.observe(0.0, 10.0));
+        assert!(scale.releasing());
+        assert!(scale.observe(0.0, 10.0 + RELEASE_HOLD));
+        assert_eq!(scale.depth(), 0.0);
+        // A deeper step is taken at once, kept or not.
+        assert!(!scale.wants_less(0.0));
+        assert!(scale.observe_keeping(metres(30.0)));
+        assert_eq!(scale.depth(), 1.5);
+    }
+
+    #[test]
+    fn a_camera_that_was_put_somewhere_has_the_depth_of_its_speed_with_no_hold() {
+        let mut scale = Timed::at_rest();
+        scale.observe(50.0);
+        scale.hold(0.0, RELEASE_HOLD / 2.0);
+        assert!(scale.scale.releasing());
+        // A teleport: the release that was pending is over, and the depth is the speed's.
+        assert!(scale.scale.settle_to(0.0));
+        assert_eq!(scale.depth(), 0.0);
+        assert!(!scale.scale.releasing());
+        // And the other way: a camera put at speed takes its step.
+        assert!(scale.scale.settle_to(metres(30.0)));
+        assert_eq!(scale.depth(), 1.5);
+        assert!(!scale.scale.settle_to(metres(30.0)));
+    }
+
+    #[test]
+    fn speed_noise_about_a_steady_speed_never_flips_a_step() {
+        // A camera at each speed from 1 to 60 m/s, with noise of 4% either way (the prefetch's
+        // running mean over a tenth of a second is steadier than that), however it began.
+        for tenth in 10..600 {
+            let speed = f64::from(tenth) / 10.0;
+            let mut scale = Timed::at_rest();
+            scale.observe(speed);
+            let first = scale.depth();
+            let mut changes = 0;
+            for n in 0..200 {
+                // A fixed pseudo-random wobble in [-4%, +4%].
+                let wobble = ((n * 7919 % 17) as f64 / 16.0 - 0.5) * 0.08;
+                changes += usize::from(scale.observe(speed * (1.0 + wobble)));
+            }
+            // The wobble may take the one step up at a boundary that it straddles (the speed is
+            // held to a step that the top of the noise needs), and then it stays there.
+            assert!(changes <= 1, "{speed} m/s: {changes} changes from {first}");
+        }
+    }
+
+    #[test]
+    fn of_speed_scaling_and_the_memory_coarsening_the_coarser_wins_and_the_bands_stay_in_order() {
+        let plain = Bands::with_d0(1000.0);
+        // The speed's factor 0.5 is coarser than the cap's 1/1.5: it alone.
+        let speed = Bands::with_d0(1000.0).speed_scaled(1.0);
+        let both = speed.coarsened(3, 1.5);
+        for level in 1..12 {
+            assert_eq!(both.floor(level), speed.floor(level), "{level}");
+            assert!((both.floor(level) - plain.floor(level) * 0.5).abs() < 1e-9);
+            assert!(both.floor(level + 1) > both.floor(level));
+        }
+        // A slight speed factor (0.7) against the cap's 1/1.5 = 0.67: the cap's, from level 3.
+        let slight = Bands::with_d0(1000.0).speed_scaled(0.5).coarsened(3, 1.5);
+        let speed = Bands::with_d0(1000.0).speed_scaled(0.5);
+        for level in 1..12 {
+            let want = if level >= 3 {
+                plain.floor(level) / 1.5
+            } else {
+                speed.floor(level)
+            };
+            assert!((slight.floor(level) - want).abs() < 1e-9, "{level}");
+            assert!(slight.floor(level + 1) > slight.floor(level));
+        }
+        // At rest the cap alone, bit for bit what it was.
+        let rest = Bands::with_d0(1000.0).coarsened(3, 1.5);
+        for level in 1..12 {
+            let want = if level >= 3 {
+                plain.floor(level) / 1.5
+            } else {
+                plain.floor(level)
+            };
+            assert_eq!(rest.floor(level), want, "{level}");
+        }
     }
 }
