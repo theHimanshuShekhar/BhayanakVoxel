@@ -72,10 +72,12 @@ pub const CHECKPOINTS: [u32; 6] = [1, 4, 16, 64, 256, 1024];
 /// How many samples a truth has when `--truth-spp` does not say: the last checkpoint. ADR 0005's
 /// is 8192, which takes eight times as long.
 pub const DEFAULT_TRUTH_SPP: u32 = 1024;
-/// How many samples the room's truths have at least when FLIP is run (#54): its noise floor was
-/// 0.0211 at 1024, and a 0.05 line counts only where it is four times the floor (0.0125). The
-/// floor goes with one over the square root of the samples, so 4096 gives about 0.0105.
-pub const ROOM_TRUTH_SPP: u32 = 4096;
+/// How many samples the room's truths have at least when FLIP is run (#54): a 0.05 line counts only
+/// where it is four times the floor (0.0125). The room's floor was 0.0211 at 1024 samples and
+/// 0.0137 at 4096 on the 4090: it falls slower than one over the square root of the samples (the
+/// two fit floor² = 1.0e-4 + 0.35 / samples, the first term being what more samples do not take
+/// away), which gives about 0.0120 at 8192.
+pub const ROOM_TRUTH_SPP: u32 = 8192;
 
 /// Where the pictures and truths go, in the output folder.
 const FOLDER: &str = "convergence";
@@ -588,6 +590,7 @@ fn run_view(view: View, settings: &Settings, out: &Path) -> Result<ViewReport, B
     let still = still::report(
         batching_exact,
         max_batch_samples,
+        still::within_s_for(name),
         &settings.still,
         &still_run,
         &still_scores,
@@ -856,6 +859,7 @@ mod tests {
             samples_per_s: Some(100.0),
             marks: Vec::new(),
             flip_within_target: None,
+            flip_within_s: still::WITHIN_S,
             frame_p99_within_target: Some(true),
             to_line: Vec::new(),
             cuts: still::CutsReport::default(),
@@ -933,6 +937,7 @@ mod tests {
                     settle_within_ms: gi::SETTLE_WITHIN_MS,
                     reference_flip: still::FLIP_TARGET,
                     reference_within_s: still::WITHIN_S,
+                    reference_room_within_s: still::ROOM_WITHIN_S,
                     held: flip,
                     over: Vec::new(),
                     not_counted: Vec::new(),

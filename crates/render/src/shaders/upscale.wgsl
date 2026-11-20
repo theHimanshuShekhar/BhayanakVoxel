@@ -36,7 +36,8 @@ struct Upscale {
     shift: vec4<f32>,
     // Where in its pixel the traced sample is, (0, 0) to (1, 1), then two unused.
     jitter: vec4<f32>,
-    // 1 if there is a history (0 on the first frame), the debug view, then two unused.
+    // 1 if there is a history (0 on the first frame), the debug view, 1 for the frames after an
+    // Edit (the light is settling), then one unused.
     params: vec4<u32>,
 }
 
@@ -54,6 +55,9 @@ struct Upscale {
 // Frames after which a pixel's history has the share it keeps: the current frame is then 1/16 of
 // the pixel. Keep this in step with the colour scale of the history length view.
 const MAX_HISTORY = 16.0;
+// ... and in the frames after an Edit (`upscale.params.z`): the new light would otherwise take a
+// sixteenth of a pixel a frame, and the noise of a short history is for half a second only.
+const SETTLING_HISTORY = 4.0;
 // 1 / (2 sigma^2) of the Gaussian that weighs traced samples by their distance, in traced pixels,
 // from the centre of the output pixel.
 const SHARPNESS = 8.0;
@@ -183,7 +187,8 @@ fn upscale_pass(@builtin(global_invocation_id) id: vec3<u32>) {
             let slack = CLAMP_SLACK * (high - low);
             let kept = clamp(past, low - slack, high + slack);
             if distance(kept, past) <= CLAMP_REJECT {
-                frames = min(textureLoad(history, vec2<i32>(at), 0).a + 1.0, MAX_HISTORY);
+                let longest = select(MAX_HISTORY, SETTLING_HISTORY, upscale.params.z != 0u);
+                frames = min(textureLoad(history, vec2<i32>(at), 0).a + 1.0, longest);
                 // A traced sample far from the pixel's centre (a weak total weight) says little
                 // about it, so it takes a smaller share than a near one.
                 // In linear light: the mean of noisy samples (one sample of GI a frame) in the encoded

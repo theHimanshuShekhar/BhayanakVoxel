@@ -548,6 +548,9 @@ pub struct Tracer {
     /// How many more frames the cache forgets fast in, after an Edit or the sun changed, and in
     /// which cells (the first Voxel and one past the last, of level 0).
     gi_boost: u32,
+    /// Frames left in which the upscaler keeps a short history, after an Edit (not a new sun, which
+    /// starts the history over anyway).
+    edit_settling: u32,
     gi_boost_box: ([i32; 3], [i32; 3]),
     /// The emitters of level 0 by region, which an update of the scene takes in region by region.
     emitter_index: EmitterIndex,
@@ -1210,6 +1213,7 @@ impl Tracer {
             gi_cache,
             gi_frame: 0,
             gi_boost: 0,
+            edit_settling: 0,
             gi_boost_box: EVERYWHERE,
             emitter_index,
             flat_ambient: false,
@@ -1351,9 +1355,10 @@ impl Tracer {
             self.history.reset();
             self.history_sun_epoch = self.sun_epoch;
         }
-        let frame = self
+        let mut frame = self
             .history
             .begin(target.resolution(), camera, self.debug_view);
+        frame.light_settling(self.edit_settling > 0);
         self.gi_frame += 1;
         self.write_uniforms(
             queue,
@@ -1373,6 +1378,7 @@ impl Tracer {
         );
         self.dispatch_primary(device, queue, profiler, encoder, target, rate);
         self.gi_boost = self.gi_boost.saturating_sub(1);
+        self.edit_settling = self.edit_settling.saturating_sub(1);
         self.upscale
             .encode(device, queue, profiler, encoder, &frame, target);
     }
@@ -1828,7 +1834,8 @@ impl Tracer {
     /// Says that an Edit changed `bricks` (and not the scene thread's streaming, which changes the
     /// world far from where anyone looks and must not make the cache forget): for
     /// [`GI_BOOST_FRAMES`] frames the cells within [`GI_BOOST_MARGIN`] Voxels of the bricks follow
-    /// the new light faster. Called when the Edit is made, which is not when its patch reaches
+    /// the new light faster, and the upscaler keeps a short history for as long (it takes the new
+    /// light at a fourth of a pixel a frame and not a sixteenth). Called when the Edit is made, which is not when its patch reaches
     /// the GPU (the scene thread packs it a frame or more later): the cache forgets from the Edit.
     pub fn edit_made(&mut self, bricks: &[BrickCoord]) {
         let Some(first) = bricks.first() else {
@@ -1853,6 +1860,7 @@ impl Tracer {
             reach
         };
         self.gi_boost = GI_BOOST_FRAMES;
+        self.edit_settling = GI_BOOST_FRAMES;
     }
 
     /// Sets the light's palette (see [`Look`]). The sun's and the sky's light are part of what the

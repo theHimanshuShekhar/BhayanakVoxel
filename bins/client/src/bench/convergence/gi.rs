@@ -26,7 +26,8 @@
 //! - no view's settled GI image is further from truth than its flat-ambient one;
 //! - the lit result settles within [`SETTLE_WITHIN_MS`] of a dig ([`EditSettle`]);
 //! - the Reference converges in the room: FLIP at most [`still::FLIP_TARGET`] within
-//!   [`still::WITHIN_S`] of the hold beginning, which the room's still run already scores.
+//!   [`still::ROOM_WITHIN_S`] (0.3 s, the owner's exception for the closed room) of the hold
+//!   beginning, which the room's still run already scores.
 //!
 //! **The dig.** The emissive room with a wall across it that the lamp's light does not get
 //! through, seen from the dark side, warmed up until the cache has settled. A gap is dug in the
@@ -192,7 +193,10 @@ pub struct Gates {
     pub room_target_flip: f64,
     pub settle_within_ms: f64,
     pub reference_flip: f64,
+    /// ... within this many seconds in the outdoor views (which have no gate here), and in the room
+    /// `reference_room_within_s`.
     pub reference_within_s: f64,
+    pub reference_room_within_s: f64,
     /// Whether the gates were held: with FLIP only.
     pub held: bool,
     /// The names of the gates that are over, empty if none: `room-flip`, `no-further:VIEW`,
@@ -613,6 +617,7 @@ pub fn gates(
         settle_within_ms: SETTLE_WITHIN_MS,
         reference_flip: still::FLIP_TARGET,
         reference_within_s: still::WITHIN_S,
+        reference_room_within_s: still::ROOM_WITHIN_S,
         held: settings.flip,
         over,
         not_counted,
@@ -795,6 +800,9 @@ mod tests {
         let _ = fs::remove_dir_all(&out);
         fs::create_dir_all(&out).unwrap();
         for game_path in [false, true] {
+            if game_path && std::env::var_os("DIG_FLAT_ONLY").is_some() {
+                continue;
+            }
             let settings = Settings {
                 size: (320, 180),
                 settle_frames: 4,
@@ -807,13 +815,14 @@ mod tests {
             let at = |n: usize| edit.luminance[n] / edit.after;
             eprintln!(
                 "game path {game_path}: dug {} Voxels, update {:.2} ms, before {:.4} after {:.4}, \
-                 settle {:?} ms, {} slow frames; the share of the end at frames 0 2 5 10 20 30 45 \
+                 settle {:?} ms (after frame {:?}), {} slow frames; the share of the end at frames 0 2 5 10 20 30 45 \
                  60: {:.2} {:.2} {:.2} {:.2} {:.2} {:.2} {:.2} {:.2}",
                 edit.voxels_dug,
                 edit.update_ms,
                 edit.before,
                 edit.after,
                 edit.settle_ms,
+                settled_at(&edit.luminance, edit.before, edit.after),
                 edit.slow_frames,
                 at(0),
                 at(2),
@@ -841,6 +850,10 @@ mod tests {
         assert_eq!(ROOM_TARGET_FLIP, 0.10);
         assert_eq!(SETTLE_WITHIN_MS, 500.0);
         assert_eq!((still::FLIP_TARGET, still::WITHIN_S), (0.05, 0.25));
+        // The room's exception (the owner, 2026-11-20; ADR 0005), a mark the run scores.
+        assert_eq!(still::within_s_for("room"), 0.3);
+        assert_eq!(still::within_s_for("golden"), 0.25);
+        assert!(still::MARKS_S.contains(&still::ROOM_WITHIN_S));
     }
 
     #[test]

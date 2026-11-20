@@ -63,7 +63,7 @@ release: a debug build's CPU side is slow enough to distort the frame times.
 | `--runs N` | With `--real-time`, how many times to run the paths in this process. Default 3. The report keeps each run and the least and the most of every number over them; the gates use the worst. |
 | `--flip-gamma-2-2` | Also score each checkpoint with the old gamma-2.2 curve (#188), from the same samples, to tell the sRGB move from the estimator's effect. Not with `--no-convergence` or `--short`. |
 | `--no-convergence` | Leave out the convergence phase (below), which otherwise runs after the caves. |
-| `--truth-spp N` | Samples of each of the convergence phase's two truths (the emissive room's have at least 4096 with FLIP, `ROOM_TRUTH_SPP`). Default 1024; ADR 0005's is 8192, which takes eight times as long (`client.exe bench --truth-spp 8192` is the 4090 baseline). At least 1024, the last checkpoint. |
+| `--truth-spp N` | Samples of each of the convergence phase's two truths (the emissive room's have at least 8192 with FLIP, `ROOM_TRUTH_SPP`). Default 1024; ADR 0005's is 8192, which takes eight times as long (`client.exe bench --truth-spp 8192` is the 4090 baseline). At least 1024, the last checkpoint. |
 | `--no-fail` | Exit with status 0 even if a pass is over budget, a frame of the streaming mode has a hole, or a gate of the real-time mode is over. |
 
 It runs unattended. Without the convergence phase it takes a minute or so (generating the whole Planet is about 22 s of it); the convergence phase, on by default, adds about 45 s on the 4090 at the default `--truth-spp`, and more on a slower GPU or with a larger `--truth-spp`.
@@ -1282,15 +1282,26 @@ view's **truth A**, which the view's own run made, at the output size:
   the cache's boost taken, on the frame thread at `World::edit` time, from the Edit's changed bricks
   (`Offscreen::edit_made`): the settle time includes that latency, which is what a player waits.
   False (`--short`): the flat scene, `Scene::update` and `Offscreen::update_scene` at once.
+  What the settle time is made of: the cache follows an Edit within a few frames (its cells forget faster for
+  30 frames, `GI_BOOST_FRAMES`), and the rest is the upscaler's history: 16 frames of it take a new
+  light at a sixteenth a frame, which on lavapipe was 40 frames to settle (650 ms on the 4090 at
+  `2eac792`, 400 ms before the upscaler's blends moved to linear light and its clamp got slack).
+  So for the 30 frames after an Edit (`Tracer::edit_made`) the upscaler keeps no more than 4 frames of
+  history (`SETTLING_HISTORY`; a sun change starts the history over anyway): on lavapipe the dig
+  settles after 15 frames (flat) or 18 (the game's path, with the patch's two-frame latency).
+  `light_let_in_by_an_edit_shows_through_the_upscaler_within_half_a_second` holds it.
 - **The gates** (`convergence.gi.gates`, held with FLIP only, **exit status 2** if any is over, `--no-fail`
   silences it): `room-flip` (the room's settled GI image at FLIP mean 0.10 or under, 1440p, the ticket's;
   #55 tightens it), `no-further:VIEW` (a view's settled GI image no further from truth than its flat
   one, for each of the three), `settle` (the dig settles within 500 ms), and `reference-room` (the
-  room's Reference view reaches FLIP 0.05 within 0.25 s of the hold beginning, which the room's
-  `still.flip_within_target` already scores: direct emitter sampling) **where that line counts in the
-  room** (ADR 0005: at least 4 times the room's floor, so a room whose truths are noisier than 0.0125
-  is not held to it; **the room's truths have at least 4096 samples** when FLIP is run, `ROOM_TRUTH_SPP`,
-  for a floor of about 0.0105 that 0.05 is four times, since the room's floor was 0.0211 at 1024).
+  room's Reference view reaches FLIP 0.05 within **0.3 s** of the hold beginning, `still::ROOM_WITHIN_S`:
+  the owner's exception of 2026-11-20 for the closed room, whose long light paths cost about three times
+  a sample as much as the outdoor views', which keep 0.25 s and have no gate here; the still run scores
+  a mark at 0.3 s for it, and `still.flip_within_s` says which time `flip_within_target` is of)
+  **where that line counts in the room** (ADR 0005: at least 4 times the room's floor, so a room whose
+  truths are noisier than 0.0125 is not held to it; **the room's truths have at least 8192 samples** when
+  FLIP is run, `ROOM_TRUTH_SPP`: the floor was 0.0211 at 1024 and 0.0137 at 4096 on the 4090, and about
+  0.0120 is what the two fit for 8192).
   Each view's `truth_spp` (`views[].truth_spp`, and the summary's "truths of N samples") says how many
   samples its truths had; the room's is `ROOM_TRUTH_SPP` when that is more than `--truth-spp`.
   `gates.over` names those that are over, `gates.not_counted` those that were not held for being under

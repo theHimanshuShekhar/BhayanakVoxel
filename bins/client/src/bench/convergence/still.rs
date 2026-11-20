@@ -37,13 +37,26 @@ const MIN_BATCHES: usize = 3;
 /// The frames per second of the window that is modelled.
 pub const HZ: u32 = 60;
 /// The times after the stop at which the image is scored, in seconds.
-pub const MARKS_S: [f64; 5] = [0.1, 0.25, 0.5, 1.0, 2.0];
+pub const MARKS_S: [f64; 6] = [0.1, 0.25, 0.3, 0.5, 1.0, 2.0];
 /// How long the run lasts when `--short` does not say: the last mark.
 pub const RUN_S: f64 = 2.0;
 /// The FLIP the acceptance of #189 asks for, within [`WITHIN_S`] of stopping.
 pub const FLIP_TARGET: f64 = 0.05;
 /// ... within this many seconds of stopping.
 pub const WITHIN_S: f64 = 0.25;
+/// ... in the closed emissive room, within this many: the owner's exception of 2026-11-20 (ADR
+/// 0005), since the long light paths of a closed room cost about three times as much a sample.
+pub const ROOM_WITHIN_S: f64 = 0.3;
+
+/// The seconds within which the view's Reference is to reach [`FLIP_TARGET`]: [`ROOM_WITHIN_S`] in
+/// the room, [`WITHIN_S`] elsewhere. Each is one of the [`MARKS_S`].
+pub fn within_s_for(view: &str) -> f64 {
+    if view == "room" {
+        ROOM_WITHIN_S
+    } else {
+        WITHIN_S
+    }
+}
 /// A frame's work may take this long for a frame rate of [`HZ`], in milliseconds.
 pub const FRAME_MS: f64 = 1000.0 / HZ as f64;
 
@@ -311,6 +324,8 @@ pub struct StillReport {
     /// 99th percentile of the work of a frame that took a batch at most [`FRAME_MS`] (null where
     /// no frame did). The 4090 is where they count.
     pub flip_within_target: Option<bool>,
+    /// The seconds that `flip_within_target` is of: [`within_s_for`] the view.
+    pub flip_within_s: f64,
     pub frame_p99_within_target: Option<bool>,
     /// The time from the stop to each FLIP line.
     pub to_line: Vec<ToLine>,
@@ -369,12 +384,16 @@ pub struct ToLine {
 ///
 /// `max_batch_samples` is the cap of the size the run traced at ([`Offscreen::max_batch_samples`]).
 ///
+/// `within_s` is the mark that `flip_within_target` is of ([`within_s_for`] the view).
+///
 /// `scores` is the FLIP mean and 99th percentile of each of `run.captures` against truth A (all
 /// `None` where FLIP was not run), and `mse` the squared error of its accumulation, in the same
 /// order.
+#[allow(clippy::too_many_arguments)]
 pub fn report(
     batching_bit_exact: bool,
     max_batch_samples: u32,
+    within_s: f64,
     settings: &Settings,
     run: &Run,
     scores: &[Option<score::Flip>],
@@ -412,9 +431,10 @@ pub fn report(
         flip_within_target: run
             .marks
             .iter()
-            .find(|&&(seconds, _)| (seconds - WITHIN_S).abs() < 1e-9)
+            .find(|&&(seconds, _)| (seconds - within_s).abs() < 1e-9)
             .and_then(|&(_, at)| scores.get(at).copied().flatten())
             .map(|f| f.mean <= FLIP_TARGET),
+        flip_within_s: within_s,
         frame_p99_within_target: Tail::of(&work).p99_ms.map(|ms| ms <= FRAME_MS),
         marks: run
             .marks
@@ -471,7 +491,8 @@ pub fn print(name: &str, s: &StillReport) {
         None => "n/a",
     };
     eprintln!(
-        "    acceptance: FLIP <= {FLIP_TARGET} within {WITHIN_S} s {}; frame p99 <= {FRAME_MS:.1} ms {}",
+        "    acceptance: FLIP <= {FLIP_TARGET} within {} s {}; frame p99 <= {FRAME_MS:.1} ms {}",
+        s.flip_within_s,
         met(s.flip_within_target),
         met(s.frame_p99_within_target)
     );
@@ -572,7 +593,7 @@ mod tests {
             captures: Vec::new(),
             cuts: render::still::Cuts::default(),
         };
-        let report = report(true, 16, &Settings::short(), &run, &[], &[], &[]);
+        let report = report(true, 16, WITHIN_S, &Settings::short(), &run, &[], &[], &[]);
         assert_eq!((report.frames, report.accumulating_frames), (7, 5));
         assert_eq!(report.frames_over, 1);
         assert_eq!(report.frame.max_ms, Some(20.0));

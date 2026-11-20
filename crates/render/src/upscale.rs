@@ -93,8 +93,8 @@ pub(crate) struct UpscaleUniform {
     shift: [f32; 4],
     /// Where in its pixel the traced sample is, then two unused.
     jitter: [f32; 4],
-    /// 1 if there is a history to use, 0 on the first frame; then the debug view; then two
-    /// unused.
+    /// 1 if there is a history to use, 0 on the first frame; then the debug view; then 1 while the
+    /// light is settling after an Edit (the history is kept short); then one unused.
     params: [u32; 4],
 }
 
@@ -122,6 +122,13 @@ pub(crate) struct Frame {
 }
 
 impl Frame {
+    /// Says that the light is settling after an Edit (the radiance cache's boost, [`crate::tracer::Tracer::edit_made`]): the
+    /// upscaler keeps a short history this frame, so that the new light is not averaged away over
+    /// the 16 frames of a long one, which is most of the half second a dig takes to show.
+    pub fn light_settling(&mut self, settling: bool) {
+        self.uniform.params[2] = u32::from(settling);
+    }
+
     /// Where in its pixel the frame is traced.
     pub fn jitter(&self) -> [f32; 2] {
         [self.uniform.jitter[0], self.uniform.jitter[1]]

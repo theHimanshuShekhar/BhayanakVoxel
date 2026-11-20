@@ -296,6 +296,42 @@ fn light_let_into_a_dark_side_of_a_room_shows_within_half_a_second_and_settles_t
 }
 
 #[test]
+fn light_let_in_by_an_edit_shows_through_the_upscaler_within_half_a_second() {
+    // As the window draws it: upscaled, with a history that would carry the dark side's old light
+    // for a long time (16 frames of it is a time constant of 16 frames), and the Edit told to the
+    // renderer, which shortens that history while the light settles.
+    let mut store = walled_room();
+    let mut scene = Scene::new(&store, None);
+    let mut gpu = gpu_of(&scene);
+    let camera = Camera::looking_at([4.0, 6.0, 34.0], [14.0, 3.0, 10.0]);
+    let before = mean(&settled(&mut gpu, &camera, 90));
+    let mut changed = std::collections::BTreeSet::new();
+    for x in 18..20 {
+        for y in 2..10 {
+            for z in 14..24 {
+                let v = VoxelCoord([x, y, z]);
+                changed.insert(v.brick());
+                store.set(v, None);
+            }
+        }
+    }
+    let changed: Vec<_> = changed.into_iter().collect();
+    let update = scene.update(&store, &changed).unwrap();
+    gpu.update_scene(&scene, &update).unwrap();
+    gpu.edit_made(&changed);
+    let series: Vec<f32> = (0..120)
+        .map(|_| mean(&gpu.render_upscaled(&camera)))
+        .collect();
+    let end = series[119];
+    assert!(end > before * 1.3, "the light shows: {before} to {end}");
+    let at_30 = series[29];
+    assert!(
+        (at_30 - end).abs() < 0.1 * (end - before),
+        "frame 30 is {at_30} of {before} to {end}"
+    );
+}
+
+#[test]
 fn a_wall_thinner_than_a_cell_keeps_the_light_of_the_lit_side_off_the_dark_one() {
     // The wall at x = 18..20 is inside one 8-voxel cell along x (16..24): the floors either side of
     // it must not be one cell, whatever order the two sides are looked at in.
