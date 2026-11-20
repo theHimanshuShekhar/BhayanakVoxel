@@ -820,6 +820,45 @@ pub fn print_summary(report: &ConvergenceReport) {
     shadows::print_summary(&report.shadows);
     let scored: Vec<_> = report.views.iter().map(|v| (v.name, &v.gi)).collect();
     gi::print_summary(&scored, &report.gi);
+    // The room's Reference gate reads the still run's wall clock, not the line's GPU time.
+    for v in report.views.iter().filter(|v| v.name == "room") {
+        eprintln!("{}", room_clocks(v));
+    }
+}
+
+/// The two clocks of the room's Reference gate, side by side. The gate (`reference-room`) is the
+/// still run's FLIP at the mark [`still::ROOM_WITHIN_S`] after the stop, on the wall clock of the
+/// 60 Hz run; the `gpu_s` of a FLIP line is only the samples times the Reference pass's mean GPU
+/// time, with none of the run's frames in it (the first still frames, the batch budget, the
+/// vsyncs).
+fn room_clocks(view: &ViewReport) -> String {
+    let num =
+        |v: Option<f64>, digits: usize| v.map_or("n/a".to_string(), |v| format!("{v:.digits$}"));
+    let at_mark = view
+        .still
+        .marks
+        .iter()
+        .find(|m| (m.seconds - still::ROOM_WITHIN_S).abs() < 1e-9);
+    let line = view
+        .lines
+        .iter()
+        .find(|l| l.flip == still::FLIP_TARGET)
+        .zip(
+            view.still
+                .to_line
+                .iter()
+                .find(|l| l.flip == still::FLIP_TARGET),
+        );
+    format!(
+        "  room Reference gate (FLIP <= {} within {} s of the stop, wall clock): FLIP {} at the mark ({} samples); the line is {} samples, {} s of GPU time but {} s from the stop in the run",
+        still::FLIP_TARGET,
+        still::ROOM_WITHIN_S,
+        num(at_mark.and_then(|m| m.flip_mean), 4),
+        at_mark.map_or("n/a".to_string(), |m| m.samples.to_string()),
+        num(line.and_then(|(l, _)| l.samples), 1),
+        num(line.and_then(|(l, _)| l.gpu_s), 3),
+        num(line.and_then(|(_, s)| s.seconds), 3),
+    )
 }
 
 #[cfg(test)]

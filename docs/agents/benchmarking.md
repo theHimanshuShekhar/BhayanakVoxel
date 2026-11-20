@@ -1317,6 +1317,12 @@ view's **truth A**, which the view's own run made, at the output size:
   truths are noisier than 0.0125 is not held to it; **the room's truths have at least 8192 samples** when
   FLIP is run, `ROOM_TRUTH_SPP`: the floor was 0.0211 at 1024 and 0.0137 at 4096 on the 4090, and about
   0.0120 is what the two fit for 8192).
+  **Two clocks:** the gate is on the still run's **wall clock** (the image at the 0.3 s mark of the 60 Hz
+  run, `still.flip_within_target`, with the first still frames, the batch budget of 12 ms a frame and
+  the vsyncs in it, as #189's acceptance is), while a FLIP line's `gpu_s` (`lines[].gpu_s`) is only
+  samples times the Reference pass's mean GPU time. A room can have a line at 0.29 `gpu_s` and be over
+  the gate: read `still.to_line[].seconds` (the line from the stop in the run) and
+  `still.marks[]` at 0.3 s, which the summary prints together as "room Reference gate".
   Each view's `truth_spp` (`views[].truth_spp`, and the summary's "truths of N samples") says how many
   samples its truths had; the room's is `ROOM_TRUTH_SPP` when that is more than `--truth-spp`.
   `gates.over` names those that are over, `gates.not_counted` those that were not held for being under
