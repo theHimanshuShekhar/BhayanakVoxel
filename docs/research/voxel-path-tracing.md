@@ -44,6 +44,11 @@ Hide all of this behind one shader function, `trace(ray) -> hit`. The tracing ba
   - "The effective world size here is **256K^3**".
   - "this level of detail will be **reserved for RTX graphics cards**". He also lists tuning knobs, including "level-of-detail threshold, **lighting refresh rates**, and the world size itself".
   - "An 8x (512 cubic) detail increase … per-voxel material attributes" and "A 10x speedup in rendering over the previous engine".
+- **Verified by the [Crystal Islands research](inspiration-john-lin-crystal-islands.md)** (#134; sources S1–S6 there). These were unknown or unverified when this section was first written:
+  - **Lin shelved the fine-voxel engine.** On 6 June 2021, three weeks after the reveal, he wrote that he had "decided to shelf the micro-voxel goal", and that the optimisations would go to the coarser "pixel art" style instead. His reasons were gameplay possibilities and end-user experience, and that two art styles are "overly ambitious" to maintain (his pinned comment on the video and the 6 June thread, read through Twitter's public syndication endpoint). Take the video as a reference for mood, palette and lighting, not for detail.
+  - **The scene used 3 GB of VRAM** (the same pinned comment). This is the only memory figure he gave.
+  - **Per-Voxel attributes include a normal.** The blog names "unique per-voxel attributes in addition to a material identifier, like albedo and normal". Our Voxels carry a palette Material and no per-Voxel normal ([ADR 0002](../adr/0002-brick-store-all-voxel-lod.md)); smooth normals are computed from neighbouring occupancy instead.
+  - **Two X posts are now verified**: 12 March 2021 (the engine's "3rd revision … 8x (512 cubic) detail increase") and 12 May 2021 ("path traced global illumination finally making a triumphant return"). The "10x faster on average" post of May 2021 is still unverified.
 - **Blog post, "The Perfect Voxel Engine"** ([voxely.net](https://voxely.net/blog/the-perfect-voxel-engine/), 2021-09-18):
   - The engine uses the Vulkan hardware ray tracing pipeline.
   - BLAS geometries are tagged by voxel format, so the shader binding table (SBT) can bind "specific intersection shaders" per format.
@@ -57,7 +62,7 @@ Hide all of this behind one shader function, `trace(ray) -> hit`. The tracing ba
 - Mar 2020: path tracing made "noiseless" and "20x faster (60fps HD!)".
 - May 2021: "Rendering is now 10x faster on average", with ray-traced soft shadows, AO and specular.
 
-Source: [x.com/ProgrammerLin](https://x.com/programmerlin), access blocked (HTTP 402). Treat these as **unverified**.
+Source: [x.com/ProgrammerLin](https://x.com/programmerlin), access blocked (HTTP 402) for x.com pages. Treat these as **unverified**. (The March and 12 May 2021 posts above were later read through the syndication endpoint and moved to the confirmed list. The "Gentle breeze animations" post sometimes attributed to Lin is @voxelbee's; see [vegetation-wind.md](vegetation-wind.md).)
 
 ### Unknown
 
@@ -81,9 +86,15 @@ Do not design around claims about his private engine beyond the confirmed points
 - **Teardown's next engine** ([Voxagon "Year summary"](https://blog.voxagon.se/2024/12/29/year-summary.html), 2024-12-29) is the closest public analogue to John Lin's design:
   - "relies heavily on hardware raytracing (using intersection shaders, still no triangles!), importance sampling".
   - Drops the shadow volume, which enables "unlimited world size … no light leakage".
-  - Denoising: "using NVIDIA DLSS Ray Reconstruction".
+  - Denoising: "using NVIDIA DLSS Ray Reconstruction". This is the **December 2024 prototype**; the November 2025 GPC talk does not say which denoiser ships, so do not cite it as the current choice ([inspiration-teardown-rt.md](inspiration-teardown-rt.md) §6).
   - Sparse format: "8x8x8 voxel 'chunks', which are tracked with a 3D bitmap".
   - Gabe Rundlett took over the prototype.
+  - **First-party detail from the GPC 2025 talk** ([Gustafsson and Rundlett, "Raytracing Voxels in Teardown and Beyond"](https://www.youtube.com/watch?v=IM1Dr98f3xU), Nov 2025; corrections from #136, detail in [inspiration-teardown-rt.md](inspiration-teardown-rt.md) §6):
+    - One BLAS per object, with AABBs tight-fitted to the content of each 8³ chunk, no mips inside a chunk, and primary visibility traced rather than rasterised. Both the developers and NVIDIA were "surprised" by the intersection-shader performance.
+    - 8³ chunks trace faster than 4³ chunks, which use less VRAM; 8³ was chosen.
+    - GPU debugging tools cannot see inside custom intersection shaders.
+    - The shadow-volume figures below, from a third-party analysis, are now backed by Gustafsson's own example: 4000 × 3400 × 290 voxels at 8 per byte, about 500 MB.
+    - The Digital Foundry clip's claim that "no one's really done it before" is wrong: per-brick AABB hardware RT is in Lin's engine and in gvox_engine (April 2024).
 - **Gabe Rundlett's open-source [gvox_engine](https://github.com/GabeRundlett/gvox_engine)** (MIT licence, C++, Vulkan via the Daxa library, GLSL):
   - [`src/renderer/rt.glsl`](https://github.com/GabeRundlett/gvox_engine/blob/rewrite/src/renderer/rt.glsl) contains a brick intersection shader (`reportIntersectionEXT`) and a `rayQueryEXT` path over `gl_RayQueryCandidateIntersectionAABBEXT`. He [described it on X](https://twitter.com/RundlettGabe/status/1781349885603668035) as "each HWRT AABB is 8x8x8 voxels".
   - [`src/renderer/kajiya/`](https://github.com/GabeRundlett/gvox_engine/tree/rewrite/src/renderer/kajiya) ports kajiya's ReSTIR GI (`rtdgi`), irradiance cache (`ircache`), reflections (`rtr`), TAA and shadow denoiser. It also integrates FSR.
@@ -146,7 +157,7 @@ Phase it in three steps:
 | **SVGF** ([Schied et al., HPG 2017](https://research.nvidia.com/publication/2017-07_spatiotemporal-variance-guided-filtering-real-time-reconstruction-path-traced)) | "10ms (+- 15%) … at 1920x1080" on 2017 hardware | Temporal accumulation plus variance-guided à-trous blur. Ghosting under fast lighting change |
 | **A-SVGF** ([Schied, Peters, Dachsbacher, HPG 2018](https://cg.ivd.kit.edu/publications/2018/adaptive_temporal_filtering/adaptive_temporal_filtering.pdf)) | "runs in 2 ms at 1080p"; gradient pipeline under 1 ms | Adds temporal gradients so history is discarded where lighting changed. This matters for **Edits** and moving sun |
 | **NRD REBLUR / RELAX / SIGMA** ([NVIDIA-RTX/NRD](https://github.com/NVIDIA-RTX/NRD) v4.18) | RTX 4080 at **1440p native**: REBLUR diffuse+specular 2.55 ms; RELAX 3.25 ms; SIGMA shadow 0.40 ms | API-agnostic compute (D3D12, Vulkan, D3D11); the app issues dispatches. Strict input rules: demodulated albedo, normalised hit distance, non-jittered matrices; no resize. AMD performance is not published |
-| **DLSS Ray Reconstruction** ([DLSS-RR guide](https://github.com/NVIDIA/DLSS/blob/main/doc/DLSS-RR%20Integration%20Guide.pdf), Aug 2026) | **RTX 3060: 5.83 ms at 1080p, 10.27 ms at 1440p** (Performance mode, preset default/F) | Combined denoiser and upscaler; NVIDIA only. Used by Teardown's next engine. **Too expensive for 60 fps on a 3060 at 1440p** |
+| **DLSS Ray Reconstruction** ([DLSS-RR guide](https://github.com/NVIDIA/DLSS/blob/main/doc/DLSS-RR%20Integration%20Guide.pdf), Aug 2026) | **RTX 3060: 5.83 ms at 1080p, 10.27 ms at 1440p** (Performance mode, preset default/F) | Combined denoiser and upscaler; NVIDIA only. Used by Teardown's next engine in its December 2024 prototype; not confirmed for what ships. **Too expensive for 60 fps on a 3060 at 1440p** |
 | **AMD FSR Ray Regeneration** ([GPUOpen](https://gpuopen.com/amd-fsr-rayregeneration/)) | RX 9070 XT at 1440p: 5.34–8.10 ms | **RX 9000 / RDNA 4 only**, DX12 only, Windows 11. Not usable on the RX 6700 or on Vulkan |
 | **Teardown / kajiya style** (see above) | Part of kajiya's 8.4 ms frame | Temporal reprojection with neighbourhood clamping, a light spatial blur, then TAA. Simplest to write |
 
