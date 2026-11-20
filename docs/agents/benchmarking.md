@@ -1250,12 +1250,12 @@ sample count is fixed: the goldens, the curve, and every number `reference` has 
   over 16.7 ms and `frame_p99_within_target` is #189's frame-time acceptance (p99 at most 16.7 ms).
 - `gpu_batch`: the GPU's time for a batch; `batch_first`, `batch_last`, `batch_max` the sizes;
   `samples_per_s` the samples a second over the frames that took one.
-- `marks[]`: at 0.1, 0.25, 0.5, 1 and 2 s after the stop, the samples the run had, and the FLIP (mean,
+- `marks[]`: at 0.1, 0.25, 0.3, 0.5, 1 and 2 s after the stop (the 0.3 s mark is the room's: ADR 0005; every view has it), the samples the run had, and the FLIP (mean,
   p99) and linear MSE of the image of that many samples against **the same truth A as the curve**. The
   image is drawn after the run from single samples of the same seed, which is bit for bit what the
   batches added up to (`batching_bit_exact` says it held on this GPU, and a test holds it on
   lavapipe), so the run is never paused to read 59 MB back. `flip_within_target` is the FLIP
-  acceptance: at most 0.05 at the 0.25 s mark.
+  acceptance: at most 0.05 at the 0.25 s mark (0.3 s in the room, whose wall clock is reported, not gated: `still.flip_within_s` says which).
 - `cuts` (#217, schema 22): `total`, `view` and `scene`: the **cuts** the view had while it was Still
   (`Tracer::cuts`: a frame that showed the Reference view and was followed by a Primary one), by what
   changed, the camera, sun or window (`view`) or the Planet (`scene`). A cut is 2 Primary frames, a

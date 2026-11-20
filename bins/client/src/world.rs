@@ -242,6 +242,9 @@ impl StillCuts {
 /// time on it, whatever the Brush, while the cursor moves.
 const GHOST_BACKOFF: u32 = 8;
 
+/// The bricks that [`World::take_edited`] keeps, the newest.
+const EDITED_KEPT: usize = 1 << 16;
+
 /// How far the player aims an Edit, in Voxels: 7.5 m, which leaves half a metre of the server's
 /// reach ([`sim::EDIT_REACH`], measured from where the server has the character) for the character
 /// to have moved on from where the client saw it.
@@ -552,6 +555,17 @@ impl World {
     /// what the server sent), for the renderer's radiance cache to follow the light there faster.
     pub fn take_edited(&mut self) -> Vec<brick_store::BrickCoord> {
         std::mem::take(&mut self.edited)
+    }
+
+    /// Notes that `bricks` were changed by an Edit, for [`World::take_edited`]. The list is kept to
+    /// [`EDITED_KEPT`] bricks, the newest: a world that nothing takes it from (a bench's, with no
+    /// renderer) does not grow it without end.
+    fn note_edited(&mut self, bricks: &[brick_store::BrickCoord]) {
+        self.edited.extend_from_slice(bricks);
+        if self.edited.len() > EDITED_KEPT {
+            let drop = self.edited.len() - EDITED_KEPT;
+            self.edited.drain(..drop);
+        }
     }
 
     /// Edits made in this world so far. [`World::edit`] makes none when nothing is aimed at or when
@@ -1245,7 +1259,7 @@ impl World {
             return Ok(None);
         };
         self.edits_made += 1;
-        self.edited.extend_from_slice(&changed);
+        self.note_edited(&changed);
         self.link.send(request)?;
         let Some(worker) = &self.worker else {
             return Ok(self.refresh(&changed)?);
@@ -1294,7 +1308,7 @@ impl World {
         if changed.is_empty() {
             return Ok(None);
         }
-        self.edited.extend_from_slice(changed);
+        self.note_edited(changed);
         // What the ghost would change has changed with them, if they are where it reads.
         if let Some(ghost) = &mut self.ghost {
             ghost.dirty |= ghost.touches(changed);

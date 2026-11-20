@@ -857,9 +857,10 @@ impl App {
     /// that the scene thread makes of it later: the cache follows the light there faster, and
     /// streaming, which is not an Edit, does not make it forget.
     fn edits_to_the_cache(&mut self) {
-        if let (Some(world), Some(renderer)) = (&mut self.world, &mut self.renderer) {
+        if let Some(world) = &mut self.world {
+            // Taken with no renderer too, so that the list does not grow with nothing to read it.
             let bricks = world.take_edited();
-            if !bricks.is_empty() {
+            if let (Some(renderer), false) = (&mut self.renderer, bricks.is_empty()) {
                 renderer.edit_made(&bricks);
             }
         }

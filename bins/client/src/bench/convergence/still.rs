@@ -462,6 +462,25 @@ pub fn report(
     }
 }
 
+fn acceptance_word(v: Option<bool>) -> &'static str {
+    match v {
+        Some(true) => "met",
+        Some(false) => "NOT met",
+        None => "n/a",
+    }
+}
+
+/// What the summary says of the still run's FLIP acceptance. The room's is reported and not gated
+/// (its Reference gate is on the line's GPU time, not on this wall clock), and it says so.
+fn flip_acceptance(view: &str, within_target: Option<bool>) -> String {
+    let word = acceptance_word(within_target);
+    if view == "room" {
+        format!("{word} (wall clock: reported, not gated)")
+    } else {
+        word.to_string()
+    }
+}
+
 /// Prints the block for whoever watches the run.
 pub fn print(name: &str, s: &StillReport) {
     let num =
@@ -485,15 +504,11 @@ pub fn print(name: &str, s: &StillReport) {
         num(s.gpu_batch.p95_ms, 2),
         num(s.samples_per_s, 0),
     );
-    let met = |v: Option<bool>| match v {
-        Some(true) => "met",
-        Some(false) => "NOT met",
-        None => "n/a",
-    };
+    let met = acceptance_word;
     eprintln!(
         "    acceptance: FLIP <= {FLIP_TARGET} within {} s {}; frame p99 <= {FRAME_MS:.1} ms {}",
         s.flip_within_s,
-        met(s.flip_within_target),
+        flip_acceptance(name, s.flip_within_target),
         met(s.frame_p99_within_target)
     );
     for m in &s.marks {
@@ -528,6 +543,18 @@ pub fn print(name: &str, s: &StillReport) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_rooms_wall_clock_acceptance_says_it_is_not_gated() {
+        // The room's Reference gate is on the line's GPU time; its wall clock is only reported, and
+        // a "NOT met" with no more would read as a failed gate while the gate passes.
+        assert_eq!(
+            flip_acceptance("room", Some(false)),
+            "NOT met (wall clock: reported, not gated)"
+        );
+        assert_eq!(flip_acceptance("pit", Some(false)), "NOT met");
+        assert_eq!(flip_acceptance("pit", Some(true)), "met");
+    }
 
     fn frame(began_ms: f64, work_ms: f64, batch: u32, total: u32) -> Frame {
         Frame {

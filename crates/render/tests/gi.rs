@@ -3,9 +3,9 @@
 
 mod common;
 
-use brick_store::{BrickStore, Material, VoxelCoord};
+use brick_store::{Brick, BrickCoord, BrickStore, Material, VoxelCoord};
 use materials::MaterialTable;
-use render::{Camera, DebugView, Image, Offscreen, Resolution, Scene};
+use render::{Camera, DebugView, Image, Offscreen, Resolution, Scene, Sun};
 
 fn material(name: &str) -> Material {
     Material(MaterialTable::built_in().by_name(name).unwrap().id)
@@ -30,6 +30,38 @@ fn lit_room() -> Scene {
         for y in 0..3 {
             for z in 8..12 {
                 store.set(VoxelCoord([x, y, z]), Some(lamp));
+            }
+        }
+    }
+    Scene::new(&store, None)
+}
+
+/// `lit_room` with a pillar of rock, 4 by 4 Voxels and the room's height, between the camera and
+/// the wall behind the lamp.
+fn pillared_room() -> Scene {
+    let rock = material("rock");
+    let mut store = BrickStore::new();
+    for x in -2..42 {
+        for y in -2..18 {
+            for z in -2..42 {
+                let inside = (0..40).contains(&x) && (0..16).contains(&y) && (0..40).contains(&z);
+                if !inside {
+                    store.set(VoxelCoord([x, y, z]), Some(rock));
+                }
+            }
+        }
+    }
+    for x in 28..32 {
+        for y in 0..3 {
+            for z in 8..12 {
+                store.set(VoxelCoord([x, y, z]), Some(material("warm light")));
+            }
+        }
+    }
+    for x in 14..18 {
+        for y in 0..16 {
+            for z in 22..26 {
+                store.set(VoxelCoord([x, y, z]), Some(rock));
             }
         }
     }
@@ -144,19 +176,16 @@ fn mse(a: &Image, b: &Image) -> f64 {
     sum as f64 / (3 * a.width * a.height) as f64
 }
 
-#[test]
-fn a_camera_moving_sideways_through_noisy_gi_is_not_smeared_by_the_history_the_clamp_lets_through()
-{
-    // The upscaler's clamp lets history stray beyond the range of the traced samples, because the
-    // mean of noisy GI is often outside the range of one frame's samples. That slack must not let
-    // a frame carry the light of where the camera was.
-    let scene = lit_room();
+/// A camera strafing through `scene` as the window draws it: the frame after `frames` frames of
+/// it, and the mse of that against the view it is of, settled, and against the view of 8 frames
+/// before, settled.
+fn strafe_errors(scene: &Scene, frames: u32) -> (f64, f64) {
     let resolution = Resolution {
         internal: (80, 45),
         output: (W, H),
     };
     let fresh = || {
-        let mut gpu = Offscreen::with_resolution(resolution, &scene).unwrap();
+        let mut gpu = Offscreen::with_resolution(resolution, scene).unwrap();
         gpu.use_legacy_light();
         gpu.set_flat_ambient(false);
         gpu
@@ -168,7 +197,6 @@ fn a_camera_moving_sideways_through_noisy_gi_is_not_smeared_by_the_history_the_c
             std::array::from_fn(|a| camera.position[a] + right[a] * 0.4 * f64::from(frames));
         camera
     };
-    let frames = 24;
     // The cache is warm, and the history is of the first view.
     let mut moving = fresh();
     for _ in 0..60 {
@@ -183,9 +211,35 @@ fn a_camera_moving_sideways_through_noisy_gi_is_not_smeared_by_the_history_the_c
         let mut gpu = fresh();
         settled(&mut gpu, &at(frame), 100)
     };
-    let now = mse(&image, &settled_at(frames));
-    let unmoved = mse(&image, &settled_at(frames - 8));
+    (
+        mse(&image, &settled_at(frames)),
+        mse(&image, &settled_at(frames - 8)),
+    )
+}
+
+#[test]
+fn a_camera_moving_sideways_through_noisy_gi_is_not_smeared_by_the_history_the_clamp_lets_through()
+{
+    // The upscaler's clamp lets history stray beyond the range of the traced samples, because the
+    // mean of noisy GI is often outside the range of one frame's samples. That slack must not let
+    // a frame carry the light of where the camera was.
+    let (now, unmoved) = strafe_errors(&lit_room(), 24);
     eprintln!("strafe with GI: {now:.2} against now, {unmoved:.2} against 8 frames back");
+    assert!(
+        now * 2.0 < unmoved,
+        "the frame is no closer to the view it is of ({now}) than to an old one ({unmoved})"
+    );
+}
+
+#[test]
+fn a_wall_a_pillar_uncovers_is_not_ghosted_by_the_history_of_the_pillar_in_noisy_gi() {
+    // The same, with a pillar between the camera and the lamp's wall that the strafe moves across:
+    // the wall it uncovers has the history of the pillar in front of it (disocclusion), which the
+    // clamp's slack must not let through into a frame of lit, noisy GI.
+    let (now, unmoved) = strafe_errors(&pillared_room(), 24);
+    eprintln!(
+        "strafe past a pillar with GI: {now:.2} against now, {unmoved:.2} against 8 frames back"
+    );
     assert!(
         now * 2.0 < unmoved,
         "the frame is no closer to the view it is of ({now}) than to an old one ({unmoved})"
@@ -457,4 +511,72 @@ fn walled_room() -> BrickStore {
         }
     }
     store
+}
+
+/// A floor of rock 128 Voxels across, walled on three sides 48 Voxels high (a valley open towards +x),
+/// and (if `ridge`) a floating slab of rock 17 000 Voxels (850 m) away along +x, at the height that
+/// the sun's disc is behind from the floor: the sun is 45 degrees up towards +x, so the slab, a
+/// brick thick, from 16 200 to 17 800 up and 912 wide, puts all of the valley in its shadow, from
+/// further than the 820 m that the bounces of Primary's GI reach (`GI_REACH`).
+fn valley_in_a_far_ridges_shadow(ridge: bool) -> Scene {
+    let rock = material("rock");
+    let mut store = BrickStore::new();
+    for x in -8..8 {
+        for z in -8..8 {
+            store.insert(BrickCoord([x, -1, z]), Brick::solid(rock));
+        }
+    }
+    for y in 0..6 {
+        for a in -8..8 {
+            store.insert(BrickCoord([-8, y, a]), Brick::solid(rock));
+            store.insert(BrickCoord([a, y, -8]), Brick::solid(rock));
+            store.insert(BrickCoord([a, y, 7]), Brick::solid(rock));
+        }
+    }
+    if ridge {
+        for y in 2025..2225 {
+            for z in -57..57 {
+                store.insert(BrickCoord([2125, y, z]), Brick::solid(rock));
+            }
+        }
+    }
+    Scene::new(&store, None)
+}
+
+#[test]
+fn a_far_ridges_shadow_is_not_lit_by_the_bounce_as_if_the_sun_were_open() {
+    // The valley is in the shadow of a ridge more than 820 m off. The sun's rays of Primary's GI
+    // (`gi_fill`, which gives the cache the light of a surface the bounce landed on) must not stop
+    // at the bounces' reach, or the shadowed walls and floor are lit by the sun in the cache and
+    // bounce it into one another: the valley comes out brighter than the Reference's.
+    let camera = Camera::looking_at([40.0, 24.0, 0.0], [-60.0, 14.0, 0.0]);
+    let sun = Sun::new([1.0, 1.0, 0.0], 0.02).expect("a direction");
+    let mut means = Vec::new();
+    for ridge in [false, true] {
+        let scene = valley_in_a_far_ridges_shadow(ridge);
+        let mut gpu = gpu_of(&scene);
+        gpu.set_sun(sun);
+        warmed(&mut gpu, &camera, 60);
+        let frames: Vec<Image> = (0..8).map(|_| gpu.render(&camera)).collect();
+        let primary = frames.iter().map(mean).sum::<f32>() / 8.0;
+        let reference = mean(&gpu.render_reference(&camera, 128));
+        eprintln!("ridge {ridge}: primary {primary} reference {reference}");
+        means.push((primary, reference));
+    }
+    let (open_p, open_r) = means[0];
+    let (shaded_p, shaded_r) = means[1];
+    // The sun is what lights the open floor, and the ridge takes it away.
+    assert!(
+        open_r > 1.5 * shaded_r,
+        "the ridge shades: {open_r} against {shaded_r}"
+    );
+    // Both are as the Reference has them: the open one (no cap in the way) and the shaded one.
+    assert!(
+        (open_p / open_r - 1.0).abs() < 0.08,
+        "open: {open_p} against {open_r}"
+    );
+    assert!(
+        (shaded_p / shaded_r - 1.0).abs() < 0.015,
+        "in the ridge's shadow: Primary {shaded_p}, the Reference's {shaded_r}"
+    );
 }

@@ -64,6 +64,14 @@ const GI_BOOST_FRAMES: u32 = 30;
 /// How far round the regions an Edit wrote the boost reaches, in Voxels: the light that an Edit lets
 /// in or shuts out changes the cells about it most (two regions, 6.4 m).
 const GI_BOOST_MARGIN: i32 = 128;
+/// The most that the box of cells which forget fast may grow to along an axis, in Voxels (100 m),
+/// by Edits that come while another is settling: past it the newest Edit's box replaces it, so
+/// that a stream of Edits (a server's, round the world) does not make the whole world forget fast.
+const GI_BOOST_MAX_EXTENT: i32 = 2048;
+/// How near an Edit's box must be to the camera, in Voxels (200 m), for the upscaler to keep a short
+/// history for it (`edit_settling`): the history cap is for the whole image, so an Edit that is
+/// not near what the camera sees does not take it.
+const EDIT_SETTLING_REACH: f64 = 4096.0;
 /// A box that holds every Voxel, for a change of the sun.
 const EVERYWHERE: ([i32; 3], [i32; 3]) = ([i32::MIN / 2; 3], [i32::MAX / 2; 3]);
 
@@ -552,6 +560,8 @@ pub struct Tracer {
     /// starts the history over anyway).
     edit_settling: u32,
     gi_boost_box: ([i32; 3], [i32; 3]),
+    /// Where the camera of the frame last drawn was (an Edit's box is judged by its nearness).
+    camera_position: [f64; 3],
     /// The emitters of level 0 by region, which an update of the scene takes in region by region.
     emitter_index: EmitterIndex,
     /// Whether Primary's light has the flat ambient of before #54 in place of its GI (see
@@ -1265,6 +1275,7 @@ impl Tracer {
             gi_boost: 0,
             edit_settling: 0,
             gi_boost_box: EVERYWHERE,
+            camera_position: [0.0; 3],
             emitter_index,
             flat_ambient: false,
             shade_layout,
@@ -1343,6 +1354,7 @@ impl Tracer {
         target: &Target,
     ) {
         self.gi_frame += 1;
+        self.camera_position = camera.position;
         self.write_uniforms(queue, camera, sun, (0, CENTRE, 0), 0);
         self.encode_atmosphere(
             device,
@@ -1410,6 +1422,7 @@ impl Tracer {
             .begin(target.resolution(), camera, self.debug_view);
         frame.light_settling(self.edit_settling > 0);
         self.gi_frame += 1;
+        self.camera_position = camera.position;
         self.write_uniforms(
             queue,
             camera,
@@ -1901,16 +1914,29 @@ impl Tracer {
             hi.map(|k| (k + 1) * 8 + GI_BOOST_MARGIN),
         );
         self.gi_boost_box = if self.gi_boost > 0 {
-            // An Edit while another is settling: the cells of both.
-            (
+            // An Edit while another is settling: the cells of both, up to a box of
+            // GI_BOOST_MAX_EXTENT along each axis; past that, the newest Edit's alone.
+            let both: ([i32; 3], [i32; 3]) = (
                 std::array::from_fn(|a| self.gi_boost_box.0[a].min(reach.0[a])),
                 std::array::from_fn(|a| self.gi_boost_box.1[a].max(reach.1[a])),
-            )
+            );
+            let small = (0..3).all(|a| {
+                i64::from(both.1[a]) - i64::from(both.0[a]) <= i64::from(GI_BOOST_MAX_EXTENT)
+            });
+            if small { both } else { reach }
         } else {
             reach
         };
         self.gi_boost = GI_BOOST_FRAMES;
-        self.edit_settling = GI_BOOST_FRAMES;
+        // The upscaler's short history is for the whole image: only for an Edit near the camera.
+        let near = (0..3).all(|a| {
+            let (lo, hi) = (f64::from(reach.0[a]), f64::from(reach.1[a]));
+            (self.camera_position[a].clamp(lo, hi) - self.camera_position[a]).abs()
+                <= EDIT_SETTLING_REACH
+        });
+        if near {
+            self.edit_settling = GI_BOOST_FRAMES;
+        }
     }
 
     /// Sets the light's palette (see [`Look`]). The sun's and the sky's light are part of what the

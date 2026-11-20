@@ -53,13 +53,19 @@ const GI_GROUP_FILL_EMITTER = 5u;
 const GI_FEED_ONE_IN = 8u;
 const GI_REFRESH_ONE_IN = 16u;
 const GI_REFRESH_ONE_IN_AFTER_EDIT = 2u;
-// How far the rays of the bounce and of the sun's light at a landing look, in voxels (820 m at 20
-// to a metre): what is further is not found, the bounce goes to the sky and the sun's ray is
-// open. These are the long incoherent rays of the frame, and on the full-size Planet a ray that
-// finds nothing would otherwise walk every one of its levels to the horizon; past this distance
-// the light of a surface is a few thousandths of a pixel's, and the Planet's own curve has hidden
-// most of it. Keep in step with the ledger in ADR 0005 ("Bounce light").
+// How far a bounce ray looks, in voxels (820 m at 20 to a metre): what is further is not found, and
+// the bounce goes to the sky. The bounces are the long incoherent rays of the frame, and on the
+// full-size Planet a ray that finds nothing would otherwise walk every one of its levels to the
+// horizon; past this distance a surface's light is a few thousandths of a pixel's, which the sky's
+// stands in for. Keep in step with the ledger in ADR 0005 ("Bounce light").
 const GI_REACH = 16384.0;
+// How far the sun's ray at a landing looks (`gi_sun`), in voxels (13 km): **much further**, because
+// a sun ray that stops early is open and lights the whole sun, not a thousandth of it: a ridge
+// 150 m high at 10 degrees of sun casts 850 m of shadow, and a mountain range at a low sun a good
+// deal more. The levels past it are skipped (the shadow of a blocker over 13 km off, a range
+// 1.1 km high at 5 degrees of sun, is open). The cost is the fills' (`gi_fill`), which only run for
+// cells that are not known yet or have not been fed for a while.
+const GI_SUN_REACH = 262144.0;
 
 // The ray that a bounce from `hit` leaves along: cosine-weighted about `normal`, and mirrored about
 // the geometric face when the smooth normal tilts it below, as the Reference's is.
@@ -104,7 +110,7 @@ fn gi_sun(ray: Ray, hit: Hit, u: vec2<f32>) -> vec3<f32> {
     // lighting: Sun and shadows
     let to_sun = sample_cone(frame.sun.xyz, frame.sun.w, u);
     // lighting: Sun and shadows
-    if dot(hit.normal, to_sun) > 0.0 && !trace_within(leave(ray, hit, to_sun), GI_REACH).hit {
+    if dot(hit.normal, to_sun) > 0.0 && !trace_within(leave(ray, hit, to_sun), GI_SUN_REACH).hit {
         // lighting: Sun and shadows
         return frame.sun_radiance.xyz * diffuse;
     }
@@ -213,7 +219,11 @@ fn gi_reconstruct(id: vec2<u32>, hit: Hit, size: vec2<u32>) -> vec3<f32> {
     let rel = vec2<i32>(id) - offset;
     let base = rel >> vec2<u32>(1u);
     let frac = vec2<f32>(rel - (base << vec2<u32>(1u))) * 0.5;
-    let tolerance = 2.0 + 0.04 * hit.t;
+    // Within a few voxels of the plane, and a little more the farther the pixel is (its footprint
+    // grows with the distance): the voxel's own quantisation and a rough ground, not a second
+    // surface behind an edge.
+    let footprint = hit.t * 2.0 * camera.params.x / f32(size.y);
+    let tolerance = 2.0 + 2.0 * footprint;
     var sum = vec3<f32>(0.0);
     var total = 0.0;
     var nearest = vec3<f32>(0.0);
@@ -248,7 +258,14 @@ fn gi_reconstruct(id: vec2<u32>, hit: Hit, size: vec2<u32>) -> vec3<f32> {
     if total > 0.0 {
         return sum / total;
     }
-    return nearest;
+    // None of the four is on the pixel's surface. The nearest that hit anything, if any did; and
+    // if there was none (a pixel of a thin feature against the sky: the four are sky), the pixel's
+    // own light of the last frame it was traced in, which is at most three frames old.
+    if nearest_plane < 1.0e30 {
+        return nearest;
+    }
+    // lighting: Bounce light
+    return textureLoad(gi_light, id, 0).xyz;
 }
 
 @compute @workgroup_size(8, 8)
