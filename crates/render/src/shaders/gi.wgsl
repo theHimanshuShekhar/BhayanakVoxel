@@ -36,7 +36,7 @@
 @group(1) @binding(21) var gi_light: texture_2d<f32>;
 // The frame's samples of the two noisy signals at every pixel, written by `gi_samples` for the
 // denoiser (denoise.wgsl): the incident light of `gi_reconstruct` in xyz, the sun's weight in w.
-@group(1) @binding(22) var samples_out: texture_storage_2d<rgba16float, write>;
+@group(1) @binding(22) var samples_out: texture_storage_2d<rgba32float, write>;
 
 // The scramble of Primary's GI samples: a number of its own, so that they do not follow the sun's
 // or the Reference's.
@@ -290,8 +290,8 @@ fn gi_samples(@builtin(global_invocation_id) id: vec3<u32>) {
         let gi = gi_reconstruct(id.xy, hit, size);
         // lighting: Sun and shadows
         let sun = textureLoad(sun_weights, id.xy, 0).x;
-        // Finite and in what a half float holds: a sample that is not is dropped, not carried on in
-        // the history for as long as it lasts.
+        // Finite and in what a half float holds (the filter's textures are halves): a sample that is
+        // not is dropped, not carried on in the history for as long as it lasts.
         light = vec4<f32>(select(vec3<f32>(0.0), min(gi, vec3<f32>(60000.0)), gi == gi), sun);
     }
     textureStore(samples_out, id.xy, light);

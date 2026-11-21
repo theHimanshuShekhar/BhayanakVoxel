@@ -21,28 +21,6 @@ const PLUS_X: u32 = 2;
 /// What a pixel's surface is: its distance along the ray and its face's code.
 type Surface = (f32, u32);
 
-fn to_half(x: f32) -> u16 {
-    // Round to nearest, for the normal range of a half (the signals here are 0..8, never tiny).
-    let bits = x.to_bits();
-    let sign = ((bits >> 16) & 0x8000) as u16;
-    if x == 0.0 {
-        return sign;
-    }
-    let exponent = ((bits >> 23) & 0xff) as i32 - 127 + 15;
-    assert!(exponent < 31, "{x} is out of the test's range");
-    if exponent < 1 {
-        // Too small for a normal half: the test's noise has no use for the denormals.
-        return sign;
-    }
-    let mantissa = (bits & 0x7f_ffff) + 0x1000;
-    let (exponent, mantissa) = if mantissa >= 0x80_0000 {
-        (exponent + 1, 0)
-    } else {
-        (exponent, mantissa)
-    };
-    sign | ((exponent as u16) << 10) | (mantissa >> 13) as u16
-}
-
 /// Noise of a known size: a number a pixel with mean 0 and standard deviation 1 (uniform), the same
 /// every run.
 struct Noise(u64);
@@ -188,14 +166,13 @@ impl Rig {
                 let value = (signal(x, y) + sigma * self.noise.next()).max(0.0);
                 values.push(value);
                 for _ in 0..4 {
-                    bytes.extend_from_slice(&to_half(value).to_le_bytes());
+                    bytes.extend_from_slice(&value.to_le_bytes());
                 }
             }
         }
-        assert_eq!(SAMPLES_FORMAT, wgpu::TextureFormat::Rgba16Float);
-        self.upload(self.buffers.samples(), &bytes, 8);
-        // What the kernels read is what a half holds.
-        values.iter().map(|&v| half_to_f32(to_half(v))).collect()
+        assert_eq!(SAMPLES_FORMAT, wgpu::TextureFormat::Rgba32Float);
+        self.upload(self.buffers.samples(), &bytes, 16);
+        values
     }
 
     /// Runs one frame of `mode` over the samples last uploaded, and returns the history image it
@@ -267,7 +244,7 @@ impl Rig {
     /// number of each pixel (the channels are the same) and the sun's weight.
     fn light(&self, mode: Denoise, written: usize) -> Vec<[f32; 4]> {
         let plane = self.buffers.result(mode, Some(written));
-        if mode == Denoise::Temporal {
+        if mode == Denoise::Temporal || mode == Denoise::Off {
             self.read_plane(plane, 16)
                 .chunks(16)
                 .map(|t| {

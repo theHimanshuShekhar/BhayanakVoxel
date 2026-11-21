@@ -51,8 +51,11 @@ use crate::shaders;
 use crate::tracer::{Plane, buffer_binding, layout_entry, plane_entry, storage_texture};
 use crate::upscale;
 
-/// The frame's samples: the incident light in xyz and the sun's weight in w.
-pub const SAMPLES_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
+/// The frame's samples: the incident light in xyz and the sun's weight in w. In `f32`, not in a
+/// half: with the denoiser off these are what `shade_pass` lights the image with, and a half's steps
+/// (a few parts in 10 000) would turn the last bit of float noise between two renders of the same
+/// scene (a patched scene and a packed one) into a step that the 8-bit image can show.
+pub const SAMPLES_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba32Float;
 /// The accumulated light, as the samples have it, in `f32` so that an average of 32 frames is not
 /// rounded away.
 pub const ACCUM_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba32Float;

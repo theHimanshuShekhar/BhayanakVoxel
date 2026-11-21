@@ -497,7 +497,7 @@ impl Offscreen {
     /// The frame's samples of the same two signals before the denoiser. For tests.
     pub fn read_frame_samples(&mut self) -> Vec<[f32; 4]> {
         let texture = self.tracer.frame_samples(&self.target).texture.clone();
-        self.read_signals(&texture, false)
+        self.read_signals(&texture, true)
     }
 
     /// The variance of the estimate the denoiser's temporal kernel made of each signal in the last

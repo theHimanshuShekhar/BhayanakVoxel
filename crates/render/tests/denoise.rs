@@ -144,6 +144,37 @@ fn a_still_view_of_noisy_gi_is_quiet_denoised_and_no_darker() {
 }
 
 #[test]
+fn the_frames_samples_are_not_rounded_to_a_half() {
+    // What this guards: the sun's weight that the denoiser off lights the image with is a full
+    // float. A render that is the same as another to the last bit of a float (a patched scene
+    // against one packed from scratch, `rings.rs`) must stay so, and a half's steps (a few parts in
+    // 10 000) turn a bit of float noise into a step that can show in the 8-bit image (one level of
+    // one pixel, on CI). A floor in a high sun has a weight of about the sun's cosine at nearly
+    // every pixel, with bits below a half's ten; a half-rounded texture has none.
+    let rock = material("rock");
+    let mut store = BrickStore::new();
+    for x in -64..64 {
+        for z in -64..64 {
+            for y in -8..0 {
+                store.set(VoxelCoord([x, y, z]), Some(rock));
+            }
+        }
+    }
+    let scene = Scene::new(&store, None);
+    let mut gpu = gpu_of(&scene, Denoise::Off);
+    gpu.set_sun(Sun::from_angles(0.5, 1.2, 0.04));
+    let camera = Camera::looking_at([0.0, 25.0, 0.0], [0.0, 0.0, 0.5]);
+    gpu.render_upscaled(&camera);
+    let weights: Vec<f32> = gpu.read_frame_samples().iter().map(|p| p[3]).collect();
+    let finer = weights.iter().filter(|w| w.to_bits() & 0x1fff != 0).count();
+    assert!(
+        finer > weights.len() / 2,
+        "{finer} of {} weights are finer than a half",
+        weights.len()
+    );
+}
+
+#[test]
 fn off_is_the_frames_samples_and_changing_the_mode_starts_the_history_over() {
     // What this guards: the fallback switches on the renderer. With the denoiser off the light
     // `shade_pass` reads is the frame's samples exactly. A mode that is changed starts the history

@@ -2235,7 +2235,7 @@ impl Tracer {
     /// and whether it is `f32` (else half floats). For tests and the bench.
     pub(crate) fn light_signals<'a>(&self, target: &'a Target) -> (&'a Plane, bool) {
         let plane = target.denoise.result(self.denoise, self.denoise_written);
-        let wide = self.denoise == Denoise::Temporal && self.denoise_written.is_some();
+        let wide = plane.texture.format() == wgpu::TextureFormat::Rgba32Float;
         (plane, wide)
     }
 
