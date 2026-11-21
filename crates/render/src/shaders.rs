@@ -88,6 +88,40 @@ pub const PROBE: &str = concat!(
     include_str!("shaders/probe.wgsl")
 );
 
+/// The hardware backend of `trace()` (#50): ray queries over the bricks' boxes (`hw.rs`). Joined to
+/// a module that has `trace.wgsl` in it by [`hardware`].
+const TRACE_HW: &str = include_str!("shaders/trace_hw.wgsl");
+
+/// `source` (a module with `trace.wgsl` in it) with `trace_within`, the one function that walks the
+/// Planet, replaced by the ray-query one: the compute walk is kept as `trace_within_compute`. The
+/// shadow rays' `occluded` is the ray-query one that ends at the first hit with `any_hit_shadows`
+/// and else the nearest-hit one like every other ray's. The module needs the device's
+/// `EXPERIMENTAL_RAY_QUERY` (see [`crate::hw`]) and a bind group 2 made by `hw::HwScene`.
+pub fn hardware(source: &str, any_hit_shadows: bool) -> String {
+    const WALK: &str = "fn trace_within(ray: Ray, reach_t: f32) -> Hit {";
+    const OCCLUDED: &str = "fn occluded(ray: Ray, reach_t: f32) -> bool {";
+    assert_eq!(source.matches(WALK).count(), 1, "trace.wgsl's trace_within");
+    assert_eq!(source.matches(OCCLUDED).count(), 1, "trace.wgsl's occluded");
+    let occluded = if any_hit_shadows {
+        "fn occluded(ray: Ray, reach_t: f32) -> bool { return occluded_any_hit(ray, reach_t); }"
+    } else {
+        "fn occluded(ray: Ray, reach_t: f32) -> bool { return trace_within(ray, reach_t).hit; }"
+    };
+    format!(
+        "enable wgpu_ray_query;\n{}\n{}\n{occluded}\n",
+        source
+            .replace(
+                WALK,
+                "fn trace_within_compute(ray: Ray, reach_t: f32) -> Hit {"
+            )
+            .replace(
+                OCCLUDED,
+                "fn occluded_compute(ray: Ray, reach_t: f32) -> bool {"
+            ),
+        TRACE_HW
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use naga::valid::{Capabilities, ValidationFlags, Validator};
@@ -112,7 +146,7 @@ mod tests {
     }
 
     #[test]
-    fn the_shade_kernels_are_valid_wgsl_and_cast_their_shadow_rays_from_one_trace_call_in_one_kernel()
+    fn the_shade_kernels_are_valid_wgsl_and_cast_their_shadow_rays_from_one_occluded_call_in_one_kernel()
      {
         assert_eq!(
             entry_points(SHADE),
@@ -120,12 +154,14 @@ mod tests {
         );
         // The smooth normal reads the Planet through `solid_at` of trace.wgsl, and the light is
         // drawn from what primary visibility found: the only rays of `shade.wgsl` are the sun's
-        // shadow rays, in `shadows`, one call of trace() in a loop over `frame.light.w` rays, and
-        // nothing else there casts one (the bounce's and the emitters' are `gi.wgsl`'s).
+        // shadow rays, in `shadows`, one call of occluded() (trace()'s question of whether anything is
+        // in the way, which the hardware backend answers with a ray query that ends at the first
+        // hit) in a loop over `frame.light.w` rays, and nothing else there casts one (the bounce's
+        // and the emitters' are `gi.wgsl`'s).
         let kernel = include_str!("shaders/shade.wgsl");
         let calls = kernel
             .lines()
-            .filter(|l| !l.trim().starts_with("//") && l.contains("trace("))
+            .filter(|l| !l.trim().starts_with("//") && l.contains("occluded("))
             .count();
         assert_eq!(calls, 1);
         let shadows = kernel
@@ -133,7 +169,7 @@ mod tests {
             .nth(1)
             .and_then(|rest| rest.split("\nfn ").next())
             .expect("a shadows kernel");
-        assert!(shadows.contains("trace(leave("));
+        assert!(shadows.contains("occluded(leave("));
         assert!(shadows.contains("for (var k = 0u;") && shadows.contains("frame.light.w"));
     }
 
@@ -326,8 +362,10 @@ mod tests {
 
     /// The shader files, all of them known: a new one is neither of a view nor checked until it is
     /// listed here.
-    const FILES: [&str; 16] = [
+    const FILES: [&str; 17] = [
         "trace.wgsl",
+        // The hardware backend of trace() (#50): lights nothing, joined to trace.wgsl by `hardware`.
+        "trace_hw.wgsl",
         "common.wgsl",
         "sampling.wgsl",
         "primary.wgsl",
@@ -716,6 +754,55 @@ mod tests {
             BLIT,
         ] {
             assert_eq!(other.matches("fn trace(").count(), 0);
+        }
+    }
+
+    #[test]
+    fn the_hardware_modules_are_valid_wgsl_with_ray_queries_and_make_spirv_and_the_compute_ones_have_none()
+     {
+        for (name, source, any_hit) in [
+            ("primary", PRIMARY),
+            ("shade", SHADE),
+            ("pathtrace", PATHTRACE),
+            ("probe", PROBE),
+        ]
+        .into_iter()
+        .flat_map(|(name, source)| [(name, source, true), (name, source, false)])
+        {
+            // The default modules never ask the device for ray queries (lavapipe has none).
+            assert!(
+                !source.contains("ray_query") && !source.contains("rayQuery"),
+                "{name}"
+            );
+            let hw = hardware(source, any_hit);
+            assert_eq!(
+                hw.contains("return occluded_any_hit(ray, reach_t);"),
+                any_hit,
+                "{name}"
+            );
+            assert_eq!(hw.matches("fn occluded(").count(), 1, "{name}");
+            assert_eq!(hw.matches("fn trace_within(").count(), 1, "{name}");
+            assert_eq!(hw.matches("fn trace_within_compute(").count(), 1, "{name}");
+            let module = naga::front::wgsl::parse_str(&hw)
+                .unwrap_or_else(|e| panic!("{name}: {}", e.emit_to_string(&hw)));
+            let info = Validator::new(ValidationFlags::all(), Capabilities::RAY_QUERY)
+                .validate(&module)
+                .unwrap_or_else(|e| panic!("{name}: {}", e.emit_to_string(&hw)));
+            // Without the capability the module is refused, which is why a device without ray
+            // queries must never be given one.
+            assert!(
+                Validator::new(ValidationFlags::all(), Capabilities::empty())
+                    .validate(&module)
+                    .is_err(),
+                "{name}"
+            );
+            // The SPIR-V backend writes it, as wgpu's Vulkan backend does (a module with pipeline
+            // constants is written once they are set, which wgpu does and this does not).
+            if module.overrides.is_empty() {
+                let options = naga::back::spv::Options::default();
+                naga::back::spv::write_vec(&module, &info, &options, None)
+                    .unwrap_or_else(|e| panic!("{name}: {e}"));
+            }
         }
     }
 }

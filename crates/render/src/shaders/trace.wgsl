@@ -347,6 +347,13 @@ fn trace(ray: Ray) -> Hit {
     return trace_within(ray, 3.4e38);
 }
 
+// Whether anything solid is in the ray's way within `reach_t`: the shadow rays' question, which does
+// not need the nearest hit. The hardware backend answers it with a ray query that ends at the first
+// hit it finds (trace_hw.wgsl).
+fn occluded(ray: Ray, reach_t: f32) -> bool {
+    return trace_within(ray, reach_t).hit;
+}
+
 // `trace`, looking no further than `reach` along the ray: what is past it is not found (a miss), and
 // the levels that only have such space to look in are skipped at once. For the rays of Primary's GI,
 // which are the long incoherent ones (gi.wgsl, `GI_REACH`).

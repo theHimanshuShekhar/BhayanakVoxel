@@ -631,6 +631,23 @@ pub struct Tracer {
     /// The staging memory that patches of rings are written through: a few big chunks, handed back
     /// by the GPU and used again, instead of a staging buffer for each write.
     belt: wgpu::util::StagingBelt,
+    /// The hardware ray-tracing backend (#50), if the device runs it: its acceleration structures
+    /// and the layout of its bind group. `None` is the compute backend, the default.
+    hw: Option<Hardware>,
+}
+
+/// The hardware backend's state: see [`crate::hw`].
+struct Hardware {
+    scene: crate::hw::HwScene,
+    layout: HwLayout,
+}
+
+/// What the pipelines need of the hardware backend: its bind group's layout (group 2), and whether
+/// shadow rays end at the first hit (see [`crate::RtBackend::Hardware`]).
+#[derive(Clone)]
+struct HwLayout {
+    layout: wgpu::BindGroupLayout,
+    any_hit_shadows: bool,
 }
 
 /// The size of a chunk of the staging belt, in bytes: a patch is written to a few of them.
@@ -679,6 +696,7 @@ pub(crate) const STORAGE_READ: wgpu::BufferBindingType =
 const STORAGE_WRITE: wgpu::BufferBindingType =
     wgpu::BufferBindingType::Storage { read_only: false };
 
+#[allow(clippy::too_many_arguments)]
 fn compute_pipeline(
     device: &wgpu::Device,
     label: &str,
@@ -686,15 +704,21 @@ fn compute_pipeline(
     entry_point: &str,
     group_1: &wgpu::BindGroupLayout,
     group_0: &wgpu::BindGroupLayout,
+    hw: Option<&HwLayout>,
     constants: &[(&str, f64)],
 ) -> wgpu::ComputePipeline {
+    // The hardware backend replaces the module's walk of the Planet with ray queries (group 2).
+    let source = match hw {
+        Some(hw) => shaders::hardware(source, hw.any_hit_shadows),
+        None => source.to_string(),
+    };
     let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some(label),
         source: wgpu::ShaderSource::Wgsl(source.into()),
     });
     let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some(label),
-        bind_group_layouts: &[Some(group_0), Some(group_1)],
+        bind_group_layouts: &[Some(group_0), Some(group_1), hw.map(|h| &h.layout)],
         immediate_size: 0,
     });
     device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -1043,6 +1067,26 @@ impl Tracer {
         Self::with_materials(device, scene, MaterialTable::built_in())
     }
 
+    /// [`Tracer::with_materials`] with the built-in table and the hardware backend (#50) on: the
+    /// device must have `EXPERIMENTAL_RAY_QUERY` (see [`crate::choose_backend`]). `camera` is where
+    /// the acceleration structures' frame starts; with `any_hit_shadows` a shadow ray ends at the
+    /// first hit instead of looking for the nearest.
+    pub fn hardware(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        scene: &Scene,
+        table: Option<&MaterialTable>,
+        camera: [f64; 3],
+        any_hit_shadows: bool,
+    ) -> Result<Self> {
+        Self::build(
+            device,
+            scene,
+            table.unwrap_or(MaterialTable::built_in()),
+            Some((queue, camera, any_hit_shadows)),
+        )
+    }
+
     /// Like [`Tracer::new`], with the Material table `table`: for tests of lighting that need
     /// Materials of an albedo or an emission that the shipped table does not have.
     pub fn with_materials(
@@ -1050,6 +1094,28 @@ impl Tracer {
         scene: &Scene,
         table: &MaterialTable,
     ) -> Result<Self> {
+        Self::build(device, scene, table, None)
+    }
+
+    /// The constructor of all of them: with `hardware`, the queue and the camera, the hardware
+    /// backend.
+    fn build(
+        device: &wgpu::Device,
+        scene: &Scene,
+        table: &MaterialTable,
+        hardware: Option<(&wgpu::Queue, [f64; 3], bool)>,
+    ) -> Result<Self> {
+        let hw_layout = hardware.map(|(_, _, any_hit_shadows)| HwLayout {
+            layout: crate::hw::bind_group_layout(device),
+            any_hit_shadows,
+        });
+        let hw = match (hardware, &hw_layout) {
+            (Some((queue, camera, _)), Some(hw)) => Some(Hardware {
+                scene: crate::hw::HwScene::new(device, queue, hw.layout.clone(), scene, camera)?,
+                layout: hw.clone(),
+            }),
+            _ => None,
+        };
         let scene_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("scene"),
             entries: &[
@@ -1183,6 +1249,7 @@ impl Tracer {
             "primary",
             &camera_layout,
             &scene_layout,
+            hw_layout.as_ref(),
             &[],
         );
         let reference = compute_pipeline(
@@ -1192,6 +1259,7 @@ impl Tracer {
             "reference",
             &camera_layout,
             &scene_layout,
+            hw_layout.as_ref(),
             &ReferenceOptions::default().constants(),
         );
         let normals = compute_pipeline(
@@ -1201,6 +1269,7 @@ impl Tracer {
             "normals",
             &normals_layout,
             &scene_layout,
+            hw_layout.as_ref(),
             &[],
         );
         let shadows = compute_pipeline(
@@ -1210,6 +1279,7 @@ impl Tracer {
             "shadows",
             &shadows_layout,
             &scene_layout,
+            hw_layout.as_ref(),
             &[],
         );
         let gi = compute_pipeline(
@@ -1219,6 +1289,7 @@ impl Tracer {
             "gi_trace",
             &gi_layout,
             &scene_layout,
+            hw_layout.as_ref(),
             &[],
         );
         let gi_resolve = compute_pipeline(
@@ -1228,6 +1299,7 @@ impl Tracer {
             "gi_resolve",
             &gi_resolve_layout,
             &scene_layout,
+            hw_layout.as_ref(),
             &[],
         );
         let gi_cache = device.create_buffer(&wgpu::BufferDescriptor {
@@ -1245,6 +1317,7 @@ impl Tracer {
             "shade_pass",
             &shade_layout,
             &scene_layout,
+            hw_layout.as_ref(),
             &[],
         );
         let emissive = emissive_materials(table);
@@ -1308,6 +1381,7 @@ impl Tracer {
             peak_growth_bytes: 0,
             peak_rebuild_bytes: 0,
             belt,
+            hw,
         })
     }
 
@@ -1356,6 +1430,7 @@ impl Tracer {
     ) {
         self.gi_frame += 1;
         self.camera_position = camera.position;
+        self.follow_hw(device, queue, camera.position);
         self.write_uniforms(queue, camera, sun, (0, CENTRE, 0), 0);
         self.encode_atmosphere(
             device,
@@ -1424,6 +1499,7 @@ impl Tracer {
         frame.light_settling(self.edit_settling > 0);
         self.gi_frame += 1;
         self.camera_position = camera.position;
+        self.follow_hw(device, queue, camera.position);
         self.write_uniforms(
             queue,
             camera,
@@ -1489,6 +1565,7 @@ impl Tracer {
         let samples = batch_of(samples, target.reference_size);
         let view = View::new(camera, sun, target);
         let first = self.accumulator.begin_batch(&view, samples);
+        self.follow_hw(device, queue, camera.position);
         self.write_uniforms(queue, camera, sun, (first, CENTRE, samples), 0);
         self.encode_atmosphere(
             device,
@@ -1629,6 +1706,48 @@ impl Tracer {
     /// change to, and starts the reference image over. Only what changed is written, unless it
     /// no longer fits in the buffers, when all of `scene` is uploaded again.
     pub fn update_scene(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        scene: &Scene,
+        update: &SceneUpdate,
+    ) -> Result<()> {
+        self.update_scene_buffers(device, queue, scene, update)?;
+        if let Some(hw) = &mut self.hw {
+            hw.scene.update(device, queue, scene, update);
+        }
+        Ok(())
+    }
+
+    /// What the last [`Tracer::update_scene`] or frame did to the hardware backend's acceleration
+    /// structures, if it has them.
+    pub fn hardware_update(&self) -> Option<&crate::hw::HwUpdate> {
+        self.hw.as_ref().map(|h| h.scene.last_update())
+    }
+
+    /// Every update of the hardware backend's acceleration structures since the last call, oldest
+    /// first (empty on the compute backend).
+    pub fn take_hardware_updates(&mut self) -> Vec<crate::hw::HwUpdate> {
+        self.hw
+            .as_mut()
+            .map_or_else(Vec::new, |h| h.scene.take_log())
+    }
+
+    /// Binds the hardware backend's group (2) in `pass`, if there is one.
+    fn bind_hw(&self, pass: &mut wgpu::ComputePass<'_>) {
+        if let Some(hw) = &self.hw {
+            pass.set_bind_group(2, hw.scene.bind_group(), &[]);
+        }
+    }
+
+    /// Moves the hardware backend's frame to the camera, if it has one.
+    fn follow_hw(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, position: [f64; 3]) {
+        if let Some(hw) = &mut self.hw {
+            hw.scene.follow(device, queue, position);
+        }
+    }
+
+    fn update_scene_buffers(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
@@ -2009,6 +2128,7 @@ impl Tracer {
             "reference",
             &self.camera_layout,
             &self.scene_layout,
+            self.hw.as_ref().map(|h| &h.layout),
             &options.constants(),
         );
         self.restart_reference();
@@ -2188,6 +2308,7 @@ impl Tracer {
         let mut pass = profiler.compute_pass(encoder, "normals");
         pass.set_pipeline(&self.normals);
         pass.set_bind_group(0, &self.scene.group, &[]);
+        self.bind_hw(&mut pass);
         pass.set_bind_group(1, &group, &[]);
         pass.dispatch_workgroups(width.div_ceil(8), height.div_ceil(8), 1);
     }
@@ -2218,6 +2339,7 @@ impl Tracer {
         let mut pass = profiler.compute_pass(encoder, "shadows");
         pass.set_pipeline(&self.shadows);
         pass.set_bind_group(0, &self.scene.group, &[]);
+        self.bind_hw(&mut pass);
         pass.set_bind_group(1, &group, &[]);
         pass.dispatch_workgroups(width.div_ceil(8), height.div_ceil(8), 1);
     }
@@ -2264,6 +2386,7 @@ impl Tracer {
         let mut pass = profiler.compute_pass(encoder, "gi");
         pass.set_pipeline(&self.gi);
         pass.set_bind_group(0, &self.scene.group, &[]);
+        self.bind_hw(&mut pass);
         pass.set_bind_group(1, &group, &[]);
         // One pixel of each 2 x 2 block (`gi_lattice_offset`): a quarter of the threads.
         pass.dispatch_workgroups(
@@ -2273,6 +2396,7 @@ impl Tracer {
         );
         pass.set_pipeline(&self.gi_resolve);
         pass.set_bind_group(0, &self.scene.group, &[]);
+        self.bind_hw(&mut pass);
         pass.set_bind_group(1, &resolve, &[]);
         pass.dispatch_workgroups(GI_CACHE_SLOTS.div_ceil(64) as u32, 1, 1);
     }
@@ -2319,6 +2443,7 @@ impl Tracer {
         let mut pass = profiler.compute_pass(encoder, "shade");
         pass.set_pipeline(&self.shade);
         pass.set_bind_group(0, &self.scene.group, &[]);
+        self.bind_hw(&mut pass);
         pass.set_bind_group(1, &group, &[]);
         pass.dispatch_workgroups(width.div_ceil(8), height.div_ceil(8), 1);
     }
@@ -2377,13 +2502,14 @@ impl Tracer {
         let mut pass = profiler.compute_pass(encoder, name);
         pass.set_pipeline(pipeline);
         pass.set_bind_group(0, &self.scene.group, &[]);
+        self.bind_hw(&mut pass);
         pass.set_bind_group(1, &group, &[]);
         pass.dispatch_workgroups(width.div_ceil(8), height.div_ceil(8), 1);
     }
 
     /// Casts `rays` through `trace()` on the GPU and returns the hits, in order.
     pub fn trace_rays(
-        &self,
+        &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         rays: &[Ray],
@@ -2391,6 +2517,8 @@ impl Tracer {
         if rays.is_empty() {
             return Vec::new();
         }
+        // The hardware backend's frame is round the first ray's cell.
+        self.follow_hw(device, queue, rays[0].cell.map(f64::from));
         // Three vec4s per ray: cell, origin, direction.
         let input: Vec<[u32; 4]> = rays
             .iter()
@@ -2446,6 +2574,7 @@ impl Tracer {
             "probe",
             &probe_layout,
             &self.scene_layout,
+            self.hw.as_ref().map(|h| &h.layout),
             &[],
         );
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
@@ -2454,6 +2583,7 @@ impl Tracer {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default()); // untimed
             pass.set_pipeline(&pipeline);
             pass.set_bind_group(0, &self.scene.group, &[]);
+            self.bind_hw(&mut pass);
             pass.set_bind_group(1, &group, &[]);
             pass.dispatch_workgroups((rays.len() as u32).div_ceil(64), 1, 1);
         }

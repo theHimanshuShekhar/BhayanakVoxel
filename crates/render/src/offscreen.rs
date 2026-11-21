@@ -11,7 +11,9 @@ use crate::sun::Sun;
 use crate::timing::Timings;
 use crate::tracer::{Plane, ReferenceOptions, Target, Tracer};
 use crate::upscale::Resolution;
-use crate::{Result, finish_and_read, request_gpu, shared_instance, staging_buffer};
+use crate::{
+    Result, RtBackend, RtChoice, finish_and_read, request_gpu_for, shared_instance, staging_buffer,
+};
 
 /// A half-precision float's value.
 fn half_to_f32(bits: u16) -> f32 {
@@ -171,6 +173,7 @@ struct Presenter {
 /// The renderer with an image of its own instead of a window.
 pub struct Offscreen {
     info: GpuInfo,
+    rt: RtChoice,
     device: wgpu::Device,
     queue: wgpu::Queue,
     tracer: Tracer,
@@ -198,6 +201,41 @@ impl Offscreen {
     /// Traces at `resolution.internal` and presents at `resolution.output`.
     pub fn with_resolution(resolution: Resolution, scene: &Scene) -> Result<Self> {
         Self::create(resolution, scene, true)
+    }
+
+    /// Like [`Offscreen::with_resolution`], with the ray backend `backend` (#50): the hardware one
+    /// if the adapter can do ray queries, else the compute one, with no error ([`Offscreen::rt`]
+    /// says which and why).
+    pub fn with_backend(resolution: Resolution, scene: &Scene, backend: RtBackend) -> Result<Self> {
+        Self::build_with(resolution, scene, true, None, false, backend, false)
+    }
+
+    /// [`Offscreen::with_backend`] on a device made as if the adapter had no ray queries, as on one
+    /// that lacks them: a hardware `backend` falls back to compute. For testing that path, through
+    /// the real device request, wherever the driver has them.
+    pub fn without_ray_queries(
+        resolution: Resolution,
+        scene: &Scene,
+        backend: RtBackend,
+    ) -> Result<Self> {
+        Self::build_with(resolution, scene, true, None, false, backend, true)
+    }
+
+    /// Which ray backend runs, and why not the one asked for if it is not.
+    pub fn rt(&self) -> &RtChoice {
+        &self.rt
+    }
+
+    /// Every update of the hardware backend's acceleration structures since the last call, the
+    /// first build included: what each rebuilt and cost. Empty on the compute backend.
+    pub fn take_hardware_updates(&mut self) -> Vec<crate::hw::HwUpdate> {
+        self.tracer.take_hardware_updates()
+    }
+
+    /// What the last update of the hardware backend's acceleration structures did and cost (a scene
+    /// update, or the camera leaving the TLAS's frame): `None` on the compute backend.
+    pub fn hardware_update(&self) -> Option<&crate::hw::HwUpdate> {
+        self.tracer.hardware_update()
     }
 
     /// Like [`Offscreen::with_resolution`], with the Reference view traced at the **output**
@@ -234,7 +272,28 @@ impl Offscreen {
         table: Option<&materials::MaterialTable>,
         full_reference: bool,
     ) -> Result<Self> {
-        let (adapter, device, queue) = request_gpu(shared_instance(), None, timers)?;
+        Self::build_with(
+            resolution,
+            scene,
+            timers,
+            table,
+            full_reference,
+            RtBackend::Compute,
+            false,
+        )
+    }
+
+    fn build_with(
+        resolution: Resolution,
+        scene: &Scene,
+        timers: bool,
+        table: Option<&materials::MaterialTable>,
+        full_reference: bool,
+        backend: RtBackend,
+        hide_ray_queries: bool,
+    ) -> Result<Self> {
+        let (adapter, device, queue, rt) =
+            request_gpu_for(shared_instance(), None, timers, backend, hide_ray_queries)?;
         let info = adapter.get_info();
         let info = GpuInfo {
             name: info.name,
@@ -243,9 +302,17 @@ impl Offscreen {
             driver_info: info.driver_info,
             backend: format!("{:?}", info.backend),
         };
-        let mut tracer = match table {
-            Some(table) => Tracer::with_materials(&device, scene, table)?,
-            None => Tracer::new(&device, scene)?,
+        let mut tracer = match (rt.active, table) {
+            (backend, table) if backend.is_hardware() => Tracer::hardware(
+                &device,
+                &queue,
+                scene,
+                table,
+                scene_centre(scene),
+                backend == RtBackend::Hardware,
+            )?,
+            (_, Some(table)) => Tracer::with_materials(&device, scene, table)?,
+            (_, None) => Tracer::new(&device, scene)?,
         };
         // The flat ambient, not Primary's GI (#54), until a caller asks for GI: most of what
         // renders here is a test of geometry, colours or the sun, whose frames must be a function of
@@ -260,6 +327,7 @@ impl Offscreen {
         };
         Ok(Self {
             info,
+            rt,
             device,
             queue,
             tracer,
@@ -1065,9 +1133,19 @@ impl Offscreen {
     }
 
     /// Casts `rays` through the GPU `trace()` and returns the hits, in order.
-    pub fn trace_rays(&self, rays: &[Ray]) -> Vec<Option<Hit>> {
+    pub fn trace_rays(&mut self, rays: &[Ray]) -> Vec<Option<Hit>> {
         self.tracer.trace_rays(&self.device, &self.queue, rays)
     }
+}
+
+/// The middle of the first level's regions, in Voxels: where the hardware backend's frame starts
+/// before a camera is known.
+fn scene_centre(scene: &Scene) -> [f64; 3] {
+    scene.levels.first().map_or([0.0; 3], |l| {
+        std::array::from_fn(|a| {
+            (f64::from(l.occupied_first[a]) + f64::from(l.occupied_end[a])) * 32.0
+        })
+    })
 }
 
 /// The sun for a frame seen from `camera`: the local one if there is one.

@@ -113,7 +113,7 @@ fn gi_sun(ray: Ray, hit: Hit, u: vec2<f32>) -> vec3<f32> {
     // lighting: Sun and shadows
     let to_sun = sample_cone(frame.sun.xyz, frame.sun.w, u);
     // lighting: Sun and shadows
-    if dot(hit.normal, to_sun) > 0.0 && !trace_within(leave(ray, hit, to_sun), GI_SUN_REACH).hit {
+    if dot(hit.normal, to_sun) > 0.0 && !occluded(leave(ray, hit, to_sun), GI_SUN_REACH) {
         // lighting: Sun and shadows
         return frame.sun_radiance.xyz * diffuse;
     }

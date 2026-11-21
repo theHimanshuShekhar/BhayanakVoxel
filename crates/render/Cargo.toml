@@ -16,5 +16,5 @@ pollster = "1.0.1"
 [dev-dependencies]
 planet-gen.workspace = true
 # Validates the WGSL in `cargo test`; this is the version wgpu 30.0.1 itself uses.
-naga = { version = "=30.0.1", features = ["wgsl-in"] }
+naga = { version = "=30.0.1", features = ["wgsl-in", "spv-out"] }
 png = "0.18.1"
