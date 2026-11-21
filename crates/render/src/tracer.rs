@@ -1378,6 +1378,7 @@ impl Tracer {
             "gi_samples",
             &samples_layout,
             &scene_layout,
+            hw_layout.as_ref(),
             &[],
         );
         let shade = compute_pipeline(
@@ -2582,6 +2583,7 @@ impl Tracer {
         let mut pass = profiler.compute_pass(encoder, "denoise");
         pass.set_pipeline(&self.samples);
         pass.set_bind_group(0, &self.scene.group, &[]);
+        self.bind_hw(&mut pass);
         pass.set_bind_group(1, &group, &[]);
         pass.dispatch_workgroups(size.0.div_ceil(8), size.1.div_ceil(8), 1);
         let frame = frame?;

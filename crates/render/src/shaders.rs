@@ -403,7 +403,7 @@ mod tests {
 
     /// The shader files, all of them known: a new one is neither of a view nor checked until it is
     /// listed here.
-    const FILES: [&str; 17] = [
+    const FILES: [&str; 18] = [
         "trace.wgsl",
         // The hardware backend of trace() (#50): lights nothing, joined to trace.wgsl by `hardware`.
         "trace_hw.wgsl",
