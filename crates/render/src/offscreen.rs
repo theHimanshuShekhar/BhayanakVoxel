@@ -16,7 +16,7 @@ use crate::{
 };
 
 /// A half-precision float's value.
-fn half_to_f32(bits: u16) -> f32 {
+pub(crate) fn half_to_f32(bits: u16) -> f32 {
     let sign = if bits & 0x8000 != 0 { -1.0 } else { 1.0 };
     let (exponent, fraction) = (i32::from((bits >> 10) & 0x1f), f32::from(bits & 0x3ff));
     match exponent {
@@ -29,7 +29,7 @@ fn half_to_f32(bits: u16) -> f32 {
 
 /// Copies a `width` x `height` texture of `bytes` per texel to the CPU after the work in
 /// `encoder`, tightly packed, rows from the top.
-fn read_texture(
+pub(crate) fn read_texture(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     mut encoder: wgpu::CommandEncoder,
@@ -319,6 +319,10 @@ impl Offscreen {
         // the scene alone (GI is a noisy sample that depends on the cache's history), and goldens
         // of them stay as they were. The bench and the look-dev sheet turn GI on.
         tracer.set_flat_ambient(true);
+        // And no denoiser (#55), for the same reason: a frame that is a function of the scene alone
+        // is the frame's samples as they are. The bench and the look-dev sheet draw Primary as the
+        // game does and turn it on (`set_denoise`).
+        tracer.set_denoise(crate::denoise::Denoise::Off);
         let profiler = Profiler::new(&device, &queue);
         let target = if full_reference {
             Target::with_full_reference(&device, resolution)
@@ -467,6 +471,75 @@ impl Offscreen {
     /// [`Tracer::set_shadow_rays`]). The bench's `--shadow-rays` uses it (#52).
     pub fn set_shadow_rays(&mut self, rays: u32) {
         self.tracer.set_shadow_rays(rays);
+    }
+
+    /// Chooses how much of Primary's denoiser runs (see [`Tracer::set_denoise`]). **An `Offscreen`
+    /// starts with it off**, like the flat ambient and for the same reason: a caller that draws
+    /// Primary as the game does (the bench, the look-dev sheet) calls
+    /// `set_denoise(Denoise::Full)`. The window's tracer has it on from the start.
+    pub fn set_denoise(&mut self, mode: crate::denoise::Denoise) {
+        self.tracer.set_denoise(mode);
+    }
+
+    /// Chooses how the sun's shadow rays are weighed (see [`Tracer::set_shadow_weight`]).
+    pub fn set_shadow_weight(&mut self, weight: crate::tracer::ShadowWeight) {
+        self.tracer.set_shadow_weight(weight);
+    }
+
+    /// The light that the last frame of [`Offscreen::render_upscaled`] was lit with: the incident
+    /// light in xyz and the sun's weight in w for every pixel of the traced image, rows from the
+    /// top, after the denoiser (or as the frame's samples are where it is off). For tests.
+    pub fn read_light_signals(&mut self) -> Vec<[f32; 4]> {
+        let (plane, wide) = self.tracer.light_signals(&self.target);
+        self.read_signals(&plane.texture.clone(), wide)
+    }
+
+    /// The frame's samples of the same two signals before the denoiser. For tests.
+    pub fn read_frame_samples(&mut self) -> Vec<[f32; 4]> {
+        let texture = self.tracer.frame_samples(&self.target).texture.clone();
+        self.read_signals(&texture, true)
+    }
+
+    /// The variance of the estimate the denoiser's temporal kernel made of each signal in the last
+    /// frame of [`Offscreen::render_upscaled`]: the light's luminance in x and the sun's weight in
+    /// y, for every pixel of the traced image. Zero with the denoiser off. For tests.
+    pub fn read_light_variance(&mut self) -> Vec<[f32; 2]> {
+        let size = self.target.resolution().internal;
+        let texture = self.tracer.light_variance(&self.target).texture.clone();
+        let encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        let bytes = read_texture(&self.device, &self.queue, encoder, &texture, size, 8);
+        bytes
+            .chunks(8)
+            .map(|t| {
+                [
+                    f32::from_le_bytes(t[0..4].try_into().unwrap()),
+                    f32::from_le_bytes(t[4..8].try_into().unwrap()),
+                ]
+            })
+            .collect()
+    }
+
+    fn read_signals(&mut self, texture: &wgpu::Texture, wide: bool) -> Vec<[f32; 4]> {
+        let size = self.target.resolution().internal;
+        let encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        let bytes_per = if wide { 16 } else { 8 };
+        let bytes = read_texture(&self.device, &self.queue, encoder, texture, size, bytes_per);
+        bytes
+            .chunks(bytes_per as usize)
+            .map(|texel| {
+                std::array::from_fn(|c| {
+                    if wide {
+                        f32::from_le_bytes(texel[4 * c..4 * c + 4].try_into().unwrap())
+                    } else {
+                        half_to_f32(u16::from_le_bytes([texel[2 * c], texel[2 * c + 1]]))
+                    }
+                })
+            })
+            .collect()
     }
 
     /// Chooses what is drawn: the lit image, or one of the debug views.

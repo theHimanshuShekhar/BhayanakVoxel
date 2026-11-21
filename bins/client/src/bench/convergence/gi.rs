@@ -1,6 +1,6 @@
-//! Primary's GI against the Reference (#54, ADR 0005): how close Primary's image is to the
+//! Primary's GI against the Reference (#54, #55, ADR 0005): how close Primary's image is to the
 //! Reference's truth in each convergence view, with the radiance cache and with the flat ambient
-//! that Primary had before it, and how fast the lit result follows a dig.
+//! that Primary had before it, denoised and not, and how fast the lit result follows a dig.
 //!
 //! **What is scored.** In each of the convergence views (the golden's, the pit and the emissive
 //! room) Primary is drawn as the window draws it, traced at half the size and upscaled, and scored
@@ -8,11 +8,20 @@
 //! view's truth A, which `run_view` has made: the same image, the same seed and the same size, so
 //! that the scores of one run say how the views stand and nothing else. Primary is drawn twice, on
 //! a GPU context of its own each:
-//! - **`flat`**: the flat ambient of 0.25 that main's Primary has ([`Offscreen::set_flat_ambient`]),
-//!   the baseline. It is not a mode of the game; it is here so that "no view moves further from
-//!   the Reference than main's Primary" has a number on the same build, and the report has each
-//!   view's score before and after.
-//! - **`gi`**: the cache's GI, as the window draws it.
+//! - **`flat`**: the flat ambient of 0.25 that main's Primary had before #54
+//!   ([`Offscreen::set_flat_ambient`]), the baseline, with no denoiser. It is not a mode of the game;
+//!   it is here so that "no view moves further from the Reference than main's Primary" has a number
+//!   on the same build, and the report has each view's score before and after.
+//! - **`raw`**: the cache's GI with the denoiser off ([`render::Denoise::Off`]): Primary as #54 left
+//!   it, which shows what the denoiser did and what it did not (a denoiser removes noise, not bias).
+//! - **`gi`**: the cache's GI as the window draws it, with the denoiser on
+//!   ([`render::Denoise::Full`], #55) and the sun's shadow rays weighed as `--shadow-weight` says.
+//!   **This is what is gated.**
+//! - **`other_weight`**: `gi` with the other weight of the sun's shadow rays
+//!   ([`render::ShadowWeight`]), so that one run says which measures better.
+//!
+//! The Reference's own score at 64 samples (`reference_64`, the convergence curve's point) is
+//! reported beside them, not gated: it is what a path tracer gets for a frame's budget of samples.
 //!
 //! Each is scored twice, as the shadows view is: **`first_frame`**, the frame after the view was
 //! made, with a cache that has nothing in it, and **`settled`**, after [`Settings::settle_frames`]
@@ -22,7 +31,8 @@
 //! frame is reported beside it.
 //!
 //! **The gates** (the ticket's acceptance, the run's exit status 2 if any is over):
-//! - the room's settled GI image is at FLIP [`ROOM_TARGET_FLIP`] or under (#55 tightens it);
+//! - **every** view's settled image of `gi` is at FLIP [`PRIMARY_TARGET_FLIP`] or under (#55: the
+//!   room's was 0.10 until the denoiser);
 //! - no view's settled GI image is further from truth than its flat-ambient one;
 //! - the lit result settles within [`SETTLE_WITHIN_MS`] of a dig ([`EditSettle`]);
 //! - the Reference converges in the room: FLIP at most [`still::FLIP_TARGET`] within
@@ -50,16 +60,17 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use brick_store::VoxelCoord;
-use render::{Camera, Image, Offscreen, Resolution, Scene};
+use render::{Camera, Denoise, Image, Offscreen, Resolution, Scene, ShadowWeight};
 use serde::Serialize;
 
-use super::shadows::Scores;
+use super::shadows::{CONVERGED_FRAMES, Converged, Scores};
 use super::views::{self, View};
 use super::{score, still, write_png};
 
-/// The FLIP the room's settled GI image is held to against the Reference's truth, at 1440p on the
-/// 4090 (the ticket's; #55's denoiser tightens it).
-pub const ROOM_TARGET_FLIP: f64 = 0.10;
+/// The FLIP Primary's settled image is held to against the Reference's truth in every view, at
+/// 1440p on the 4090 (#55's; ADR 0005's "acceptable" line). It was 0.10 in the room until the
+/// denoiser. A denoiser removes noise, not bias, so this is Primary's bias as much as its noise.
+pub const PRIMARY_TARGET_FLIP: f64 = 0.05;
 /// The lit result of a dig has settled within this long of it, in milliseconds (the ticket's
 /// half second).
 pub const SETTLE_WITHIN_MS: f64 = 500.0;
@@ -94,6 +105,11 @@ pub struct Settings {
     /// Edit made through `World::edit` with the scene thread, the frames paced at 60 Hz by the clock
     /// (the scene thread's time is real). Off for `--short`, which has no Planet to make.
     pub game_path: bool,
+    /// How the sun's shadow rays are weighed in `gi` (`--shadow-weight`): the gates are on it.
+    pub shadow_weight: ShadowWeight,
+    /// Frames of a still camera that Primary with no denoiser is averaged over for `converged` (0:
+    /// not measured).
+    pub converged_frames: u32,
 }
 
 impl Settings {
@@ -108,6 +124,8 @@ impl Settings {
             warm_frames: WARM_FRAMES,
             dig_frames: DIG_FRAMES,
             game_path: true,
+            shadow_weight: ShadowWeight::default(),
+            converged_frames: CONVERGED_FRAMES,
         }
     }
 
@@ -120,6 +138,8 @@ impl Settings {
             warm_frames: 6,
             dig_frames: 12,
             game_path: false,
+            shadow_weight: ShadowWeight::default(),
+            converged_frames: 0,
         }
     }
 }
@@ -147,8 +167,24 @@ pub struct Variant {
 pub struct ViewGi {
     /// Primary with the flat ambient of before #54: the baseline.
     pub flat: Variant,
-    /// Primary with the cache's GI.
+    /// Primary with the cache's GI and no denoiser: as #54 left it.
+    pub raw: Variant,
+    /// Primary as the window draws it: the cache's GI, the denoiser on (#55), and the shadow rays
+    /// weighed as `shadow_weight` says. What the gates are held on.
     pub gi: Variant,
+    /// `gi` with the other weight of the sun's shadow rays.
+    pub other_weight: Variant,
+    /// The names of the two weights.
+    pub shadow_weight: &'static str,
+    pub other_shadow_weight: &'static str,
+    /// FLIP's mean of the Reference at 64 samples against truth A: the curve's point, reported
+    /// beside Primary's score and not gated. Null without FLIP or where the curve has no point
+    /// at 64.
+    pub reference_64: Option<f64>,
+    /// Primary converged (no denoiser, averaged over many frames of the still view), and the view's
+    /// error split into its bias (FLIP of that against truth A: what no denoiser removes) and the
+    /// denoiser's residual (FLIP of `gi.settled` against it); null where `--converged-frames` is 0.
+    pub converged: Option<Converged>,
     /// Frames of a still camera that `settled` is after.
     pub settle_frames: u32,
     /// Whether the settled GI image is at least as close to truth as the flat one by FLIP mean;
@@ -191,7 +227,7 @@ pub struct EditSettle {
 /// The gates, and what is over.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct Gates {
-    pub room_target_flip: f64,
+    pub primary_target_flip: f64,
     pub settle_within_ms: f64,
     pub reference_flip: f64,
     /// ... within this many seconds in the outdoor views (which have no gate here), and in the room
@@ -200,8 +236,9 @@ pub struct Gates {
     pub reference_room_within_s: f64,
     /// Whether the gates were held: with FLIP only.
     pub held: bool,
-    /// The names of the gates that are over, empty if none: `room-flip`, `no-further:VIEW`,
-    /// `settle`, `reference-room`.
+    /// The names of the gates that are over, empty if none: `primary-flip:VIEW` (a view's settled
+    /// FLIP over [`PRIMARY_TARGET_FLIP`], the sun view's too), `no-further:VIEW`, `settle`,
+    /// `reference-room`.
     pub over: Vec<String>,
     /// The gates that were not held because the view cannot tell their line from its own noise
     /// (ADR 0005: a line counts where it is at least `MIN_LINE_OVER_FLOOR` times the floor):
@@ -218,7 +255,7 @@ pub struct GiReport {
 
 /// The mean luminance of an 8-bit RGBA image in linear light (Rec. 709 weights), which is the
 /// light itself where the display is the sRGB curve alone.
-fn mean_luminance(image: &Image) -> f64 {
+pub(super) fn mean_luminance(image: &Image) -> f64 {
     let l = |c: u8| f64::from(render::srgb_decode(f32::from(c) / 255.0));
     let pixels = image.rgba.as_chunks::<4>().0;
     let n = pixels.len() as f64;
@@ -229,19 +266,119 @@ fn mean_luminance(image: &Image) -> f64 {
         / n
 }
 
+/// How Primary is lit in one of the variants.
+#[derive(Clone, Copy)]
+struct Lighting {
+    /// The flat ambient of before #54 instead of the cache's GI.
+    flat: bool,
+    denoise: Denoise,
+    shadow_weight: ShadowWeight,
+}
+
 /// Primary of `view`'s scene, as the window draws it, in the legacy light of the convergence views:
 /// the first frame and the frame after `frames`.
-fn draw(view: &View, settings: &Settings, flat: bool) -> Result<(Image, Image), Box<dyn Error>> {
+fn draw(
+    view: &View,
+    settings: &Settings,
+    lighting: Lighting,
+) -> Result<(Image, Image), Box<dyn Error>> {
     let resolution = Resolution::scaled(settings.size, render::upscale::DEFAULT_SCALE);
     let mut gpu = Offscreen::with_resolution(resolution, &view.scene)?;
     gpu.use_legacy_light();
-    gpu.set_flat_ambient(flat);
+    gpu.set_flat_ambient(lighting.flat);
+    gpu.set_denoise(lighting.denoise);
+    gpu.set_shadow_weight(lighting.shadow_weight);
     let first = gpu.render_upscaled(&view.camera);
     let mut settled = first.clone();
     for _ in 1..settings.settle_frames.max(2) {
         settled = gpu.render_upscaled(&view.camera);
     }
     Ok((first, settled))
+}
+
+/// Primary of `view`'s scene with the cache's GI, the denoiser off and the shadow rays weighed as
+/// `weight` says, averaged over `settings.converged_frames` frames of the still camera after
+/// `settle_frames` of them: its own mean (#55's `Primary converged`).
+fn converged_image(
+    view: &View,
+    settings: &Settings,
+    weight: ShadowWeight,
+    denoise: Denoise,
+) -> Result<Option<Image>, Box<dyn Error>> {
+    if settings.converged_frames == 0 {
+        return Ok(None);
+    }
+    eprintln!(
+        "convergence: {}: Primary, denoiser {denoise:?}, averaged over {} frames...",
+        view.name, settings.converged_frames
+    );
+    let resolution = Resolution::scaled(settings.size, render::upscale::DEFAULT_SCALE);
+    let mut gpu = Offscreen::with_resolution(resolution, &view.scene)?;
+    gpu.use_legacy_light();
+    gpu.set_flat_ambient(false);
+    gpu.set_denoise(denoise);
+    gpu.set_shadow_weight(weight);
+    for _ in 0..settings.settle_frames.max(2) {
+        gpu.render_upscaled(&view.camera);
+    }
+    Ok(score::mean_of_frames(settings.converged_frames, || {
+        gpu.render_upscaled(&view.camera)
+    }))
+}
+
+/// Splits a view's error (#55): `converged` is Primary averaged over many frames with no denoiser,
+/// so FLIP of it against truth A is the bias and FLIP of Primary's settled frames against it is the
+/// noise that is left, which the denoiser is for. Also the sun view's.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn converged_split(
+    converged: &Image,
+    denoised_converged: &Image,
+    truth: &Image,
+    truth_rgb: &[u8],
+    denoised_settled: &Image,
+    raw_settled: &Image,
+    size: (usize, usize),
+    frames: u32,
+    flip: bool,
+    name: &str,
+) -> Result<Converged, String> {
+    let rgb = score::rgb_of_rgba(&converged.rgba);
+    let against = |what: &str, reference: &[u8], test: &Image| -> Result<Option<Scores>, String> {
+        if !flip {
+            return Ok(None);
+        }
+        eprintln!("convergence: {name}: FLIP of {what}...");
+        score::flip(reference, &score::rgb_of_rgba(&test.rgba), size).map(|f| Some(f.into()))
+    };
+    Ok(Converged {
+        frames,
+        luminance_ratio: mean_luminance(converged) / mean_luminance(truth),
+        bias: against(
+            "Primary converged against truth (the bias)",
+            truth_rgb,
+            converged,
+        )?,
+        residual: against(
+            "Primary denoised, settled, against Primary converged (the residual)",
+            &rgb,
+            denoised_settled,
+        )?,
+        raw_residual: against(
+            "Primary with no denoiser, settled, against Primary converged",
+            &rgb,
+            raw_settled,
+        )?,
+        denoised_limit: against(
+            "Primary denoised and averaged against truth (the denoiser's limit)",
+            truth_rgb,
+            denoised_converged,
+        )?,
+        denoiser_shift: against(
+            "Primary denoised and averaged against Primary converged (the denoiser's shift)",
+            &rgb,
+            denoised_converged,
+        )?,
+    })
 }
 
 /// Scores Primary's two ways of lighting `view` against truth A (`truth`, the image the player would
@@ -260,30 +397,74 @@ pub fn score_view(
     let size = (settings.size.0 as usize, settings.size.1 as usize);
     let truth_mean = mean_luminance(truth);
     let mut files = Vec::new();
-    let mut variant = |label: &str, flat: bool| -> Result<Variant, Box<dyn Error>> {
-        let (first, settled) = draw(view, settings, flat)?;
-        let mut scored = |when: &str, image: &Image| -> Result<Score, Box<dyn Error>> {
-            let flip = if settings.flip {
-                eprintln!("convergence: {name}: FLIP of Primary, {label}, {when}...");
-                Some(score::flip(truth_rgb, &score::rgb_of_rgba(&image.rgba), size)?.into())
-            } else {
-                None
+    let mut variant =
+        |label: &str, lighting: Lighting| -> Result<(Variant, Image), Box<dyn Error>> {
+            let (first, settled) = draw(view, settings, lighting)?;
+            let mut scored = |when: &str, image: &Image| -> Result<Score, Box<dyn Error>> {
+                let flip = if settings.flip {
+                    eprintln!("convergence: {name}: FLIP of Primary, {label}, {when}...");
+                    Some(score::flip(truth_rgb, &score::rgb_of_rgba(&image.rgba), size)?.into())
+                } else {
+                    None
+                };
+                let file = format!("primary-{label}-{}.png", when.replace(' ', "-"));
+                write_png(&folder.join(&file), image)?;
+                files.push(file);
+                Ok(Score {
+                    flip,
+                    luminance_ratio: mean_luminance(image) / truth_mean,
+                })
             };
-            let file = format!("primary-{label}-{}.png", when.replace(' ', "-"));
-            write_png(&folder.join(&file), image)?;
-            files.push(file);
-            Ok(Score {
-                flip,
-                luminance_ratio: mean_luminance(image) / truth_mean,
-            })
+            let variant = Variant {
+                first_frame: scored("first frame", &first)?,
+                settled: scored("settled", &settled)?,
+            };
+            Ok((variant, settled))
         };
-        Ok(Variant {
-            first_frame: scored("first frame", &first)?,
-            settled: scored("settled", &settled)?,
-        })
+    let weight = settings.shadow_weight;
+    let other = match weight {
+        ShadowWeight::CentreCosine => ShadowWeight::PerSample,
+        ShadowWeight::PerSample => ShadowWeight::CentreCosine,
     };
-    let flat = variant("flat", true)?;
-    let gi = variant("gi", false)?;
+    let lit = |denoise, shadow_weight| Lighting {
+        flat: false,
+        denoise,
+        shadow_weight,
+    };
+    let (flat, _) = variant(
+        "flat",
+        Lighting {
+            flat: true,
+            denoise: Denoise::Off,
+            shadow_weight: weight,
+        },
+    )?;
+    let (raw, raw_settled) = variant("raw", lit(Denoise::Off, weight))?;
+    let (gi, gi_settled) = variant("gi", lit(Denoise::Full, weight))?;
+    let (other_weight, _) = variant(&format!("gi-{}", other.name()), lit(Denoise::Full, other))?;
+    let converged = match converged_image(view, settings, weight, Denoise::Off)? {
+        Some(image) => {
+            let denoised =
+                converged_image(view, settings, weight, Denoise::Full)?.expect("the same frames");
+            write_png(&folder.join("primary-converged-denoised.png"), &denoised)?;
+            files.push("primary-converged-denoised.png".to_string());
+            write_png(&folder.join("primary-converged.png"), &image)?;
+            files.push("primary-converged.png".to_string());
+            Some(converged_split(
+                &image,
+                &denoised,
+                truth,
+                truth_rgb,
+                &gi_settled,
+                &raw_settled,
+                size,
+                settings.converged_frames,
+                settings.flip,
+                name,
+            )?)
+        }
+        None => None,
+    };
     files.sort();
     let gi_not_further = flat
         .settled
@@ -292,7 +473,13 @@ pub fn score_view(
         .map(|(flat, gi)| gi.flip_mean <= flat.flip_mean);
     Ok(ViewGi {
         flat,
+        raw,
         gi,
+        other_weight,
+        shadow_weight: weight.name(),
+        other_shadow_weight: other.name(),
+        reference_64: None,
+        converged,
         settle_frames: settings.settle_frames.max(2),
         gi_not_further,
         files,
@@ -385,6 +572,8 @@ fn dig_flat(settings: &Settings, out: &Path) -> Result<EditSettle, Box<dyn Error
     let mut gpu = Offscreen::with_resolution(resolution, &scene)?;
     gpu.use_legacy_light();
     gpu.set_flat_ambient(false);
+    gpu.set_denoise(Denoise::Full);
+    gpu.set_shadow_weight(settings.shadow_weight);
     // The warm-up: the camera still, the cache gathering the dark side's light.
     let mut recent = Vec::new();
     for _ in 0..settings.warm_frames {
@@ -505,6 +694,8 @@ fn dig_in_the_game(settings: &Settings, out: &Path) -> Result<EditSettle, Box<dy
     let mut gpu = Offscreen::with_resolution(resolution, world.scene())?;
     gpu.use_legacy_light();
     gpu.set_flat_ambient(false);
+    gpu.set_denoise(Denoise::Full);
+    gpu.set_shadow_weight(settings.shadow_weight);
 
     let frame = Duration::from_secs_f64(FRAME_MS / 1e3);
     // One frame as the game draws it: the camera is told, what the scene thread made is copied.
@@ -585,21 +776,25 @@ fn dig_in_the_game(settings: &Settings, out: &Path) -> Result<EditSettle, Box<dy
 /// Each view comes with whether its Reference was within the target ([`still::FLIP_TARGET`] in
 /// [`still::WITHIN_S`] of the wall clock; the room's in [`still::ROOM_WITHIN_S`] of GPU time, which
 /// `convergence::reference_within` works out) and whether that line counts in the view.
+///
+/// `sun` is the settled FLIP mean of the sun-and-sky view's Primary (`convergence.shadows`), which
+/// is held to [`PRIMARY_TARGET_FLIP`] too.
 pub fn gates(
     settings: &Settings,
     views: &[(&'static str, &ViewGi, Option<bool>, bool)],
+    sun: Option<f64>,
     edit: &EditSettle,
 ) -> Gates {
     let mut over = Vec::new();
     let mut not_counted = Vec::new();
     if settings.flip {
         for &(name, gi, reference_within, counts) in views {
+            // A view that FLIP did not score is over: nothing says it is close to the truth.
+            let flip = gi.gi.settled.flip.map(|f| f.flip_mean);
+            if !flip.is_some_and(|f| f <= PRIMARY_TARGET_FLIP) {
+                over.push(format!("primary-flip:{name}"));
+            }
             if name == "room" {
-                // A room that FLIP did not score is over: nothing says it is lit.
-                let flip = gi.gi.settled.flip.map(|f| f.flip_mean);
-                if !flip.is_some_and(|f| f <= ROOM_TARGET_FLIP) {
-                    over.push("room-flip".to_string());
-                }
                 if !counts {
                     not_counted.push("reference-room".to_string());
                 } else if reference_within != Some(true) {
@@ -610,12 +805,15 @@ pub fn gates(
                 over.push(format!("no-further:{name}"));
             }
         }
+        if !sun.is_some_and(|f| f <= PRIMARY_TARGET_FLIP) {
+            over.push("primary-flip:sun".to_string());
+        }
         if edit.within_target != Some(true) {
             over.push("settle".to_string());
         }
     }
     Gates {
-        room_target_flip: ROOM_TARGET_FLIP,
+        primary_target_flip: PRIMARY_TARGET_FLIP,
         settle_within_ms: SETTLE_WITHIN_MS,
         reference_flip: still::FLIP_TARGET,
         reference_within_s: still::WITHIN_S,
@@ -641,14 +839,41 @@ pub fn print_summary(views: &[(&'static str, &ViewGi)], report: &GiReport) {
         |v: Option<f64>, digits: usize| v.map_or("n/a".to_string(), |v| format!("{v:.digits$}"));
     eprintln!("convergence, Primary against truth (FLIP mean; luminance over truth's):");
     for &(name, gi) in views {
-        for (what, v) in [("flat ambient", &gi.flat), ("GI", &gi.gi)] {
+        for (what, v) in [
+            ("flat ambient", &gi.flat),
+            ("GI, no denoiser", &gi.raw),
+            (gi.shadow_weight, &gi.gi),
+            (gi.other_shadow_weight, &gi.other_weight),
+        ] {
+            let what = if std::ptr::eq(v, &gi.gi) || std::ptr::eq(v, &gi.other_weight) {
+                format!("denoised, {what}")
+            } else {
+                what.to_string()
+            };
             eprintln!(
-                "  {name:<7} {what:<12} first frame {} ({:.3}), settled after {} frames {} ({:.3})",
+                "  {name:<7} {what:<30} first frame {} ({:.3}), settled after {} frames {} ({:.3})",
                 num(v.first_frame.flip.map(|f| f.flip_mean), 4),
                 v.first_frame.luminance_ratio,
                 gi.settle_frames,
                 num(v.settled.flip.map(|f| f.flip_mean), 4),
                 v.settled.luminance_ratio,
+            );
+        }
+        eprintln!(
+            "  {name:<7} the Reference at 64 samples: FLIP {} (reported, not gated)",
+            num(gi.reference_64, 4)
+        );
+        if let Some(c) = &gi.converged {
+            eprintln!(
+                "  {name:<7} Primary converged ({} frames, luminance {:.3}): bias {} (FLIP against truth), \
+                 residual {} denoised, {} with no denoiser, the denoiser's own shift {}, its limit against truth {}",
+                c.frames,
+                c.luminance_ratio,
+                num(c.bias.map(|f| f.flip_mean), 4),
+                num(c.residual.map(|f| f.flip_mean), 4),
+                num(c.raw_residual.map(|f| f.flip_mean), 4),
+                num(c.denoiser_shift.map(|f| f.flip_mean), 4),
+                num(c.denoised_limit.map(|f| f.flip_mean), 4),
             );
         }
     }
@@ -731,7 +956,13 @@ mod tests {
                 gi.settled.flip.unwrap().flip_mean <= flat.settled.flip.unwrap().flip_mean,
             ),
             flat,
+            raw: gi,
             gi,
+            other_weight: gi,
+            shadow_weight: "per-sample",
+            other_shadow_weight: "centre-cosine",
+            reference_64: Some(0.2),
+            converged: None,
             settle_frames: 32,
             files: Vec::new(),
         }
@@ -758,36 +989,47 @@ mod tests {
     fn the_gates_are_the_tickets_and_each_is_over_by_itself() {
         let settings = Settings::full((2560, 1440));
         let ok = [
-            ("golden", &view(0.2, 0.15), None, true),
-            ("pit", &view(0.2, 0.19), None, true),
-            ("room", &view(0.4, 0.09), Some(true), true),
+            ("golden", &view(0.2, 0.05), None, true),
+            ("pit", &view(0.2, 0.04), None, true),
+            ("room", &view(0.4, 0.03), Some(true), true),
         ];
-        let g = gates(&settings, &ok, &edit(Some(300.0)));
+        let g = gates(&settings, &ok, Some(0.04), &edit(Some(300.0)));
         assert!(g.held && g.over.is_empty(), "{g:?}");
-        // The room over its FLIP, a view that moved away, a dig that took too long, a Reference
-        // that did not get there in time: each is named.
-        let worse = view(0.2, 0.25);
+        // Every view over the one FLIP (the room's 0.10 is not what it was), the sun view too, a
+        // view that moved away, a dig that took too long, a Reference that did not get there in
+        // time: each is named.
+        let worse = view(0.04, 0.06);
         let bad = [
             ("golden", &worse, None, true),
-            ("pit", &view(0.2, 0.19), None, true),
-            ("room", &view(0.4, 0.11), Some(false), true),
+            ("pit", &view(0.2, 0.04), None, true),
+            ("room", &view(0.4, 0.09), Some(false), true),
         ];
-        let g = gates(&settings, &bad, &edit(Some(600.0)));
+        let g = gates(&settings, &bad, Some(0.051), &edit(Some(600.0)));
         assert_eq!(
             g.over,
-            ["no-further:golden", "room-flip", "reference-room", "settle"]
+            [
+                "primary-flip:golden",
+                "no-further:golden",
+                "primary-flip:room",
+                "reference-room",
+                "primary-flip:sun",
+                "settle"
+            ]
         );
+        // A sun view that FLIP did not score is over.
+        let g = gates(&settings, &ok, None, &edit(Some(300.0)));
+        assert_eq!(g.over, ["primary-flip:sun"]);
         // A Reference whose line the room cannot tell from its floor is not held to it, and the
         // report says so.
-        let blurred = [("room", &view(0.4, 0.09), Some(false), false)];
-        let g = gates(&settings, &blurred, &edit(Some(300.0)));
+        let blurred = [("room", &view(0.4, 0.03), Some(false), false)];
+        let g = gates(&settings, &blurred, Some(0.04), &edit(Some(300.0)));
         assert!(g.over.is_empty(), "{g:?}");
         assert_eq!(g.not_counted, ["reference-room"]);
         // A dig whose time cannot be told is over too.
-        let g = gates(&settings, &ok, &edit(None));
+        let g = gates(&settings, &ok, Some(0.04), &edit(None));
         assert_eq!(g.over, ["settle"]);
         // Without FLIP no gate is held.
-        let g = gates(&Settings::short((80, 45)), &bad, &edit(Some(600.0)));
+        let g = gates(&Settings::short((80, 45)), &bad, None, &edit(Some(600.0)));
         assert!(!g.held && g.over.is_empty());
     }
 
@@ -812,6 +1054,8 @@ mod tests {
                 warm_frames: 60,
                 dig_frames: 90,
                 game_path,
+                shadow_weight: ShadowWeight::default(),
+                converged_frames: 0,
             };
             let edit = dig(&settings, &out).unwrap();
             let at = |n: usize| edit.luminance[n] / edit.after;
@@ -849,7 +1093,8 @@ mod tests {
 
     #[test]
     fn the_targets_are_the_tickets() {
-        assert_eq!(ROOM_TARGET_FLIP, 0.10);
+        // #55: one FLIP for every view (the room's was 0.10 before the denoiser).
+        assert_eq!(PRIMARY_TARGET_FLIP, 0.05);
         assert_eq!(SETTLE_WITHIN_MS, 500.0);
         assert_eq!((still::FLIP_TARGET, still::WITHIN_S), (0.05, 0.25));
         // The room's exception (the owner, 2026-11-20; ADR 0005), a mark the run scores.
@@ -862,7 +1107,7 @@ mod tests {
     fn exit_status_is_2_for_an_over_gate_and_0_for_no_fail() {
         let mut report = GiReport {
             edit: edit(Some(1.0)),
-            gates: gates(&Settings::short((80, 45)), &[], &edit(None)),
+            gates: gates(&Settings::short((80, 45)), &[], None, &edit(None)),
         };
         assert_eq!(exit_code(&report, false), 0);
         report.gates.over.push("settle".into());

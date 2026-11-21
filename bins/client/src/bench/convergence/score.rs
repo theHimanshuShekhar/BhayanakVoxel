@@ -66,6 +66,56 @@ pub fn gamma22_rgb(linear: &[f32]) -> Vec<u8> {
         .collect()
 }
 
+/// The mean of the frames `next` makes (`frames` of them), in linear light, as the 8-bit image the
+/// player would see: the average of what a still view of Primary draws, a frame after a frame, which
+/// is its own mean (`Primary converged`, #55). Frames of one size, RGBA, 8 bits a channel.
+pub fn mean_of_frames(
+    frames: u32,
+    mut next: impl FnMut() -> render::Image,
+) -> Option<render::Image> {
+    let decode: Vec<f32> = (0..=255u8)
+        .map(|c| render::srgb_decode(f32::from(c) / 255.0))
+        .collect();
+    let mut sum: Vec<f32> = Vec::new();
+    let mut size = (0, 0);
+    for _ in 0..frames {
+        let image = next();
+        if sum.is_empty() {
+            size = (image.width, image.height);
+            sum = vec![0.0; image.rgba.len() / 4 * 3];
+        }
+        for (acc, px) in sum
+            .as_chunks_mut::<3>()
+            .0
+            .iter_mut()
+            .zip(image.rgba.as_chunks::<4>().0)
+        {
+            for c in 0..3 {
+                acc[c] += decode[usize::from(px[c])];
+            }
+        }
+    }
+    if sum.is_empty() {
+        return None;
+    }
+    let scale = 1.0 / frames as f32;
+    let rgba = sum
+        .as_chunks::<3>()
+        .0
+        .iter()
+        .flat_map(|acc| {
+            let level =
+                |v: f32| (render::srgb_encode((v * scale).clamp(0.0, 1.0)) * 255.0).round() as u8;
+            [level(acc[0]), level(acc[1]), level(acc[2]), 255]
+        })
+        .collect();
+    Some(render::Image {
+        width: size.0,
+        height: size.1,
+        rgba,
+    })
+}
+
 /// RGB bytes of an RGBA image, which is what FLIP reads.
 pub fn rgb_of_rgba(rgba: &[u8]) -> Vec<u8> {
     rgba.as_chunks::<4>()
@@ -135,6 +185,30 @@ pub fn samples_to_reach(points: &[(f64, f64)], line: f64) -> Option<Reach> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_converged_image_is_the_mean_in_linear_light() {
+        // What this guards: `Primary converged` averages the light, not the 8-bit codes. Frames of
+        // black and white average to half the light, which the sRGB curve draws as 188 (not 128, the
+        // mean of the codes); alpha stays 255. Without frames there is no image.
+        let frame = |level: u8| render::Image {
+            width: 2,
+            height: 1,
+            rgba: vec![level, level, level, 255, level, 0, 255 - level, 255],
+        };
+        let mut n = 0;
+        let mean = mean_of_frames(4, || {
+            n += 1;
+            frame(if n % 2 == 0 { 255 } else { 0 })
+        })
+        .unwrap();
+        assert_eq!((mean.width, mean.height), (2, 1));
+        assert_eq!(&mean.rgba[..4], &[188, 188, 188, 255]);
+        // The other pixel's green is 0 in every frame, its blue was 255 half of the time.
+        assert_eq!(mean.rgba[5], 0);
+        assert_eq!(mean.rgba[6], 188);
+        assert!(mean_of_frames(0, || frame(0)).is_none());
+    }
 
     #[test]
     fn the_mean_squared_difference_is_per_channel() {

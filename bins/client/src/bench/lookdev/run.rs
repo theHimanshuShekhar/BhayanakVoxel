@@ -495,6 +495,7 @@ pub fn run(options: &Options) -> Result<PathBuf, Box<dyn Error>> {
         // The shipped Materials and the prototype's eight crystals.
         let mut gpu = Offscreen::with_materials(Resolution::native(w, h), &scene, stamps::table())?;
         gpu.set_flat_ambient(false);
+        gpu.set_denoise(render::Denoise::Full);
         eprintln!(
             "[{n}] {}: {written} stamp Voxels, ready in {:.0} s; {}",
             shot.name,
@@ -600,6 +601,12 @@ fn gi_versus(
     let mut images = vec![("reference", reference)];
     for (slug, flat) in [("primary-flat", true), ("primary-gi", false)] {
         gpu.set_flat_ambient(flat);
+        // The flat baseline is main's Primary of before the denoiser; the GI image is the game's.
+        gpu.set_denoise(if flat {
+            render::Denoise::Off
+        } else {
+            render::Denoise::Full
+        });
         // A new history, and a cache with nothing in it.
         gpu.reset_accumulation();
         let mut settled = gpu.render_upscaled(camera);
@@ -609,6 +616,7 @@ fn gi_versus(
         images.push((slug, settled));
     }
     gpu.set_flat_ambient(false);
+    gpu.set_denoise(render::Denoise::Full);
     for (slug, image) in images {
         let file = format!("{dir}/{slug}.png");
         write_png(&options.out.join(&file), &image)?;
@@ -627,6 +635,7 @@ fn emissive_room(options: &Options) -> Result<Section, Box<dyn Error>> {
     let (w, h) = options.size;
     let mut gpu = Offscreen::with_resolution(Resolution::native(w, h), &view.scene)?;
     gpu.set_flat_ambient(false);
+    gpu.set_denoise(render::Denoise::Full);
     let dir = "room";
     std::fs::create_dir_all(options.out.join(dir))?;
     let mut section = Section {
@@ -927,7 +936,9 @@ fn settle_frames(options: &Options) -> u32 {
 }
 
 /// The shot's Primary image from its still camera, at the game's settings: one frame, which has
-/// the sun's shadows from two samples of the disc a pixel (#52), and the same view after
+/// the sun's shadows from two samples of the disc a pixel (#52) and goes through the denoiser's
+/// filter with no history (#55: `render` has no denoiser, so the frame is drawn as a window draws
+/// its first), and the same view after
 /// [`SETTLE_FRAMES`] frames of a camera that has not moved, which is what a window shows a view that
 /// has stopped.
 fn primary_still(
@@ -940,7 +951,8 @@ fn primary_still(
     let camera = still_camera(shot);
     gpu.set_stages(Stages::default());
     gpu.set_sun(sun_for(&camera));
-    let primary = gpu.render(&camera);
+    gpu.reset_accumulation();
+    let primary = gpu.render_upscaled(&camera);
     let file = format!("{dir}/primary.png");
     write_png(&options.out.join(&file), &primary)?;
     section.stills.push(Figure {

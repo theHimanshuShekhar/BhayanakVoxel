@@ -24,6 +24,7 @@ pub mod camera;
 mod composite;
 pub mod cpu;
 mod debug_view;
+pub mod denoise;
 pub mod emitters;
 mod gpu_materials;
 pub mod hw;
@@ -49,6 +50,7 @@ use std::error::Error;
 
 pub use camera::Camera;
 pub use debug_view::DebugView;
+pub use denoise::Denoise;
 pub use hw::HwUpdate;
 pub use look::Look;
 pub use offscreen::{DrawTimes, FrameDrawn, GpuInfo, GpuPasses, Image, Offscreen, UpdateTimes};
@@ -60,7 +62,8 @@ pub use scene::{
 pub use sun::Sun;
 pub use timing::Timings;
 pub use tracer::{
-    DEFAULT_SHADOW_RAYS, EmitterEstimator, Fault, MAX_SHADOW_RAYS, ReferenceOptions, SkyEstimator,
+    DEFAULT_SHADOW_RAYS, EmitterEstimator, Fault, MAX_SHADOW_RAYS, ReferenceOptions, ShadowWeight,
+    SkyEstimator,
 };
 pub use upscale::Resolution;
 pub use window::{Mode, Renderer};

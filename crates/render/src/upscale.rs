@@ -129,6 +129,36 @@ impl Frame {
         self.uniform.params[2] = u32::from(settling);
     }
 
+    /// The camera of the frame, as the shader reads it.
+    pub(crate) fn camera(&self) -> CameraUniform {
+        self.uniform.camera
+    }
+
+    /// The camera of the frame before, whose image the history is.
+    pub(crate) fn previous(&self) -> CameraUniform {
+        self.uniform.previous
+    }
+
+    /// How far the camera is from the previous one, in Voxels, as the shader reads it.
+    pub(crate) fn shift(&self) -> [f32; 4] {
+        self.uniform.shift
+    }
+
+    /// Whether there is a history to carry on from (0 on the first frame, and after a reset).
+    pub(crate) fn has_history(&self) -> bool {
+        self.uniform.params[0] != 0
+    }
+
+    /// The history image to read.
+    pub(crate) fn read(&self) -> usize {
+        self.read
+    }
+
+    /// The history image to write.
+    pub(crate) fn write(&self) -> usize {
+        self.write
+    }
+
     /// Where in its pixel the frame is traced.
     pub fn jitter(&self) -> [f32; 2] {
         [self.uniform.jitter[0], self.uniform.jitter[1]]
