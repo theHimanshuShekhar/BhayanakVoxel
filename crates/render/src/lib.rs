@@ -49,7 +49,7 @@ use std::error::Error;
 
 pub use camera::Camera;
 pub use debug_view::DebugView;
-pub use hw::HwUpdate;
+pub use hw::{HwPhases, HwUpdate};
 pub use look::Look;
 pub use offscreen::{DrawTimes, FrameDrawn, GpuInfo, GpuPasses, Image, Offscreen, UpdateTimes};
 pub use post::{NormalBias, Stages, ToneCurve};
