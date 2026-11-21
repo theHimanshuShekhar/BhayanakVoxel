@@ -167,7 +167,15 @@ use super::stream::StreamReport;
 /// shadow rays (`hw_nearest`), the frame with the hardware's updates in, and the hardware context's
 /// `accel` and Edit stress). `edits.accel` is the Edit stress's updates of the
 /// acceleration structures (null on compute). Nothing else is changed.
-pub const SCHEMA_VERSION: u32 = 31;
+///
+/// 33 (#236; 32 is #234's and #203's) keeps the hardware backend's acceleration structures in step
+/// off the frame thread: `rt.accel` gains `sweep` (the sweep's own updates, no longer counted as
+/// the flight's or its warm-up's), each update `pending` (groups waiting for their rebuild) and
+/// each summary `pending_max`; the streaming real-time run takes `--rt-backend` (`streaming_real_time.rt`:
+/// `requested`, `active`, `fallback`, `accel`; `both` also puts the hardware run in `rt.real_time_hw`);
+/// every `Spread` has `p95_ms`. The `prepare_ms`/`build_ms` of an update are the frame thread's cost
+/// only; the GPU's own time is only in the Edit stress (it waits there).
+pub const SCHEMA_VERSION: u32 = 33;
 
 /// One timed thing (a pass, or the GPU total of a profiler frame) in one mode, against its
 /// budget. In reference mode a profiler frame is one sample, so the entries of that mode have
@@ -654,6 +662,7 @@ mod tests {
                 fallback: None,
                 accel: None,
                 comparison: None,
+                real_time_hw: None,
             },
         };
         let json = serde_json::to_value(&report).unwrap();
@@ -679,9 +688,10 @@ mod tests {
                 "streaming_real_time"
             ]
         );
-        assert_eq!(json["schema_version"], 31);
+        assert_eq!(json["schema_version"], 33);
         assert_eq!(json["rt"]["active"], "compute");
         assert_eq!(json["rt"]["comparison"], serde_json::Value::Null);
+        assert_eq!(json["rt"]["real_time_hw"], serde_json::Value::Null);
         assert_eq!(json["convergence"], serde_json::Value::Null);
         assert_eq!(json["streaming"], serde_json::Value::Null);
         assert_eq!(json["streaming_real_time"], serde_json::Value::Null);

@@ -238,6 +238,46 @@ impl Offscreen {
         self.tracer.hardware_update()
     }
 
+    /// How many groups of the hardware backend's acceleration structures are stale and wait for
+    /// a later update's budget (0 on the compute backend).
+    pub fn hardware_pending(&self) -> usize {
+        self.tracer.hardware_pending()
+    }
+
+    /// Builds every stale group of the hardware backend's acceleration structures at once,
+    /// whatever the budget (a no-op on the compute backend).
+    pub fn settle_hardware(&mut self) {
+        self.tracer.settle_hardware(&self.device, &self.queue);
+    }
+
+    /// Sets the most boxes an update of the hardware backend builds.
+    pub fn set_hardware_budget(&mut self, boxes: u64) {
+        self.tracer.set_hardware_budget(boxes);
+    }
+
+    /// Whether the hardware backend's updates wait for the GPU (so that their time is the
+    /// builds' own; see [`crate::hw::HwScene::set_wait`]).
+    pub fn set_hardware_wait(&mut self, wait: bool) {
+        self.tracer.set_hardware_wait(wait);
+    }
+
+    /// The groups of the hardware backend that are built, and the boxes each was built from.
+    pub fn hardware_groups(&self) -> std::collections::BTreeMap<crate::hw::GroupKey, u32> {
+        self.tracer.hardware_groups()
+    }
+
+    /// The boxes of every built group of the hardware backend as the GPU has them (waits).
+    pub fn hardware_boxes(&self) -> std::collections::BTreeMap<crate::hw::GroupKey, Vec<[u32; 8]>> {
+        self.tracer.hardware_boxes(&self.device, &self.queue)
+    }
+
+    /// The boxes that the GPU makes for `jobs` (level, group, box count) from the scene it has,
+    /// read back, on any backend: for the test that holds the box pass to
+    /// [`crate::hw::group_prims`].
+    pub fn box_pass_boxes(&self, jobs: &[(u8, [i32; 3], u32)]) -> Vec<Vec<[u32; 8]>> {
+        self.tracer.box_pass_boxes(&self.device, &self.queue, jobs)
+    }
+
     /// Like [`Offscreen::with_resolution`], with the Reference view traced at the **output**
     /// resolution whatever Primary's scale is, as a window does (ADR 0005). The other
     /// constructors trace it at the traced resolution, which is what the bench's flight times.

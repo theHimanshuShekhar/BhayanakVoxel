@@ -117,6 +117,9 @@ pub fn run(
     let (mut edits, mut voxels) = (0u32, 0u64);
     // What the flight did to the acceleration structures is not the Edits'.
     gpu.take_hardware_updates();
+    // An update of the hardware backend's structures does not wait for the GPU, so that a frame
+    // never does; here it waits, so that the time of an Edit has the builds' own in it (#236).
+    gpu.set_hardware_wait(true);
     for _ in 0..FRAMES {
         allowance.refill();
         let next = op(if edits % 2 == 0 {
@@ -162,6 +165,7 @@ pub fn run(
     let seconds = f64::from(FRAMES) / 60.0;
     let stats = Stats::of(&per_frame);
     let budget_ms = budgets.passes.get("edits").copied();
+    gpu.set_hardware_wait(false);
     let accel = gpu.take_hardware_updates();
     let frame_thread_stats = Stats::of(&frame_thread);
     let frame_thread_budget_ms = budgets.passes.get(FRAME_THREAD_BUDGET).copied();

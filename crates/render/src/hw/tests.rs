@@ -3,8 +3,15 @@
 
 use brick_store::{BrickCoord, BrickStore, Material, VoxelCoord};
 
+use std::collections::BTreeSet;
+
 use super::*;
-use crate::scene::{Core, SceneUpdate};
+use crate::scene::{Core, RingPatch, SceneUpdate};
+
+/// Every group the scene has a region in.
+fn all_groups(scene: &Scene) -> BTreeSet<GroupKey> {
+    group_counts(scene).into_keys().collect()
+}
 
 const STONE: Material = Material(7);
 
@@ -181,13 +188,10 @@ fn the_anchor_is_the_snap_multiple_nearest_the_camera() {
     assert_eq!(anchor_for([6_000_000.0, 0.0, 0.0])[0] % ANCHOR_SNAP, 0);
 }
 
-/// Rings of a patch of the test Planet around a camera 1565 Voxels up, an Edit that places a block
-/// of Stone `size` Voxels each way on the ground at `(x, z)`, and the groups that the scene's patch
-/// of it makes stale, with the scene's patch and how many groups there are in all.
-fn dirty_after_a_block(
-    (x0, z0): (i32, i32),
-    size: i32,
-) -> (BTreeSet<GroupKey>, crate::scene::RingPatch, usize) {
+/// Rings of a patch of the test Planet around a camera 1565 Voxels up, and an Edit that places a
+/// block of Stone `size` Voxels each way on the ground at `(x, z)`: the scene before and after
+/// it, and the scene's patch of it.
+fn a_block_placed((x0, z0): (i32, i32), size: i32) -> (Scene, Scene, RingPatch) {
     use crate::lod::Bands;
     use crate::scene::Bound;
     let mut store =
@@ -198,8 +202,7 @@ fn dirty_after_a_block(
         radius: 1600,
     };
     let mut scene = Scene::rings(&store, [0.0, 1565.0, 0.0], Bands::with_d0(64.0), bound).unwrap();
-    let mut index = RegionIndex::of(&scene);
-    let total = all_groups(&scene).len();
+    let before = scene.mirror();
     let top = (1400..1650)
         .rev()
         .find(|&y| store.get(VoxelCoord([x0, y, z0])).is_some())
@@ -218,31 +221,65 @@ fn dirty_after_a_block(
     let SceneUpdate::Rings(patch) = scene.update(&store, &changed).unwrap() else {
         panic!("an Edit of rings is a patch of rings");
     };
-    (index.dirty(&scene, &patch), patch, total)
+    (before, scene, patch)
+}
+
+/// The groups whose boxes differ between two scenes (the boxes, not the words they were made
+/// from): what a patch's groups must hold every one of.
+fn groups_that_differ(before: &Scene, after: &Scene) -> BTreeSet<GroupKey> {
+    all_groups(before)
+        .union(&all_groups(after))
+        .copied()
+        .filter(|&(level, group)| {
+            group_prims(before, level as usize, group) != group_prims(after, level as usize, group)
+        })
+        .collect()
+}
+
+/// A patch's groups with the count each has in the scene it was made for.
+fn listed(scene: &Scene, patch: &RingPatch) -> BTreeSet<GroupKey> {
+    for &((level, group), count) in &patch.groups {
+        assert_eq!(
+            count,
+            group_prims(scene, level as usize, group).len() as u32,
+            "the count of {level} {group:?}"
+        );
+        assert_eq!(count, group_box_count(scene, level as usize, group));
+    }
+    patch.groups.iter().map(|&(key, _)| key).collect()
 }
 
 #[test]
-fn an_edit_makes_stale_only_the_groups_that_hold_the_regions_it_wrote() {
+fn an_edit_lists_only_the_groups_that_hold_the_regions_it_wrote_and_every_one_whose_boxes_moved() {
     // An Edit under the camera: level 0, a region's entries written.
-    let (dirty, patch, total) = dirty_after_a_block((0, 0), 8);
+    let (before, after, patch) = a_block_placed((0, 0), 8);
+    let total = all_groups(&after).len();
+    let groups = listed(&after, &patch);
     assert!(
         !patch.regions.is_empty() || !patch.rewritten.is_empty(),
         "{patch:?}"
     );
     assert!(
-        !dirty.is_empty() && dirty.len() < total,
-        "{dirty:?} of {total}"
+        !groups.is_empty() && groups.len() < total,
+        "{groups:?} of {total}"
     );
-    assert!(dirty.iter().all(|&(level, _)| level == 0), "{dirty:?}");
+    assert!(groups.iter().all(|&(level, _)| level == 0), "{groups:?}");
+    // The patch says it all: a group whose boxes are not the same is in it.
+    let moved = groups_that_differ(&before, &after);
+    assert!(!moved.is_empty());
+    assert!(
+        moved.is_subset(&groups),
+        "moved {moved:?}, listed {groups:?}"
+    );
 }
 
 /// A mixed brick of a coarse level whose words are written in place: nothing of `regions`,
-/// `table` or `brick_refs` says where, only `rewritten_coarse`, and the box made from the words
-/// is stale. Without that list the dirty set is empty and the hardware backend draws the ground
-/// that the block stands on (the reviewer's probe of #233).
+/// `table` or `brick_refs` says where, and the box made from the words is stale. The patch's
+/// groups are made from the regions `write_region` was given, so it lists the group (the reviewer's
+/// probe of #233: without it the hardware backend draws the ground that the block stands on).
 #[test]
-fn a_coarse_brick_written_in_place_makes_its_group_stale() {
-    let (dirty, patch, total) = dirty_after_a_block((100, 100), 4);
+fn a_coarse_brick_written_in_place_lists_its_group() {
+    let (before, after, patch) = a_block_placed((100, 100), 4);
     assert_eq!(
         (
             patch.regions.len(),
@@ -252,10 +289,143 @@ fn a_coarse_brick_written_in_place_makes_its_group_stale() {
         (0, 0, 0),
         "{patch:?}"
     );
-    assert_eq!(patch.rewritten_coarse, vec![(1, [0, 11, 0])]);
+    let groups = listed(&after, &patch);
+    assert_eq!(groups, BTreeSet::from([(1, group_of([0, 11, 0]))]));
+    assert!(groups_that_differ(&before, &after).is_subset(&groups));
+}
+
+#[test]
+fn a_move_of_the_rings_lists_every_group_whose_boxes_moved_and_the_groups_it_emptied_with_a_count_of_0()
+ {
+    use crate::lod::Bands;
+    use crate::scene::Bound;
+    let mut store =
+        planet_gen::generate_region(7, BrickCoord([-12, 178, -12]), BrickCoord([12, 193, 12]));
+    store.build_lod(5);
+    let bound = Bound {
+        centre: [0; 3],
+        radius: 1600,
+    };
+    let mut scene = Scene::rings(&store, [0.0, 1565.0, 0.0], Bands::with_d0(64.0), bound).unwrap();
+    let mut merged: Option<RingPatch> = None;
+    // Walk along the ground in steps a ring follows (not a jump), the patches kept as the
+    // outbox keeps them: merged.
+    for step in 1..=8 {
+        let before = scene.mirror();
+        let camera = [f64::from(step) * 40.0, 1565.0, 0.0];
+        let Some(SceneUpdate::Rings(patch)) = scene.recentre(&store, camera).unwrap() else {
+            continue;
+        };
+        let groups = listed(&scene, &patch);
+        let moved = groups_that_differ(&before, &scene);
+        assert!(
+            moved.is_subset(&groups),
+            "step {step}: {moved:?} not in {groups:?}"
+        );
+        for &(key, count) in &patch.groups {
+            if count == 0 {
+                assert!(!all_groups(&scene).contains(&key));
+            }
+        }
+        match &mut merged {
+            Some(all) => all.merge(patch),
+            None => merged = Some(patch),
+        }
+    }
+    let merged = merged.expect("the rings moved");
+    // Merged, each group has its count as the scene is now.
+    assert_eq!(merged.groups.len(), listed(&scene, &merged).len());
+}
+
+#[test]
+fn merged_patches_list_a_group_once_with_the_later_count() {
+    let key = (0u8, [1, 2, 3]);
+    let mut a = RingPatch {
+        groups: vec![(key, 5), ((1, [0; 3]), 9)],
+        ..RingPatch::default()
+    };
+    let b = RingPatch {
+        groups: vec![(key, 7), ((0, [9, 9, 9]), 1)],
+        ..RingPatch::default()
+    };
+    a.merge(b);
     assert_eq!(
-        dirty,
-        BTreeSet::from([(1, group_of([0, 11, 0]))]),
-        "of {total}"
+        a.groups,
+        vec![(key, 7), ((0, [9, 9, 9]), 1), ((1, [0; 3]), 9)]
+            .into_iter()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>()
     );
+}
+
+#[test]
+fn a_regions_box_count_is_the_boxes_the_cpu_makes_of_it_and_a_groups_the_sum() {
+    let mut store = store_with(&[[1, 1, 1], [9, 1, 1], [9, 9, 9], [300, 1, 1]]);
+    store.insert(
+        BrickCoord([5, 5, 5]),
+        brick_store::Brick::solid(Material(300)),
+    );
+    for scene in [
+        Scene::new(&store, None),
+        Scene::new(
+            &BrickStore::new(),
+            Some(Core {
+                radius: 500,
+                material: STONE,
+            }),
+        ),
+    ] {
+        let counts = group_counts(&scene);
+        assert!(!counts.is_empty());
+        for (&(level, group), &count) in &counts {
+            assert!(count > 0);
+            assert_eq!(
+                count as usize,
+                group_prims(&scene, level as usize, group).len()
+            );
+            assert_eq!(count, group_box_count(&scene, level as usize, group));
+        }
+        assert_eq!(
+            counts.keys().copied().collect::<BTreeSet<_>>(),
+            all_groups(&scene)
+        );
+    }
+}
+
+#[test]
+fn a_mask_that_sets_no_voxel_is_the_whole_brick_here_as_on_the_gpu() {
+    // No scene lists one, but a word that is not there is read as a zero on the GPU, and the CPU's
+    // twin does the same, so that the boxes can be compared box for box.
+    let mut scene = Scene::new(&store_with(&[[1, 1, 1]]), None);
+    let at = scene.brick_refs[0] as usize;
+    scene.bricks[at..at + 16].fill(0);
+    let prims = group_prims(&scene, 0, [0, 0, 0]);
+    assert_eq!(prims.len(), 1);
+    assert_eq!((prims[0].min, prims[0].max), ([0.0; 3], [8.0; 3]));
+}
+
+#[test]
+fn the_pools_room_is_given_out_first_fit_given_back_whole_and_grown_only_at_the_top() {
+    let mut pool = Pool {
+        capacity: 100,
+        ..Pool::default()
+    };
+    assert_eq!(pool.alloc(30), Some(0));
+    assert_eq!(pool.alloc(30), Some(30));
+    assert_eq!(pool.alloc(30), Some(60));
+    assert_eq!(pool.alloc(30), None, "10 are left above the top");
+    assert_eq!(pool.used(), 90);
+    // The middle one is given back and the next that fits goes there.
+    pool.release(30..60);
+    assert_eq!(pool.alloc(40), None);
+    assert_eq!(pool.alloc(20), Some(30));
+    assert_eq!(pool.alloc(10), Some(50));
+    // Neighbours that are free join, and the top comes down with the last.
+    pool.release(0..30);
+    pool.release(30..50);
+    assert_eq!(pool.free, vec![0..50]);
+    pool.release(50..60);
+    pool.release(60..90);
+    assert_eq!((pool.top, pool.free.len(), pool.used()), (0, 0, 0));
 }

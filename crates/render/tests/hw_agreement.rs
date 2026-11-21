@@ -348,7 +348,7 @@ fn an_edit_near_the_camera_rebuilds_only_the_groups_it_touched_and_the_hardware_
 
 /// A coarse brick whose words are written in place, with no word of `regions` or `brick_refs`
 /// written for it, still has a stale box (it is as tight as the words it was made from): the
-/// patch names its region in `rewritten_coarse`, and the group is made again. Without that, the
+/// patch lists its group (`RingPatch::groups`), and the group is made again. Without that, the
 /// update is `none` and the rays hit the ground under the block.
 #[test]
 fn an_edit_in_place_at_a_coarse_level_makes_its_group_again() {
@@ -357,7 +357,7 @@ fn an_edit_in_place_at_a_coarse_level_makes_its_group_again() {
         return;
     };
     assert!(
-        !patch.rewritten_coarse.is_empty(),
+        patch.regions.is_empty() && patch.groups.iter().any(|&((level, _), _)| level > 0),
         "the case is not one of a coarse brick rewritten in place: {patch:?}"
     );
     assert_eq!(update.kind, "patch", "{update:?}");
@@ -366,4 +366,379 @@ fn an_edit_in_place_at_a_coarse_level_makes_its_group_again() {
         "{} of {total} groups rebuilt",
         update.blas_rebuilt
     );
+}
+
+// ----------------------------------------------------------------------------------------------
+// #236: the boxes are made on the GPU, and the acceleration structures follow streaming without
+// waiting for it.
+
+use render::hw::{group_counts, group_prims};
+
+/// The boxes of every group of `scene` as the GPU makes them, and as the CPU makes them: equal,
+/// box for box. Runs on any adapter (the pass needs no ray queries).
+fn assert_the_gpu_makes_the_cpus_boxes(label: &str, scene: &Scene) -> usize {
+    let counts = group_counts(scene);
+    assert!(!counts.is_empty(), "{label}: no groups");
+    let gpu = Offscreen::new(8, 8, scene).unwrap();
+    let jobs: Vec<(u8, [i32; 3], u32)> = counts.iter().map(|(&(l, g), &n)| (l, g, n)).collect();
+    let made = gpu.box_pass_boxes(&jobs);
+    let mut boxes = 0;
+    for ((&(level, group), _), got) in counts.iter().zip(&made) {
+        let want: Vec<[u32; 8]> = group_prims(scene, level as usize, group)
+            .iter()
+            .map(render::hw::Prim::record)
+            .collect();
+        assert_eq!(
+            got.len(),
+            want.len(),
+            "{label}: level {level} group {group:?}"
+        );
+        for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+            assert_eq!(g, w, "{label}: level {level} group {group:?} box {i}");
+        }
+        boxes += want.len();
+    }
+    boxes
+}
+
+/// The test Planet's rings (every level), a core (whole regions that are one Material), a
+/// hand-made scene (solid bricks, bricks of one Voxel, bricks of a few at the corners) and the
+/// rings after an Edit: the GPU's boxes are the CPU's.
+#[test]
+fn the_gpu_makes_the_cpus_boxes_box_for_box() {
+    let mut store = generate_region(7, BrickCoord([-12, 178, -12]), BrickCoord([12, 193, 12]));
+    store.build_lod(5);
+    let bound = Bound {
+        centre: [0; 3],
+        radius: 1600,
+    };
+    let mut rings = Scene::rings(&store, [0.0, 1565.0, 0.0], Bands::with_d0(64.0), bound).unwrap();
+    let n = assert_the_gpu_makes_the_cpus_boxes("rings", &rings);
+    assert!(n > 1000, "the rings have {n} boxes");
+    // A level of every kind: the coarse ones have bricks of their own.
+    assert!(group_counts(&rings).keys().any(|&(level, _)| level >= 1));
+
+    let mut hand = BrickStore::new();
+    for v in [
+        [10, 0, 0],
+        [-90, 35, 70],
+        [100, 3, -50],
+        [63, 5, 0],
+        [64, 0, 0],
+        [7, 7, 7],
+        [0, 0, 0],
+        [1, 1, 1],
+    ] {
+        hand.set(VoxelCoord(v), Some(STONE));
+    }
+    hand.insert(
+        BrickCoord([5, 5, 5]),
+        brick_store::Brick::solid(Material(300)),
+    );
+    let hand_scene = Scene::new(
+        &hand,
+        Some(Core {
+            radius: 150,
+            material: STONE,
+        }),
+    );
+    assert_the_gpu_makes_the_cpus_boxes("hand and core", &hand_scene);
+    let core = Scene::new(
+        &BrickStore::new(),
+        Some(Core {
+            radius: 700,
+            material: STONE,
+        }),
+    );
+    let n = assert_the_gpu_makes_the_cpus_boxes("core", &core);
+    assert!(n > 1);
+
+    // After an Edit, and after the rings move (a region gains and loses bricks).
+    let top = (1400..1650)
+        .rev()
+        .find(|&y| store.get(VoxelCoord([3, y, 3])).is_some())
+        .unwrap();
+    let mut changed = std::collections::BTreeSet::new();
+    for x in 3..7 {
+        for y in top + 1..top + 5 {
+            for z in 3..7 {
+                store.set(VoxelCoord([x, y, z]), Some(STONE));
+                changed.insert(VoxelCoord([x, y, z]).brick());
+            }
+        }
+    }
+    let changed: Vec<BrickCoord> = changed.into_iter().collect();
+    store.refresh_lod(changed.iter().copied());
+    rings.update(&store, &changed).unwrap();
+    assert_the_gpu_makes_the_cpus_boxes("rings after an Edit", &rings);
+    for step in 1..=4 {
+        let camera = [f64::from(step) * 30.0, 1565.0, -f64::from(step) * 20.0];
+        rings.recentre(&store, camera).unwrap();
+    }
+    assert_the_gpu_makes_the_cpus_boxes("rings after a walk", &rings);
+}
+
+/// How many of `rays` the hardware backend and a fresh compute backend disagree on, and how many
+/// hit (rounding at a box's edge may flip a handful).
+fn disagreement(
+    hw: &mut Offscreen,
+    scene: &Scene,
+    rays: &[render::reference::Ray],
+) -> (usize, usize) {
+    let mut compute = Offscreen::new(8, 8, scene).unwrap();
+    let (a, b) = (hw.trace_rays(rays), compute.trace_rays(rays));
+    let hits = b.iter().flatten().count();
+    let differing = a
+        .iter()
+        .zip(&b)
+        .filter(|(h, c)| match (h, c) {
+            (None, None) => false,
+            (Some(h), Some(c)) => {
+                (h.voxel, h.material) != (c.voxel, c.material)
+                    || (h.t - c.t).abs() > 1e-2 * (1.0 + c.t.abs())
+            }
+            _ => true,
+        })
+        .count();
+    (hits, differing)
+}
+
+/// Rays down at the ground of the test Planet's patch from `height` Voxels up, at a camera at `at`
+/// (x, z), with a spread of 60 Voxels.
+fn rays_down_from(at: [f64; 2], height: f64, seed: u32) -> Vec<render::reference::Ray> {
+    let mut rng = Lcg(u64::from(seed));
+    (0..1024)
+        .map(|_| {
+            let x = at[0] + f64::from(rng.next() * 120.0 - 60.0);
+            let z = at[1] + f64::from(rng.next() * 120.0 - 60.0);
+            let from = [at[0], 1500.0 + height, at[1]];
+            ray(from, [x, 1500.0 + f64::from(rng.next() * 40.0), z])
+        })
+        .collect()
+}
+
+fn walking_scene() -> (BrickStore, Scene) {
+    let mut store = generate_region(7, BrickCoord([-12, 178, -12]), BrickCoord([12, 193, 12]));
+    store.build_lod(5);
+    let bound = Bound {
+        centre: [0; 3],
+        radius: 1600,
+    };
+    let scene = Scene::rings(&store, [-60.0, 1565.0, -60.0], Bands::with_d0(64.0), bound).unwrap();
+    (store, scene)
+}
+
+/// The structures are as the scene is: every group the scene has is built, from as many boxes as
+/// it has, and the boxes that the GPU holds are the CPU's, and no group is there that the scene
+/// has not.
+fn assert_not_stale(label: &str, hw: &Offscreen, scene: &Scene) {
+    assert_eq!(hw.hardware_pending(), 0, "{label}");
+    let built = hw.hardware_groups();
+    assert_eq!(
+        built,
+        group_counts(scene),
+        "{label}: groups and their boxes"
+    );
+    for ((level, group), boxes) in hw.hardware_boxes() {
+        let want: Vec<[u32; 8]> = group_prims(scene, level as usize, group)
+            .iter()
+            .map(render::hw::Prim::record)
+            .collect();
+        assert_eq!(boxes, want, "{label}: level {level} group {group:?}");
+    }
+}
+
+/// Ring moves (groups gained, changed and emptied), at the full budget and at one so small that
+/// the updates queue: hits agree with compute's once the queue is built, no group is stale then,
+/// and while a group waits its old BLAS stays in the TLAS (no group of the scene that was built
+/// goes, no hole), and the hits through what did not change are as before.
+#[test]
+fn the_hardware_follows_the_rings_as_they_move_with_no_group_stale_and_no_hole() {
+    for budget in [render::hw::BUILD_BUDGET, 1] {
+        let (store, mut scene) = walking_scene();
+        let mut hw =
+            Offscreen::with_backend(Resolution::native(8, 8), &scene, RtBackend::Hardware).unwrap();
+        if hw.rt().active != RtBackend::Hardware {
+            eprintln!("skipped: {:?}", hw.rt().fallback);
+            return;
+        }
+        hw.take_hardware_updates();
+        assert_not_stale("the first build", &hw, &scene);
+        hw.set_hardware_budget(budget);
+        let mut ever_pending = 0;
+        let mut patches = 0;
+        for step in 1..=10 {
+            let camera = [
+                -60.0 + f64::from(step) * 14.0,
+                1565.0,
+                -60.0 + f64::from(step) * 9.0,
+            ];
+            let before = hw.hardware_groups();
+            let Some(update) = scene.recentre(&store, camera).unwrap() else {
+                continue;
+            };
+            patches += 1;
+            hw.update_scene(&scene, &update).unwrap();
+            ever_pending = ever_pending.max(hw.hardware_pending());
+            // No hole: a group that was built and that the scene still has is still built.
+            let wanted = group_counts(&scene);
+            let now = hw.hardware_groups();
+            for key in before.keys().filter(|k| wanted.contains_key(k)) {
+                assert!(
+                    now.contains_key(key),
+                    "budget {budget}, step {step}: group {key:?} went"
+                );
+            }
+            // Whatever is built traces as the compute path does where nothing changed: rays
+            // down at where the camera is.
+            let (hits, differing) = disagreement(
+                &mut hw,
+                &scene,
+                &rays_down_from([camera[0], camera[2]], 65.0, step as u32),
+            );
+            if budget == render::hw::BUILD_BUDGET {
+                assert_eq!(hw.hardware_pending(), 0);
+                assert!(hits > 300, "step {step}: {hits} hits");
+                assert!(differing <= 1024 / 100, "step {step}: {differing} differ");
+            }
+        }
+        assert!(patches >= 3, "the rings moved {patches} times");
+        if budget == 1 {
+            assert!(ever_pending > 0, "a budget of one box left nothing waiting");
+        }
+        // Built to the end of the queue: not stale.
+        hw.settle_hardware();
+        assert_not_stale(&format!("budget {budget}"), &hw, &scene);
+        let (hits, differing) = disagreement(
+            &mut hw,
+            &scene,
+            &rays_down_from([-60.0 + 140.0, -60.0 + 90.0], 65.0, 99),
+        );
+        assert!(
+            hits > 300 && differing <= 1024 / 100,
+            "{hits} hits, {differing} differ"
+        );
+    }
+}
+
+/// A group of a queue that has waited is built from the scene as it is when its turn comes, not as
+/// it was when it was queued: an Edit in a group that waited and another after it.
+#[test]
+fn a_group_that_waits_is_built_from_the_scene_as_it_is_then_and_edits_show_at_once() {
+    let (mut store, mut scene) = walking_scene();
+    let mut hw =
+        Offscreen::with_backend(Resolution::native(8, 8), &scene, RtBackend::Hardware).unwrap();
+    if hw.rt().active != RtBackend::Hardware {
+        eprintln!("skipped: {:?}", hw.rt().fallback);
+        return;
+    }
+    hw.set_hardware_budget(1);
+    // Moves that queue groups far from the camera.
+    for step in 1..=6 {
+        let camera = [-60.0 + f64::from(step) * 22.0, 1565.0, -60.0];
+        if let Some(update) = scene.recentre(&store, camera).unwrap() {
+            hw.update_scene(&scene, &update).unwrap();
+        }
+    }
+    let waiting = hw.hardware_pending();
+    // An Edit at the camera, with groups still waiting: it is the nearest, so it is built in the
+    // update that brings it, and the rays down at the block agree.
+    let camera = [-60.0 + 6.0 * 22.0, 1565.0, -60.0];
+    let (x0, z0) = (camera[0] as i32, camera[2] as i32);
+    let top = (1400..1650)
+        .rev()
+        .find(|&y| store.get(VoxelCoord([x0, y, z0])).is_some())
+        .expect("ground");
+    let mut changed = std::collections::BTreeSet::new();
+    for x in x0..x0 + 6 {
+        for y in top + 1..top + 7 {
+            for z in z0..z0 + 6 {
+                store.set(VoxelCoord([x, y, z]), Some(STONE));
+                changed.insert(VoxelCoord([x, y, z]).brick());
+            }
+        }
+    }
+    let changed: Vec<BrickCoord> = changed.into_iter().collect();
+    store.refresh_lod(changed.iter().copied());
+    let update = scene.update(&store, &changed).unwrap();
+    hw.take_hardware_updates();
+    hw.update_scene(&scene, &update).unwrap();
+    let edit = hw.take_hardware_updates();
+    assert_eq!(edit.len(), 1);
+    assert!(edit[0].blas_rebuilt >= 1, "{edit:?}");
+    let mut rng = Lcg(3);
+    let top = top as f64;
+    let rays: Vec<_> = (0..512)
+        .map(|_| {
+            let x = f64::from(x0) + f64::from(rng.next() * 6.0);
+            let z = f64::from(z0) + f64::from(rng.next() * 6.0);
+            ray([x, top + 50.0, z], [x, top + 4.0, z])
+        })
+        .collect();
+    let (hits, differing) = disagreement(&mut hw, &scene, &rays);
+    assert!(hits > 450, "{hits} hits on the block");
+    assert!(
+        differing <= rays.len() / 100,
+        "{differing} differ with {waiting} groups waiting"
+    );
+    hw.settle_hardware();
+    assert_not_stale("after the queue", &hw, &scene);
+}
+
+/// A jump is a scene made again: every group is built at once, whatever the budget, and nothing of
+/// the old one is left.
+#[test]
+fn a_jump_builds_every_group_at_once_and_leaves_none_of_the_old_scene() {
+    let (store, mut scene) = walking_scene();
+    let mut hw =
+        Offscreen::with_backend(Resolution::native(8, 8), &scene, RtBackend::Hardware).unwrap();
+    if hw.rt().active != RtBackend::Hardware {
+        eprintln!("skipped: {:?}", hw.rt().fallback);
+        return;
+    }
+    hw.set_hardware_budget(1);
+    hw.take_hardware_updates();
+    let update = scene
+        .jump_to(&store, [60.0, 1565.0, 60.0], Bands::with_d0(32.0))
+        .unwrap()
+        .expect("rings");
+    assert_eq!(update, render::scene::SceneUpdate::Rebuilt);
+    hw.update_scene(&scene, &update).unwrap();
+    let log = hw.take_hardware_updates();
+    assert_eq!(log.len(), 1, "{log:?}");
+    assert_eq!(log[0].kind, "build");
+    assert_eq!(log[0].pending, 0);
+    assert_not_stale("after a jump", &hw, &scene);
+    let (hits, differing) = disagreement(&mut hw, &scene, &rays_down_from([60.0, 60.0], 65.0, 7));
+    assert!(
+        hits > 300 && differing <= 1024 / 100,
+        "{hits} hits, {differing} differ"
+    );
+}
+
+/// The TLAS's frame follows the camera without waiting and without changing a hit: rays from far
+/// above (a camera 9000 Voxels up) move it, rays from the ground move it back.
+#[test]
+fn the_tlas_frame_moves_with_the_camera_and_the_hits_stay_compute_s() {
+    let (_, scene) = walking_scene();
+    let mut hw =
+        Offscreen::with_backend(Resolution::native(8, 8), &scene, RtBackend::Hardware).unwrap();
+    if hw.rt().active != RtBackend::Hardware {
+        eprintln!("skipped: {:?}", hw.rt().fallback);
+        return;
+    }
+    let first = hw.take_hardware_updates();
+    for (height, seed) in [(9000.0, 1u32), (65.0, 2), (9000.0, 3)] {
+        let (hits, differing) =
+            disagreement(&mut hw, &scene, &rays_down_from([0.0, 0.0], height, seed));
+        assert!(hits > 300, "from {height}: {hits} hits");
+        assert!(differing <= 1024 / 100, "from {height}: {differing} differ");
+    }
+    let moves = hw.take_hardware_updates();
+    assert!(
+        moves.iter().filter(|u| u.kind == "anchor").count() >= 2,
+        "{moves:?} (first {first:?})"
+    );
+    assert!(moves.iter().all(|u| u.blas_rebuilt == 0), "{moves:?}");
+    assert_not_stale("after the frame moved", &hw, &scene);
 }

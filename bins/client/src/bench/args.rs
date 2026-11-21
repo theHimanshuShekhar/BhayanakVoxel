@@ -70,12 +70,14 @@ Options:
                    to compare them
   --rt-backend B   How rays find the Planet (#50): compute (the default: the compute-shader DDA),
                    hw (ray queries over the bricks' tight boxes, with shadow rays that end at the
-                   first hit, for the flight, the sweep and the Edit stress; the compute path, with
+                   first hit, for the flight, the sweep and the Edit stress and for the runs of
+                   `--streaming --real-time`, #236; the compute path, with
                    a warning and the reason in the report's `rt.fallback`, if the adapter has no
                    ray queries), hw-nearest (hw with shadow rays that look for the nearest hit) or
                    both (the bench as for compute, then the same flight and Edit stress on hw, and
                    the flight on hw-nearest, each on a context of its own, and the passes that cast
-                   rays compared: `rt.comparison`). The report's `rt` says which ran and what the
+                   rays compared: `rt.comparison`; with `--streaming --real-time`, the real-time
+                   runs on compute and then on hw: `rt.real_time_hw`). The report's `rt` says which ran and what the
                    acceleration structures cost to update
   --no-fail        Exit with status 0 even if a pass is over its budget, there is a hole or a
                    real-time gate is over

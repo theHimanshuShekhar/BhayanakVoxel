@@ -69,8 +69,9 @@ impl RtMode {
 /// One update of the acceleration structures: what it rebuilt and what it cost.
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]
 pub struct AccelUpdate {
-    /// `build` (all of it), `patch` (the groups a move or an Edit touched), `anchor` (the camera
-    /// left the TLAS's frame: instances only) or `none`.
+    /// `build` (all of it, after a jump), `patch` (the groups a move or an Edit touched, as many as
+    /// the frame's budget allowed), `anchor` (the camera left the TLAS's frame: instances only) or
+    /// `none`.
     pub kind: String,
     pub blas_rebuilt: u32,
     pub prims_rebuilt: u64,
@@ -79,9 +80,15 @@ pub struct AccelUpdate {
     /// BLASes (regular groups of 4 x 4 x 4 regions) and boxes (one per non-empty brick) there are.
     pub blas_total: u32,
     pub prims_total: u64,
-    /// CPU time to work out the boxes and make the BLASes.
+    /// Groups that were stale and waited for a later update's budget after this one.
+    pub pending: u32,
+    /// The frame thread's CPU time of planning the update: the groups to build (which the scene
+    /// thread listed with the patch), the pool's room, the new BLASes and the TLAS's instances.
+    /// No box is made by the CPU: the GPU makes them from the occupancy masks (#236).
     pub prepare_ms: f64,
-    /// Recording the builds, submitting them and waiting for the GPU.
+    /// Recording the box pass and the builds and submitting them: the frame thread's cost of the
+    /// builds. It does not wait for the GPU (#236), except in the Edit stress, which asks the
+    /// update to wait so that the builds' own time is in it.
     pub build_ms: f64,
 }
 
@@ -95,6 +102,7 @@ impl From<&HwUpdate> for AccelUpdate {
             tlas_instances: u.tlas_instances,
             blas_total: u.blas_total,
             prims_total: u.prims_total,
+            pending: u.pending,
             prepare_ms: u.prepare.as_secs_f64() * 1e3,
             build_ms: u.build.as_secs_f64() * 1e3,
         }
@@ -115,6 +123,9 @@ pub struct AccelSummary {
     /// BLASes rebuilt by an update, mean and most.
     pub blas_rebuilt_per_update_mean: Option<f64>,
     pub blas_rebuilt_per_update_max: Option<u32>,
+    /// The most groups that were stale and waiting for a later update's budget after one of the
+    /// updates.
+    pub pending_max: u32,
     pub prepare_ms: Stats,
     pub build_ms: Stats,
     /// `prepare_ms` + `build_ms` of each update.
@@ -145,6 +156,7 @@ impl AccelSummary {
             blas_rebuilt_per_update_mean: (!per.is_empty())
                 .then(|| per.iter().map(|&n| f64::from(n)).sum::<f64>() / per.len() as f64),
             blas_rebuilt_per_update_max: per.iter().copied().max(),
+            pending_max: updates.iter().map(|u| u.pending).max().unwrap_or(0),
             prepare_ms: Stats::of(&done.iter().map(|u| ms(u.prepare)).collect::<Vec<_>>()),
             build_ms: Stats::of(&done.iter().map(|u| ms(u.build)).collect::<Vec<_>>()),
             total_ms: Stats::of(
@@ -174,6 +186,10 @@ pub struct AccelReport {
     /// The first measured frame of each mode, which follows the camera back to the start of the
     /// path: another jump, which `scene_update_ms` has in its maximum and `flight` does not.
     pub first_frame: AccelSummary,
+    /// The sweep's still frames, its jumps to each height and its warm-ups, all of them (the
+    /// sweep is not the flight, and its jumps are not the flight's): with `--rt-backend hw` alone
+    /// the sweep runs on the hardware backend, which `both` does not.
+    pub sweep: AccelSummary,
     /// The jump to where the Edit stress starts, if it ran.
     pub settle: AccelSummary,
     /// The Edits' updates (after each Edit, the groups it touched rebuilt and the TLAS built
@@ -333,6 +349,10 @@ pub struct RtReport {
     /// The two backends side by side (`both`); null otherwise, or if the adapter has no ray
     /// queries (`fallback` says so).
     pub comparison: Option<Comparison>,
+    /// With `--streaming --real-time --rt-backend both`: the real-time mode's runs again on the
+    /// hardware backend (#236), to read its frame thread's update and its frame time against
+    /// the compute backend's, which are the report's `streaming_real_time`. Null otherwise.
+    pub real_time_hw: Option<super::realtime::RealTimeReport>,
 }
 
 #[cfg(test)]
@@ -417,6 +437,7 @@ mod tests {
             flight_frames: 3,
             warmup: AccelSummary::default(),
             first_frame: AccelSummary::default(),
+            sweep: AccelSummary::default(),
             settle: AccelSummary::default(),
             edits: None,
         };

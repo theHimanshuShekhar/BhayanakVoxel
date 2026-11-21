@@ -45,13 +45,17 @@ use net::{ServerEnd, loopback};
 use planet_gen::planet::tangents;
 use planet_gen::world_map::{WORLD_MAP_SIZE, WorldMap};
 use render::reference::{Ray, trace};
-use render::{Camera, GpuPasses, Mode, Offscreen, Rebuild, Resolution, Scene, SceneUpdate, camera};
+use render::{
+    Camera, GpuPasses, Mode, Offscreen, Rebuild, Resolution, RtBackend, RtChoice, Scene,
+    SceneUpdate, camera,
+};
 use serde::Serialize;
 use serde_json::Value;
 use sim::Predictor;
 
 use super::budget::{EXIT_OVER_BUDGET, StreamingBudgets};
 use super::process;
+use super::rt::AccelSummary;
 use super::stream::{
     Constants, Series, Sizing, Start, TestPlanet, measure_sizes, over_the_ground, percentile_99,
     test_planet, within_reach,
@@ -250,12 +254,14 @@ impl Gpu for NoGpu {
     }
 }
 
-/// Times in milliseconds of the frames of a path: the 99th percentile (nearest rank), the worst
-/// and the mean.
+/// Times in milliseconds of the frames of a path: the 95th and 99th percentiles (nearest rank),
+/// the worst and the mean.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize)]
 pub struct Spread {
     pub samples: usize,
     pub mean_ms: f64,
+    /// The 95th percentile (#236 holds the frame thread's update to compute's at it).
+    pub p95_ms: f64,
     pub p99_ms: f64,
     pub worst_ms: f64,
 }
@@ -268,9 +274,11 @@ impl Spread {
         let mut sorted = times.to_vec();
         sorted.sort_by(f64::total_cmp);
         let rank = (sorted.len() * 99).div_ceil(100);
+        let rank95 = (sorted.len() * 95).div_ceil(100);
         Self {
             samples: sorted.len(),
             mean_ms: sorted.iter().sum::<f64>() / sorted.len() as f64,
+            p95_ms: sorted[rank95 - 1],
             p99_ms: sorted[rank - 1],
             worst_ms: sorted[sorted.len() - 1],
         }
@@ -1287,6 +1295,26 @@ pub struct RealTimeReport {
     /// Set when a run did not finish: the runs above are those that did (and the gates are held to
     /// those only), and the exit status is 1.
     pub error: Option<Failure>,
+    /// Which way rays found the Planet in the runs (`--rt-backend`, #236), and what their
+    /// acceleration structures did; null for a report that was not made by [`run`].
+    pub rt: Option<RtRealTime>,
+}
+
+/// The ray backend of the real-time mode's runs (#236): the report's `rt` block, for the mode.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct RtRealTime {
+    /// What `--rt-backend` asked for the runs: `compute`, `hw`, `hw-nearest`.
+    pub requested: String,
+    /// What ran: `hw` only if asked for and the adapter has ray queries; else `compute`.
+    pub active: String,
+    /// Why not what was asked for, if it did not run.
+    pub fallback: Option<String>,
+    /// Each run's updates of the hardware backend's acceleration structures, over the whole run
+    /// (the cold start, the paths, the catching up between them and the Edit): `updates` the ones
+    /// that built something, `pending_max` the most groups that waited for a later frame's budget,
+    /// `prepare_ms` and `build_ms` what the frame thread spent (`build_ms` is recording and
+    /// submitting: nothing waits for the GPU). Null for a run on `compute`.
+    pub accel: Vec<Option<AccelSummary>>,
 }
 
 impl RealTimeReport {
@@ -1310,7 +1338,14 @@ impl RealTimeReport {
             min,
             max,
             error: None,
+            rt: None,
         }
+    }
+
+    /// This report, with the ray backend the runs were on.
+    pub fn with_rt(mut self, rt: RtRealTime) -> Self {
+        self.rt = Some(rt);
+        self
     }
 
     /// The report of a mode that stopped on `failure`.
@@ -2982,11 +3017,20 @@ fn whole_run(
     flat_ambient: bool,
     script: &Script,
     limit_ms: f64,
-) -> Result<(RunReport, f64), Failure> {
+    backend: RtBackend,
+) -> Result<(RunReport, f64, RtChoice, Option<AccelSummary>), Failure> {
     // What the paths do is caught where the step is known; this catches the rest (making the
     // world, the GPU, and ending the run, which drops them).
     catch_unwind(AssertUnwindSafe(|| {
-        run_once(full, run, resolution, flat_ambient, script, limit_ms)
+        run_once(
+            full,
+            run,
+            resolution,
+            flat_ambient,
+            script,
+            limit_ms,
+            backend,
+        )
     }))
     .unwrap_or_else(|payload| {
         Err(Failure {
@@ -3004,7 +3048,8 @@ fn run_once(
     flat_ambient: bool,
     script: &Script,
     limit_ms: f64,
-) -> Result<(RunReport, f64), Failure> {
+    backend: RtBackend,
+) -> Result<(RunReport, f64, RtChoice, Option<AccelSummary>), Failure> {
     let failed = |step: &str, error: Box<dyn Error>| Failure {
         run,
         step: step.to_string(),
@@ -3013,8 +3058,14 @@ fn run_once(
     let built = if full { build_full() } else { build_test() }
         .map_err(|e| failed("building the world", e))?;
     let d0 = built.setup.d0;
-    let mut gpu = Offscreen::with_resolution(resolution, built.world.scene())
+    let mut gpu = Offscreen::with_backend(resolution, built.world.scene(), backend)
         .map_err(|e| failed("making the GPU context", e))?;
+    let choice = gpu.rt().clone();
+    if let Some(why) = &choice.fallback {
+        eprintln!("warning: --rt-backend: {why}; this run is a compute run");
+    }
+    // The first build is the world's, not the run's: the log is of what the run did.
+    gpu.take_hardware_updates();
     gpu.set_flat_ambient(flat_ambient);
     // The atmosphere measures the camera's height from the Planet's sea level.
     gpu.set_ground_level(f64::from(if full {
@@ -3026,7 +3077,11 @@ fn run_once(
     built.world.set_buffer_limit(gpu.buffer_limit_words());
     let report = one_run(built, &mut OffscreenGpu(&mut gpu), script, limit_ms)
         .map_err(|stopped| failed(&stopped.step, stopped.error))?;
-    Ok((report, d0))
+    let accel = choice
+        .active
+        .is_hardware()
+        .then(|| AccelSummary::of(&gpu.take_hardware_updates()));
+    Ok((report, d0, choice, accel))
 }
 
 /// Runs the real-time mode: `runs` runs of the paths, each on a world of its own and a GPU of its
@@ -3043,6 +3098,7 @@ pub fn run(
     flat_ambient: bool,
     budgets: &StreamingBudgets,
     stream_slice: Option<Duration>,
+    backend: RtBackend,
 ) -> RealTimeReport {
     let mut script = if full {
         Script::full()
@@ -3053,6 +3109,8 @@ pub fn run(
         script.stream_slice = slice;
     }
     let mut reports = Vec::new();
+    let mut accel = Vec::new();
+    let mut choice = None;
     let mut d0 = 0.0;
     let mut failure = None;
     for run in 1..=runs {
@@ -3065,11 +3123,14 @@ pub fn run(
             flat_ambient,
             &script,
             budgets.frame_time_p99_ms,
+            backend,
         ) {
-            Ok((report, d)) => {
+            Ok((report, d, rt, summary)) => {
                 d0 = d;
                 eprintln!("real time: run {run} took {:.0?}", began.elapsed());
                 reports.push(report);
+                accel.push(summary);
+                choice = Some(rt);
             }
             Err(f) => {
                 eprintln!(
@@ -3091,10 +3152,26 @@ pub fn run(
     if flat_ambient {
         planet.push_str(", flat ambient");
     }
-    let report = RealTimeReport::new(planet, d0, reports, budgets);
+    let rt = RtRealTime {
+        requested: backend_name(choice.as_ref().map_or(backend, |c| c.requested)).to_string(),
+        active: backend_name(choice.as_ref().map_or(RtBackend::Compute, |c| c.active)).to_string(),
+        fallback: choice.and_then(|c| c.fallback),
+        accel,
+    };
+    planet.push_str(&format!(", rays by {}", rt.active));
+    let report = RealTimeReport::new(planet, d0, reports, budgets).with_rt(rt);
     match failure {
         Some(failure) => report.failed(failure),
         None => report,
+    }
+}
+
+/// The name `--rt-backend` gives `backend`.
+fn backend_name(backend: RtBackend) -> &'static str {
+    match backend {
+        RtBackend::Compute => "compute",
+        RtBackend::Hardware => "hw",
+        RtBackend::HardwareNearest => "hw-nearest",
     }
 }
 
@@ -3155,12 +3232,14 @@ mod tests {
             frame_time: Spread {
                 samples: 600,
                 mean_ms: frame_p99 / 2.0,
+                p95_ms: frame_p99 * 0.9,
                 p99_ms: frame_p99,
                 worst_ms: frame_p99 * 2.0,
             },
             frame_cpu: Spread {
                 samples: 600,
                 mean_ms: cpu_p99 / 2.0,
+                p95_ms: cpu_p99 * 0.9,
                 p99_ms: cpu_p99,
                 worst_ms: cpu_p99 * 2.0,
             },
@@ -3171,6 +3250,7 @@ mod tests {
                 Spread {
                     samples: 600,
                     mean_ms: 1.0,
+                    p95_ms: 1.5,
                     p99_ms: 2.0,
                     worst_ms: 3.0,
                 },
@@ -3578,6 +3658,7 @@ mod tests {
                         Spread {
                             samples: 600,
                             mean_ms,
+                            p95_ms: p99_ms * 0.9,
                             p99_ms,
                             worst_ms: p99_ms * 2.0,
                         },
@@ -3767,9 +3848,12 @@ mod tests {
                 "min",
                 "mode",
                 "planet",
+                "rt",
                 "runs"
             ]
         );
+        // No ray backend was asked for (#236): `rt` is null until `with_rt` says which ran.
+        assert!(json["rt"].is_null());
         assert_eq!(json["mode"], "real-time");
         assert_eq!(json["deterministic"], false);
         assert!(json["error"].is_null());

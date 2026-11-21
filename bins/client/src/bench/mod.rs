@@ -271,12 +271,13 @@ fn run(args: &Args) -> Result<u8, Box<dyn Error>> {
     } else {
         (None, None)
     };
-    let rt = RtReport {
+    let mut rt = RtReport {
         requested: args.rt.name().to_string(),
         active: choice.active.name().to_string(),
         fallback: choice.fallback.clone().or(compare_fallback),
         accel: main_accel,
         comparison,
+        real_time_hw: None,
     };
     // The convergence phase (#187) has GPU contexts of its own, one for each of its views, and
     // runs after everything that is timed against the budgets, so that it cannot
@@ -329,6 +330,21 @@ fn run(args: &Args) -> Result<u8, Box<dyn Error>> {
             args.flat_ambient,
             &budgets,
             stream_slice,
+            args.rt.main_backend(),
+        )),
+        _ => None,
+    };
+    // `--rt-backend both` with the real-time mode (#236): the same runs again, on the hardware
+    // backend, to put its frame thread's update and its frame time beside the compute backend's.
+    rt.real_time_hw = match real_time_budgets {
+        Some(budgets) if args.real_time && args.rt == RtMode::Both => Some(realtime::run(
+            !plan.patch,
+            args.runs,
+            resolution,
+            args.flat_ambient,
+            &budgets,
+            stream_slice,
+            RtBackend::Hardware,
         )),
         _ => None,
     };
@@ -423,6 +439,21 @@ fn run(args: &Args) -> Result<u8, Box<dyn Error>> {
             r.gates.over.join(", ")
         );
     }
+    // The hardware run of `--rt-backend both` is held to the same gates (#236): it is the one
+    // that must pass them with the acceleration structures on.
+    let real_time_hw_code = report
+        .rt
+        .real_time_hw
+        .as_ref()
+        .map_or(0, |r| realtime::exit_code(r, args.no_fail));
+    if real_time_hw_code != 0
+        && let Some(r) = &report.rt.real_time_hw
+    {
+        eprintln!(
+            "streaming (real time, hardware rays): over its gates: {}",
+            r.gates.over.join(", ")
+        );
+    }
     // A gate of the GI (#54) is a failure whatever `--diag` said: it holds Primary to the Reference.
     let gi_code = report
         .convergence
@@ -436,7 +467,11 @@ fn run(args: &Args) -> Result<u8, Box<dyn Error>> {
             c.gi.gates.over.join(", ")
         );
     }
-    let code = code.max(streaming_code).max(real_time_code).max(gi_code);
+    let code = code
+        .max(streaming_code)
+        .max(real_time_code)
+        .max(real_time_hw_code)
+        .max(gi_code);
     // An error of the real-time mode is exit status 1, not 2 (a gate that is over): nothing says
     // whether its gates would have held.
     let code = match &report.streaming_real_time {
@@ -510,6 +545,7 @@ fn accel_report(
         flight_frames: flight.accel.measured_frames,
         warmup: AccelSummary::of(&flight.accel.warmup),
         first_frame: AccelSummary::of(&flight.accel.first_frame),
+        sweep: AccelSummary::of(&flight.accel.sweep),
         settle: AccelSummary::of(&flight.accel.settle),
         edits: edits.and_then(|e| e.accel.clone()),
     }
@@ -667,6 +703,10 @@ struct AccelLog {
     /// How many frames `measured` is of (the measured frames of every mode flown, less the first of
     /// each).
     measured_frames: u32,
+    /// Everything the sweep made (its still frames and its jumps to each height and back):
+    /// `sweep` calls `run_mode` eight times, and without this its frames would be counted as the
+    /// flight's and its jumps as the warm-up's.
+    sweep: Vec<HwUpdate>,
     /// Moving to where the Edit stress starts (`settle_for_edits`).
     settle: Vec<HwUpdate>,
 }
@@ -843,7 +883,8 @@ fn sweep_keyframe(height: f64) -> Keyframe {
 fn settle_for_edits(gpu: &mut Offscreen, flight: &mut Flight) -> Result<(), Box<dyn Error>> {
     let at = sweep_keyframe(SWEEP_HEIGHTS[SWEEP_HEIGHTS.len() - 1]);
     let camera = CameraPath::new(vec![at, at]).camera_at(0, 2);
-    gpu.take_hardware_updates();
+    // Anything still logged is the last part's tail, and a jump's: with the warm-up's.
+    flight.accel.warmup.extend(gpu.take_hardware_updates());
     flight.follow(gpu, &camera)?;
     flight.accel.settle.extend(gpu.take_hardware_updates());
     Ok(())
@@ -867,6 +908,8 @@ fn sweep(
         warmup: 2,
         spp: 2,
     };
+    // The flight's log is set aside, and the sweep's is its own.
+    let outside = std::mem::take(&mut flight.accel);
     let mut altitudes = Vec::new();
     for height in SWEEP_HEIGHTS {
         let at = sweep_keyframe(height);
@@ -888,6 +931,16 @@ fn sweep(
             reference: pass_stats(&reference, "reference"),
         });
     }
+    let swept = std::mem::replace(&mut flight.accel, outside);
+    flight.accel.sweep.extend(
+        swept
+            .warmup
+            .into_iter()
+            .chain(swept.first_frame)
+            .chain(swept.measured)
+            .chain(swept.settle)
+            .chain(swept.sweep),
+    );
     Ok(altitudes)
 }
 
@@ -958,6 +1011,10 @@ fn print_summary(report: &Report) {
         print_streaming(s);
     }
     if let Some(r) = &report.streaming_real_time {
+        print_real_time(r);
+    }
+    if let Some(r) = &report.rt.real_time_hw {
+        eprintln!("the same real-time runs on the hardware backend (--rt-backend both):");
         print_real_time(r);
     }
     if let Some(c) = &report.convergence {
@@ -1114,6 +1171,10 @@ fn print_real_time(r: &realtime::RealTimeReport) {
                 m.wait.mean_ms,
                 m.gpu_total.mean_ms,
                 m.wait_not_passes.mean_ms,
+            );
+            eprintln!(
+                "        frame thread's scene update: mean {:.2} p95 {:.2} max {:.2} ms",
+                m.update.mean_ms, m.update.p95_ms, m.update.worst_ms,
             );
             if !p.gpu_passes.is_empty() {
                 let passes: Vec<String> = p
@@ -1379,5 +1440,13 @@ mod tests {
         assert_eq!(accel.flight.updates as usize, log.measured.len());
         assert_eq!(accel.flight_frames, 5);
         assert_eq!(accel.warmup.updates as usize, log.warmup.len());
+        // Moving to where the Edit stress starts keeps what was still queued, in the warm-up's
+        // part (#236: it used to throw it away).
+        let before = flight.accel.warmup.len();
+        gpu.update_scene(&flight.scene, &render::SceneUpdate::Rebuilt)
+            .unwrap();
+        settle_for_edits(&mut gpu, &mut flight).unwrap();
+        assert_eq!(flight.accel.warmup.len(), before + 1);
+        assert_eq!(flight.accel.warmup.last().map(|u| u.kind), Some("build"));
     }
 }
