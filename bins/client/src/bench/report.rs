@@ -7,6 +7,7 @@ use super::budget::{Budgets, Status, status};
 use super::convergence::ConvergenceReport;
 use super::edits::EditsReport;
 use super::realtime::RealTimeReport;
+use super::rt::RtReport;
 use super::stats::Stats;
 use super::stream::StreamReport;
 
@@ -156,7 +157,16 @@ use super::stream::StreamReport;
 /// crossing and `stop after a flight`; the paths after it move one place down in `paths`, and its
 /// peak is in the run's `scene_used_peak_mib`, which the `scene_mib` gate reads. Nothing else is
 /// changed.
-pub const SCHEMA_VERSION: u32 = 30;
+///
+/// 31 (#50, a spike) adds the report's `rt` block: `requested` (`--rt-backend`: compute, hw or both),
+/// `active` (the backend of the flight, the sweep and the Edit stress), `fallback` (why not hw, if
+/// it was asked for and the adapter has no ray queries), `accel` (on hw: the acceleration
+/// structures' first build, the updates that followed the camera and the Edit stress's, each with
+/// what it rebuilt and its CPU and GPU time) and `comparison` (`both`: the same flight on the two
+/// backends, the passes that cast rays side by side with their speed-ups, and the hardware
+/// context's `accel` and Edit stress). `edits.accel` is the Edit stress's updates of the
+/// acceleration structures (null on compute). Nothing else is changed.
+pub const SCHEMA_VERSION: u32 = 31;
 
 /// One timed thing (a pass, or the GPU total of a profiler frame) in one mode, against its
 /// budget. In reference mode a profiler frame is one sample, so the entries of that mode have
@@ -453,6 +463,8 @@ pub struct Report {
     /// Planet with real threads, the paths, the gates and the sizing at full size, over several
     /// runs; not deterministic. Null without the flag.
     pub streaming_real_time: Option<RealTimeReport>,
+    /// How rays found the Planet in the flight, and what the hardware backend costs (#50).
+    pub rt: RtReport,
 }
 
 #[cfg(test)]
@@ -635,6 +647,13 @@ mod tests {
             convergence: None,
             streaming: None,
             streaming_real_time: None,
+            rt: RtReport {
+                requested: "compute".into(),
+                active: "compute".into(),
+                fallback: None,
+                accel: None,
+                comparison: None,
+            },
         };
         let json = serde_json::to_value(&report).unwrap();
         let keys = |v: &serde_json::Value| -> Vec<String> {
@@ -652,13 +671,16 @@ mod tests {
                 "edits",
                 "machine",
                 "modes",
+                "rt",
                 "schema_version",
                 "screenshots",
                 "streaming",
                 "streaming_real_time"
             ]
         );
-        assert_eq!(json["schema_version"], 30);
+        assert_eq!(json["schema_version"], 31);
+        assert_eq!(json["rt"]["active"], "compute");
+        assert_eq!(json["rt"]["comparison"], serde_json::Value::Null);
         assert_eq!(json["convergence"], serde_json::Value::Null);
         assert_eq!(json["streaming"], serde_json::Value::Null);
         assert_eq!(json["streaming_real_time"], serde_json::Value::Null);

@@ -48,8 +48,8 @@ fn rays(offset: f64) -> Vec<Ray> {
 fn the_gpu_gives_the_same_hits_a_billion_voxels_from_the_origin() {
     let near = generate_region(3, BrickCoord([176, -6, -6]), BrickCoord([196, 6, 6]));
     let far = shifted(&near, SHIFT);
-    let near = Offscreen::new(8, 8, &Scene::new(&near, None)).unwrap();
-    let far = Offscreen::new(8, 8, &Scene::new(&far, None)).unwrap();
+    let mut near = Offscreen::new(8, 8, &Scene::new(&near, None)).unwrap();
+    let mut far = Offscreen::new(8, 8, &Scene::new(&far, None)).unwrap();
 
     let a = near.trace_rays(&rays(0.0));
     let b = far.trace_rays(&rays(f64::from(SHIFT)));

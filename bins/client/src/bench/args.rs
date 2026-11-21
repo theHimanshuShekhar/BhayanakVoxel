@@ -3,6 +3,7 @@
 use std::path::PathBuf;
 
 use super::convergence::CHECKPOINTS;
+use super::rt::RtMode;
 
 pub const USAGE: &str = "\
 Usage: client bench [OPTIONS]
@@ -67,6 +68,13 @@ Options:
                    phase's sun-and-sky view (#52), 1 to 16 [default: the renderer's, 2]. The
                    report's `convergence.shadows.shadow_rays` says which; run it with 1 and with 2
                    to compare them
+  --rt-backend B   How rays find the Planet (#50): compute (the default: the compute-shader DDA),
+                   hw (ray queries over the bricks' tight boxes, for the flight, the sweep and the
+                   Edit stress; the compute path, with a warning and the reason in the report's
+                   `rt.fallback`, if the adapter has no ray queries) or both (the bench as for
+                   compute, then the same flight and Edit stress on hw on a context of its own, and
+                   the passes that cast rays compared: `rt.comparison`). The report's `rt` says
+                   which ran and what the acceleration structures cost to update
   --no-fail        Exit with status 0 even if a pass is over its budget, there is a hole or a
                    real-time gate is over
   -h, --help       Print this";
@@ -120,6 +128,8 @@ pub struct Args {
     /// `--shadow-rays N`: the shadow rays a pixel of Primary casts in the convergence phase's
     /// sun-and-sky view (#52), where the renderer's default is not wanted.
     pub shadow_rays: Option<u32>,
+    /// `--rt-backend` (#50): how rays find the Planet.
+    pub rt: RtMode,
     pub size: Option<(u32, u32)>,
     pub bias: f64,
     pub diag: Diag,
@@ -151,6 +161,7 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Parsed, String> {
         truth_spp: None,
         flip_gamma22: false,
         shadow_rays: None,
+        rt: RtMode::default(),
         size: None,
         bias: 1.0,
         diag: Diag::default(),
@@ -177,6 +188,7 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Parsed, String> {
             "--flip-gamma-2-2" => parsed.flip_gamma22 = true,
             "--truth-spp" => parsed.truth_spp = Some(truth_spp(&value("--truth-spp")?)?),
             "--shadow-rays" => parsed.shadow_rays = Some(shadow_rays(&value("--shadow-rays")?)?),
+            "--rt-backend" => parsed.rt = RtMode::parse(&value("--rt-backend")?)?,
             "--out" => parsed.out = value("--out")?.into(),
             "--budgets" => parsed.budgets = Some(value("--budgets")?.into()),
             "--size" => parsed.size = Some(size(&value("--size")?)?),
@@ -339,11 +351,23 @@ mod tests {
                 truth_spp: None,
                 flip_gamma22: false,
                 shadow_rays: None,
+                rt: RtMode::Compute,
                 size: None,
                 bias: 1.0,
                 diag: Diag::default()
             }
         );
+    }
+
+    #[test]
+    fn the_ray_backend_is_compute_unless_asked_and_a_bad_one_is_refused() {
+        assert_eq!(run(&[]).rt, RtMode::Compute);
+        assert_eq!(run(&["--rt-backend", "compute"]).rt, RtMode::Compute);
+        assert_eq!(run(&["--rt-backend", "hw"]).rt, RtMode::Hardware);
+        assert_eq!(run(&["--rt-backend", "both"]).rt, RtMode::Both);
+        for bad in [&["--rt-backend"][..], &["--rt-backend", "rtx"]] {
+            assert!(parse_all(bad).is_err(), "{bad:?}");
+        }
     }
 
     #[test]

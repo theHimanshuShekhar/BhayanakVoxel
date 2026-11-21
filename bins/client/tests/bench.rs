@@ -281,7 +281,13 @@ fn check_convergence(convergence: &Value, out: &Path) {
 }
 
 fn check_schema(report: &Value, out: &Path) {
-    assert_eq!(report["schema_version"], 30);
+    assert_eq!(report["schema_version"], 31);
+    // The default is the compute backend, with no acceleration structures (#50).
+    assert_eq!(report["rt"]["requested"], "compute");
+    assert_eq!(report["rt"]["active"], "compute");
+    assert!(report["rt"]["fallback"].is_null());
+    assert!(report["rt"]["accel"].is_null());
+    assert!(report["rt"]["comparison"].is_null());
     // The Edit stress is of the whole Planet, which the patch is not.
     assert!(report["edits"].is_null());
     // The streaming mode is asked for (see its own test); the other tests do not. The real-time

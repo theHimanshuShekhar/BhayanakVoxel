@@ -36,6 +36,7 @@ use serde::Serialize;
 use super::Flight;
 use super::budget::{Budgets, status};
 use super::report::Entry;
+use super::rt::AccelSummary;
 use super::stats::Stats;
 
 /// The name of the budget (in `[passes]`) that the longest frame-thread time of an Edit is held to.
@@ -67,6 +68,9 @@ pub struct EditsReport {
     pub scene_thread: Stats,
     /// CPU time of every frame, the ones with no Edit at 0, against the `edits` budget.
     pub per_frame: Entry,
+    /// The updates of the hardware backend's acceleration structures that the Edits made (the
+    /// groups they touched, and the TLAS again), which are in the times above: null on compute.
+    pub accel: Option<AccelSummary>,
 }
 
 impl EditsReport {
@@ -111,6 +115,8 @@ pub fn run(
     let (mut per_frame, mut per_edit) = (Vec::new(), Vec::new());
     let (mut frame_thread, mut scene_thread) = (Vec::new(), Vec::new());
     let (mut edits, mut voxels) = (0u32, 0u64);
+    // What the flight did to the acceleration structures is not the Edits'.
+    gpu.take_hardware_updates();
     for _ in 0..FRAMES {
         allowance.refill();
         let next = op(if edits % 2 == 0 {
@@ -156,6 +162,7 @@ pub fn run(
     let seconds = f64::from(FRAMES) / 60.0;
     let stats = Stats::of(&per_frame);
     let budget_ms = budgets.passes.get("edits").copied();
+    let accel = gpu.take_hardware_updates();
     let frame_thread_stats = Stats::of(&frame_thread);
     let frame_thread_budget_ms = budgets.passes.get(FRAME_THREAD_BUDGET).copied();
     Ok(Some(EditsReport {
@@ -182,6 +189,7 @@ pub fn run(
             stats,
             budget_ms,
         },
+        accel: (!accel.is_empty()).then(|| AccelSummary::of(&accel)),
     }))
 }
 
@@ -205,6 +213,7 @@ mod tests {
             scene,
             store: Some(store),
             diag: Default::default(),
+            accel: Vec::new(),
         };
         let budgets =
             Budgets::parse("[passes]\nedits = 1.0\nedit_frame_thread = 1000.0\n").unwrap();
@@ -239,6 +248,7 @@ mod tests {
             scene,
             store: None,
             diag: Default::default(),
+            accel: Vec::new(),
         };
         assert!(run(&mut gpu, &mut bare, &budgets).unwrap().is_none());
     }

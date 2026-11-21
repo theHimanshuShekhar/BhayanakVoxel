@@ -21,6 +21,7 @@ mod path;
 mod process;
 mod realtime;
 mod report;
+mod rt;
 mod stats;
 mod stream;
 
@@ -32,7 +33,7 @@ use std::process::ExitCode;
 use std::time::Instant;
 
 use brick_store::BrickStore;
-use render::{Camera, Image, Mode, Offscreen, Resolution, Scene};
+use render::{Camera, HwUpdate, Image, Mode, Offscreen, Resolution, RtBackend, Scene};
 
 use args::{Args, Diag, Parsed, USAGE};
 use budget::{Budgets, Status};
@@ -41,6 +42,7 @@ use report::{
     Altitude, Build, CaveStill, Config, KeyframeLod, Machine, Measured, ModeReport, Modes, Report,
     SCHEMA_VERSION,
 };
+use rt::{AccelReport, AccelSummary, AccelUpdate, BackendTimes, Comparison, RtMode, RtReport};
 use stats::Stats;
 
 const REPORT_FILE: &str = "report.json";
@@ -177,43 +179,22 @@ fn run(args: &Args) -> Result<u8, Box<dyn Error>> {
         .map_err(|e| format!("cannot create {}: {e}", args.out.display()))?;
 
     let started = Instant::now();
-    let mut flight = if plan.patch {
-        Flight {
-            scene: patch_scene(),
-            store: None,
-            diag: args.diag,
-        }
-    } else {
-        eprintln!("generating the Planet (this takes a while)...");
-        let mut store = planet_gen::generate_planet(crate::SEED);
-        store.build_lod(crate::RING_LEVELS - 1);
-        // The bands are for the image that is presented: twice the traced height.
-        let bands = render::lod::Bands::new(plan.height * 2, render::lod::VFOV, args.bias);
-        let scene = crate::planet_scene(
-            &store,
-            plan.path.camera_at(0, 2).position,
-            bands,
-            planet_gen::MAX_RADIUS,
-        )?;
-        Flight {
-            scene,
-            store: Some(store),
-            diag: args.diag,
-        }
-    };
+    let mut flight = new_flight(&plan, args)?;
     eprintln!("scene ready after {:.1?}", started.elapsed());
     let resolution = Resolution {
         internal: (plan.width, plan.height),
         output: (plan.width * 2, plan.height * 2),
     };
-    let mut gpu = Offscreen::with_resolution(resolution, &flight.scene)?;
-    // The flight times what the player's frame costs, and the player's Primary has the radiance
-    // cache's GI (#54): an `Offscreen` starts with the flat ambient of before it.
-    gpu.set_flat_ambient(false);
-    if !plan.patch {
-        // The atmosphere measures the camera's height from the Planet's sea level.
-        gpu.set_ground_level(f64::from(planet_gen::world_map::WORLD_RADIUS));
+    let mut gpu = Offscreen::with_backend(resolution, &flight.scene, args.rt.main_backend())?;
+    let choice = gpu.rt().clone();
+    if let Some(why) = &choice.fallback {
+        eprintln!(
+            "warning: --rt-backend {}: {why}; this is a compute run",
+            args.rt.name()
+        );
     }
+    let initial_accel = gpu.take_hardware_updates().into_iter().next();
+    prepare(&mut gpu, &plan);
     eprintln!(
         "the Planet takes {:.1} MiB of GPU memory",
         gpu.scene_bytes() as f64 / (1024.0 * 1024.0)
@@ -229,8 +210,6 @@ fn run(args: &Args) -> Result<u8, Box<dyn Error>> {
     if !gpu.timers_supported() {
         eprintln!("warning: the GPU has no timestamp queries; passes cannot be timed");
     }
-    gpu.set_keep_history(true);
-
     gpu.set_flush_scene_updates(!args.diag.no_flush);
     let mut screenshots = Vec::new();
     let primary = run_mode(
@@ -264,6 +243,8 @@ fn run(args: &Args) -> Result<u8, Box<dyn Error>> {
         edits::run(&mut gpu, &mut flight, &budgets)?
     };
     let timers_supported = gpu.timers_supported();
+    let main_accel = (choice.active == RtBackend::Hardware)
+        .then(|| accel_report(initial_accel.as_ref(), &flight, edits.as_ref()));
     // The cave stills are of another scene, and another GPU context: this one's is done with.
     drop(gpu);
     drop(flight);
@@ -273,6 +254,27 @@ fn run(args: &Args) -> Result<u8, Box<dyn Error>> {
         cave_stills(&plan, &budgets, &args.out)?
     };
     screenshots.extend(cave_shots);
+    // `--rt-backend both`: the hardware backend's flight, after what is timed against the budgets.
+    let (comparison, compare_fallback) = if args.rt == RtMode::Both {
+        match realtime::catching(|| {
+            compare_hardware(&plan, args, resolution, &budgets, &modes.primary)
+        }) {
+            Ok(done) => done,
+            Err(e) => {
+                eprintln!("warning: the hardware comparison failed, and is left out: {e}");
+                (None, Some(format!("the hardware run failed: {e}")))
+            }
+        }
+    } else {
+        (None, None)
+    };
+    let rt = RtReport {
+        requested: args.rt.name().to_string(),
+        active: choice.active.name().to_string(),
+        fallback: choice.fallback.clone().or(compare_fallback),
+        accel: main_accel,
+        comparison,
+    };
     // The convergence phase (#187) has GPU contexts of its own, one for each of its views, and
     // runs after everything that is timed against the budgets, so that it cannot
     // move any of it. It is not timed against a budget itself.
@@ -374,6 +376,7 @@ fn run(args: &Args) -> Result<u8, Box<dyn Error>> {
         modes,
         streaming,
         streaming_real_time,
+        rt,
     };
     let json = serde_json::to_string_pretty(&report)?;
     let file = args.out.join(REPORT_FILE);
@@ -449,6 +452,112 @@ fn run(args: &Args) -> Result<u8, Box<dyn Error>> {
     Ok(code)
 }
 
+/// The scene of a flight, made afresh: the patch, or the Planet generated (which takes a while).
+fn new_flight(plan: &Plan, args: &Args) -> Result<Flight, Box<dyn Error>> {
+    Ok(if plan.patch {
+        Flight {
+            scene: patch_scene(),
+            store: None,
+            diag: args.diag,
+            accel: Vec::new(),
+        }
+    } else {
+        eprintln!("generating the Planet (this takes a while)...");
+        let mut store = planet_gen::generate_planet(crate::SEED);
+        store.build_lod(crate::RING_LEVELS - 1);
+        // The bands are for the image that is presented: twice the traced height.
+        let bands = render::lod::Bands::new(plan.height * 2, render::lod::VFOV, args.bias);
+        let scene = crate::planet_scene(
+            &store,
+            plan.path.camera_at(0, 2).position,
+            bands,
+            planet_gen::MAX_RADIUS,
+        )?;
+        Flight {
+            scene,
+            store: Some(store),
+            diag: args.diag,
+            accel: Vec::new(),
+        }
+    })
+}
+
+/// What the flight needs of a context before it is timed.
+fn prepare(gpu: &mut Offscreen, plan: &Plan) {
+    // The flight times what the player's frame costs, and the player's Primary has the radiance
+    // cache's GI (#54): an `Offscreen` starts with the flat ambient of before it.
+    gpu.set_flat_ambient(false);
+    if !plan.patch {
+        // The atmosphere measures the camera's height from the Planet's sea level.
+        gpu.set_ground_level(f64::from(planet_gen::world_map::WORLD_RADIUS));
+    }
+    gpu.set_keep_history(true);
+}
+
+/// The hardware backend's acceleration structures over a run: its first build, the updates of the
+/// flight, and those of the Edit stress.
+fn accel_report(
+    initial: Option<&HwUpdate>,
+    flight: &Flight,
+    edits: Option<&edits::EditsReport>,
+) -> AccelReport {
+    AccelReport {
+        initial: initial.map(AccelUpdate::from).unwrap_or_default(),
+        flight: AccelSummary::of(&flight.accel),
+        edits: edits.and_then(|e| e.accel.clone()),
+    }
+}
+
+/// `--rt-backend both` (#50): the flight and the Edit stress again on the hardware backend, on a
+/// context of its own, and put by the compute run's. `Err` is a failure to run; a missing feature is
+/// `Ok((None, Some(why)))`.
+fn compare_hardware(
+    plan: &Plan,
+    args: &Args,
+    resolution: Resolution,
+    budgets: &Budgets,
+    compute: &ModeReport,
+) -> Result<(Option<Comparison>, Option<String>), Box<dyn Error>> {
+    eprintln!("rt: the same flight on the hardware backend...");
+    let mut flight = new_flight(plan, args)?;
+    let mut gpu = Offscreen::with_backend(resolution, &flight.scene, RtBackend::Hardware)?;
+    if gpu.rt().active != RtBackend::Hardware {
+        let why = gpu.rt().fallback.clone();
+        eprintln!(
+            "warning: no hardware comparison: {}",
+            why.as_deref()
+                .unwrap_or("the hardware backend did not start")
+        );
+        return Ok((None, why));
+    }
+    let initial = gpu.take_hardware_updates().into_iter().next();
+    prepare(&mut gpu, plan);
+    gpu.set_flush_scene_updates(!args.diag.no_flush);
+    let primary = run_mode(
+        &mut gpu,
+        &mut flight,
+        &plan.path,
+        plan.primary,
+        Mode::Primary,
+        budgets,
+        None,
+    )?;
+    let edits = if plan.patch {
+        None
+    } else {
+        eprintln!("rt: edits on the hardware backend...");
+        edits::run(&mut gpu, &mut flight, budgets)?
+    };
+    let accel = accel_report(initial.as_ref(), &flight, edits.as_ref());
+    let comparison = Comparison::new(
+        BackendTimes::of("compute", compute),
+        BackendTimes::of("hw", &primary),
+        accel,
+        edits,
+    );
+    Ok((Some(comparison), None))
+}
+
 /// The streaming mode (see [`stream`]): the test Planet streamed in, stepped, and drawn on a GPU of
 /// its own, which is the one thing in the report that is timed.
 fn run_streaming(
@@ -487,6 +596,9 @@ struct Flight {
     store: Option<BrickStore>,
     /// What `--diag` asked for.
     diag: Diag,
+    /// The updates of the hardware backend's acceleration structures that following the camera
+    /// made, from every mode flown so far (empty on the compute backend).
+    accel: Vec<HwUpdate>,
 }
 
 impl Flight {
@@ -605,6 +717,7 @@ fn run_mode(
         }
     }
 
+    flight.accel.extend(gpu.take_hardware_updates());
     let timings = gpu.timings();
     let passes: Vec<(String, &[f64])> = timings
         .passes()

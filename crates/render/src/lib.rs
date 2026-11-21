@@ -26,6 +26,7 @@ pub mod cpu;
 mod debug_view;
 pub mod emitters;
 mod gpu_materials;
+pub mod hw;
 pub mod lod;
 pub mod look;
 mod offscreen;
@@ -48,6 +49,7 @@ use std::error::Error;
 
 pub use camera::Camera;
 pub use debug_view::DebugView;
+pub use hw::HwUpdate;
 pub use look::Look;
 pub use offscreen::{DrawTimes, FrameDrawn, GpuInfo, GpuPasses, Image, Offscreen, UpdateTimes};
 pub use post::{NormalBias, Stages, ToneCurve};
@@ -91,6 +93,63 @@ fn shared_instance() -> &'static wgpu::Instance {
     INSTANCE.get_or_init(create_instance)
 }
 
+/// How rays find the Planet's bricks (#50): the compute-shader DDA, which is the default, the
+/// fallback and the CPU-checkable reference; or hardware ray queries over the bricks' boxes
+/// ([`hw`]), which need an adapter with `EXPERIMENTAL_RAY_QUERY`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RtBackend {
+    #[default]
+    Compute,
+    Hardware,
+}
+
+impl RtBackend {
+    pub fn name(self) -> &'static str {
+        match self {
+            RtBackend::Compute => "compute",
+            RtBackend::Hardware => "hw",
+        }
+    }
+}
+
+/// What was asked for and what runs: the hardware backend is chosen only if the adapter can do ray
+/// queries, and anything else runs the compute path with no error, `fallback` saying why.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RtChoice {
+    pub requested: RtBackend,
+    pub active: RtBackend,
+    pub fallback: Option<String>,
+}
+
+/// The backend to run for a request, on an adapter with `features` and `limits`.
+pub fn choose_backend(
+    requested: RtBackend,
+    features: wgpu::Features,
+    limits: &wgpu::Limits,
+) -> RtChoice {
+    let fallback = match requested {
+        RtBackend::Compute => None,
+        RtBackend::Hardware if !features.contains(wgpu::Features::EXPERIMENTAL_RAY_QUERY) => {
+            Some("the adapter has no ray queries (EXPERIMENTAL_RAY_QUERY)".to_string())
+        }
+        RtBackend::Hardware
+            if limits.max_blas_primitive_count == 0 || limits.max_tlas_instance_count == 0 =>
+        {
+            Some("the adapter's acceleration structure limits are 0".to_string())
+        }
+        RtBackend::Hardware => None,
+    };
+    RtChoice {
+        requested,
+        active: if requested == RtBackend::Hardware && fallback.is_none() {
+            RtBackend::Hardware
+        } else {
+            RtBackend::Compute
+        },
+        fallback,
+    }
+}
+
 /// Requests a device on a Vulkan adapter, presentable to `surface` if one is given. With
 /// `timers`, it has timestamp queries if the adapter does.
 fn request_gpu(
@@ -98,11 +157,25 @@ fn request_gpu(
     surface: Option<&wgpu::Surface<'_>>,
     timers: bool,
 ) -> Result<(wgpu::Adapter, wgpu::Device, wgpu::Queue)> {
+    let (adapter, device, queue, _) =
+        request_gpu_for(instance, surface, timers, RtBackend::Compute)?;
+    Ok((adapter, device, queue))
+}
+
+/// [`request_gpu`] for a backend: with `RtBackend::Hardware`, a device with ray queries if the
+/// adapter has them, and the choice made (see [`choose_backend`]).
+fn request_gpu_for(
+    instance: &wgpu::Instance,
+    surface: Option<&wgpu::Surface<'_>>,
+    timers: bool,
+    backend: RtBackend,
+) -> Result<(wgpu::Adapter, wgpu::Device, wgpu::Queue, RtChoice)> {
     let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
         power_preference: wgpu::PowerPreference::HighPerformance,
         compatible_surface: surface,
         ..Default::default()
     }))?;
+    let choice = choose_backend(backend, adapter.features(), &adapter.limits());
     let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
         label: Some("bhayanak device"),
         // Pass timers, where the adapter has them; without them the timers read "n/a".
@@ -110,12 +183,24 @@ fn request_gpu(
             adapter.features() & profiler::FEATURES
         } else {
             wgpu::Features::empty()
+        } | if choice.active == RtBackend::Hardware {
+            wgpu::Features::EXPERIMENTAL_RAY_QUERY
+        } else {
+            wgpu::Features::empty()
         },
         // The Planet's bricks are one big storage buffer, well over the portable 128 MiB limit.
         required_limits: adapter.limits(),
+        experimental_features: if choice.active == RtBackend::Hardware {
+            // SAFETY: ray queries are experimental in wgpu 30 (ADR 0001): they may hit bugs of
+            // wgpu's that are undefined behaviour from safe code. Opted into only for the
+            // hardware backend, which is a spike (#50) and never the default.
+            unsafe { wgpu::ExperimentalFeatures::enabled() }
+        } else {
+            wgpu::ExperimentalFeatures::disabled()
+        },
         ..Default::default()
     }))?;
-    Ok((adapter, device, queue))
+    Ok((adapter, device, queue, choice))
 }
 
 /// Submits `encoder` and returns the first `size` bytes of `staging`, a `MAP_READ` buffer that
