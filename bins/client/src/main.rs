@@ -678,9 +678,11 @@ struct App {
     dig_seconds: f64,
     /// Whether `Alt` is held, which makes the wheel size the Brush.
     alt: bool,
-    /// The world clock (#203) and the rule that stops it while the camera is still: the key is the
-    /// camera's view without the sun (the camera, the LOD bias, the Edits made).
-    day: DayClock<(Camera, f32, u64)>,
+    /// The world clock (#203), which always runs, and the hold of the sky it shows while the
+    /// Reference view accumulates a Still view. The key is the view's without the sun: the camera,
+    /// the LOD bias, the Edits made and the reference image's size (what the scene's key has, so
+    /// the sky is held for exactly as long as the Reference view of it is).
+    day: DayClock<(Camera, f32, u64, (u32, u32))>,
     /// The LOD bias in use: output pixels one Voxel may cover. The overlay changes it.
     bias: f32,
     /// How long the view the reference image is of (and the bias) has been still, and with no
@@ -1095,9 +1097,13 @@ impl App {
     fn step_day(&mut self, seconds: f64) {
         let edits = self.world.as_ref().map_or(0, World::edits_made);
         let mode = self.renderer.as_ref().map_or(Mode::Primary, Renderer::mode);
+        let size = self
+            .renderer
+            .as_ref()
+            .map_or((0, 0), Renderer::reference_size);
         let drive = self
             .day
-            .frame(seconds, (self.camera, self.bias, edits), mode);
+            .frame(seconds, (self.camera, self.bias, edits, size), mode);
         if let Some(renderer) = &mut self.renderer {
             renderer.set_day_sky(drive.sky, drive.jumped);
         }

@@ -81,7 +81,7 @@ The time of day of the Planet: a fraction of the day (0 midnight, 0.25 sunrise, 
 _Avoid_: Game time, sun position
 
 **Moon**:
-A dim, cool directional light and a soft disc in the sky at night, opposite the sun and a little behind it in phase. It is the one shadowed **key light** while the sun is down (the sun while it is up, whichever is stronger; the one going out fades to nothing before the other takes over, so the shadows turn while there is no key light), so it costs no second shadow ray. Not physical: the hero look over physical blue (#203).
+A dim, cool directional light and a soft disc in the sky at night, opposite the sun and a little behind it in phase. It is the one shadowed **key light** when it is stronger than the sun at the camera (not simply when the sun is down: at dusk it takes over while the sun is still about a degree up). The one going out fades to nothing before the other takes over, so the shadows turn while there is no key light; the fade dims a low moon (under about 4.7 degrees) too, so there is effectively no key light for the last part of the night before dawn (about t = 0.20 to 0.25), and the sky and the cache light the ground then. It costs no second shadow ray. Not physical: the hero look over physical blue (#203).
 
 **Still**:
 The camera, the sun and the window have not changed for 2 frames and no Edit has happened. The Reference view is shown only while the view is Still, and after a flight only once the scene has caught up with the camera; any change cuts to the Primary view at once and the Reference view starts again from sample 0.

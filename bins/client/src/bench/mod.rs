@@ -992,7 +992,6 @@ fn write_png(path: &Path, image: &Image) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-/// The report in brief, for whoever is watching the run.
 /// The day cycle's lines (#203).
 fn print_day_cycle(d: &daycycle::DayCycleReport) {
     let (e, fixed) = (&d.exposure, &d.exposure_fixed_camera);
@@ -1033,6 +1032,7 @@ fn print_day_cycle(d: &daycycle::DayCycleReport) {
     }
 }
 
+/// The report in brief, for whoever is watching the run.
 fn print_summary(report: &Report) {
     let ms = |v: Option<f64>| v.map_or("n/a".to_string(), |v| format!("{v:.3}"));
     if !report.config.diag.is_empty() {

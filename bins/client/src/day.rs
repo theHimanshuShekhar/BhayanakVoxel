@@ -7,9 +7,10 @@
 //! when the camera, the sun and the window have not changed for 2 frames (ADR 0005), and the
 //! Reference view accumulates while it is, which a sun that moves every frame would stop. So the
 //! shown sky is **held while the Reference view is accumulating a Still view**: the same gate as
-//! the scene's hold ([`loading_paused_for`]: the mode is Reference and the camera, the bias and
-//! the Edits have not changed for [`STILL_FRAMES`] frames). In Primary, and in Reference while the
-//! camera moves, the shown sky is the clock's, frame by frame.
+//! the scene's hold ([`loading_paused_for`]: the mode is Reference and the camera, the bias, the
+//! Edits and the reference image's size have not changed for [`STILL_FRAMES`] frames; the key is
+//! the scene's without the sun). In Primary, and in Reference while the camera moves, the shown
+//! sky is the clock's, frame by frame.
 //!
 //! When the view stops being Still the shown sky catches up with the clock in one step. It is a
 //! jump of the sun if it is more than [`render::daylight::JUMP_ANGLE`] away (the usual

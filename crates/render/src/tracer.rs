@@ -561,7 +561,8 @@ pub struct KeyLight {
 
 /// How far ahead of the other light (in luminance; the moon's on the ground is 0.006 to 0.01 and a
 /// low sun's a few hundredths at 0.8 degrees) a key light must be to be at its full radiance: the
-/// twilight window of the swap.
+/// twilight window of the swap. It is not limited to the swap: a low moon with the sun still down
+/// is dimmed by it too (the moon under about 4.7 degrees, before dawn), as a low sun is.
 pub const KEY_FADE: f32 = 0.006;
 
 fn smoothstep(x: f32) -> f32 {

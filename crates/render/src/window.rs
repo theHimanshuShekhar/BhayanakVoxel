@@ -324,6 +324,11 @@ impl Renderer {
         self.plan.samples()
     }
 
+    /// The size the reference image is traced at, which a resize changes (and so restarts it).
+    pub fn reference_size(&self) -> (u32, u32) {
+        self.target.reference_size()
+    }
+
     /// What the reference image would be of with the view from `camera`: it starts over when this
     /// changes (see [`View`]), so comparing it from frame to frame tells whether the view is still.
     pub fn view(&self, camera: &Camera) -> View {
