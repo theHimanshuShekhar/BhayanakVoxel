@@ -171,9 +171,11 @@ use super::stream::StreamReport;
 /// 33 (#236; 32 is #234's and #203's) keeps the hardware backend's acceleration structures in step
 /// off the frame thread: `rt.accel` gains `sweep` (the sweep's own updates, no longer counted as
 /// the flight's or its warm-up's), each update `pending` (groups waiting for their rebuild) and
-/// each summary `pending_max`; the streaming real-time run takes `--rt-backend` (`streaming_real_time.rt`:
+/// each summary `pending_max` and `updates_waiting` (the updates that left groups waiting); the streaming real-time run takes `--rt-backend` (`streaming_real_time.rt`:
 /// `requested`, `active`, `fallback`, `accel`; `both` also puts the hardware run in `rt.real_time_hw`);
-/// every `Spread` has `p95_ms`. The `prepare_ms`/`build_ms` of an update are the frame thread's cost
+/// every `Spread` has `p95_ms`; the real-time `frame_parts.update` counts the hardware
+/// backend's builds wherever they are encoded (also those of the draw), and an adapter that cannot
+/// run the hardware backend stops a real-time run that asked for it (an `error`, exit status 1). The `prepare_ms`/`build_ms` of an update are the frame thread's cost
 /// only; the GPU's own time is only in the Edit stress (it waits there).
 pub const SCHEMA_VERSION: u32 = 33;
 

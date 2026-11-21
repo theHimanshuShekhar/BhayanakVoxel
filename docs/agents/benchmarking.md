@@ -1551,8 +1551,11 @@ Edits). All are on the same GPU, driver and clocks. Read `rt.comparison`:
 - **The dirty groups are found on the scene thread** (ADR 0006), which already knows which
   regions it wrote: `Scene::write_region` notes each region it changes (`Patch::touched`), and
   `take_patch` maps them to groups with each group's box count (`RingPatch::groups`: a count of 0
-  means the group is gone). A patch of a move of the rings lists every group whose boxes moved.
-  Patches merge in the outbox like the rest (the later count wins). A rebuild of the whole scene
+  means the group is gone), and flags the groups that **may have gained** (`RingPatch::grown`: a
+  brick that is new, a brick with a Voxel where it had none, a region that is new: any box not
+  inside a box the group had; a dig that exposes interior bricks the scene did not list is one).
+  A patch of a move of the rings lists every group whose boxes moved. Patches merge in the outbox
+  like the rest (the later count wins, `grown` is the union). A rebuild of the whole scene
   (`Patched`/`Rebuilt` updates) restarts the backend: every group is made again.
 - **The boxes are made on the GPU** (`shaders/hw_boxes.wgsl`, `BoxPass`) from the occupancy masks
   that the scene's buffers already hold, into one pool buffer (`Pool`, a first-fit allocator that
@@ -1561,12 +1564,31 @@ Edits). All are on the same GPU, driver and clocks. Read `rt.comparison`:
   to the CPU's, box for box, so that compute and hardware keep the same boxes.
 - **Nothing waits**: the box pass, the BLAS builds and the TLAS build are submitted in queue order
   (wgpu-hal places the barriers between them). Each group has a stable TLAS instance slot.
-- **A budget** (`BUILD_BUDGET`, 2^18 boxes an update, like #145's upload budget) spreads the builds
-  over frames, the groups nearest the camera first (at least one a frame). **A group waiting for
-  its build keeps its old BLAS in the TLAS: there is never a hole**, and it shows the boxes it had
-  until its build is done (`pending` counts such groups). A jump or a rebuild builds every group in
-  one update: the GPU is busy ~100 ms then, and the frame thread's part is one scan of the groups.
-  Those updates are in `warmup`, `first_frame`, `sweep` or `settle`, not in `flight`.
+- **What waits, and what cannot.** A group waiting for its build keeps its old BLAS in the TLAS
+  and the shader reads the scene's current bricks through the old boxes. That is exact for a group
+  that **only lost** (every box it has now lies inside a box it had: a ray enters a box with
+  nothing in it any more and finds nothing, as the rebuilt group would, a few frames later), and
+  wrong for one that **gained**, since a ray cannot hit what no box covers: it would pass through
+  the new brick, or hit something farther. So a group that is in `RingPatch::grown`, or has no
+  BLAS yet, is built **in the frame it is listed in whatever the budget**. Only groups that only
+  lost wait; "never a hole" is true of those and of nothing else, and `pending` counts them.
+- **The budget** (`BUILD_BUDGET`, 2^18 boxes, like #145's upload budget) is **a frame's**, counted
+  over every build of the frame: the updates before the draw, and the first draw (`follow`, with
+  the profiler's frame count): a second view of a frame builds none of what may wait, and a
+  frame that has built nothing builds at least the nearest group. The groups that may wait are
+  built nearest the camera first; one that has waited `MAX_WAIT_FRAMES` (30, about half a
+  second) frames is built whatever the budget, so that a far group is not left behind for ever.
+  The groups that may not wait come first and are in the count, so a frame that gained more than
+  the budget has the cost of it: it is the number to look for in `scene_update_ms` on the 4090
+  (the ring move's leading face). A jump or a rebuild builds every group in one update: the GPU
+  is busy ~100 ms then, and the frame thread's part is one scan of the groups. Those updates
+  are in `warmup`, `first_frame`, `sweep` or `settle`, not in `flight`. The box pass dispatches
+  32768 jobs at a time, so a jump of any size cannot exceed a dimension of a dispatch.
+- **The frame's update counts every build**: `frame_parts.update` is the update's call and the
+  builds of the draw (those of `follow`, which are encoded in it; `DrawTimes::hardware`, taken
+  out of `encode`), so the "within 1.0 ms of compute" check is of all the hardware backend's work
+  on the frame thread. The log of the updates (`HwScene::take_log`) keeps the latest 4096 if
+  nobody takes it; the benches take it every frame.
 - The TLAS's frame moves with the camera (hysteresis of 1.5 snaps) in `HwScene::follow`, on the
   frame thread, as an update of the instances only, also with no wait.
 
@@ -1578,6 +1600,10 @@ the other on contexts of their own. The acceptance of #236 reads each path's `fr
 (`mean_ms` and `p95_ms`: **`Spread` has `p95_ms` since schema 33**) and `frame_time`: the hardware's
 update is to be within 1.0 ms of compute's at the mean and at p95, and every gate holds with
 `--rt-backend hw`. The summary prints "frame thread's scene update" under each path's mean frame.
+Each run's `accel` has `pending_max` and `updates_waiting` (the updates that left groups waiting)
+to say how much the budget held back. **A run asked for the hardware backend (`hw`, or the hardware
+half of `both`) on an adapter with no ray queries is an error** (`error` of that report, with the
+adapter's reason, exit status 1): its gates would be compute's, and say nothing of the backend.
 
 `--rt-backend hw` alone runs the whole bench (the flight, the sweep and the Edit stress) on the
 hardware backend: `rt.active` is `hw`, `rt.accel` has the same `initial`/`flight`/`sweep`/`edits`
@@ -1593,11 +1619,16 @@ with it is for the orchestrator's runs to show (`needs-benchmark`, `needs-stream
 
 **Tests.** `cargo test -p render --lib hw::` (CPU only: the tight boxes, the regular grouping, the
 groups a patch lists with their counts (an Edit, a coarse brick written in place, a move of the
-rings, merged patches), the box counts and the pool's allocator); `cargo test -p render --test
+rings, merged patches), which of them may wait (a dig of the surface only loses, a block placed or
+a dig into the interior gains, and every group that is not flagged has its new boxes inside the
+old), the box counts and the pool's allocator); `cargo test -p render --test
 hw_agreement -- --nocapture` (on a device: the choice of backend, the fallback through a device
 made without ray queries, the GPU's boxes against the CPU's box for box, an Edit's patch and
 agreement with compute at level 0 and at a coarse level, the rings moving with no group stale and
-no hole with the budget full and at 1, a waiting group, a jump, the TLAS's frame following the
+no hole with the budget full and at 1 (**at 1, hits are compared with compute's on every step
+while groups wait, ahead of the camera and behind it: no hit lost, none farther**), the budget
+being a frame's whatever its views, a group that waited too long, the box pass in many dispatches,
+the log's bound, the draw's builds counted as the hardware's, a waiting group, a jump, the TLAS's frame following the
 camera, the shadows of both variants against compute's, and the hits of both backends on 6000
 rays; those that need ray queries skip themselves, printing why, where there are none).
 
@@ -1649,7 +1680,8 @@ rays; those that need ray queries skip themselves, printing why, where there are
                            "error": { "run", "step", "message" } | null } | null,  // --real-time only
   "rt": { "requested": "compute" | "hw" | "both", "active": "compute" | "hw", "fallback": STRING | null,
           "accel": { "initial", "flight", "flight_frames", "warmup", "first_frame", "sweep",
-                     "settle", "noop_search_ms", "edits" } | null,   // active hw only
+                     "settle", "edits" } | null,   // active hw only; each part is a SUMMARY
+                                        // (with its own "noop_search_ms"), "flight_frames" a count
           "comparison": { "compute", "hw", "hw_nearest", "speedup", "hw_gpu_total_plus_accel_ms",
                          "compute_over_hw_with_accel", "hw_accel", "hw_edits" } | null,  // both only
           "real_time_hw": { ...the shape of streaming_real_time... } | null }  // both and --real-time only
@@ -1659,6 +1691,11 @@ rays; those that need ray queries skip themselves, printing why, where there are
 - `STATS` is `{ "samples", "mean_ms", "p95_ms", "max_ms" }`. The figures are `null` when there are
   no samples. `p95_ms` is the nearest rank. Times come from every sample the GPU timers recorded
   over the measured frames (`Timings::history()`), not from the overlay's rolling window.
+- `SUMMARY` (the hardware backend's updates of a stretch of a run; the parts of `rt.accel` and each
+  entry of `streaming_real_time.rt.accel`) is `{ "updates", "noop_updates", "blas_rebuilt",
+  "prims_rebuilt", "tlas_rebuilds", "blas_rebuilt_per_update_mean", "blas_rebuilt_per_update_max",
+  "pending_max", "updates_waiting", "prepare_ms": STATS, "build_ms": STATS, "total_ms": STATS,
+  "total_sum_ms", "noop_search_ms" }`; see "The hardware ray backend".
 - `ENTRY` is `STATS` plus `name`, `budget_ms` (null if the pass has none) and `status`:
   - `within`: the **mean** is at most the budget.
   - `over`: the mean is above it. This blocks the merge.

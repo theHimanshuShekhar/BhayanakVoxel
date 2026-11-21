@@ -191,7 +191,13 @@ fn the_anchor_is_the_snap_multiple_nearest_the_camera() {
 /// Rings of a patch of the test Planet around a camera 1565 Voxels up, and an Edit that places a
 /// block of Stone `size` Voxels each way on the ground at `(x, z)`: the scene before and after
 /// it, and the scene's patch of it.
-fn a_block_placed((x0, z0): (i32, i32), size: i32) -> (Scene, Scene, RingPatch) {
+fn a_block_placed(at: (i32, i32), size: i32) -> (Scene, Scene, RingPatch) {
+    an_edit(at, size, false)
+}
+
+/// As [`a_block_placed`], or with `dig` the same `size` of the ground dug out under where it
+/// would stand.
+fn an_edit((x0, z0): (i32, i32), size: i32, dig: bool) -> (Scene, Scene, RingPatch) {
     use crate::lod::Bands;
     use crate::scene::Bound;
     let mut store =
@@ -208,10 +214,15 @@ fn a_block_placed((x0, z0): (i32, i32), size: i32) -> (Scene, Scene, RingPatch) 
         .find(|&y| store.get(VoxelCoord([x0, y, z0])).is_some())
         .unwrap();
     let mut changed = BTreeSet::new();
+    let (low, fill) = if dig {
+        (top + 1 - size, None)
+    } else {
+        (top + 1, Some(STONE))
+    };
     for x in x0..x0 + size {
-        for y in top + 1..top + 1 + size {
+        for y in low..low + size {
             for z in z0..z0 + size {
-                store.set(VoxelCoord([x, y, z]), Some(STONE));
+                store.set(VoxelCoord([x, y, z]), fill);
                 changed.insert(VoxelCoord([x, y, z]).brick());
             }
         }
@@ -234,6 +245,28 @@ fn groups_that_differ(before: &Scene, after: &Scene) -> BTreeSet<GroupKey> {
             group_prims(before, level as usize, group) != group_prims(after, level as usize, group)
         })
         .collect()
+}
+
+/// What a group that is not in `patch.grown` must be: every box it has in `after` lies inside
+/// a box it had in `before`, so that the BLAS it had still covers all of it. The groups that
+/// are new are not asked for it (they are always built).
+fn assert_only_lost(before: &Scene, after: &Scene, patch: &RingPatch) -> usize {
+    let mut waiting = 0;
+    for &((level, group), _) in &patch.groups {
+        if patch.grown.contains(&(level, group)) {
+            continue;
+        }
+        let old = group_prims(before, level as usize, group);
+        for new in group_prims(after, level as usize, group) {
+            assert!(
+                old.iter()
+                    .any(|o| (0..3).all(|a| o.min[a] <= new.min[a] && o.max[a] >= new.max[a])),
+                "level {level} group {group:?}: the box {new:?} is in no box it had"
+            );
+        }
+        waiting += 1;
+    }
+    waiting
 }
 
 /// A patch's groups with the count each has in the scene it was made for.
@@ -271,6 +304,39 @@ fn an_edit_lists_only_the_groups_that_hold_the_regions_it_wrote_and_every_one_wh
         moved.is_subset(&groups),
         "moved {moved:?}, listed {groups:?}"
     );
+    // A block placed grows boxes: the group it is in is built at once (not allowed to wait), and
+    // the groups that do not grow only lost.
+    assert!(!patch.grown.is_empty(), "{patch:?}");
+    assert!(patch.grown.iter().all(|g| groups.contains(g)));
+    assert_only_lost(&before, &after, &patch);
+}
+
+#[test]
+fn digging_the_surface_only_loses_boxes_so_its_groups_may_wait_and_placing_makes_them_grow() {
+    for at in [(0, 0), (100, 100)] {
+        // A pit of two Voxels at the surface: the bricks that were listed read with fewer Voxels.
+        let (before, after, dug) = an_edit(at, 2, true);
+        let groups = listed(&after, &dug);
+        assert!(!groups.is_empty(), "nothing was dug at {at:?}");
+        assert!(
+            dug.grown.is_empty(),
+            "a dig lists a group as grown at {at:?}: {:?}",
+            dug.grown
+        );
+        assert_eq!(assert_only_lost(&before, &after, &dug), groups.len());
+        let (before, after, placed) = a_block_placed(at, 2);
+        assert!(!placed.grown.is_empty(), "no group grows at {at:?}");
+        assert_only_lost(&before, &after, &placed);
+    }
+}
+
+/// A dig that goes deep exposes bricks that the scene did not list (the interior is not): they
+/// are new boxes, and the group may not wait for them.
+#[test]
+fn a_dig_that_exposes_the_interior_lists_its_group_as_grown() {
+    let (before, after, dug) = an_edit((0, 0), 6, true);
+    assert!(!dug.grown.is_empty(), "{dug:?}");
+    assert_only_lost(&before, &after, &dug);
 }
 
 /// A mixed brick of a coarse level whose words are written in place: nothing of `regions`,
@@ -317,6 +383,7 @@ fn a_move_of_the_rings_lists_every_group_whose_boxes_moved_and_the_groups_it_emp
             continue;
         };
         let groups = listed(&scene, &patch);
+        assert_only_lost(&before, &scene, &patch);
         let moved = groups_that_differ(&before, &scene);
         assert!(
             moved.is_subset(&groups),
@@ -344,11 +411,15 @@ fn merged_patches_list_a_group_once_with_the_later_count() {
         groups: vec![(key, 5), ((1, [0; 3]), 9)],
         ..RingPatch::default()
     };
+    a.grown = vec![(1, [0; 3])];
     let b = RingPatch {
         groups: vec![(key, 7), ((0, [9, 9, 9]), 1)],
+        grown: vec![key, (1, [0; 3])],
         ..RingPatch::default()
     };
     a.merge(b);
+    // A group that grew in either is one that grew.
+    assert_eq!(a.grown, vec![key, (1, [0; 3])]);
     assert_eq!(
         a.groups,
         vec![(key, 7), ((0, [9, 9, 9]), 1), ((1, [0; 3]), 9)]

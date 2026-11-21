@@ -136,6 +136,11 @@ pub struct DrawTimes {
     /// Making the commands: the passes' encoding, the timer queries' resolving, and finishing the
     /// command buffer.
     pub encode: std::time::Duration,
+    /// How much of `encode` the hardware backend's acceleration structures took: the groups it
+    /// builds as the draw follows the camera (the box pass, the BLAS builds, the TLAS's build and
+    /// its submit), which the benchmark counts with the update of the scene, whichever call it
+    /// is made in. Zero on the compute backend.
+    pub hardware: std::time::Duration,
     /// `Queue::submit` of them.
     pub submit: std::time::Duration,
     /// Waiting for the GPU: the passes' times being read back, and then the device having nothing
@@ -250,6 +255,18 @@ impl Offscreen {
         self.tracer.settle_hardware(&self.device, &self.queue);
     }
 
+    /// Follows the camera at `position` as a draw of frame `frame` does (see
+    /// [`crate::hw::HwScene::follow`]): for tests that stand for the draws of a frame.
+    pub fn follow_hardware(&mut self, frame: Option<u64>, position: [f64; 3]) {
+        self.tracer
+            .follow_hardware(&self.device, &self.queue, frame, position);
+    }
+
+    /// Sets the frames a group of the hardware backend that only lost may wait for its build.
+    pub fn set_hardware_max_wait(&mut self, frames: u32) {
+        self.tracer.set_hardware_max_wait(frames);
+    }
+
     /// Sets the most boxes an update of the hardware backend builds.
     pub fn set_hardware_budget(&mut self, boxes: u64) {
         self.tracer.set_hardware_budget(boxes);
@@ -276,6 +293,16 @@ impl Offscreen {
     /// [`crate::hw::group_prims`].
     pub fn box_pass_boxes(&self, jobs: &[(u8, [i32; 3], u32)]) -> Vec<Vec<[u32; 8]>> {
         self.tracer.box_pass_boxes(&self.device, &self.queue, jobs)
+    }
+
+    /// [`Offscreen::box_pass_boxes`] with `chunk` jobs to a dispatch.
+    pub fn box_pass_boxes_chunked(
+        &self,
+        jobs: &[(u8, [i32; 3], u32)],
+        chunk: usize,
+    ) -> Vec<Vec<[u32; 8]>> {
+        self.tracer
+            .box_pass_boxes_chunked(&self.device, &self.queue, jobs, chunk)
     }
 
     /// Like [`Offscreen::with_resolution`], with the Reference view traced at the **output**
@@ -755,6 +782,8 @@ impl Offscreen {
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
         self.profiler.begin_frame();
+        // What the update before the draw cost is the update's: the draw's is what follows.
+        self.tracer.take_hardware_cost();
         self.tracer.encode_upscaled(
             &self.device,
             &self.queue,
@@ -764,6 +793,7 @@ impl Offscreen {
             &sun_for(self.local_sun, self.sun, camera),
             &self.target,
         );
+        let hardware = self.tracer.take_hardware_cost();
         self.profiler.resolve(&mut encoder);
         let commands = encoder.finish();
         let encoded = began.elapsed();
@@ -805,6 +835,7 @@ impl Offscreen {
         });
         self.last_draw = DrawTimes {
             encode: encoded,
+            hardware,
             submit: submitted - encoded,
             wait: waited,
             gpu,

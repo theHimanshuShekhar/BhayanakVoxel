@@ -503,6 +503,44 @@ fn disagreement(
     (hits, differing)
 }
 
+/// How the hardware backend's hits differ from a fresh compute backend's on `rays`: what the
+/// hardware does not hit that compute does (a hole), hits farther than compute (a hole that
+/// something behind fills), and any other difference (a different Voxel or Material, a nearer hit
+/// or a hit where compute has none).
+#[derive(Debug, Default, PartialEq)]
+struct Kinds {
+    hits: usize,
+    holes: usize,
+    farther: usize,
+    other: usize,
+}
+
+fn kinds_of_disagreement(
+    hw: &mut Offscreen,
+    compute: &mut Offscreen,
+    rays: &[render::reference::Ray],
+) -> Kinds {
+    let (a, b) = (hw.trace_rays(rays), compute.trace_rays(rays));
+    let mut kinds = Kinds {
+        hits: b.iter().flatten().count(),
+        ..Kinds::default()
+    };
+    for (h, c) in a.iter().zip(&b) {
+        match (h, c) {
+            (None, None) => {}
+            (None, Some(_)) => kinds.holes += 1,
+            (Some(h), Some(c)) if (h.voxel, h.material) == (c.voxel, c.material) => {
+                if (h.t - c.t).abs() > 1e-2 * (1.0 + c.t.abs()) {
+                    kinds.other += 1;
+                }
+            }
+            (Some(h), Some(c)) if h.t > c.t => kinds.farther += 1,
+            _ => kinds.other += 1,
+        }
+    }
+    kinds
+}
+
 /// Rays down at the ground of the test Planet's patch from `height` Voxels up, at a camera at `at`
 /// (x, z), with a spread of 60 Voxels.
 fn rays_down_from(at: [f64; 2], height: f64, seed: u32) -> Vec<render::reference::Ray> {
@@ -566,6 +604,7 @@ fn the_hardware_follows_the_rings_as_they_move_with_no_group_stale_and_no_hole()
         assert_not_stale("the first build", &hw, &scene);
         hw.set_hardware_budget(budget);
         let mut ever_pending = 0;
+        let mut waiting_at_a_trace = false;
         let mut patches = 0;
         for step in 1..=10 {
             let camera = [
@@ -600,11 +639,39 @@ fn the_hardware_follows_the_rings_as_they_move_with_no_group_stale_and_no_hole()
                 assert_eq!(hw.hardware_pending(), 0);
                 assert!(hits > 300, "step {step}: {hits} hits");
                 assert!(differing <= 1024 / 100, "step {step}: {differing} differ");
+            } else {
+                // No stale tracing while groups wait (#236): the hits are compute's where the
+                // camera is, ahead of it (where the rings gain bricks) and behind it (where they
+                // lose them), with nothing missed and nothing found farther. A ray that
+                // goes through the trace builds what is next in the queue first, as a draw does.
+                waiting_at_a_trace |= hw.hardware_pending() > 0;
+                let mut compute = Offscreen::new(8, 8, &scene).unwrap();
+                for (n, at) in [[0.0, 0.0], [90.0, 60.0], [-90.0, -60.0], [0.0, 120.0]]
+                    .into_iter()
+                    .enumerate()
+                {
+                    let kinds = kinds_of_disagreement(
+                        &mut hw,
+                        &mut compute,
+                        &rays_down_from([camera[0] + at[0], camera[2] + at[1]], 65.0, 7 + n as u32),
+                    );
+                    assert_eq!(
+                        (kinds.holes, kinds.farther),
+                        (0, 0),
+                        "step {step}, rays at {at:?}: {kinds:?}, {} groups wait",
+                        hw.hardware_pending()
+                    );
+                    assert!(
+                        kinds.other <= 1024 / 100,
+                        "step {step}, rays at {at:?}: {kinds:?}"
+                    );
+                }
             }
         }
         assert!(patches >= 3, "the rings moved {patches} times");
         if budget == 1 {
             assert!(ever_pending > 0, "a budget of one box left nothing waiting");
+            assert!(waiting_at_a_trace, "no group waited at a trace");
         }
         // Built to the end of the queue: not stale.
         hw.settle_hardware();
@@ -741,4 +808,145 @@ fn the_tlas_frame_moves_with_the_camera_and_the_hits_stay_compute_s() {
     );
     assert!(moves.iter().all(|u| u.blas_rebuilt == 0), "{moves:?}");
     assert_not_stale("after the frame moved", &hw, &scene);
+}
+
+/// The box pass dispatches a chunk of jobs at a time (a dimension of a dispatch is 65535 and a jump
+/// has a job for every group of the Planet): the boxes are the same whatever the chunk, so
+/// that a jump of any size makes the CPU's boxes and cannot panic the frame thread.
+#[test]
+fn the_box_pass_makes_the_same_boxes_in_one_dispatch_or_in_many() {
+    let (_, scene) = walking_scene();
+    let counts = group_counts(&scene);
+    let once: Vec<(u8, [i32; 3], u32)> = counts.iter().map(|(&(l, g), &n)| (l, g, n)).collect();
+    // The groups three times over (a chunk is at least 8 jobs: 256 bytes of them).
+    let jobs: Vec<_> = (0..3).flat_map(|_| once.clone()).collect();
+    assert!(jobs.len() > 16, "{} jobs", jobs.len());
+    let gpu = Offscreen::new(8, 8, &scene).unwrap();
+    let whole = gpu.box_pass_boxes(&jobs);
+    let in_chunks = gpu.box_pass_boxes_chunked(&jobs, 8);
+    assert_eq!(whole, in_chunks);
+    assert!(whole.iter().map(Vec::len).sum::<usize>() > 1000);
+    assert_eq!(whole[..once.len()], whole[once.len()..2 * once.len()]);
+}
+
+/// The budget is a frame's, not a draw's: the draws of one frame (the views of a window's frame)
+/// have one build of what waits between them, a frame after it another, and what has waited
+/// `max_wait` frames is built whatever the budget.
+#[test]
+fn the_build_budget_is_a_frames_whatever_its_views_and_what_waits_too_long_is_built() {
+    let (store, mut scene) = walking_scene();
+    let mut hw =
+        Offscreen::with_backend(Resolution::native(8, 8), &scene, RtBackend::Hardware).unwrap();
+    if hw.rt().active != RtBackend::Hardware {
+        eprintln!("skipped: {:?}", hw.rt().fallback);
+        return;
+    }
+    hw.set_hardware_budget(1);
+    hw.set_hardware_max_wait(100);
+    // Moves, with no draw between them, until several groups wait.
+    let mut camera = [-60.0, 1565.0, -60.0];
+    for step in 1..=10 {
+        camera = [
+            -60.0 + f64::from(step) * 14.0,
+            1565.0,
+            -60.0 + f64::from(step) * 9.0,
+        ];
+        if let Some(update) = scene.recentre(&store, camera).unwrap() {
+            hw.update_scene(&scene, &update).unwrap();
+        }
+    }
+    let waiting = hw.hardware_pending();
+    assert!(waiting >= 4, "{waiting} groups wait");
+    // The frame the moves were in is closed by its draw, which has the budget its updates left.
+    hw.follow_hardware(Some(0), camera);
+    let waiting = hw.hardware_pending();
+    hw.take_hardware_updates();
+    // Frame 1: two views. The first has what the budget leaves (one group, which the frame has not
+    // yet had); the second has none.
+    hw.follow_hardware(Some(1), camera);
+    let after_first = hw.hardware_pending();
+    hw.follow_hardware(Some(1), camera);
+    let rebuilt: u32 = hw
+        .take_hardware_updates()
+        .iter()
+        .map(|u| u.blas_rebuilt)
+        .sum();
+    assert_eq!(
+        (after_first, hw.hardware_pending(), rebuilt),
+        (waiting - 1, waiting - 1, 1),
+        "two views of one frame built more than one group of {waiting}"
+    );
+    // Frame 2: one more.
+    hw.follow_hardware(Some(2), camera);
+    hw.follow_hardware(Some(2), camera);
+    assert_eq!(hw.hardware_pending(), waiting - 2);
+    // Frame 3: what is left has waited 3 frames (0 to 2), which is as long as it may: all of it is
+    // built, whatever the budget.
+    hw.set_hardware_max_wait(3);
+    hw.follow_hardware(Some(3), camera);
+    assert_eq!(hw.hardware_pending(), 0, "a group that waited stayed");
+    assert_not_stale("after the aged groups", &hw, &scene);
+}
+
+/// A log nobody takes (the window client never does) does not grow without end.
+#[test]
+fn the_log_of_updates_keeps_the_latest_few_thousand_when_nobody_takes_it() {
+    let (_, scene) = walking_scene();
+    let mut hw =
+        Offscreen::with_backend(Resolution::native(8, 8), &scene, RtBackend::Hardware).unwrap();
+    if hw.rt().active != RtBackend::Hardware {
+        eprintln!("skipped: {:?}", hw.rt().fallback);
+        return;
+    }
+    let nothing = render::SceneUpdate::Rings(render::RingPatch::default());
+    for _ in 0..render::hw::LOG_LIMIT + 50 {
+        hw.update_scene(&scene, &nothing).unwrap();
+    }
+    assert_eq!(hw.take_hardware_updates().len(), render::hw::LOG_LIMIT);
+    assert!(hw.take_hardware_updates().is_empty());
+}
+
+/// The builds of a draw that follows the camera are counted as the hardware backend's (the bench
+/// takes them out of the encode and puts them in the frame's update, #236): a draw that builds a
+/// group that waited has `DrawTimes::hardware` of the time that took, inside `encode`; one that
+/// builds nothing has none.
+#[test]
+fn a_draw_that_builds_a_group_that_waited_counts_it_as_the_hardwares() {
+    let (store, mut scene) = walking_scene();
+    let mut hw =
+        Offscreen::with_backend(Resolution::native(32, 18), &scene, RtBackend::Hardware).unwrap();
+    if hw.rt().active != RtBackend::Hardware {
+        eprintln!("skipped: {:?}", hw.rt().fallback);
+        return;
+    }
+    hw.set_hardware_budget(1);
+    let mut camera = [-60.0, 1565.0, -60.0];
+    for step in 1..=10 {
+        camera = [
+            -60.0 + f64::from(step) * 14.0,
+            1565.0,
+            -60.0 + f64::from(step) * 9.0,
+        ];
+        if let Some(update) = scene.recentre(&store, camera).unwrap() {
+            hw.update_scene(&scene, &update).unwrap();
+        }
+    }
+    assert!(hw.hardware_pending() > 0);
+    let looking = render::Camera::looking_at(camera, [camera[0], 1500.0, camera[2] + 100.0]);
+    hw.take_hardware_updates();
+    // Frame 1 closes the frame of the moves; frame 2 builds one group that waited.
+    hw.draw_upscaled_timed(&looking);
+    hw.draw_upscaled_timed(&looking);
+    let drawn = hw.last_draw_times();
+    assert!(
+        drawn.hardware > std::time::Duration::ZERO && drawn.hardware <= drawn.encode,
+        "{drawn:?}"
+    );
+    hw.settle_hardware();
+    hw.draw_upscaled_timed(&looking);
+    assert_eq!(
+        hw.last_draw_times().hardware,
+        std::time::Duration::ZERO,
+        "a draw that builds nothing"
+    );
 }

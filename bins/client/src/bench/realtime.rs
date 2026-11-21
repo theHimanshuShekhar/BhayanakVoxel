@@ -187,17 +187,34 @@ pub struct GpuFrame {
     /// that were copied. Zero if no buffer grew.
     pub grow: Duration,
     pub grown_bytes: u64,
+    /// What the hardware backend's acceleration structures took in the frame outside the update's
+    /// call: the groups built as the draw followed the camera (#236). It is not in `encode`, and
+    /// the frame's update is `write + flush + hardware`, wherever the builds were encoded.
+    pub hardware: Duration,
 }
 
 impl GpuFrame {
     /// The CPU's part: all but the wait.
     fn cpu(&self) -> Duration {
-        self.write + self.flush + self.encode + self.submit
+        self.write + self.flush + self.hardware + self.encode + self.submit
     }
 }
 
-/// The offscreen GPU of the bench.
-pub struct OffscreenGpu<'a>(pub &'a mut Offscreen);
+/// The offscreen GPU of the bench, and the updates of the hardware backend's acceleration
+/// structures that it has taken from the GPU (every frame: the GPU keeps a few thousand).
+pub struct OffscreenGpu<'a> {
+    pub gpu: &'a mut Offscreen,
+    pub accel: Vec<render::HwUpdate>,
+}
+
+impl<'a> OffscreenGpu<'a> {
+    pub fn new(gpu: &'a mut Offscreen) -> Self {
+        Self {
+            gpu,
+            accel: Vec::new(),
+        }
+    }
+}
 
 impl Gpu for OffscreenGpu<'_> {
     fn frame(
@@ -208,33 +225,37 @@ impl Gpu for OffscreenGpu<'_> {
     ) -> Result<GpuFrame, Box<dyn Error>> {
         let mut frame = GpuFrame::default();
         if let Some(update) = update {
-            self.0.update_scene(scene, update)?;
-            let times = self.0.last_update_times();
+            self.gpu.update_scene(scene, update)?;
+            let times = self.gpu.last_update_times();
             frame.write = times.write;
             frame.flush = times.flush;
             frame.writes = times.writes;
-            frame.grow = self.0.last_grow_time();
-            frame.grown_bytes = self.0.last_grown_bytes();
+            frame.grow = self.gpu.last_grow_time();
+            frame.grown_bytes = self.gpu.last_grown_bytes();
         }
-        self.0.draw_upscaled_timed(camera);
-        let drawn = self.0.last_draw_times();
-        frame.encode = drawn.encode;
+        self.gpu.draw_upscaled_timed(camera);
+        let drawn = self.gpu.last_draw_times();
+        // The groups the draw built as it followed the camera are the frame's update, as the
+        // ones of the update's own call are (#236): out of the encode, into `hardware`.
+        frame.hardware = drawn.hardware;
+        frame.encode = drawn.encode.saturating_sub(drawn.hardware);
         frame.submit = drawn.submit;
         frame.wait = drawn.wait;
         frame.passes = drawn.gpu;
+        self.accel.extend(self.gpu.take_hardware_updates());
         Ok(frame)
     }
 
     fn peak_growth_bytes(&self) -> u64 {
-        self.0.peak_growth_bytes()
+        self.gpu.peak_growth_bytes()
     }
 
     fn pass_times(&self) -> Vec<(String, f64)> {
-        self.0.last_draw_pass_times().to_vec()
+        self.gpu.last_draw_pass_times().to_vec()
     }
 
     fn peak_rebuild_bytes(&self) -> u64 {
-        self.0.peak_rebuild_bytes()
+        self.gpu.peak_rebuild_bytes()
     }
 }
 
@@ -2209,7 +2230,7 @@ impl<'a> Session<'a> {
             cpu_ms: ms(followed + gpu.cpu()),
             camera_ms: ms(camera_wait),
             recentre_ms: ms(followed),
-            update_ms: ms(gpu.write + gpu.flush),
+            update_ms: ms(gpu.write + gpu.flush + gpu.hardware),
             update_write_ms: ms(gpu.write),
             update_flush_ms: ms(gpu.flush),
             writes: gpu.writes,
@@ -3041,6 +3062,21 @@ fn whole_run(
     })
 }
 
+/// Whether the GPU context is on the backend that the run asked for. The hardware backend with no
+/// ray queries on the adapter would run on compute, and its gates would pass for the wrong thing:
+/// that is an error, and the reason is the adapter's.
+fn ran_as_asked(asked: RtBackend, choice: &RtChoice) -> Result<(), String> {
+    if asked.is_hardware() && !choice.active.is_hardware() {
+        return Err(format!(
+            "--rt-backend {} was asked for, and the adapter cannot do it ({}): this would be a \
+             compute run, and its gates would say nothing of the hardware backend",
+            backend_name(asked),
+            choice.fallback.as_deref().unwrap_or("no reason given")
+        ));
+    }
+    Ok(())
+}
+
 fn run_once(
     full: bool,
     run: u32,
@@ -3061,9 +3097,9 @@ fn run_once(
     let mut gpu = Offscreen::with_backend(resolution, built.world.scene(), backend)
         .map_err(|e| failed("making the GPU context", e))?;
     let choice = gpu.rt().clone();
-    if let Some(why) = &choice.fallback {
-        eprintln!("warning: --rt-backend: {why}; this run is a compute run");
-    }
+    // A run that was asked to be on the hardware backend and is not has gates that say nothing of
+    // it: it stops here, with the reason, and the mode exits with an error (status 1).
+    ran_as_asked(backend, &choice).map_err(|why| failed("making the GPU context", why.into()))?;
     // The first build is the world's, not the run's: the log is of what the run did.
     gpu.take_hardware_updates();
     gpu.set_flat_ambient(flat_ambient);
@@ -3075,12 +3111,13 @@ fn run_once(
     }));
     // A growth is cut to what a buffer of this GPU may hold (see `Scene::set_buffer_limit`).
     built.world.set_buffer_limit(gpu.buffer_limit_words());
-    let report = one_run(built, &mut OffscreenGpu(&mut gpu), script, limit_ms)
+    let mut gpu = OffscreenGpu::new(&mut gpu);
+    let report = one_run(built, &mut gpu, script, limit_ms)
         .map_err(|stopped| failed(&stopped.step, stopped.error))?;
     let accel = choice
         .active
         .is_hardware()
-        .then(|| AccelSummary::of(&gpu.take_hardware_updates()));
+        .then(|| AccelSummary::of(&gpu.accel));
     Ok((report, d0, choice, accel))
 }
 
@@ -4153,6 +4190,24 @@ mod tests {
     }
 
     #[test]
+    fn a_run_asked_for_the_hardware_backend_on_an_adapter_without_it_is_an_error() {
+        let choice = |active, fallback: Option<&str>| RtChoice {
+            requested: RtBackend::Hardware,
+            active,
+            fallback: fallback.map(str::to_string),
+        };
+        assert!(ran_as_asked(RtBackend::Hardware, &choice(RtBackend::Hardware, None)).is_ok());
+        let no_queries = choice(RtBackend::Compute, Some("the adapter has no ray queries"));
+        let why = ran_as_asked(RtBackend::Hardware, &no_queries).unwrap_err();
+        assert!(
+            why.contains("no ray queries") && why.contains("hw"),
+            "{why}"
+        );
+        // Compute asked for, compute run: nothing to say.
+        assert!(ran_as_asked(RtBackend::Compute, &choice(RtBackend::Compute, None)).is_ok());
+    }
+
+    #[test]
     fn a_gpu_frames_cpu_part_is_all_but_the_wait() {
         let ms = Duration::from_millis;
         let frame = GpuFrame {
@@ -4165,9 +4220,11 @@ mod tests {
             passes: None,
             grow: ms(50),
             grown_bytes: 1 << 20,
+            hardware: ms(16),
         };
-        // The growth is inside the write: it is not another part of the CPU's time.
-        assert_eq!(frame.cpu(), ms(15));
+        // The growth is inside the write: it is not another part of the CPU's time. The hardware
+        // backend's builds are (outside the encode they were measured in).
+        assert_eq!(frame.cpu(), ms(31));
         assert_eq!(GpuFrame::default().cpu(), Duration::ZERO);
     }
 

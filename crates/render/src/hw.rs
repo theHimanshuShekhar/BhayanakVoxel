@@ -37,18 +37,23 @@
 //!   recorded and submitted, in the order of the queue, after the scene's own upload and before
 //!   the frame that traces: wgpu makes the barriers between them. A box is never written while a
 //!   frame that was submitted earlier reads it, for the same reason.
-//! * **Builds are budgeted** ([`BUILD_BUDGET`] boxes a frame): the groups to build again wait in a
-//!   queue, nearest the camera first (so an Edit, which is at the camera, is built the frame it
-//!   is made), and a group whose turn has not come keeps the BLAS it had in the TLAS, so there is
-//!   never a hole and never a half-built BLAS to trace. What it shows for a few frames is the
-//!   boxes it had; the words of the bricks are the scene's, as they are. A jump, which makes
+//! * **Builds are budgeted** ([`BUILD_BUDGET`] boxes a frame, counted over every build of the
+//!   frame, whichever draw or update makes it), but only for the groups that **only lost**
+//!   ([`RingPatch::grown`]): a group whose every box now lies inside a box it had may wait for
+//!   its turn, nearest the camera first, and then traces the BLAS it had, whose boxes cover
+//!   everything that is left of it: a ray enters a box that has nothing in it any more and
+//!   finds nothing there, which is what the group's own rebuild would do, a few frames later. A
+//!   group that **gained** (a brick that is new, a brick with a Voxel where it had none, a region
+//!   that is new) or that has no BLAS yet is built in the frame it is listed in, whatever the
+//!   budget, since a ray cannot hit what no box covers: that is the whole of "no hole". A group
+//!   that has waited [`MAX_WAIT_FRAMES`] frames is built whatever the budget. A jump, which makes
 //!   every group again, builds them all at once: there is nothing right to show until it has.
 //!
 //! What this does **not** do: the compute path's clip to the ball that has the Planet in it
 //! (nothing is outside it, so it only saves steps), compaction, or update-in-place of a BLAS (a
 //! group's BLAS is built again whole, from its new boxes).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::ops::Range;
 use std::time::{Duration, Instant};
 
@@ -65,14 +70,25 @@ pub const GROUP_REGIONS: i32 = 4;
 pub const GROUP_BRICKS: i32 = GROUP_REGIONS * REGION_BRICKS;
 /// The TLAS's origin is a multiple of this many Voxels of level 0, nearest to the camera.
 pub const ANCHOR_SNAP: i32 = 4096;
-/// How many boxes of BLASes an update builds at the most (and, in the frames that follow, a
-/// pump of the queue): at least the nearest group is always built. An update after a jump is not
-/// held to it. A first value: a build of 52 BLASes of the flight cost the GPU 1.3 ms (#236), so
-/// this is about the 1.5 ms of GPU time that no frame's patch has reached, and it is only a
-/// bound on a burst.
+/// How many boxes of BLASes a **frame** builds of the groups that may wait (see the module's
+/// notes), counted over every build of the frame; the groups that may not wait are built whatever
+/// it is, and a frame that has built nothing builds the nearest group of those that may. An
+/// update after a jump is not held to it. A first value: a build of 52 BLASes of the flight cost
+/// the GPU 1.3 ms (#236), so this is about the 1.5 ms of GPU time that no frame's patch has
+/// reached, and it is only a bound on a burst.
 pub const BUILD_BUDGET: u64 = 1 << 18;
 /// The bytes of a box in the pool, and the BLAS's stride: its corners and the two words.
 pub const BOX_BYTES: u64 = 32;
+/// The most frames a group that only lost waits for its build (about half a second at 60 a
+/// second): after that it is built whatever the budget, so that a group far from the camera is
+/// not left behind by the groups nearer it for ever.
+pub const MAX_WAIT_FRAMES: u32 = 30;
+/// The most updates the log keeps (the oldest go first) if nobody takes it: the window client never
+/// does, and the bench takes it every frame.
+pub const LOG_LIMIT: usize = 4096;
+/// Jobs of the box pass a dispatch has: a row of workgroups each, and the limit of a dimension of
+/// a dispatch is 65535. A chunk of jobs is bound at an offset of a multiple of 1 MiB.
+const JOB_CHUNK: usize = 32768;
 
 /// A BLAS: its level and the coordinate of its cube in the level's grid of groups.
 pub type GroupKey = (u8, [i32; 3]);
@@ -344,6 +360,8 @@ pub struct BoxPass {
     layout: wgpu::BindGroupLayout,
     jobs: wgpu::Buffer,
     jobs_capacity: usize,
+    /// Jobs to a dispatch ([`JOB_CHUNK`]).
+    chunk: usize,
 }
 
 impl BoxPass {
@@ -385,7 +403,15 @@ impl BoxPass {
             layout,
             jobs: Self::jobs_buffer(device, 16),
             jobs_capacity: 16,
+            chunk: JOB_CHUNK,
         }
+    }
+
+    /// Jobs to a dispatch, for a test that wants more dispatches than there are jobs to fill a
+    /// dimension of one (the offset of its bind group has to be a multiple
+    /// of 256 bytes), so a multiple of 8 jobs.
+    pub fn set_chunk(&mut self, jobs: usize) {
+        self.chunk = jobs.max(1);
     }
 
     fn jobs_buffer(device: &wgpu::Device, capacity: usize) -> wgpu::Buffer {
@@ -432,14 +458,6 @@ impl BoxPass {
             })
             .collect();
         queue.write_buffer(&self.jobs, 0, bytemuck::cast_slice(&words));
-        let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("hardware boxes"),
-            layout: &self.layout,
-            entries: &[
-                crate::tracer::buffer_entry(0, &self.jobs),
-                crate::tracer::buffer_entry(1, out),
-            ],
-        });
         // Untimed on purpose: it runs between frames, with the builds, and its cost is the update's
         // (the Edit stress waits for it), not a pass of the frame.
         let descriptor = wgpu::ComputePassDescriptor {
@@ -449,18 +467,32 @@ impl BoxPass {
         let mut pass = encoder.begin_compute_pass(&descriptor); // untimed
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, scene_group, &[]);
-        pass.set_bind_group(1, &group, &[]);
         // One row of workgroups a job, a workgroup a region of its group: 64. A frame's jobs are
-        // a few hundred at the most, a jump's all of the Planet's groups.
-        assert!(
-            jobs.len() <= device.limits().max_compute_workgroups_per_dimension as usize,
-            "more groups than rows of workgroups"
-        );
-        pass.dispatch_workgroups(
-            (GROUP_REGIONS * GROUP_REGIONS * GROUP_REGIONS) as u32,
-            jobs.len() as u32,
-            1,
-        );
+        // a few hundred at the most, a jump's all of the Planet's groups, which the dispatches
+        // of a chunk of jobs each (bound at its own offset) keep under the limit of a dimension.
+        for (n, chunk) in jobs.chunks(self.chunk).enumerate() {
+            let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("hardware boxes"),
+                layout: &self.layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                            buffer: &self.jobs,
+                            offset: (n * self.chunk) as u64 * 32,
+                            size: std::num::NonZeroU64::new(chunk.len() as u64 * 32),
+                        }),
+                    },
+                    crate::tracer::buffer_entry(1, out),
+                ],
+            });
+            pass.set_bind_group(1, &group, &[]);
+            pass.dispatch_workgroups(
+                (GROUP_REGIONS * GROUP_REGIONS * GROUP_REGIONS) as u32,
+                chunk.len() as u32,
+                1,
+            );
+        }
     }
 }
 
@@ -533,15 +565,35 @@ struct Group {
     slot: u32,
 }
 
+/// How much a call of `pump` may build of the groups that may wait.
+#[derive(Clone, Copy, Debug)]
+enum Limit {
+    /// All of them.
+    All,
+    /// Up to `left` boxes, and one group whatever its size if `at_least_one`.
+    Boxes { left: u64, at_least_one: bool },
+}
+
+/// A group that is stale and not yet built again.
+#[derive(Clone, Copy, Debug)]
+struct Wait {
+    /// How many boxes it has now (0: it is gone).
+    count: u32,
+    /// Whether it may not wait for the budget: it gained boxes (see [`RingPatch::grown`]), or it
+    /// has no BLAS to trace while it waits.
+    urgent: bool,
+    /// The frames it has waited.
+    waited: u32,
+}
+
 /// The acceleration structures of a scene, and what binds them for the shaders (group 2 of the
 /// hardware pipelines).
 pub struct HwScene {
     layout: wgpu::BindGroupLayout,
     boxes: BoxPass,
     groups: BTreeMap<GroupKey, Group>,
-    /// The groups that are stale and not yet built again, with how many boxes each has now (0: it
-    /// is gone).
-    pending: BTreeMap<GroupKey, u32>,
+    /// The groups that are stale and not yet built again.
+    pending: BTreeMap<GroupKey, Wait>,
     /// The boxes of every group, 8 words a box, a group's after another's.
     pool: Pool,
     pool_buffer: wgpu::Buffer,
@@ -566,10 +618,22 @@ pub struct HwScene {
     camera: [f64; 3],
     bind_group: wgpu::BindGroup,
     budget: u64,
+    /// The frames a group may wait ([`MAX_WAIT_FRAMES`]).
+    max_wait: u32,
+    /// The boxes and the groups built since the last frame's draw closed the frame: what the
+    /// budget of the frame has had of it, whichever update or draw built them.
+    spent: u64,
+    built: u32,
+    /// The frame whose draw last followed the camera, so that a draw after it in the same frame
+    /// (another view) has no budget of its own.
+    frame: Option<u64>,
     wait: bool,
     last: HwUpdate,
-    /// Every update since the log was last taken ([`HwScene::take_log`]), for the bench's totals.
-    log: Vec<HwUpdate>,
+    /// What the updates since [`HwScene::take_cost`] cost the frame thread, in all.
+    cost: Duration,
+    /// The updates since the log was last taken ([`HwScene::take_log`]), for the bench's totals: at
+    /// most [`LOG_LIMIT`], the oldest dropped.
+    log: VecDeque<HwUpdate>,
 }
 
 fn blas_descriptor(count: u32) -> wgpu::BlasAABBGeometrySizeDescriptor {
@@ -678,9 +742,14 @@ impl HwScene {
             camera: position,
             bind_group,
             budget: BUILD_BUDGET,
+            max_wait: MAX_WAIT_FRAMES,
+            spent: 0,
+            built: 0,
+            frame: None,
             wait: false,
             last: HwUpdate::default(),
-            log: Vec::new(),
+            cost: Duration::ZERO,
+            log: VecDeque::new(),
         };
         hw.update(device, queue, scene_group, scene, &SceneUpdate::Rebuilt);
         Ok(hw)
@@ -692,11 +761,21 @@ impl HwScene {
 
     /// Every update since the last call, oldest first (the first build is the first of them).
     pub fn take_log(&mut self) -> Vec<HwUpdate> {
-        std::mem::take(&mut self.log)
+        std::mem::take(&mut self.log).into()
+    }
+
+    /// What every update since the last call cost the frame thread (their `prepare` and `build`),
+    /// whichever call made them: [`HwScene::update`] or [`HwScene::follow`], which is in a draw.
+    pub fn take_cost(&mut self) -> Duration {
+        std::mem::take(&mut self.cost)
     }
 
     fn record(&mut self, update: HwUpdate) {
-        self.log.push(update.clone());
+        self.cost += update.prepare + update.build;
+        if self.log.len() >= LOG_LIMIT {
+            self.log.pop_front();
+        }
+        self.log.push_back(update.clone());
         self.last = update;
     }
 
@@ -713,6 +792,12 @@ impl HwScene {
     /// The most boxes an update builds (see [`BUILD_BUDGET`]), for tests that want a queue.
     pub fn set_budget(&mut self, boxes: u64) {
         self.budget = boxes;
+    }
+
+    /// The frames a group that only lost may wait for its build, for tests that want to see it
+    /// built for having waited ([`MAX_WAIT_FRAMES`]).
+    pub fn set_max_wait(&mut self, frames: u32) {
+        self.max_wait = frames;
     }
 
     /// Whether an update waits for the GPU to be done with it, so that its time is the builds'
@@ -790,7 +875,17 @@ impl HwScene {
         let started = Instant::now();
         let all = match update {
             SceneUpdate::Rings(patch) => {
-                self.pending.extend(patch.groups.iter().copied());
+                for &(key, count) in &patch.groups {
+                    let urgent = patch.grown.binary_search(&key).is_ok()
+                        || (count > 0 && !self.groups.contains_key(&key));
+                    let wait = self.pending.entry(key).or_insert(Wait {
+                        count,
+                        urgent,
+                        waited: 0,
+                    });
+                    wait.count = count;
+                    wait.urgent |= urgent;
+                }
                 false
             }
             _ => {
@@ -809,7 +904,17 @@ impl HwScene {
             });
             return;
         }
-        self.pump(device, queue, scene_group, started, all);
+        let limit = if all { Limit::All } else { self.left() };
+        self.pump(device, queue, scene_group, started, limit);
+    }
+
+    /// What of the frame's budget is left: the boxes, and whether the frame has built nothing yet
+    /// (so that it builds a group that is over the budget by itself).
+    fn left(&self) -> Limit {
+        Limit::Boxes {
+            left: self.budget.saturating_sub(self.spent),
+            at_least_one: self.built == 0,
+        }
     }
 
     /// Builds every group again after a jump or a scene made again: nothing that there was is
@@ -825,7 +930,19 @@ impl HwScene {
         self.next_slot = 0;
         self.slot_key.clear();
         self.table.clear();
-        self.pending = group_counts(scene).into_iter().collect();
+        self.pending = group_counts(scene)
+            .into_iter()
+            .map(|(key, count)| {
+                (
+                    key,
+                    Wait {
+                        count,
+                        urgent: true,
+                        waited: 0,
+                    },
+                )
+            })
+            .collect();
     }
 
     /// Gives back what the group `group` of `slot` held: its room in the pool.
@@ -845,15 +962,17 @@ impl HwScene {
             .sum()
     }
 
-    /// Builds the stale groups that the budget allows (all of them if `all`), and the TLAS.
+    /// Builds the stale groups that may not wait, and as many of the others as `limit` allows,
+    /// nearest the camera first, and the TLAS.
     fn pump(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         scene_group: &wgpu::BindGroup,
         started: Instant,
-        all: bool,
+        limit: Limit,
     ) {
+        let all = matches!(limit, Limit::All);
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("acceleration structures"),
         });
@@ -864,7 +983,7 @@ impl HwScene {
         let gone: Vec<GroupKey> = self
             .pending
             .iter()
-            .filter(|(_, count)| **count == 0)
+            .filter(|(_, wait)| wait.count == 0)
             .map(|(key, _)| *key)
             .collect();
         for key in gone {
@@ -876,19 +995,31 @@ impl HwScene {
                 touched.push(group.slot);
             }
         }
-        // The rest, nearest the camera first, until the budget is spent.
-        let mut order: Vec<(f64, GroupKey, u32)> = self
+        // The groups that may not wait come first, whatever the budget (and are in it); the rest,
+        // nearest the camera first, until what is left of it is spent. A group that has waited
+        // too long may not wait either.
+        let mut order: Vec<(bool, f64, GroupKey, u32)> = self
             .pending
             .iter()
-            .map(|(&key, &count)| (self.distance2(key), key, count))
+            .map(|(&key, wait)| {
+                let urgent =
+                    wait.urgent || wait.waited >= self.max_wait || !self.groups.contains_key(&key);
+                (!urgent, self.distance2(key), key, wait.count)
+            })
             .collect();
-        order.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
-        let budget = if all { u64::MAX } else { self.budget };
+        order.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.total_cmp(&b.1)).then(a.2.cmp(&b.2)));
+        let (mut left, at_least_one) = match limit {
+            Limit::All => (u64::MAX, false),
+            Limit::Boxes { left, at_least_one } => (left, at_least_one),
+        };
         let mut spent = 0u64;
         let mut jobs: Vec<BoxJob> = Vec::new();
-        for (_, key, count) in order {
-            if !jobs.is_empty() && spent + u64::from(count) > budget {
-                break;
+        for (may_wait, _, key, count) in order {
+            if may_wait {
+                if u64::from(count) > left && !(at_least_one && jobs.is_empty()) {
+                    break;
+                }
+                left = left.saturating_sub(u64::from(count));
             }
             spent += u64::from(count);
             self.pending.remove(&key);
@@ -942,6 +1073,13 @@ impl HwScene {
                 },
             );
         }
+        if jobs.is_empty() && touched.is_empty() && !self.tlas_stale {
+            // Everything that waits may wait (a second view of the frame, or a budget that is
+            // spent): nothing to build, and no TLAS build for nothing.
+            return;
+        }
+        self.spent += spent;
+        self.built += jobs.len() as u32;
         self.sync_instances(device, queue, touched);
         let prepare = started.elapsed();
         let submitting = Instant::now();
@@ -1113,13 +1251,29 @@ impl HwScene {
     /// Takes in the camera's position, from a frame that is about to draw: if it left the TLAS's
     /// frame, moves the frame (the instances' transforms change, the BLASes do not); and builds
     /// the next of the stale groups that wait for their turn. Nothing here waits for the GPU.
+    ///
+    /// `frame` says which frame the draw is of (the profiler's count of them), `None` for a draw
+    /// that is not a frame: the frame's budget is what [`HwScene::update`] and the first draw of
+    /// the frame have between them, so that a second view drawn in the frame builds nothing of
+    /// the groups that may wait, and it is the draw that closes the frame.
     pub fn follow(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         scene_group: &wgpu::BindGroup,
+        frame: Option<u64>,
         position: [f64; 3],
     ) {
+        let first_of_frame = frame.is_none() || self.frame != frame;
+        self.frame = frame;
+        let limit = if first_of_frame {
+            self.left()
+        } else {
+            Limit::Boxes {
+                left: 0,
+                at_least_one: false,
+            }
+        };
         self.camera = position;
         let anchor = anchor_for(position);
         // Hysteresis of a snap: within 1.5 snaps of the frame's origin is as good as at it.
@@ -1139,9 +1293,17 @@ impl HwScene {
             self.tlas_stale = true;
             let everyone: Vec<u32> = (0..self.next_slot).collect();
             self.sync_instances(device, queue, everyone);
-            self.pump(device, queue, scene_group, started, false);
+            self.pump(device, queue, scene_group, started, limit);
         } else if !self.pending.is_empty() {
-            self.pump(device, queue, scene_group, Instant::now(), false);
+            self.pump(device, queue, scene_group, Instant::now(), limit);
+        }
+        if first_of_frame {
+            // The frame is over: what it built is spent, and what still waits has waited a frame.
+            self.spent = 0;
+            self.built = 0;
+            for wait in self.pending.values_mut() {
+                wait.waited += 1;
+            }
         }
     }
 
@@ -1154,9 +1316,9 @@ impl HwScene {
         scene_group: &wgpu::BindGroup,
     ) {
         if !self.pending.is_empty() {
-            self.pump(device, queue, scene_group, Instant::now(), true);
+            self.pump(device, queue, scene_group, Instant::now(), Limit::All);
             // That was no jump: it says so in the log.
-            if let Some(last) = self.log.last_mut() {
+            if let Some(last) = self.log.back_mut() {
                 last.kind = "patch";
             }
             self.last.kind = "patch";

@@ -126,6 +126,9 @@ pub struct AccelSummary {
     /// The most groups that were stale and waiting for a later update's budget after one of the
     /// updates.
     pub pending_max: u32,
+    /// How many of the updates left groups waiting (the frames in which a group showed the boxes
+    /// it had, which only lost: see `RingPatch::grown`).
+    pub updates_waiting: u32,
     pub prepare_ms: Stats,
     pub build_ms: Stats,
     /// `prepare_ms` + `build_ms` of each update.
@@ -157,6 +160,7 @@ impl AccelSummary {
                 .then(|| per.iter().map(|&n| f64::from(n)).sum::<f64>() / per.len() as f64),
             blas_rebuilt_per_update_max: per.iter().copied().max(),
             pending_max: updates.iter().map(|u| u.pending).max().unwrap_or(0),
+            updates_waiting: updates.iter().filter(|u| u.pending > 0).count() as u32,
             prepare_ms: Stats::of(&done.iter().map(|u| ms(u.prepare)).collect::<Vec<_>>()),
             build_ms: Stats::of(&done.iter().map(|u| ms(u.build)).collect::<Vec<_>>()),
             total_ms: Stats::of(
@@ -386,6 +390,17 @@ mod tests {
             RtMode::HardwareNearest.main_backend(),
             RtBackend::HardwareNearest
         );
+    }
+
+    #[test]
+    fn a_summary_says_how_many_groups_waited_at_the_most_and_in_how_many_updates() {
+        let waiting = |n| HwUpdate {
+            pending: n,
+            ..update("patch", 1, 1)
+        };
+        let s = AccelSummary::of(&[waiting(0), waiting(3), waiting(5), waiting(0), waiting(1)]);
+        assert_eq!((s.pending_max, s.updates_waiting), (5, 3));
+        assert_eq!(AccelSummary::of(&[]).updates_waiting, 0);
     }
 
     #[test]

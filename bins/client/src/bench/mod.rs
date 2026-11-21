@@ -474,8 +474,22 @@ fn run(args: &Args) -> Result<u8, Box<dyn Error>> {
         .max(gi_code);
     // An error of the real-time mode is exit status 1, not 2 (a gate that is over): nothing says
     // whether its gates would have held.
+    // The hardware half of `--rt-backend both` is the same (an adapter with no ray queries stops it
+    // with its reason, #236: its gates would have been compute's).
+    let hw_error = report
+        .rt
+        .real_time_hw
+        .as_ref()
+        .and_then(|r| r.error.as_ref());
+    if let Some(e) = hw_error {
+        eprintln!(
+            "streaming (real time, hardware rays) stopped at `{}`: {}",
+            e.step, e.message
+        );
+    }
     let code = match &report.streaming_real_time {
         Some(r) if r.error.is_some() => 1,
+        _ if hw_error.is_some() => 1,
         _ => code,
     };
     if code != 0 {

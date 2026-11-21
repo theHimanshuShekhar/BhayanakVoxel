@@ -118,7 +118,9 @@ pub fn run(
     // What the flight did to the acceleration structures is not the Edits'.
     gpu.take_hardware_updates();
     // An update of the hardware backend's structures does not wait for the GPU, so that a frame
-    // never does; here it waits, so that the time of an Edit has the builds' own in it (#236).
+    // never does; here it waits, so that the time of an Edit has the builds' own in it (#236). The
+    // wait is for everything the queue holds, the previous frame's passes and the scene's own
+    // writes too: the Edit+BVH figure is an upper bound on the builds' cost, not their exact one.
     gpu.set_hardware_wait(true);
     for _ in 0..FRAMES {
         allowance.refill();

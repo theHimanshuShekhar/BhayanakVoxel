@@ -1439,7 +1439,12 @@ impl Tracer {
     ) {
         self.gi_frame += 1;
         self.camera_position = camera.position;
-        self.follow_hw(device, queue, camera.position);
+        self.follow_hw(
+            device,
+            queue,
+            Some(profiler.frames_begun()),
+            camera.position,
+        );
         self.write_uniforms(queue, camera, sun, (0, CENTRE, 0), 0);
         self.encode_atmosphere(
             device,
@@ -1508,7 +1513,12 @@ impl Tracer {
         frame.light_settling(self.edit_settling > 0);
         self.gi_frame += 1;
         self.camera_position = camera.position;
-        self.follow_hw(device, queue, camera.position);
+        self.follow_hw(
+            device,
+            queue,
+            Some(profiler.frames_begun()),
+            camera.position,
+        );
         self.write_uniforms(
             queue,
             camera,
@@ -1574,7 +1584,12 @@ impl Tracer {
         let samples = batch_of(samples, target.reference_size);
         let view = View::new(camera, sun, target);
         let first = self.accumulator.begin_batch(&view, samples);
-        self.follow_hw(device, queue, camera.position);
+        self.follow_hw(
+            device,
+            queue,
+            Some(profiler.frames_begun()),
+            camera.position,
+        );
         self.write_uniforms(queue, camera, sun, (first, CENTRE, samples), 0);
         self.encode_atmosphere(
             device,
@@ -1743,6 +1758,14 @@ impl Tracer {
             .map_or_else(Vec::new, |h| h.scene.take_log())
     }
 
+    /// What the updates of the hardware backend's acceleration structures since the last call cost
+    /// the frame thread, whichever call made them (zero on the compute backend).
+    pub fn take_hardware_cost(&mut self) -> std::time::Duration {
+        self.hw
+            .as_mut()
+            .map_or(std::time::Duration::ZERO, |h| h.scene.take_cost())
+    }
+
     /// How many groups of the hardware backend's acceleration structures are stale and wait for
     /// the budget of a later update (0 on the compute backend).
     pub fn hardware_pending(&self) -> usize {
@@ -1800,12 +1823,42 @@ impl Tracer {
         queue: &wgpu::Queue,
         jobs: &[(u8, [i32; 3], u32)],
     ) -> Vec<Vec<[u32; 8]>> {
-        crate::hw::BoxPass::new(device, &self.scene_layout).make(
-            device,
-            queue,
-            &self.scene.group,
-            jobs,
-        )
+        self.box_pass_boxes_chunked(device, queue, jobs, usize::MAX)
+    }
+
+    /// [`Tracer::box_pass_boxes`] with `chunk` jobs to a dispatch.
+    pub fn box_pass_boxes_chunked(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        jobs: &[(u8, [i32; 3], u32)],
+        chunk: usize,
+    ) -> Vec<Vec<[u32; 8]>> {
+        let mut pass = crate::hw::BoxPass::new(device, &self.scene_layout);
+        if chunk != usize::MAX {
+            pass.set_chunk(chunk);
+        }
+        pass.make(device, queue, &self.scene.group, jobs)
+    }
+
+    /// Follows the camera as a draw of frame `frame` would (see [`crate::hw::HwScene::follow`]),
+    /// for tests that stand for the draws of a frame: a view after the first of a frame has no
+    /// budget of its own.
+    pub fn follow_hardware(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        frame: Option<u64>,
+        position: [f64; 3],
+    ) {
+        self.follow_hw(device, queue, frame, position);
+    }
+
+    /// The frames a group of the hardware backend that only lost may wait for its build.
+    pub fn set_hardware_max_wait(&mut self, frames: u32) {
+        if let Some(hw) = &mut self.hw {
+            hw.scene.set_max_wait(frames);
+        }
     }
 
     /// Binds the hardware backend's group (2) in `pass`, if there is one.
@@ -1815,10 +1868,19 @@ impl Tracer {
         }
     }
 
-    /// Moves the hardware backend's frame to the camera, if it has one.
-    fn follow_hw(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, position: [f64; 3]) {
+    /// Moves the hardware backend's frame to the camera, if it has one, and builds the next groups
+    /// that wait. `frame`: which frame of the profiler this draw is of, or `None` for one that is not (see
+    /// [`crate::hw::HwScene::follow`]).
+    fn follow_hw(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        frame: Option<u64>,
+        position: [f64; 3],
+    ) {
         if let Some(hw) = &mut self.hw {
-            hw.scene.follow(device, queue, &self.scene.group, position);
+            hw.scene
+                .follow(device, queue, &self.scene.group, frame, position);
         }
     }
 
@@ -2593,7 +2655,7 @@ impl Tracer {
             return Vec::new();
         }
         // The hardware backend's frame is round the first ray's cell.
-        self.follow_hw(device, queue, rays[0].cell.map(f64::from));
+        self.follow_hw(device, queue, None, rays[0].cell.map(f64::from));
         // Three vec4s per ray: cell, origin, direction.
         let input: Vec<[u32; 4]> = rays
             .iter()
