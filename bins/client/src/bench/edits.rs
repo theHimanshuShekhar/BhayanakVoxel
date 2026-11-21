@@ -213,7 +213,7 @@ mod tests {
             scene,
             store: Some(store),
             diag: Default::default(),
-            accel: Vec::new(),
+            accel: Default::default(),
         };
         let budgets =
             Budgets::parse("[passes]\nedits = 1.0\nedit_frame_thread = 1000.0\n").unwrap();
@@ -248,7 +248,7 @@ mod tests {
             scene,
             store: None,
             diag: Default::default(),
-            accel: Vec::new(),
+            accel: Default::default(),
         };
         assert!(run(&mut gpu, &mut bare, &budgets).unwrap().is_none());
     }

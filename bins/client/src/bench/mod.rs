@@ -462,7 +462,7 @@ fn new_flight(plan: &Plan, args: &Args) -> Result<Flight, Box<dyn Error>> {
             scene: patch_scene(),
             store: None,
             diag: args.diag,
-            accel: Vec::new(),
+            accel: Default::default(),
         }
     } else {
         eprintln!("generating the Planet (this takes a while)...");
@@ -480,7 +480,7 @@ fn new_flight(plan: &Plan, args: &Args) -> Result<Flight, Box<dyn Error>> {
             scene,
             store: Some(store),
             diag: args.diag,
-            accel: Vec::new(),
+            accel: Default::default(),
         }
     })
 }
@@ -506,7 +506,11 @@ fn accel_report(
 ) -> AccelReport {
     AccelReport {
         initial: initial.map(AccelUpdate::from).unwrap_or_default(),
-        flight: AccelSummary::of(&flight.accel),
+        flight: AccelSummary::of(&flight.accel.measured),
+        flight_frames: flight.accel.measured_frames,
+        warmup: AccelSummary::of(&flight.accel.warmup),
+        first_frame: AccelSummary::of(&flight.accel.first_frame),
+        settle: AccelSummary::of(&flight.accel.settle),
         edits: edits.and_then(|e| e.accel.clone()),
     }
 }
@@ -646,7 +650,25 @@ struct Flight {
     diag: Diag,
     /// The updates of the hardware backend's acceleration structures that following the camera
     /// made, from every mode flown so far (empty on the compute backend).
-    accel: Vec<HwUpdate>,
+    accel: AccelLog,
+}
+
+/// The updates of the hardware backend's acceleration structures (#50), by where in a run they
+/// were made: the jumps of the camera, which rebuild all of them, are not the flight's.
+#[derive(Default)]
+struct AccelLog {
+    /// Moving to the end of the path, where each mode warms up, and the warm-up frames.
+    warmup: Vec<HwUpdate>,
+    /// The first measured frame, which follows the camera back from the end of the path to its start:
+    /// another jump.
+    first_frame: Vec<HwUpdate>,
+    /// The rest of the measured frames: the flight.
+    measured: Vec<HwUpdate>,
+    /// How many frames `measured` is of (the measured frames of every mode flown, less the first of
+    /// each).
+    measured_frames: u32,
+    /// Moving to where the Edit stress starts (`settle_for_edits`).
+    settle: Vec<HwUpdate>,
 }
 
 impl Flight {
@@ -723,6 +745,7 @@ fn run_mode(
     for _ in 0..share.warmup {
         draw(gpu, mode, &end, share.spp, false);
     }
+    flight.accel.warmup.extend(gpu.take_hardware_updates());
     // The timers' histories hold everything since the start of the run, warm-up and the other
     // mode's frames included. From here on is this mode's.
     let timings = gpu.timings();
@@ -758,6 +781,9 @@ fn run_mode(
         let shot = shots.is_some() && keyframes.contains(&frame);
         let image = draw(gpu, mode, &camera, share.spp, shot);
         wall.push(began.elapsed().as_secs_f64() * 1e3);
+        if frame == 0 {
+            flight.accel.first_frame.extend(gpu.take_hardware_updates());
+        }
         if let (true, Some(image), Some((out, names))) = (shot, image, shots.as_mut()) {
             let file = format!("{name}-frame{frame:04}.png");
             write_png(&out.join(&file), &image)?;
@@ -765,7 +791,8 @@ fn run_mode(
         }
     }
 
-    flight.accel.extend(gpu.take_hardware_updates());
+    flight.accel.measured.extend(gpu.take_hardware_updates());
+    flight.accel.measured_frames += share.frames.saturating_sub(1);
     let timings = gpu.timings();
     let passes: Vec<(String, &[f64])> = timings
         .passes()
@@ -816,8 +843,9 @@ fn sweep_keyframe(height: f64) -> Keyframe {
 fn settle_for_edits(gpu: &mut Offscreen, flight: &mut Flight) -> Result<(), Box<dyn Error>> {
     let at = sweep_keyframe(SWEEP_HEIGHTS[SWEEP_HEIGHTS.len() - 1]);
     let camera = CameraPath::new(vec![at, at]).camera_at(0, 2);
+    gpu.take_hardware_updates();
     flight.follow(gpu, &camera)?;
-    flight.accel.extend(gpu.take_hardware_updates());
+    flight.accel.settle.extend(gpu.take_hardware_updates());
     Ok(())
 }
 
@@ -1276,5 +1304,80 @@ fn print_streaming(s: &stream::StreamReport) {
             "  (not deterministic) copy {:?} ms, draw {:?} ms over {} drawn frames; the GPU wrote {} bytes",
             t.upload_ms.mean_ms, t.draw_ms.mean_ms, t.drawn_frames, t.gpu_uploaded_bytes
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// What `run_mode` puts in each of the flight's logs of the hardware backend's updates (#50):
+    /// the jump to where a mode warms up and the warm-up in `warmup`, the first measured frame (the
+    /// camera going back to the start) in `first_frame`, the rest in `measured` with the number of
+    /// frames it is of, and a full rebuild from before the mode in none of the last two. The path
+    /// is 30 000 Voxels long, past the TLAS's frame, so that the camera's moves make updates in the
+    /// draws. Skips itself where the adapter has no ray queries. Makes an `Offscreen` (a Vulkan
+    /// device), so the Windows job, which has none, skips it.
+    #[test]
+    fn the_flights_updates_are_logged_by_where_in_the_run_they_were_made() {
+        let mut flight = Flight {
+            scene: patch_scene(),
+            store: None,
+            diag: Diag::default(),
+            accel: Default::default(),
+        };
+        let resolution = Resolution::native(32, 18);
+        let mut gpu =
+            Offscreen::with_backend(resolution, &flight.scene, RtBackend::Hardware).unwrap();
+        if gpu.rt().active != RtBackend::Hardware {
+            eprintln!("skipped: {:?}", gpu.rt().fallback);
+            return;
+        }
+        gpu.take_hardware_updates();
+        // A full rebuild before the mode flies, as the first follow of a real run is.
+        gpu.update_scene(&flight.scene, &render::SceneUpdate::Rebuilt)
+            .unwrap();
+        let key = |x: f64| Keyframe {
+            position: [x, 1565.0, 0.0],
+            target: [x, 1500.0, 100.0],
+        };
+        let path = CameraPath::new(vec![key(0.0), key(30_000.0)]);
+        let share = ModePlan {
+            frames: 6,
+            warmup: 1,
+            spp: 1,
+        };
+        let budgets = Budgets::parse("[passes]\n").unwrap();
+        run_mode(
+            &mut gpu,
+            &mut flight,
+            &path,
+            share,
+            Mode::Primary,
+            &budgets,
+            None,
+        )
+        .unwrap();
+        let log = &flight.accel;
+        let kinds = |updates: &[HwUpdate]| updates.iter().map(|u| u.kind).collect::<Vec<_>>();
+        assert!(kinds(&log.warmup).contains(&"build"), "{:?}", log.warmup);
+        assert!(kinds(&log.warmup).contains(&"anchor"), "{:?}", log.warmup);
+        assert_eq!(kinds(&log.first_frame), ["anchor"], "{:?}", log.first_frame);
+        assert!(
+            !log.measured.is_empty(),
+            "the camera crosses the TLAS's frame"
+        );
+        assert!(
+            log.measured.iter().all(|u| u.kind == "anchor"),
+            "{:?}",
+            log.measured
+        );
+        assert_eq!(log.measured_frames, 5);
+        assert!(log.settle.is_empty());
+        // And what the report sums is the steady flight's alone.
+        let accel = accel_report(None, &flight, None);
+        assert_eq!(accel.flight.updates as usize, log.measured.len());
+        assert_eq!(accel.flight_frames, 5);
+        assert_eq!(accel.warmup.updates as usize, log.warmup.len());
     }
 }

@@ -119,14 +119,22 @@ pub struct AccelSummary {
     pub build_ms: Stats,
     /// `prepare_ms` + `build_ms` of each update.
     pub total_ms: Stats,
-    /// The sum of `total_ms` over the updates: what the stretch of the run spent on them.
+    /// The sum of `total_ms` over the updates, and the time of the search that found nothing stale
+    /// in those that rebuilt nothing (`noop_updates`): what the stretch of the run spent on them.
     pub total_sum_ms: f64,
+    /// The part of `total_sum_ms` that is the search of the updates that rebuilt nothing.
+    pub noop_search_ms: f64,
 }
 
 impl AccelSummary {
     pub fn of(updates: &[HwUpdate]) -> Self {
         let done: Vec<&HwUpdate> = updates.iter().filter(|u| u.kind != "none").collect();
         let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3;
+        let noop_search: f64 = updates
+            .iter()
+            .filter(|u| u.kind == "none")
+            .map(|u| ms(u.prepare + u.build))
+            .sum();
         let per: Vec<u32> = done.iter().map(|u| u.blas_rebuilt).collect();
         Self {
             updates: done.len() as u32,
@@ -145,7 +153,8 @@ impl AccelSummary {
                     .map(|u| ms(u.prepare + u.build))
                     .collect::<Vec<_>>(),
             ),
-            total_sum_ms: done.iter().map(|u| ms(u.prepare + u.build)).sum(),
+            total_sum_ms: done.iter().map(|u| ms(u.prepare + u.build)).sum::<f64>() + noop_search,
+            noop_search_ms: noop_search,
         }
     }
 }
@@ -155,7 +164,18 @@ impl AccelSummary {
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct AccelReport {
     pub initial: AccelUpdate,
+    /// The updates of the measured frames, but the first of each mode: the flight.
     pub flight: AccelSummary,
+    /// How many frames `flight` is of.
+    pub flight_frames: u32,
+    /// The jump to the end of the path where a mode warms up (all of the structures are made again,
+    /// as the camera is thousands of Voxels away), and the warm-up frames.
+    pub warmup: AccelSummary,
+    /// The first measured frame of each mode, which follows the camera back to the start of the
+    /// path: another jump, which `scene_update_ms` has in its maximum and `flight` does not.
+    pub first_frame: AccelSummary,
+    /// The jump to where the Edit stress starts, if it ran.
+    pub settle: AccelSummary,
     /// The Edits' updates (after each Edit, the groups it touched rebuilt and the TLAS built
     /// again); null if the Edit stress did not run.
     pub edits: Option<AccelSummary>,
@@ -240,7 +260,7 @@ pub struct Comparison {
     pub hw_nearest: Option<BackendTimes>,
     pub speedup: Vec<Speedup>,
     /// The hardware backend's mean `gpu_total` plus what its acceleration structures' updates cost
-    /// the flight per frame (the sum of `hw_accel.flight.total_ms` over the measured frames): the
+    /// the flight per frame (`hw_accel.flight.total_sum_ms` over `hw_accel.flight_frames`): the
     /// frame as the player would have it if the updates are on the frame thread (they are in this
     /// bench), which `speedup.gpu_total` leaves out. Compute has no such cost.
     pub hw_gpu_total_plus_accel_ms: Option<f64>,
@@ -279,10 +299,10 @@ impl Comparison {
                 }
             })
             .collect();
-        let with_accel = (hw.frames > 0)
+        let with_accel = (hw_accel.flight_frames > 0)
             .then(|| {
                 hw.mean("gpu_total")
-                    .map(|t| t + hw_accel.flight.total_sum_ms / f64::from(hw.frames))
+                    .map(|t| t + hw_accel.flight.total_sum_ms / f64::from(hw_accel.flight_frames))
             })
             .flatten();
         Self {
@@ -365,6 +385,15 @@ mod tests {
         assert_eq!(s.total_ms.mean_ms, Some(7.0));
         assert_eq!(AccelSummary::of(&[]).updates, 0);
         assert_eq!(AccelSummary::of(&[update("none", 0, 0)]).noop_updates, 1);
+        // The search of an update that found nothing stale is in the total, and apart.
+        let noop = HwUpdate {
+            kind: "none",
+            prepare: Duration::from_millis(3),
+            ..HwUpdate::default()
+        };
+        let s = AccelSummary::of(&[update("patch", 1, 4), noop]);
+        assert_eq!((s.updates, s.noop_updates), (1, 1));
+        assert_eq!((s.noop_search_ms, s.total_sum_ms), (3.0, 8.0));
         assert_eq!(s.noop_updates, 1);
     }
 
@@ -385,6 +414,10 @@ mod tests {
             initial: AccelUpdate::default(),
             // 3 frames, and the updates cost 6 ms in all: 2 ms a frame on top of the hardware's 4.
             flight: AccelSummary::of(&[update("patch", 2, 4), update("patch", 1, 0)]),
+            flight_frames: 3,
+            warmup: AccelSummary::default(),
+            first_frame: AccelSummary::default(),
+            settle: AccelSummary::default(),
             edits: None,
         };
         let c = Comparison::new(

@@ -111,9 +111,9 @@ jobs:
       - uses: ./.github/actions/setup-rust
       - name: Tests of the crates that need no GPU
         run: cargo test -p brick-store -p materials -p net -p planet-gen -p sim -p prefetch-sim -p server
-      # The client's unit tests, minus the real-thread tests and the four that make an Offscreen
-      # renderer (a Vulkan device): the cave stills, the landscape golden, the Edit stress of the bench
-      # and the look-dev smoke run.
+      # The client's unit tests, minus the real-thread tests and the five that make an Offscreen
+      # renderer (a Vulkan device): the cave stills, the landscape golden, the Edit stress of the bench,
+      # the look-dev smoke run and the log of the hardware backend's updates.
       - name: Client tests that need no GPU, without the real-thread tests
         shell: bash
         run: |
@@ -124,6 +124,7 @@ jobs:
             --skip bench::landscape::the_landscape_from_the_ground_500_m_and_20_km_matches_the_approved_images
             --skip bench::edits::tests::the_largest_brush_is_dug_and_placed_in_turn_at_no_more_than_the_metric_rate
             --skip bench::lookdev::run::tests::a_short_run_writes_a_folder_for_each_shot_and_a_sheet_that_names_every_image
+            --skip bench::tests::the_flights_updates_are_logged_by_where_in_the_run_they_were_made
           )
           for f in "${filters[@]}"; do skips+=(--skip "$f"); done
           cargo test -p client --bin client -- "${skips[@]}"

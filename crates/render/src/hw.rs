@@ -6,6 +6,10 @@
 //! (`hit_brick`), then `rayQueryGenerateIntersection`s the hit. The compute `trace()` stays the
 //! default, the fallback and the CPU-checkable reference (`reference.rs`).
 //!
+//! Shadow rays (`occluded` in the shaders) end at the first hit with `RtBackend::Hardware`
+//! (`RAY_FLAG_TERMINATE_ON_FIRST_HIT`), as the compute walk does, and look for the nearest like
+//! any ray with `RtBackend::HardwareNearest`; every other ray is the nearest-hit query.
+//!
 //! * **Tight boxes** ([`tight_box`]): a brick's box is the min/max of the Voxels of its occupancy
 //!   mask, not the whole 8 x 8 x 8 (Tuxedo Labs, GPC 2025; #136). A brick that is one Material is
 //!   its whole box. A region that is one Material (the core) is one box of 64 Voxels, since its
@@ -22,9 +26,7 @@
 //!   (instances only; the BLASes are as they were) when the camera leaves it.
 //!
 //! What the spike does **not** do: the compute path's clip to the ball that has the Planet in it
-//! (nothing is outside it, so it only saves steps), early-out on the first hit for shadow rays
-//! (`trace` returns the nearest hit, as the compute path does, so the passes are comparable),
-//! compaction, update-in-place of a BLAS (an Edit rebuilds the BLASes of the groups it touched),
+//! (nothing is outside it, so it only saves steps), compaction, update-in-place of a BLAS (an Edit rebuilds the BLASes of the groups it touched),
 //! or a TLAS built in a pass of the frame (an update waits for the GPU, which is how it is timed).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};

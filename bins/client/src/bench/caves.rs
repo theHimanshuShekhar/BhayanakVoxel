@@ -237,7 +237,7 @@ pub fn run(
             scene: current,
             store: Some(store),
             diag: Default::default(),
-            accel: Vec::new(),
+            accel: Default::default(),
         };
         let path = CameraPath::new(vec![still.key, still.key]).radial();
         eprintln!("cave still: {}", still.name);

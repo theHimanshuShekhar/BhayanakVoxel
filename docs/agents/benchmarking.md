@@ -1500,14 +1500,23 @@ Edits). All are on the same GPU, driver and clocks. Read `rt.comparison`:
   that following the camera makes**, the hardware's acceleration structure updates included: it is
   timed in the flight apart from the passes, and there is no p99 (`p95_ms` and `max_ms` are what
   `STATS` has).
-- `hw_accel`: the cost of the acceleration structures. `initial` is the first build; `flight` and
-  `edits` are summaries (`updates`, `noop_updates` (scene updates after which no box was stale),
-  `blas_rebuilt`, `prims_rebuilt`, `tlas_rebuilds`, the BLASes rebuilt per update `_mean`/`_max`,
-  and `prepare_ms`, `build_ms` and `total_ms` as STATS, `total_sum_ms`). Each update has a `kind`:
-  `build` (all), `patch` (the groups a move or an Edit touched, and the TLAS again) or `anchor` (the
-  camera left the TLAS's frame: instances only).
+- `hw_accel`: the cost of the acceleration structures. `initial` is the first build. `flight` is a
+  summary of the updates of the **steady flight**: the measured frames of the mode, less the first
+  (`flight_frames` of them). The jumps are apart, since a jump rebuilds everything and is not
+  what following the camera costs: **`warmup`** (the move to the end of the path where the mode
+  warms up, and the warm-up frames), **`first_frame`** (the first measured frame, which follows
+  the camera back from there to the start of the path; `scene_update_ms` has it in its `max_ms`,
+  which is a jump and not a stutter of the flight) and **`settle`** (the move to where the Edit
+  stress starts). `edits` is the Edit stress's. A summary has `updates`, `noop_updates` (scene
+  updates after which no box was stale), `blas_rebuilt`, `prims_rebuilt`, `tlas_rebuilds`, the
+  BLASes rebuilt per update `_mean`/`_max`, `prepare_ms`, `build_ms` and `total_ms` as STATS of the
+  updates that rebuilt something, `total_sum_ms` (their total and the search of the no-op updates)
+  and `noop_search_ms` (the no-op updates' part of it). Each update has a `kind`: `build` (all),
+  `patch` (the groups a move or an Edit touched, and the TLAS again) or `anchor` (the camera left
+  the TLAS's frame: instances only).
   - **`prepare_ms`** is CPU time: the search for the groups the patch made stale (the scene's
-    patch mapped to groups), then the boxes worked out and a buffer and a BLAS made for each group.
+    patch mapped to groups; it sorts every region's first entry when entries of `brick_refs` were
+    written, so it is not free, and a no-op update has it alone), then the boxes worked out and a buffer and a BLAS made for each group.
   - **`build_ms`** is everything from the first build command to the GPU being idle: it records the
     BLAS and TLAS builds, writes the boxes' words, the instance table and the bind group, submits,
     and **waits for the GPU to finish everything queued** (`device.poll(wait)`), the scene's own
@@ -1517,8 +1526,12 @@ Edits). All are on the same GPU, driver and clocks. Read `rt.comparison`:
 - `hw_edits`: the Edit stress on the hardware backend, in the report's `edits` shape, to put by
   `edits` (compute). **Both stress runs start from the same camera and rings**: the sweep's last
   height (20 000 Voxels over the pole), where the compute run ends the sweep, and the hardware run
-  is put there before it starts, so the Edits land on the same levels (a stress that started from
-  the flight's low end would make its Edits in level 0, which are cheaper to repair). Its budgets
+  is put there before it starts (`settle_for_edits`; on the compute run it is one `recentre` to the
+  camera the sweep already sits at, which does nothing unless the selection still owed work, so the
+  compute `edits` are as they were, if not provably to the last digit), so the Edits land on the same
+  levels (a stress that started from
+  the flight's low end would make its Edits in level 0, which are cheaper to repair). The two sides'
+  buffers can still differ in size: the compute run flew the Reference and the sweep first. Its budgets
   are not gated. The acceleration structures' update is inside the frame thread's time
   (`update_scene` waits for the build), so it is in `frame_thread`.
 
@@ -1554,7 +1567,7 @@ that compare skip themselves, printing why, on an adapter without ray queries).
 
 ```
 {
-  "schema_version": 30,
+  "schema_version": 31,
   "build":   { "version", "commit" },          // commit: CI builds only, else null; on a PR
                                                // build it is GitHub's merge commit, not the head
   "machine": { "gpu", "device_type", "driver", "driver_info", "backend", "os", "arch",
