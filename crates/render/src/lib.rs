@@ -23,6 +23,7 @@ pub mod batch;
 pub mod camera;
 mod composite;
 pub mod cpu;
+pub mod daylight;
 mod debug_view;
 pub mod emitters;
 mod gpu_materials;
@@ -48,6 +49,7 @@ mod window;
 use std::error::Error;
 
 pub use camera::Camera;
+pub use daylight::{DaySky, Daylight, Drive, LocalFrame, Moon, Night};
 pub use debug_view::DebugView;
 pub use hw::HwUpdate;
 pub use look::Look;

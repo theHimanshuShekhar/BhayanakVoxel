@@ -17,14 +17,31 @@ use crate::window::Mode;
 pub struct Controls {
     pub mode: Mode,
     pub debug_view: DebugView,
-    /// The sun's azimuth and elevation in radians (see [`Sun::from_angles`](crate::Sun)).
-    pub sun: (f32, f32),
+    /// The world clock (#203), which moves the sun and the moon.
+    pub day: DayControls,
     /// Which stages of the art direction are on (see [`Stages`]).
     pub stages: Stages,
     /// The LOD bias: output pixels one Voxel may cover (see [`Bands`](crate::lod::Bands)). It
     /// changes when the slider is let go, not while it is dragged, since selecting the bricks
     /// again takes a moment.
     pub bias: f32,
+}
+
+/// The world clock as the panel edits it: the time of day in hours (0 is midnight, 6 sunrise, 12
+/// noon, 18 sunset), the day's length in minutes, and whether it is stopped. Whoever owns the clock
+/// fills it in each frame and applies what changed ([`DayControls::HOURS`] is a day).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DayControls {
+    pub hours: f32,
+    pub day_minutes: f32,
+    pub paused: bool,
+}
+
+impl DayControls {
+    /// Hours in a day, which the time's slider runs over.
+    pub const HOURS: f32 = 24.0;
+    /// The shortest and longest day length the slider offers, in minutes.
+    pub const MINUTES: std::ops::RangeInclusive<f32> = 0.05..=240.0;
 }
 
 /// What the bands have selected, for the panel.
@@ -335,23 +352,19 @@ pub fn show(ctx: &Context, info: &Info, controls: &mut Controls) {
                     }
                 });
 
-            // Edited in degrees; the stored radians are only touched when the user drags, so
-            // that converting back and forth cannot nudge the sun (which restarts the
-            // reference image) every frame.
-            let (azimuth, elevation) = controls.sun;
-            let mut degrees = [azimuth.to_degrees(), elevation.to_degrees()];
-            if ui
-                .add(Slider::new(&mut degrees[0], -180.0..=180.0).text("sun azimuth (deg)"))
-                .changed()
-            {
-                controls.sun.0 = degrees[0].to_radians();
-            }
-            if ui
-                .add(Slider::new(&mut degrees[1], -90.0..=90.0).text("sun elevation (deg)"))
-                .changed()
-            {
-                controls.sun.1 = degrees[1].to_radians();
-            }
+            // Edited in hours and minutes; what is stored is only touched when the user drags, so
+            // that converting back and forth cannot set the clock (which moves the sun, and
+            // restarts the reference image) every frame.
+            ui.add(
+                Slider::new(&mut controls.day.hours, 0.0..=DayControls::HOURS)
+                    .text("time of day (h)"),
+            );
+            ui.add(
+                Slider::new(&mut controls.day.day_minutes, DayControls::MINUTES)
+                    .logarithmic(true)
+                    .text("day length (min)"),
+            );
+            ui.checkbox(&mut controls.day.paused, "pause the clock (P)");
             ui.label("Art direction");
             ui.horizontal_wrapped(|ui| {
                 ui.checkbox(&mut controls.stages.tone, "tone curve");
@@ -359,7 +372,7 @@ pub fn show(ctx: &Context, info: &Info, controls: &mut Controls) {
                 ui.checkbox(&mut controls.stages.bloom, "bloom");
                 ui.checkbox(&mut controls.stages.smooth_normals, "smooth normals");
             });
-            ui.weak("N: walk / noclip, arrows: sun, V: view, F1: hide, Esc: free the mouse");
+            ui.weak("N: walk / noclip, arrows: time of day, P: pause the clock, V: view, F1: hide, Esc: free the mouse");
             ui.weak(TOOL_HELP);
         });
 }
@@ -394,7 +407,11 @@ mod tests {
         Controls {
             mode: Mode::Primary,
             debug_view: DebugView::Lit,
-            sun: (0.5, 0.8),
+            day: DayControls {
+                hours: 19.0,
+                day_minutes: 30.0,
+                paused: false,
+            },
             stages: Stages::default(),
             bias: 1.0,
         }
@@ -597,7 +614,11 @@ mod tests {
         let mut controls = Controls {
             mode: Mode::Reference,
             debug_view: DebugView::Depth,
-            sun: (0.5, 0.8),
+            day: DayControls {
+                hours: 19.0,
+                day_minutes: 30.0,
+                paused: false,
+            },
             stages: Stages::default(),
             bias: 1.0,
         };

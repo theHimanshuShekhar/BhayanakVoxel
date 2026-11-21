@@ -4,6 +4,7 @@ use std::path::PathBuf;
 
 use super::convergence::CHECKPOINTS;
 use super::rt::RtMode;
+use super::daycycle::SHORTEST_DAY_SECONDS;
 
 pub const USAGE: &str = "\
 Usage: client bench [OPTIONS]
@@ -77,6 +78,17 @@ Options:
                    the flight on hw-nearest, each on a context of its own, and the passes that cast
                    rays compared: `rt.comparison`). The report's `rt` says which ran and what the
                    acceleration structures cost to update
+  --time-of-day H  Light the flight (primary and reference, the sweep and the edits) by the sky of the
+                   world clock at H hours (0 to 24: 0 midnight, 6 sunrise, 12 noon, 18 sunset) in
+                   place of the fixed hero sun, with the clock stopped there (#203)
+  --day-cycle      Also run the day cycle (#203), after the flight: a day of the world clock run
+                   fast over the flight's path, on its GPU. It reports the frames' times (exit
+                   status 2 if the p99 is over 16.7 ms or any frame is), the sun's step a frame
+                   and its jumps, the exposure's stability (how far, how fast and how often it
+                   turned), and the radiance cache's lag behind a drifting sun at the game's pace
+                   and the sped-up one, against a jump. It adds a `day_cycle` block
+  --day-seconds N  With --day-cycle, how long the sped-up day is, in seconds of the clock
+                   [default: 60; 6 with --short]. At least 4: a faster sun would jump
   --no-fail        Exit with status 0 even if a pass is over its budget, there is a hole or a
                    real-time gate is over
   -h, --help       Print this";
@@ -132,6 +144,11 @@ pub struct Args {
     pub shadow_rays: Option<u32>,
     /// `--rt-backend` (#50): how rays find the Planet.
     pub rt: RtMode,
+    /// `--time-of-day`: the hours at which the flight's sky is put (#203).
+    pub time_of_day: Option<f64>,
+    /// `--day-cycle` and `--day-seconds`: the day cycle phase, and the length of its day if said.
+    pub day_cycle: bool,
+    pub day_seconds: Option<f64>,
     pub size: Option<(u32, u32)>,
     pub bias: f64,
     pub diag: Diag,
@@ -164,6 +181,9 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Parsed, String> {
         flip_gamma22: false,
         shadow_rays: None,
         rt: RtMode::default(),
+        time_of_day: None,
+        day_cycle: false,
+        day_seconds: None,
         size: None,
         bias: 1.0,
         diag: Diag::default(),
@@ -191,6 +211,9 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Parsed, String> {
             "--truth-spp" => parsed.truth_spp = Some(truth_spp(&value("--truth-spp")?)?),
             "--shadow-rays" => parsed.shadow_rays = Some(shadow_rays(&value("--shadow-rays")?)?),
             "--rt-backend" => parsed.rt = RtMode::parse(&value("--rt-backend")?)?,
+            "--time-of-day" => parsed.time_of_day = Some(time_of_day(&value("--time-of-day")?)?),
+            "--day-cycle" => parsed.day_cycle = true,
+            "--day-seconds" => parsed.day_seconds = Some(day_seconds(&value("--day-seconds")?)?),
             "--out" => parsed.out = value("--out")?.into(),
             "--budgets" => parsed.budgets = Some(value("--budgets")?.into()),
             "--size" => parsed.size = Some(size(&value("--size")?)?),
@@ -210,6 +233,9 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Parsed, String> {
     }
     if parsed.stream_slice_ms.is_some() && !parsed.real_time {
         return Err("--stream-slice-ms is for --real-time".into());
+    }
+    if parsed.day_seconds.is_some() && !parsed.day_cycle {
+        return Err("--day-seconds is for --day-cycle".into());
     }
     if parsed.truth_spp.is_some() && !parsed.convergence {
         return Err(
@@ -279,6 +305,24 @@ fn shadow_rays(text: &str) -> Result<u32, String> {
                 "`{text}` is not a number of shadow rays from 1 to {}",
                 render::MAX_SHADOW_RAYS
             )
+        })
+}
+
+/// `--time-of-day`: hours, from 0 up to 24 (24 is midnight again).
+fn time_of_day(text: &str) -> Result<f64, String> {
+    text.parse::<f64>()
+        .ok()
+        .filter(|h| h.is_finite() && (0.0..=24.0).contains(h))
+        .ok_or_else(|| format!("`{text}` is not a time of day in hours like 18.5 (0 to 24)"))
+}
+
+/// `--day-seconds`: at least [`SHORTEST_DAY_SECONDS`], or the sun would jump between frames.
+fn day_seconds(text: &str) -> Result<f64, String> {
+    text.parse::<f64>()
+        .ok()
+        .filter(|s| s.is_finite() && *s >= SHORTEST_DAY_SECONDS)
+        .ok_or_else(|| {
+            format!("`{text}` is not a day of at least {SHORTEST_DAY_SECONDS} seconds like 60")
         })
 }
 
@@ -354,6 +398,9 @@ mod tests {
                 flip_gamma22: false,
                 shadow_rays: None,
                 rt: RtMode::Compute,
+                time_of_day: None,
+                day_cycle: false,
+                day_seconds: None,
                 size: None,
                 bias: 1.0,
                 diag: Diag::default()
@@ -546,5 +593,33 @@ mod tests {
             assert!(parse_all(bad).is_err(), "{bad:?}");
         }
         assert!(parse_all(&["--nope"]).unwrap_err().contains("--nope"));
+    }
+
+    #[test]
+    fn the_day_cycle_and_its_time_of_day_are_read_and_bounded() {
+        let args = run(&[
+            "--day-cycle",
+            "--day-seconds",
+            "30",
+            "--time-of-day",
+            "18.5",
+        ]);
+        assert!(args.day_cycle);
+        assert_eq!(
+            (args.day_seconds, args.time_of_day),
+            (Some(30.0), Some(18.5))
+        );
+        assert_eq!(run(&["--time-of-day", "24"]).time_of_day, Some(24.0));
+        for bad in [
+            &["--day-seconds", "30"][..],
+            &["--day-cycle", "--day-seconds", "3.9"],
+            &["--day-cycle", "--day-seconds", "fast"],
+            &["--day-cycle", "--day-seconds"],
+            &["--time-of-day", "24.5"],
+            &["--time-of-day", "-1"],
+            &["--time-of-day", "noon"],
+        ] {
+            assert!(parse_all(bad).is_err(), "{bad:?}");
+        }
     }
 }

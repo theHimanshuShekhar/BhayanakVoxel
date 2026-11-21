@@ -11,6 +11,7 @@ use crate::accumulation::Accumulator;
 use crate::atmosphere::{AtmosphereTables, AtmosphereView};
 use crate::batch::max_samples;
 use crate::camera::{Camera, CameraUniform};
+use crate::daylight::{MOON_DISC, Night};
 use crate::debug_view::DebugView;
 use crate::emitters::{Applied, EmitterIndex, Emitters, emissive_materials};
 use crate::gpu_materials;
@@ -295,6 +296,14 @@ struct FrameUniform {
     /// fourth word of each is unused).
     boost_min: [i32; 4],
     boost_max: [i32; 4],
+    /// The moon: its direction, then the cosine of its disc's angular radius.
+    moon: [f32; 4],
+    /// The colour of the moon's disc (radiance), then 1 if there is a moon.
+    moon_disc: [f32; 4],
+    /// How visible the stars are, how visible the moon's disc and halo are, then two unused.
+    night: [f32; 4],
+    /// The rows of the matrix from a world direction to the stars' own (the fourth of each unused).
+    star_rows: [[f32; 4]; 3],
 }
 
 /// Where primary visibility traces when nothing moves it: the centre of the pixel.
@@ -509,19 +518,40 @@ impl Target {
 pub struct View {
     camera: Camera,
     sun: Sun,
+    /// The moon, the night sky's floor and the stars (#203): what the sky is besides the sun. A
+    /// running clock moves them as it moves the sun, so a view is not Still while it does.
+    night: Night,
     /// The size the reference image is traced at.
     size: (u32, u32),
 }
 
 impl View {
-    /// The view of `camera` and `sun` into the reference image of `target`.
-    pub(crate) fn new(camera: &Camera, sun: &Sun, target: &Target) -> Self {
+    /// The view of `camera` and `sun` (with the `night`'s sky) into the reference image of `target`.
+    pub(crate) fn new(camera: &Camera, sun: &Sun, night: &Night, target: &Target) -> Self {
         Self {
             camera: *camera,
             sun: *sun,
+            night: *night,
             size: target.reference_size,
         }
     }
+}
+
+/// The light that casts the shadows of a frame, which is **the sun while it is the stronger and the
+/// moon when it is not** (#203): the shaders have one directional light (`frame.sun` and
+/// `frame.sun_radiance`), so the moon costs no second shadow ray and no second sun-sample of the
+/// radiance cache. Where the key changes hands the sun's light and the moon's are both a few
+/// hundredths of what the day's is, which is what keeps the swap from showing.
+struct Key {
+    /// The direction and the angular size of the light.
+    light: Sun,
+    /// Its radiance on a surface that faces it (`look.rs`'s `sun`).
+    radiance: [f32; 3],
+    is_moon: bool,
+}
+
+fn luminance(c: [f32; 3]) -> f32 {
+    0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2]
 }
 
 pub struct Tracer {
@@ -580,6 +610,10 @@ pub struct Tracer {
     /// history of every frame of a walk.
     sun_epoch: u64,
     history_sun_epoch: u64,
+    /// The sky besides the sun (#203): the moon, the night floor and the stars; and whether the
+    /// last frame's key light was the moon (see [`Key`]).
+    night: Night,
+    key_is_moon: bool,
     /// Whether the view has neither GI nor emitters (see [`Tracer::set_sun_and_sky_only`]).
     sun_and_sky_only: bool,
     /// The shadow rays a pixel casts (see [`Tracer::set_shadow_rays`]).
@@ -1357,6 +1391,8 @@ impl Tracer {
             post: Post::new(device),
             sun_epoch: 0,
             history_sun_epoch: 0,
+            night: Night::NONE,
+            key_is_moon: false,
             sun_and_sky_only: false,
             shadow_rays: DEFAULT_SHADOW_RAYS,
             atmosphere: AtmosphereTables::new(device),
@@ -1431,7 +1467,8 @@ impl Tracer {
         self.gi_frame += 1;
         self.camera_position = camera.position;
         self.follow_hw(device, queue, camera.position);
-        self.write_uniforms(queue, camera, sun, (0, CENTRE, 0), 0);
+        let key = self.settle_key(camera, sun);
+        self.write_uniforms(queue, camera, &key, (0, CENTRE, 0), 0);
         self.encode_atmosphere(
             device,
             queue,
@@ -1487,6 +1524,8 @@ impl Tracer {
         target: &Target,
         rate: f32,
     ) {
+        // The key light is settled first: a change of its hands is a new sun (see `Key`).
+        let key = self.settle_key(camera, sun);
         // A new sun starts the history over, whatever else is the same: the lit image's shadows
         // are the sun's, and nothing of the old sun's is to be carried into the new one.
         if self.history_sun_epoch != self.sun_epoch {
@@ -1503,7 +1542,7 @@ impl Tracer {
         self.write_uniforms(
             queue,
             camera,
-            sun,
+            &key,
             (0, frame.jitter(), 0),
             frame.sun_sample(),
         );
@@ -1563,10 +1602,11 @@ impl Tracer {
         samples: u32,
     ) -> u32 {
         let samples = batch_of(samples, target.reference_size);
-        let view = View::new(camera, sun, target);
+        let view = View::new(camera, sun, &self.night, target);
         let first = self.accumulator.begin_batch(&view, samples);
         self.follow_hw(device, queue, camera.position);
-        self.write_uniforms(queue, camera, sun, (first, CENTRE, samples), 0);
+        let key = self.settle_key(camera, sun);
+        self.write_uniforms(queue, camera, &key, (first, CENTRE, samples), 0);
         self.encode_atmosphere(
             device,
             queue,
@@ -1662,7 +1702,10 @@ impl Tracer {
             now.saturating_sub(last).as_secs_f32().min(1.0)
         });
         self.last_frame_at = Some(now);
-        let key = (View::new(camera, sun, target), self.scene_epoch);
+        let key = (
+            View::new(camera, sun, &self.night, target),
+            self.scene_epoch,
+        );
         let was_showing = matches!(self.still.last_plan(), Plan::Reference { .. });
         let plan = self
             .still
@@ -1976,6 +2019,7 @@ impl Tracer {
             up: up.map(|c| c as f32),
             sun_direction: sun.direction(),
             aspect: width as f32 / height.max(1) as f32,
+            night_level: self.night.level,
         }
     }
 
@@ -2007,11 +2051,89 @@ impl Tracer {
     }
 
     /// Says that the sun was changed (turned, or another one set), not that it moves with the
-    /// camera: the next frame of Primary starts the upscaler's history over (#52).
+    /// camera: the next frame of Primary starts the upscaler's history over (#52), and the radiance
+    /// cache forgets fast everywhere ([`GI_BOOST_FRAMES`]).
+    ///
+    /// **This is the signal of a jump, and a drift is not one** (#203): the slow movement of a
+    /// running clock's sun (`daylight::Daylight::step` says which a step was) is not told here, and
+    /// the cache and the upscaler follow it by their normal updates. A caller that moves the sun
+    /// every frame must not call this every frame, or the cache never settles.
     pub fn sun_changed(&mut self) {
         self.sun_epoch += 1;
         self.gi_boost = GI_BOOST_FRAMES;
         self.gi_boost_box = EVERYWHERE;
+    }
+
+    /// How many times the sun has jumped ([`Tracer::sun_changed`]; the key light changing hands
+    /// from the sun to the moon or back counts too). It moves on a jump and never on a drift, so a
+    /// reader that keeps the value it last saw (the temporal denoiser, #55) knows to reset or to
+    /// shorten its history when it differs.
+    pub fn sun_epoch(&self) -> u64 {
+        self.sun_epoch
+    }
+
+    /// Sets the sky besides the sun: the moon, the night's floor and the stars ([`Night`]). The
+    /// moon is the key light while the sun is not (see [`Key`]). Not a jump by itself: the views'
+    /// Reference starts over (the night is part of the [`View`]), and the upscaler's history keeps
+    /// going; a caller that puts the sky somewhere else says so with [`Tracer::sun_changed`].
+    pub fn set_night(&mut self, night: Night) {
+        self.night = night;
+        self.post.set_night_level(night.level);
+    }
+
+    pub fn night(&self) -> Night {
+        self.night
+    }
+
+    /// The key light of a frame of `camera` under `sun` and the night's moon: the stronger of the
+    /// two lights as a surface on the ground of `camera`'s up gets them (the air takes the light of
+    /// a body that is low, and all of it below the horizon).
+    fn key_light(&self, camera: &Camera, sun: &Sun) -> Key {
+        let view = self.atmosphere_view(camera, sun, (1, 1));
+        let sun_radiance = match self.look.atmosphere {
+            Some(air) => air.sun_light_on_ground(view.mu_s()),
+            None => self.look.sun,
+        };
+        let by_the_sun = Key {
+            light: *sun,
+            radiance: sun_radiance,
+            is_moon: false,
+        };
+        let Some(moon) = self.night.moon else {
+            return by_the_sun;
+        };
+        let mu_moon: f32 = (0..3)
+            .map(|a| view.up[a] * moon.direction[a])
+            .sum::<f32>()
+            .clamp(-1.0, 1.0);
+        let moon_radiance = match self.look.atmosphere {
+            Some(air) => {
+                let through = air.sun_transmittance(air.observer_height, mu_moon);
+                std::array::from_fn(|c| moon.light[c] * through[c])
+            }
+            None if mu_moon > 0.0 => moon.light,
+            None => [0.0; 3],
+        };
+        match Sun::new(moon.direction, moon.angular_radius) {
+            Some(light) if luminance(moon_radiance) > luminance(sun_radiance) => Key {
+                light,
+                radiance: moon_radiance,
+                is_moon: true,
+            },
+            _ => by_the_sun,
+        }
+    }
+
+    /// [`Tracer::key_light`], with a change of the key light's hands counted as the sun jumping:
+    /// the shadows of the one must not be carried into the other, and the cache's light of the one
+    /// is not the other's. It is rare (twice a day) and happens while both lights are dim.
+    fn settle_key(&mut self, camera: &Camera, sun: &Sun) -> Key {
+        let key = self.key_light(camera, sun);
+        if key.is_moon != self.key_is_moon {
+            self.key_is_moon = key.is_moon;
+            self.sun_changed();
+        }
+        key
     }
 
     /// Says that an Edit changed `bricks` (and not the scene thread's streaming, which changes the
@@ -2160,7 +2282,7 @@ impl Tracer {
         &self,
         queue: &wgpu::Queue,
         camera: &Camera,
-        sun: &Sun,
+        key: &Key,
         (sample_index, jitter, batch): (u32, [f32; 2], u32),
         sun_sample: u32,
     ) {
@@ -2170,7 +2292,7 @@ impl Tracer {
             bytemuck::bytes_of(&camera.uniform()),
         );
         let frame = FrameUniform {
-            sun: sun.uniform(),
+            sun: key.light.uniform(),
             params: [sample_index, self.seed, self.debug_view.index(), batch],
             jitter: [jitter[0], jitter[1], 0.0, 0.0],
             look_up: {
@@ -2179,12 +2301,10 @@ impl Tracer {
             },
             look: {
                 let mut look = self.look.uniform();
-                // The sun's light is what the air lets through to the ground.
-                if let Some(air) = self.look.atmosphere {
-                    let view = self.atmosphere_view(camera, sun, (1, 1));
-                    let [r, g, b] = air.sun_light_on_ground(view.mu_s());
-                    look.sun = [r, g, b, 0.0];
-                }
+                // The key light's radiance: what the air lets through to the ground of the sun's
+                // light, or of the moon's (see [`Key`]).
+                let [r, g, b] = key.radiance;
+                look.sun = [r, g, b, 0.0];
                 look
             },
             flags: [
@@ -2219,6 +2339,24 @@ impl Tracer {
                 self.gi_boost_box.1[2],
                 0,
             ],
+            moon: match &self.night.moon {
+                Some(moon) => {
+                    let [x, y, z] = moon.direction;
+                    [x, y, z, moon.angular_radius.cos()]
+                }
+                None => [0.0, 1.0, 0.0, 2.0],
+            },
+            moon_disc: match &self.night.moon {
+                Some(_) => [MOON_DISC[0], MOON_DISC[1], MOON_DISC[2], 1.0],
+                None => [0.0; 4],
+            },
+            night: [
+                self.night.stars,
+                self.night.moon.map_or(0.0, |moon| moon.visible),
+                0.0,
+                0.0,
+            ],
+            star_rows: self.night.star_rows.map(|[x, y, z]| [x, y, z, 0.0]),
         };
         queue.write_buffer(&self.frame_buffer, 0, bytemuck::bytes_of(&frame));
     }
@@ -2860,7 +2998,7 @@ mod tests {
         );
         let at = |size: (u32, u32), scale: f32| {
             let target = Target::with_full_reference(&device, Resolution::scaled(size, scale));
-            View::new(&camera, &sun, &target)
+            View::new(&camera, &sun, &Night::NONE, &target)
         };
         assert_eq!(at((64, 36), 0.5), at((64, 36), 0.5));
         assert_ne!(at((64, 36), 0.5), at((96, 54), 0.5), "the window's size");
@@ -2869,8 +3007,8 @@ mod tests {
         let moved = Camera::looking_at([1.0, 5.0, 0.0], [0.0; 3]);
         let target = Target::with_full_reference(&device, Resolution::native(64, 36));
         assert_ne!(
-            View::new(&camera, &sun, &target),
-            View::new(&moved, &sun, &target)
+            View::new(&camera, &sun, &Night::NONE, &target),
+            View::new(&moved, &sun, &Night::NONE, &target)
         );
     }
 }
