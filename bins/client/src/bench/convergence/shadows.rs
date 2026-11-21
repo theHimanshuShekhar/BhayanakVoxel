@@ -10,8 +10,9 @@
 //! (1024 by default, as the convergence views' truths are) at 1440p, with the seed of the
 //! convergence phase's truth A. Truth B, with another seed, gives the metric's noise floor in this
 //! view, and a line counts only where it is at least [`MIN_LINE_OVER_FLOOR`] times that floor.
-//! Primary's image is drawn as the window draws it, traced at half the size and upscaled; it is
-//! scored twice, against truth A, by FLIP (mean and 99th percentile, as the other views are):
+//! Primary's image is drawn as the window draws it, traced at half the size and upscaled, with the
+//! denoiser on (#55, [`render::Denoise::Full`]); it is scored twice, against truth A, by FLIP (mean
+//! and 99th percentile, as the other views are):
 //! - **`first_frame`**: the first frame of the view, with no history, which is what the player has
 //!   the frame after the sun changes (the shadows have no history, and neither does the upscaler
 //!   after a new sun). A few samples of the sun's disc a pixel
@@ -19,8 +20,14 @@
 //!   (`meets_target`, reported and printed, no gate), as the ticket's acceptance has it. The 4090
 //!   has it at 0.062 with 2 rays (ADR 0005's row), so the target is not met and is not loosened.
 //! - **`settled`**: after [`Settings::settle_frames`] frames of a camera that has not moved, the
-//!   upscaler's history having gathered samples. Reported beside the first frame, and not held to
-//!   the target.
+//!   upscaler's and the denoiser's histories having gathered samples. **This is what #55 gates**:
+//!   FLIP 0.05 or under ([`super::gi::PRIMARY_TARGET_FLIP`]), as in every view.
+//!
+//! **The weights.** Primary is drawn with the shadow weight that `--shadow-weight` chose
+//! ([`Settings::shadow_weight`]), which is what `first_frame` and `settled` are of, and again with
+//! the other one (`other_weight`), and with the denoiser off (`raw`: #52's Primary), so that one run
+//! has the comparison #55 asks for. The Reference at 64 samples (`reference_64`) is reported beside
+//! them, not gated.
 //!
 //! **The shadow-edge error.** Where the sun is half hidden, Primary weighs its rays by the
 //! cosine at the disc's centre and the Reference weighs each of its samples by its own cosine, so
@@ -40,7 +47,7 @@ use std::error::Error;
 use std::fs;
 use std::path::Path;
 
-use render::{Image, Offscreen, ReferenceOptions, Resolution};
+use render::{Denoise, Image, Offscreen, ReferenceOptions, Resolution, ShadowWeight};
 use serde::Serialize;
 
 use super::score::{self, Flip};
@@ -82,6 +89,9 @@ pub struct Settings {
     /// The shadow rays a pixel of Primary casts (`--shadow-rays`; the renderer's default if not
     /// given).
     pub shadow_rays: u32,
+    /// How Primary weighs the shadow rays (`--shadow-weight`): `first_frame` and `settled` are of
+    /// it, and the gate is on it.
+    pub shadow_weight: ShadowWeight,
 }
 
 impl Settings {
@@ -94,6 +104,7 @@ impl Settings {
             settle_frames: 32,
             flip: true,
             shadow_rays: render::DEFAULT_SHADOW_RAYS,
+            shadow_weight: ShadowWeight::default(),
         }
     }
 
@@ -105,6 +116,7 @@ impl Settings {
             settle_frames: 4,
             flip: false,
             shadow_rays: render::DEFAULT_SHADOW_RAYS,
+            shadow_weight: ShadowWeight::default(),
         }
     }
 }
@@ -137,11 +149,22 @@ pub struct ShadowsReport {
     pub target_flip: f64,
     pub min_line_over_floor: f64,
     pub target_counts: Option<bool>,
-    /// Primary's first frame, with no history: what the next frame after a sun change shows.
+    /// Primary's first frame, with no history: what the next frame after a sun change shows. The
+    /// denoiser is on and the shadow rays are weighed as `shadow_weight` says.
     pub first_frame: PrimaryScore,
-    /// Primary after `settle_frames` frames of a still camera.
+    /// Primary after `settle_frames` frames of a still camera. **What #55 gates**
+    /// (`convergence.gi.gates`, `primary-flip:sun`).
     pub settled: PrimaryScore,
     pub settle_frames: u32,
+    /// The weight of the sun's shadow rays of `first_frame` and `settled`, and the other one's, drawn
+    /// the same way in `other_weight`.
+    pub shadow_weight: &'static str,
+    pub other_shadow_weight: &'static str,
+    pub other_weight: PrimaryFrames,
+    /// Primary with the denoiser off (as #52 shipped it), the same weight as `shadow_weight`.
+    pub raw: PrimaryFrames,
+    /// The Reference at 64 samples against truth A: reported, not gated. Null without FLIP.
+    pub reference_64: Option<Scores>,
     /// Whether the first frame's FLIP mean is at or under the target; null without FLIP. The
     /// settled image is reported beside it and is not what is held to the target.
     pub meets_target: Option<bool>,
@@ -164,6 +187,13 @@ impl From<Flip> for Scores {
             flip_p99: flip.p99,
         }
     }
+}
+
+/// Primary's first frame and settled frame in one of the ways of drawing it.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct PrimaryFrames {
+    pub first_frame: PrimaryScore,
+    pub settled: PrimaryScore,
 }
 
 /// An image of Primary's, scored against truth A.
@@ -323,6 +353,9 @@ pub fn run(settings: &Settings, out: &Path) -> Result<ShadowsReport, Box<dyn Err
     gpu.set_sun_and_sky_only(true);
     gpu.set_shadow_rays(settings.shadow_rays);
     gpu.set_keep_history(true);
+    // Primary as the window draws it: the denoiser on (an `Offscreen` starts with it off).
+    gpu.set_denoise(Denoise::Full);
+    gpu.set_shadow_weight(settings.shadow_weight);
 
     // Truth A and B, then the unshadowed image: the Reference, with the same samples.
     let truth_a = truth(&mut gpu, &view.camera, TRUTH_SEEDS[0], settings.truth_spp);
@@ -338,13 +371,34 @@ pub fn run(settings: &Settings, out: &Path) -> Result<ShadowsReport, Box<dyn Err
         UNSHADOWED_SPP.min(settings.truth_spp),
     );
     gpu.set_reference_options(ReferenceOptions::default());
+    // The Reference at 64 samples, a frame's worth for a path tracer: reported beside Primary.
+    let reference_64 = truth(
+        &mut gpu,
+        &view.camera,
+        TRUTH_SEEDS[0],
+        64.min(settings.truth_spp),
+    );
 
-    // Primary: the first frame of the view, and the frame after `settle_frames` of it.
-    let first = gpu.render_upscaled(&view.camera);
-    let mut settled = first.clone();
-    for _ in 1..settings.settle_frames.max(2) {
-        settled = gpu.render_upscaled(&view.camera);
-    }
+    // Primary: the first frame of the view, and the frame after `settle_frames` of it, in each of the
+    // ways: the chosen weight (denoised), the other weight (denoised), the chosen weight with no
+    // denoiser. A change of either starts the history over.
+    let other = match settings.shadow_weight {
+        ShadowWeight::CentreCosine => ShadowWeight::PerSample,
+        ShadowWeight::PerSample => ShadowWeight::CentreCosine,
+    };
+    let mut frames = |denoise: Denoise, weight: ShadowWeight| {
+        gpu.set_denoise(denoise);
+        gpu.set_shadow_weight(weight);
+        let first = gpu.render_upscaled(&view.camera);
+        let mut settled = first.clone();
+        for _ in 1..settings.settle_frames.max(2) {
+            settled = gpu.render_upscaled(&view.camera);
+        }
+        (first, settled)
+    };
+    let (first, settled) = frames(Denoise::Full, settings.shadow_weight);
+    let (other_first, other_settled) = frames(Denoise::Full, other);
+    let (raw_first, raw_settled) = frames(Denoise::Off, settings.shadow_weight);
     drop(gpu);
 
     let sun = visible_sun(&truth_a.linear, &unshadowed.linear);
@@ -369,6 +423,15 @@ pub fn run(settings: &Settings, out: &Path) -> Result<ShadowsReport, Box<dyn Err
     };
     let first_frame = scored("Primary's first frame", &first)?;
     let settled_score = scored("Primary, settled", &settled)?;
+    let other_weight = PrimaryFrames {
+        first_frame: scored("Primary's first frame, the other weight", &other_first)?,
+        settled: scored("Primary, settled, the other weight", &other_settled)?,
+    };
+    let raw = PrimaryFrames {
+        first_frame: scored("Primary's first frame, no denoiser", &raw_first)?,
+        settled: scored("Primary, settled, no denoiser", &raw_settled)?,
+    };
+    let reference_64_score = flip("the Reference at 64 samples", &reference_64.image)?;
 
     let target_counts = floor.map(|f| TARGET_FLIP >= MIN_LINE_OVER_FLOOR * f.flip_mean);
     let meets_target = first_frame.flip.map(|f| f.flip_mean <= TARGET_FLIP);
@@ -381,6 +444,11 @@ pub fn run(settings: &Settings, out: &Path) -> Result<ShadowsReport, Box<dyn Err
         ("unshadowed.png", &unshadowed.image),
         ("primary-first.png", &first),
         ("primary-settled.png", &settled),
+        ("primary-first-other-weight.png", &other_first),
+        ("primary-settled-other-weight.png", &other_settled),
+        ("primary-first-no-denoiser.png", &raw_first),
+        ("primary-settled-no-denoiser.png", &raw_settled),
+        ("reference-64.png", &reference_64.image),
         ("edges.png", &edge_image(&edge, (width, height))),
     ] {
         write_png(&folder.join(file), image)?;
@@ -415,6 +483,11 @@ pub fn run(settings: &Settings, out: &Path) -> Result<ShadowsReport, Box<dyn Err
         first_frame,
         settled: settled_score,
         settle_frames: settings.settle_frames.max(2),
+        shadow_weight: settings.shadow_weight.name(),
+        other_shadow_weight: other.name(),
+        other_weight,
+        raw,
+        reference_64: reference_64_score,
         meets_target,
         edge_share,
         files,
@@ -435,11 +508,31 @@ pub fn print_summary(report: &ShadowsReport) {
         num(report.floor.map(|f| f.flip_mean), 4),
         report.edge_share * 100.0
     );
+    let settled = format!("settled ({} frames)", report.settle_frames);
     for (what, p) in [
-        ("first frame".to_string(), &report.first_frame),
         (
-            format!("settled ({} frames)", report.settle_frames),
+            format!("denoised, {}, first frame", report.shadow_weight),
+            &report.first_frame,
+        ),
+        (
+            format!("denoised, {}, {settled}", report.shadow_weight),
             &report.settled,
+        ),
+        (
+            format!("denoised, {}, first frame", report.other_shadow_weight),
+            &report.other_weight.first_frame,
+        ),
+        (
+            format!("denoised, {}, {settled}", report.other_shadow_weight),
+            &report.other_weight.settled,
+        ),
+        (
+            format!("no denoiser, {}, first frame", report.shadow_weight),
+            &report.raw.first_frame,
+        ),
+        (
+            format!("no denoiser, {}, {settled}", report.shadow_weight),
+            &report.raw.settled,
         ),
     ] {
         eprintln!(
@@ -451,6 +544,10 @@ pub fn print_summary(report: &ShadowsReport) {
             num(p.edge.other_mean, 2),
         );
     }
+    eprintln!(
+        "  the Reference at 64 samples: FLIP mean {} (reported, not gated)",
+        num(report.reference_64.map(|f| f.flip_mean), 4)
+    );
     let note = match (report.meets_target, report.target_counts) {
         (Some(meets), Some(counts)) => format!(
             "{}{}",

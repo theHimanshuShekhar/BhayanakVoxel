@@ -12,6 +12,7 @@ use crate::atmosphere::{AtmosphereTables, AtmosphereView};
 use crate::batch::max_samples;
 use crate::camera::{Camera, CameraUniform};
 use crate::debug_view::DebugView;
+use crate::denoise::{self, Denoise, SAMPLES_FORMAT};
 use crate::emitters::{Applied, EmitterIndex, Emitters, emissive_materials};
 use crate::gpu_materials;
 use crate::look::{Look, LookUniform};
@@ -78,6 +79,38 @@ const EVERYWHERE: ([i32; 3], [i32; 3]) = ([i32::MIN / 2; 3], [i32::MAX / 2; 3]);
 
 /// Format of the upscaler's history: encoded colour, and in alpha the frames it has been through.
 pub const HISTORY_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
+
+/// Where `shade_pass` reads the light that it lights the image with (the denoiser's result, or the
+/// frame's samples as they are when it is off): a texture of [`SAMPLES_FORMAT`], the incident light
+/// in xyz and the sun's weight in w (`denoised_light` in `shade.wgsl`).
+const DENOISED_BINDING: u32 = 23;
+
+/// How `shadows` weighs the light of each of a pixel's shadow rays (ADR 0005, "Sun and shadows").
+/// The two agree in expectation where the surface faces the sun squarely, and differ by the change of
+/// the cosine over the sun's disc at a penumbra and where the surface is nearly edge-on to the sun,
+/// which is where #52's miss was. The bench's `--shadow-weight` chooses, and reports both.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(u32)]
+pub enum ShadowWeight {
+    /// The cosine at the disc's centre, however many of the rays see the sun: no noise on a lit
+    /// surface, and a bias in the penumbra (#52's, shipped on 2026-11-17).
+    #[default]
+    CentreCosine = 0,
+    /// Each ray weighed by its own cosine over the disc's mean cosine, as the Reference weighs its
+    /// samples: unbiased, and noisier where a surface is edge-on to the sun.
+    PerSample = 1,
+}
+
+impl ShadowWeight {
+    pub const ALL: [ShadowWeight; 2] = [Self::CentreCosine, Self::PerSample];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::CentreCosine => "centre-cosine",
+            Self::PerSample => "per-sample",
+        }
+    }
+}
 
 /// `Level` in `trace.wgsl`.
 #[repr(C)]
@@ -289,7 +322,8 @@ struct FrameUniform {
     /// rays a pixel casts.
     light: [u32; 4],
     /// Primary's radiance cache: the frame's number, 1 if an Edit or the sun changed lately (in the
-    /// cells of the box below), and two unused.
+    /// cells of the box below), then how `shadows` weighs each ray (0: the cosine at the disc's
+    /// centre, 1: the ray's own cosine, [`ShadowWeight`]), and one unused.
     gi: [u32; 4],
     /// The first Voxel of the box that the cache forgets faster in, and one past its last (the
     /// fourth word of each is unused).
@@ -327,7 +361,8 @@ impl Plane {
             format,
             usage: wgpu::TextureUsages::STORAGE_BINDING
                 | wgpu::TextureUsages::TEXTURE_BINDING
-                | wgpu::TextureUsages::COPY_SRC,
+                | wgpu::TextureUsages::COPY_SRC
+                | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
@@ -391,6 +426,8 @@ pub struct Target {
     /// The light from the bounce, the sky and the emitters at each hit (`gi_trace`), read by the lit
     /// image's pass.
     gi_light: Plane,
+    /// The denoiser's samples, history and results (`denoise.rs`).
+    denoise: denoise::Buffers,
     reference_size: (u32, u32),
     /// The reference path tracer's mean as linear light, and the display transform's images for it.
     reference_hdr: Plane,
@@ -431,6 +468,7 @@ impl Target {
             normals: Plane::new(device, "smooth normals", internal, NORMALS_FORMAT),
             sun_weights: Plane::new(device, "sun weights", internal, SUN_FORMAT),
             gi_light: Plane::new(device, "gi light", internal, GI_FORMAT),
+            denoise: denoise::Buffers::new(device, internal),
             reference_size,
             reference_hdr: Plane::new(
                 device,
@@ -568,6 +606,15 @@ pub struct Tracer {
     /// Whether Primary's light has the flat ambient of before #54 in place of its GI (see
     /// [`Tracer::set_flat_ambient`]).
     flat_ambient: bool,
+    /// The frame's samples of the two noisy signals at every pixel (`gi_samples`), and the denoiser
+    /// that works on them (`denoise.rs`).
+    samples_layout: wgpu::BindGroupLayout,
+    samples: wgpu::ComputePipeline,
+    denoise_pass: denoise::Pass,
+    denoise: Denoise,
+    /// The history image the denoiser wrote in the last frame of Primary that had one (the last
+    /// frame's result is in it, see `Buffers::result`), none for a frame that had no history.
+    denoise_written: Option<usize>,
     shade_layout: wgpu::BindGroupLayout,
     shade: wgpu::ComputePipeline,
     /// The display transform and the exposure it keeps from frame to frame.
@@ -584,6 +631,8 @@ pub struct Tracer {
     sun_and_sky_only: bool,
     /// The shadow rays a pixel casts (see [`Tracer::set_shadow_rays`]).
     shadow_rays: u32,
+    /// How each ray's light is weighed (see [`Tracer::set_shadow_weight`]).
+    shadow_weight: ShadowWeight,
     /// The atmosphere's tables, and the height of the Planet's ground along the up: 0 in a world
     /// that is not a Planet (the camera's height is then its height above y = 0 along its
     /// up), the Planet's radius over the Planet ([`Tracer::set_ground_level`]).
@@ -1217,13 +1266,25 @@ impl Tracer {
                 texture(5, uint),
                 texture(6, uint),
                 texture(8, loaded),
-                texture(10, loaded),
                 layout_entry(GI_CACHE_BINDING, buffer_binding(STORAGE_WRITE)),
-                texture(21, loaded),
+                texture(DENOISED_BINDING, loaded),
             ]
             .into_iter()
             .chain(AtmosphereTables::layout_entries())
             .collect::<Vec<_>>(),
+        });
+        let samples_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("denoise samples"),
+            entries: &[
+                layout_entry(0, buffer_binding(wgpu::BufferBindingType::Uniform)),
+                layout_entry(2, buffer_binding(wgpu::BufferBindingType::Uniform)),
+                texture(5, uint),
+                texture(6, uint),
+                texture(8, loaded),
+                texture(10, loaded),
+                texture(21, loaded),
+                layout_entry(22, storage_texture(SAMPLES_FORMAT)),
+            ],
         });
         let materials = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("materials"),
@@ -1310,6 +1371,15 @@ impl Tracer {
                 | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
+        let samples = compute_pipeline(
+            device,
+            "denoise samples",
+            shaders::SHADE,
+            "gi_samples",
+            &samples_layout,
+            &scene_layout,
+            &[],
+        );
         let shade = compute_pipeline(
             device,
             "shade",
@@ -1352,6 +1422,11 @@ impl Tracer {
             camera_position: [0.0; 3],
             emitter_index,
             flat_ambient: false,
+            samples_layout,
+            samples,
+            denoise_pass: denoise::Pass::new(device),
+            denoise: Denoise::default(),
+            denoise_written: None,
             shade_layout,
             shade,
             post: Post::new(device),
@@ -1359,6 +1434,7 @@ impl Tracer {
             history_sun_epoch: 0,
             sun_and_sky_only: false,
             shadow_rays: DEFAULT_SHADOW_RAYS,
+            shadow_weight: ShadowWeight::default(),
             atmosphere: AtmosphereTables::new(device),
             ground_level: 0.0,
             look: Look::default(),
@@ -1443,7 +1519,8 @@ impl Tracer {
         );
         // Nothing carries over from one call to the next, the exposure included: it settles at
         // once, on this image. (The radiance cache does: it is the world's, not the image's.)
-        self.dispatch_primary(device, queue, profiler, encoder, target, 1.0);
+        self.denoise_written = None;
+        self.dispatch_primary(device, queue, profiler, encoder, target, 1.0, None);
         self.gi_boost = self.gi_boost.saturating_sub(1);
     }
 
@@ -1516,7 +1593,22 @@ impl Tracer {
             sun,
             target.resolution.internal,
         );
-        self.dispatch_primary(device, queue, profiler, encoder, target, rate);
+        // The denoiser's history is the upscaler's: the same cameras, and it starts over with it.
+        let denoise = denoise::Frame::new(
+            &frame,
+            self.stages.smooth_normals,
+            (self.gi_boost > 0).then_some(self.gi_boost_box),
+        );
+        self.denoise_written = Some(denoise.written());
+        self.dispatch_primary(
+            device,
+            queue,
+            profiler,
+            encoder,
+            target,
+            rate,
+            Some(&denoise),
+        );
         self.gi_boost = self.gi_boost.saturating_sub(1);
         self.edit_settling = self.edit_settling.saturating_sub(1);
         self.upscale
@@ -2110,6 +2202,53 @@ impl Tracer {
         }
     }
 
+    /// Chooses how `shadows` weighs the light of each of its rays ([`ShadowWeight`]). The
+    /// upscaler's history and the denoiser's start over: they hold the other weight's light.
+    pub fn set_shadow_weight(&mut self, weight: ShadowWeight) {
+        if weight != self.shadow_weight {
+            self.shadow_weight = weight;
+            self.history.reset();
+        }
+    }
+
+    pub fn shadow_weight(&self) -> ShadowWeight {
+        self.shadow_weight
+    }
+
+    /// Chooses how much of the denoiser (#55) runs ([`Denoise`]): all of it for the game's A-SVGF
+    /// (what a `Tracer` has), the temporal accumulation alone, or none, which lights the image with
+    /// the frame's samples as they are, as before the denoiser. The upscaler's history and the
+    /// denoiser's start over.
+    pub fn set_denoise(&mut self, mode: Denoise) {
+        if mode != self.denoise {
+            self.denoise = mode;
+            self.history.reset();
+        }
+    }
+
+    pub fn denoise(&self) -> Denoise {
+        self.denoise
+    }
+
+    /// The texture that the last frame of Primary was lit with (the denoiser's result, or the frame's
+    /// samples as they are where it is off): the incident light in xyz and the sun's weight in w,
+    /// and whether it is `f32` (else half floats). For tests and the bench.
+    pub(crate) fn light_signals<'a>(&self, target: &'a Target) -> (&'a Plane, bool) {
+        let plane = target.denoise.result(self.denoise, self.denoise_written);
+        let wide = self.denoise == Denoise::Temporal && self.denoise_written.is_some();
+        (plane, wide)
+    }
+
+    /// The variance that the denoiser's temporal kernel estimated for the last frame's light.
+    pub(crate) fn light_variance<'a>(&self, target: &'a Target) -> &'a Plane {
+        target.denoise.temporal_variance()
+    }
+
+    /// The frame's samples of the last frame of Primary, before the denoiser (half floats).
+    pub(crate) fn frame_samples<'a>(&self, target: &'a Target) -> &'a Plane {
+        target.denoise.samples()
+    }
+
     /// Sets the seed of the reference's random numbers (the default is [`RNG_SEED`]) and starts
     /// its image over: the same view, sample count and seed give the same image, and another seed
     /// gives an independent one of the same expected value.
@@ -2206,7 +2345,12 @@ impl Tracer {
                 u32::from(!self.sun_and_sky_only),
                 self.shadow_rays,
             ],
-            gi: [self.gi_frame, u32::from(self.gi_boost > 0), 0, 0],
+            gi: [
+                self.gi_frame,
+                u32::from(self.gi_boost > 0),
+                self.shadow_weight as u32,
+                0,
+            ],
             boost_min: [
                 self.gi_boost_box.0[0],
                 self.gi_boost_box.0[1],
@@ -2228,6 +2372,7 @@ impl Tracer {
     /// the display transform, which makes the encoded lit image. A debug view is drawn by primary
     /// visibility itself (the upscaler draws the history length one), and passes through the
     /// display transform as it is.
+    #[allow(clippy::too_many_arguments)]
     fn dispatch_primary(
         &self,
         device: &wgpu::Device,
@@ -2236,6 +2381,7 @@ impl Tracer {
         encoder: &mut wgpu::CommandEncoder,
         target: &Target,
         rate: f32,
+        denoise: Option<&denoise::Frame>,
     ) {
         self.dispatch(
             device,
@@ -2261,7 +2407,8 @@ impl Tracer {
             }
             self.dispatch_shadows(device, profiler, encoder, target);
             self.dispatch_gi(device, profiler, encoder, target);
-            self.dispatch_shade(device, profiler, encoder, target);
+            let written = self.dispatch_denoise(device, queue, profiler, encoder, target, denoise);
+            self.dispatch_shade(device, profiler, encoder, target, written);
         }
         self.post.encode(
             device,
@@ -2401,14 +2548,68 @@ impl Tracer {
         pass.dispatch_workgroups(GI_CACHE_SLOTS.div_ceil(64) as u32, 1, 1);
     }
 
-    /// The lit image as linear light, from the G-buffer and the sun's light at each hit
-    /// (`shade_pass` in `shade.wgsl`).
+    /// The denoiser (`denoise.rs`, #55), in one timed pass called `denoise`: the frame's samples of
+    /// the sun's weight and the incident light at every pixel (`gi_samples`), then, with a `frame`
+    /// to carry on from (not for a frame with no history to keep, as `encode_primary`'s) and unless
+    /// the denoiser is off, the temporal accumulation and the filter. Returns the history image the
+    /// frame wrote, which says where the result is (`Buffers::result`); `None` for a frame with no
+    /// history to keep, which `shade_pass` lights with the samples.
+    fn dispatch_denoise(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        profiler: &mut Profiler,
+        encoder: &mut wgpu::CommandEncoder,
+        target: &Target,
+        frame: Option<&denoise::Frame>,
+    ) -> Option<usize> {
+        let view = plane_entry;
+        let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("denoise samples"),
+            layout: &self.samples_layout,
+            entries: &[
+                buffer_entry(0, &self.camera_buffer),
+                buffer_entry(2, &self.frame_buffer),
+                view(5, &target.gbuffer),
+                view(6, &target.surface),
+                view(8, &target.normals),
+                view(10, &target.sun_weights),
+                view(21, &target.gi_light),
+                view(22, target.denoise.samples()),
+            ],
+        });
+        let size = target.resolution.internal;
+        let mut pass = profiler.compute_pass(encoder, "denoise");
+        pass.set_pipeline(&self.samples);
+        pass.set_bind_group(0, &self.scene.group, &[]);
+        pass.set_bind_group(1, &group, &[]);
+        pass.dispatch_workgroups(size.0.div_ceil(8), size.1.div_ceil(8), 1);
+        let frame = frame?;
+        self.denoise_pass.encode(
+            device,
+            queue,
+            &mut pass,
+            frame,
+            self.denoise,
+            size,
+            &target.denoise,
+            &target.gbuffer,
+            &target.surface,
+            &target.normals,
+        );
+        Some(frame.written())
+    }
+
+    /// The lit image as linear light, from the G-buffer and the light at each hit: the sun's weight
+    /// and the incident light, denoised or not (`shade_pass` in `shade.wgsl`). `written` is the
+    /// history image the denoiser's frame wrote, if it ran.
     fn dispatch_shade(
         &self,
         device: &wgpu::Device,
         profiler: &mut Profiler,
         encoder: &mut wgpu::CommandEncoder,
         target: &Target,
+        written: Option<usize>,
     ) {
         let view = plane_entry;
         let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -2431,9 +2632,11 @@ impl Tracer {
                 view(5, &target.gbuffer),
                 view(6, &target.surface),
                 view(8, &target.normals),
-                view(10, &target.sun_weights),
                 buffer_entry(GI_CACHE_BINDING, &self.gi_cache),
-                view(21, &target.gi_light),
+                view(
+                    DENOISED_BINDING,
+                    target.denoise.result(self.denoise, written),
+                ),
             ]
             .into_iter()
             .chain(self.atmosphere.entries())

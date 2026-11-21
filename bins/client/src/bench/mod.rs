@@ -291,6 +291,10 @@ fn run(args: &Args) -> Result<u8, Box<dyn Error>> {
         if let Some(rays) = args.shadow_rays {
             settings.shadows.shadow_rays = rays;
         }
+        if let Some(weight) = args.shadow_weight {
+            settings.shadows.shadow_weight = weight;
+            settings.gi.shadow_weight = weight;
+        }
         // It is not budgeted, so a phase that fails must not take the timed results with it: not
         // by an error, and not by a panic either (the readback's `expect`s, wgpu's uncaptured-error
         // handler, a worker of FLIP's thread pool), which would end the process with status 101
@@ -488,8 +492,10 @@ fn new_flight(plan: &Plan, args: &Args) -> Result<Flight, Box<dyn Error>> {
 /// What the flight needs of a context before it is timed.
 fn prepare(gpu: &mut Offscreen, plan: &Plan) {
     // The flight times what the player's frame costs, and the player's Primary has the radiance
-    // cache's GI (#54): an `Offscreen` starts with the flat ambient of before it.
+    // cache's GI (#54) and the denoiser (#55): an `Offscreen` starts with the flat ambient of before
+    // them and no denoiser.
     gpu.set_flat_ambient(false);
+    gpu.set_denoise(render::Denoise::Full);
     if !plan.patch {
         // The atmosphere measures the camera's height from the Planet's sea level.
         gpu.set_ground_level(f64::from(planet_gen::world_map::WORLD_RADIUS));
@@ -620,6 +626,7 @@ fn run_streaming(
     let streamer = stream::Streamer::new();
     let mut gpu = Offscreen::with_resolution(resolution, streamer.scene())?;
     gpu.set_flat_ambient(false);
+    gpu.set_denoise(render::Denoise::Full);
     gpu.set_ground_level(f64::from(planet_gen::world_map::TEST_RADIUS));
     streamer.set_buffer_limit(gpu.buffer_limit_words());
     // A frame is drawn every frame in a measurement, and every tenth in a smoke test, where a

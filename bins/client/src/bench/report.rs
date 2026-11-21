@@ -167,7 +167,22 @@ use super::stream::StreamReport;
 /// shadow rays (`hw_nearest`), the frame with the hardware's updates in, and the hardware context's
 /// `accel` and Edit stress). `edits.accel` is the Edit stress's updates of the
 /// acceleration structures (null on compute). Nothing else is changed.
-pub const SCHEMA_VERSION: u32 = 31;
+///
+/// 32 (#55; 30 is #226's, merged, and 31 is #233's) adds the denoiser. A new pass line
+/// `denoise` is in `passes[]` (the report lists passes generically), with its stage budget in the
+/// budgets file's `[passes]`. Primary is drawn denoised in the convergence phase's views and in every
+/// path of the flight, and **a number of schema 31 or before is not comparable with a Primary one**
+/// of this schema. In each view's `gi`: `gi` is now Primary with the denoiser on and the sun's shadow
+/// rays weighed as `shadow_weight` says (`--shadow-weight`, `centre-cosine` unless given); `raw` is
+/// the cache's GI with no denoiser (what `gi` was before); `other_weight` is `gi` with the other
+/// weight (`other_shadow_weight`); `reference_64` is FLIP's mean of the Reference at 64 samples
+/// against truth A. In `convergence.shadows`: `first_frame` and `settled` are denoised with
+/// `shadow_weight`, and `other_weight` and `raw` (each with `first_frame` and `settled`), the two
+/// names and `reference_64` (mean and 99th percentile) are new. In `convergence.gi.gates`
+/// `room_target_flip` is now `primary_target_flip` (0.05, every view's settled `gi` and the sun
+/// view's settled Primary; the gate `room-flip` is now `primary-flip:VIEW` with `sun` among the views).
+/// Nothing else is changed.
+pub const SCHEMA_VERSION: u32 = 32;
 
 /// One timed thing (a pass, or the GPU total of a profiler frame) in one mode, against its
 /// budget. In reference mode a profiler frame is one sample, so the entries of that mode have
@@ -679,7 +694,7 @@ mod tests {
                 "streaming_real_time"
             ]
         );
-        assert_eq!(json["schema_version"], 31);
+        assert_eq!(json["schema_version"], 32);
         assert_eq!(json["rt"]["active"], "compute");
         assert_eq!(json["rt"]["comparison"], serde_json::Value::Null);
         assert_eq!(json["convergence"], serde_json::Value::Null);

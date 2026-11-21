@@ -47,7 +47,9 @@ struct Frame {
     light: vec4<u32>,
     // Primary's radiance cache (gi.wgsl): the number of the frame (it counts every frame of
     // Primary, from 1, whatever the upscaler's history does), then 1 for the frames after an Edit
-    // or a new sun, when the cells of the box below forget faster, then two unused.
+    // or a new sun, when the cells of the box below forget faster, then how `shadows` weighs each
+    // ray of the sun (0: the cosine at the disc's centre; 1: the ray's own cosine, as the
+    // Reference's samples are), then one unused.
     gi: vec4<u32>,
     // The first Voxel of that box and one past its last (level 0 coordinates), then one unused each.
     boost_min: vec4<i32>,

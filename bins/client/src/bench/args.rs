@@ -77,6 +77,12 @@ Options:
                    the flight on hw-nearest, each on a context of its own, and the passes that cast
                    rays compared: `rt.comparison`). The report's `rt` says which ran and what the
                    acceleration structures cost to update
+  --shadow-weight W How Primary weighs the shadow rays of the sun in the convergence phase (#55):
+                   `centre-cosine` (the cosine to the centre of the disc, what shipped with #52)
+                   or `per-sample` (each ray's own cosine, the Reference's) [default:
+                   centre-cosine]. It is the one the gates are held on and the one the report's
+                   `gi` and `settled` are of; the other is reported beside it
+                   (`other_shadow_weight`), so one run compares both
   --no-fail        Exit with status 0 even if a pass is over its budget, there is a hole or a
                    real-time gate is over
   -h, --help       Print this";
@@ -132,6 +138,9 @@ pub struct Args {
     pub shadow_rays: Option<u32>,
     /// `--rt-backend` (#50): how rays find the Planet.
     pub rt: RtMode,
+    /// `--shadow-weight W`: which weight of the sun's shadow rays the convergence phase's gates are
+    /// held on (#55); the other is reported beside it.
+    pub shadow_weight: Option<render::ShadowWeight>,
     pub size: Option<(u32, u32)>,
     pub bias: f64,
     pub diag: Diag,
@@ -164,6 +173,7 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Parsed, String> {
         flip_gamma22: false,
         shadow_rays: None,
         rt: RtMode::default(),
+        shadow_weight: None,
         size: None,
         bias: 1.0,
         diag: Diag::default(),
@@ -191,6 +201,9 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Parsed, String> {
             "--truth-spp" => parsed.truth_spp = Some(truth_spp(&value("--truth-spp")?)?),
             "--shadow-rays" => parsed.shadow_rays = Some(shadow_rays(&value("--shadow-rays")?)?),
             "--rt-backend" => parsed.rt = RtMode::parse(&value("--rt-backend")?)?,
+            "--shadow-weight" => {
+                parsed.shadow_weight = Some(shadow_weight(&value("--shadow-weight")?)?);
+            }
             "--out" => parsed.out = value("--out")?.into(),
             "--budgets" => parsed.budgets = Some(value("--budgets")?.into()),
             "--size" => parsed.size = Some(size(&value("--size")?)?),
@@ -220,6 +233,12 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Parsed, String> {
         return Err(
             "--shadow-rays is for the convergence phase's sun-and-sky view, which \
              --no-convergence leaves out"
+                .into(),
+        );
+    }
+    if parsed.shadow_weight.is_some() && !parsed.convergence {
+        return Err(
+            "--shadow-weight is for the convergence phase, which --no-convergence leaves out"
                 .into(),
         );
     }
@@ -279,6 +298,17 @@ fn shadow_rays(text: &str) -> Result<u32, String> {
                 "`{text}` is not a number of shadow rays from 1 to {}",
                 render::MAX_SHADOW_RAYS
             )
+        })
+}
+
+/// `--shadow-weight`: the name of one of `render::ShadowWeight::ALL`.
+fn shadow_weight(text: &str) -> Result<render::ShadowWeight, String> {
+    render::ShadowWeight::ALL
+        .into_iter()
+        .find(|w| w.name() == text)
+        .ok_or_else(|| {
+            let names: Vec<_> = render::ShadowWeight::ALL.iter().map(|w| w.name()).collect();
+            format!("`{text}` is not a shadow weight: {}", names.join(" or "))
         })
 }
 
@@ -354,6 +384,7 @@ mod tests {
                 flip_gamma22: false,
                 shadow_rays: None,
                 rt: RtMode::Compute,
+                shadow_weight: None,
                 size: None,
                 bias: 1.0,
                 diag: Diag::default()
@@ -475,6 +506,26 @@ mod tests {
             &["--shadow-rays", "two"],
             // The view is of the convergence phase, which this leaves out.
             &["--no-convergence", "--shadow-rays", "2"],
+        ] {
+            assert!(parse_all(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn the_shadow_weight_is_one_of_the_two_the_renderer_has() {
+        assert_eq!(run(&[]).shadow_weight, None);
+        assert_eq!(
+            run(&["--shadow-weight", "per-sample"]).shadow_weight,
+            Some(render::ShadowWeight::PerSample)
+        );
+        assert_eq!(
+            run(&["--shadow-weight", "centre-cosine"]).shadow_weight,
+            Some(render::ShadowWeight::CentreCosine)
+        );
+        for bad in [
+            &["--shadow-weight", "cosine"][..],
+            &["--shadow-weight"],
+            &["--no-convergence", "--shadow-weight", "per-sample"],
         ] {
             assert!(parse_all(bad).is_err(), "{bad:?}");
         }

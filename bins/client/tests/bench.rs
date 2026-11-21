@@ -159,7 +159,12 @@ fn check_convergence(convergence: &Value, out: &Path) {
         // Primary against truth (#54): the flat ambient and the cache's GI, each in its first frame
         // and its settled one, with no FLIP in a short run but the images' brightness.
         let gi = &view["gi"];
-        for variant in ["flat", "gi"] {
+        // And with the denoiser (#55): `raw` has none, `gi` has it with the sun's shadow rays
+        // weighed as `shadow_weight` says, and `other_weight` with the other weight.
+        assert_eq!(string(&gi["shadow_weight"]), "centre-cosine");
+        assert_eq!(string(&gi["other_shadow_weight"]), "per-sample");
+        assert!(gi["reference_64"].is_null(), "no FLIP: {name}");
+        for variant in ["flat", "raw", "gi", "other_weight"] {
             for when in ["first_frame", "settled"] {
                 let score = &gi[variant][when];
                 assert!(score["flip"].is_null(), "no FLIP: {name} {variant} {when}");
@@ -173,8 +178,12 @@ fn check_convergence(convergence: &Value, out: &Path) {
         for file in [
             "primary-flat-first-frame.png",
             "primary-flat-settled.png",
+            "primary-raw-first-frame.png",
+            "primary-raw-settled.png",
             "primary-gi-first-frame.png",
             "primary-gi-settled.png",
+            "primary-gi-per-sample-first-frame.png",
+            "primary-gi-per-sample-settled.png",
         ] {
             assert!(
                 out.join(string(&convergence["folder"]))
@@ -227,7 +236,7 @@ fn check_convergence(convergence: &Value, out: &Path) {
     let gates = &convergence["gi"]["gates"];
     assert_eq!(gates["held"], false);
     assert_eq!(gates["over"], serde_json::json!([]));
-    assert_eq!(number(&gates["room_target_flip"]), 0.10);
+    assert_eq!(number(&gates["primary_target_flip"]), 0.05);
     assert_eq!(number(&gates["settle_within_ms"]), 500.0);
     assert!(
         out.join(string(&convergence["folder"]))
@@ -256,6 +265,17 @@ fn check_convergence(convergence: &Value, out: &Path) {
     assert!(sun["flip"].is_null(), "--short runs no FLIP");
     assert!(sun["floor"].is_null() && sun["meets_target"].is_null());
     assert_eq!(sun["seeds"]["truth_a"], 1);
+    // Primary is denoised (#55) with the weight of the sun's rays that `--shadow-weight` chose, and
+    // the other weight and the denoiser off are reported beside it, with the Reference at 64 samples.
+    assert_eq!(string(&sun["shadow_weight"]), "centre-cosine");
+    assert_eq!(string(&sun["other_shadow_weight"]), "per-sample");
+    assert!(sun["reference_64"].is_null(), "no FLIP");
+    for variant in ["other_weight", "raw"] {
+        for when in ["first_frame", "settled"] {
+            assert!(sun[variant][when]["flip"].is_null(), "{variant} {when}");
+            assert!(sun[variant][when]["edge"]["edge_pixels"].is_u64());
+        }
+    }
     for score in ["first_frame", "settled"] {
         assert!(sun[score]["flip"].is_null(), "{score}");
         // The shadow-edge error is made without FLIP.
@@ -270,6 +290,11 @@ fn check_convergence(convergence: &Value, out: &Path) {
         "unshadowed.png",
         "primary-first.png",
         "primary-settled.png",
+        "primary-first-other-weight.png",
+        "primary-settled-other-weight.png",
+        "primary-first-no-denoiser.png",
+        "primary-settled-no-denoiser.png",
+        "reference-64.png",
         "edges.png",
     ] {
         assert!(folder.join(file).is_file(), "sun/{file}");
@@ -281,7 +306,7 @@ fn check_convergence(convergence: &Value, out: &Path) {
 }
 
 fn check_schema(report: &Value, out: &Path) {
-    assert_eq!(report["schema_version"], 31);
+    assert_eq!(report["schema_version"], 32);
     // The default is the compute backend, with no acceleration structures (#50).
     assert_eq!(report["rt"]["requested"], "compute");
     assert_eq!(report["rt"]["active"], "compute");
@@ -369,12 +394,15 @@ fn check_schema(report: &Value, out: &Path) {
             passes.iter().any(|p| string(&p["name"]) == mode),
             "{mode}: {passes:?}"
         );
-        // Primary mode also upscales.
+        // Primary mode also denoises (#55: the `denoise` pass, which the budgets file holds to
+        // 1.0 ms) and upscales.
         if mode == "primary" {
-            assert!(
-                passes.iter().any(|p| string(&p["name"]) == "upscale"),
-                "{passes:?}"
-            );
+            for pass in ["denoise", "upscale"] {
+                assert!(
+                    passes.iter().any(|p| string(&p["name"]) == pass),
+                    "{pass}: {passes:?}"
+                );
+            }
         }
         for pass in passes {
             check_entry(pass);
