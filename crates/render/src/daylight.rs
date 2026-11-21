@@ -46,12 +46,18 @@ pub const MOON_LIGHT: [f32; 3] = [0.018, 0.020, 0.038];
 
 /// The moon's disc as the sky shows it: its radiance (the units of the sky's own), pale and cool.
 /// The disc is added to the sky and the light it stands for is the key light's, so nothing counts it
-/// twice (see `tracer::Key`).
+/// twice (see `tracer::KeyLight`).
 pub const MOON_DISC: [f32; 3] = [0.30, 0.29, 0.38];
 
 /// How far the sun's step in one frame may go, in radians, and still be a drift: 2 degrees. A
 /// clock at the default day moves the sun 0.003 degrees a frame; a sped-up cycle of a minute 0.1.
 pub const JUMP_ANGLE: f32 = 2.0 * std::f32::consts::PI / 180.0;
+
+/// The shortest day a clock may be given, in seconds: at 60 frames a second a day of this length
+/// moves the sun 1.5 degrees a frame, which is a drift. A day of 3 seconds would move it 2.0, exactly
+/// [`JUMP_ANGLE`], and a shorter one would jump on every frame. The bench's `--day-seconds` and the
+/// overlay's day length slider are both floored here.
+pub const SHORTEST_DAY_SECONDS: f64 = 4.0;
 
 const DEGREES: f64 = std::f64::consts::PI / 180.0;
 
@@ -337,8 +343,9 @@ impl Daylight {
     /// jump from the sky of the last step. It is a jump if
     /// - it is the first step;
     /// - the clock was set since the last (its epoch moved), whatever the time was set to; or
-    /// - the sun went further than [`JUMP_ANGLE`] in the step (a big step of a fast or a
-    ///   long-stalled clock). The angle is between the two sun directions, so a time that wraps
+    /// - the sun went further than [`JUMP_ANGLE`] in the step (a fast clock's big step, or the catch-up
+    ///   of the shown sky after a Still Reference view held it, as the client does). The angle is
+    ///   between the two sun directions, so a time that wraps
     ///   past midnight is a small step and a whole day is none.
     ///
     /// A slower step is a drift. The time of day alone does not say which: the same two times are a
@@ -374,6 +381,15 @@ mod tests {
 
     fn near(a: [f32; 3], b: [f32; 3], tolerance: f32) -> bool {
         (0..3).all(|i| (a[i] - b[i]).abs() < tolerance)
+    }
+
+    #[test]
+    fn the_shortest_day_moves_the_sun_less_than_a_jump_a_frame_at_60_hz() {
+        let degrees_a_frame = 360.0 / (SHORTEST_DAY_SECONDS * 60.0);
+        assert!(
+            degrees_a_frame < f64::from(JUMP_ANGLE.to_degrees()) - 0.1,
+            "{degrees_a_frame}"
+        );
     }
 
     #[test]

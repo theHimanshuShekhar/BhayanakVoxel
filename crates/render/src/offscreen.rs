@@ -445,6 +445,13 @@ impl Offscreen {
         self.sky_frame = frame;
     }
 
+    /// The light that casts the shadows of a frame of `camera` now: the sun or the moon, with the
+    /// radiance it is given (see [`KeyLight`](crate::tracer::KeyLight)).
+    pub fn key_light(&mut self, camera: &Camera) -> crate::tracer::KeyLight {
+        let sun = self.lit_sun(camera);
+        self.tracer.key_light(camera, &sun)
+    }
+
     /// How many times the sun has jumped: see [`Tracer::sun_epoch`].
     pub fn sun_epoch(&self) -> u64 {
         self.tracer.sun_epoch()

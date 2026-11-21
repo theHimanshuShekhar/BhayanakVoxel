@@ -13,16 +13,18 @@
 //! 2. **Does the exposure pump?** Auto-exposure follows the day (τ 2.5 s, [`render::post`]), which
 //!    must be a smooth rise at dusk and fall at dawn, not a wobble. The exposure is read back
 //!    every few frames (outside the timed part) and [`exposure_stability`] says how far and how fast
-//!    it went and how often it turned round.
+//!    it went and how often it turned round. It is read twice: over the flight (`exposure`, where
+//!    the scenery changes the exposure too: a ridge against the sky, a cave mouth), and from a
+//!    **fixed camera** over the same day (`exposure_fixed_camera`), where only the sky can: that
+//!    one is the evidence for "no pumping", and the flight's is what a player sees.
 //! 3. **Does the radiance cache keep up with a sun that drifts?** A drifting sun does not boost the
 //!    cache (ADR 0005, #54); it follows by its normal updates. [`cache_follow`] drifts the clock
 //!    from four times of day for 2 seconds at the default pace and at the sped-up one, and compares
 //!    the image it ends with against the same time of day after a jump (the cache boosted, then
 //!    settled). The difference is in 8-bit levels, next to the floor of two settled frames.
 //!
-//! The clock here is stepped by the bench itself, and not by [`crate::day::DayClock`], whose
-//! freeze rule is about a camera that stops: here the camera moves every frame, so it would run
-//! anyway.
+//! The clock here is stepped by the bench itself, and not by [`crate::day::DayClock`], whose hold
+//! is for a Reference view that is Still: this is Primary, drawn every frame.
 
 use std::error::Error;
 use std::time::Instant;
@@ -46,8 +48,8 @@ const RATE: f64 = 60.0;
 pub const DEFAULT_DAY_SECONDS: f64 = 60.0;
 
 /// The shortest day: a sun that moves 2 degrees a frame is a jump, and this bench's frames are
-/// meant to be drifts. 4 seconds is 240 frames, 1.5 degrees a frame.
-pub const SHORTEST_DAY_SECONDS: f64 = 4.0;
+/// meant to be drifts. 4 seconds is 240 frames, 1.5 degrees a frame (also the overlay's floor).
+pub const SHORTEST_DAY_SECONDS: f64 = render::daylight::SHORTEST_DAY_SECONDS;
 
 /// Frames between two readings of the exposure (6 is 10 a second).
 const EXPOSURE_EVERY: usize = 6;
@@ -61,6 +63,11 @@ const EXPOSURE_DEADBAND: f64 = 0.05;
 /// light changes hands (0.21 and 0.75), which is a jump and would show the boost and not the drift.
 const FOLLOW_TIMES: [f64; 4] = [0.15, 0.30, 0.55, 0.82];
 
+/// Frames the fixed camera's exposure is let to settle at the day's first sky before it is read: 450
+/// is 7.5 s, 3 of the exposure's τ of 2.5 s, so that what is read is the day and not the first
+/// frames' catching up with where it starts.
+const EXPOSURE_WARM_FRAMES: u32 = 450;
+
 /// Frames to warm the caches at a time of day, to run the drift, and to settle the reference.
 const WARM_FRAMES: u32 = 90;
 const DRIFT_FRAMES: u32 = 120;
@@ -68,7 +75,9 @@ const SETTLE_FRAMES: u32 = 90;
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct DayCycleReport {
-    /// The length of the day that was run, in seconds of the clock, and the frames in it.
+    /// Where the day began, in hours (`--time-of-day`, or 0 for midnight), the length of the day that
+    /// was run, in seconds of the clock, and the frames in it.
+    pub start_hours: f64,
     pub day_seconds: f64,
     pub frames: usize,
     /// The frames' wall times, in ms, and how many of them were over [`FRAME_LIMIT_MS`], with the
@@ -80,8 +89,11 @@ pub struct DayCycleReport {
     /// sun's epoch moved: once for the first frame and each key swap of the day (two).
     pub sun_step_max_degrees: f32,
     pub sun_jumps: u64,
-    /// The exposure over the day.
+    /// The exposure over the day, flown: the scenery changes it as well as the sky.
     pub exposure: ExposureStability,
+    /// The exposure over the same day from one camera that does not move (the radiance cache's
+    /// view), so that only the sky changes it: reversals and travel here are the sky's pumping.
+    pub exposure_fixed_camera: ExposureStability,
     /// The radiance cache against a jump, at the default pace and at the sped-up one.
     pub cache_follow: Vec<CacheFollow>,
     pub gates: DayCycleGates,
@@ -252,6 +264,8 @@ pub fn run(
         }
     }
     let sun_jumps = gpu.sun_epoch() - epoch_before;
+    let exposure_fixed_camera =
+        fixed_camera_exposure(gpu, flight, follow_camera, day_seconds, start)?;
     let frame_p99_ms = p99(&wall);
     let frames_over_limit = wall.iter().filter(|&&ms| ms > FRAME_LIMIT_MS).count();
     let follow = {
@@ -274,6 +288,7 @@ pub fn run(
         ));
     }
     Ok(DayCycleReport {
+        start_hours: start * 24.0,
         day_seconds,
         frames,
         frame_ms: Stats::of(&wall),
@@ -282,9 +297,43 @@ pub fn run(
         sun_step_max_degrees: sun_step_max,
         sun_jumps,
         exposure: exposure_stability(&exposure, EXPOSURE_EVERY as f64 / RATE),
+        exposure_fixed_camera,
         cache_follow: follow,
         gates: DayCycleGates { over },
     })
+}
+
+/// The exposure over a day seen from one place: `day_seconds` of the clock from `start`, the camera
+/// at `camera` the whole time, after the exposure has settled at the first sky.
+fn fixed_camera_exposure(
+    gpu: &mut Offscreen,
+    flight: &mut Flight,
+    camera: &render::Camera,
+    day_seconds: f64,
+    start: f64,
+) -> Result<ExposureStability, Box<dyn Error>> {
+    flight.follow(gpu, camera)?;
+    let mut clock = WorldClock::new(start, day_seconds);
+    let mut daylight = Daylight::new();
+    let drive = daylight.step(clock.time_of_day(), clock.epoch());
+    gpu.set_day_sky(drive.sky, drive.jumped);
+    for _ in 0..EXPOSURE_WARM_FRAMES {
+        draw(gpu, Mode::Primary, camera, 1, false);
+    }
+    let frames = (day_seconds * RATE).round() as usize;
+    let mut stops = Vec::new();
+    for frame in 0..frames {
+        clock.advance(1.0 / RATE);
+        let drive = daylight.step(clock.time_of_day(), clock.epoch());
+        gpu.set_day_sky(drive.sky, drive.jumped);
+        draw(gpu, Mode::Primary, camera, 1, false);
+        if frame % EXPOSURE_EVERY == 0
+            && let Some(read) = gpu.exposure_stops(false)
+        {
+            stops.push(f64::from(read));
+        }
+    }
+    Ok(exposure_stability(&stops, EXPOSURE_EVERY as f64 / RATE))
 }
 
 /// Draws `frames` frames of the same view with the sky of `sky`, `jumped` the first time.

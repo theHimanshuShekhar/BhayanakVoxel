@@ -1089,11 +1089,15 @@ impl App {
         self.day.clock_mut().set_time_of_day(time_of_day);
     }
 
-    /// Runs the world clock for the frame, unless the camera is still, and gives the renderer the
-    /// sky: before [`App::hold_still`], whose view has the sun in it.
+    /// Runs the world clock for the frame and gives the renderer the sky: the clock's, unless the
+    /// Reference view is accumulating a Still view, when the sky shown is held (see [`day`]). Before
+    /// [`App::hold_still`], whose view has the sun in it.
     fn step_day(&mut self, seconds: f64) {
         let edits = self.world.as_ref().map_or(0, World::edits_made);
-        let drive = self.day.frame(seconds, (self.camera, self.bias, edits));
+        let mode = self.renderer.as_ref().map_or(Mode::Primary, Renderer::mode);
+        let drive = self
+            .day
+            .frame(seconds, (self.camera, self.bias, edits), mode);
         if let Some(renderer) = &mut self.renderer {
             renderer.set_day_sky(drive.sky, drive.jumped);
         }

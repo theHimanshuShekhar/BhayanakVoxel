@@ -77,11 +77,11 @@ The unbiased view of the same world that the Primary view is measured against. I
 _Avoid_: Ground truth, path-traced mode, reference mode
 
 **World clock**:
-The time of day of the Planet: a fraction of the day (0 midnight, 0.25 sunrise, 0.5 noon, 0.75 sunset), the day's length in seconds (30 minutes by default), whether it is paused, and how many times it has been set. A plain value, so that in M2 the server holds it and sends it. It moves the sun and the moon (#203). **Setting** it (or a step that takes the sun far) is a *jump*: the light caches forget at once. **Running** it is a *drift*: they follow by their normal updates. The client runs it only in frames where the camera moved, so that a view can be Still.
+The time of day of the Planet: a fraction of the day (0 midnight, 0.25 sunrise, 0.5 noon, 0.75 sunset), the day's length in seconds (30 minutes by default), whether it is paused, and how many times it has been set. A plain value, so that in M2 the server holds it and sends it. It moves the sun and the moon (#203). **Setting** it (or a step that takes the sun far) is a *jump*: the light caches forget at once. **Running** it is a *drift*: they follow by their normal updates. It always runs, whatever the camera does; what is *shown* is held only while the Reference view is accumulating a Still view (the gate of the scene's hold), and catches up with the clock when the view moves again (a jump if far).
 _Avoid_: Game time, sun position
 
 **Moon**:
-A dim, cool directional light and a soft disc in the sky at night, opposite the sun and a little behind it in phase. It is the one shadowed **key light** while the sun is down (the sun while it is up, crossfaded through twilight by whichever is stronger), so it costs no second shadow ray. Not physical: the hero look over physical blue (#203).
+A dim, cool directional light and a soft disc in the sky at night, opposite the sun and a little behind it in phase. It is the one shadowed **key light** while the sun is down (the sun while it is up, whichever is stronger; the one going out fades to nothing before the other takes over, so the shadows turn while there is no key light), so it costs no second shadow ray. Not physical: the hero look over physical blue (#203).
 
 **Still**:
 The camera, the sun and the window have not changed for 2 frames and no Edit has happened. The Reference view is shown only while the view is Still, and after a flight only once the scene has caught up with the camera; any change cuts to the Primary view at once and the Reference view starts again from sample 0.

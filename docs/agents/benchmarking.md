@@ -1828,16 +1828,20 @@ hour; at least 4, since a faster sun would jump) is `60 N` frames, each moving t
 a drift, never a jump (the bench's `sun_step_max_degrees` and `sun_jumps` say so; the jumps are the first
 frame and the two times a day the key light changes hands). It reports:
 
-- `frame_ms` (mean, p95, max), `frame_p99_ms` and `frames_over_limit`: **the gate**. A frame over 16.7 ms
+- `start_hours` (where the day began), `frame_ms` (mean, p95, max), `frame_p99_ms` and `frames_over_limit`: **the gate**. A frame over 16.7 ms
   or a p99 over it is `day_cycle.gates.over` and exit status 2 (`--no-fail` as ever). This is the "no frame
   over the limit" of #203's acceptance.
-- `exposure`: read back every 6 frames (outside the timed part): `min_stops`, `max_stops`,
-  `max_stops_per_s` (the fastest it moved over a second of the clock), `total_variation_stops`,
-  `travel_over_range` (the path walked over the range: about 2 for one rise at dusk and one fall at dawn;
-  every wobble adds to it) and `reversals` (how many times it turned round by more than 0.05 stops). **This
-  is the "no exposure pumping" measure**: a day should have a handful of reversals (noon, night, and the
-  dusk and dawn knees) and `travel_over_range` near 2; a pumping exposure has tens. It is **not gated**
-  (there is no agreed number yet): the first 4090 run sets one.
+- `exposure` and `exposure_fixed_camera`: the auto-exposure read back every 6 frames (outside the timed
+  part), twice: over the flight, and over the same day from **one camera that does not move** (the cache
+  follow's view; the exposure is let settle at the first sky for 450 frames before it is read). Each has
+  `min_stops`, `max_stops`, `max_stops_per_s` (the fastest it moved over a second of the clock),
+  `total_variation_stops`, `travel_over_range` (the path walked over the range: about 2 for one rise at
+  dusk and one fall at dawn; every wobble adds to it) and `reversals` (how many times it turned round by
+  more than 0.05 stops). The flight's cannot tell pumping from scenery (a ridge against the sky, a cave
+  mouth change the exposure too, which is the metering working), so **`exposure_fixed_camera` is the "no
+  exposure pumping" measure**: only the sky changes it, a day should have a handful of reversals (noon,
+  night, and the dusk and dawn knees) and `travel_over_range` near 2, and a pumping exposure has tens.
+  Neither is **gated** (there is no agreed number yet): the first 4090 run sets one.
 - `cache_follow`: the radiance cache against a drifting sun (#203's design problem 2). For four times of
   day (before dawn, morning, afternoon, after dusk), at the game's half-hour pace and at the sped-up one,
   the clock runs for 2 seconds (120 frames) with no boost, and the image is compared with the same time put
@@ -1848,7 +1852,8 @@ frame and the two times a day the key light changes hands). It reports:
   to 5 for a cache that was not told at all. It is reported and not gated.
 
 `--time-of-day H` (hours, 0 to 24) also lights the ordinary flight, sweep and Edits by the world clock's
-sky at that time, stopped there, in place of the fixed hero sun: `client bench --time-of-day 21` is a
+sky at that time, stopped there, in place of the fixed hero sun, and **is where the day cycle starts** (the
+day runs from there round to there again; the default is midnight): `client bench --time-of-day 21` is a
 night flight (the frame times at night: the moon is the key light, the stars and the night floor are drawn).
 
 On the 4090 (the owner or the orchestrating agent; not run in CI beyond `--short`):

@@ -540,14 +540,33 @@ impl View {
 /// The light that casts the shadows of a frame, which is **the sun while it is the stronger and the
 /// moon when it is not** (#203): the shaders have one directional light (`frame.sun` and
 /// `frame.sun_radiance`), so the moon costs no second shadow ray and no second sun-sample of the
-/// radiance cache. Where the key changes hands the sun's light and the moon's are both a few
-/// hundredths of what the day's is, which is what keeps the swap from showing.
-struct Key {
+/// radiance cache.
+///
+/// The two lights are not crossfaded (that would be two shadows); the light that is going out is
+/// **faded to nothing before the other takes over**: the key's radiance is its light times
+/// `smoothstep(0, KEY_FADE, how far it is ahead of the other light)`, which is 0 where the two are
+/// equal, the point at which the key changes hands. So the shadows turn from one direction to the
+/// other while there is no key light, and each light rises from nothing once it is ahead: the
+/// key's radiance is continuous through the swap, and the sky and the cache's bounce light (which
+/// do not read the key) go on through it.
+#[derive(Clone, Copy, Debug)]
+pub struct KeyLight {
     /// The direction and the angular size of the light.
-    light: Sun,
-    /// Its radiance on a surface that faces it (`look.rs`'s `sun`).
-    radiance: [f32; 3],
-    is_moon: bool,
+    pub light: Sun,
+    /// Its radiance on a surface that faces it (`look.rs`'s `sun`), after the fade.
+    pub radiance: [f32; 3],
+    /// Whether the key is the moon.
+    pub is_moon: bool,
+}
+
+/// How far ahead of the other light (in luminance; the moon's on the ground is 0.006 to 0.01 and a
+/// low sun's a few hundredths at 0.8 degrees) a key light must be to be at its full radiance: the
+/// twilight window of the swap.
+pub const KEY_FADE: f32 = 0.006;
+
+fn smoothstep(x: f32) -> f32 {
+    let x = x.clamp(0.0, 1.0);
+    x * x * (3.0 - 2.0 * x)
 }
 
 fn luminance(c: [f32; 3]) -> f32 {
@@ -611,7 +630,7 @@ pub struct Tracer {
     sun_epoch: u64,
     history_sun_epoch: u64,
     /// The sky besides the sun (#203): the moon, the night floor and the stars; and whether the
-    /// last frame's key light was the moon (see [`Key`]).
+    /// last frame's key light was the moon (see [`KeyLight`]).
     night: Night,
     key_is_moon: bool,
     /// Whether the view has neither GI nor emitters (see [`Tracer::set_sun_and_sky_only`]).
@@ -1524,7 +1543,7 @@ impl Tracer {
         target: &Target,
         rate: f32,
     ) {
-        // The key light is settled first: a change of its hands is a new sun (see `Key`).
+        // The key light is settled first: a change of its hands is a new sun (see `KeyLight`).
         let key = self.settle_key(camera, sun);
         // A new sun starts the history over, whatever else is the same: the lit image's shadows
         // are the sun's, and nothing of the old sun's is to be carried into the new one.
@@ -2073,7 +2092,7 @@ impl Tracer {
     }
 
     /// Sets the sky besides the sun: the moon, the night's floor and the stars ([`Night`]). The
-    /// moon is the key light while the sun is not (see [`Key`]). Not a jump by itself: the views'
+    /// moon is the key light while the sun is not (see [`KeyLight`]). Not a jump by itself: the views'
     /// Reference starts over (the night is part of the [`View`]), and the upscaler's history keeps
     /// going; a caller that puts the sky somewhere else says so with [`Tracer::sun_changed`].
     pub fn set_night(&mut self, night: Night) {
@@ -2087,14 +2106,15 @@ impl Tracer {
 
     /// The key light of a frame of `camera` under `sun` and the night's moon: the stronger of the
     /// two lights as a surface on the ground of `camera`'s up gets them (the air takes the light of
-    /// a body that is low, and all of it below the horizon).
-    fn key_light(&self, camera: &Camera, sun: &Sun) -> Key {
+    /// a body that is low, and all of it below the horizon), faded where they are alike (see
+    /// [`KeyLight`]).
+    pub fn key_light(&self, camera: &Camera, sun: &Sun) -> KeyLight {
         let view = self.atmosphere_view(camera, sun, (1, 1));
         let sun_radiance = match self.look.atmosphere {
             Some(air) => air.sun_light_on_ground(view.mu_s()),
             None => self.look.sun,
         };
-        let by_the_sun = Key {
+        let by_the_sun = KeyLight {
             light: *sun,
             radiance: sun_radiance,
             is_moon: false,
@@ -2114,20 +2134,24 @@ impl Tracer {
             None if mu_moon > 0.0 => moon.light,
             None => [0.0; 3],
         };
-        match Sun::new(moon.direction, moon.angular_radius) {
-            Some(light) if luminance(moon_radiance) > luminance(sun_radiance) => Key {
+        let (sun_light, moon_light) = (luminance(sun_radiance), luminance(moon_radiance));
+        let mut key = match Sun::new(moon.direction, moon.angular_radius) {
+            Some(light) if moon_light > sun_light => KeyLight {
                 light,
                 radiance: moon_radiance,
                 is_moon: true,
             },
             _ => by_the_sun,
-        }
+        };
+        let fade = smoothstep((sun_light - moon_light).abs() / KEY_FADE);
+        key.radiance = key.radiance.map(|c| c * fade);
+        key
     }
 
     /// [`Tracer::key_light`], with a change of the key light's hands counted as the sun jumping:
     /// the shadows of the one must not be carried into the other, and the cache's light of the one
     /// is not the other's. It is rare (twice a day) and happens while both lights are dim.
-    fn settle_key(&mut self, camera: &Camera, sun: &Sun) -> Key {
+    fn settle_key(&mut self, camera: &Camera, sun: &Sun) -> KeyLight {
         let key = self.key_light(camera, sun);
         if key.is_moon != self.key_is_moon {
             self.key_is_moon = key.is_moon;
@@ -2282,7 +2306,7 @@ impl Tracer {
         &self,
         queue: &wgpu::Queue,
         camera: &Camera,
-        key: &Key,
+        key: &KeyLight,
         (sample_index, jitter, batch): (u32, [f32; 2], u32),
         sun_sample: u32,
     ) {
@@ -2302,7 +2326,7 @@ impl Tracer {
             look: {
                 let mut look = self.look.uniform();
                 // The key light's radiance: what the air lets through to the ground of the sun's
-                // light, or of the moon's (see [`Key`]).
+                // light, or of the moon's (see [`KeyLight`]).
                 let [r, g, b] = key.radiance;
                 look.sun = [r, g, b, 0.0];
                 look

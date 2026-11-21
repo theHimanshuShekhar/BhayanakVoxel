@@ -252,14 +252,14 @@ fn run(args: &Args) -> Result<u8, Box<dyn Error>> {
         } else {
             daycycle::DEFAULT_DAY_SECONDS
         });
-        let seconds = seconds.max(daycycle::SHORTEST_DAY_SECONDS);
         let follow_camera = plan.path.camera_at(0, 2);
         match daycycle::run(
             &mut gpu,
             &mut flight,
             &plan.path,
             seconds,
-            0.0,
+            // The cycle starts where `--time-of-day` lit the flight, or at midnight.
+            args.time_of_day.map_or(0.0, |hours| hours / 24.0),
             &follow_camera,
         ) {
             Ok(report) => Some(report),
@@ -995,11 +995,12 @@ fn write_png(path: &Path, image: &Image) -> Result<(), Box<dyn Error>> {
 /// The report in brief, for whoever is watching the run.
 /// The day cycle's lines (#203).
 fn print_day_cycle(d: &daycycle::DayCycleReport) {
-    let e = &d.exposure;
+    let (e, fixed) = (&d.exposure, &d.exposure_fixed_camera);
     eprintln!(
         "\nday cycle: a day of {} s, {} frames: frame p99 {:.2} ms, max {:.2} ms, {} over {} ms; the \
          sun moved at most {:.2} deg a frame, {} jumps; exposure {:.2} to {:.2} stops, at most {:.2} \
-         stops/s, travel {:.2} of its range, {} reversals",
+         stops/s, travel {:.2} of its range, {} reversals; from a fixed camera {:.2} to {:.2} stops, \
+         at most {:.2} stops/s, travel {:.2} of its range, {} reversals",
         d.day_seconds,
         d.frames,
         d.frame_p99_ms,
@@ -1012,7 +1013,12 @@ fn print_day_cycle(d: &daycycle::DayCycleReport) {
         e.max_stops,
         e.max_stops_per_s,
         e.travel_over_range,
-        e.reversals
+        e.reversals,
+        fixed.min_stops,
+        fixed.max_stops,
+        fixed.max_stops_per_s,
+        fixed.travel_over_range,
+        fixed.reversals
     );
     for f in &d.cache_follow {
         eprintln!(

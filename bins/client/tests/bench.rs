@@ -513,6 +513,8 @@ fn the_day_cycle_reports_a_sped_up_day_with_its_frames_exposure_and_cache() {
     assert_eq!(report["config"]["time_of_day"], 21.0);
     let day = &report["day_cycle"];
     assert_eq!(day["day_seconds"], 4.0);
+    // `--time-of-day` is where the cycle starts, as well as where the flight is lit.
+    assert_eq!(day["start_hours"], 21.0);
     assert_eq!(day["frames"], 240);
     assert_eq!(day["frame_ms"]["samples"], 240);
     assert!(number(&day["frame_p99_ms"]) > 0.0);
@@ -523,6 +525,10 @@ fn the_day_cycle_reports_a_sped_up_day_with_its_frames_exposure_and_cache() {
     assert!(day["exposure"]["samples"].as_u64().unwrap() >= 30);
     // One rise and one fall: a handful of turns, not a wobble.
     assert!(day["exposure"]["reversals"].as_u64().unwrap() <= 6, "{day}");
+    // The same day from a camera that does not move, where only the sky can change the exposure.
+    let fixed = &day["exposure_fixed_camera"];
+    assert!(fixed["samples"].as_u64().unwrap() >= 30, "{day}");
+    assert!(fixed["reversals"].as_u64().unwrap() <= 6, "{day}");
     // The cache's follow: four times of day at the game's pace and at the sped-up one.
     assert_eq!(day["cache_follow"].as_array().unwrap().len(), 8);
     assert!(day["gates"]["over"].is_array());

@@ -40,8 +40,11 @@ pub struct DayControls {
 impl DayControls {
     /// Hours in a day, which the time's slider runs over.
     pub const HOURS: f32 = 24.0;
-    /// The shortest and longest day length the slider offers, in minutes.
-    pub const MINUTES: std::ops::RangeInclusive<f32> = 0.05..=240.0;
+    /// The shortest and longest day length the slider offers, in minutes: the shortest is
+    /// [`SHORTEST_DAY_SECONDS`](crate::daylight::SHORTEST_DAY_SECONDS), below which the sun would
+    /// jump on a frame.
+    pub const MINUTES: std::ops::RangeInclusive<f32> =
+        (crate::daylight::SHORTEST_DAY_SECONDS / 60.0) as f32..=240.0;
 }
 
 /// What the bands have selected, for the panel.
@@ -630,6 +633,17 @@ mod tests {
         assert!(text.contains("Depth"), "{text}");
         // Showing the panel is not an edit.
         assert_eq!(controls, before);
+    }
+
+    #[test]
+    fn the_day_length_slider_does_not_go_below_a_day_that_drifts() {
+        let seconds = f64::from(*DayControls::MINUTES.start()) * 60.0;
+        assert!(
+            seconds >= crate::daylight::SHORTEST_DAY_SECONDS - 1e-6,
+            "{seconds}"
+        );
+        // And not so far above it that the 4 seconds' day is out of reach.
+        assert!(seconds < crate::daylight::SHORTEST_DAY_SECONDS + 0.01);
     }
 
     fn hud_text(slots: &[String], dig: Option<f32>, query: Option<&mut String>) -> String {

@@ -699,7 +699,7 @@ mod tests {
         assert_eq!(json["schema_version"], 32);
         assert_eq!(json["rt"]["active"], "compute");
         assert_eq!(json["rt"]["comparison"], serde_json::Value::Null);
-                assert_eq!(json["day_cycle"], serde_json::Value::Null);
+        assert_eq!(json["day_cycle"], serde_json::Value::Null);
         assert_eq!(json["convergence"], serde_json::Value::Null);
         assert_eq!(json["streaming"], serde_json::Value::Null);
         assert_eq!(json["streaming_real_time"], serde_json::Value::Null);

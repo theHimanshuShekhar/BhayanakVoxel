@@ -89,7 +89,12 @@ fn hdr(gpu: &mut Offscreen, camera: &Camera) -> (usize, usize, Vec<[f32; 3]>) {
 fn a_time_of_day_is_one_look_whatever_came_before_it() {
     // Pausing and setting the clock must give the frame of that time of day and nothing else: the
     // sky is a function of the time of day alone, so a frame at 21:36 is the same frame whether the
-    // clock ran there, was set there, or was there all along.
+    // clock ran there, was set there, or was there all along. `Offscreen::render` keeps nothing from
+    // the frame before it (no radiance cache, no upscaler history): this is the *sky and the key
+    // light* as a function of the time and not of the route, which is what the clock owes the
+    // renderer. What the caches do with a drifting or a jumping sun is
+    // `the_cache_keeps_up_with_a_drifting_sun_...`'s, and the Reference view of a held sky (the
+    // Still view the game shows) is the same function of the time again.
     let camera = camera_at_the_moon(0.9);
     let mut fresh = ground_gpu();
     let want = at(&mut fresh, &camera, 0.9);
@@ -600,4 +605,67 @@ fn the_exposure_aims_lower_when_the_sky_is_dark_so_a_night_stays_dark() {
         "day {day}, night {night}: {} stops, wanted {want}",
         night - day
     );
+}
+
+// ---- The key light changes hands without a flip of the shadows being seen.
+
+/// The key light of the ground view at each of `steps` times in `from..to`: (time, is the moon,
+/// luminance of its radiance, its direction).
+fn key_lights(from: f64, to: f64, steps: u32) -> Vec<(f64, bool, f32, [f32; 3])> {
+    let camera = ground_camera();
+    let mut gpu = ground_gpu();
+    (0..=steps)
+        .map(|i| {
+            let time = from + (to - from) * f64::from(i) / f64::from(steps);
+            gpu.set_day_sky(DaySky::at(time), true);
+            let key = gpu.key_light(&camera);
+            (
+                time,
+                key.is_moon,
+                luminance(key.radiance),
+                key.light.direction(),
+            )
+        })
+        .collect()
+}
+
+/// Across the handoff of the key light, in steps of 1e-5 of a day (the clock at 30 times the
+/// default day's pace, about 3 frames of a sped-up one), the key's radiance is
+/// continuous and has gone to about nothing in the frame the shadows turn to the other light.
+fn assert_handoff_is_dark(from: f64, to: f64, name: &str) {
+    let keys = key_lights(from, to, ((to - from) / 1e-5).round() as u32);
+    let swap = keys
+        .windows(2)
+        .position(|w| w[1].1 != w[0].1)
+        .unwrap_or_else(|| panic!("{name}: the key never changes hands in {from}..{to}"));
+    let (before, after) = (&keys[swap], &keys[swap + 1]);
+    // The shadows really turn: the two lights are far apart.
+    let turn: f32 = (0..3).map(|a| before.3[a] * after.3[a]).sum();
+    assert!(turn < 0.0, "{name}: the light turns by cos {turn}");
+    for key in [before, after] {
+        assert!(key.2 < 5e-4, "{name}: the key at the swap is {}", key.2);
+    }
+    // No step of its light, anywhere in the window, is more than what a smooth fade makes.
+    let step = keys
+        .windows(2)
+        .map(|w| (w[1].2 - w[0].2).abs())
+        .fold(0.0f32, f32::max);
+    assert!(step < 5e-4, "{name}: the key's light steps by {step}");
+}
+
+#[test]
+fn the_key_light_fades_out_before_it_changes_hands_at_dusk() {
+    // The sun is still up when the moon is stronger; the shadows turn at once, to the other side of
+    // the sky, while the sun's light is a thousandth of the day's.
+    assert_handoff_is_dark(0.744, 0.752, "dusk");
+    // And the sweep begins in the sun's light of a twilight and ends in the moon's.
+    let keys = key_lights(0.744, 0.756, 12);
+    assert!(!keys[0].1 && keys[0].2 > 0.05, "{:?}", keys[0]);
+    assert!(keys[12].1 && keys[12].2 > 0.004, "{:?}", keys[12]);
+}
+
+#[test]
+fn the_key_light_fades_out_before_it_changes_hands_at_dawn() {
+    // Both lights are dim at dawn: the moon is setting and the sun not yet up.
+    assert_handoff_is_dark(0.19, 0.22, "dawn");
 }

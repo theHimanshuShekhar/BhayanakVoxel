@@ -3,8 +3,8 @@
 use std::path::PathBuf;
 
 use super::convergence::CHECKPOINTS;
-use super::rt::RtMode;
 use super::daycycle::SHORTEST_DAY_SECONDS;
+use super::rt::RtMode;
 
 pub const USAGE: &str = "\
 Usage: client bench [OPTIONS]
