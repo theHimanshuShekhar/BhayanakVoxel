@@ -88,16 +88,19 @@ const DENOISED_BINDING: u32 = 23;
 /// How `shadows` weighs the light of each of a pixel's shadow rays (ADR 0005, "Sun and shadows").
 /// The two agree in expectation where the surface faces the sun squarely, and differ by the change of
 /// the cosine over the sun's disc at a penumbra and where the surface is nearly edge-on to the sun,
-/// which is where #52's miss was. The bench's `--shadow-weight` chooses, and reports both.
+/// which is where #52's miss was. `PerSample` is the default (the 4090 of #55 measured the sun view's
+/// settled FLIP at 0.026 with it and the denoiser, against 0.055 with the centre cosine); the
+/// bench's `--shadow-weight` chooses, and reports both.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(u32)]
 pub enum ShadowWeight {
     /// The cosine at the disc's centre, however many of the rays see the sun: no noise on a lit
-    /// surface, and a bias in the penumbra (#52's, shipped on 2026-11-17).
-    #[default]
+    /// surface, and a bias in the penumbra (#52's, shipped on 2026-11-17, and the default until #55).
     CentreCosine = 0,
     /// Each ray weighed by its own cosine over the disc's mean cosine, as the Reference weighs its
-    /// samples: unbiased, and noisier where a surface is edge-on to the sun.
+    /// samples: unbiased, and noisier where a surface is edge-on to the sun, which the denoiser
+    /// takes (#55). The default.
+    #[default]
     PerSample = 1,
 }
 

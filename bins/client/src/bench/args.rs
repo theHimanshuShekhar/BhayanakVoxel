@@ -78,11 +78,15 @@ Options:
                    rays compared: `rt.comparison`). The report's `rt` says which ran and what the
                    acceleration structures cost to update
   --shadow-weight W How Primary weighs the shadow rays of the sun in the convergence phase (#55):
-                   `centre-cosine` (the cosine to the centre of the disc, what shipped with #52)
-                   or `per-sample` (each ray's own cosine, the Reference's) [default:
-                   centre-cosine]. It is the one the gates are held on and the one the report's
-                   `gi` and `settled` are of; the other is reported beside it
-                   (`other_shadow_weight`), so one run compares both
+                   `per-sample` (each ray's own cosine, the Reference's) [default] or
+                   `centre-cosine` (the cosine to the centre of the disc, what shipped with
+                   #52). It is the one the gates are held on and the one the report's `gi` and
+                   `settled` are of; the other is reported beside it (`other_shadow_weight`), so
+                   one run compares both
+  --converged-frames N  Frames of a still view that Primary with no denoiser is averaged over in the
+                   convergence phase, for `Primary converged` (#55): the error of each view is split
+                   into its bias (FLIP of that against truth) and the denoiser's residual (FLIP of
+                   the denoised image against it) [default: 1024; 0 leaves it out]
   --no-fail        Exit with status 0 even if a pass is over its budget, there is a hole or a
                    real-time gate is over
   -h, --help       Print this";
@@ -141,6 +145,9 @@ pub struct Args {
     /// `--shadow-weight W`: which weight of the sun's shadow rays the convergence phase's gates are
     /// held on (#55); the other is reported beside it.
     pub shadow_weight: Option<render::ShadowWeight>,
+    /// `--converged-frames N`: the frames `Primary converged` is averaged over (the phase's default
+    /// if not given).
+    pub converged_frames: Option<u32>,
     pub size: Option<(u32, u32)>,
     pub bias: f64,
     pub diag: Diag,
@@ -174,6 +181,7 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Parsed, String> {
         shadow_rays: None,
         rt: RtMode::default(),
         shadow_weight: None,
+        converged_frames: None,
         size: None,
         bias: 1.0,
         diag: Diag::default(),
@@ -201,6 +209,9 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Parsed, String> {
             "--truth-spp" => parsed.truth_spp = Some(truth_spp(&value("--truth-spp")?)?),
             "--shadow-rays" => parsed.shadow_rays = Some(shadow_rays(&value("--shadow-rays")?)?),
             "--rt-backend" => parsed.rt = RtMode::parse(&value("--rt-backend")?)?,
+            "--converged-frames" => {
+                parsed.converged_frames = Some(converged_frames(&value("--converged-frames")?)?);
+            }
             "--shadow-weight" => {
                 parsed.shadow_weight = Some(shadow_weight(&value("--shadow-weight")?)?);
             }
@@ -233,6 +244,12 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Parsed, String> {
         return Err(
             "--shadow-rays is for the convergence phase's sun-and-sky view, which \
              --no-convergence leaves out"
+                .into(),
+        );
+    }
+    if parsed.converged_frames.is_some() && !parsed.convergence {
+        return Err(
+            "--converged-frames is for the convergence phase, which --no-convergence leaves out"
                 .into(),
         );
     }
@@ -299,6 +316,14 @@ fn shadow_rays(text: &str) -> Result<u32, String> {
                 render::MAX_SHADOW_RAYS
             )
         })
+}
+
+/// `--converged-frames`: a count of frames, 0 for none.
+fn converged_frames(text: &str) -> Result<u32, String> {
+    text.parse::<u32>()
+        .ok()
+        .filter(|&n| n <= 1 << 16)
+        .ok_or_else(|| format!("`{text}` is not a count of frames, 0 to 65536"))
 }
 
 /// `--shadow-weight`: the name of one of `render::ShadowWeight::ALL`.
@@ -385,6 +410,7 @@ mod tests {
                 shadow_rays: None,
                 rt: RtMode::Compute,
                 shadow_weight: None,
+                converged_frames: None,
                 size: None,
                 bias: 1.0,
                 diag: Diag::default()
@@ -506,6 +532,25 @@ mod tests {
             &["--shadow-rays", "two"],
             // The view is of the convergence phase, which this leaves out.
             &["--no-convergence", "--shadow-rays", "2"],
+        ] {
+            assert!(parse_all(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn the_converged_frames_are_a_count_for_the_convergence_phase() {
+        assert_eq!(run(&[]).converged_frames, None);
+        assert_eq!(run(&["--converged-frames", "0"]).converged_frames, Some(0));
+        assert_eq!(
+            run(&["--converged-frames", "256"]).converged_frames,
+            Some(256)
+        );
+        for bad in [
+            &["--converged-frames", "many"][..],
+            &["--converged-frames", "-1"],
+            &["--converged-frames", "1000000"],
+            &["--converged-frames"],
+            &["--no-convergence", "--converged-frames", "8"],
         ] {
             assert!(parse_all(bad).is_err(), "{bad:?}");
         }

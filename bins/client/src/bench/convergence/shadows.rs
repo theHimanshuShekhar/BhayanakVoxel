@@ -75,6 +75,10 @@ const SUNLESS: f32 = 0.002;
 /// many, with the cosine of the sun's disc the only thing that varies.
 const UNSHADOWED_SPP: u32 = 256;
 
+/// The frames of a still view that Primary is averaged over for its converged image
+/// (`--converged-frames`).
+pub const CONVERGED_FRAMES: u32 = 1024;
+
 /// What to run.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Settings {
@@ -92,6 +96,9 @@ pub struct Settings {
     /// How Primary weighs the shadow rays (`--shadow-weight`): `first_frame` and `settled` are of
     /// it, and the gate is on it.
     pub shadow_weight: ShadowWeight,
+    /// Frames of a still camera that Primary with no denoiser is averaged over for `converged` (0:
+    /// not measured).
+    pub converged_frames: u32,
 }
 
 impl Settings {
@@ -105,6 +112,7 @@ impl Settings {
             flip: true,
             shadow_rays: render::DEFAULT_SHADOW_RAYS,
             shadow_weight: ShadowWeight::default(),
+            converged_frames: CONVERGED_FRAMES,
         }
     }
 
@@ -117,6 +125,7 @@ impl Settings {
             flip: false,
             shadow_rays: render::DEFAULT_SHADOW_RAYS,
             shadow_weight: ShadowWeight::default(),
+            converged_frames: 0,
         }
     }
 }
@@ -165,6 +174,9 @@ pub struct ShadowsReport {
     pub raw: PrimaryFrames,
     /// The Reference at 64 samples against truth A: reported, not gated. Null without FLIP.
     pub reference_64: Option<Scores>,
+    /// Primary converged, and the error split into its bias and the denoiser's residual; null where
+    /// `--converged-frames` is 0.
+    pub converged: Option<Converged>,
     /// Whether the first frame's FLIP mean is at or under the target; null without FLIP. The
     /// settled image is reported beside it and is not what is held to the target.
     pub meets_target: Option<bool>,
@@ -172,6 +184,35 @@ pub struct ShadowsReport {
     pub edge_share: f64,
     /// The files of this view in the output folder's `convergence/sun/`, sorted.
     pub files: Vec<String>,
+}
+
+/// Where a view's error is, split in two (#55): the part that no denoiser can remove and the part
+/// that is the denoiser's to. **Primary converged** is Primary with the denoiser off (the weight of
+/// the run), averaged in linear light over `frames` frames of the still view after it has settled:
+/// the mean that Primary's own samples converge to, its light as it is drawn, with its own bias
+/// (the radiance cache's GI, the weight of the shadow rays, the upscaler's clamp).
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+pub struct Converged {
+    pub frames: u32,
+    /// The mean luminance of Primary converged over truth A's, in linear light (8-bit images).
+    pub luminance_ratio: f64,
+    /// FLIP of Primary converged against truth A: **the bias**, what no denoiser can take away.
+    /// Null without FLIP.
+    pub bias: Option<Scores>,
+    /// FLIP of Primary denoised and settled (`settled`, the weight of the run) against Primary
+    /// converged: **the residual**, what the denoiser leaves of the noise.
+    pub residual: Option<Scores>,
+    /// The same for Primary with no denoiser, settled (`raw.settled`): what the noise is without it.
+    pub raw_residual: Option<Scores>,
+    /// FLIP of Primary denoised and **averaged** over the same frames against Primary converged:
+    /// what the denoiser does to the mean (its clamp, and the blur of light that it keeps per traced
+    /// pixel), which more frames do not take away. The part of `residual` that is not this is the
+    /// noise the denoiser leaves.
+    pub denoiser_shift: Option<Scores>,
+    /// FLIP of Primary denoised and averaged against truth A: where the denoiser's image goes as
+    /// frames are added, the best it can do in this view with the light it is given (compare `bias`,
+    /// which is the same with no denoiser).
+    pub denoised_limit: Option<Scores>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize)]
@@ -399,6 +440,35 @@ pub fn run(settings: &Settings, out: &Path) -> Result<ShadowsReport, Box<dyn Err
     let (first, settled) = frames(Denoise::Full, settings.shadow_weight);
     let (other_first, other_settled) = frames(Denoise::Full, other);
     let (raw_first, raw_settled) = frames(Denoise::Off, settings.shadow_weight);
+    // Primary converged: the same, with no denoiser, for many frames more. The settled frame above
+    // is its start.
+    let converged_image = if settings.converged_frames > 0 {
+        eprintln!(
+            "convergence: {name}: Primary, no denoiser, averaged over {} frames...",
+            settings.converged_frames
+        );
+        score::mean_of_frames(settings.converged_frames, || {
+            gpu.render_upscaled(&view.camera)
+        })
+    } else {
+        None
+    };
+    // And the denoiser's, averaged the same way: the mean it keeps.
+    let converged_denoised = if converged_image.is_some() {
+        eprintln!(
+            "convergence: {name}: Primary, denoised, averaged over {} frames...",
+            settings.converged_frames
+        );
+        gpu.set_denoise(Denoise::Full);
+        for _ in 0..settings.settle_frames.max(2) {
+            gpu.render_upscaled(&view.camera);
+        }
+        score::mean_of_frames(settings.converged_frames, || {
+            gpu.render_upscaled(&view.camera)
+        })
+    } else {
+        None
+    };
     drop(gpu);
 
     let sun = visible_sun(&truth_a.linear, &unshadowed.linear);
@@ -432,6 +502,21 @@ pub fn run(settings: &Settings, out: &Path) -> Result<ShadowsReport, Box<dyn Err
         settled: scored("Primary, settled, no denoiser", &raw_settled)?,
     };
     let reference_64_score = flip("the Reference at 64 samples", &reference_64.image)?;
+    let converged = match &converged_image {
+        Some(converged) => Some(super::gi::converged_split(
+            converged,
+            converged_denoised.as_ref().expect("made with it"),
+            &truth_a.image,
+            &truth_rgb,
+            &settled,
+            &raw_settled,
+            size,
+            settings.converged_frames,
+            settings.flip,
+            name,
+        )?),
+        None => None,
+    };
 
     let target_counts = floor.map(|f| TARGET_FLIP >= MIN_LINE_OVER_FLOOR * f.flip_mean);
     let meets_target = first_frame.flip.map(|f| f.flip_mean <= TARGET_FLIP);
@@ -450,7 +535,18 @@ pub fn run(settings: &Settings, out: &Path) -> Result<ShadowsReport, Box<dyn Err
         ("primary-settled-no-denoiser.png", &raw_settled),
         ("reference-64.png", &reference_64.image),
         ("edges.png", &edge_image(&edge, (width, height))),
-    ] {
+    ]
+    .into_iter()
+    .chain(
+        converged_image
+            .as_ref()
+            .map(|image| ("primary-converged.png", image)),
+    )
+    .chain(
+        converged_denoised
+            .as_ref()
+            .map(|image| ("primary-converged-denoised.png", image)),
+    ) {
         write_png(&folder.join(file), image)?;
         files.push(file.to_string());
     }
@@ -488,6 +584,7 @@ pub fn run(settings: &Settings, out: &Path) -> Result<ShadowsReport, Box<dyn Err
         other_weight,
         raw,
         reference_64: reference_64_score,
+        converged,
         meets_target,
         edge_share,
         files,
@@ -548,6 +645,19 @@ pub fn print_summary(report: &ShadowsReport) {
         "  the Reference at 64 samples: FLIP mean {} (reported, not gated)",
         num(report.reference_64.map(|f| f.flip_mean), 4)
     );
+    if let Some(c) = &report.converged {
+        eprintln!(
+            "  Primary converged ({} frames, luminance {:.3}): bias {} (FLIP against truth), residual {} \
+             denoised, {} with no denoiser, the denoiser's own shift {}, its limit against truth {}",
+            c.frames,
+            c.luminance_ratio,
+            num(c.bias.map(|f| f.flip_mean), 4),
+            num(c.residual.map(|f| f.flip_mean), 4),
+            num(c.raw_residual.map(|f| f.flip_mean), 4),
+            num(c.denoiser_shift.map(|f| f.flip_mean), 4),
+            num(c.denoised_limit.map(|f| f.flip_mean), 4),
+        );
+    }
     let note = match (report.meets_target, report.target_counts) {
         (Some(meets), Some(counts)) => format!(
             "{}{}",

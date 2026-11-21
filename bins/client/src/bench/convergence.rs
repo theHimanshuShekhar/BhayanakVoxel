@@ -1067,9 +1067,10 @@ mod tests {
             raw: variant(0.2, 0.1),
             gi: variant(0.1, 0.04),
             other_weight: variant(0.1, 0.03),
-            shadow_weight: "centre-cosine",
-            other_shadow_weight: "per-sample",
+            shadow_weight: "per-sample",
+            other_shadow_weight: "centre-cosine",
             reference_64: flip.then_some(0.15),
+            converged: None,
             settle_frames: 4,
             gi_not_further: flip.then_some(true),
             files: vec!["primary-gi-settled.png".into()],
@@ -1116,8 +1117,8 @@ mod tests {
             first_frame: score(0.04),
             settled: score(0.02),
             settle_frames: 4,
-            shadow_weight: "centre-cosine",
-            other_shadow_weight: "per-sample",
+            shadow_weight: "per-sample",
+            other_shadow_weight: "centre-cosine",
             other_weight: shadows::PrimaryFrames {
                 first_frame: score(0.03),
                 settled: score(0.015),
@@ -1126,6 +1127,7 @@ mod tests {
                 first_frame: score(0.06),
                 settled: score(0.05),
             },
+            converged: None,
             reference_64: flip.then_some(shadows::Scores {
                 flip_mean: 0.1,
                 flip_p99: 0.4,
@@ -1233,7 +1235,7 @@ mod tests {
         };
         let mut sun = shadows::Settings::full(size, env("CONVERGENCE_TEST_SUN_TRUTH_SPP", 64));
         sun.shadow_rays = env("CONVERGENCE_TEST_SHADOW_RAYS", sun.shadow_rays);
-        // `CONVERGENCE_TEST_SHADOW_WEIGHT=per-sample` makes it the weight of the gates (#55).
+        // `CONVERGENCE_TEST_SHADOW_WEIGHT=centre-cosine` makes it the weight of the gates (#55).
         let weight = std::env::var("CONVERGENCE_TEST_SHADOW_WEIGHT")
             .ok()
             .and_then(|name| {
@@ -1243,8 +1245,11 @@ mod tests {
             })
             .unwrap_or_default();
         sun.shadow_weight = weight;
+        // `CONVERGENCE_TEST_CONVERGED_FRAMES` (default 128, which is quick) is `Primary converged`'s.
+        sun.converged_frames = env("CONVERGENCE_TEST_CONVERGED_FRAMES", 128);
         let mut gi_settings = gi::Settings::full(size);
         gi_settings.shadow_weight = weight;
+        gi_settings.converged_frames = sun.converged_frames;
         let settings = Settings {
             size,
             checkpoints: vec![1, 4, 16, 64],

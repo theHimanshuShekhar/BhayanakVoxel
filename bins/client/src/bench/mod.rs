@@ -291,6 +291,10 @@ fn run(args: &Args) -> Result<u8, Box<dyn Error>> {
         if let Some(rays) = args.shadow_rays {
             settings.shadows.shadow_rays = rays;
         }
+        if let Some(frames) = args.converged_frames {
+            settings.shadows.converged_frames = frames;
+            settings.gi.converged_frames = frames;
+        }
         if let Some(weight) = args.shadow_weight {
             settings.shadows.shadow_weight = weight;
             settings.gi.shadow_weight = weight;

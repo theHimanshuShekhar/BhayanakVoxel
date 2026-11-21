@@ -173,7 +173,7 @@ use super::stream::StreamReport;
 /// budgets file's `[passes]`. Primary is drawn denoised in the convergence phase's views and in every
 /// path of the flight, and **a number of schema 31 or before is not comparable with a Primary one**
 /// of this schema. In each view's `gi`: `gi` is now Primary with the denoiser on and the sun's shadow
-/// rays weighed as `shadow_weight` says (`--shadow-weight`, `centre-cosine` unless given); `raw` is
+/// rays weighed as `shadow_weight` says (`--shadow-weight`, `per-sample` unless given); `raw` is
 /// the cache's GI with no denoiser (what `gi` was before); `other_weight` is `gi` with the other
 /// weight (`other_shadow_weight`); `reference_64` is FLIP's mean of the Reference at 64 samples
 /// against truth A. In `convergence.shadows`: `first_frame` and `settled` are denoised with
@@ -181,7 +181,11 @@ use super::stream::StreamReport;
 /// names and `reference_64` (mean and 99th percentile) are new. In `convergence.gi.gates`
 /// `room_target_flip` is now `primary_target_flip` (0.05, every view's settled `gi` and the sun
 /// view's settled Primary; the gate `room-flip` is now `primary-flip:VIEW` with `sun` among the views).
-/// Nothing else is changed.
+/// Each view's `gi` and `convergence.shadows` have a `converged` (null with `--converged-frames 0`):
+/// Primary with no denoiser averaged over `--converged-frames` frames (default 1024) of the settled
+/// still view, with `frames`, `luminance_ratio`, `bias` (FLIP against truth A), `residual` (the
+/// denoised settled frame against it), `raw_residual`, `denoiser_shift` and `denoised_limit`
+/// (each a FLIP score set, or null with FLIP off). Nothing else is changed.
 pub const SCHEMA_VERSION: u32 = 32;
 
 /// One timed thing (a pass, or the GPU total of a profiler frame) in one mode, against its

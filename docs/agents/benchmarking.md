@@ -1340,8 +1340,9 @@ run without it (0.178 ms at 1 ray on the 4090, 1440p) or from `--diag` runs of a
   the target. **Where it stands (#52, 4090, 1440p, hero sun, 8192-sample truth, floor 0.0008):** at
   the default 2 rays the first frame is **0.062** and the settled image **0.059**, so
   `meets_target` is false; 1 ray was 0.074 and 0.072 (`--shadow-rays 1`). The owner shipped 2 rays
-  with the centre-cosine weight; its bias is the cause and #55 re-judges the weight (ADR 0005's
-  "Sun and shadows" row has the numbers). `meets_target` is reported and printed only: it is not a
+  with the centre-cosine weight; its bias was the cause, and #55 made the unbiased per-sample weight
+  the default (0.026 settled on the 4090 with the denoiser; ADR 0005's "Sun and shadows" row has the
+  numbers). `meets_target` is reported and printed only: it is not a
   gate and does not change the exit status, and the target is not loosened.
 - **The shadow-edge error** (`edge`). FLIP's mean over a whole image says little about the few
   pixels of a shadow's edge, where Primary weighs its rays by the cosine at the disc's centre
@@ -1457,8 +1458,8 @@ sits before the upscaler (`crates/render/src/denoise.rs` has the account).
 What the 4090 runs for #55 (the orchestrator's, with the PR's Windows artifact):
 
 ```
-client bench --truth-spp 8192                              # the gate: centre-cosine weight, every view
-client bench --truth-spp 8192 --shadow-weight per-sample   # the same, with the Reference's weight
+client bench --truth-spp 8192                                  # the gate: per-sample weight (the default), every view
+client bench --truth-spp 8192 --shadow-weight centre-cosine    # the same, with #52's weight
 ```
 
 Each run reports **both weights** and the denoiser off, so one run has the comparison:
@@ -1470,6 +1471,35 @@ settled, in the other views too, is the weight to keep. The summary prints every
 The convergence views' pictures are the denoised ones (`primary-gi-*.png`, and for the other weight
 `primary-gi-per-sample-*.png` or `primary-gi-centre-cosine-*.png`), and the look-dev sheet's
 `primary.png` and `primary-settled.png` are drawn as a window draws a first frame and a settled one.
+
+**Primary converged: where a view's error is.** A denoiser takes noise away, not bias, so the gate's
+error is split in two in every view (the golden, the pit, the room, and the sun view's
+`convergence.shadows`), each run: `converged` is Primary with the denoiser off, in the weight of the
+run, drawn for `--converged-frames N` frames (default 1024; 0 leaves it out) of the still view after
+it has settled, and **averaged in linear light**: the mean that Primary's own samples converge to,
+with its own bias (the radiance cache's GI, the weight of the shadow rays, the upscaler's clamp). Its
+picture is `primary-converged.png` in the view's folder.
+
+- `converged.bias`: FLIP of it against truth A. What no denoiser can remove: if this is over 0.05 in
+  a view, the gate there needs work on the light (the GI), not on the denoiser.
+- `converged.residual`: FLIP of Primary denoised and settled (`gi.settled`, `settled` for the sun)
+  against it. What the denoiser leaves of the noise: this is the denoiser's to tune.
+- `converged.raw_residual`: the same for Primary with no denoiser (`raw.settled`): what the noise is
+  without it, so the denoiser's share is `raw_residual` against `residual`.
+- `converged.luminance_ratio`: its mean luminance over the truth's: how dark or bright the light is
+  as Primary draws it, with the noise averaged out (the room's 0.92 is the bias that the room's
+  GI has, not noise).
+- `converged.denoiser_shift`: FLIP of Primary denoised and averaged over the same frames against
+  `converged`: how far the denoiser moves the mean (its clamps, the rejection of history, the
+  filter's guide), with the noise averaged out.
+- `converged.denoised_limit`: FLIP of that denoised mean against truth A, to read against `bias`: if
+  it is no worse than `bias`, the denoiser adds no error of its own to the view and what is left is
+  the light's.
+
+The FLIP of a mean of a noisy image is not the mean of the FLIPs, so `bias` and `residual` do not add
+up to the settled FLIP; they say which of the two is the larger. The run adds `--converged-frames`
+frames a view, so the default 1024 makes the phase longer (it was not timed on the 4090). To measure
+it alone with fewer: `client bench --truth-spp 8192 --converged-frames 256`.
 
 ## The hardware ray backend (#50)
 

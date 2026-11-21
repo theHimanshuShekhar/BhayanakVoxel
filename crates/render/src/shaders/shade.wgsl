@@ -97,12 +97,12 @@ fn sun_sample(pixel: vec2<u32>, sample: u32) -> vec2<f32> {
 // that has changed is right on the next one (the denoiser's history is the sun epoch's too).
 //
 // The weight (`frame.gi.z`, `tracer::ShadowWeight`, chosen by the bench's `--shadow-weight`):
-//   0, centre-cosine (#52's, shipped): the surface's cosine to the sun's centre, times the share of
+//   0, centre-cosine (#52's, the default until #55): the surface's cosine to the sun's centre, times the share of
 //      the rays that saw the sun, so that a lit surface, the whole picture but the penumbra, has no
 //      noise from the wide disc. The Reference weighs each sample by its own cosine, so the two
 //      differ by the change of the cosine over the disc where the sun is half hidden and where the
 //      surface is nearly edge-on to it: a bias that no denoiser takes away;
-//   1, per-sample: each ray that sees the sun counts by its own cosine over the disc's mean cosine
+//   1, per-sample (the default since #55): each ray that sees the sun counts by its own cosine over the disc's mean cosine
 //      (`0.5 * (1 + cos_max)`), as the Reference's sample does: the same mean as the Reference's
 //      and no bias, with the noise of the cosine over the disc where the surface is edge-on to the sun,
 //      which the denoiser (#55) is there to take.

@@ -161,8 +161,8 @@ fn check_convergence(convergence: &Value, out: &Path) {
         let gi = &view["gi"];
         // And with the denoiser (#55): `raw` has none, `gi` has it with the sun's shadow rays
         // weighed as `shadow_weight` says, and `other_weight` with the other weight.
-        assert_eq!(string(&gi["shadow_weight"]), "centre-cosine");
-        assert_eq!(string(&gi["other_shadow_weight"]), "per-sample");
+        assert_eq!(string(&gi["shadow_weight"]), "per-sample");
+        assert_eq!(string(&gi["other_shadow_weight"]), "centre-cosine");
         assert!(gi["reference_64"].is_null(), "no FLIP: {name}");
         for variant in ["flat", "raw", "gi", "other_weight"] {
             for when in ["first_frame", "settled"] {
@@ -175,6 +175,20 @@ fn check_convergence(convergence: &Value, out: &Path) {
             }
         }
         assert!(gi["gi_not_further"].is_null(), "no FLIP: {name}");
+        // Primary converged (#55) is measured where `--converged-frames` asks (the short bench does
+        // not): its brightness is, its FLIP is not.
+        let converged = &gi["converged"];
+        if !converged.is_null() {
+            assert!(number(&converged["luminance_ratio"]) > 0.0, "{name}");
+            assert!(converged["bias"].is_null() && converged["residual"].is_null());
+            assert!(
+                out.join(string(&convergence["folder"]))
+                    .join(name)
+                    .join("primary-converged.png")
+                    .is_file(),
+                "{name}/primary-converged.png"
+            );
+        }
         for file in [
             "primary-flat-first-frame.png",
             "primary-flat-settled.png",
@@ -182,8 +196,8 @@ fn check_convergence(convergence: &Value, out: &Path) {
             "primary-raw-settled.png",
             "primary-gi-first-frame.png",
             "primary-gi-settled.png",
-            "primary-gi-per-sample-first-frame.png",
-            "primary-gi-per-sample-settled.png",
+            "primary-gi-centre-cosine-first-frame.png",
+            "primary-gi-centre-cosine-settled.png",
         ] {
             assert!(
                 out.join(string(&convergence["folder"]))
@@ -267,8 +281,8 @@ fn check_convergence(convergence: &Value, out: &Path) {
     assert_eq!(sun["seeds"]["truth_a"], 1);
     // Primary is denoised (#55) with the weight of the sun's rays that `--shadow-weight` chose, and
     // the other weight and the denoiser off are reported beside it, with the Reference at 64 samples.
-    assert_eq!(string(&sun["shadow_weight"]), "centre-cosine");
-    assert_eq!(string(&sun["other_shadow_weight"]), "per-sample");
+    assert_eq!(string(&sun["shadow_weight"]), "per-sample");
+    assert_eq!(string(&sun["other_shadow_weight"]), "centre-cosine");
     assert!(sun["reference_64"].is_null(), "no FLIP");
     for variant in ["other_weight", "raw"] {
         for when in ["first_frame", "settled"] {
@@ -284,6 +298,10 @@ fn check_convergence(convergence: &Value, out: &Path) {
         assert!(edge["other_mean"].is_null() || number(&edge["other_mean"]) >= 0.0);
     }
     assert!((0.0..=1.0).contains(&number(&sun["edge_share"])));
+    if !sun["converged"].is_null() {
+        assert!(number(&sun["converged"]["luminance_ratio"]) > 0.0);
+        assert!(sun["converged"]["bias"].is_null());
+    }
     let folder = out.join(string(&convergence["folder"])).join("sun");
     for file in [
         "truth-a.png",
@@ -454,6 +472,8 @@ fn the_short_bench_writes_a_report_and_screenshots_and_no_fail_ignores_the_budge
     let run = bench(&[
         "--short",
         "--no-fail",
+        "--converged-frames",
+        "2",
         "--out",
         out.join("run").to_str().unwrap(),
         "--budgets",
@@ -468,6 +488,11 @@ fn the_short_bench_writes_a_report_and_screenshots_and_no_fail_ignores_the_budge
 
     let report = read_report(&out.join("run"));
     check_schema(&report, &out.join("run"));
+    // `--converged-frames` reaches the views and the sun view.
+    for view in report["convergence"]["views"].as_array().unwrap() {
+        assert_eq!(view["gi"]["converged"]["frames"], 2, "{}", view["name"]);
+    }
+    assert_eq!(report["convergence"]["shadows"]["converged"]["frames"], 2);
     // The report is also on stdout.
     assert_eq!(
         serde_json::from_slice::<Value>(&run.stdout).unwrap(),
