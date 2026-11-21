@@ -1120,6 +1120,31 @@ impl Tracer {
         Self::with_materials(device, scene, MaterialTable::built_in())
     }
 
+    /// Replaces the Planet being drawn with `scene`: what the window does when the Planet it is
+    /// loading is ready. The tracer is rebuilt, and **keeps the settings of the one it replaces**:
+    /// the Planet's ground level (without it the camera is in space in the atmosphere's eyes, and
+    /// the sky is black and the sun unattenuated, #203), the look, the stages, the night, the debug
+    /// view, the seed and the rest of what a caller set on it. The new Planet counts as the sun
+    /// jumping ([`Tracer::sun_changed`]), as it starts the views and the caches over.
+    pub fn replace_scene(&mut self, device: &wgpu::Device, scene: &Scene) -> Result<()> {
+        let mut next = Self::new(device, scene)?;
+        next.debug_view = self.debug_view;
+        next.ground_level = self.ground_level;
+        next.look = self.look;
+        next.stages = self.stages;
+        next.sun_and_sky_only = self.sun_and_sky_only;
+        next.flat_ambient = self.flat_ambient;
+        next.shadow_rays = self.shadow_rays;
+        next.seed = self.seed;
+        next.set_night(self.night);
+        next.key_is_moon = self.key_is_moon;
+        // Never back to a count the old tracer's readers have seen.
+        next.sun_epoch = self.sun_epoch;
+        next.sun_changed();
+        *self = next;
+        Ok(())
+    }
+
     /// [`Tracer::with_materials`] with the built-in table and the hardware backend (#50) on: the
     /// device must have `EXPERIMENTAL_RAY_QUERY` (see [`crate::choose_backend`]). `camera` is where
     /// the acceleration structures' frame starts; with `any_hit_shadows` a shadow ray ends at the

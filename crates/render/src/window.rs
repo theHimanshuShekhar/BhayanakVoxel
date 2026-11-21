@@ -140,8 +140,7 @@ impl Renderer {
 
     /// Replaces the Planet being drawn. A new Planet starts the reference image over.
     pub fn set_scene(&mut self, scene: &Scene) -> Result<()> {
-        self.tracer = Tracer::new(&self.device, scene)?;
-        Ok(())
+        self.tracer.replace_scene(&self.device, scene)
     }
 
     /// Brings the GPU copy of the Planet up to date with `scene`, after `update` (the result of

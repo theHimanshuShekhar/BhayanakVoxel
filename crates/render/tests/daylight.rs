@@ -669,3 +669,176 @@ fn the_key_light_fades_out_before_it_changes_hands_at_dawn() {
     // Both lights are dim at dawn: the moon is setting and the sun not yet up.
     assert_handoff_is_dark(0.19, 0.22, "dawn");
 }
+
+// ---- The window's way to the sky.
+
+/// A stone floor with its top at the Planet's sea level, in a world whose up is +y: the ground of
+/// a Planet at the scale the game is played at (the camera is 320 km from the origin).
+fn sea_level_floor() -> Scene {
+    let top = GROUND as i32;
+    let mut store = BrickStore::new();
+    for x in -60..60 {
+        for z in -60..60 {
+            store.set(VoxelCoord([x, top - 1, z]), Some(STONE));
+        }
+    }
+    Scene::new(&store, None)
+}
+
+/// A camera 3 m above the floor that looks at the horizon, with the sky in its upper part.
+fn horizon_camera() -> Camera {
+    let y = GROUND + 60.0;
+    let mut camera = Camera::looking_at([0.0, y, 0.0], [0.0, y, -300.0]);
+    camera.turn(0.0, 0.1);
+    camera
+}
+
+/// 40 frames of the game's clock from `time_of_day`, as the window draws them: the clock's sky each
+/// frame, no sky frame (the camera's own), the walking camera; then the last frame's image and the
+/// exposure it settled at.
+fn drawn_by_the_clock(
+    gpu: &mut Offscreen,
+    camera: &Camera,
+    time_of_day: f64,
+) -> (render::Image, f32) {
+    gpu.set_flat_ambient(false);
+    let mut daylight = Daylight::new();
+    let mut now = Duration::ZERO;
+    let mut time = time_of_day;
+    for _ in 0..40 {
+        time += 1.0 / 108_000.0;
+        let drive = daylight.step(time, 0);
+        gpu.set_day_sky(drive.sky, drive.jumped);
+        now += Duration::from_millis(16);
+        gpu.draw_frame(camera, false, now);
+    }
+    (gpu.shown(), gpu.exposure_stops(false).expect("metered"))
+}
+
+/// The mean of the image's top quarter, which is the sky: its linear-ish level in 0..=255.
+fn sky_level(image: &render::Image) -> f32 {
+    let rows = image.height as usize / 4;
+    let px = &image.rgba[..rows * image.width as usize * 4];
+    let sum: u64 = px
+        .chunks(4)
+        .map(|p| u64::from(p[0]) + u64::from(p[1]) + u64::from(p[2]))
+        .sum();
+    sum as f32 / (px.len() / 4 * 3) as f32
+}
+
+#[test]
+fn the_window_sets_its_sky_up_on_an_empty_planet_and_gets_the_same_day_as_a_built_one() {
+    // The window starts on an empty scene, sets the Planet's ground level on it (the camera's height
+    // for the atmosphere), and replaces the scene when the Planet has loaded (`Renderer::set_scene`).
+    // The owner's playtest drew a black sky and a blinding ground by day: the new scene's tracer had
+    // lost the ground level, which put the camera at the Planet's radius above the ground in the
+    // atmosphere's eyes (in space: black sky, the sun unattenuated on the ground). The benches and
+    // the look-dev sheet build their `Offscreen` with the scene, and never saw it.
+    let camera = horizon_camera();
+    for time_of_day in [1.0 - hero_time_of_day(), 0.5] {
+        let mut built = Offscreen::new(WIDTH, HEIGHT, &sea_level_floor()).unwrap();
+        built.set_ground_level(GROUND);
+        let (want, want_stops) = drawn_by_the_clock(&mut built, &camera, time_of_day);
+
+        let mut window = Offscreen::new(WIDTH, HEIGHT, &Scene::default()).unwrap();
+        window.set_ground_level(GROUND);
+        window.set_scene(&sea_level_floor()).unwrap();
+        let (got, got_stops) = drawn_by_the_clock(&mut window, &camera, time_of_day);
+
+        let (sky, built_sky) = (sky_level(&got), sky_level(&want));
+        assert!(
+            built_sky > 60.0,
+            "the built day is a bright sky: {built_sky} at {time_of_day}"
+        );
+        assert!(
+            (sky - built_sky).abs() < 4.0,
+            "sky {sky} against {built_sky} at {time_of_day}: the window's is black or blown"
+        );
+        assert!(
+            (got_stops - want_stops).abs() < 0.1,
+            "exposure {got_stops} stops against {want_stops} at {time_of_day}"
+        );
+        let apart = levels(&got, &want);
+        assert!(
+            apart < 2.0,
+            "the window's frame is {apart} levels from the built one's at {time_of_day}"
+        );
+    }
+}
+
+#[test]
+fn a_replaced_scene_keeps_the_settings_and_counts_as_a_jump() {
+    // `set_scene` is `Tracer::replace_scene`: the look, the stages, the shadow rays and the night
+    // are the caller's and not the scene's, and a reader of the sun's epoch (the denoiser) sees the
+    // new Planet as a jump.
+    let camera = Camera::looking_at([4.0, 60.0, 40.0], [4.0, 0.0, 4.0]);
+    let set = |gpu: &mut Offscreen| {
+        gpu.set_look(render::Look::LEGACY);
+        gpu.set_stages(Stages::NONE);
+        gpu.set_shadow_rays(1);
+        let mut sky = DaySky::at(0.9);
+        sky.night = 0.7;
+        gpu.set_day_sky(sky, true);
+    };
+    let mut built = Offscreen::new(WIDTH, HEIGHT, &pillar_scene()).unwrap();
+    set(&mut built);
+    let want = built.render(&camera);
+
+    let mut window = Offscreen::new(WIDTH, HEIGHT, &Scene::default()).unwrap();
+    set(&mut window);
+    let before = window.sun_epoch();
+    window.set_scene(&pillar_scene()).unwrap();
+    assert!(window.sun_epoch() > before, "a new scene is a jump");
+    let got = window.render(&camera);
+    assert_eq!(
+        got.rgba, want.rgba,
+        "the replaced scene is drawn with the settings it had"
+    );
+}
+
+#[test]
+fn the_day_is_the_same_sky_wherever_on_the_planet_the_camera_stands() {
+    // The sky is a function of the time of day and the camera's local frame, so a camera standing at
+    // the pole the game spawns at (+z), on the equator, at mid-latitudes and at the antipode, 3 m
+    // above sea level and looking at the horizon, sees the same sky: bright by day, and the same
+    // image to a rounding. No frame bug (a position the frame degenerates at, a sky that is only
+    // right on +y) hides at one place.
+    let ups: [([f64; 3], &str); 7] = [
+        ([0.0, 0.0, 1.0], "the spawn pole, +z"),
+        ([0.0, 0.0, -1.0], "-z"),
+        ([0.0, 1.0, 0.0], "+y"),
+        ([1.0, 0.0, 0.0], "the equator at +x"),
+        ([-0.6, 0.0, -0.8], "the equator, elsewhere"),
+        ([0.5, 0.5, 0.7], "mid-latitude"),
+        ([0.3, -0.9, 0.3], "a southern latitude"),
+    ];
+    let mut gpu = Offscreen::new(WIDTH, HEIGHT, &Scene::default()).unwrap();
+    gpu.set_ground_level(GROUND);
+    for time_of_day in [1.0 - hero_time_of_day(), 0.5] {
+        let mut first: Option<render::Image> = None;
+        for (up, name) in ups {
+            let len = up.iter().map(|c| c * c).sum::<f64>().sqrt();
+            let up = up.map(|c| c / len);
+            let mut camera = Camera::looking_at([0.0, 0.0, 0.0], [0.0, 0.0, -1.0]);
+            camera.position = up.map(|c| c * (GROUND + 60.0));
+            camera.carry_up(up);
+            camera.pitch = 0.1;
+            let image = at(&mut gpu, &camera, time_of_day);
+            let sky = sky_level(&image);
+            assert!(
+                sky > 60.0,
+                "a dark sky ({sky}) at {name}, time {time_of_day}"
+            );
+            match &first {
+                None => first = Some(image),
+                Some(want) => {
+                    let apart = levels(&image, want);
+                    assert!(
+                        apart < 2.0,
+                        "{name} at {time_of_day}: {apart} levels from the spawn pole's sky"
+                    );
+                }
+            }
+        }
+    }
+}

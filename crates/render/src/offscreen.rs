@@ -350,6 +350,17 @@ impl Offscreen {
         })
     }
 
+    /// Replaces the Planet being drawn, as the window's `Renderer::set_scene` does when the Planet
+    /// it was loading is ready: the same call, so that a test of the window's sky setup (a ground
+    /// level and a day sky set on the empty scene the window starts with, then the Planet) is of
+    /// the window's code. Only with the compute backend, which is the window's.
+    pub fn set_scene(&mut self, scene: &Scene) -> Result<()> {
+        if self.rt.active.is_hardware() {
+            return Err("set_scene is the window's path, which has the compute backend".into());
+        }
+        self.tracer.replace_scene(&self.device, scene)
+    }
+
     /// Brings the GPU copy of the Planet up to date with `scene`, after `update` (the result of
     /// [`Scene::update`]) changed it. This starts the reference image over.
     pub fn update_scene(&mut self, scene: &Scene, update: &SceneUpdate) -> Result<()> {
