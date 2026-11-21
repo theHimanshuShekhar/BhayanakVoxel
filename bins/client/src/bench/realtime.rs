@@ -55,7 +55,7 @@ use sim::Predictor;
 
 use super::budget::{EXIT_OVER_BUDGET, StreamingBudgets};
 use super::process;
-use super::rt::AccelSummary;
+use super::rt::{AccelSummary, HwFrame, PathHardware};
 use super::stream::{
     Constants, Series, Sizing, Start, TestPlanet, measure_sizes, over_the_ground, percentile_99,
     test_planet, within_reach,
@@ -191,6 +191,9 @@ pub struct GpuFrame {
     /// call: the groups built as the draw followed the camera (#236). It is not in `encode`, and
     /// the frame's update is `write + flush + hardware`, wherever the builds were encoded.
     pub hardware: Duration,
+    /// The same by part, from every update of the frame (the call's and the draw's), for a frame
+    /// on the hardware backend; None on the compute one (see [`PathReport::hardware`]).
+    pub accel: Option<HwFrame>,
 }
 
 impl GpuFrame {
@@ -242,7 +245,11 @@ impl Gpu for OffscreenGpu<'_> {
         frame.submit = drawn.submit;
         frame.wait = drawn.wait;
         frame.passes = drawn.gpu;
-        self.accel.extend(self.gpu.take_hardware_updates());
+        let updates = self.gpu.take_hardware_updates();
+        if self.gpu.rt().active.is_hardware() {
+            frame.accel = Some(HwFrame::of(&updates));
+        }
+        self.accel.extend(updates);
         Ok(frame)
     }
 
@@ -794,6 +801,10 @@ pub struct PathReport {
     /// to the GPU, the encoding, the submit, the wait for the GPU, or what the GPU says its passes
     /// took. The slowest frames have the same parts one by one; this is all of them.
     pub frame_parts: FrameParts,
+    /// Where the hardware backend's part of `frame_parts.update` went, by what the frame thread
+    /// did (host prep, recording, finish, submit), and how much it built a frame (#236); null on
+    /// the compute backend.
+    pub hardware: Option<PathHardware>,
     /// The GPU's own time of each pass, by the pass's name, over the frames whose times came in
     /// (#54: GI is passes `gi` and `shade`, and the frame's cost is read against main's here).
     pub gpu_passes: std::collections::BTreeMap<String, Spread>,
@@ -1609,6 +1620,8 @@ struct Frame {
     /// Whether the drawn scene's lag was over what level 0 reaches (see
     /// [`PathReport::lag_over_floor_frames`]); false when nothing is scored.
     lag_over_floor: bool,
+    /// The hardware backend's cost in the frame, by part (None on the compute backend).
+    hw: Option<HwFrame>,
     /// Whether the frame's update was the scene made again for a depth that was given back
     /// ([`Rebuild::Release`]).
     release_rebuild: bool,
@@ -1666,6 +1679,8 @@ struct Capture {
     /// The parts of every frame, and the GPU's time of every pass.
     recentre_ms: Vec<f64>,
     update_all_ms: Vec<f64>,
+    /// Each frame's update and its hardware parts, for a path on the hardware backend.
+    hardware: Vec<(f64, HwFrame)>,
     encode_ms: Vec<f64>,
     submit_ms: Vec<f64>,
     wait_ms: Vec<f64>,
@@ -1755,6 +1770,7 @@ impl Capture {
             frame_ms: Vec::new(),
             recentre_ms: Vec::new(),
             update_all_ms: Vec::new(),
+            hardware: Vec::new(),
             encode_ms: Vec::new(),
             submit_ms: Vec::new(),
             wait_ms: Vec::new(),
@@ -1817,6 +1833,9 @@ impl Capture {
         self.cpu_ms.push(frame.cpu_ms);
         self.recentre_ms.push(frame.parts.recentre_ms);
         self.update_all_ms.push(frame.parts.update_ms);
+        if let Some(hw) = frame.hw {
+            self.hardware.push((frame.parts.update_ms, hw));
+        }
         self.encode_ms.push(frame.parts.encode_ms);
         self.submit_ms.push(frame.parts.submit_ms);
         self.wait_ms.push(frame.parts.wait_ms);
@@ -1908,6 +1927,7 @@ impl Capture {
                 gpu_total: Spread::of(&self.gpu_total_ms),
                 wait_not_passes: Spread::of(&self.wait_not_passes_ms),
             },
+            hardware: (!self.hardware.is_empty()).then(|| PathHardware::of(&self.hardware)),
             gpu_passes: self
                 .pass_series
                 .iter()
@@ -2285,6 +2305,7 @@ impl<'a> Session<'a> {
             soft_misses: self.world.stats().soft_misses,
             camera_soft_miss: self.score_camera
                 && soft_miss_under(self.world.scene(), camera, self.world.bands()),
+            hw: gpu.accel,
             release_rebuild: kind == "rebuild"
                 && self.world.scene().rebuild_reason() == Some(Rebuild::Release),
             lag_over_floor: self.score_camera
@@ -3281,6 +3302,7 @@ mod tests {
                 worst_ms: cpu_p99 * 2.0,
             },
             frame_parts: FrameParts::default(),
+            hardware: None,
             // A `gi` pass well inside its gate.
             gpu_passes: [(
                 "gi".to_string(),
@@ -3953,6 +3975,7 @@ mod tests {
                 "frames_over_limit_by_update",
                 "generated_bricks",
                 "gpu_passes",
+                "hardware",
                 "hole_looks",
                 "holes",
                 "holes_per_frame",
@@ -4221,6 +4244,7 @@ mod tests {
             grow: ms(50),
             grown_bytes: 1 << 20,
             hardware: ms(16),
+            accel: None,
         };
         // The growth is inside the write: it is not another part of the CPU's time. The hardware
         // backend's builds are (outside the encode they were measured in).

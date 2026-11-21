@@ -314,6 +314,36 @@ pub fn group_counts(scene: &Scene) -> BTreeMap<GroupKey, u32> {
     groups
 }
 
+/// Where an update's time went on the frame thread, in the order of the work (they add up to
+/// `prepare + build`: each is the time between two readings of one clock). For the benchmark to say
+/// which part of the hardware backend's cost it is (#236).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct HwPhases {
+    /// What came before the pump: for an update the patch's groups merged into the queue (the
+    /// search for a stale one, if there is none), for a draw's follow the TLAS's frame moved, which
+    /// writes every instance again.
+    pub before: Duration,
+    /// Choosing the groups (the queue sorted by the camera's distance, the budget), and for each
+    /// the pool's room, its BLAS (made, if it is new) and its job for the box pass.
+    pub plan: Duration,
+    /// The TLAS's instances and the table of them written (`write_buffer`), and the bind group
+    /// made again if the TLAS or a buffer was.
+    pub instances: Duration,
+    /// Recording the box pass (the jobs written, a bind group and a dispatch a chunk of them).
+    pub boxes: Duration,
+    /// Making the entries of the BLASes' builds and recording them and the TLAS's.
+    pub builds: Duration,
+    /// Finishing the command buffer.
+    pub finish: Duration,
+    /// `Queue::submit` of that command buffer alone. The writes of the buffers that the frame's
+    /// update made with `write_buffer` since the last submit (the scene's upload, the instances)
+    /// are sent with the first submit after them, which is this one when an update came first: so
+    /// the frame's own submit is cheaper for it.
+    pub submit: Duration,
+    /// Waiting for the GPU to be done: zero, but in the Edit stress ([`HwScene::set_wait`]).
+    pub wait: Duration,
+}
+
 /// What an update of the acceleration structures did and cost, and what there is now.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct HwUpdate {
@@ -340,6 +370,8 @@ pub struct HwUpdate {
     /// the cost of the builds themselves (the benchmark's Edit stress asks for that; a frame
     /// never waits).
     pub build: Duration,
+    /// `prepare + build` in the parts of the work.
+    pub phases: HwPhases,
 }
 
 /// One group's job for the box pass.
@@ -900,6 +932,10 @@ impl HwScene {
                 tlas_instances: self.groups.len() as u32,
                 prims_total: self.prims_total(),
                 prepare: started.elapsed(),
+                phases: HwPhases {
+                    before: started.elapsed(),
+                    ..HwPhases::default()
+                },
                 ..HwUpdate::default()
             });
             return;
@@ -973,6 +1009,7 @@ impl HwScene {
         limit: Limit,
     ) {
         let all = matches!(limit, Limit::All);
+        let entered = Instant::now();
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("acceleration structures"),
         });
@@ -1080,9 +1117,9 @@ impl HwScene {
         }
         self.spent += spent;
         self.built += jobs.len() as u32;
+        let planned = Instant::now();
         self.sync_instances(device, queue, touched);
-        let prepare = started.elapsed();
-        let submitting = Instant::now();
+        let synced = Instant::now();
         let kind = if jobs.is_empty() { "anchor" } else { "patch" };
         self.boxes.encode(
             device,
@@ -1092,6 +1129,7 @@ impl HwScene {
             &self.pool_buffer,
             &jobs,
         );
+        let boxed = Instant::now();
         let sizes: Vec<wgpu::BlasAABBGeometrySizeDescriptor> =
             jobs.iter().map(|job| blas_descriptor(job.count)).collect();
         let entries: Vec<wgpu::BlasBuildEntry<'_>> = jobs
@@ -1111,13 +1149,27 @@ impl HwScene {
             })
             .collect();
         encoder.build_acceleration_structures(entries.iter(), std::iter::once(&self.tlas));
-        queue.submit(std::iter::once(encoder.finish()));
+        let recorded = Instant::now();
+        let commands = encoder.finish();
+        let finished = Instant::now();
+        queue.submit(std::iter::once(commands));
+        let submitted = Instant::now();
         if self.wait {
             device
                 .poll(wgpu::PollType::wait_indefinitely())
                 .expect("device poll failed");
         }
-        let build = submitting.elapsed();
+        let done = Instant::now();
+        let phases = HwPhases {
+            before: entered - started,
+            plan: planned - entered,
+            instances: synced - planned,
+            boxes: boxed - synced,
+            builds: recorded - boxed,
+            finish: finished - recorded,
+            submit: submitted - finished,
+            wait: done - submitted,
+        };
         self.tlas_stale = false;
         self.record(HwUpdate {
             kind: if all { "build" } else { kind },
@@ -1128,8 +1180,9 @@ impl HwScene {
             blas_total: self.groups.len() as u32,
             prims_total: self.prims_total(),
             pending: self.pending.len() as u32,
-            prepare,
-            build,
+            prepare: synced - started,
+            build: done - synced,
+            phases,
         });
     }
 

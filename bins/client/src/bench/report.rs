@@ -174,7 +174,9 @@ use super::stream::StreamReport;
 /// each summary `pending_max` and `updates_waiting` (the updates that left groups waiting); the streaming real-time run takes `--rt-backend` (`streaming_real_time.rt`:
 /// `requested`, `active`, `fallback`, `accel`; `both` also puts the hardware run in `rt.real_time_hw`);
 /// every `Spread` has `p95_ms`; the real-time `frame_parts.update` counts the hardware
-/// backend's builds wherever they are encoded (also those of the draw), and an adapter that cannot
+/// backend's builds wherever they are encoded (also those of the draw), each path has `hardware` (null on
+/// compute: that cost by part per frame, `update_rest`, the BLASes and boxes a frame, the cost per BLAS), each
+/// summary `phases_ms` and each Edit's update `phases_ms`, and an adapter that cannot
 /// run the hardware backend stops a real-time run that asked for it (an `error`, exit status 1). The `prepare_ms`/`build_ms` of an update are the frame thread's cost
 /// only; the GPU's own time is only in the Edit stress (it waits there).
 pub const SCHEMA_VERSION: u32 = 33;

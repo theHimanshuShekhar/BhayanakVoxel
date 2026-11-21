@@ -950,3 +950,46 @@ fn a_draw_that_builds_a_group_that_waited_counts_it_as_the_hardwares() {
         "a draw that builds nothing"
     );
 }
+
+/// An update's phases are the parts of its cost: they add up to `prepare + build` (the bench's
+/// split of the hardware backend's frame-thread time is of these, #236), and an update that built
+/// something spent time in the plan, the recording and the submit.
+#[test]
+fn the_phases_of_an_update_add_up_to_what_it_cost() {
+    let (store, mut scene) = walking_scene();
+    let mut hw =
+        Offscreen::with_backend(Resolution::native(8, 8), &scene, RtBackend::Hardware).unwrap();
+    if hw.rt().active != RtBackend::Hardware {
+        eprintln!("skipped: {:?}", hw.rt().fallback);
+        return;
+    }
+    hw.take_hardware_updates();
+    for step in 1..=6 {
+        let camera = [
+            -60.0 + f64::from(step) * 14.0,
+            1565.0,
+            -60.0 + f64::from(step) * 9.0,
+        ];
+        if let Some(update) = scene.recentre(&store, camera).unwrap() {
+            hw.update_scene(&scene, &update).unwrap();
+        }
+    }
+    let log = hw.take_hardware_updates();
+    let built: Vec<_> = log.iter().filter(|u| u.blas_rebuilt > 0).collect();
+    assert!(!built.is_empty(), "{log:?}");
+    for u in &log {
+        let p = u.phases;
+        let sum =
+            p.before + p.plan + p.instances + p.boxes + p.builds + p.finish + p.submit + p.wait;
+        assert_eq!(sum, u.prepare + u.build, "{u:?}");
+    }
+    for u in built {
+        let p = u.phases;
+        assert!(
+            p.plan > std::time::Duration::ZERO
+                && p.builds > std::time::Duration::ZERO
+                && p.submit > std::time::Duration::ZERO,
+            "{u:?}"
+        );
+    }
+}

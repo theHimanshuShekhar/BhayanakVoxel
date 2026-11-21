@@ -19,6 +19,7 @@ use render::{HwUpdate, RtBackend};
 use serde::Serialize;
 
 use super::edits::EditsReport;
+use super::realtime::Spread;
 use super::report::{Entry, ModeReport};
 use super::stats::Stats;
 
@@ -90,6 +91,67 @@ pub struct AccelUpdate {
     /// builds. It does not wait for the GPU (#236), except in the Edit stress, which asks the
     /// update to wait so that the builds' own time is in it.
     pub build_ms: f64,
+    /// `prepare_ms + build_ms` by part (see [`AccelPhases`]).
+    pub phases_ms: PhasesMs,
+}
+
+/// One update's time by part, in milliseconds (`render::HwPhases`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize)]
+pub struct PhasesMs {
+    pub before: f64,
+    pub plan: f64,
+    pub instances: f64,
+    pub boxes_pass: f64,
+    pub builds: f64,
+    pub finish: f64,
+    pub submit: f64,
+    pub wait: f64,
+}
+
+impl From<&HwUpdate> for PhasesMs {
+    fn from(u: &HwUpdate) -> Self {
+        let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3;
+        Self {
+            before: ms(u.phases.before),
+            plan: ms(u.phases.plan),
+            instances: ms(u.phases.instances),
+            boxes_pass: ms(u.phases.boxes),
+            builds: ms(u.phases.builds),
+            finish: ms(u.phases.finish),
+            submit: ms(u.phases.submit),
+            wait: ms(u.phases.wait),
+        }
+    }
+}
+
+/// The updates' time by part: each a `Stats` over the updates that rebuilt something.
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+pub struct AccelPhases {
+    pub before: Stats,
+    pub plan: Stats,
+    pub instances: Stats,
+    pub boxes_pass: Stats,
+    pub builds: Stats,
+    pub finish: Stats,
+    pub submit: Stats,
+    pub wait: Stats,
+}
+
+impl AccelPhases {
+    fn of(done: &[&HwUpdate]) -> Self {
+        let all: Vec<PhasesMs> = done.iter().map(|u| PhasesMs::from(*u)).collect();
+        let col = |f: fn(&PhasesMs) -> f64| Stats::of(&all.iter().map(f).collect::<Vec<_>>());
+        Self {
+            before: col(|p| p.before),
+            plan: col(|p| p.plan),
+            instances: col(|p| p.instances),
+            boxes_pass: col(|p| p.boxes_pass),
+            builds: col(|p| p.builds),
+            finish: col(|p| p.finish),
+            submit: col(|p| p.submit),
+            wait: col(|p| p.wait),
+        }
+    }
 }
 
 impl From<&HwUpdate> for AccelUpdate {
@@ -105,6 +167,7 @@ impl From<&HwUpdate> for AccelUpdate {
             pending: u.pending,
             prepare_ms: u.prepare.as_secs_f64() * 1e3,
             build_ms: u.build.as_secs_f64() * 1e3,
+            phases_ms: PhasesMs::from(u),
         }
     }
 }
@@ -133,6 +196,8 @@ pub struct AccelSummary {
     pub build_ms: Stats,
     /// `prepare_ms` + `build_ms` of each update.
     pub total_ms: Stats,
+    /// `prepare_ms` + `build_ms` by part, per update that rebuilt something.
+    pub phases_ms: AccelPhases,
     /// The sum of `total_ms` over the updates, and the time of the search that found nothing stale
     /// in those that rebuilt nothing (`noop_updates`): what the stretch of the run spent on them.
     pub total_sum_ms: f64,
@@ -169,8 +234,173 @@ impl AccelSummary {
                     .map(|u| ms(u.prepare + u.build))
                     .collect::<Vec<_>>(),
             ),
+            phases_ms: AccelPhases::of(&done),
             total_sum_ms: done.iter().map(|u| ms(u.prepare + u.build)).sum::<f64>() + noop_search,
             noop_search_ms: noop_search,
+        }
+    }
+}
+
+/// What the hardware backend's updates cost the frame thread in one frame, by part, in
+/// milliseconds: the parts of [`render::HwPhases`] summed over the frame's updates (the one of the
+/// update's own call and the draw's follow of the camera), and how much they built (#236).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct HwFrame {
+    pub before: f64,
+    pub plan: f64,
+    pub instances: f64,
+    pub boxes_pass: f64,
+    pub builds: f64,
+    pub finish: f64,
+    pub submit: f64,
+    pub wait: f64,
+    /// BLASes built and the boxes in them, and the submits made (updates that did something).
+    pub blas: u32,
+    pub boxes: u64,
+    pub submits: u32,
+}
+
+impl HwFrame {
+    pub fn of(updates: &[HwUpdate]) -> Self {
+        let mut f = Self::default();
+        let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3;
+        for u in updates {
+            f.before += ms(u.phases.before);
+            f.plan += ms(u.phases.plan);
+            f.instances += ms(u.phases.instances);
+            f.boxes_pass += ms(u.phases.boxes);
+            f.builds += ms(u.phases.builds);
+            f.finish += ms(u.phases.finish);
+            f.submit += ms(u.phases.submit);
+            f.wait += ms(u.phases.wait);
+            f.blas += u.blas_rebuilt;
+            f.boxes += u.prims_rebuilt;
+            f.submits += u32::from(u.kind != "none");
+        }
+        f
+    }
+
+    /// All of the frame's hardware time: the sum of the parts.
+    pub fn total(&self) -> f64 {
+        self.before
+            + self.plan
+            + self.instances
+            + self.boxes_pass
+            + self.builds
+            + self.finish
+            + self.submit
+            + self.wait
+    }
+}
+
+/// A count per frame: the mean, the 95th percentile (nearest rank) and the most.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize)]
+pub struct Count {
+    pub mean: f64,
+    pub p95: f64,
+    pub max: f64,
+}
+
+impl Count {
+    fn of(values: &[f64]) -> Self {
+        let s = Spread::of(values);
+        Self {
+            mean: s.mean_ms,
+            p95: s.p95_ms,
+            max: s.worst_ms,
+        }
+    }
+}
+
+/// Microseconds per BLAS built, by part, over the frames that built any: the sum of a part over
+/// them over the BLASes they built.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize)]
+pub struct PerBlasUs {
+    pub total: f64,
+    pub before: f64,
+    pub plan: f64,
+    pub instances: f64,
+    pub boxes_pass: f64,
+    pub builds: f64,
+    pub finish: f64,
+    pub submit: f64,
+}
+
+/// What the hardware backend cost the frame thread over the frames of a path, by part (#236): each
+/// `Spread` is of every frame of the path (zero where nothing was built), like
+/// `frame_parts.update`, which has all of it: `total` is the hardware's part of it and
+/// `update_rest` what is left, which is what the compute backend's update costs as well.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize)]
+pub struct PathHardware {
+    /// Frames in which a BLAS was built.
+    pub frames_with_builds: usize,
+    /// The parts' sum, per frame.
+    pub total: Spread,
+    pub before: Spread,
+    pub plan: Spread,
+    pub instances: Spread,
+    pub boxes_pass: Spread,
+    pub builds: Spread,
+    pub finish: Spread,
+    pub submit: Spread,
+    pub wait: Spread,
+    /// `frame_parts.update` less `total`, per frame.
+    pub update_rest: Spread,
+    /// BLASes and boxes built per frame, and the submits made.
+    pub blas: Count,
+    pub boxes: Count,
+    pub submits: Count,
+    pub per_blas_us: PerBlasUs,
+}
+
+impl PathHardware {
+    /// `frames` are each frame's update (`frame_parts.update`, in ms) and its hardware parts.
+    pub fn of(frames: &[(f64, HwFrame)]) -> Self {
+        let col =
+            |f: fn(&HwFrame) -> f64| -> Vec<f64> { frames.iter().map(|(_, h)| f(h)).collect() };
+        let built: Vec<&HwFrame> = frames
+            .iter()
+            .map(|(_, h)| h)
+            .filter(|h| h.blas > 0)
+            .collect();
+        let blas: f64 = built.iter().map(|h| f64::from(h.blas)).sum();
+        let per = |f: fn(&HwFrame) -> f64| -> f64 {
+            if blas == 0.0 {
+                0.0
+            } else {
+                built.iter().map(|h| f(h)).sum::<f64>() / blas * 1e3
+            }
+        };
+        Self {
+            frames_with_builds: built.len(),
+            total: Spread::of(&col(HwFrame::total)),
+            before: Spread::of(&col(|h| h.before)),
+            plan: Spread::of(&col(|h| h.plan)),
+            instances: Spread::of(&col(|h| h.instances)),
+            boxes_pass: Spread::of(&col(|h| h.boxes_pass)),
+            builds: Spread::of(&col(|h| h.builds)),
+            finish: Spread::of(&col(|h| h.finish)),
+            submit: Spread::of(&col(|h| h.submit)),
+            wait: Spread::of(&col(|h| h.wait)),
+            update_rest: Spread::of(
+                &frames
+                    .iter()
+                    .map(|(update, h)| update - h.total())
+                    .collect::<Vec<_>>(),
+            ),
+            blas: Count::of(&col(|h| f64::from(h.blas))),
+            boxes: Count::of(&col(|h| h.boxes as f64)),
+            submits: Count::of(&col(|h| f64::from(h.submits))),
+            per_blas_us: PerBlasUs {
+                total: per(HwFrame::total),
+                before: per(|h| h.before),
+                plan: per(|h| h.plan),
+                instances: per(|h| h.instances),
+                boxes_pass: per(|h| h.boxes_pass),
+                builds: per(|h| h.builds),
+                finish: per(|h| h.finish),
+                submit: per(|h| h.submit),
+            },
         }
     }
 }
@@ -375,6 +605,58 @@ mod tests {
             build: Duration::from_millis(build_ms),
             ..HwUpdate::default()
         }
+    }
+
+    fn phased(blas: u32, ms: f64) -> HwUpdate {
+        let d = |x: f64| Duration::from_secs_f64(x / 1e3);
+        HwUpdate {
+            kind: "patch",
+            blas_rebuilt: blas,
+            prims_rebuilt: u64::from(blas) * 100,
+            phases: render::HwPhases {
+                before: d(ms * 0.5),
+                plan: d(ms),
+                instances: d(ms * 0.5),
+                boxes: d(ms),
+                builds: d(ms * 2.0),
+                finish: d(ms),
+                submit: d(ms * 4.0),
+                wait: Duration::ZERO,
+            },
+            ..HwUpdate::default()
+        }
+    }
+
+    #[test]
+    fn a_frames_hardware_time_is_its_updates_parts_summed_and_its_builds_counted() {
+        let f = HwFrame::of(&[phased(10, 1.0), phased(5, 2.0), update("none", 0, 0)]);
+        assert!((f.total() - 10.0 * 3.0).abs() < 1e-9, "{f:?}");
+        assert!(
+            (f.plan - 3.0).abs() < 1e-9 && (f.submit - 12.0).abs() < 1e-9,
+            "{f:?}"
+        );
+        assert_eq!((f.blas, f.boxes, f.submits), (15, 1500, 2));
+        assert_eq!(HwFrame::of(&[]), HwFrame::default());
+    }
+
+    #[test]
+    fn a_paths_hardware_report_has_every_frame_the_rest_of_its_update_and_the_cost_per_blas() {
+        let a = HwFrame::of(&[phased(10, 1.0)]);
+        let idle = HwFrame::default();
+        // 10 ms of the first frame's 12 is the hardware's, and the other frame has an update of
+        // 0.5 ms with no hardware in it.
+        let h = PathHardware::of(&[(12.0, a), (0.5, idle)]);
+        assert_eq!(h.frames_with_builds, 1);
+        assert_eq!(h.total.samples, 2);
+        assert!((h.total.mean_ms - 5.0).abs() < 1e-9, "{h:?}");
+        assert!((h.update_rest.worst_ms - 2.0).abs() < 1e-9, "{h:?}");
+        assert!((h.update_rest.mean_ms - 1.25).abs() < 1e-9, "{h:?}");
+        assert_eq!((h.blas.max, h.blas.mean), (10.0, 5.0));
+        assert_eq!(h.submits.max, 1.0);
+        // Over the frames that built: 10 ms / 10 BLAS = 1000 us each, 400 of them the submit.
+        assert!((h.per_blas_us.total - 1000.0).abs() < 1e-6, "{h:?}");
+        assert!((h.per_blas_us.submit - 400.0).abs() < 1e-6, "{h:?}");
+        assert_eq!(PathHardware::of(&[]).per_blas_us, PerBlasUs::default());
     }
 
     #[test]

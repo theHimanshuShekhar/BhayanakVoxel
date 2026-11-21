@@ -1190,6 +1190,26 @@ fn print_real_time(r: &realtime::RealTimeReport) {
                 "        frame thread's scene update: mean {:.2} p95 {:.2} max {:.2} ms",
                 m.update.mean_ms, m.update.p95_ms, m.update.worst_ms,
             );
+            if let Some(h) = &p.hardware {
+                eprintln!(
+                    "        hardware per frame, mean (p95) ms: total {:.2} ({:.2}) = before {:.2} + plan {:.2} + instances {:.2} + boxes pass {:.2} + builds {:.2} + finish {:.2} + submit {:.2} ({:.2}); update less hardware {:.2}; BLAS {:.1} (max {}), {} us each, {} frames with builds",
+                    h.total.mean_ms,
+                    h.total.p95_ms,
+                    h.before.mean_ms,
+                    h.plan.mean_ms,
+                    h.instances.mean_ms,
+                    h.boxes_pass.mean_ms,
+                    h.builds.mean_ms,
+                    h.finish.mean_ms,
+                    h.submit.mean_ms,
+                    h.submit.p95_ms,
+                    h.update_rest.mean_ms,
+                    h.blas.mean,
+                    h.blas.max,
+                    h.per_blas_us.total.round(),
+                    h.frames_with_builds,
+                );
+            }
             if !p.gpu_passes.is_empty() {
                 let passes: Vec<String> = p
                     .gpu_passes

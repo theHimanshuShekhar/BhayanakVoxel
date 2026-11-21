@@ -1605,6 +1605,26 @@ to say how much the budget held back. **A run asked for the hardware backend (`h
 half of `both`) on an adapter with no ray queries is an error** (`error` of that report, with the
 adapter's reason, exit status 1): its gates would be compute's, and say nothing of the backend.
 
+**Where the hardware's frame-thread time goes** (each path's `hardware`, null on compute; each
+run's `accel.*.phases_ms`; each Edit's `phases_ms`). Every update is timed in parts that add up to
+its `prepare_ms + build_ms` (one clock, read between the parts), and a path's `hardware` has them
+per frame, summed over the frame's updates (the update's call and the draw's follow), over every
+frame of the path like `frame_parts.update` (zero where nothing was built): `total`, then
+`before` (the patch merged into the queue, or the TLAS's frame moved: every instance written),
+`plan` (the queue sorted, the pool's room, the new BLASes made, the jobs), `instances` (the
+instance table written and the bind group made again), `boxes_pass` (recording the box pass),
+`builds` (the entries and the BLAS and TLAS build commands recorded), `finish`, `submit`
+(`Queue::submit` of the hardware's command buffer alone) and `wait` (zero but in the Edit stress),
+each a `Spread` with `mean_ms`, `p95_ms`, `p99_ms`, `worst_ms`. `update_rest` is
+`frame_parts.update - total` per frame: what the compute backend pays as well (the scene's write
+and flush), so it is to match compute's `frame_parts.update`, and the rest of the gap is what the
+parts do not cover. `blas`, `boxes` and `submits` are per frame `{mean, p95, max}`;
+`frames_with_builds` the frames with a BLAS built; `per_blas_us` the parts over the BLASes built,
+in microseconds, over the frames that built (so the cost can be read per BLAS). **The `submit` of
+the hardware's command buffer also sends the `write_buffer`s of the frame's update that were
+queued before it** (the scene's upload), which on compute go in the draw's submit: read
+`frame_parts.submit` of the two backends with it (the hardware's is lower by that much).
+
 `--rt-backend hw` alone runs the whole bench (the flight, the sweep and the Edit stress) on the
 hardware backend: `rt.active` is `hw`, `rt.accel` has the same `initial`/`flight`/`sweep`/`edits`
 as `hw_accel`, and `modes`, `altitudes` and `edits` are the hardware ones, to compare with a
@@ -1695,6 +1715,7 @@ rays; those that need ray queries skip themselves, printing why, where there are
   entry of `streaming_real_time.rt.accel`) is `{ "updates", "noop_updates", "blas_rebuilt",
   "prims_rebuilt", "tlas_rebuilds", "blas_rebuilt_per_update_mean", "blas_rebuilt_per_update_max",
   "pending_max", "updates_waiting", "prepare_ms": STATS, "build_ms": STATS, "total_ms": STATS,
+  "phases_ms": { "before", "plan", "instances", "boxes_pass", "builds", "finish", "submit", "wait": STATS },
   "total_sum_ms", "noop_search_ms" }`; see "The hardware ray backend".
 - `ENTRY` is `STATS` plus `name`, `budget_ms` (null if the pass has none) and `status`:
   - `within`: the **mean** is at most the budget.
