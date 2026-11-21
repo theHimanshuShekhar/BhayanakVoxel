@@ -242,6 +242,111 @@ pub struct HwUpdate {
     pub build: Duration,
 }
 
+/// Where the regions and table slots of a scene of rings are (by the level and key they hold), as
+/// of the last update: what turns the indices that a [`RingPatch`] lists back into the groups they
+/// are in. CPU only.
+#[derive(Default)]
+pub struct RegionIndex {
+    slot_key: HashMap<usize, (u8, [i32; 3])>,
+    region_key: HashMap<usize, (u8, [i32; 3])>,
+}
+
+impl RegionIndex {
+    /// The index of every region and table slot that `scene` has.
+    pub fn of(scene: &Scene) -> Self {
+        let mut index = Self::default();
+        for (level, lv) in scene.levels.iter().enumerate() {
+            for slot in 0..=lv.table_mask as usize {
+                let global = lv.table_base as usize + slot;
+                if let Some(w) = scene.table.get(global * 4..global * 4 + 4)
+                    && w[3] != 0
+                {
+                    let key = (level as u8, [w[0] as i32, w[1] as i32, w[2] as i32]);
+                    index.slot_key.insert(global, key);
+                    index.region_key.insert(w[3] as usize - 1, key);
+                }
+            }
+        }
+        index
+    }
+
+    /// The groups whose boxes `patch` made stale in `scene` (which it was made for), and the index
+    /// brought up to date with it.
+    pub fn dirty(&mut self, scene: &Scene, patch: &RingPatch) -> BTreeSet<GroupKey> {
+        let mut dirty = BTreeSet::new();
+        let mark = |dirty: &mut BTreeSet<GroupKey>, (level, key): (u8, [i32; 3])| {
+            dirty.insert((level, group_of(key)));
+        };
+        for &slot in &patch.table {
+            if let Some(&old) = self.slot_key.get(&slot) {
+                mark(&mut dirty, old);
+            }
+            let w = scene.table.get(slot * 4..slot * 4 + 4);
+            match w {
+                Some(w) if w[3] != 0 => {
+                    let level = scene
+                        .levels
+                        .iter()
+                        .position(|lv| {
+                            (lv.table_base as usize..=(lv.table_base + lv.table_mask) as usize)
+                                .contains(&slot)
+                        })
+                        .unwrap_or(0) as u8;
+                    let key = (level, [w[0] as i32, w[1] as i32, w[2] as i32]);
+                    mark(&mut dirty, key);
+                    self.slot_key.insert(slot, key);
+                    self.region_key.insert(w[3] as usize - 1, key);
+                }
+                _ => {
+                    self.slot_key.remove(&slot);
+                }
+            }
+        }
+        for &region in &patch.regions {
+            if let Some(&key) = self.region_key.get(&region) {
+                mark(&mut dirty, key);
+            }
+        }
+        for &key in &patch.rewritten {
+            mark(&mut dirty, (0, key));
+        }
+        // The coarse levels' (their words are rewritten in place just the same, and the box that
+        // was made from them is stale).
+        for &(level, key) in &patch.rewritten_coarse {
+            mark(&mut dirty, (level as u8, key));
+        }
+        // Entries of `brick_refs` written in place: the region they belong to has them from its
+        // `first_ref`, for as many bricks as its mask has.
+        if !patch.brick_refs.is_empty() {
+            let mut owners: Vec<(u32, usize)> = self
+                .region_key
+                .keys()
+                .filter_map(|&r| {
+                    let first = *scene.regions.get(r * REGION_WORDS + REGION_FIRST_REF)?;
+                    (first & SOLID_FLAG == 0).then_some((first, r))
+                })
+                .collect();
+            owners.sort_unstable();
+            for range in &patch.brick_refs {
+                let end = owners.partition_point(|&(first, _)| (first as usize) < range.end);
+                for &(first, r) in owners[..end].iter().rev() {
+                    if first as usize + 512 <= range.start {
+                        break;
+                    }
+                    let count: u32 = scene.regions[r * REGION_WORDS..][..16]
+                        .iter()
+                        .map(|w| w.count_ones())
+                        .sum();
+                    if first as usize + count as usize > range.start {
+                        mark(&mut dirty, self.region_key[&r]);
+                    }
+                }
+            }
+        }
+        dirty
+    }
+}
+
 /// A group on the GPU.
 struct Group {
     blas: wgpu::Blas,
@@ -272,8 +377,7 @@ pub struct HwScene {
     anchor: [i32; 3],
     bind_group: wgpu::BindGroup,
     /// Where the scene's regions and table slots are, to find the groups a patch touches.
-    slot_key: HashMap<usize, (u8, [i32; 3])>,
-    region_key: HashMap<usize, (u8, [i32; 3])>,
+    index: RegionIndex,
     last: HwUpdate,
     /// Every update since the log was last taken ([`HwScene::take_log`]), for the bench's totals.
     log: Vec<HwUpdate>,
@@ -359,8 +463,7 @@ impl HwScene {
             anchor_buffer,
             anchor,
             bind_group,
-            slot_key: HashMap::new(),
-            region_key: HashMap::new(),
+            index: RegionIndex::default(),
             last: HwUpdate::default(),
             log: Vec::new(),
         };
@@ -484,27 +587,9 @@ impl HwScene {
     ) {
         self.groups.clear();
         self.words_used = 0;
-        self.slot_key.clear();
-        self.region_key.clear();
         let keys = all_groups(scene);
-        self.refresh(device, queue, scene, &keys, kind);
-        self.index_regions(scene);
-    }
-
-    /// Notes where every region and table slot of `scene` is, for [`HwScene::dirty_groups`].
-    fn index_regions(&mut self, scene: &Scene) {
-        for (level, lv) in scene.levels.iter().enumerate() {
-            for slot in 0..=lv.table_mask as usize {
-                let global = lv.table_base as usize + slot;
-                if let Some(w) = scene.table.get(global * 4..global * 4 + 4)
-                    && w[3] != 0
-                {
-                    let key = (level as u8, [w[0] as i32, w[1] as i32, w[2] as i32]);
-                    self.slot_key.insert(global, key);
-                    self.region_key.insert(w[3] as usize - 1, key);
-                }
-            }
-        }
+        self.refresh(device, queue, scene, &keys, kind, Duration::ZERO);
+        self.index = RegionIndex::of(scene);
     }
 
     /// Rebuilds the BLASes of `keys` (taking out those with no box now), and the TLAS.
@@ -515,6 +600,7 @@ impl HwScene {
         scene: &Scene,
         keys: &BTreeSet<GroupKey>,
         kind: &'static str,
+        searched: Duration,
     ) {
         let prepared = Instant::now();
         let mut made = Vec::new();
@@ -561,7 +647,8 @@ impl HwScene {
             );
             self.words_used += group.words.len();
         }
-        let prepare = prepared.elapsed();
+        // The search for the groups to make again is part of making them.
+        let prepare = searched + prepared.elapsed();
         let built = Instant::now();
         let rebuilt = self.build(device, queue, keys);
         let build = built.elapsed();
@@ -694,76 +781,7 @@ impl HwScene {
         let SceneUpdate::Rings(patch) = update else {
             return None;
         };
-        Some(self.dirty_from_patch(scene, patch))
-    }
-
-    fn dirty_from_patch(&mut self, scene: &Scene, patch: &RingPatch) -> BTreeSet<GroupKey> {
-        let mut dirty = BTreeSet::new();
-        let mark = |dirty: &mut BTreeSet<GroupKey>, (level, key): (u8, [i32; 3])| {
-            dirty.insert((level, group_of(key)));
-        };
-        for &slot in &patch.table {
-            if let Some(&old) = self.slot_key.get(&slot) {
-                mark(&mut dirty, old);
-            }
-            let w = scene.table.get(slot * 4..slot * 4 + 4);
-            match w {
-                Some(w) if w[3] != 0 => {
-                    let level = scene
-                        .levels
-                        .iter()
-                        .position(|lv| {
-                            (lv.table_base as usize..=(lv.table_base + lv.table_mask) as usize)
-                                .contains(&slot)
-                        })
-                        .unwrap_or(0) as u8;
-                    let key = (level, [w[0] as i32, w[1] as i32, w[2] as i32]);
-                    mark(&mut dirty, key);
-                    self.slot_key.insert(slot, key);
-                    self.region_key.insert(w[3] as usize - 1, key);
-                }
-                _ => {
-                    self.slot_key.remove(&slot);
-                }
-            }
-        }
-        for &region in &patch.regions {
-            if let Some(&key) = self.region_key.get(&region) {
-                mark(&mut dirty, key);
-            }
-        }
-        for &key in &patch.rewritten {
-            mark(&mut dirty, (0, key));
-        }
-        // Entries of `brick_refs` written in place: the region they belong to has them from its
-        // `first_ref`, for as many bricks as its mask has.
-        if !patch.brick_refs.is_empty() {
-            let mut owners: Vec<(u32, usize)> = self
-                .region_key
-                .keys()
-                .filter_map(|&r| {
-                    let first = *scene.regions.get(r * REGION_WORDS + REGION_FIRST_REF)?;
-                    (first & SOLID_FLAG == 0).then_some((first, r))
-                })
-                .collect();
-            owners.sort_unstable();
-            for range in &patch.brick_refs {
-                let end = owners.partition_point(|&(first, _)| (first as usize) < range.end);
-                for &(first, r) in owners[..end].iter().rev() {
-                    if first as usize + 512 <= range.start {
-                        break;
-                    }
-                    let count: u32 = scene.regions[r * REGION_WORDS..][..16]
-                        .iter()
-                        .map(|w| w.count_ones())
-                        .sum();
-                    if first as usize + count as usize > range.start {
-                        mark(&mut dirty, self.region_key[&r]);
-                    }
-                }
-            }
-        }
-        dirty
+        Some(self.index.dirty(scene, patch))
     }
 
     /// Brings the acceleration structures up to date with `scene` after `update`: only the groups
@@ -775,17 +793,21 @@ impl HwScene {
         scene: &Scene,
         update: &SceneUpdate,
     ) {
-        match self.dirty_groups(scene, update) {
+        let searching = Instant::now();
+        let dirty = self.dirty_groups(scene, update);
+        let searched = searching.elapsed();
+        match dirty {
             Some(dirty) if dirty.is_empty() => {
                 self.record(HwUpdate {
                     kind: "none",
                     blas_total: self.groups.len() as u32,
                     tlas_instances: self.groups.len() as u32,
                     prims_total: self.last.prims_total,
+                    prepare: searched,
                     ..HwUpdate::default()
                 });
             }
-            Some(dirty) => self.refresh(device, queue, scene, &dirty, "patch"),
+            Some(dirty) => self.refresh(device, queue, scene, &dirty, "patch", searched),
             None => self.rebuild_all(device, queue, scene, "build"),
         }
     }

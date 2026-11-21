@@ -111,7 +111,7 @@ fn shadows(@builtin(global_invocation_id) id: vec3<u32>) {
             // lighting: Sun and shadows
             let to_sun = sample_cone(frame.sun.xyz, frame.sun.w, sun_sample(id.xy, frame.light.x * rays + k));
             // lighting: Sun and shadows
-            if dot(hit.normal, to_sun) > 0.0 && !trace(leave(ray, hit, to_sun)).hit {
+            if dot(hit.normal, to_sun) > 0.0 && !occluded(leave(ray, hit, to_sun), 3.4e38) {
                 seen += 1u;
             }
         }

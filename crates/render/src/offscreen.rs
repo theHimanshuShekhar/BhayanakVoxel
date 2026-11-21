@@ -207,7 +207,18 @@ impl Offscreen {
     /// if the adapter can do ray queries, else the compute one, with no error ([`Offscreen::rt`]
     /// says which and why).
     pub fn with_backend(resolution: Resolution, scene: &Scene, backend: RtBackend) -> Result<Self> {
-        Self::build_with(resolution, scene, true, None, false, backend)
+        Self::build_with(resolution, scene, true, None, false, backend, false)
+    }
+
+    /// [`Offscreen::with_backend`] on a device made as if the adapter had no ray queries, as on one
+    /// that lacks them: a hardware `backend` falls back to compute. For testing that path, through
+    /// the real device request, wherever the driver has them.
+    pub fn without_ray_queries(
+        resolution: Resolution,
+        scene: &Scene,
+        backend: RtBackend,
+    ) -> Result<Self> {
+        Self::build_with(resolution, scene, true, None, false, backend, true)
     }
 
     /// Which ray backend runs, and why not the one asked for if it is not.
@@ -268,6 +279,7 @@ impl Offscreen {
             table,
             full_reference,
             RtBackend::Compute,
+            false,
         )
     }
 
@@ -278,9 +290,10 @@ impl Offscreen {
         table: Option<&materials::MaterialTable>,
         full_reference: bool,
         backend: RtBackend,
+        hide_ray_queries: bool,
     ) -> Result<Self> {
         let (adapter, device, queue, rt) =
-            request_gpu_for(shared_instance(), None, timers, backend)?;
+            request_gpu_for(shared_instance(), None, timers, backend, hide_ray_queries)?;
         let info = adapter.get_info();
         let info = GpuInfo {
             name: info.name,
@@ -290,9 +303,14 @@ impl Offscreen {
             backend: format!("{:?}", info.backend),
         };
         let mut tracer = match (rt.active, table) {
-            (RtBackend::Hardware, table) => {
-                Tracer::hardware(&device, &queue, scene, table, scene_centre(scene))?
-            }
+            (backend, table) if backend.is_hardware() => Tracer::hardware(
+                &device,
+                &queue,
+                scene,
+                table,
+                scene_centre(scene),
+                backend == RtBackend::Hardware,
+            )?,
             (_, Some(table)) => Tracer::with_materials(&device, scene, table)?,
             (_, None) => Tracer::new(&device, scene)?,
         };

@@ -346,7 +346,20 @@ struct Patch {
     bricks: Vec<Range<usize>>,
     /// The regions of level 0 with bricks rewritten in place (see [`RingPatch::rewritten`]).
     rewritten: BTreeSet<[i32; 3]>,
+    /// The same for the coarse levels (see [`RingPatch::rewritten_coarse`]).
+    rewritten_coarse: BTreeSet<(usize, [i32; 3])>,
     levels: bool,
+}
+
+impl Patch {
+    /// Notes that mixed bricks of the region `key` of `level` had their words written in place.
+    fn note_rewritten(&mut self, level: usize, key: [i32; 3]) {
+        if level == 0 {
+            self.rewritten.insert(key);
+        } else {
+            self.rewritten_coarse.insert((level, key));
+        }
+    }
 }
 
 /// The lengths of the four buffers of a scene of rings, in words. Each grows on its own, when it
@@ -388,6 +401,11 @@ pub struct RingPatch {
     /// `bricks` do not say which region they are in, and what a Voxel is made of may have changed
     /// (the emitters' index reads this).
     pub rewritten: Vec<[i32; 3]>,
+    /// The same for the coarse levels, by level and key (ascending): `rewritten` is level 0's
+    /// only, since the emitters' index is. The hardware ray backend's boxes (#50) are as tight as
+    /// the words they were made from, so a coarse brick that reads differently in place moves its
+    /// box, with no word of `regions` or `brick_refs` written.
+    pub rewritten_coarse: Vec<(usize, [i32; 3])>,
     /// Whether [`Scene::levels`] changed: the boxes walked, the holes, or the ball that rays are
     /// clipped to.
     pub levels: bool,
@@ -522,6 +540,9 @@ impl RingPatch {
         rewritten.sort_unstable();
         rewritten.dedup();
         self.rewritten = rewritten;
+        self.rewritten_coarse.extend(later.rewritten_coarse);
+        self.rewritten_coarse.sort_unstable();
+        self.rewritten_coarse.dedup();
         self.levels |= later.levels;
         // The buffers only grow, so the later lengths are the longer.
         self.sizes = later.sizes.or(self.sizes);
@@ -1721,9 +1742,7 @@ impl Scene {
                             self.bricks[at..at + range.len()]
                                 .copy_from_slice(&words[range.clone()]);
                             self.patch().bricks.push(at..at + range.len());
-                            if level == 0 {
-                                self.patch().rewritten.insert(key);
-                            }
+                            self.patch().note_rewritten(level, key);
                         }
                         Want::Absent => unreachable!("the brick stays"),
                     }
@@ -1758,9 +1777,7 @@ impl Scene {
                         let at = entry as usize;
                         self.bricks[at..at + range.len()].copy_from_slice(&words[range.clone()]);
                         self.patch().bricks.push(at..at + range.len());
-                        if level == 0 {
-                            self.patch().rewritten.insert(key);
-                        }
+                        self.patch().note_rewritten(level, key);
                         new[*bit] = Some(entry);
                     }
                     (_, Some(entry)) => self.release_brick(entry),
@@ -2243,6 +2260,7 @@ impl Scene {
             brick_refs: merged(patch.brick_refs),
             bricks: merged(patch.bricks),
             rewritten: patch.rewritten.into_iter().collect(),
+            rewritten_coarse: patch.rewritten_coarse.into_iter().collect(),
             levels: patch.levels,
             sizes,
         }

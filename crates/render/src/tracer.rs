@@ -639,7 +639,15 @@ pub struct Tracer {
 /// The hardware backend's state: see [`crate::hw`].
 struct Hardware {
     scene: crate::hw::HwScene,
+    layout: HwLayout,
+}
+
+/// What the pipelines need of the hardware backend: its bind group's layout (group 2), and whether
+/// shadow rays end at the first hit (see [`crate::RtBackend::Hardware`]).
+#[derive(Clone)]
+struct HwLayout {
     layout: wgpu::BindGroupLayout,
+    any_hit_shadows: bool,
 }
 
 /// The size of a chunk of the staging belt, in bytes: a patch is written to a few of them.
@@ -696,12 +704,12 @@ fn compute_pipeline(
     entry_point: &str,
     group_1: &wgpu::BindGroupLayout,
     group_0: &wgpu::BindGroupLayout,
-    hw: Option<&wgpu::BindGroupLayout>,
+    hw: Option<&HwLayout>,
     constants: &[(&str, f64)],
 ) -> wgpu::ComputePipeline {
     // The hardware backend replaces the module's walk of the Planet with ray queries (group 2).
     let source = match hw {
-        Some(_) => shaders::hardware(source),
+        Some(hw) => shaders::hardware(source, hw.any_hit_shadows),
         None => source.to_string(),
     };
     let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -710,7 +718,7 @@ fn compute_pipeline(
     });
     let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some(label),
-        bind_group_layouts: &[Some(group_0), Some(group_1), hw],
+        bind_group_layouts: &[Some(group_0), Some(group_1), hw.map(|h| &h.layout)],
         immediate_size: 0,
     });
     device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -1061,19 +1069,21 @@ impl Tracer {
 
     /// [`Tracer::with_materials`] with the built-in table and the hardware backend (#50) on: the
     /// device must have `EXPERIMENTAL_RAY_QUERY` (see [`crate::choose_backend`]). `camera` is where
-    /// the acceleration structures' frame starts.
+    /// the acceleration structures' frame starts; with `any_hit_shadows` a shadow ray ends at the
+    /// first hit instead of looking for the nearest.
     pub fn hardware(
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         scene: &Scene,
         table: Option<&MaterialTable>,
         camera: [f64; 3],
+        any_hit_shadows: bool,
     ) -> Result<Self> {
         Self::build(
             device,
             scene,
             table.unwrap_or(MaterialTable::built_in()),
-            Some((queue, camera)),
+            Some((queue, camera, any_hit_shadows)),
         )
     }
 
@@ -1093,13 +1103,16 @@ impl Tracer {
         device: &wgpu::Device,
         scene: &Scene,
         table: &MaterialTable,
-        hardware: Option<(&wgpu::Queue, [f64; 3])>,
+        hardware: Option<(&wgpu::Queue, [f64; 3], bool)>,
     ) -> Result<Self> {
-        let hw_layout = hardware.map(|_| crate::hw::bind_group_layout(device));
+        let hw_layout = hardware.map(|(_, _, any_hit_shadows)| HwLayout {
+            layout: crate::hw::bind_group_layout(device),
+            any_hit_shadows,
+        });
         let hw = match (hardware, &hw_layout) {
-            (Some((queue, camera)), Some(layout)) => Some(Hardware {
-                scene: crate::hw::HwScene::new(device, queue, layout.clone(), scene, camera)?,
-                layout: layout.clone(),
+            (Some((queue, camera, _)), Some(hw)) => Some(Hardware {
+                scene: crate::hw::HwScene::new(device, queue, hw.layout.clone(), scene, camera)?,
+                layout: hw.clone(),
             }),
             _ => None,
         };

@@ -66,7 +66,7 @@ release: a debug build's CPU side is slow enough to distort the frame times.
 | `--flip-gamma-2-2` | Also score each checkpoint with the old gamma-2.2 curve (#188), from the same samples, to tell the sRGB move from the estimator's effect. Not with `--no-convergence` or `--short`. |
 | `--no-convergence` | Leave out the convergence phase (below), which otherwise runs after the caves. |
 | `--truth-spp N` | Samples of each of the convergence phase's two truths (the emissive room's have at least 8192 with FLIP, `ROOM_TRUTH_SPP`). Default 1024; ADR 0005's is 8192, which takes eight times as long (`client.exe bench --truth-spp 8192` is the 4090 baseline). At least 1024, the last checkpoint. |
-| `--rt-backend B` | How rays find the Planet (#50, a spike): `compute` (the default: the compute-shader DDA, the reference), `hw` (ray queries over the bricks' tight boxes, for the flight, the sweep and the Edit stress) or `both` (the bench as for `compute`, then the same flight and Edit stress on `hw`, on a context of its own, and the two compared). An adapter without ray queries runs compute with a warning and the reason in `rt.fallback`, not an error. See "The hardware ray backend" below. |
+| `--rt-backend B` | How rays find the Planet (#50, a spike): `compute` (the default: the compute-shader DDA, the reference), `hw` (ray queries over the bricks' tight boxes, shadow rays ending at the first hit, for the flight, the sweep and the Edit stress), `hw-nearest` (`hw` with shadow rays that look for the nearest hit) or `both` (the bench as for `compute`, then the same flight and Edit stress on `hw` and the flight on `hw-nearest`, each on a context of its own, and the three compared). An adapter without ray queries runs compute with a warning and the reason in `rt.fallback`, not an error. See "The hardware ray backend" below. |
 | `--no-fail` | Exit with status 0 even if a pass is over budget, a frame of the streaming mode has a hole, or a gate of the real-time mode is over. |
 
 It runs unattended. Without the convergence phase it takes a minute or so (generating the whole Planet is about 22 s of it); the convergence phase, on by default, adds about 45 s on the 4090 at the default `--truth-spp`, and more on a slower GPU or with a larger `--truth-spp`.
@@ -121,7 +121,7 @@ stops").
    phase" below.
 
 7. With `--rt-backend both` (#50), after the cave stills: the same flight and Edit stress again on the
-   hardware ray backend, on a context of its own. See "The hardware ray backend" below.
+   hardware ray backend, and the flight on its nearest-hit variant, each on a context of its own. See "The hardware ray backend" below.
 
 8. With `--streaming`, after everything else (the cave stills and the convergence phase included, so that the flag cannot
    move their timings), the streaming mode (#181), on a GPU of its own. See "The streaming mode"
@@ -1450,10 +1450,12 @@ A spike: are wgpu ray queries over procedural AABBs faster than the compute DDA 
 `trace()` casts (the primary rays, the sun shadows and the GI), at 5 cm on the 4090? The code is
 `crates/render/src/hw.rs` (the acceleration structures), `shaders/trace_hw.wgsl` (the shader) and
 `bins/client/src/bench/rt.rs` (the report). Compute is and stays the default and the reference; the
-hardware backend is chosen only by `--rt-backend hw|both` (the player's game does not use it), and
-only on an adapter with `EXPERIMENTAL_RAY_QUERY` (`render::choose_backend`: no ray queries, or
-limits of 0, is the compute backend with a reason, never an error; lavapipe in CI has them and runs
-the hardware backend in tests).
+hardware backend is chosen only by `--rt-backend hw|hw-nearest|both` (the player's game does not use
+it), and only on an adapter with `EXPERIMENTAL_RAY_QUERY` (`render::choose_backend`: no ray queries,
+or limits of 0, is the compute backend with a reason, never an error). Whether lavapipe has ray
+queries depends on its Mesa (the dev box's, 25.0.7, has them); the tests that compare the backends
+skip themselves, printing why, where it has none, and the fallback is tested through a device made
+without the feature (`Offscreen::without_ray_queries`).
 
 **What is built.** One AABB for each non-empty brick of each ring level, as tight as the Voxels that
 the brick's occupancy mask has set (a solid or uniform region is one box of its whole 64-Voxel
@@ -1464,6 +1466,14 @@ camera (snapped to 4096 Voxels) so that its floats are fine near the camera. On 
 shader runs the compute path's in-brick DDA (`hit_brick`, `hit_region`) and commits its hit with
 `rayQueryGenerateIntersection`; every pass is the same shader with either backend.
 
+**The two kinds of shadow ray.** The sun's shadow rays (`shade.wgsl`) and the GI's (`gi.wgsl`) ask
+`occluded(ray, reach)`, which only needs to know that something is there: on compute it is the same
+walk as any ray's, which goes front to back and stops at the first Voxel; on **`hw`** it is a ray
+query with `RAY_FLAG_TERMINATE_ON_FIRST_HIT` that ends at the first box that has a Voxel in the way,
+whichever the hardware reaches first; on **`hw-nearest`** it looks for the nearest hit like a
+primary ray does (what `hw` was before the early-out, kept to tell what the early-out is worth). The
+primary rays, the GI's bounces and the path tracer's rays are the nearest-hit query on both.
+
 **Running the comparison** (on the 4090, from a release build or the Windows artifact):
 
 ```
@@ -1471,34 +1481,74 @@ client.exe bench --rt-backend both --no-convergence --no-fail --out bench-out-rt
 client.exe bench --rt-backend hw --no-convergence --no-fail --out bench-out-hw   # the sweep too
 ```
 
-`both` is one process: the compute run is the ordinary bench, and the hardware run is a second
-context that flies the same path and makes the same Edits, so both are on the same GPU, driver and
-clocks. Read `rt.comparison`:
+`both` is one process: the compute run is the ordinary bench; the hardware run is a second context
+that flies the same path and makes the same Edits; and a third, `hw-nearest`, flies the path (no
+Edits). All are on the same GPU, driver and clocks. Read `rt.comparison`:
 
 - `speedup`: for `primary`, `shadows`, `gi` and `gpu_total`, the compute mean, the hardware mean
-  and `compute_over_hw` (above 1, hardware is faster; null if a pass was not timed).
-- `compute` and `hw`: every pass's STATS of the flight's primary mode on each backend.
+  and `compute_over_hw` (above 1, hardware is faster; null if a pass was not timed), and the same
+  with `hw-nearest` (`hw_nearest_mean_ms`, `compute_over_hw_nearest`).
+- **`speedup.gpu_total` is the GPU time of the frame's passes and leaves out the hardware's
+  acceleration structure updates**, which happen between frames and wait for the GPU. For the frame
+  with them in, `hw_gpu_total_plus_accel_ms` is the hardware's mean `gpu_total` plus the flight's
+  updates' total cost (`hw_accel.flight.total_sum_ms`) spread over the measured frames, and
+  `compute_over_hw_with_accel` is compute's `gpu_total` over it. (The updates' time is mostly CPU
+  time with the GPU idle, so adding it to the GPU time is the frame's length if the update is on
+  the frame thread, as here, and not the GPU's work.)
+- `compute`, `hw` and `hw_nearest`: the flight's primary mode on each backend: every pass's STATS,
+  `gpu_total`, `frame_time` and `scene_update_ms`. **`scene_update_ms` (its `max_ms`) is the stutter
+  that following the camera makes**, the hardware's acceleration structure updates included: it is
+  timed in the flight apart from the passes, and there is no p99 (`p95_ms` and `max_ms` are what
+  `STATS` has).
 - `hw_accel`: the cost of the acceleration structures. `initial` is the first build; `flight` and
-  `edits` are summaries (`updates`, `blas_rebuilt`, `prims_rebuilt`, `tlas_rebuilds`, per update
-  the BLASes rebuilt `_mean`/`_max`, and `prepare_ms` (the CPU's: the boxes worked out and the
-  BLASes made), `build_ms` (recording the builds, submitting them and waiting for the GPU) and
-  `total_ms` as STATS). Each update has a `kind`: `build` (all), `patch` (the groups a move or an
-  Edit touched, and the TLAS again) or `anchor` (the camera left the TLAS's frame: instances only).
+  `edits` are summaries (`updates`, `noop_updates` (scene updates after which no box was stale),
+  `blas_rebuilt`, `prims_rebuilt`, `tlas_rebuilds`, the BLASes rebuilt per update `_mean`/`_max`,
+  and `prepare_ms`, `build_ms` and `total_ms` as STATS, `total_sum_ms`). Each update has a `kind`:
+  `build` (all), `patch` (the groups a move or an Edit touched, and the TLAS again) or `anchor` (the
+  camera left the TLAS's frame: instances only).
+  - **`prepare_ms`** is CPU time: the search for the groups the patch made stale (the scene's
+    patch mapped to groups), then the boxes worked out and a buffer and a BLAS made for each group.
+  - **`build_ms`** is everything from the first build command to the GPU being idle: it records the
+    BLAS and TLAS builds, writes the boxes' words, the instance table and the bind group, submits,
+    and **waits for the GPU to finish everything queued** (`device.poll(wait)`), the scene's own
+    uploads (`update_scene`'s writes) included, which compute does not wait for. So it is the time
+    the frame thread stands still for an update, and is an upper bound on what the builds alone
+    cost.
 - `hw_edits`: the Edit stress on the hardware backend, in the report's `edits` shape, to put by
-  `edits` (compute). Its budgets are not gated. The acceleration structures' update is inside the
-  frame thread's time (`update_scene` waits for the build), so it is in `frame_thread`.
+  `edits` (compute). **Both stress runs start from the same camera and rings**: the sweep's last
+  height (20 000 Voxels over the pole), where the compute run ends the sweep, and the hardware run
+  is put there before it starts, so the Edits land on the same levels (a stress that started from
+  the flight's low end would make its Edits in level 0, which are cheaper to repair). Its budgets
+  are not gated. The acceleration structures' update is inside the frame thread's time
+  (`update_scene` waits for the build), so it is in `frame_thread`.
+
+**Where the updates run, if the player's client used this.** All on the **frame thread**, and the
+frame waits: `Renderer::update_scene` calls `Tracer::update_scene`
+(`crates/render/src/tracer.rs`, `update_scene`), which calls `HwScene::update` right after writing
+the scene's buffers, from the client's `upload` (`bins/client/src/main.rs`, `upload`, called by
+`stream` and `show` on the frame thread). `HwScene::update` makes the groups' boxes and BLASes
+(`prepare`, CPU) and builds them with a `device.poll(wait_indefinitely)` (`build`), so a frame that
+makes a patch is that long late. The move of the TLAS's frame when the camera leaves its snap
+(`HwScene::follow`) is in `Tracer`'s draw, also on the frame thread, with its own wait. The scene thread
+(ADR 0006) packs the bricks and does none of this. The bench measures that: the flight's updates are
+in `scene_update_ms` and `hw_accel.flight`, and the worst of them is a stutter of that size. Moving
+them to another thread is not done here.
 
 `--rt-backend hw` alone runs the whole bench (the flight, the sweep and the Edit stress) on the
 hardware backend: `rt.active` is `hw`, `rt.accel` has the same `initial`/`flight`/`edits` as
 `hw_accel`, and `modes`, `altitudes` and `edits` are the hardware ones, to compare with a
-`compute` report's by hand. The budgets are the compute backend's: a `hw` report is held to them
-like any other, so use `--no-fail` to read it. The cave stills, the convergence phase and the
-streaming modes always use compute: they are not what is compared.
+`compute` report's by hand (`hw-nearest` is the same with nearest-hit shadows). The budgets are
+the compute backend's: a `hw` report is held to them like any other, so use `--no-fail` to read
+it. The cave stills, the convergence phase and the streaming modes always use compute: they are
+not what is compared.
 
-**Tests.** `cargo test -p render hw::` (the tight boxes, the regular grouping, the fallback choice,
-and the patch's dirty groups; CPU only), `cargo test -p render --test hw_agreement` (on lavapipe:
-the fallback test, and an `#[ignore]`d one that compares the hit of both backends on a set of rays:
-`cargo test -p render --test hw_agreement -- --ignored --nocapture` on a GPU).
+**Tests.** `cargo test -p render --lib hw::` (CPU only: the tight boxes, the regular grouping, and
+the groups an Edit makes stale, in level 0 and in a coarse level where a brick is written in place
+and nothing but `RingPatch::rewritten_coarse` says where); `cargo test -p render --test
+hw_agreement -- --nocapture` (on a device: the choice of backend, the fallback through a device made
+without ray queries, an Edit's patch and agreement with compute at level 0 and at a coarse level,
+the shadows of both variants against compute's, and the hits of both backends on 6000 rays; those
+that compare skip themselves, printing why, on an adapter without ray queries).
 
 ## Reading the report
 
@@ -1547,7 +1597,8 @@ the fallback test, and an `#[ignore]`d one that compares the hit of both backend
                            "error": { "run", "step", "message" } | null } | null,  // --real-time only
   "rt": { "requested": "compute" | "hw" | "both", "active": "compute" | "hw", "fallback": STRING | null,
           "accel": { "initial", "flight", "edits" } | null,     // active hw only
-          "comparison": { "compute", "hw", "speedup", "hw_accel", "hw_edits" } | null }  // both only
+          "comparison": { "compute", "hw", "hw_nearest", "speedup", "hw_gpu_total_plus_accel_ms",
+                         "compute_over_hw_with_accel", "hw_accel", "hw_edits" } | null }  // both only
 }
 ```
 

@@ -240,10 +240,13 @@ fn run(args: &Args) -> Result<u8, Box<dyn Error>> {
         None
     } else {
         eprintln!("edits: the largest Brush at the metric rate...");
+        settle_for_edits(&mut gpu, &mut flight)?;
         edits::run(&mut gpu, &mut flight, &budgets)?
     };
     let timers_supported = gpu.timers_supported();
-    let main_accel = (choice.active == RtBackend::Hardware)
+    let main_accel = choice
+        .active
+        .is_hardware()
         .then(|| accel_report(initial_accel.as_ref(), &flight, edits.as_ref()));
     // The cave stills are of another scene, and another GPU context: this one's is done with.
     drop(gpu);
@@ -508,27 +511,29 @@ fn accel_report(
     }
 }
 
-/// `--rt-backend both` (#50): the flight and the Edit stress again on the hardware backend, on a
-/// context of its own, and put by the compute run's. `Err` is a failure to run; a missing feature is
-/// `Ok((None, Some(why)))`.
-fn compare_hardware(
+/// One hardware flight of `--rt-backend both` (#50): its primary mode's times and what its
+/// acceleration structures cost, and with `with_edits` its Edit stress too.
+struct HardwareFlight {
+    times: BackendTimes,
+    accel: AccelReport,
+    edits: Option<edits::EditsReport>,
+}
+
+/// The flight (and with `with_edits` the Edit stress) on the hardware backend `backend`, on a
+/// context of its own. `Ok(Err(why))` is an adapter that cannot do it; `Err` a failure to run.
+fn fly_hardware(
     plan: &Plan,
     args: &Args,
     resolution: Resolution,
     budgets: &Budgets,
-    compute: &ModeReport,
-) -> Result<(Option<Comparison>, Option<String>), Box<dyn Error>> {
-    eprintln!("rt: the same flight on the hardware backend...");
+    backend: RtBackend,
+    with_edits: bool,
+) -> Result<Result<HardwareFlight, Option<String>>, Box<dyn Error>> {
+    eprintln!("rt: the same flight on the {} backend...", backend.name());
     let mut flight = new_flight(plan, args)?;
-    let mut gpu = Offscreen::with_backend(resolution, &flight.scene, RtBackend::Hardware)?;
-    if gpu.rt().active != RtBackend::Hardware {
-        let why = gpu.rt().fallback.clone();
-        eprintln!(
-            "warning: no hardware comparison: {}",
-            why.as_deref()
-                .unwrap_or("the hardware backend did not start")
-        );
-        return Ok((None, why));
+    let mut gpu = Offscreen::with_backend(resolution, &flight.scene, backend)?;
+    if gpu.rt().active != backend {
+        return Ok(Err(gpu.rt().fallback.clone()));
     }
     let initial = gpu.take_hardware_updates().into_iter().next();
     prepare(&mut gpu, plan);
@@ -542,18 +547,61 @@ fn compare_hardware(
         budgets,
         None,
     )?;
-    let edits = if plan.patch {
+    let edits = if plan.patch || !with_edits {
         None
     } else {
-        eprintln!("rt: edits on the hardware backend...");
+        eprintln!("rt: edits on the {} backend...", backend.name());
+        settle_for_edits(&mut gpu, &mut flight)?;
         edits::run(&mut gpu, &mut flight, budgets)?
     };
-    let accel = accel_report(initial.as_ref(), &flight, edits.as_ref());
+    Ok(Ok(HardwareFlight {
+        times: BackendTimes::of(backend.name(), &primary),
+        accel: accel_report(initial.as_ref(), &flight, edits.as_ref()),
+        edits,
+    }))
+}
+
+/// `--rt-backend both` (#50): the flight and the Edit stress again on the hardware backend, and the
+/// flight on the one with nearest-hit shadows, each on a context of its own, put by the compute
+/// run's. `Err` is a failure to run; a missing feature is `Ok((None, Some(why)))`.
+fn compare_hardware(
+    plan: &Plan,
+    args: &Args,
+    resolution: Resolution,
+    budgets: &Budgets,
+    compute: &ModeReport,
+) -> Result<(Option<Comparison>, Option<String>), Box<dyn Error>> {
+    let run =
+        |backend, with_edits| fly_hardware(plan, args, resolution, budgets, backend, with_edits);
+    let hw = match run(RtBackend::Hardware, true)? {
+        Ok(hw) => hw,
+        Err(why) => {
+            eprintln!(
+                "warning: no hardware comparison: {}",
+                why.as_deref()
+                    .unwrap_or("the hardware backend did not start")
+            );
+            return Ok((None, why));
+        }
+    };
+    // The nearest-hit shadows are a side question: if it cannot run, the comparison is without it.
+    let nearest = match run(RtBackend::HardwareNearest, false) {
+        Ok(Ok(n)) => Some(n.times),
+        Ok(Err(why)) => {
+            eprintln!("warning: no hw-nearest run: {why:?}");
+            None
+        }
+        Err(e) => {
+            eprintln!("warning: the hw-nearest run failed, and is left out: {e}");
+            None
+        }
+    };
     let comparison = Comparison::new(
         BackendTimes::of("compute", compute),
-        BackendTimes::of("hw", &primary),
-        accel,
-        edits,
+        hw.times,
+        nearest,
+        hw.accel,
+        hw.edits,
     );
     Ok((Some(comparison), None))
 }
@@ -751,6 +799,28 @@ fn run_mode(
 /// Voxels (see [`planet_gen`]), so these are too, whatever a Voxel measures.
 const SWEEP_HEIGHTS: [f64; 4] = [48.0, 1000.0, 5000.0, 20000.0];
 
+/// The camera of the sweep at `height` Voxels over the pole.
+fn sweep_keyframe(height: f64) -> Keyframe {
+    let radius = f64::from(planet_gen::PLANET_RADIUS);
+    Keyframe {
+        position: [0.0, radius + height, 0.0],
+        target: [0.0, radius, -1500.0],
+    }
+}
+
+/// Puts the rings where the Edit stress starts from, on either backend: the camera of the sweep's
+/// last height. The compute run reaches the stress from the sweep, which ends there, so this does
+/// nothing to it; the hardware run of `--rt-backend both` has no sweep, and without this it would
+/// start from the low end of the flight, with its Edits in level 0 and not in the coarse levels the
+/// compute run's are in (#50), and `hw_edits` and `edits` would be of different Edits.
+fn settle_for_edits(gpu: &mut Offscreen, flight: &mut Flight) -> Result<(), Box<dyn Error>> {
+    let at = sweep_keyframe(SWEEP_HEIGHTS[SWEEP_HEIGHTS.len() - 1]);
+    let camera = CameraPath::new(vec![at, at]).camera_at(0, 2);
+    flight.follow(gpu, &camera)?;
+    flight.accel.extend(gpu.take_hardware_updates());
+    Ok(())
+}
+
 /// The test Planet from a still camera at each of [`SWEEP_HEIGHTS`], looking at the ground that
 /// slopes away towards the horizon: both modes' passes timed there, over a few dozen frames, and
 /// the bricks the bands select. It follows the flight and does not change it.
@@ -769,13 +839,9 @@ fn sweep(
         warmup: 2,
         spp: 2,
     };
-    let radius = f64::from(planet_gen::PLANET_RADIUS);
     let mut altitudes = Vec::new();
     for height in SWEEP_HEIGHTS {
-        let at = Keyframe {
-            position: [0.0, radius + height, 0.0],
-            target: [0.0, radius, -1500.0],
-        };
+        let at = sweep_keyframe(height);
         let path = CameraPath::new(vec![at, at]);
         eprintln!("sweep: {:.0} m", height / brick_store::VOXELS_PER_METRE);
         let by_mode = |gpu: &mut Offscreen, flight: &mut Flight, share, mode| {

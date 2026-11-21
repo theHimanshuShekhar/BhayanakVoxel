@@ -4,7 +4,7 @@
 use brick_store::{BrickCoord, BrickStore, Material, VoxelCoord};
 
 use super::*;
-use crate::scene::Core;
+use crate::scene::{Core, SceneUpdate};
 
 const STONE: Material = Material(7);
 
@@ -179,4 +179,83 @@ fn the_anchor_is_the_snap_multiple_nearest_the_camera() {
     assert_eq!(anchor_for([0.0; 3]), [0; 3]);
     assert_eq!(anchor_for([2047.0, -2049.0, 5000.0]), [0, -4096, 4096]);
     assert_eq!(anchor_for([6_000_000.0, 0.0, 0.0])[0] % ANCHOR_SNAP, 0);
+}
+
+/// Rings of a patch of the test Planet around a camera 1565 Voxels up, an Edit that places a block
+/// of Stone `size` Voxels each way on the ground at `(x, z)`, and the groups that the scene's patch
+/// of it makes stale, with the scene's patch and how many groups there are in all.
+fn dirty_after_a_block(
+    (x0, z0): (i32, i32),
+    size: i32,
+) -> (BTreeSet<GroupKey>, crate::scene::RingPatch, usize) {
+    use crate::lod::Bands;
+    use crate::scene::Bound;
+    let mut store =
+        planet_gen::generate_region(7, BrickCoord([-12, 178, -12]), BrickCoord([12, 193, 12]));
+    store.build_lod(5);
+    let bound = Bound {
+        centre: [0; 3],
+        radius: 1600,
+    };
+    let mut scene = Scene::rings(&store, [0.0, 1565.0, 0.0], Bands::with_d0(64.0), bound).unwrap();
+    let mut index = RegionIndex::of(&scene);
+    let total = all_groups(&scene).len();
+    let top = (1400..1650)
+        .rev()
+        .find(|&y| store.get(VoxelCoord([x0, y, z0])).is_some())
+        .unwrap();
+    let mut changed = BTreeSet::new();
+    for x in x0..x0 + size {
+        for y in top + 1..top + 1 + size {
+            for z in z0..z0 + size {
+                store.set(VoxelCoord([x, y, z]), Some(STONE));
+                changed.insert(VoxelCoord([x, y, z]).brick());
+            }
+        }
+    }
+    let changed: Vec<BrickCoord> = changed.into_iter().collect();
+    store.refresh_lod(changed.iter().copied());
+    let SceneUpdate::Rings(patch) = scene.update(&store, &changed).unwrap() else {
+        panic!("an Edit of rings is a patch of rings");
+    };
+    (index.dirty(&scene, &patch), patch, total)
+}
+
+#[test]
+fn an_edit_makes_stale_only_the_groups_that_hold_the_regions_it_wrote() {
+    // An Edit under the camera: level 0, a region's entries written.
+    let (dirty, patch, total) = dirty_after_a_block((0, 0), 8);
+    assert!(
+        !patch.regions.is_empty() || !patch.rewritten.is_empty(),
+        "{patch:?}"
+    );
+    assert!(
+        !dirty.is_empty() && dirty.len() < total,
+        "{dirty:?} of {total}"
+    );
+    assert!(dirty.iter().all(|&(level, _)| level == 0), "{dirty:?}");
+}
+
+/// A mixed brick of a coarse level whose words are written in place: nothing of `regions`,
+/// `table` or `brick_refs` says where, only `rewritten_coarse`, and the box made from the words
+/// is stale. Without that list the dirty set is empty and the hardware backend draws the ground
+/// that the block stands on (the reviewer's probe of #233).
+#[test]
+fn a_coarse_brick_written_in_place_makes_its_group_stale() {
+    let (dirty, patch, total) = dirty_after_a_block((100, 100), 4);
+    assert_eq!(
+        (
+            patch.regions.len(),
+            patch.table.len(),
+            patch.brick_refs.len()
+        ),
+        (0, 0, 0),
+        "{patch:?}"
+    );
+    assert_eq!(patch.rewritten_coarse, vec![(1, [0, 11, 0])]);
+    assert_eq!(
+        dirty,
+        BTreeSet::from([(1, group_of([0, 11, 0]))]),
+        "of {total}"
+    );
 }

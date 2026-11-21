@@ -163,8 +163,9 @@ use super::stream::StreamReport;
 /// it was asked for and the adapter has no ray queries), `accel` (on hw: the acceleration
 /// structures' first build, the updates that followed the camera and the Edit stress's, each with
 /// what it rebuilt and its CPU and GPU time) and `comparison` (`both`: the same flight on the two
-/// backends, the passes that cast rays side by side with their speed-ups, and the hardware
-/// context's `accel` and Edit stress). `edits.accel` is the Edit stress's updates of the
+/// backends, the passes that cast rays side by side with their speed-ups, the same with nearest-hit
+/// shadow rays (`hw_nearest`), the frame with the hardware's updates in, and the hardware context's
+/// `accel` and Edit stress). `edits.accel` is the Edit stress's updates of the
 /// acceleration structures (null on compute). Nothing else is changed.
 pub const SCHEMA_VERSION: u32 = 31;
 

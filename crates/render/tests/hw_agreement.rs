@@ -1,8 +1,9 @@
 //! The hardware ray-query backend (#50, a spike) against the compute `trace()`, and the choice
-//! between them. Needs a Vulkan device: CI uses lavapipe, which may or may not have ray queries
-//! (it depends on its Mesa): the fallback test holds either way, the Edit test skips itself where
-//! the adapter has none, and the comparison on a set of rays is `#[ignore]`d (run it on a GPU with
-//! ray queries: `cargo test -p render --test hw_agreement -- --ignored --nocapture`).
+//! between them. Needs a Vulkan device: CI uses lavapipe, which has ray queries or not by its Mesa
+//! (the dev box's, Mesa 25.0.7, has them). The tests of the fallback hold on either, through a
+//! device made without the feature; those that compare the backends skip themselves, printing why,
+//! on an adapter that has none (`cargo test -p render --test hw_agreement -- --nocapture` shows
+//! which ran), and all of them run on the 4090.
 
 mod common;
 
@@ -45,28 +46,89 @@ fn the_hardware_backend_is_chosen_only_where_the_adapter_has_ray_queries_and_oth
         &wgpu::Limits::default(),
     );
     assert_eq!(zero.active, RtBackend::Compute);
+    // Both hardware variants are chosen and refused alike.
+    let both = choose_backend(
+        RtBackend::HardwareNearest,
+        wgpu::Features::EXPERIMENTAL_RAY_QUERY,
+        &limits,
+    );
+    assert_eq!(both.active, RtBackend::HardwareNearest);
+    let neither = choose_backend(RtBackend::HardwareNearest, wgpu::Features::empty(), &limits);
+    assert_eq!(neither.active, RtBackend::Compute);
+}
 
-    // On this adapter, whatever it is: asking for hardware never fails, and draws a frame.
-    let store = generate_region(7, BrickCoord([-12, 178, -12]), BrickCoord([12, 193, 12]));
-    let scene = Scene::new(&store, None);
-    let mut gpu =
+fn small_scene() -> Scene {
+    Scene::new(
+        &generate_region(7, BrickCoord([-12, 178, -12]), BrickCoord([12, 193, 12])),
+        None,
+    )
+}
+
+/// The real device request without the feature: an adapter that has no ray queries (lavapipe in
+/// CI, if its Mesa has none; any adapter here, by hiding them) runs compute with no error, says why,
+/// has no acceleration structures, and draws what the default backend draws.
+#[test]
+fn a_device_without_ray_queries_runs_compute_with_no_error_and_draws_what_the_default_draws() {
+    let scene = small_scene();
+    let camera = Camera::looking_at([0.0, 1620.0, 100.0], [0.0, 1560.0, 0.0]);
+    let mut compute = Offscreen::new(32, 18, &scene).unwrap();
+    let want = compute.render(&camera);
+    for backend in [RtBackend::Hardware, RtBackend::HardwareNearest] {
+        let mut gpu =
+            Offscreen::without_ray_queries(Resolution::native(32, 18), &scene, backend).unwrap();
+        let rt = gpu.rt().clone();
+        assert_eq!(rt.requested, backend);
+        assert_eq!(rt.active, RtBackend::Compute);
+        assert!(rt.fallback.is_some_and(|r| r.contains("ray quer")));
+        assert!(gpu.hardware_update().is_none());
+        assert!(gpu.take_hardware_updates().is_empty());
+        assert_eq!(gpu.render(&camera).rgba, want.rgba);
+    }
+}
+
+/// Asking for hardware on this adapter, whatever it is, never fails: it runs what it can, and the
+/// choice says which.
+#[test]
+fn asking_for_hardware_never_fails_and_says_what_ran() {
+    let scene = small_scene();
+    let gpu =
         Offscreen::with_backend(Resolution::native(32, 18), &scene, RtBackend::Hardware).unwrap();
-    let rt = gpu.rt().clone();
+    let rt = gpu.rt();
     assert_eq!(rt.requested, RtBackend::Hardware);
     assert_eq!(rt.fallback.is_none(), rt.active == RtBackend::Hardware);
     eprintln!(
         "asked for hardware; ran {:?} ({:?})",
         rt.active, rt.fallback
     );
+}
+
+/// The lit frame of each hardware variant is the compute frame: the sun's shadow rays, which end at
+/// the first hit with `Hardware` and look for the nearest with `HardwareNearest`, find what the
+/// compute walk finds. Pixels may differ only where a ray grazes a box's edge.
+#[test]
+fn the_shadows_of_both_hardware_variants_are_the_compute_backends() {
+    let scene = small_scene();
     let camera = Camera::looking_at([0.0, 1620.0, 100.0], [0.0, 1560.0, 0.0]);
-    let image = gpu.render(&camera);
-    assert_eq!((image.width, image.height), (32, 18));
-    // The compute default draws the same frame where it fell back.
-    if rt.active == RtBackend::Compute {
-        let mut compute = Offscreen::new(32, 18, &scene).unwrap();
-        assert!(gpu.hardware_update().is_none());
-        assert_eq!(compute.rt().active, RtBackend::Compute);
-        assert_eq!(compute.render(&camera).rgba, image.rgba);
+    let mut compute = Offscreen::new(32, 18, &scene).unwrap();
+    let want = compute.render(&camera);
+    for backend in [RtBackend::Hardware, RtBackend::HardwareNearest] {
+        let mut gpu = Offscreen::with_backend(Resolution::native(32, 18), &scene, backend).unwrap();
+        if gpu.rt().active != backend {
+            eprintln!("skipped: {:?}", gpu.rt().fallback);
+            return;
+        }
+        let got = gpu.render(&camera);
+        let differing = got
+            .rgba
+            .chunks(4)
+            .zip(want.rgba.chunks(4))
+            .filter(|(a, b)| a.iter().zip(*b).any(|(&a, &b)| a.abs_diff(b) > 2))
+            .count();
+        assert!(
+            differing <= 32 * 18 / 100,
+            "{backend:?}: {differing} of {} pixels differ from compute's",
+            32 * 18
+        );
     }
 }
 
@@ -102,8 +164,9 @@ fn rays_for(scene_name: &str) -> Vec<render::reference::Ray> {
     rays
 }
 
+/// Runs wherever the adapter has ray queries (CI's lavapipe, if its Mesa has them: the test prints
+/// why when it skips itself); `--nocapture` shows the counts.
 #[test]
-#[ignore = "needs an adapter with ray queries; run it on the 4090"]
 fn hardware_and_compute_find_the_same_hits_on_a_small_scene() {
     let patch = Scene::new(
         &generate_region(7, BrickCoord([-12, 178, -12]), BrickCoord([12, 193, 12])),
@@ -168,11 +231,19 @@ fn hardware_and_compute_find_the_same_hits_on_a_small_scene() {
     }
 }
 
-#[test]
-fn an_edit_rebuilds_only_the_groups_it_touched_and_the_hardware_still_agrees_with_compute() {
+/// Builds the rings of a patch of the test Planet around `camera`, builds the hardware backend's
+/// acceleration structures for it, places a block of Stone, `size` Voxels each way, on the ground at
+/// `x, z` (Voxels), and brings the backend up to date as the bench's Edit stress does. Returns the
+/// scene's patch, the update that the backend recorded and how many groups there are in all, after
+/// checking that the hits of the hardware backend and of a fresh compute backend on rays down at the
+/// block are the same. `None` where the adapter has no ray queries.
+fn place_a_block_and_compare(
+    camera: [f64; 3],
+    (x0, z0): (i32, i32),
+    size: i32,
+) -> Option<(render::scene::RingPatch, render::HwUpdate, u32)> {
     let mut store = generate_region(7, BrickCoord([-12, 178, -12]), BrickCoord([12, 193, 12]));
     store.build_lod(5);
-    let camera = [0.0, 1565.0, 0.0];
     let bound = Bound {
         centre: [0; 3],
         radius: 1600,
@@ -182,7 +253,7 @@ fn an_edit_rebuilds_only_the_groups_it_touched_and_the_hardware_still_agrees_wit
         Offscreen::with_backend(Resolution::native(8, 8), &scene, RtBackend::Hardware).unwrap();
     if hw.rt().active != RtBackend::Hardware {
         eprintln!("skipped: {:?}", hw.rt().fallback);
-        return;
+        return None;
     }
     let first = hw.take_hardware_updates();
     assert_eq!(first.len(), 1);
@@ -190,12 +261,16 @@ fn an_edit_rebuilds_only_the_groups_it_touched_and_the_hardware_still_agrees_wit
     let total = first[0].blas_total;
     assert!(total > 1, "the scene has {total} groups");
 
-    // Place a block of an odd Material a few Voxels across under the ground, at the middle of the
-    // patch (setting air under the ground would do nothing: the rock there is not held).
+    // A block of Stone on the ground: higher than the bricks' tight boxes are, so a box that is
+    // not made again is below the block.
+    let top = (1400..1650)
+        .rev()
+        .find(|&y| store.get(VoxelCoord([x0, y, z0])).is_some())
+        .expect("ground in the patch");
     let mut changed = std::collections::BTreeSet::new();
-    for x in 0..8 {
-        for y in 1520..1528 {
-            for z in 0..8 {
+    for x in x0..x0 + size {
+        for y in top + 1..top + 1 + size {
+            for z in z0..z0 + size {
                 let at = VoxelCoord([x, y, z]);
                 store.set(at, Some(STONE));
                 changed.insert(at.brick());
@@ -205,33 +280,28 @@ fn an_edit_rebuilds_only_the_groups_it_touched_and_the_hardware_still_agrees_wit
     let changed: Vec<BrickCoord> = changed.into_iter().collect();
     store.refresh_lod(changed.iter().copied());
     let update = scene.update(&store, &changed).unwrap();
+    let render::scene::SceneUpdate::Rings(patch) = &update else {
+        panic!("an Edit of rings is a patch of rings");
+    };
+    let patch = patch.clone();
     hw.update_scene(&scene, &update).unwrap();
     let after = hw.take_hardware_updates();
-    let patch = after.iter().find(|u| u.kind == "patch").unwrap_or_else(|| {
-        panic!("an Edit's update is a patch of the groups it touched: {after:?}")
-    });
-    assert!(
-        patch.blas_rebuilt >= 1 && patch.blas_rebuilt < total,
-        "{} of {total} groups rebuilt",
-        patch.blas_rebuilt
-    );
-    assert!(patch.tlas_rebuilt);
+    assert_eq!(after.len(), 1, "{after:?}");
+    let recorded = after[0].clone();
 
-    // And what it draws is what compute draws of the edited scene, through the block.
+    // Rays down at the block from above: what they hit is the block, through the old boxes' tops.
     let mut rng = Lcg(5);
+    let top = top as f64;
     let rays: Vec<_> = (0..1024)
         .map(|_| {
+            let x = f64::from(x0) + f64::from(rng.next() * size as f32);
+            let z = f64::from(z0) + f64::from(rng.next() * size as f32);
             let from = [
-                f64::from(rng.next() * 40.0 - 20.0),
-                1560.0 + f64::from(rng.next() * 20.0),
-                f64::from(rng.next() * 40.0 - 20.0),
+                x + f64::from(rng.next() - 0.5),
+                top + 60.0,
+                z + f64::from(rng.next() - 0.5),
             ];
-            let to = [
-                f64::from(rng.next() * 8.0),
-                1520.0 + f64::from(rng.next() * 8.0),
-                f64::from(rng.next() * 8.0),
-            ];
-            ray(from, to)
+            ray(from, [x, top + 1.0 + f64::from(size) / 2.0, z])
         })
         .collect();
     let mut compute = Offscreen::new(8, 8, &scene).unwrap();
@@ -241,13 +311,59 @@ fn an_edit_rebuilds_only_the_groups_it_touched_and_the_hardware_still_agrees_wit
         .zip(&b)
         .filter(|(h, c)| match (h, c) {
             (None, None) => false,
-            (Some(h), Some(c)) => (h.voxel, h.material) != (c.voxel, c.material),
+            (Some(h), Some(c)) => {
+                (h.voxel, h.material) != (c.voxel, c.material)
+                    || (h.t - c.t).abs() > 1e-2 * (1.0 + c.t.abs())
+            }
             _ => true,
         })
         .count();
     assert!(
-        b.iter().flatten().count() > 100,
+        b.iter().flatten().count() > 900,
         "the rays should hit the block"
     );
-    assert!(differing <= rays.len() / 200, "{differing} differ");
+    assert!(
+        differing <= rays.len() / 200,
+        "{differing} of {} differ (hw {:?} compute {:?})",
+        rays.len(),
+        a.iter().flatten().next(),
+        b.iter().flatten().next()
+    );
+    Some((patch, recorded, total))
+}
+
+#[test]
+fn an_edit_near_the_camera_rebuilds_only_the_groups_it_touched_and_the_hardware_agrees() {
+    let Some((_, update, total)) = place_a_block_and_compare([0.0, 1565.0, 0.0], (0, 0), 8) else {
+        return;
+    };
+    assert_eq!(update.kind, "patch", "{update:?}");
+    assert!(
+        update.blas_rebuilt >= 1 && update.blas_rebuilt < total,
+        "{} of {total} groups rebuilt",
+        update.blas_rebuilt
+    );
+    assert!(update.tlas_rebuilt);
+}
+
+/// A coarse brick whose words are written in place, with no word of `regions` or `brick_refs`
+/// written for it, still has a stale box (it is as tight as the words it was made from): the
+/// patch names its region in `rewritten_coarse`, and the group is made again. Without that, the
+/// update is `none` and the rays hit the ground under the block.
+#[test]
+fn an_edit_in_place_at_a_coarse_level_makes_its_group_again() {
+    let Some((patch, update, total)) = place_a_block_and_compare([0.0, 1565.0, 0.0], (100, 100), 4)
+    else {
+        return;
+    };
+    assert!(
+        !patch.rewritten_coarse.is_empty(),
+        "the case is not one of a coarse brick rewritten in place: {patch:?}"
+    );
+    assert_eq!(update.kind, "patch", "{update:?}");
+    assert!(
+        update.blas_rebuilt >= 1 && update.blas_rebuilt < total,
+        "{} of {total} groups rebuilt",
+        update.blas_rebuilt
+    );
 }

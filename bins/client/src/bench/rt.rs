@@ -28,18 +28,21 @@ pub enum RtMode {
     #[default]
     Compute,
     Hardware,
+    /// Ray queries with the shadow rays looking for the nearest hit (`RtBackend::HardwareNearest`).
+    HardwareNearest,
     Both,
 }
 
 impl RtMode {
-    /// `compute`, `hw` or `both`.
+    /// `compute`, `hw`, `hw-nearest` or `both`.
     pub fn parse(text: &str) -> Result<Self, String> {
         match text {
             "compute" => Ok(Self::Compute),
             "hw" | "hardware" => Ok(Self::Hardware),
+            "hw-nearest" => Ok(Self::HardwareNearest),
             "both" => Ok(Self::Both),
             _ => Err(format!(
-                "`{text}` is not a ray backend: compute, hw or both"
+                "`{text}` is not a ray backend: compute, hw, hw-nearest or both"
             )),
         }
     }
@@ -48,6 +51,7 @@ impl RtMode {
         match self {
             Self::Compute => "compute",
             Self::Hardware => "hw",
+            Self::HardwareNearest => "hw-nearest",
             Self::Both => "both",
         }
     }
@@ -56,6 +60,7 @@ impl RtMode {
     pub fn main_backend(self) -> RtBackend {
         match self {
             Self::Hardware => RtBackend::Hardware,
+            Self::HardwareNearest => RtBackend::HardwareNearest,
             Self::Compute | Self::Both => RtBackend::Compute,
         }
     }
@@ -101,6 +106,9 @@ impl From<&HwUpdate> for AccelUpdate {
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]
 pub struct AccelSummary {
     pub updates: u32,
+    /// Updates that found nothing to rebuild (a scene update that no box was stale after): not in
+    /// `updates` or the figures below, which are of those that rebuilt something.
+    pub noop_updates: u32,
     pub blas_rebuilt: u64,
     pub prims_rebuilt: u64,
     pub tlas_rebuilds: u32,
@@ -111,6 +119,8 @@ pub struct AccelSummary {
     pub build_ms: Stats,
     /// `prepare_ms` + `build_ms` of each update.
     pub total_ms: Stats,
+    /// The sum of `total_ms` over the updates: what the stretch of the run spent on them.
+    pub total_sum_ms: f64,
 }
 
 impl AccelSummary {
@@ -120,6 +130,7 @@ impl AccelSummary {
         let per: Vec<u32> = done.iter().map(|u| u.blas_rebuilt).collect();
         Self {
             updates: done.len() as u32,
+            noop_updates: (updates.len() - done.len()) as u32,
             blas_rebuilt: per.iter().map(|&n| u64::from(n)).sum(),
             prims_rebuilt: done.iter().map(|u| u.prims_rebuilt).sum(),
             tlas_rebuilds: done.iter().filter(|u| u.tlas_rebuilt).count() as u32,
@@ -134,6 +145,7 @@ impl AccelSummary {
                     .map(|u| ms(u.prepare + u.build))
                     .collect::<Vec<_>>(),
             ),
+            total_sum_ms: done.iter().map(|u| ms(u.prepare + u.build)).sum(),
         }
     }
 }
@@ -157,6 +169,13 @@ pub struct BackendTimes {
     /// Every timed pass of the frame, by name (`primary`, `normals`, `shadows`, `gi`, `shade`...).
     pub passes: Vec<PassTimes>,
     pub gpu_total: Stats,
+    /// CPU time to draw a frame (the commands, the submit, and the hardware backend's move of the
+    /// TLAS's frame when the camera leaves it, which waits for the GPU).
+    pub frame_time: Stats,
+    /// CPU time per frame to follow the camera with the Planet, the update of the hardware
+    /// backend's acceleration structures included (`max_ms` is the stutter it makes). Not in
+    /// `frame_time` or in any pass. There is no p99: `p95_ms` and `max_ms` are what there are.
+    pub scene_update_ms: Stats,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -177,6 +196,8 @@ impl BackendTimes {
             frames: report.frames,
             passes: report.passes.iter().map(pass).collect(),
             gpu_total: report.gpu_total.stats.clone(),
+            frame_time: report.frame_time.clone(),
+            scene_update_ms: report.scene_update_ms.clone(),
         }
     }
 
@@ -203,14 +224,28 @@ pub struct Speedup {
     pub compute_mean_ms: Option<f64>,
     pub hw_mean_ms: Option<f64>,
     pub compute_over_hw: Option<f64>,
+    /// With `hw-nearest` (shadow rays that look for the nearest hit), if it ran.
+    pub hw_nearest_mean_ms: Option<f64>,
+    pub compute_over_hw_nearest: Option<f64>,
 }
 
 /// `--rt-backend both`: the same flight on both backends.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct Comparison {
     pub compute: BackendTimes,
+    /// `hw`: shadow rays that end at the first hit.
     pub hw: BackendTimes,
+    /// `hw-nearest`, the same flight (the primary mode only) with shadow rays that look for the
+    /// nearest hit, to tell what the early-out is worth; null if it did not run.
+    pub hw_nearest: Option<BackendTimes>,
     pub speedup: Vec<Speedup>,
+    /// The hardware backend's mean `gpu_total` plus what its acceleration structures' updates cost
+    /// the flight per frame (the sum of `hw_accel.flight.total_ms` over the measured frames): the
+    /// frame as the player would have it if the updates are on the frame thread (they are in this
+    /// bench), which `speedup.gpu_total` leaves out. Compute has no such cost.
+    pub hw_gpu_total_plus_accel_ms: Option<f64>,
+    /// `compute`'s mean `gpu_total` over it.
+    pub compute_over_hw_with_accel: Option<f64>,
     /// The hardware context's acceleration structures: its first build, the flight's updates and
     /// the Edit stress's.
     pub hw_accel: AccelReport,
@@ -223,24 +258,39 @@ impl Comparison {
     pub fn new(
         compute: BackendTimes,
         hw: BackendTimes,
+        hw_nearest: Option<BackendTimes>,
         hw_accel: AccelReport,
         hw_edits: Option<EditsReport>,
     ) -> Self {
+        let over =
+            |c: Option<f64>, h: Option<f64>| c.zip(h).filter(|(_, h)| *h > 0.0).map(|(c, h)| c / h);
         let speedup = COMPARED
             .iter()
             .map(|&pass| {
                 let (c, h) = (compute.mean(pass), hw.mean(pass));
+                let n = hw_nearest.as_ref().and_then(|n| n.mean(pass));
                 Speedup {
                     pass: pass.to_string(),
                     compute_mean_ms: c,
                     hw_mean_ms: h,
-                    compute_over_hw: c.zip(h).filter(|(_, h)| *h > 0.0).map(|(c, h)| c / h),
+                    compute_over_hw: over(c, h),
+                    hw_nearest_mean_ms: n,
+                    compute_over_hw_nearest: over(c, n),
                 }
             })
             .collect();
+        let with_accel = (hw.frames > 0)
+            .then(|| {
+                hw.mean("gpu_total")
+                    .map(|t| t + hw_accel.flight.total_sum_ms / f64::from(hw.frames))
+            })
+            .flatten();
         Self {
+            compute_over_hw_with_accel: over(compute.mean("gpu_total"), with_accel),
+            hw_gpu_total_plus_accel_ms: with_accel,
             compute,
             hw,
+            hw_nearest,
             speedup,
             hw_accel,
             hw_edits,
@@ -284,13 +334,18 @@ mod tests {
     }
 
     #[test]
-    fn the_flag_has_three_values_and_compute_is_the_default() {
+    fn the_flag_has_four_values_and_compute_is_the_default() {
         assert_eq!(RtMode::default(), RtMode::Compute);
         assert_eq!(RtMode::parse("hw"), Ok(RtMode::Hardware));
+        assert_eq!(RtMode::parse("hw-nearest"), Ok(RtMode::HardwareNearest));
         assert_eq!(RtMode::parse("both"), Ok(RtMode::Both));
         assert!(RtMode::parse("rtx").is_err());
         assert_eq!(RtMode::Both.main_backend(), RtBackend::Compute);
         assert_eq!(RtMode::Hardware.main_backend(), RtBackend::Hardware);
+        assert_eq!(
+            RtMode::HardwareNearest.main_backend(),
+            RtBackend::HardwareNearest
+        );
     }
 
     #[test]
@@ -309,6 +364,8 @@ mod tests {
         // 1 + 4 and 1 + 8 ms.
         assert_eq!(s.total_ms.mean_ms, Some(7.0));
         assert_eq!(AccelSummary::of(&[]).updates, 0);
+        assert_eq!(AccelSummary::of(&[update("none", 0, 0)]).noop_updates, 1);
+        assert_eq!(s.noop_updates, 1);
     }
 
     #[test]
@@ -321,15 +378,28 @@ mod tests {
                 stats: Stats::of(&[ms]),
             }],
             gpu_total: Stats::of(&[ms * 2.0]),
+            frame_time: Stats::default(),
+            scene_update_ms: Stats::default(),
         };
         let accel = AccelReport {
             initial: AccelUpdate::default(),
-            flight: AccelSummary::default(),
+            // 3 frames, and the updates cost 6 ms in all: 2 ms a frame on top of the hardware's 4.
+            flight: AccelSummary::of(&[update("patch", 2, 4), update("patch", 1, 0)]),
             edits: None,
         };
-        let c = Comparison::new(times("compute", 4.0), times("hw", 2.0), accel, None);
+        let c = Comparison::new(
+            times("compute", 4.0),
+            times("hw", 2.0),
+            Some(times("hw-nearest", 3.0)),
+            accel,
+            None,
+        );
         let by = |pass: &str| c.speedup.iter().find(|s| s.pass == pass).unwrap();
         assert_eq!(by("primary").compute_over_hw, Some(2.0));
+        assert_eq!(by("primary").compute_over_hw_nearest, Some(4.0 / 3.0));
+        // The whole frame with the updates: 4 ms of GPU and 6 ms over 3 frames of them.
+        assert_eq!(c.hw_gpu_total_plus_accel_ms, Some(6.0));
+        assert_eq!(c.compute_over_hw_with_accel, Some(8.0 / 6.0));
         assert_eq!(by("gpu_total").compute_over_hw, Some(2.0));
         // A pass that was not timed has no figure, and not a made-up one.
         assert_eq!(by("shadows").compute_over_hw, None);

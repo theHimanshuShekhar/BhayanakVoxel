@@ -69,12 +69,14 @@ Options:
                    report's `convergence.shadows.shadow_rays` says which; run it with 1 and with 2
                    to compare them
   --rt-backend B   How rays find the Planet (#50): compute (the default: the compute-shader DDA),
-                   hw (ray queries over the bricks' tight boxes, for the flight, the sweep and the
-                   Edit stress; the compute path, with a warning and the reason in the report's
-                   `rt.fallback`, if the adapter has no ray queries) or both (the bench as for
-                   compute, then the same flight and Edit stress on hw on a context of its own, and
-                   the passes that cast rays compared: `rt.comparison`). The report's `rt` says
-                   which ran and what the acceleration structures cost to update
+                   hw (ray queries over the bricks' tight boxes, with shadow rays that end at the
+                   first hit, for the flight, the sweep and the Edit stress; the compute path, with
+                   a warning and the reason in the report's `rt.fallback`, if the adapter has no
+                   ray queries), hw-nearest (hw with shadow rays that look for the nearest hit) or
+                   both (the bench as for compute, then the same flight and Edit stress on hw, and
+                   the flight on hw-nearest, each on a context of its own, and the passes that cast
+                   rays compared: `rt.comparison`). The report's `rt` says which ran and what the
+                   acceleration structures cost to update
   --no-fail        Exit with status 0 even if a pass is over its budget, there is a hole or a
                    real-time gate is over
   -h, --help       Print this";
@@ -364,6 +366,10 @@ mod tests {
         assert_eq!(run(&[]).rt, RtMode::Compute);
         assert_eq!(run(&["--rt-backend", "compute"]).rt, RtMode::Compute);
         assert_eq!(run(&["--rt-backend", "hw"]).rt, RtMode::Hardware);
+        assert_eq!(
+            run(&["--rt-backend", "hw-nearest"]).rt,
+            RtMode::HardwareNearest
+        );
         assert_eq!(run(&["--rt-backend", "both"]).rt, RtMode::Both);
         for bad in [&["--rt-backend"][..], &["--rt-backend", "rtx"]] {
             assert!(parse_all(bad).is_err(), "{bad:?}");

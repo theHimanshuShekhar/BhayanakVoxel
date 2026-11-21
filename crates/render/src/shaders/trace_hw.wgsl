@@ -97,15 +97,19 @@ fn hw_candidate(ray: Ray, w: Walk, c: RayIntersection, limit: f32) -> Hit {
     return hit_brick(ray, w, level, entry, brick, t_in, normal);
 }
 
-// The first solid Voxel along the ray that is nearer than `reach_t`, or a miss: trace.wgsl's
-// `trace_within`, by ray query.
-fn trace_within(ray: Ray, reach_t: f32) -> Hit {
+fn hw_walk(ray: Ray) -> Walk {
     var w: Walk;
     w.d = select(ray.dir, vec3<f32>(TINY), abs(ray.dir) < vec3<f32>(TINY));
     w.inv = 1.0 / w.d;
     w.step = select(vec3<i32>(-1), vec3<i32>(1), w.d > vec3<f32>(0.0));
     w.upper = max(w.step, vec3<i32>(0));
+    return w;
+}
 
+// The first solid Voxel along the ray that is nearer than `reach_t`, or a miss: trace.wgsl's
+// `trace_within`, by ray query.
+fn trace_within(ray: Ray, reach_t: f32) -> Hit {
+    let w = hw_walk(ray);
     let origin = vec3<f32>(ray.cell - hw_anchor.xyz) + ray.origin;
     var rq: ray_query;
     rayQueryInitialize(&rq, hw_tlas, RayDesc(RAY_FLAG_NONE, 0xffu, 0.0, reach_t, origin, w.d));
@@ -129,4 +133,28 @@ fn trace_within(ray: Ray, reach_t: f32) -> Hit {
         }
     }
     return nearest;
+}
+
+// Whether a solid Voxel is in the ray's way within `reach_t`, which ends at the first one that any
+// box has (the order the boxes come in is the hardware's, not the ray's): `occluded`, for the
+// backend with early-out shadows (`shaders::hardware`).
+fn occluded_any_hit(ray: Ray, reach_t: f32) -> bool {
+    let w = hw_walk(ray);
+    let origin = vec3<f32>(ray.cell - hw_anchor.xyz) + ray.origin;
+    var rq: ray_query;
+    rayQueryInitialize(&rq, hw_tlas, RayDesc(RAY_FLAG_TERMINATE_ON_FIRST_HIT, 0xffu, 0.0, reach_t, origin, w.d));
+    loop {
+        if !rayQueryProceed(&rq) {
+            break;
+        }
+        let c = rayQueryGetCandidateIntersection(&rq);
+        if c.kind != RAY_QUERY_INTERSECTION_AABB {
+            continue;
+        }
+        let h = hw_candidate(ray, w, c, reach_t);
+        if h.hit && h.t < reach_t {
+            return true;
+        }
+    }
+    return false;
 }
