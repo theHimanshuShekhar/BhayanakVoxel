@@ -3035,17 +3035,25 @@ mod tests {
             assert!(updates <= nodes, "the sweep does not end");
         }
         // The tidying of the queue goes on after the sweep, and is not what this counts: it
-        // changes nothing that is drawn (+0 -0), and takes as many updates as the stale entries
-        // are many over `TIDY`. In this small tree the queue has 4 entries for each node when the
-        // flip comes (32 053 for 7 909 nodes, 4 updates of tidying), where it had 1.2 (9 834 for
-        // 8 117) before #226: `set_margins` now looks at every node again with the cap off too
-        // (the cap under the sea depends on the margins), and what that leaves hot (22 000 entries
-        // after the first step, 212 at the flip before) is looked at again at each step of the
-        // climb, each look leaving a stale entry. Measured with the under-sea cap off as well: it
-        // is the look again, not the cap.
+        // changes nothing that is drawn (+0 -0), and takes as many updates as the entries of the
+        // queue are many over `TIDY`. Here the climb leaves 32 053 entries for 7 909 nodes (4
+        // updates), where it left 9 834 for 8 117 before #226. They are entries of nodes that the
+        // climb out of the wide scene removed (most of them), which stay until they come due or
+        // the tidy drops them, as the queue has always dropped dead entries: `set_margins` now
+        // looks at every node again with the cap off too (the cap under the sea depends on the
+        // margins), so each node has an entry where about half had none, and the first update
+        // moves them into the queue. Not a leak, and not the under-sea cap (the same with it
+        // off); real play calls `set_margins` once at the start, with the cap on, as before.
+        let entries = selection.queued_entries;
+        let mut tidied = 0;
         while selection.tidying() {
             selection.update(&store, [0.0, y, 0.0]);
             assert_eq!(selection.rewanted(), selection.tidying());
+            tidied += 1;
+            assert!(
+                tidied <= entries / selection.tidy_by + 2,
+                "{tidied} updates to tidy {entries} entries"
+            );
         }
         is_as_the_rule_says(&selection, "after the sweep");
         (updates, selection.bricks().collect())
