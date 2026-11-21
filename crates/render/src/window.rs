@@ -5,6 +5,7 @@ use std::time::Instant;
 use crate::camera::Camera;
 use crate::composite::Composite;
 use crate::cpu::RenderCpu;
+use crate::daylight::{DaySky, LocalFrame, Night};
 use crate::debug_view::DebugView;
 use crate::look::Look;
 use crate::post::Stages;
@@ -53,6 +54,9 @@ pub struct Renderer {
     /// If set, the sun is at these angles (azimuth, elevation, angular radius) in the camera's local
     /// frame, so it follows the Planet's up (see [`Sun::local`]); `sun` is then not used.
     local_sun: Option<(f32, f32, f32)>,
+    /// The sky of the world clock's time of day (see [`Renderer::set_day_sky`]); it replaces the
+    /// sun above while there is one.
+    day_sky: Option<DaySky>,
     /// Copies the images to the surface, mixing the Reference view over Primary's as it fades in.
     composite: Composite,
     /// What `composite` reads: the upscaled image and the reference image.
@@ -114,6 +118,7 @@ impl Renderer {
                 crate::sun::DEFAULT_ELEVATION,
                 crate::sun::DEFAULT_ANGULAR_RADIUS,
             )),
+            day_sky: None,
             composite,
             composite_group,
             began: Instant::now(),
@@ -135,8 +140,7 @@ impl Renderer {
 
     /// Replaces the Planet being drawn. A new Planet starts the reference image over.
     pub fn set_scene(&mut self, scene: &Scene) -> Result<()> {
-        self.tracer = Tracer::new(&self.device, scene)?;
-        Ok(())
+        self.tracer.replace_scene(&self.device, scene)
     }
 
     /// Brings the GPU copy of the Planet up to date with `scene`, after `update` (the result of
@@ -235,29 +239,57 @@ impl Renderer {
 
     /// Changes the sun. In reference mode this starts the image over.
     pub fn set_sun(&mut self, sun: Sun) {
-        if self.local_sun.is_some() || sun != self.sun {
+        if self.local_sun.is_some() || self.day_sky.is_some() || sun != self.sun {
             self.tracer.sun_changed();
         }
         self.sun = sun;
         self.local_sun = None;
+        self.day_sky = None;
     }
 
     /// Puts the sun at `azimuth` and `elevation` radians in the camera's local frame, `radius`
     /// radians wide: it follows the local up, so it stays at the same height in the sky over the
     /// whole Planet ([`Sun::local`]). In reference mode this starts the image over when it moves.
     pub fn set_local_sun(&mut self, azimuth: f32, elevation: f32, radius: f32) {
-        if self.local_sun != Some((azimuth, elevation, radius)) {
+        if self.day_sky.is_some() || self.local_sun != Some((azimuth, elevation, radius)) {
             self.tracer.sun_changed();
         }
         self.local_sun = Some((azimuth, elevation, radius));
+        self.day_sky = None;
     }
 
-    /// The sun for a frame seen from `camera`.
-    fn sun_for(&self, camera: &Camera) -> Sun {
-        match self.local_sun {
+    /// Puts the sky at the world clock's time of day (#203): the sun, the moon, the night's floor
+    /// and the stars, in the camera's local frame ([`LocalFrame::of`]), so they keep their place in
+    /// the sky over the whole Planet. It replaces [`Renderer::set_sun`] and
+    /// [`Renderer::set_local_sun`]. Call it every frame with what `Daylight::step` said:
+    /// **`jumped` is what tells the light's caches that the sun was put somewhere** (the clock was
+    /// set, or the step was big) and makes them forget at once; a sky that only drifted on from the
+    /// last frame's is followed by the caches' normal updates, and the upscaler's history goes on.
+    /// The Reference view starts over whenever the sky changes at all.
+    pub fn set_day_sky(&mut self, sky: DaySky, jumped: bool) {
+        if jumped || self.day_sky.is_none() {
+            self.tracer.sun_changed();
+        }
+        self.day_sky = Some(sky);
+        self.local_sun = None;
+    }
+
+    /// The sun and the night for a frame seen from `camera`.
+    fn sky_for(&self, camera: &Camera) -> (Sun, Night) {
+        if let Some(sky) = &self.day_sky {
+            let frame = LocalFrame::of(camera);
+            return (sky.sun_in(&frame), sky.night_in(&frame));
+        }
+        let sun = match self.local_sun {
             Some((azimuth, elevation, radius)) => Sun::local(camera, azimuth, elevation, radius),
             None => self.sun,
-        }
+        };
+        (sun, Night::NONE)
+    }
+
+    /// How many times the sun has jumped: see [`Tracer::sun_epoch`](crate::tracer::Tracer::sun_epoch).
+    pub fn sun_epoch(&self) -> u64 {
+        self.tracer.sun_epoch()
     }
 
     /// Sets the light's palette (see [`Look`]).
@@ -292,10 +324,16 @@ impl Renderer {
         self.plan.samples()
     }
 
+    /// The size the reference image is traced at, which a resize changes (and so restarts it).
+    pub fn reference_size(&self) -> (u32, u32) {
+        self.target.reference_size()
+    }
+
     /// What the reference image would be of with the view from `camera`: it starts over when this
     /// changes (see [`View`]), so comparing it from frame to frame tells whether the view is still.
     pub fn view(&self, camera: &Camera) -> View {
-        View::new(camera, &self.sun_for(camera), &self.target)
+        let (sun, night) = self.sky_for(camera);
+        View::new(camera, &sun, &night, &self.target)
     }
 
     /// Reconfigures the surface and the images. Zero-sized windows (minimised) are ignored.
@@ -380,7 +418,8 @@ impl Renderer {
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
         self.profiler.begin_frame();
-        let sun = self.sun_for(camera);
+        let (sun, night) = self.sky_for(camera);
+        self.tracer.set_night(night);
         self.plan = self.tracer.encode_frame(
             &self.device,
             &self.queue,
