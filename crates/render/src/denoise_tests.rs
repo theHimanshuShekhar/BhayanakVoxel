@@ -492,8 +492,9 @@ fn the_filter_keeps_an_edge_in_depth_that_the_light_does_not_show() {
     // 20 Voxels away and one 40, lit 3.0 and 2.0 with a noise of 1.0 on both (the luminance stop, which reads
     // the variance, is loose over that step: it is the geometry that must hold the edge). One
     // frame (no history, the variance from the neighbourhood) through the whole filter, whose
-    // reach is 30 pixels: the columns beside the edge keep their own side's light. Without the
-    // depth stop the near side is 0.1 darker or more.
+    // reach is 30 pixels: the six columns each side of the edge keep their step (1.0, to within the
+    // noise that is left, which the filter does not take out of pixels it finds quiet). Without the
+    // depth stop the step is under 0.95 (0.78 and 0.81 measured).
     let mut rig = Rig::new();
     let camera = rig.camera;
     rig.set_surfaces(|x, y| {
@@ -509,15 +510,12 @@ fn the_filter_keeps_an_edge_in_depth_that_the_light_does_not_show() {
         },
     );
     let light = rig.light(Denoise::Full, written);
-    let near = mean(columns(&light, 30, 32, |p| p[0]).into_iter());
-    let far = mean(columns(&light, 32, 34, |p| p[0]).into_iter());
+    let near = mean(columns(&light, 26, 32, |p| p[0]).into_iter());
+    let far = mean(columns(&light, 32, 38, |p| p[0]).into_iter());
     assert!(
-        (near - 3.0).abs() < 0.12,
-        "the near side beside the edge is {near}"
-    );
-    assert!(
-        (far - 2.0).abs() < 0.12,
-        "the far side beside the edge is {far}"
+        near - far > 0.95,
+        "the step across the edge (3.0 to 2.0) is {} after the filter",
+        near - far
     );
 }
 
@@ -525,9 +523,9 @@ fn the_filter_keeps_an_edge_in_depth_that_the_light_does_not_show() {
 fn the_filter_keeps_an_edge_in_the_normal_that_the_depth_does_not_show() {
     // What this guards: the normal stop. Two faces meet on the same plane of distance (a wall and
     // one turned a quarter turn, as far as the filter can tell: the same distance along each ray),
-    // lit 3.0 and 2.0 with a noise of 1.0. The columns beside the edge keep their own side's light.
+    // lit 3.0 and 2.0 with a noise of 1.0. The six columns each side of the edge keep their step.
     // Without the normal stop the plane check lets the nearest taps across and the edge softens
-    // (the near side is 0.1 darker or more).
+    // (the step is under 0.95 (0.78 and 0.81 measured)).
     let mut rig = Rig::new();
     let camera = rig.camera;
     rig.set_surfaces(|x, y| {
@@ -543,15 +541,12 @@ fn the_filter_keeps_an_edge_in_the_normal_that_the_depth_does_not_show() {
         },
     );
     let light = rig.light(Denoise::Full, written);
-    let left = mean(columns(&light, 30, 32, |p| p[0]).into_iter());
-    let right = mean(columns(&light, 32, 34, |p| p[0]).into_iter());
+    let left = mean(columns(&light, 26, 32, |p| p[0]).into_iter());
+    let right = mean(columns(&light, 32, 38, |p| p[0]).into_iter());
     assert!(
-        (left - 3.0).abs() < 0.12,
-        "the left side beside the edge is {left}"
-    );
-    assert!(
-        (right - 2.0).abs() < 0.12,
-        "the right side beside the edge is {right}"
+        left - right > 0.95,
+        "the step across the edge (3.0 to 2.0) is {} after the filter",
+        left - right
     );
 }
 
@@ -594,6 +589,37 @@ fn the_filter_blurs_a_flat_wall_of_noise_and_keeps_its_mean() {
     assert!(after < before / 3.0, "the noise is {after} of {before}");
     let m = mean(values.iter().copied());
     assert!((m - 1.0).abs() < 0.03, "the mean is {m}");
+}
+
+#[test]
+fn a_quiet_pixel_is_left_as_it_is_and_a_noisy_one_is_not() {
+    // What this guards: the filter's gate, which keeps a pixel whose estimate is already quiet (a
+    // standard deviation of a few percent of its value) out of the blur: a long history that has
+    // averaged its noise away has nothing a blur could add, and detail it could take. A wall of
+    // noise of 0.01 on 1.0 comes out as it went in; one of 0.5 does not (the test above). Without
+    // the gate the filter averages the 0.01 too, and every pixel moves.
+    let mut rig = Rig::new();
+    rig.wall(20.0);
+    let samples = rig.samples(0.01, |_, _| 1.0);
+    let written = rig.run(
+        Denoise::Full,
+        &Inputs {
+            has_history: false,
+            ..Inputs::still()
+        },
+    );
+    let light = rig.light(Denoise::Full, written);
+    let values = columns(&light, 8, 56, |p| p[0]);
+    let before: Vec<f32> = (0..SIZE.1)
+        .flat_map(|y| (8..56).map(move |x| (x, y)))
+        .map(|(x, y)| samples[(y * SIZE.0 + x) as usize])
+        .collect();
+    let moved = values
+        .iter()
+        .zip(&before)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    assert!(moved < 0.002, "a quiet pixel moved by {moved}");
 }
 
 #[test]

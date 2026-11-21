@@ -133,6 +133,15 @@ const SUN_FLOOR = 0.002;
 // pixel's footprint a step of the filter (a curved surface leaves its tangent plane the farther the
 // tap is), in a Gaussian. The normal's: the cosine to this power.
 const PHI_PLANE = 2.0;
+// A pixel whose estimate is already quiet is not filtered: the share of the filter's result in the
+// pixel's own value goes from nothing, where the standard deviation of the estimate is under
+// QUIET_BELOW of its value (and a floor), to all of it, from NOISY_FROM on. A history that is long
+// has averaged its noise away, and a blur of it can only take detail (an edge, a thin shadow) from
+// it; what the filter is for is the pixels that have a few samples.
+const QUIET_BELOW = 0.03;
+const NOISY_FROM = 0.12;
+const QUIET_FLOOR_LIGHT = 0.02;
+const QUIET_FLOOR_SUN = 0.05;
 const NORMAL_POWER = 24.0;
 // The B3 spline's weights at 0, 1 and 2 taps from the centre.
 const ATROUS_KERNEL = array<f32, 3>(0.375, 0.25, 0.0625);
@@ -341,18 +350,28 @@ fn denoise_temporal(@builtin(global_invocation_id) id: vec3<u32>) {
         past_moments = past_moments / past_weight;
         count = past_moments.z;
 
+        // How spread the history's own samples are, per pixel (its second moments less its mean's
+        // square): a pixel whose light is noisy has a history that is a few of those spreads from the
+        // neighbourhood's mean by chance, and a clamp or a rejection that does not know it takes
+        // light away (the bias a darker, browner cave has); one that has settled has none to spare.
+        let past_l = luma(past.xyz);
+        let hist_l = sqrt(max(past_moments.x - past_l * past_l, 0.0));
+        let hist_w = sqrt(max(past_moments.y - past.w * past.w, 0.0));
+        let hist = vec4<f32>(past.xyz / max(past_l, 1e-4) * hist_l, hist_w);
+
         // The adaptive part: how far the history is from the neighbourhood's mean in standard
         // deviations (with a slack for what 3 x 3 samples do not show), in the light's luminance and
         // in the sun's weight; the history is shortened by how far past TEMPORAL_REJECT_FROM it is.
-        let off_light = abs(luma(past.xyz) - lum_mean)
-            / (lum_spread + TEMPORAL_REJECT_SLACK_RELATIVE * lum_mean + TEMPORAL_REJECT_SLACK_ABSOLUTE);
+        let off_light = abs(past_l - lum_mean)
+            / (sqrt(lum_var + hist_l * hist_l) + TEMPORAL_REJECT_SLACK_RELATIVE * lum_mean + TEMPORAL_REJECT_SLACK_ABSOLUTE);
         let off_sun = abs(past.w - mean.w)
-            / (spread.w + TEMPORAL_REJECT_SLACK_RELATIVE * mean.w + TEMPORAL_REJECT_SLACK_ABSOLUTE);
+            / (sqrt(spread.w * spread.w + hist_w * hist_w) + TEMPORAL_REJECT_SLACK_RELATIVE * mean.w + TEMPORAL_REJECT_SLACK_ABSOLUTE);
         count *= 1.0 - clamp(max(off_light, off_sun) - TEMPORAL_REJECT_FROM, 0.0, 1.0);
 
         // The clamp.
         let slack = CLAMP_SLACK_RELATIVE * mean + CLAMP_SLACK_ABSOLUTE;
-        past = clamp(past, mean - CLAMP_SIGMAS * spread - slack, mean + CLAMP_SIGMAS * spread + slack);
+        let range = CLAMP_SIGMAS * sqrt(spread * spread + hist * hist) + slack;
+        past = clamp(past, mean - range, mean + range);
 
         // An Edit or a new sun is changing the light in this pixel's cells: a short history, so
         // that the new light is not averaged away over a long one.
@@ -463,10 +482,23 @@ fn denoise_atrous(@builtin(global_invocation_id) id: vec3<u32>) {
         }
     }
     // The centre's own weight is never zero, so the totals are positive.
-    textureStore(signal_out, p, vec4<f32>(sum_light / total_light, max(sum_sun / total_sun, 0.0)));
+    let filtered = vec4<f32>(sum_light / total_light, max(sum_sun / total_sun, 0.0));
+    // The deviation is in units of the filtered value, not of the pixel's own: a pixel that the
+    // noise made dark would otherwise count as noisier than one it made bright, be filtered more, and
+    // the mean of the pixels would rise.
+    let noise_light = sqrt(blurred.x) / (luma(filtered.xyz) + QUIET_FLOOR_LIGHT);
+    let noise_sun = sqrt(blurred.y) / (filtered.w + QUIET_FLOOR_SUN);
+    let noisy = smoothstep(vec2<f32>(QUIET_BELOW), vec2<f32>(NOISY_FROM), vec2<f32>(noise_light, noise_sun));
+    let filtered_variance = vec2<f32>(var_light / (total_light * total_light), var_sun / (total_sun * total_sun));
+    let own_variance = textureLoad(variance, p, 0).xy;
+    textureStore(
+        signal_out,
+        p,
+        vec4<f32>(mix(centre.xyz, filtered.xyz, noisy.x), mix(centre.w, filtered.w, noisy.y)),
+    );
     textureStore(
         variance_next,
         p,
-        vec4<f32>(var_light / (total_light * total_light), var_sun / (total_sun * total_sun), 0.0, 0.0),
+        vec4<f32>(mix(own_variance, filtered_variance, noisy), 0.0, 0.0),
     );
 }

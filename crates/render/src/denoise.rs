@@ -30,6 +30,18 @@
 //! [`crate::Tracer::edit_made`]). A fast turn leaves the pixels it uncovers with no history, and the
 //! filter blurs them harder for being new (their variance is the neighbourhood's).
 //!
+//! **The one place where the sun resets the history** is `Tracer::sun_changed` (a "the sun jumped":
+//! it was turned or another one was set), which bumps the tracer's `sun_epoch`; the upscaler's
+//! `History::begin` then starts over, and the `has_history` word of [`DenoiseUniform`] it gives the
+//! denoiser is 0 for that frame. Nothing else in the denoiser looks at the sun. A sun that moves a
+//! little every frame (a day and night cycle, #203) must not call `sun_changed` for each step, or
+//! the history would never be longer than a frame: it calls it for a jump, and the slow drift is
+//! left to the temporal kernel's own checks (the neighbourhood clamp and the adaptive reject follow
+//! light that changes by a few percent a frame, which the settled history lags by a frame or two).
+//!
+//! The filter's own gate (`QUIET_BELOW`, `NOISY_FROM` in the shader) leaves a pixel whose estimate
+//! is quiet alone: a blur of a long history takes detail and adds nothing.
+//!
 //! [`History`]: crate::upscale
 
 use bytemuck::{Pod, Zeroable};
