@@ -1133,6 +1133,17 @@ impl SceneWorker {
             .cap_is_off()
     }
 
+    /// What the selection of a stepped thread asks of residency now (see [`Scene::reach`]).
+    #[cfg(test)]
+    pub fn selection_reach(&self) -> render::lod::Reach {
+        let engine = self.stepped.as_ref().expect("only a stepped thread");
+        engine
+            .lock()
+            .expect("the engine is not poisoned")
+            .scene
+            .reach()
+    }
+
     /// The nodes of the selection of a stepped thread (see [`Scene::nodes`]).
     #[cfg(test)]
     pub fn selection_nodes(&self) -> usize {
@@ -2292,19 +2303,7 @@ impl Engine {
             // The hold of a release is from when the speed first fell, by the clock: not from the
             // time that each look saw, which a busy thread makes too short.
             let now = self.clock.since(self.speed_epoch).as_secs_f64();
-            // While the camera itself is under the sea's sphere the depth is not given back: a
-            // release makes the scene again at the camera, and one made there has the horizon cap
-            // off, which at rest bands is the wide scene (the planet's shell out to the top level),
-            // 552 to 572 MiB at full size against the 512 MiB of the gate; the hold at the bottom
-            // of a dive made all of it at once. Over the sphere (the camera's own height, not the
-            // cap's hysteresis: a scene made again there has the cap on) the release goes the way it
-            // does anywhere. Nothing needs the clock for this: the camera's height changes only
-            // when the camera moves, which wakes the thread.
-            if self.scene.camera_under_horizon(camera) && self.speed.wants_less(speed) {
-                self.speed.observe_keeping(speed)
-            } else {
-                self.speed.observe(speed, now)
-            }
+            self.speed.observe(speed, now)
         };
         if !changed {
             return Ok(false);
@@ -2332,15 +2331,8 @@ impl Engine {
         // What waits to be looked at is gone with the old selection, so [`World::reband_pending`]
         // (the stats of this publish, which carries the new scene) is false only once it is
         // published.
-        //
-        // **Also a scene whose cap is off** (it went off under the sea and comes on only 50 m over
-        // it, `select::CAP_ON`): a release is let through only for a camera over the sea's sphere,
-        // and a reband in place would keep that cap state, so a camera that stops 10 m over would
-        // have the wide scene at rest bands (552 to 572 MiB at full size). A scene made again at
-        // the camera has the cap on there.
         let over = self.shared.release_rebuild_over.load(Ordering::Relaxed);
-        if bands.scaled_d0() > before && (self.scene.rebanding() > over || self.scene.cap_is_off())
-        {
+        if bands.scaled_d0() > before && self.scene.rebanding() > over {
             let store = self.store.read().expect("the store's lock is not poisoned");
             let update = self.scene.rebuild_for(&store, camera, bands);
             drop(store);

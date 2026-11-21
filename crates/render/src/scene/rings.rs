@@ -1404,15 +1404,6 @@ impl Scene {
         })
     }
 
-    /// Whether the horizon cap was asked for and the raised camera at `camera` is under the sea's
-    /// sphere (see [`Selection::camera_under_horizon`]): a scene made again there has the cap off,
-    /// which is the wide scene at rest bands (ADR 0004, #213); over the sphere it has it on.
-    pub fn camera_under_horizon(&self, camera: [f64; 3]) -> bool {
-        self.rings
-            .as_ref()
-            .is_some_and(|r| r.selection.camera_under_horizon(camera))
-    }
-
     /// Culls by the Planet's horizon (see [`crate::lod::Horizon`], [`Selection::set_horizon`]): what
     /// is drawn and wanted resident is what a camera over `horizon`'s sphere could see. Kept when
     /// the scene is made again for other bands or a jump. Returns what changed, as

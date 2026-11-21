@@ -463,6 +463,16 @@ pub const CROSSING_OVER_METRES: f64 = 80.0;
 /// camera.
 pub const CROSSING_HOLD_CAP: Duration = Duration::from_secs(90);
 
+/// The camera held under the sea (#226): it dives to [`CROSSING_UNDER_METRES`] under sea level at
+/// [`HELD_DIVE_METRES_PER_SECOND`], under the 10 m/s at which the speed-scaled bands go coarser
+/// (a faster dive is measured at that depth and hides the scene this path is for, #168), and stays
+/// until the scene has settled there: at the camera, nothing absorbing or rebanding, nothing waiting
+/// and the loader with nothing out, or [`HELD_HOLD_CAP`].
+pub const HELD_DIVE_METRES_PER_SECOND: f64 = 8.0;
+/// The longest that the held camera waits for the scene to settle: the wide scene of a cap that is
+/// off peaked 82 s into the hold at full size (#213).
+pub const HELD_HOLD_CAP: Duration = Duration::from_secs(240);
+
 /// How many of the slowest frames of a path are kept.
 const SLOWEST: usize = 5;
 
@@ -2534,6 +2544,53 @@ impl<'a> Session<'a> {
         )
     }
 
+    /// The camera held under the sea (#226): straight down from the Spawn to [`CROSSING_UNDER_METRES`]
+    /// under sea level at [`HELD_DIVE_METRES_PER_SECOND`], and held there until the scene has
+    /// settled (or [`HELD_HOLD_CAP`]). The horizon cap goes off on the way down and stays off, so
+    /// the scene the hold builds is the one a camera in a cave or a pit under the sea has: the
+    /// sea-level crossing leaves before it is built (its hold ends when the scene is at the camera,
+    /// and the climb brings the cap back).
+    fn held_under_the_sea(
+        &mut self,
+        spawn: &Camera,
+        sea: f64,
+    ) -> Result<PathReport, Box<dyn Error>> {
+        let speed = HELD_DIVE_METRES_PER_SECOND * VOXELS_PER_METRE;
+        let start = norm(spawn.position);
+        let bottom = sea - CROSSING_UNDER_METRES * VOXELS_PER_METRE;
+        let spawn = *spawn;
+        let at = |radius: f64| Camera {
+            position: std::array::from_fn(|a| {
+                spawn.position[a] + spawn.horizon_up[a] * (radius - start)
+            }),
+            ..spawn
+        };
+        // The time the camera reached the bottom, once it has.
+        let reached = std::cell::Cell::new(None::<f64>);
+        let done = std::cell::Cell::new(false);
+        let cap = HELD_HOLD_CAP.as_secs_f64();
+        self.path_until(
+            "held under the sea",
+            |world, t| {
+                let radius = (start - t * speed).max(bottom);
+                let camera = at(radius);
+                if radius <= bottom {
+                    let since = reached.get().unwrap_or(t);
+                    reached.set(Some(since));
+                    let settled = world.lag(camera.position) < crate::world::CAUGHT_UP_LAG
+                        && world.caught_up(camera.position)
+                        && world.waiting() == 0
+                        && world.loader().is_some_and(|l| l.pending == 0);
+                    if settled || t - since > cap {
+                        done.set(true);
+                    }
+                }
+                camera
+            },
+            |_, _| done.get(),
+        )
+    }
+
     /// A flight, and then the camera standing where it stopped until no brick is drawn coarser than
     /// the bands ask (the **settle time**), or the cap.
     ///
@@ -2805,6 +2862,8 @@ impl<'a> Session<'a> {
         self.settle(&spawn, cap, "the 180 degree turn")?;
         paths.push(self.sea_level_crossing(&spawn, setup.sea)?);
         self.settle(&spawn, cap, "the sea-level crossing")?;
+        paths.push(self.held_under_the_sea(&spawn, setup.sea)?);
+        self.settle(&spawn, cap, "the camera held under the sea")?;
         paths.push(self.stop_after_a_flight(&course, script)?);
         self.settle(&spawn, cap, "the stop after a flight")?;
         let still_after_flight = self.still_after_a_flight(&course, script)?;
@@ -4378,6 +4437,7 @@ mod tests {
                 "vertical take-off",
                 "180 degree turn",
                 "sea-level crossing",
+                "held under the sea",
                 "stop after a flight"
             ]
         );
@@ -4419,7 +4479,7 @@ mod tests {
         );
         let stop = run.paths.last().unwrap();
         assert!(stop.still_cuts.is_some());
-        assert!(run.paths[..6].iter().all(|p| p.still_cuts.is_none()));
+        assert!(run.paths[..7].iter().all(|p| p.still_cuts.is_none()));
         for path in &run.paths {
             assert!(path.frames > 0, "{}", path.name);
             assert_eq!(path.frame_time.samples, path.frames);
@@ -4718,17 +4778,39 @@ mod tests {
             crossing.cap_flips, crossing.scene_update_max_ms, crossing.scene_round_max_ms,
         );
         assert_eq!(crossing.holes, 0);
-        // The depth of the dive is kept under the sea (#168): a release that found the camera there
-        // made the scene as the wide one, 552 to 572 MiB.
+        let held = run
+            .paths
+            .iter()
+            .find(|p| p.name == "held under the sea")
+            .expect("the held camera is a path");
+        eprintln!(
+            "held under the sea: {:.1} s, scene peak {:.1} MiB (at the end {:.1}) in {:?}; holes {}",
+            held.seconds,
+            held.scene_used_peak_mib,
+            held.scene_used_end_mib,
+            held.scene_level_bricks_end,
+            held.holes
+        );
+        // The crossing's memory is the gate's: its release at the bottom makes the scene again
+        // there, and a camera under the sea has the cap of the sea's sphere (#226), not the wide
+        // scene (552 to 572 MiB before it).
         assert!(
             crossing.scene_used_peak_mib <= BUDGETS.scene_mib,
             "the crossing's scene peaked at {:.1} MiB, over the {} MiB gate",
             crossing.scene_used_peak_mib,
             BUDGETS.scene_mib
         );
+        // The cap goes off in the held path (8 m/s: no release, so the scene follows the camera
+        // under the sea and flips) and comes on again in the crossing: the dive at 50 m/s gives
+        // its depth back at the bottom, and the scene made again there has the cap off already.
+        assert!(crossing.cap_flips >= 1, "the crossing's cap came on again");
+        assert!(held.cap_flips >= 1, "the held camera's cap went off");
+        assert_eq!(held.holes, 0);
         assert!(
-            crossing.cap_flips >= 2,
-            "the crossing flipped the cap both ways"
+            held.scene_used_peak_mib <= BUDGETS.scene_mib,
+            "the held camera's scene peaked at {:.1} MiB, over the {} MiB gate",
+            held.scene_used_peak_mib,
+            BUDGETS.scene_mib
         );
         // The bound is loose since #168: an "ordinary" update now includes the follow step right
         // after a step of the speed scale's depth (550 to 718 ms on the 4090 at `0f5a936`, 504 to 665
@@ -4738,6 +4820,48 @@ mod tests {
         assert!(
             flip_update <= ordinary_update,
             "a flip's update is {flip_update:.2} ms, over the other paths' {ordinary_update:.2} ms"
+        );
+    }
+
+    /// The camera held under the sea at full size, without a GPU (#226): the cold start, and then
+    /// only that path, to see its scene's peak in a few minutes. The whole run does it too (the test
+    /// above), with the other paths' numbers.
+    /// `cargo test --release -p client --bin client -- --ignored --nocapture held_under_the_sea`
+    #[test]
+    #[ignore = "generates the full-size world map: about 5 minutes"]
+    fn a_camera_held_under_the_sea_at_full_size_keeps_the_scene_within_the_gate() {
+        let built = build_full().expect("the full-size Planet loads");
+        let Built { world, setup, .. } = built;
+        let script = Script::full();
+        world.set_backed_up_slice(script.stream_slice);
+        world.count_soft_misses();
+        world.measure_scene_thread();
+        let mut gpu = NoGpu;
+        let mut session = Session::new(world, &mut gpu, BUDGETS.frame_time_p99_ms);
+        let (_, _) = session.cold_start(&setup, &script).expect("the cold start");
+        session
+            .settle(&setup.spawn, script.between_cap, "the cold start")
+            .expect("settled");
+        let held = session
+            .held_under_the_sea(&setup.spawn, setup.sea)
+            .expect("the held path");
+        eprintln!(
+            "held under the sea: {:.1} s, scene peak {:.1} MiB (at the end {:.1}) in {:?}; \
+             holes {}, absorbing {} updates, flips {}",
+            held.seconds,
+            held.scene_used_peak_mib,
+            held.scene_used_end_mib,
+            held.scene_level_bricks_end,
+            held.holes,
+            held.absorb_updates,
+            held.cap_flips
+        );
+        assert_eq!(held.holes, 0);
+        assert!(
+            held.scene_used_peak_mib <= BUDGETS.scene_mib,
+            "the held camera's scene peaked at {:.1} MiB, over the {} MiB gate",
+            held.scene_used_peak_mib,
+            BUDGETS.scene_mib
         );
     }
 

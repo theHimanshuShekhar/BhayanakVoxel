@@ -27,9 +27,10 @@
 //! be seen, so it stays whole at the coarse level that holds it (never a hole), and its children
 //! are not wanted. The cap is another reason for a node to change, tracked like the bands' by
 //! how far the camera has to go for it to (a unit of path moves the margin by up to a hundred near
-//! the ground, for a climb: see `Cap::slack`). It is off for a camera under sea level, and is
-//! turned on again [`CAP_ON`] above it, so that a swimmer does not flip it. A flip changes the cap of
-//! every node at once, so the nodes are looked at again [`SWEEP`] at a time, one batch in each
+//! the ground, for a climb: see `Cap::slack`). It is off for a camera under sea level, where the
+//! camera is capped as one at the sea's surface over it instead (`Reach::under`, #226: with no
+//! cap the scene was the whole Planet), and is turned on again [`CAP_ON`] above it, so that a
+//! swimmer does not flip it. A flip changes the cap of every node at once, so the nodes are looked at again [`SWEEP`] at a time, one batch in each
 //! [`Selection::update`], and not all in the update that found it (#213): a node that is not
 //! reached yet is as it was, which is a cut through the tree like any other.
 //!
@@ -1417,7 +1418,7 @@ impl Selection {
         self.look_again(store);
         // The cap seen from a camera raised by another margin has other nodes in it, whether or not
         // it came on or went off.
-        if flipped || self.reach.horizon.is_some() {
+        if flipped || self.horizon.is_some() {
             self.reconsider_all();
         }
     }
@@ -1622,23 +1623,10 @@ impl Selection {
         .height(self.camera);
         let on = height.is_some_and(|h| h > if was.is_some() { 0.0 } else { CAP_ON });
         self.reach.horizon = if on { self.horizon } else { None };
+        // Off, the camera is under the sea and has the cap of a camera in a cave (#226).
+        self.reach.under = if on { None } else { self.horizon };
         self.placed = self.reach.from(self.camera);
         self.reach.horizon != was
-    }
-
-    /// Whether the cap was asked for and the raised camera at `camera` is under the sea's sphere
-    /// itself: no hysteresis, as [`Selection::place`] has for a cap that is on. A selection made
-    /// again at such a camera has the cap off; at any camera over the sphere it has it on.
-    pub fn camera_under_horizon(&self, camera: [f64; 3]) -> bool {
-        let Some(horizon) = self.horizon else {
-            return false;
-        };
-        let height = Reach {
-            horizon: Some(horizon),
-            ..self.reach
-        }
-        .height(camera);
-        height.is_some_and(|h| h <= 0.0)
     }
 
     /// Looks at every node at the next [`Selection::update`], for a change of the cap.
@@ -2979,11 +2967,6 @@ mod tests {
         selection.set_margins(&store, margins);
         assert!(selection.reach().horizon.is_none());
         assert_eq!(selection.horizon(), Some(Horizon::new(SEA)));
-        // A camera is under the sphere when its raised height is: no hysteresis (a scene made
-        // again over it has the cap on), though the cap here is off until 50 m over it.
-        assert!(selection.camera_under_horizon([0.0, SEA - 101.0, 0.0]));
-        assert!(!selection.camera_under_horizon([0.0, SEA - 99.0, 0.0]));
-        assert!(!selection.camera_under_horizon([0.0, SEA + 500.0, 0.0]));
         assert!(selection.reach().horizon.is_none());
         let (_, free) = capped_ball([0.0, 150.0, 0.0], false);
         assert_eq!(
@@ -3045,11 +3028,32 @@ mod tests {
         // The update that found the flip looked at a batch, and not at every node.
         let nodes = selection.nodes();
         let mut updates = 1;
-        while selection.rewanted() {
+        while selection.absorbing() {
             selection.update(&store, [0.0, y, 0.0]);
             is_a_cut(&selection);
             updates += 1;
             assert!(updates <= nodes, "the sweep does not end");
+        }
+        // The tidying of the queue goes on after the sweep, and is not what this counts: it
+        // changes nothing that is drawn (+0 -0), and takes as many updates as the entries of the
+        // queue are many over `TIDY`. Here the climb leaves 32 053 entries for 7 909 nodes (4
+        // updates), where it left 9 834 for 8 117 before #226. They are entries of nodes that the
+        // climb out of the wide scene removed (most of them), which stay until they come due or
+        // the tidy drops them, as the queue has always dropped dead entries: `set_margins` now
+        // looks at every node again with the cap off too (the cap under the sea depends on the
+        // margins), so each node has an entry where about half had none, and the first update
+        // moves them into the queue. Not a leak, and not the under-sea cap (the same with it
+        // off); real play calls `set_margins` once at the start, with the cap on, as before.
+        let entries = selection.queued_entries;
+        let mut tidied = 0;
+        while selection.tidying() {
+            selection.update(&store, [0.0, y, 0.0]);
+            assert_eq!(selection.rewanted(), selection.tidying());
+            tidied += 1;
+            assert!(
+                tidied <= entries / selection.tidy_by + 2,
+                "{tidied} updates to tidy {entries} entries"
+            );
         }
         is_as_the_rule_says(&selection, "after the sweep");
         (updates, selection.bricks().collect())
@@ -3060,7 +3064,8 @@ mod tests {
         for climbing in [true, false] {
             let (at_once, drawn) = flip_in_updates(usize::MAX, usize::MAX, climbing);
             // One update looks at every node; the children of the nodes it splits are looked at
-            // by the next (they are the sweep's too), and no more.
+            // by the next (they are the sweep's too), and no more. (The tidying of the queue,
+            // which follows, is not counted: see `flip_in_updates`.)
             assert!(at_once <= 2, "{at_once} updates (climbing: {climbing})");
             let (spread, spread_drawn) = flip_in_updates(50, 20, climbing);
             // The tree has some thousands of nodes: a batch of 50 takes many updates.
