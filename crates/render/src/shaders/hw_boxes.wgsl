@@ -3,8 +3,10 @@
 // Joined to trace.wgsl (the scene's buffers, `find_region`) by `shaders::boxes`; the CPU twin is
 // `group_prims` in hw.rs, which the tests hold this to, box for box.
 //
-// One job is one group: the 4 x 4 x 4 regions of a level that one BLAS is made of. A job is a
-// row of workgroups, one workgroup for each of the group's 64 regions, in the order x + 4y + 16z.
+// One job is one cell: the 4 x 4 x 4 regions of a level that the scene thread counts, which a BLAS is
+// made of one or more of (`Grouping`); a cell's boxes are laid out where the job says, and their
+// coordinates are from the corner of the BLAS, which is `cell` cells from the cell's own. A job is a
+// row of workgroups, one workgroup for each of the cell's 64 regions, in the order x + 4y + 16z.
 // A box is 8 words, as the BLAS's geometry has it (a stride of 32 bytes): its min and max corners
 // (f32, in Voxels of the level from the group's corner) and the two words that the shader reads
 // for a candidate (`Prim::words`). A region's boxes come after the boxes of the regions before it
@@ -17,11 +19,12 @@ struct BoxJob {
     // The first region of the group's cube, in regions of its level.
     first: vec3<i32>,
     level: u32,
-    // Where the group's boxes start in `box_out`, in boxes, and how many it has: no box is written
+    // Where the cell's boxes start in `box_out`, in boxes, and how many it has: no box is written
     // past them.
     start: u32,
     count: u32,
-    pad0: u32,
+    // Where the cell is in its BLAS, in cells: x | y << 8 | z << 16.
+    cell: u32,
     pad1: u32,
 }
 
@@ -34,7 +37,7 @@ const BOX_REGION = 0x80000000u;
 
 var<workgroup> region_boxes: array<u32, 64>;
 
-// The region of the group at index `i` (x + 4y + 16z), as a region coordinate.
+// The region of the cell at index `i` (x + 4y + 16z), as a region coordinate.
 fn group_region(job: BoxJob, i: u32) -> vec3<i32> {
     return job.first + vec3<i32>(vec3<u32>(i & 3u, (i >> 2u) & 3u, i >> 4u));
 }
@@ -53,7 +56,7 @@ fn region_box_count(record: u32) -> u32 {
 }
 
 fn pack_brick(brick: vec3<u32>) -> u32 {
-    return brick.x | (brick.y << 5u) | (brick.z << 10u);
+    return brick.x | (brick.y << 8u) | (brick.z << 16u);
 }
 
 fn write_box(at: u32, low: vec3<u32>, high: vec3<u32>, word0: u32, word1: u32) {
@@ -88,7 +91,8 @@ fn box_main(@builtin(local_invocation_index) t: u32, @builtin(workgroup_id) wg: 
         offset += region_boxes[i];
     }
     let local = vec3<u32>(wg.x & 3u, (wg.x >> 2u) & 3u, wg.x >> 4u);
-    let corner = local * 8u;
+    let cell = vec3<u32>(job.cell & 255u, (job.cell >> 8u) & 255u, (job.cell >> 16u) & 255u);
+    let corner = (local + cell * 4u) * 8u;
     let record = u32(find_region(job.level, group_region(job, wg.x)));
     let base = record * REGION_WORDS;
     let first_ref = regions[base + 16u];

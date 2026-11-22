@@ -267,6 +267,23 @@ impl Offscreen {
         self.tracer.set_hardware_max_wait(frames);
     }
 
+    /// Changes how the hardware backend's BLASes are made of the scene's cells (`scene` is the one
+    /// this was made for or updated to), and builds them all again (a no-op on compute).
+    pub fn set_hardware_grouping(&mut self, scene: &Scene, grouping: crate::hw::Grouping) {
+        self.tracer
+            .set_hardware_grouping(&self.device, &self.queue, scene, grouping);
+    }
+
+    /// How the hardware backend's cells go into BLASes.
+    pub fn hardware_grouping(&self) -> crate::hw::Grouping {
+        self.tracer.hardware_grouping()
+    }
+
+    /// The instances of the hardware backend's TLAS (0 on the compute backend).
+    pub fn hardware_instances(&self) -> u32 {
+        self.tracer.hardware_instances()
+    }
+
     /// Sets the most boxes an update of the hardware backend builds.
     pub fn set_hardware_budget(&mut self, boxes: u64) {
         self.tracer.set_hardware_budget(boxes);

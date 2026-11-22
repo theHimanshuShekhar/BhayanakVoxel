@@ -192,6 +192,13 @@ pub struct AccelSummary {
     /// How many of the updates left groups waiting (the frames in which a group showed the boxes
     /// it had, which only lost: see `RingPatch::grown`).
     pub updates_waiting: u32,
+    /// The BLASes and boxes the updates rebuilt, by the level of the group (index 0 is level 0):
+    /// where the builds are, which sizes of BLAS to try (#236).
+    pub blas_rebuilt_by_level: Vec<u64>,
+    pub prims_rebuilt_by_level: Vec<u64>,
+    /// The most instances the TLAS had and the most boxes there were, after one of the updates.
+    pub tlas_instances_max: u32,
+    pub prims_total_max: u64,
     pub prepare_ms: Stats,
     pub build_ms: Stats,
     /// `prepare_ms` + `build_ms` of each update.
@@ -226,6 +233,14 @@ impl AccelSummary {
             blas_rebuilt_per_update_max: per.iter().copied().max(),
             pending_max: updates.iter().map(|u| u.pending).max().unwrap_or(0),
             updates_waiting: updates.iter().filter(|u| u.pending > 0).count() as u32,
+            blas_rebuilt_by_level: (0..render::lod::LEVELS)
+                .map(|l| updates.iter().map(|u| u64::from(u.blas_by_level[l])).sum())
+                .collect(),
+            prims_rebuilt_by_level: (0..render::lod::LEVELS)
+                .map(|l| updates.iter().map(|u| u.prims_by_level[l]).sum())
+                .collect(),
+            tlas_instances_max: updates.iter().map(|u| u.tlas_instances).max().unwrap_or(0),
+            prims_total_max: updates.iter().map(|u| u.prims_total).max().unwrap_or(0),
             prepare_ms: Stats::of(&done.iter().map(|u| ms(u.prepare)).collect::<Vec<_>>()),
             build_ms: Stats::of(&done.iter().map(|u| ms(u.build)).collect::<Vec<_>>()),
             total_ms: Stats::of(
@@ -258,6 +273,10 @@ pub struct HwFrame {
     pub blas: u32,
     pub boxes: u64,
     pub submits: u32,
+    /// The TLAS's instances at the end of the frame, and the draw's own submit (`frame_parts.submit`,
+    /// in ms), which on this backend checks every instance of the TLAS it traces (#236).
+    pub tlas_instances: u32,
+    pub draw_submit: f64,
 }
 
 impl HwFrame {
@@ -350,6 +369,10 @@ pub struct PathHardware {
     pub blas: Count,
     pub boxes: Count,
     pub submits: Count,
+    /// The TLAS's instances, and the draw's own submit in ms (`frame_parts.submit`: with the
+    /// instances, what a submit that traces costs by them).
+    pub tlas_instances: Count,
+    pub draw_submit: Spread,
     pub per_blas_us: PerBlasUs,
 }
 
@@ -391,6 +414,8 @@ impl PathHardware {
             blas: Count::of(&col(|h| f64::from(h.blas))),
             boxes: Count::of(&col(|h| h.boxes as f64)),
             submits: Count::of(&col(|h| f64::from(h.submits))),
+            tlas_instances: Count::of(&col(|h| f64::from(h.tlas_instances))),
+            draw_submit: Spread::of(&col(|h| h.draw_submit)),
             per_blas_us: PerBlasUs {
                 total: per(HwFrame::total),
                 before: per(|h| h.before),
@@ -587,6 +612,9 @@ pub struct RtReport {
     /// hardware backend (#236), to read its frame thread's update and its frame time against
     /// the compute backend's, which are the report's `streaming_real_time`. Null otherwise.
     pub real_time_hw: Option<super::realtime::RealTimeReport>,
+    /// What `--hw-group-regions` said (`4` if nothing did): the regions along an edge of the
+    /// hardware backend's BLASes, or `NEAR:FAR@LEVEL` (#236).
+    pub hw_group_regions: String,
 }
 
 #[cfg(test)]
@@ -657,6 +685,51 @@ mod tests {
         assert!((h.per_blas_us.total - 1000.0).abs() < 1e-6, "{h:?}");
         assert!((h.per_blas_us.submit - 400.0).abs() < 1e-6, "{h:?}");
         assert_eq!(PathHardware::of(&[]).per_blas_us, PerBlasUs::default());
+    }
+
+    #[test]
+    fn a_paths_hardware_report_has_the_draws_submit_and_the_tlas_instances_of_every_frame() {
+        let a = HwFrame {
+            tlas_instances: 12_000,
+            draw_submit: 0.9,
+            ..HwFrame::of(&[phased(10, 1.0)])
+        };
+        let b = HwFrame {
+            tlas_instances: 8_000,
+            draw_submit: 0.5,
+            ..HwFrame::default()
+        };
+        let h = PathHardware::of(&[(12.0, a), (0.5, b)]);
+        assert_eq!(h.tlas_instances.max, 12_000.0);
+        assert_eq!(h.tlas_instances.mean, 10_000.0);
+        assert!((h.draw_submit.mean_ms - 0.7).abs() < 1e-9, "{h:?}");
+        assert_eq!(h.draw_submit.samples, 2);
+    }
+
+    #[test]
+    fn a_summary_says_where_the_builds_were_by_level_and_how_big_the_tlas_got() {
+        let mut a = phased(10, 1.0);
+        a.blas_by_level[0] = 7;
+        a.blas_by_level[3] = 3;
+        a.prims_by_level[0] = 700;
+        a.prims_by_level[3] = 300;
+        a.tlas_instances = 500;
+        a.prims_total = 9000;
+        let mut b = phased(2, 1.0);
+        b.blas_by_level[0] = 2;
+        b.prims_by_level[0] = 50;
+        b.tlas_instances = 400;
+        let s = AccelSummary::of(&[a, b]);
+        assert_eq!(s.blas_rebuilt_by_level.len(), render::lod::LEVELS);
+        assert_eq!(
+            (s.blas_rebuilt_by_level[0], s.blas_rebuilt_by_level[3]),
+            (9, 3)
+        );
+        assert_eq!(
+            (s.prims_rebuilt_by_level[0], s.prims_rebuilt_by_level[3]),
+            (750, 300)
+        );
+        assert_eq!((s.tlas_instances_max, s.prims_total_max), (500, 9000));
     }
 
     #[test]

@@ -67,6 +67,7 @@ release: a debug build's CPU side is slow enough to distort the frame times.
 | `--no-convergence` | Leave out the convergence phase (below), which otherwise runs after the caves. |
 | `--truth-spp N` | Samples of each of the convergence phase's two truths (the emissive room's have at least 8192 with FLIP, `ROOM_TRUTH_SPP`). Default 1024; ADR 0005's is 8192, which takes eight times as long (`client.exe bench --truth-spp 8192` is the 4090 baseline). At least 1024, the last checkpoint. |
 | `--rt-backend B` | How rays find the Planet (#50, a spike): `compute` (the default: the compute-shader DDA, the reference), `hw` (ray queries over the bricks' tight boxes, shadow rays ending at the first hit, for the flight, the sweep and the Edit stress, and for `--streaming --real-time`'s runs, #236), `hw-nearest` (`hw` with shadow rays that look for the nearest hit) or `both` (the bench as for `compute`, then the same flight and Edit stress on `hw` and the flight on `hw-nearest`, each on a context of its own, and the three compared). An adapter without ray queries runs compute with a warning and the reason in `rt.fallback`, not an error. See "The hardware ray backend" below. |
+| `--hw-group-regions G` | How the hardware backend makes its BLASes (#236): `G` regions along an edge of each, `4` (the default: one cell), `8` or `16`, or `NEAR:FAR@LEVEL` (levels below LEVEL have BLASes of NEAR regions, the others FAR: `4:16@6`). A BLAS is built again whole when any cell of it is stale, so bigger ones cost the frame thread less (fewer builds to record, fewer instances for a submit that traces to check) and the GPU more (more boxes a patch). The report's `rt.hw_group_regions` and `streaming_real_time.rt.hw_group_regions` say what ran. |
 | `--no-fail` | Exit with status 0 even if a pass is over budget, a frame of the streaming mode has a hole, or a gate of the real-time mode is over. |
 
 It runs unattended. Without the convergence phase it takes a minute or so (generating the whole Planet is about 22 s of it); the convergence phase, on by default, adds about 45 s on the 4090 at the default `--truth-spp`, and more on a slower GPU or with a larger `--truth-spp`.
@@ -1604,6 +1605,17 @@ Each run's `accel` has `pending_max` and `updates_waiting` (the updates that lef
 to say how much the budget held back. **A run asked for the hardware backend (`hw`, or the hardware
 half of `both`) on an adapter with no ray queries is an error** (`error` of that report, with the
 adapter's reason, exit status 1): its gates would be compute's, and say nothing of the backend.
+
+**BLAS size** (`--hw-group-regions`, #236): the scene thread lists and counts **cells** of 4 x 4 x 4
+regions (`RingPatch::groups`), whatever the BLASes are; `HwScene` keeps each cell's count and a BLAS
+is 1, 2 or 4 cells along an edge (4, 8 or 16 regions) of them, set by level. A BLAS with a stale cell
+is built again whole, from all its cells (the box pass has a job a cell, which writes its boxes after
+the cells before it, from the BLAS's corner); it may not wait if a cell of it gained boxes, as ever.
+`accel.*.blas_rebuilt_by_level` and `prims_rebuilt_by_level` say where the builds are (index 0 is
+level 0), `tlas_instances_max` and `prims_total_max` how big the TLAS got, and each path's
+`hardware.tlas_instances` and `hardware.draw_submit` (the draw's own submit in ms, a `Spread`) are
+there to read what a submit that traces costs by the TLAS's instances: wgpu-core checks every
+instance of a TLAS in each submit that uses it.
 
 **Where the hardware's frame-thread time goes** (each path's `hardware`, null on compute; each
 run's `accel.*.phases_ms`; each Edit's `phases_ms`). Every update is timed in parts that add up to

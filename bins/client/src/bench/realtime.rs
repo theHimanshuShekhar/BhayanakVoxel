@@ -247,7 +247,11 @@ impl Gpu for OffscreenGpu<'_> {
         frame.passes = drawn.gpu;
         let updates = self.gpu.take_hardware_updates();
         if self.gpu.rt().active.is_hardware() {
-            frame.accel = Some(HwFrame::of(&updates));
+            frame.accel = Some(HwFrame {
+                tlas_instances: self.gpu.hardware_instances(),
+                draw_submit: drawn.submit.as_secs_f64() * 1e3,
+                ..HwFrame::of(&updates)
+            });
         }
         self.accel.extend(updates);
         Ok(frame)
@@ -1347,6 +1351,8 @@ pub struct RtRealTime {
     /// `prepare_ms` and `build_ms` what the frame thread spent (`build_ms` is recording and
     /// submitting: nothing waits for the GPU). Null for a run on `compute`.
     pub accel: Vec<Option<AccelSummary>>,
+    /// What `--hw-group-regions` said (`4` if nothing did): see [`super::rt::RtReport`].
+    pub hw_group_regions: String,
 }
 
 impl RealTimeReport {
@@ -3215,6 +3221,7 @@ pub fn run(
         active: backend_name(choice.as_ref().map_or(RtBackend::Compute, |c| c.active)).to_string(),
         fallback: choice.and_then(|c| c.fallback),
         accel,
+        hw_group_regions: render::hw::process_grouping().describe(),
     };
     planet.push_str(&format!(", rays by {}", rt.active));
     let report = RealTimeReport::new(planet, d0, reports, budgets).with_rt(rt);

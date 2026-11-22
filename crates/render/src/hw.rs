@@ -17,10 +17,14 @@
 //!   from the occupancy masks that the scene already has there, in one pool of boxes that the
 //!   BLASes are built from and the ray-query shader reads the candidates' words from; the CPU
 //!   twin, [`group_prims`], is what the tests hold the GPU to, box for box (#236).
-//! * **Regular BLAS grouping** ([`group_of`]): every level's bricks go into BLASes by
-//!   [`GROUP_REGIONS`]-region cubes of the level's region grid, a function of the region's
-//!   coordinate alone: never of what is in it, so an Edit changes the contents of a BLAS and not
-//!   which BLAS a brick is in, and the TLAS keeps its shape.
+//! * **Regular BLAS grouping** ([`group_of`], [`Grouping`]): every level's bricks go into
+//!   **cells** of [`GROUP_REGIONS`]-region cubes of the level's region grid (what the scene thread
+//!   lists and counts), and the cells into BLASes of 1, 2 or 4 cells along an edge (4, 8 or 16
+//!   regions; one cell by default, `--hw-group-regions` in the benchmark), both functions of the
+//!   region's coordinate alone: never of what is in it, so an Edit changes the contents of a BLAS
+//!   and not which BLAS a brick is in, and the TLAS keeps its shape. A BLAS is built again whole
+//!   when any of its cells is stale, so a bigger one costs the GPU more boxes and the frame thread
+//!   fewer builds (a build costs it per BLAS, and a submit that traces per instance of the TLAS).
 //! * Each BLAS is one TLAS instance with a translation and a scale of 2^level, so a box is in
 //!   level Voxels in the BLAS (0..256) whatever the level; the instance's custom data indexes the
 //!   instance table the shader reads (group origin, level, where its boxes start in the pool).
@@ -53,7 +57,7 @@
 //! (nothing is outside it, so it only saves steps), compaction, or update-in-place of a BLAS (a
 //! group's BLAS is built again whole, from its new boxes).
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ops::Range;
 use std::time::{Duration, Instant};
 
@@ -63,11 +67,15 @@ use crate::scene::{
     SceneUpdate, hash_region,
 };
 
-/// Regions along each edge of a BLAS's cube: 4 x 4 x 4 regions, 32 bricks and 256 Voxels of its
-/// level across. A boxes' coordinates in a BLAS are then 0..=256, exact in `f32`.
+/// Regions along each edge of a **cell**: 4 x 4 x 4 regions, 32 bricks and 256 Voxels of its level
+/// across. A cell is the unit the scene thread lists and counts ([`RingPatch::groups`]) and the box
+/// pass makes boxes for; a BLAS is a cube of 1, 2 or 4 cells along each edge ([`Grouping`]), so
+/// that a box's coordinates in a BLAS are 0..=1024 at the most, exact in `f32`.
 pub const GROUP_REGIONS: i32 = 4;
-/// Bricks along each edge of a BLAS's cube.
+/// Bricks along each edge of a cell.
 pub const GROUP_BRICKS: i32 = GROUP_REGIONS * REGION_BRICKS;
+/// The most cells along an edge of a BLAS, as a power of two (4: 16 regions, 128 bricks).
+pub const MAX_BLAS_SHIFT: u8 = 2;
 /// The TLAS's origin is a multiple of this many Voxels of level 0, nearest to the camera.
 pub const ANCHOR_SNAP: i32 = 4096;
 /// How many boxes of BLASes a **frame** builds of the groups that may wait (see the module's
@@ -93,16 +101,143 @@ const JOB_CHUNK: usize = 32768;
 /// A BLAS: its level and the coordinate of its cube in the level's grid of groups.
 pub type GroupKey = (u8, [i32; 3]);
 
-/// The group of the region at `region` (a region coordinate of its level): its cube of
+/// The cell of the region at `region` (a region coordinate of its level): its cube of
 /// [`GROUP_REGIONS`] regions in a regular grid. A function of the coordinate and of nothing the
 /// bricks hold.
 pub fn group_of(region: [i32; 3]) -> [i32; 3] {
     region.map(|r| r.div_euclid(GROUP_REGIONS))
 }
 
-/// The first Voxel of a group's cube, in Voxels of level 0.
+/// The first Voxel of a cell's cube, in Voxels of level 0.
 pub fn group_origin(level: u8, group: [i32; 3]) -> [i32; 3] {
     group.map(|g| (g * GROUP_REGIONS * REGION_VOXELS) << level)
+}
+
+/// How the cells of each level go into BLASes: a BLAS is a cube of `1 << shift` cells along each
+/// edge (4, 8 or 16 regions), a regular grid like the cells', so which BLAS a brick is in is still
+/// a function of its coordinate and nothing else. The default is one cell a BLAS.
+///
+/// Fewer, larger BLASes cost the frame thread less (the builds are recorded and submitted a BLAS
+/// at a time, and a submit that traces checks every instance of the TLAS) and the GPU more (a
+/// BLAS is built again whole, so a patch builds more boxes): which is better is for the 4090 to
+/// say (`--hw-group-regions`, #236).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Grouping {
+    shift: [u8; crate::lod::LEVELS],
+}
+
+impl Default for Grouping {
+    fn default() -> Self {
+        Self {
+            shift: [0; crate::lod::LEVELS],
+        }
+    }
+}
+
+impl Grouping {
+    /// Levels below `from` have BLASes of `near` regions along an edge, and the others `far`
+    /// (each 4, 8 or 16).
+    pub fn split(near: i32, far: i32, from: usize) -> std::result::Result<Self, String> {
+        let shift = |regions: i32| match regions {
+            4 => Ok(0),
+            8 => Ok(1),
+            16 => Ok(2),
+            _ => Err(format!(
+                "a BLAS of {regions} regions an edge: only 4, 8 or 16"
+            )),
+        };
+        let (near, far) = (shift(near)?, shift(far)?);
+        let mut g = Self::default();
+        for (level, s) in g.shift.iter_mut().enumerate() {
+            *s = if level < from { near } else { far };
+        }
+        Ok(g)
+    }
+
+    /// Every level's BLASes are `regions` along an edge.
+    pub fn uniform(regions: i32) -> std::result::Result<Self, String> {
+        Self::split(regions, regions, 0)
+    }
+
+    /// `N` (every level), or `NEAR:FAR@LEVEL` (levels below LEVEL have BLASes of NEAR regions an
+    /// edge, the others FAR): the value of `--hw-group-regions`.
+    pub fn parse(text: &str) -> std::result::Result<Self, String> {
+        let number = |t: &str| {
+            t.trim()
+                .parse::<i32>()
+                .map_err(|_| format!("`{text}` is not N or NEAR:FAR@LEVEL"))
+        };
+        match text.split_once(':') {
+            None => Self::uniform(number(text)?),
+            Some((near, rest)) => {
+                let (far, level) = rest
+                    .split_once('@')
+                    .ok_or_else(|| format!("`{text}` is not N or NEAR:FAR@LEVEL"))?;
+                let level = level
+                    .trim()
+                    .parse::<usize>()
+                    .map_err(|_| format!("`{text}` is not N or NEAR:FAR@LEVEL"))?;
+                Self::split(number(near)?, number(far)?, level)
+            }
+        }
+    }
+
+    /// The text [`Grouping::parse`] takes, for the report.
+    pub fn describe(&self) -> String {
+        let first = self.shift[0];
+        match self.shift.iter().position(|&s| s != first) {
+            None => format!("{}", GROUP_REGIONS << first),
+            Some(at) => format!(
+                "{}:{}@{at}",
+                GROUP_REGIONS << first,
+                GROUP_REGIONS << self.shift[at]
+            ),
+        }
+    }
+
+    fn shift(&self, level: u8) -> u8 {
+        self.shift[(level as usize).min(self.shift.len() - 1)]
+    }
+
+    /// Regions along an edge of a BLAS of `level`.
+    pub fn regions(&self, level: u8) -> i32 {
+        GROUP_REGIONS << self.shift(level)
+    }
+
+    /// The BLAS the cell `cell` (a coordinate of cells) of `level` is in.
+    pub fn blas_of(&self, level: u8, cell: [i32; 3]) -> GroupKey {
+        let s = self.shift(level);
+        (level, cell.map(|c| c >> s))
+    }
+
+    /// The cells of the BLAS `blas` of `level`, with where each is in it (in cells), in the order
+    /// of x, then y, then z.
+    pub fn cells(&self, level: u8, blas: [i32; 3]) -> impl Iterator<Item = ([i32; 3], [u32; 3])> {
+        let s = self.shift(level);
+        let n = 1u32 << s;
+        (0..n * n * n).map(move |i| {
+            let at = [i % n, i / n % n, i / (n * n)];
+            (std::array::from_fn(|a| (blas[a] << s) + at[a] as i32), at)
+        })
+    }
+
+    /// The first Voxel of a BLAS's cube, in Voxels of level 0.
+    pub fn origin(&self, level: u8, blas: [i32; 3]) -> [i32; 3] {
+        blas.map(|g| (g * self.regions(level) * REGION_VOXELS) << level)
+    }
+}
+
+static PROCESS_GROUPING: std::sync::OnceLock<Grouping> = std::sync::OnceLock::new();
+
+/// Sets the grouping that every hardware backend made after this has (the benchmark's
+/// `--hw-group-regions`); the first call wins, and it is for a program's start.
+pub fn set_process_grouping(grouping: Grouping) {
+    let _ = PROCESS_GROUPING.set(grouping);
+}
+
+/// The grouping a hardware backend starts with: the process's, or one cell a BLAS.
+pub fn process_grouping() -> Grouping {
+    PROCESS_GROUPING.get().copied().unwrap_or_default()
 }
 
 /// The smallest and largest Voxel (as local coordinates 0..=7) that a brick's 512-bit occupancy
@@ -155,7 +290,7 @@ pub fn find_region(scene: &Scene, level: usize, key: [i32; 3]) -> Option<usize> 
 pub struct Prim {
     pub min: [f32; 3],
     pub max: [f32; 3],
-    /// Word 0: the brick's coordinate in the group (5 bits an axis; for a whole region, its first
+    /// Word 0: the brick's coordinate in the BLAS (8 bits an axis; for a whole region, its first
     /// brick's) and [`Prim::REGION`]. Word 1: the box's corner Voxels in the brick, 3 bits an axis
     /// each, min then max (not used for a region).
     pub words: [u32; 2],
@@ -187,8 +322,8 @@ pub fn region_box_count(scene: &Scene, region: usize) -> u32 {
     }
 }
 
-/// The regions of the group at `group` of `level` that the scene lists: their indices in
-/// `scene.regions` and where in the group (0..64, as x + 4y + 16z) they are.
+/// The regions of the cell at `group` of `level` that the scene lists: their indices in
+/// `scene.regions` and where in the cell (0..64, as x + 4y + 16z) they are.
 fn group_regions(
     scene: &Scene,
     level: usize,
@@ -206,8 +341,7 @@ fn group_regions(
     })
 }
 
-/// How many boxes the group at `group` of `level` has: what its BLAS is made of. 0 for a group
-/// that has no region.
+/// How many boxes the cell at `group` of `level` has. 0 for a cell that has no region.
 pub fn group_box_count(scene: &Scene, level: usize, group: [i32; 3]) -> u32 {
     group_regions(scene, level, group)
         .map(|(region, _)| region_box_count(scene, region))
@@ -218,16 +352,32 @@ pub fn group_box_count(scene: &Scene, level: usize, group: [i32; 3]) -> u32 {
 /// the scene lists, tight; or one for a region that is one Material. In region and brick order.
 /// **What the GPU's [`BoxPass`] makes, box for box.**
 pub fn group_prims(scene: &Scene, level: usize, group: [i32; 3]) -> Vec<Prim> {
+    cell_prims(scene, level, group, [0; 3])
+}
+
+/// The boxes of the cell at `cell` of `level` as they are in a BLAS in which the cell is `at`
+/// cells from its corner.
+fn cell_prims(scene: &Scene, level: usize, cell: [i32; 3], at: [u32; 3]) -> Vec<Prim> {
     let mut out = Vec::new();
-    for (region, i) in group_regions(scene, level, group) {
+    for (region, i) in group_regions(scene, level, cell) {
         let local = [
             i as i32 % GROUP_REGIONS,
             i as i32 / GROUP_REGIONS % GROUP_REGIONS,
             i as i32 / (GROUP_REGIONS * GROUP_REGIONS),
         ];
+        let local: [i32; 3] = std::array::from_fn(|a| local[a] + at[a] as i32 * GROUP_REGIONS);
         region_prims(scene, region, local, &mut out);
     }
     out
+}
+
+/// The boxes of the BLAS at `blas` of `level` under `grouping`: its cells' boxes, a cell's after
+/// the cells before it (x, then y, then z). **What the GPU makes for it, box for box.**
+pub fn blas_prims(scene: &Scene, grouping: &Grouping, level: usize, blas: [i32; 3]) -> Vec<Prim> {
+    grouping
+        .cells(level as u8, blas)
+        .flat_map(|(cell, at)| cell_prims(scene, level, cell, at))
+        .collect()
 }
 
 /// Appends the boxes of the region at index `region` of `scene.regions`, `local` regions from the
@@ -239,7 +389,7 @@ fn region_prims(scene: &Scene, region: usize, local: [i32; 3], out: &mut Vec<Pri
     };
     let first_ref = record[REGION_FIRST_REF];
     let corner = local.map(|l| l * REGION_BRICKS);
-    let pack = |brick: [i32; 3]| brick[0] as u32 | (brick[1] as u32) << 5 | (brick[2] as u32) << 10;
+    let pack = |brick: [i32; 3]| brick[0] as u32 | (brick[1] as u32) << 8 | (brick[2] as u32) << 16;
     if first_ref & SOLID_FLAG != 0 {
         let min = corner.map(|c| (c * 8) as f32);
         out.push(Prim {
@@ -344,6 +494,16 @@ pub struct HwPhases {
     pub wait: Duration,
 }
 
+/// Every BLAS that the scene has a cell in under `grouping`, with how many boxes it has: what a
+/// full build makes of it.
+pub fn blas_counts(scene: &Scene, grouping: &Grouping) -> BTreeMap<GroupKey, u32> {
+    let mut blases = BTreeMap::new();
+    for ((level, cell), count) in group_counts(scene) {
+        *blases.entry(grouping.blas_of(level, cell)).or_insert(0) += count;
+    }
+    blases
+}
+
 /// What an update of the acceleration structures did and cost, and what there is now.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct HwUpdate {
@@ -354,6 +514,9 @@ pub struct HwUpdate {
     /// BLASes built (each from the pool's boxes, made by the GPU) and the boxes in them.
     pub blas_rebuilt: u32,
     pub prims_rebuilt: u64,
+    /// The same by level: BLASes and boxes built of each.
+    pub blas_by_level: [u32; crate::lod::LEVELS],
+    pub prims_by_level: [u64; crate::lod::LEVELS],
     /// Whether the TLAS was built again, and how many instances it has.
     pub tlas_rebuilt: bool,
     pub tlas_instances: u32,
@@ -374,11 +537,14 @@ pub struct HwUpdate {
     pub phases: HwPhases,
 }
 
-/// One group's job for the box pass.
+/// One cell's job for the box pass.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BoxJob {
     pub level: u8,
+    /// The cell, in cells of its level.
     pub group: [i32; 3],
+    /// Where the cell is in its BLAS, in cells: its boxes' coordinates are from the BLAS's corner.
+    pub cell: [u32; 3],
     /// Where its boxes start in the output, in boxes.
     pub start: u32,
     /// How many it has: no box is written past them.
@@ -484,7 +650,7 @@ impl BoxPass {
                     i32::from(j.level),
                     j.start as i32,
                     j.count as i32,
-                    0,
+                    (j.cell[0] | j.cell[1] << 8 | j.cell[2] << 16) as i32,
                     0,
                 ]
             })
@@ -623,8 +789,14 @@ struct Wait {
 pub struct HwScene {
     layout: wgpu::BindGroupLayout,
     boxes: BoxPass,
+    /// How the cells go into BLASes.
+    grouping: Grouping,
+    /// How many boxes each cell of the scene has now (a cell with none is not here), as the scene
+    /// thread's patches have counted them.
+    cells: BTreeMap<GroupKey, u32>,
+    /// The BLASes, by [`Grouping::blas_of`].
     groups: BTreeMap<GroupKey, Group>,
-    /// The groups that are stale and not yet built again.
+    /// The BLASes that are stale and not yet built again.
     pending: BTreeMap<GroupKey, Wait>,
     /// The boxes of every group, 8 words a box, a group's after another's.
     pool: Pool,
@@ -753,6 +925,8 @@ impl HwScene {
         let mut hw = Self {
             layout,
             boxes: BoxPass::new(device, scene_layout),
+            grouping: process_grouping(),
+            cells: BTreeMap::new(),
             groups: BTreeMap::new(),
             pending: BTreeMap::new(),
             pool: Pool {
@@ -907,16 +1081,31 @@ impl HwScene {
         let started = Instant::now();
         let all = match update {
             SceneUpdate::Rings(patch) => {
+                // The patch lists cells; what is stale is the BLAS each is in, which is urgent if
+                // a cell of it gained boxes (or it has no BLAS), and has all its cells' boxes.
+                let mut blases: BTreeSet<GroupKey> = BTreeSet::new();
                 for &(key, count) in &patch.groups {
+                    if count > 0 {
+                        self.cells.insert(key, count);
+                    } else {
+                        self.cells.remove(&key);
+                    }
+                    let blas = self.grouping.blas_of(key.0, key.1);
                     let urgent = patch.grown.binary_search(&key).is_ok()
-                        || (count > 0 && !self.groups.contains_key(&key));
-                    let wait = self.pending.entry(key).or_insert(Wait {
-                        count,
+                        || (count > 0 && !self.groups.contains_key(&blas));
+                    let wait = self.pending.entry(blas).or_insert(Wait {
+                        count: 0,
                         urgent,
                         waited: 0,
                     });
-                    wait.count = count;
                     wait.urgent |= urgent;
+                    blases.insert(blas);
+                }
+                for blas in blases {
+                    let count = self.blas_count(blas);
+                    if let Some(wait) = self.pending.get_mut(&blas) {
+                        wait.count = count;
+                    }
                 }
                 false
             }
@@ -966,11 +1155,18 @@ impl HwScene {
         self.next_slot = 0;
         self.slot_key.clear();
         self.table.clear();
-        self.pending = group_counts(scene)
+        self.cells = group_counts(scene);
+        let blases: BTreeSet<GroupKey> = self
+            .cells
+            .keys()
+            .map(|&(level, cell)| self.grouping.blas_of(level, cell))
+            .collect();
+        self.pending = blases
             .into_iter()
-            .map(|(key, count)| {
+            .map(|blas| {
+                let count = self.blas_count(blas);
                 (
-                    key,
+                    blas,
                     Wait {
                         count,
                         urgent: true,
@@ -981,6 +1177,32 @@ impl HwScene {
             .collect();
     }
 
+    /// How many boxes the BLAS `blas` has now: its cells' counts.
+    fn blas_count(&self, blas: GroupKey) -> u32 {
+        self.grouping
+            .cells(blas.0, blas.1)
+            .map(|(cell, _)| self.cells.get(&(blas.0, cell)).copied().unwrap_or(0))
+            .sum()
+    }
+
+    /// Changes how the cells go into BLASes: every BLAS is made again (queued, all of it), and the
+    /// next update or [`HwScene::flush`] builds them. For a program's start and for the tests.
+    pub fn set_grouping(&mut self, grouping: Grouping, scene: &Scene) {
+        self.grouping = grouping;
+        self.restart(scene);
+        self.tlas_stale = true;
+    }
+
+    /// How the cells go into BLASes.
+    pub fn grouping(&self) -> Grouping {
+        self.grouping
+    }
+
+    /// The instances of the TLAS.
+    pub fn instances(&self) -> u32 {
+        self.groups.len() as u32
+    }
+
     /// Gives back what the group `group` of `slot` held: its room in the pool.
     fn release(&mut self, group: &Group) {
         self.pool.release(group.start..group.start + group.capacity);
@@ -988,8 +1210,9 @@ impl HwScene {
 
     /// How far the group at `key` is from the camera, squared, in Voxels of level 0.
     fn distance2(&self, key: GroupKey) -> f64 {
-        let origin = group_origin(key.0, key.1);
-        let half = f64::from(GROUP_REGIONS * REGION_VOXELS / 2) * f64::from(1u32 << key.0);
+        let origin = self.grouping.origin(key.0, key.1);
+        let half =
+            f64::from(self.grouping.regions(key.0) * REGION_VOXELS / 2) * f64::from(1u32 << key.0);
         (0..3)
             .map(|a| {
                 let d = f64::from(origin[a]) + half - self.camera[a];
@@ -1050,10 +1273,12 @@ impl HwScene {
             Limit::Boxes { left, at_least_one } => (left, at_least_one),
         };
         let mut spent = 0u64;
+        // The BLASes to build (and their boxes), and the box pass's jobs: a job a cell of them.
+        let mut built: Vec<(GroupKey, u32)> = Vec::new();
         let mut jobs: Vec<BoxJob> = Vec::new();
         for (may_wait, _, key, count) in order {
             if may_wait {
-                if u64::from(count) > left && !(at_least_one && jobs.is_empty()) {
+                if u64::from(count) > left && !(at_least_one && built.is_empty()) {
                     break;
                 }
                 left = left.saturating_sub(u64::from(count));
@@ -1093,12 +1318,21 @@ impl HwScene {
             }
             self.slot_key[slot as usize] = Some(key);
             touched.push(slot);
-            jobs.push(BoxJob {
-                level: key.0,
-                group: key.1,
-                start,
-                count,
-            });
+            let mut at = start;
+            for (cell, local) in self.grouping.cells(key.0, key.1) {
+                let n = self.cells.get(&(key.0, cell)).copied().unwrap_or(0);
+                if n > 0 {
+                    jobs.push(BoxJob {
+                        level: key.0,
+                        group: cell,
+                        cell: local,
+                        start: at,
+                        count: n,
+                    });
+                    at += n;
+                }
+            }
+            built.push((key, count));
             self.groups.insert(
                 key,
                 Group {
@@ -1110,17 +1344,17 @@ impl HwScene {
                 },
             );
         }
-        if jobs.is_empty() && touched.is_empty() && !self.tlas_stale {
+        if built.is_empty() && touched.is_empty() && !self.tlas_stale {
             // Everything that waits may wait (a second view of the frame, or a budget that is
             // spent): nothing to build, and no TLAS build for nothing.
             return;
         }
         self.spent += spent;
-        self.built += jobs.len() as u32;
+        self.built += built.len() as u32;
         let planned = Instant::now();
         self.sync_instances(device, queue, touched);
         let synced = Instant::now();
-        let kind = if jobs.is_empty() { "anchor" } else { "patch" };
+        let kind = if built.is_empty() { "anchor" } else { "patch" };
         self.boxes.encode(
             device,
             queue,
@@ -1130,13 +1364,15 @@ impl HwScene {
             &jobs,
         );
         let boxed = Instant::now();
-        let sizes: Vec<wgpu::BlasAABBGeometrySizeDescriptor> =
-            jobs.iter().map(|job| blas_descriptor(job.count)).collect();
-        let entries: Vec<wgpu::BlasBuildEntry<'_>> = jobs
+        let sizes: Vec<wgpu::BlasAABBGeometrySizeDescriptor> = built
+            .iter()
+            .map(|&(_, count)| blas_descriptor(count))
+            .collect();
+        let entries: Vec<wgpu::BlasBuildEntry<'_>> = built
             .iter()
             .zip(&sizes)
-            .map(|(job, size)| {
-                let group = &self.groups[&(job.level, job.group)];
+            .map(|(key, size)| {
+                let group = &self.groups[&key.0];
                 wgpu::BlasBuildEntry {
                     blas: &group.blas,
                     geometry: wgpu::BlasGeometries::AabbGeometries(vec![wgpu::BlasAabbGeometry {
@@ -1160,6 +1396,12 @@ impl HwScene {
                 .expect("device poll failed");
         }
         let done = Instant::now();
+        let mut blas_by_level = [0u32; crate::lod::LEVELS];
+        let mut prims_by_level = [0u64; crate::lod::LEVELS];
+        for &((level, _), count) in &built {
+            blas_by_level[(level as usize).min(crate::lod::LEVELS - 1)] += 1;
+            prims_by_level[(level as usize).min(crate::lod::LEVELS - 1)] += u64::from(count);
+        }
         let phases = HwPhases {
             before: entered - started,
             plan: planned - entered,
@@ -1173,8 +1415,10 @@ impl HwScene {
         self.tlas_stale = false;
         self.record(HwUpdate {
             kind: if all { "build" } else { kind },
-            blas_rebuilt: jobs.len() as u32,
-            prims_rebuilt: jobs.iter().map(|j| u64::from(j.count)).sum(),
+            blas_rebuilt: built.len() as u32,
+            prims_rebuilt: built.iter().map(|&(_, n)| u64::from(n)).sum(),
+            blas_by_level,
+            prims_by_level,
             tlas_rebuilt: true,
             tlas_instances: self.groups.len() as u32,
             blas_total: self.groups.len() as u32,
@@ -1255,7 +1499,7 @@ impl HwScene {
             match self.slot_key.get(at).copied().flatten() {
                 Some(key) => {
                     let group = &self.groups[&key];
-                    let origin = group_origin(key.0, key.1);
+                    let origin = self.grouping.origin(key.0, key.1);
                     let s = (1u32 << key.0) as f32;
                     let t: [f32; 3] = std::array::from_fn(|a| (origin[a] - self.anchor[a]) as f32);
                     self.tlas[at] = Some(wgpu::TlasInstance::new(
@@ -1470,6 +1714,7 @@ impl BoxPass {
                 let job = BoxJob {
                     level,
                     group,
+                    cell: [0; 3],
                     start: at,
                     count,
                 };

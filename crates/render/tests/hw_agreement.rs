@@ -241,6 +241,7 @@ fn place_a_block_and_compare(
     camera: [f64; 3],
     (x0, z0): (i32, i32),
     size: i32,
+    grouping: Grouping,
 ) -> Option<(render::scene::RingPatch, render::HwUpdate, u32)> {
     let mut store = generate_region(7, BrickCoord([-12, 178, -12]), BrickCoord([12, 193, 12]));
     store.build_lod(5);
@@ -258,7 +259,11 @@ fn place_a_block_and_compare(
     let first = hw.take_hardware_updates();
     assert_eq!(first.len(), 1);
     assert_eq!(first[0].kind, "build");
-    let total = first[0].blas_total;
+    let mut total = first[0].blas_total;
+    if grouping != Grouping::default() {
+        hw.set_hardware_grouping(&scene, grouping);
+        total = hw.take_hardware_updates().last().unwrap().blas_total;
+    }
     assert!(total > 1, "the scene has {total} groups");
 
     // A block of Stone on the ground: higher than the bricks' tight boxes are, so a box that is
@@ -334,16 +339,21 @@ fn place_a_block_and_compare(
 
 #[test]
 fn an_edit_near_the_camera_rebuilds_only_the_groups_it_touched_and_the_hardware_agrees() {
-    let Some((_, update, total)) = place_a_block_and_compare([0.0, 1565.0, 0.0], (0, 0), 8) else {
-        return;
-    };
-    assert_eq!(update.kind, "patch", "{update:?}");
-    assert!(
-        update.blas_rebuilt >= 1 && update.blas_rebuilt < total,
-        "{} of {total} groups rebuilt",
-        update.blas_rebuilt
-    );
-    assert!(update.tlas_rebuilt);
+    for grouping in groupings() {
+        let Some((_, update, total)) =
+            place_a_block_and_compare([0.0, 1565.0, 0.0], (0, 0), 8, grouping)
+        else {
+            return;
+        };
+        assert_eq!(update.kind, "patch", "{update:?}");
+        assert!(
+            update.blas_rebuilt >= 1 && update.blas_rebuilt < total.max(2),
+            "{} of {total} groups rebuilt, groups of {}",
+            update.blas_rebuilt,
+            grouping.describe()
+        );
+        assert!(update.tlas_rebuilt);
+    }
 }
 
 /// A coarse brick whose words are written in place, with no word of `regions` or `brick_refs`
@@ -352,7 +362,8 @@ fn an_edit_near_the_camera_rebuilds_only_the_groups_it_touched_and_the_hardware_
 /// update is `none` and the rays hit the ground under the block.
 #[test]
 fn an_edit_in_place_at_a_coarse_level_makes_its_group_again() {
-    let Some((patch, update, total)) = place_a_block_and_compare([0.0, 1565.0, 0.0], (100, 100), 4)
+    let Some((patch, update, total)) =
+        place_a_block_and_compare([0.0, 1565.0, 0.0], (100, 100), 4, Grouping::default())
     else {
         return;
     };
@@ -372,7 +383,17 @@ fn an_edit_in_place_at_a_coarse_level_makes_its_group_again() {
 // #236: the boxes are made on the GPU, and the acceleration structures follow streaming without
 // waiting for it.
 
-use render::hw::{group_counts, group_prims};
+use render::hw::{Grouping, blas_counts, blas_prims, group_counts, group_prims};
+
+/// The groupings the tests that follow the scene are run under: a cell a BLAS (the default), BLASes
+/// of 8 regions an edge, and a mixture (4 below level 2, 16 above) with bigger ones still.
+fn groupings() -> [Grouping; 3] {
+    [
+        Grouping::default(),
+        Grouping::uniform(8).unwrap(),
+        Grouping::split(4, 16, 2).unwrap(),
+    ]
+}
 
 /// The boxes of every group of `scene` as the GPU makes them, and as the CPU makes them: equal,
 /// box for box. Runs on any adapter (the pass needs no ray queries).
@@ -572,13 +593,14 @@ fn walking_scene() -> (BrickStore, Scene) {
 fn assert_not_stale(label: &str, hw: &Offscreen, scene: &Scene) {
     assert_eq!(hw.hardware_pending(), 0, "{label}");
     let built = hw.hardware_groups();
+    let grouping = hw.hardware_grouping();
     assert_eq!(
         built,
-        group_counts(scene),
+        blas_counts(scene, &grouping),
         "{label}: groups and their boxes"
     );
     for ((level, group), boxes) in hw.hardware_boxes() {
-        let want: Vec<[u32; 8]> = group_prims(scene, level as usize, group)
+        let want: Vec<[u32; 8]> = blas_prims(scene, &grouping, level as usize, group)
             .iter()
             .map(render::hw::Prim::record)
             .collect();
@@ -592,7 +614,11 @@ fn assert_not_stale(label: &str, hw: &Offscreen, scene: &Scene) {
 /// goes, no hole), and the hits through what did not change are as before.
 #[test]
 fn the_hardware_follows_the_rings_as_they_move_with_no_group_stale_and_no_hole() {
-    for budget in [render::hw::BUILD_BUDGET, 1] {
+    let budgets = [render::hw::BUILD_BUDGET, 1];
+    for (budget, grouping) in budgets
+        .into_iter()
+        .flat_map(|b| groupings().into_iter().map(move |g| (b, g)))
+    {
         let (store, mut scene) = walking_scene();
         let mut hw =
             Offscreen::with_backend(Resolution::native(8, 8), &scene, RtBackend::Hardware).unwrap();
@@ -600,6 +626,7 @@ fn the_hardware_follows_the_rings_as_they_move_with_no_group_stale_and_no_hole()
             eprintln!("skipped: {:?}", hw.rt().fallback);
             return;
         }
+        hw.set_hardware_grouping(&scene, grouping);
         hw.take_hardware_updates();
         assert_not_stale("the first build", &hw, &scene);
         hw.set_hardware_budget(budget);
@@ -620,12 +647,13 @@ fn the_hardware_follows_the_rings_as_they_move_with_no_group_stale_and_no_hole()
             hw.update_scene(&scene, &update).unwrap();
             ever_pending = ever_pending.max(hw.hardware_pending());
             // No hole: a group that was built and that the scene still has is still built.
-            let wanted = group_counts(&scene);
+            let wanted = blas_counts(&scene, &grouping);
             let now = hw.hardware_groups();
             for key in before.keys().filter(|k| wanted.contains_key(k)) {
                 assert!(
                     now.contains_key(key),
-                    "budget {budget}, step {step}: group {key:?} went"
+                    "budget {budget}, {}: step {step}: group {key:?} went",
+                    grouping.describe()
                 );
             }
             // Whatever is built traces as the compute path does where nothing changed: rays
@@ -675,7 +703,11 @@ fn the_hardware_follows_the_rings_as_they_move_with_no_group_stale_and_no_hole()
         }
         // Built to the end of the queue: not stale.
         hw.settle_hardware();
-        assert_not_stale(&format!("budget {budget}"), &hw, &scene);
+        assert_not_stale(
+            &format!("budget {budget}, groups of {}", grouping.describe()),
+            &hw,
+            &scene,
+        );
         let (hits, differing) = disagreement(
             &mut hw,
             &scene,
@@ -992,4 +1024,89 @@ fn the_phases_of_an_update_add_up_to_what_it_cost() {
             "{u:?}"
         );
     }
+}
+
+/// A BLAS of several cells that hold boxes (the walking scene's regions are too few for two cells
+/// of one BLAS): its boxes are its cells' in order, from its own corner; the hits are compute's;
+/// and an Edit makes the whole BLAS again, from all its cells.
+#[test]
+fn a_blas_of_several_cells_has_all_their_boxes_in_order_and_follows_an_edit() {
+    let mut store = generate_region(7, BrickCoord([-44, 178, -44]), BrickCoord([44, 193, 44]));
+    store.build_lod(5);
+    let bound = Bound {
+        centre: [0; 3],
+        radius: 1600,
+    };
+    let mut scene =
+        Scene::rings(&store, [256.0, 1565.0, 256.0], Bands::with_d0(64.0), bound).unwrap();
+    let mut hw =
+        Offscreen::with_backend(Resolution::native(8, 8), &scene, RtBackend::Hardware).unwrap();
+    if hw.rt().active != RtBackend::Hardware {
+        eprintln!("skipped: {:?}", hw.rt().fallback);
+        return;
+    }
+    for grouping in [
+        Grouping::uniform(8).unwrap(),
+        Grouping::uniform(16).unwrap(),
+    ] {
+        hw.set_hardware_grouping(&scene, grouping);
+        hw.take_hardware_updates();
+        let blases = blas_counts(&scene, &grouping);
+        // Some BLAS has more than one cell with boxes in it.
+        let mut cells: std::collections::BTreeMap<_, usize> = Default::default();
+        for &(level, cell) in group_counts(&scene).keys() {
+            *cells.entry(grouping.blas_of(level, cell)).or_default() += 1;
+        }
+        let many = cells.values().filter(|&&n| n > 1).count();
+        assert!(
+            many >= 1,
+            "groups of {}: {many} BLASes of many cells",
+            grouping.describe()
+        );
+        assert_not_stale(&format!("groups of {}", grouping.describe()), &hw, &scene);
+        assert_eq!(hw.hardware_groups(), blases);
+        let (hits, differing) =
+            disagreement(&mut hw, &scene, &rays_down_from([256.0, 256.0], 65.0, 3));
+        assert!(
+            hits > 300 && differing <= 1024 / 100,
+            "{hits} hits, {differing} differ"
+        );
+    }
+    // An Edit in one cell of a BLAS of several makes the BLAS again, from all its cells.
+    let grouping = Grouping::uniform(8).unwrap();
+    hw.set_hardware_grouping(&scene, grouping);
+    hw.take_hardware_updates();
+    let top = (1400..1650)
+        .rev()
+        .find(|&y| store.get(VoxelCoord([250, y, 250])).is_some())
+        .expect("ground");
+    let mut changed = std::collections::BTreeSet::new();
+    for x in 250..258 {
+        for y in top + 1..top + 9 {
+            for z in 250..258 {
+                let at = VoxelCoord([x, y, z]);
+                store.set(at, Some(STONE));
+                changed.insert(at.brick());
+            }
+        }
+    }
+    let changed: Vec<BrickCoord> = changed.into_iter().collect();
+    store.refresh_lod(changed.iter().copied());
+    let update = scene.update(&store, &changed).unwrap();
+    hw.update_scene(&scene, &update).unwrap();
+    hw.settle_hardware();
+    assert_not_stale("after the Edit", &hw, &scene);
+    let mut rng = Lcg(9);
+    let rays: Vec<_> = (0..512)
+        .map(|_| {
+            let x = 250.0 + f64::from(rng.next() * 8.0);
+            let z = 250.0 + f64::from(rng.next() * 8.0);
+            ray([x, top as f64 + 60.0, z], [x, top as f64 + 5.0, z])
+        })
+        .collect();
+    let (hits, differing) = disagreement(&mut hw, &scene, &rays);
+    assert!(
+        hits > 450 && differing <= 512 / 100,
+        "{hits} hits, {differing} differ"
+    );
 }

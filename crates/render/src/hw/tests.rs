@@ -500,3 +500,42 @@ fn the_pools_room_is_given_out_first_fit_given_back_whole_and_grown_only_at_the_
     pool.release(60..90);
     assert_eq!((pool.top, pool.free.len(), pool.used()), (0, 0, 0));
 }
+
+#[test]
+fn a_blas_is_a_cube_of_cells_that_is_a_function_of_the_cells_coordinate_and_the_levels_size() {
+    let g = Grouping::split(4, 16, 2).unwrap();
+    // Levels 0 and 1 have one cell a BLAS, the others 4 x 4 x 4.
+    assert_eq!(g.regions(1), 4);
+    assert_eq!(g.regions(2), 16);
+    assert_eq!(g.blas_of(1, [3, -1, 0]), (1, [3, -1, 0]));
+    assert_eq!(g.blas_of(2, [3, 0, 4]), (2, [0, 0, 1]));
+    assert_eq!(g.blas_of(2, [-1, -4, -5]), (2, [-1, -1, -2]));
+    // The cells of a BLAS are 64 of them, each in the BLAS that holds it, at the place the order
+    // of x, y, z says.
+    let cells: Vec<_> = g.cells(2, [-1, 0, 2]).collect();
+    assert_eq!(cells.len(), 64);
+    for (i, (cell, at)) in cells.iter().enumerate() {
+        assert_eq!(g.blas_of(2, *cell), (2, [-1, 0, 2]));
+        assert_eq!(*at, [i as u32 % 4, i as u32 / 4 % 4, i as u32 / 16]);
+    }
+    assert_eq!(
+        g.cells(0, [5, 6, 7]).collect::<Vec<_>>(),
+        [([5, 6, 7], [0; 3])]
+    );
+    // A BLAS's corner is its first cell's.
+    assert_eq!(g.origin(0, [1, 0, 0]), group_origin(0, [1, 0, 0]));
+    assert_eq!(g.origin(3, [1, 0, 0]), group_origin(3, [4, 0, 0]));
+}
+
+#[test]
+fn the_grouping_flag_takes_a_size_or_a_size_below_a_level_and_another_from_it() {
+    assert_eq!(Grouping::parse("4").unwrap(), Grouping::default());
+    assert_eq!(Grouping::parse("8").unwrap(), Grouping::uniform(8).unwrap());
+    let split = Grouping::parse("8:16@3").unwrap();
+    assert_eq!((split.regions(2), split.regions(3)), (8, 16));
+    assert_eq!(split.describe(), "8:16@3");
+    assert_eq!(Grouping::uniform(16).unwrap().describe(), "16");
+    for bad in ["", "3", "32", "8:16", "8:16@x", "a:b@1", "8:5@1"] {
+        assert!(Grouping::parse(bad).is_err(), "{bad}");
+    }
+}

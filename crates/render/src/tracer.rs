@@ -1781,6 +1781,33 @@ impl Tracer {
         }
     }
 
+    /// Changes how the hardware backend's BLASes are made of the scene's cells and builds them all
+    /// again at once ([`crate::hw::Grouping`]; a no-op on the compute backend).
+    pub fn set_hardware_grouping(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        scene: &crate::Scene,
+        grouping: crate::hw::Grouping,
+    ) {
+        if let Some(hw) = &mut self.hw {
+            hw.scene.set_grouping(grouping, scene);
+            hw.scene.flush(device, queue, &self.scene.group);
+        }
+    }
+
+    /// How the hardware backend's cells go into BLASes (the default on the compute backend).
+    pub fn hardware_grouping(&self) -> crate::hw::Grouping {
+        self.hw
+            .as_ref()
+            .map_or_else(Default::default, |h| h.scene.grouping())
+    }
+
+    /// The instances of the hardware backend's TLAS (0 on the compute backend).
+    pub fn hardware_instances(&self) -> u32 {
+        self.hw.as_ref().map_or(0, |h| h.scene.instances())
+    }
+
     /// Sets the most boxes an update of the hardware backend builds (see [`crate::hw::BUILD_BUDGET`]).
     pub fn set_hardware_budget(&mut self, boxes: u64) {
         if let Some(hw) = &mut self.hw {

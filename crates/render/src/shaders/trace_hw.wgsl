@@ -57,7 +57,7 @@ fn hw_candidate(ray: Ray, w: Walk, c: RayIntersection, limit: f32) -> Hit {
     let prim = (u32(hw_instances[at + 1u].x) + c.primitive_index) * 8u + 6u;
     let w0 = hw_prims[prim];
     let w1 = hw_prims[prim + 1u];
-    let local = vec3<i32>(vec3<u32>(w0 & 31u, (w0 >> 5u) & 31u, (w0 >> 10u) & 31u));
+    let local = vec3<i32>(vec3<u32>(w0 & 255u, (w0 >> 8u) & 255u, (w0 >> 16u) & 255u));
     let brick = (group.xyz >> vec3<u32>(level + 3u)) + local;
     let whole_region = (w0 & HW_REGION_BOX) != 0u;
     // The box in Voxels of the level, then in Voxels of level 0.

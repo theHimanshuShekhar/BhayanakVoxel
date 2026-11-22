@@ -79,6 +79,12 @@ Options:
                    rays compared: `rt.comparison`; with `--streaming --real-time`, the real-time
                    runs on compute and then on hw: `rt.real_time_hw`). The report's `rt` says which ran and what the
                    acceleration structures cost to update
+  --hw-group-regions G
+                   How the hardware backend (--rt-backend hw|both) makes its BLASes (#236): G
+                   regions along an edge of each, 4 (the default), 8 or 16, or NEAR:FAR@LEVEL
+                   (levels below LEVEL have BLASes of NEAR regions an edge, the others FAR, e.g.
+                   4:16@6). Fewer, larger BLASes cost the frame thread less and the GPU more; the
+                   report's `rt.hw_group_regions` says what ran
   --no-fail        Exit with status 0 even if a pass is over its budget, there is a hole or a
                    real-time gate is over
   -h, --help       Print this";
@@ -134,6 +140,9 @@ pub struct Args {
     pub shadow_rays: Option<u32>,
     /// `--rt-backend` (#50): how rays find the Planet.
     pub rt: RtMode,
+    /// `--hw-group-regions` (#236): how the hardware backend's BLASes are made of the cells; None
+    /// is the default, one cell a BLAS.
+    pub hw_group: Option<render::hw::Grouping>,
     pub size: Option<(u32, u32)>,
     pub bias: f64,
     pub diag: Diag,
@@ -166,6 +175,7 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Parsed, String> {
         flip_gamma22: false,
         shadow_rays: None,
         rt: RtMode::default(),
+        hw_group: None,
         size: None,
         bias: 1.0,
         diag: Diag::default(),
@@ -193,6 +203,9 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Parsed, String> {
             "--truth-spp" => parsed.truth_spp = Some(truth_spp(&value("--truth-spp")?)?),
             "--shadow-rays" => parsed.shadow_rays = Some(shadow_rays(&value("--shadow-rays")?)?),
             "--rt-backend" => parsed.rt = RtMode::parse(&value("--rt-backend")?)?,
+            "--hw-group-regions" => {
+                parsed.hw_group = Some(render::hw::Grouping::parse(&value("--hw-group-regions")?)?);
+            }
             "--out" => parsed.out = value("--out")?.into(),
             "--budgets" => parsed.budgets = Some(value("--budgets")?.into()),
             "--size" => parsed.size = Some(size(&value("--size")?)?),
@@ -356,6 +369,7 @@ mod tests {
                 flip_gamma22: false,
                 shadow_rays: None,
                 rt: RtMode::Compute,
+                hw_group: None,
                 size: None,
                 bias: 1.0,
                 diag: Diag::default()
@@ -395,6 +409,27 @@ mod tests {
             &["--streaming", "--flat-ambient"],
             // The diagnostic switches say the budgets are not checked, which the gates always are.
             &["--streaming", "--real-time", "--diag", "no-flush"],
+        ] {
+            assert!(parse_all(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn the_hardware_grouping_is_read_as_a_size_or_a_split_and_bad_ones_are_refused() {
+        use render::hw::Grouping;
+        assert_eq!(run(&[]).hw_group, None);
+        assert_eq!(
+            run(&["--hw-group-regions", "8"]).hw_group,
+            Some(Grouping::uniform(8).unwrap())
+        );
+        assert_eq!(
+            run(&["--hw-group-regions", "4:16@6"]).hw_group,
+            Some(Grouping::split(4, 16, 6).unwrap())
+        );
+        for bad in [
+            &["--hw-group-regions"][..],
+            &["--hw-group-regions", "5"],
+            &["--hw-group-regions", "4:16"],
         ] {
             assert!(parse_all(bad).is_err(), "{bad:?}");
         }

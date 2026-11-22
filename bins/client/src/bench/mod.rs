@@ -143,6 +143,10 @@ pub fn main(args: impl IntoIterator<Item = String>) -> ExitCode {
 }
 
 fn run(args: &Args) -> Result<u8, Box<dyn Error>> {
+    // Every hardware backend of the run is made with it (#236).
+    if let Some(grouping) = args.hw_group {
+        render::hw::set_process_grouping(grouping);
+    }
     let (budgets, source) = match &args.budgets {
         Some(file) => {
             let text = fs::read_to_string(file)
@@ -278,6 +282,7 @@ fn run(args: &Args) -> Result<u8, Box<dyn Error>> {
         accel: main_accel,
         comparison,
         real_time_hw: None,
+        hw_group_regions: render::hw::process_grouping().describe(),
     };
     // The convergence phase (#187) has GPU contexts of its own, one for each of its views, and
     // runs after everything that is timed against the budgets, so that it cannot
@@ -1192,7 +1197,7 @@ fn print_real_time(r: &realtime::RealTimeReport) {
             );
             if let Some(h) = &p.hardware {
                 eprintln!(
-                    "        hardware per frame, mean (p95) ms: total {:.2} ({:.2}) = before {:.2} + plan {:.2} + instances {:.2} + boxes pass {:.2} + builds {:.2} + finish {:.2} + submit {:.2} ({:.2}); update less hardware {:.2}; BLAS {:.1} (max {}), {} us each, {} frames with builds",
+                    "        hardware per frame, mean (p95) ms: total {:.2} ({:.2}) = before {:.2} + plan {:.2} + instances {:.2} + boxes pass {:.2} + builds {:.2} + finish {:.2} + submit {:.2} ({:.2}); update less hardware {:.2}; BLAS {:.1} (max {}), {} us each, {} frames with builds; draw submit {:.2} ({:.2}) with {:.0} TLAS instances",
                     h.total.mean_ms,
                     h.total.p95_ms,
                     h.before.mean_ms,
@@ -1208,6 +1213,9 @@ fn print_real_time(r: &realtime::RealTimeReport) {
                     h.blas.max,
                     h.per_blas_us.total.round(),
                     h.frames_with_builds,
+                    h.draw_submit.mean_ms,
+                    h.draw_submit.p95_ms,
+                    h.tlas_instances.mean,
                 );
             }
             if !p.gpu_passes.is_empty() {
