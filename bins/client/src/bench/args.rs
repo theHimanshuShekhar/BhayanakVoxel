@@ -81,10 +81,14 @@ Options:
                    acceleration structures cost to update
   --hw-group-regions G
                    How the hardware backend (--rt-backend hw|both) makes its BLASes (#236): G
-                   regions along an edge of each, 4 (the default), 8 or 16, or NEAR:FAR@LEVEL
+                   regions along an edge of each, 4, 8, 16 (the default) or 32, or NEAR:FAR@LEVEL
                    (levels below LEVEL have BLASes of NEAR regions an edge, the others FAR, e.g.
                    4:16@6). Fewer, larger BLASes cost the frame thread less and the GPU more; the
                    report's `rt.hw_group_regions` says what ran
+  --hw-build-blas N
+                   The most BLASes a frame builds of the groups that may wait (#236), default no
+                   bound; the groups that may not wait (they gained boxes, or have no BLAS) are built
+                   at once whatever it is. The report counts them as `blas_urgent`
   --no-fail        Exit with status 0 even if a pass is over its budget, there is a hole or a
                    real-time gate is over
   -h, --help       Print this";
@@ -141,8 +145,10 @@ pub struct Args {
     /// `--rt-backend` (#50): how rays find the Planet.
     pub rt: RtMode,
     /// `--hw-group-regions` (#236): how the hardware backend's BLASes are made of the cells; None
-    /// is the default, one cell a BLAS.
+    /// is the default, 16 regions an edge.
     pub hw_group: Option<render::hw::Grouping>,
+    /// `--hw-build-blas` (#236): the most BLASes a frame builds of the groups that may wait.
+    pub hw_blas_budget: Option<u32>,
     pub size: Option<(u32, u32)>,
     pub bias: f64,
     pub diag: Diag,
@@ -176,6 +182,7 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Parsed, String> {
         shadow_rays: None,
         rt: RtMode::default(),
         hw_group: None,
+        hw_blas_budget: None,
         size: None,
         bias: 1.0,
         diag: Diag::default(),
@@ -205,6 +212,15 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Parsed, String> {
             "--rt-backend" => parsed.rt = RtMode::parse(&value("--rt-backend")?)?,
             "--hw-group-regions" => {
                 parsed.hw_group = Some(render::hw::Grouping::parse(&value("--hw-group-regions")?)?);
+            }
+            "--hw-build-blas" => {
+                parsed.hw_blas_budget = Some(
+                    value("--hw-build-blas")?
+                        .parse::<u32>()
+                        .ok()
+                        .filter(|&n| n >= 1)
+                        .ok_or("--hw-build-blas takes a whole number of at least 1")?,
+                );
             }
             "--out" => parsed.out = value("--out")?.into(),
             "--budgets" => parsed.budgets = Some(value("--budgets")?.into()),
@@ -370,6 +386,7 @@ mod tests {
                 shadow_rays: None,
                 rt: RtMode::Compute,
                 hw_group: None,
+                hw_blas_budget: None,
                 size: None,
                 bias: 1.0,
                 diag: Diag::default()
@@ -426,10 +443,20 @@ mod tests {
             run(&["--hw-group-regions", "4:16@6"]).hw_group,
             Some(Grouping::split(4, 16, 6).unwrap())
         );
+        assert_eq!(
+            run(&["--hw-group-regions", "16:32@2"]).hw_group,
+            Some(Grouping::split(16, 32, 2).unwrap())
+        );
+        assert_eq!(run(&[]).hw_blas_budget, None);
+        assert_eq!(run(&["--hw-build-blas", "12"]).hw_blas_budget, Some(12));
         for bad in [
             &["--hw-group-regions"][..],
             &["--hw-group-regions", "5"],
+            &["--hw-group-regions", "64"],
             &["--hw-group-regions", "4:16"],
+            &["--hw-build-blas"],
+            &["--hw-build-blas", "0"],
+            &["--hw-build-blas", "x"],
         ] {
             assert!(parse_all(bad).is_err(), "{bad:?}");
         }

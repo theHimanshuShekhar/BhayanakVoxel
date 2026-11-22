@@ -1808,6 +1808,13 @@ impl Tracer {
         self.hw.as_ref().map_or(0, |h| h.scene.instances())
     }
 
+    /// Sets the most BLASes a frame of the hardware backend builds of the groups that may wait.
+    pub fn set_hardware_blas_budget(&mut self, blas: u32) {
+        if let Some(hw) = &mut self.hw {
+            hw.scene.set_blas_budget(blas);
+        }
+    }
+
     /// Sets the most boxes an update of the hardware backend builds (see [`crate::hw::BUILD_BUDGET`]).
     pub fn set_hardware_budget(&mut self, boxes: u64) {
         if let Some(hw) = &mut self.hw {

@@ -85,12 +85,22 @@ impl EditsReport {
     }
 }
 
+/// The mode of Edit number `edit` (from 0): `first`, then the other, in turn.
+fn mode_of(edit: u32, first: EditMode) -> EditMode {
+    match (edit.is_multiple_of(2), first) {
+        (true, mode) => mode,
+        (false, EditMode::Dig) => EditMode::Place,
+        (false, _) => EditMode::Dig,
+    }
+}
+
 /// Runs the stress on the flight's Planet, or returns `None` for a scene that has no store to
 /// Edit (`--short`'s patch).
 pub fn run(
     gpu: &mut Offscreen,
     flight: &mut Flight,
     budgets: &Budgets,
+    first: EditMode,
 ) -> Result<Option<EditsReport>, Box<dyn Error>> {
     let Flight { scene, store, .. } = flight;
     let Some(store) = store.as_mut() else {
@@ -124,11 +134,7 @@ pub fn run(
     gpu.set_hardware_wait(true);
     for _ in 0..FRAMES {
         allowance.refill();
-        let next = op(if edits % 2 == 0 {
-            EditMode::Dig
-        } else {
-            EditMode::Place
-        });
+        let next = op(mode_of(edits, first));
         let mut took = 0.0;
         // Affordable by the whole cube, which is more than the Edit changes.
         if allowance.has_op()
@@ -195,12 +201,23 @@ pub fn run(
             stats,
             budget_ms,
         },
-        accel: (!accel.is_empty()).then(|| AccelSummary::of(&accel)),
+        accel: (!accel.is_empty()).then(|| AccelSummary {
+            group_regions: gpu.hardware_grouping().describe(),
+            ..AccelSummary::of(&accel)
+        }),
     }))
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_edits_alternate_from_the_mode_the_stress_starts_with() {
+        let modes = |first| (0..4).map(|n| mode_of(n, first)).collect::<Vec<_>>();
+        use EditMode::{Dig, Place};
+        assert_eq!(modes(Dig), [Dig, Place, Dig, Place]);
+        assert_eq!(modes(Place), [Place, Dig, Place, Dig]);
+    }
+
     use super::*;
     use brick_store::BrickCoord;
     use render::Scene;
@@ -223,7 +240,9 @@ mod tests {
         };
         let budgets =
             Budgets::parse("[passes]\nedits = 1.0\nedit_frame_thread = 1000.0\n").unwrap();
-        let report = run(&mut gpu, &mut flight, &budgets).unwrap().unwrap();
+        let report = run(&mut gpu, &mut flight, &budgets, EditMode::Dig)
+            .unwrap()
+            .unwrap();
         // The first from the burst and the rest as the allowance comes: about ten in 30 s.
         assert!(report.edits >= 4, "{report:?}");
         assert_eq!(report.per_edit.samples, report.edits as usize);
@@ -256,6 +275,10 @@ mod tests {
             diag: Default::default(),
             accel: Default::default(),
         };
-        assert!(run(&mut gpu, &mut bare, &budgets).unwrap().is_none());
+        assert!(
+            run(&mut gpu, &mut bare, &budgets, EditMode::Dig)
+                .unwrap()
+                .is_none()
+        );
     }
 }

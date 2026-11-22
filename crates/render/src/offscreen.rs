@@ -284,6 +284,11 @@ impl Offscreen {
         self.tracer.hardware_instances()
     }
 
+    /// Sets the most BLASes a frame of the hardware backend builds of the groups that may wait.
+    pub fn set_hardware_blas_budget(&mut self, blas: u32) {
+        self.tracer.set_hardware_blas_budget(blas);
+    }
+
     /// Sets the most boxes an update of the hardware backend builds.
     pub fn set_hardware_budget(&mut self, boxes: u64) {
         self.tracer.set_hardware_budget(boxes);

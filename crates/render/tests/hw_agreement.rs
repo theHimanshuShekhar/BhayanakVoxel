@@ -385,13 +385,13 @@ fn an_edit_in_place_at_a_coarse_level_makes_its_group_again() {
 
 use render::hw::{Grouping, blas_counts, blas_prims, group_counts, group_prims};
 
-/// The groupings the tests that follow the scene are run under: a cell a BLAS (the default), BLASes
-/// of 8 regions an edge, and a mixture (4 below level 2, 16 above) with bigger ones still.
+/// The groupings the tests that follow the scene are run under: a cell a BLAS, BLASes of 8
+/// regions an edge, and a mixture (4 below level 2, 32 above).
 fn groupings() -> [Grouping; 3] {
     [
         Grouping::default(),
         Grouping::uniform(8).unwrap(),
-        Grouping::split(4, 16, 2).unwrap(),
+        Grouping::split(4, 32, 2).unwrap(),
     ]
 }
 
@@ -1048,6 +1048,7 @@ fn a_blas_of_several_cells_has_all_their_boxes_in_order_and_follows_an_edit() {
     for grouping in [
         Grouping::uniform(8).unwrap(),
         Grouping::uniform(16).unwrap(),
+        Grouping::uniform(32).unwrap(),
     ] {
         hw.set_hardware_grouping(&scene, grouping);
         hw.take_hardware_updates();
@@ -1109,4 +1110,116 @@ fn a_blas_of_several_cells_has_all_their_boxes_in_order_and_follows_an_edit() {
         hits > 450 && differing <= 512 / 100,
         "{hits} hits, {differing} differ"
     );
+}
+
+/// The frame's budget counts BLASes as well as boxes: with room for any number of boxes and one
+/// BLAS, a frame builds one of the groups that may wait and no more; with two, two. They are not
+/// counted as urgent, and what waits is built when the budget has room.
+#[test]
+fn the_blas_budget_bounds_the_groups_that_may_wait_to_so_many_a_frame() {
+    let (store, mut scene) = walking_scene();
+    let mut hw =
+        Offscreen::with_backend(Resolution::native(8, 8), &scene, RtBackend::Hardware).unwrap();
+    if hw.rt().active != RtBackend::Hardware {
+        eprintln!("skipped: {:?}", hw.rt().fallback);
+        return;
+    }
+    hw.set_hardware_grouping(&scene, Grouping::default());
+    hw.set_hardware_budget(1 << 40);
+    hw.set_hardware_blas_budget(1);
+    hw.set_hardware_max_wait(100);
+    let mut camera = [-60.0, 1565.0, -60.0];
+    for step in 1..=10 {
+        camera = [
+            -60.0 + f64::from(step) * 14.0,
+            1565.0,
+            -60.0 + f64::from(step) * 9.0,
+        ];
+        if let Some(update) = scene.recentre(&store, camera).unwrap() {
+            hw.update_scene(&scene, &update).unwrap();
+        }
+    }
+    // The moves' updates built the groups that gained boxes whatever the budget of one.
+    let moves = hw.take_hardware_updates();
+    let (rebuilt, urgent): (u32, u32) = moves
+        .iter()
+        .fold((0, 0), |(r, u), l| (r + l.blas_rebuilt, u + l.blas_urgent));
+    assert!(urgent > 1 && rebuilt >= urgent, "{moves:?}");
+    // The frame they were in is closed by the first draw, which has the budget they left: none.
+    hw.follow_hardware(Some(0), camera);
+    hw.take_hardware_updates();
+    let waiting = hw.hardware_pending();
+    assert!(waiting >= 4, "{waiting} groups wait");
+    for frame in 1..=2 {
+        hw.follow_hardware(Some(frame), camera);
+        let log = hw.take_hardware_updates();
+        let rebuilt: u32 = log.iter().map(|u| u.blas_rebuilt).sum();
+        let urgent: u32 = log.iter().map(|u| u.blas_urgent).sum();
+        assert_eq!((rebuilt, urgent), (1, 0), "frame {frame}: {log:?}");
+        assert_eq!(hw.hardware_pending(), waiting - frame as usize);
+    }
+    // With room for two, a frame builds two.
+    hw.set_hardware_blas_budget(2);
+    hw.follow_hardware(Some(3), camera);
+    let rebuilt: u32 = hw
+        .take_hardware_updates()
+        .iter()
+        .map(|u| u.blas_rebuilt)
+        .sum();
+    assert_eq!(rebuilt, 2);
+    assert_eq!(hw.hardware_pending(), waiting - 4);
+    // On a budget of one, what is left is built a frame at a time and nothing is stale after.
+    hw.set_hardware_blas_budget(1);
+    for frame in 4..12 {
+        hw.follow_hardware(Some(frame), camera);
+    }
+    assert_eq!(hw.hardware_pending(), 0);
+    assert_not_stale("after the budget's frames", &hw, &scene);
+}
+
+/// What the groups that must be built at once cost counts against the frame's box budget: an
+/// update whose urgent builds took more than the budget leaves the groups that may wait waiting.
+#[test]
+fn the_groups_built_at_once_use_up_the_frames_box_budget() {
+    // One move (the groups that gain boxes are built at once, those that only lose may wait) with
+    // a box budget: the boxes it built and the groups left waiting.
+    let moved = |budget: u64| -> Option<(u64, usize)> {
+        let (store, mut scene) = walking_scene();
+        let mut hw =
+            Offscreen::with_backend(Resolution::native(8, 8), &scene, RtBackend::Hardware).unwrap();
+        if hw.rt().active != RtBackend::Hardware {
+            eprintln!("skipped: {:?}", hw.rt().fallback);
+            return None;
+        }
+        hw.set_hardware_grouping(&scene, Grouping::default());
+        hw.set_hardware_budget(budget);
+        hw.set_hardware_max_wait(100);
+        // The first build of the scene is not the frame's: the move is in the first frame.
+        hw.follow_hardware(Some(0), [-60.0, 1565.0, -60.0]);
+        hw.take_hardware_updates();
+        let update = scene
+            .recentre(&store, [-60.0 + 14.0, 1565.0, -60.0 + 9.0])
+            .unwrap()
+            .expect("the move changes the rings");
+        hw.update_scene(&scene, &update).unwrap();
+        let boxes: u64 = hw
+            .take_hardware_updates()
+            .iter()
+            .map(|u| u.prims_rebuilt)
+            .sum();
+        Some((boxes, hw.hardware_pending()))
+    };
+    let Some((all, none_wait)) = moved(1 << 40) else {
+        return;
+    };
+    assert_eq!(none_wait, 0, "room for everything left groups waiting");
+    // A budget of one box: the urgent groups are built, whatever it is, and that is all.
+    let (urgent, waiting) = moved(1).unwrap();
+    assert!(
+        waiting >= 1 && urgent < all,
+        "{urgent} of {all} boxes, {waiting} wait"
+    );
+    // Half of what the urgent builds took: it is spent, and the groups that may wait do not get
+    // what the urgent ones were not charged.
+    assert_eq!(moved(urgent / 2).unwrap(), (urgent, waiting));
 }

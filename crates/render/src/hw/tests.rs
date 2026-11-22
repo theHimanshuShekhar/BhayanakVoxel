@@ -535,7 +535,13 @@ fn the_grouping_flag_takes_a_size_or_a_size_below_a_level_and_another_from_it() 
     assert_eq!((split.regions(2), split.regions(3)), (8, 16));
     assert_eq!(split.describe(), "8:16@3");
     assert_eq!(Grouping::uniform(16).unwrap().describe(), "16");
-    for bad in ["", "3", "32", "8:16", "8:16@x", "a:b@1", "8:5@1"] {
+    assert_eq!(
+        Grouping::parse("16:32@3").unwrap(),
+        Grouping::split(16, 32, 3).unwrap()
+    );
+    assert_eq!(Grouping::parse("32").unwrap().regions(0), 32);
+    assert_eq!(Grouping::uniform(32).unwrap().cells(1, [0; 3]).count(), 512);
+    for bad in ["", "3", "64", "8:16", "8:16@x", "a:b@1", "8:5@1"] {
         assert!(Grouping::parse(bad).is_err(), "{bad}");
     }
 }

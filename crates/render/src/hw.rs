@@ -19,14 +19,15 @@
 //!   twin, [`group_prims`], is what the tests hold the GPU to, box for box (#236).
 //! * **Regular BLAS grouping** ([`group_of`], [`Grouping`]): every level's bricks go into
 //!   **cells** of [`GROUP_REGIONS`]-region cubes of the level's region grid (what the scene thread
-//!   lists and counts), and the cells into BLASes of 1, 2 or 4 cells along an edge (4, 8 or 16
-//!   regions; one cell by default, `--hw-group-regions` in the benchmark), both functions of the
+//!   lists and counts), and the cells into BLASes of 1, 2, 4 or 8 cells along an edge (4, 8, 16
+//!   or 32 regions; 16 in the program, one cell in the tests that read cells, `--hw-group-regions` in
+//!   the benchmark), both functions of the
 //!   region's coordinate alone: never of what is in it, so an Edit changes the contents of a BLAS
 //!   and not which BLAS a brick is in, and the TLAS keeps its shape. A BLAS is built again whole
 //!   when any of its cells is stale, so a bigger one costs the GPU more boxes and the frame thread
 //!   fewer builds (a build costs it per BLAS, and a submit that traces per instance of the TLAS).
 //! * Each BLAS is one TLAS instance with a translation and a scale of 2^level, so a box is in
-//!   level Voxels in the BLAS (0..256) whatever the level; the instance's custom data indexes the
+//!   level Voxels in the BLAS (0..2048) whatever the level; the instance's custom data indexes the
 //!   instance table the shader reads (group origin, level, where its boxes start in the pool).
 //! * The TLAS is in a frame whose origin is [`ANCHOR_SNAP`]-aligned and near the camera, so that
 //!   its `f32`s are fine near the camera whatever the Planet's coordinates are; it is rebuilt
@@ -50,7 +51,10 @@
 //!   group that **gained** (a brick that is new, a brick with a Voxel where it had none, a region
 //!   that is new) or that has no BLAS yet is built in the frame it is listed in, whatever the
 //!   budget, since a ray cannot hit what no box covers: that is the whole of "no hole". A group
-//!   that has waited [`MAX_WAIT_FRAMES`] frames is built whatever the budget. A jump, which makes
+//!   that has waited [`MAX_WAIT_FRAMES`] frames is built whatever the budget. What the groups that
+//!   may not wait build is in the budget too (the groups that may wait have what is left of it),
+//!   and a bound on the BLASes a frame builds of those that may wait ([`process_blas_budget`],
+//!   `--hw-build-blas`) spreads a burst of them over frames. A jump, which makes
 //!   every group again, builds them all at once: there is nothing right to show until it has.
 //!
 //! What this does **not** do: the compute path's clip to the ball that has the Planet in it
@@ -69,13 +73,18 @@ use crate::scene::{
 
 /// Regions along each edge of a **cell**: 4 x 4 x 4 regions, 32 bricks and 256 Voxels of its level
 /// across. A cell is the unit the scene thread lists and counts ([`RingPatch::groups`]) and the box
-/// pass makes boxes for; a BLAS is a cube of 1, 2 or 4 cells along each edge ([`Grouping`]), so
-/// that a box's coordinates in a BLAS are 0..=1024 at the most, exact in `f32`.
+/// pass makes boxes for; a BLAS is a cube of 1 to 8 cells along each edge ([`Grouping`]), so
+/// that a box's coordinates in a BLAS are 0..=2048 at the most, exact in `f32`.
 pub const GROUP_REGIONS: i32 = 4;
 /// Bricks along each edge of a cell.
 pub const GROUP_BRICKS: i32 = GROUP_REGIONS * REGION_BRICKS;
-/// The most cells along an edge of a BLAS, as a power of two (4: 16 regions, 128 bricks).
-pub const MAX_BLAS_SHIFT: u8 = 2;
+/// The most cells along an edge of a BLAS, as a power of two (8: 32 regions, 256 bricks, which a
+/// box word's 8 bits an axis hold).
+pub const MAX_BLAS_SHIFT: u8 = 3;
+/// Regions along an edge of a BLAS in the program (what [`process_grouping`] is if nothing sets
+/// it): the 4090's sweep of #236 found BLASes of 16 the cheapest for the frame thread that
+/// keeps the GPU's time under compute's.
+pub const PRODUCTION_REGIONS: i32 = 16;
 /// The TLAS's origin is a multiple of this many Voxels of level 0, nearest to the camera.
 pub const ANCHOR_SNAP: i32 = 4096;
 /// How many boxes of BLASes a **frame** builds of the groups that may wait (see the module's
@@ -114,8 +123,10 @@ pub fn group_origin(level: u8, group: [i32; 3]) -> [i32; 3] {
 }
 
 /// How the cells of each level go into BLASes: a BLAS is a cube of `1 << shift` cells along each
-/// edge (4, 8 or 16 regions), a regular grid like the cells', so which BLAS a brick is in is still
-/// a function of its coordinate and nothing else. The default is one cell a BLAS.
+/// edge (4, 8, 16 or 32 regions), a regular grid like the cells', so which BLAS a brick is in is
+/// still a function of its coordinate and nothing else. The `Default` is one cell a BLAS (what the
+/// tests that read cells are written for); the program's is [`PRODUCTION_REGIONS`]
+/// ([`process_grouping`]).
 ///
 /// Fewer, larger BLASes cost the frame thread less (the builds are recorded and submitted a BLAS
 /// at a time, and a submit that traces checks every instance of the TLAS) and the GPU more (a
@@ -136,14 +147,15 @@ impl Default for Grouping {
 
 impl Grouping {
     /// Levels below `from` have BLASes of `near` regions along an edge, and the others `far`
-    /// (each 4, 8 or 16).
+    /// (each 4, 8, 16 or 32).
     pub fn split(near: i32, far: i32, from: usize) -> std::result::Result<Self, String> {
         let shift = |regions: i32| match regions {
             4 => Ok(0),
             8 => Ok(1),
             16 => Ok(2),
+            32 => Ok(3),
             _ => Err(format!(
-                "a BLAS of {regions} regions an edge: only 4, 8 or 16"
+                "a BLAS of {regions} regions an edge: only 4, 8, 16 or 32"
             )),
         };
         let (near, far) = (shift(near)?, shift(far)?);
@@ -221,6 +233,16 @@ impl Grouping {
         })
     }
 
+    /// The BLAS the cell is in, where it is in it (in cells) and that place's index, x + n y + n² z
+    /// for n cells an edge: the order a BLAS's boxes follow its cells in.
+    fn place(&self, level: u8, cell: [i32; 3]) -> (GroupKey, [u32; 3], u32) {
+        let s = self.shift(level);
+        let n = 1u32 << s;
+        let blas = cell.map(|c| c >> s);
+        let at: [u32; 3] = std::array::from_fn(|a| (cell[a] - (blas[a] << s)) as u32);
+        ((level, blas), at, at[0] + n * at[1] + n * n * at[2])
+    }
+
     /// The first Voxel of a BLAS's cube, in Voxels of level 0.
     pub fn origin(&self, level: u8, blas: [i32; 3]) -> [i32; 3] {
         blas.map(|g| (g * self.regions(level) * REGION_VOXELS) << level)
@@ -235,9 +257,28 @@ pub fn set_process_grouping(grouping: Grouping) {
     let _ = PROCESS_GROUPING.set(grouping);
 }
 
-/// The grouping a hardware backend starts with: the process's, or one cell a BLAS.
+static PROCESS_BLAS_BUDGET: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(u32::MAX);
+
+/// Sets the most BLASes a frame builds of the groups that may wait (every hardware backend made
+/// after it): the cost of a build to the frame thread is a BLAS's, whatever its boxes, so this
+/// bounds it where the box budget does not (`--hw-build-blas`, #236). Not set, there is no bound.
+pub fn set_process_blas_budget(blas: u32) {
+    PROCESS_BLAS_BUDGET.store(blas, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// What [`set_process_blas_budget`] set (`u32::MAX`, no bound, if nothing did).
+pub fn process_blas_budget() -> u32 {
+    PROCESS_BLAS_BUDGET.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The grouping a hardware backend starts with: the process's, or [`PRODUCTION_REGIONS`] regions
+/// an edge.
 pub fn process_grouping() -> Grouping {
-    PROCESS_GROUPING.get().copied().unwrap_or_default()
+    PROCESS_GROUPING
+        .get()
+        .copied()
+        .unwrap_or_else(|| Grouping::uniform(PRODUCTION_REGIONS).expect("a size that there is"))
 }
 
 /// The smallest and largest Voxel (as local coordinates 0..=7) that a brick's 512-bit occupancy
@@ -513,6 +554,9 @@ pub struct HwUpdate {
     pub kind: &'static str,
     /// BLASes built (each from the pool's boxes, made by the GPU) and the boxes in them.
     pub blas_rebuilt: u32,
+    /// How many of them could not wait (see [`HwScene::update`]): the rest were built because
+    /// the frame's budget had room.
+    pub blas_urgent: u32,
     pub prims_rebuilt: u64,
     /// The same by level: BLASes and boxes built of each.
     pub blas_by_level: [u32; crate::lod::LEVELS],
@@ -751,6 +795,23 @@ impl Pool {
     }
 }
 
+/// A cell of a BLAS that has boxes.
+#[derive(Clone, Copy, Debug)]
+struct Member {
+    cell: [i32; 3],
+    /// Where it is in the BLAS, in cells.
+    at: [u32; 3],
+    count: u32,
+}
+
+/// The cells of a BLAS that have boxes, in the order of their places in it (which is the order
+/// their boxes follow in the BLAS), and the boxes of them all.
+#[derive(Default)]
+struct Members {
+    cells: BTreeMap<u32, Member>,
+    total: u32,
+}
+
 /// A group on the GPU.
 struct Group {
     blas: wgpu::Blas,
@@ -768,8 +829,12 @@ struct Group {
 enum Limit {
     /// All of them.
     All,
-    /// Up to `left` boxes, and one group whatever its size if `at_least_one`.
-    Boxes { left: u64, at_least_one: bool },
+    /// Up to `left` boxes and `blas` BLASes, and one group whatever its size if `at_least_one`.
+    Boxes {
+        left: u64,
+        blas: u32,
+        at_least_one: bool,
+    },
 }
 
 /// A group that is stale and not yet built again.
@@ -791,9 +856,9 @@ pub struct HwScene {
     boxes: BoxPass,
     /// How the cells go into BLASes.
     grouping: Grouping,
-    /// How many boxes each cell of the scene has now (a cell with none is not here), as the scene
-    /// thread's patches have counted them.
-    cells: BTreeMap<GroupKey, u32>,
+    /// The cells of each BLAS that have boxes now, as the scene thread's patches have counted them
+    /// (a BLAS with none is not here).
+    members: BTreeMap<GroupKey, Members>,
     /// The BLASes, by [`Grouping::blas_of`].
     groups: BTreeMap<GroupKey, Group>,
     /// The BLASes that are stale and not yet built again.
@@ -822,6 +887,8 @@ pub struct HwScene {
     camera: [f64; 3],
     bind_group: wgpu::BindGroup,
     budget: u64,
+    /// The most BLASes a frame builds of those that may wait ([`process_blas_budget`]).
+    blas_budget: u32,
     /// The frames a group may wait ([`MAX_WAIT_FRAMES`]).
     max_wait: u32,
     /// The boxes and the groups built since the last frame's draw closed the frame: what the
@@ -926,7 +993,7 @@ impl HwScene {
             layout,
             boxes: BoxPass::new(device, scene_layout),
             grouping: process_grouping(),
-            cells: BTreeMap::new(),
+            members: BTreeMap::new(),
             groups: BTreeMap::new(),
             pending: BTreeMap::new(),
             pool: Pool {
@@ -948,6 +1015,7 @@ impl HwScene {
             camera: position,
             bind_group,
             budget: BUILD_BUDGET,
+            blas_budget: process_blas_budget(),
             max_wait: MAX_WAIT_FRAMES,
             spent: 0,
             built: 0,
@@ -998,6 +1066,11 @@ impl HwScene {
     /// The most boxes an update builds (see [`BUILD_BUDGET`]), for tests that want a queue.
     pub fn set_budget(&mut self, boxes: u64) {
         self.budget = boxes;
+    }
+
+    /// The most BLASes a frame builds of the groups that may wait (see [`process_blas_budget`]).
+    pub fn set_blas_budget(&mut self, blas: u32) {
+        self.blas_budget = blas;
     }
 
     /// The frames a group that only lost may wait for its build, for tests that want to see it
@@ -1085,12 +1158,7 @@ impl HwScene {
                 // a cell of it gained boxes (or it has no BLAS), and has all its cells' boxes.
                 let mut blases: BTreeSet<GroupKey> = BTreeSet::new();
                 for &(key, count) in &patch.groups {
-                    if count > 0 {
-                        self.cells.insert(key, count);
-                    } else {
-                        self.cells.remove(&key);
-                    }
-                    let blas = self.grouping.blas_of(key.0, key.1);
+                    let blas = self.set_cell(key, count);
                     let urgent = patch.grown.binary_search(&key).is_ok()
                         || (count > 0 && !self.groups.contains_key(&blas));
                     let wait = self.pending.entry(blas).or_insert(Wait {
@@ -1102,7 +1170,7 @@ impl HwScene {
                     blases.insert(blas);
                 }
                 for blas in blases {
-                    let count = self.blas_count(blas);
+                    let count = self.members.get(&blas).map_or(0, |m| m.total);
                     if let Some(wait) = self.pending.get_mut(&blas) {
                         wait.count = count;
                     }
@@ -1138,6 +1206,7 @@ impl HwScene {
     fn left(&self) -> Limit {
         Limit::Boxes {
             left: self.budget.saturating_sub(self.spent),
+            blas: self.blas_budget.saturating_sub(self.built),
             at_least_one: self.built == 0,
         }
     }
@@ -1155,20 +1224,18 @@ impl HwScene {
         self.next_slot = 0;
         self.slot_key.clear();
         self.table.clear();
-        self.cells = group_counts(scene);
-        let blases: BTreeSet<GroupKey> = self
-            .cells
-            .keys()
-            .map(|&(level, cell)| self.grouping.blas_of(level, cell))
-            .collect();
-        self.pending = blases
-            .into_iter()
-            .map(|blas| {
-                let count = self.blas_count(blas);
+        self.members.clear();
+        for (key, count) in group_counts(scene) {
+            self.set_cell(key, count);
+        }
+        self.pending = self
+            .members
+            .iter()
+            .map(|(&blas, m)| {
                 (
                     blas,
                     Wait {
-                        count,
+                        count: m.total,
                         urgent: true,
                         waited: 0,
                     },
@@ -1177,12 +1244,27 @@ impl HwScene {
             .collect();
     }
 
-    /// How many boxes the BLAS `blas` has now: its cells' counts.
-    fn blas_count(&self, blas: GroupKey) -> u32 {
-        self.grouping
-            .cells(blas.0, blas.1)
-            .map(|(cell, _)| self.cells.get(&(blas.0, cell)).copied().unwrap_or(0))
-            .sum()
+    /// Takes in that the cell `key` has `count` boxes now, and returns the BLAS it is in.
+    fn set_cell(&mut self, key: GroupKey, count: u32) -> GroupKey {
+        let (blas, at, index) = self.grouping.place(key.0, key.1);
+        let members = self.members.entry(blas).or_default();
+        if let Some(old) = members.cells.remove(&index) {
+            members.total -= old.count;
+        }
+        if count > 0 {
+            members.cells.insert(
+                index,
+                Member {
+                    cell: key.1,
+                    at,
+                    count,
+                },
+            );
+            members.total += count;
+        } else if members.cells.is_empty() {
+            self.members.remove(&blas);
+        }
+        blas
     }
 
     /// Changes how the cells go into BLASes: every BLAS is made again (queued, all of it), and the
@@ -1268,21 +1350,31 @@ impl HwScene {
             })
             .collect();
         order.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.total_cmp(&b.1)).then(a.2.cmp(&b.2)));
-        let (mut left, at_least_one) = match limit {
-            Limit::All => (u64::MAX, false),
-            Limit::Boxes { left, at_least_one } => (left, at_least_one),
+        let (mut left, mut blas_left, at_least_one) = match limit {
+            Limit::All => (u64::MAX, u32::MAX, false),
+            Limit::Boxes {
+                left,
+                blas,
+                at_least_one,
+            } => (left, blas, at_least_one),
         };
+        let mut urgent_built = 0u32;
         let mut spent = 0u64;
         // The BLASes to build (and their boxes), and the box pass's jobs: a job a cell of them.
         let mut built: Vec<(GroupKey, u32)> = Vec::new();
         let mut jobs: Vec<BoxJob> = Vec::new();
         for (may_wait, _, key, count) in order {
-            if may_wait {
-                if u64::from(count) > left && !(at_least_one && built.is_empty()) {
-                    break;
-                }
-                left = left.saturating_sub(u64::from(count));
+            if may_wait
+                && (u64::from(count) > left || blas_left == 0)
+                && !(at_least_one && built.is_empty())
+            {
+                break;
             }
+            // Every build is in the frame's budget, those that may wait have what the others
+            // leave of it.
+            left = left.saturating_sub(u64::from(count));
+            blas_left = blas_left.saturating_sub(1);
+            urgent_built += u32::from(!may_wait);
             spent += u64::from(count);
             self.pending.remove(&key);
             // The BLAS and the room it has are kept if the boxes still fit: its old boxes are
@@ -1319,18 +1411,20 @@ impl HwScene {
             self.slot_key[slot as usize] = Some(key);
             touched.push(slot);
             let mut at = start;
-            for (cell, local) in self.grouping.cells(key.0, key.1) {
-                let n = self.cells.get(&(key.0, cell)).copied().unwrap_or(0);
-                if n > 0 {
-                    jobs.push(BoxJob {
-                        level: key.0,
-                        group: cell,
-                        cell: local,
-                        start: at,
-                        count: n,
-                    });
-                    at += n;
-                }
+            for member in self
+                .members
+                .get(&key)
+                .into_iter()
+                .flat_map(|m| m.cells.values())
+            {
+                jobs.push(BoxJob {
+                    level: key.0,
+                    group: member.cell,
+                    cell: member.at,
+                    start: at,
+                    count: member.count,
+                });
+                at += member.count;
             }
             built.push((key, count));
             self.groups.insert(
@@ -1416,6 +1510,7 @@ impl HwScene {
         self.record(HwUpdate {
             kind: if all { "build" } else { kind },
             blas_rebuilt: built.len() as u32,
+            blas_urgent: urgent_built,
             prims_rebuilt: built.iter().map(|&(_, n)| u64::from(n)).sum(),
             blas_by_level,
             prims_by_level,
@@ -1568,6 +1663,7 @@ impl HwScene {
         } else {
             Limit::Boxes {
                 left: 0,
+                blas: 0,
                 at_least_one: false,
             }
         };

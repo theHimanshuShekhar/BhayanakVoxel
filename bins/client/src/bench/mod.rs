@@ -33,6 +33,7 @@ use std::process::ExitCode;
 use std::time::Instant;
 
 use brick_store::BrickStore;
+use net::EditMode;
 use render::{Camera, HwUpdate, Image, Mode, Offscreen, Resolution, RtBackend, Scene};
 
 use args::{Args, Diag, Parsed, USAGE};
@@ -147,6 +148,9 @@ fn run(args: &Args) -> Result<u8, Box<dyn Error>> {
     if let Some(grouping) = args.hw_group {
         render::hw::set_process_grouping(grouping);
     }
+    if let Some(blas) = args.hw_blas_budget {
+        render::hw::set_process_blas_budget(blas);
+    }
     let (budgets, source) = match &args.budgets {
         Some(file) => {
             let text = fs::read_to_string(file)
@@ -244,14 +248,14 @@ fn run(args: &Args) -> Result<u8, Box<dyn Error>> {
         None
     } else {
         eprintln!("edits: the largest Brush at the metric rate...");
-        settle_for_edits(&mut gpu, &mut flight)?;
-        edits::run(&mut gpu, &mut flight, &budgets)?
+        settle_for_edits(&mut gpu, &mut flight, EDIT_HEIGHTS[1])?;
+        edits::run(&mut gpu, &mut flight, &budgets, EditMode::Dig)?
     };
     let timers_supported = gpu.timers_supported();
     let main_accel = choice
         .active
         .is_hardware()
-        .then(|| accel_report(initial_accel.as_ref(), &flight, edits.as_ref()));
+        .then(|| accel_report(initial_accel.as_ref(), &flight, edits.as_ref(), &gpu));
     // The cave stills are of another scene, and another GPU context: this one's is done with.
     drop(gpu);
     drop(flight);
@@ -557,8 +561,10 @@ fn accel_report(
     initial: Option<&HwUpdate>,
     flight: &Flight,
     edits: Option<&edits::EditsReport>,
+    gpu: &Offscreen,
 ) -> AccelReport {
     AccelReport {
+        group_regions: gpu.hardware_grouping().describe(),
         initial: initial.map(AccelUpdate::from).unwrap_or_default(),
         flight: AccelSummary::of(&flight.accel.measured),
         flight_frames: flight.accel.measured_frames,
@@ -576,6 +582,8 @@ struct HardwareFlight {
     times: BackendTimes,
     accel: AccelReport,
     edits: Option<edits::EditsReport>,
+    /// The Edit stress again with the camera by the ground, where the Edits are in level 0.
+    ground: Option<edits::EditsReport>,
 }
 
 /// The flight (and with `with_edits` the Edit stress) on the hardware backend `backend`, on a
@@ -610,13 +618,33 @@ fn fly_hardware(
         None
     } else {
         eprintln!("rt: edits on the {} backend...", backend.name());
-        settle_for_edits(&mut gpu, &mut flight)?;
-        edits::run(&mut gpu, &mut flight, budgets)?
+        settle_for_edits(&mut gpu, &mut flight, EDIT_HEIGHTS[1])?;
+        edits::run(&mut gpu, &mut flight, budgets, EditMode::Dig)?
+    };
+    // The Edits of the compute run's stress are in the coarse levels (the camera is a kilometre
+    // up); a BLAS of level 0 is made again by an Edit by the ground, which this stress has: the
+    // Edit+BVH of the BLAS sizes (#236). It goes on from where the first left the Planet.
+    let ground = match &edits {
+        Some(first) if with_edits => {
+            eprintln!(
+                "rt: edits by the ground on the {} backend...",
+                backend.name()
+            );
+            settle_for_edits(&mut gpu, &mut flight, EDIT_HEIGHTS[0])?;
+            let start = if first.edits.is_multiple_of(2) {
+                EditMode::Dig
+            } else {
+                EditMode::Place
+            };
+            edits::run(&mut gpu, &mut flight, budgets, start)?
+        }
+        _ => None,
     };
     Ok(Ok(HardwareFlight {
         times: BackendTimes::of(backend.name(), &primary),
-        accel: accel_report(initial.as_ref(), &flight, edits.as_ref()),
+        accel: accel_report(initial.as_ref(), &flight, edits.as_ref(), &gpu),
         edits,
+        ground,
     }))
 }
 
@@ -655,13 +683,14 @@ fn compare_hardware(
             None
         }
     };
-    let comparison = Comparison::new(
+    let mut comparison = Comparison::new(
         BackendTimes::of("compute", compute),
         hw.times,
         nearest,
         hw.accel,
         hw.edits,
     );
+    comparison.hw_edits_ground = hw.ground;
     Ok((Some(comparison), None))
 }
 
@@ -885,6 +914,10 @@ fn run_mode(
 /// Voxels (see [`planet_gen`]), so these are too, whatever a Voxel measures.
 const SWEEP_HEIGHTS: [f64; 4] = [48.0, 1000.0, 5000.0, 20000.0];
 
+/// The heights the Edit stress is run from: by the ground (2.4 m), where its Edits are in level 0 and
+/// the finest BLASes, and the sweep's last (1 km), where they are in the coarse levels only.
+const EDIT_HEIGHTS: [f64; 2] = [SWEEP_HEIGHTS[0], SWEEP_HEIGHTS[3]];
+
 /// The camera of the sweep at `height` Voxels over the pole.
 fn sweep_keyframe(height: f64) -> Keyframe {
     let radius = f64::from(planet_gen::PLANET_RADIUS);
@@ -899,8 +932,12 @@ fn sweep_keyframe(height: f64) -> Keyframe {
 /// nothing to it; the hardware run of `--rt-backend both` has no sweep, and without this it would
 /// start from the low end of the flight, with its Edits in level 0 and not in the coarse levels the
 /// compute run's are in (#50), and `hw_edits` and `edits` would be of different Edits.
-fn settle_for_edits(gpu: &mut Offscreen, flight: &mut Flight) -> Result<(), Box<dyn Error>> {
-    let at = sweep_keyframe(SWEEP_HEIGHTS[SWEEP_HEIGHTS.len() - 1]);
+fn settle_for_edits(
+    gpu: &mut Offscreen,
+    flight: &mut Flight,
+    height: f64,
+) -> Result<(), Box<dyn Error>> {
+    let at = sweep_keyframe(height);
     let camera = CameraPath::new(vec![at, at]).camera_at(0, 2);
     // Anything still logged is the last part's tail, and a jump's: with the warm-up's.
     flight.accel.warmup.extend(gpu.take_hardware_updates());
@@ -1197,7 +1234,7 @@ fn print_real_time(r: &realtime::RealTimeReport) {
             );
             if let Some(h) = &p.hardware {
                 eprintln!(
-                    "        hardware per frame, mean (p95) ms: total {:.2} ({:.2}) = before {:.2} + plan {:.2} + instances {:.2} + boxes pass {:.2} + builds {:.2} + finish {:.2} + submit {:.2} ({:.2}); update less hardware {:.2}; BLAS {:.1} (max {}), {} us each, {} frames with builds; draw submit {:.2} ({:.2}) with {:.0} TLAS instances",
+                    "        hardware per frame, mean (p95) ms: total {:.2} ({:.2}) = before {:.2} + plan {:.2} + instances {:.2} + boxes pass {:.2} + builds {:.2} + finish {:.2} + submit {:.2} ({:.2}); update less hardware {:.2}; BLAS {:.1} (p95 {:.0}, max {}; urgent {:.1}), {} us each, {} frames with builds; draw submit {:.2} ({:.2}) with {:.0} TLAS instances",
                     h.total.mean_ms,
                     h.total.p95_ms,
                     h.before.mean_ms,
@@ -1210,7 +1247,9 @@ fn print_real_time(r: &realtime::RealTimeReport) {
                     h.submit.p95_ms,
                     h.update_rest.mean_ms,
                     h.blas.mean,
+                    h.blas.p95,
                     h.blas.max,
+                    h.blas_urgent.mean,
                     h.per_blas_us.total.round(),
                     h.frames_with_builds,
                     h.draw_submit.mean_ms,
@@ -1478,7 +1517,9 @@ mod tests {
         assert_eq!(log.measured_frames, 5);
         assert!(log.settle.is_empty());
         // And what the report sums is the steady flight's alone.
-        let accel = accel_report(None, &flight, None);
+        let accel = accel_report(None, &flight, None, &gpu);
+        // What the report says of the BLAS size is the context's own.
+        assert_eq!(accel.group_regions, gpu.hardware_grouping().describe());
         assert_eq!(accel.flight.updates as usize, log.measured.len());
         assert_eq!(accel.flight_frames, 5);
         assert_eq!(accel.warmup.updates as usize, log.warmup.len());
@@ -1487,7 +1528,7 @@ mod tests {
         let before = flight.accel.warmup.len();
         gpu.update_scene(&flight.scene, &render::SceneUpdate::Rebuilt)
             .unwrap();
-        settle_for_edits(&mut gpu, &mut flight).unwrap();
+        settle_for_edits(&mut gpu, &mut flight, EDIT_HEIGHTS[1]).unwrap();
         assert_eq!(flight.accel.warmup.len(), before + 1);
         assert_eq!(flight.accel.warmup.last().map(|u| u.kind), Some("build"));
     }

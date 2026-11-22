@@ -3138,13 +3138,15 @@ fn run_once(
     }));
     // A growth is cut to what a buffer of this GPU may hold (see `Scene::set_buffer_limit`).
     built.world.set_buffer_limit(gpu.buffer_limit_words());
+    // What the context has, not what the flag said (#236).
+    let group_regions = gpu.hardware_grouping().describe();
     let mut gpu = OffscreenGpu::new(&mut gpu);
     let report = one_run(built, &mut gpu, script, limit_ms)
         .map_err(|stopped| failed(&stopped.step, stopped.error))?;
-    let accel = choice
-        .active
-        .is_hardware()
-        .then(|| AccelSummary::of(&gpu.accel));
+    let accel = choice.active.is_hardware().then(|| AccelSummary {
+        group_regions: group_regions.clone(),
+        ..AccelSummary::of(&gpu.accel)
+    });
     Ok((report, d0, choice, accel))
 }
 

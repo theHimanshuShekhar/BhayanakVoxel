@@ -75,6 +75,9 @@ pub struct AccelUpdate {
     /// `none`.
     pub kind: String,
     pub blas_rebuilt: u32,
+    /// Of them, the BLASes that were built at once because a group gained boxes or had no BLAS
+    /// (the rest may wait for the frame's budget).
+    pub blas_urgent: u32,
     pub prims_rebuilt: u64,
     pub tlas_rebuilt: bool,
     pub tlas_instances: u32,
@@ -159,6 +162,7 @@ impl From<&HwUpdate> for AccelUpdate {
         Self {
             kind: u.kind.to_string(),
             blas_rebuilt: u.blas_rebuilt,
+            blas_urgent: u.blas_urgent,
             prims_rebuilt: u.prims_rebuilt,
             tlas_rebuilt: u.tlas_rebuilt,
             tlas_instances: u.tlas_instances,
@@ -176,11 +180,18 @@ impl From<&HwUpdate> for AccelUpdate {
 /// rebuilt anything: how many, what they rebuilt, and what each cost.
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]
 pub struct AccelSummary {
+    /// The BLAS size of the context that made these updates, read from the context (`--hw-group-
+    /// regions`' syntax), where a summary says it (the Edit stress's and the real-time runs').
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub group_regions: String,
     pub updates: u32,
     /// Updates that found nothing to rebuild (a scene update that no box was stale after): not in
     /// `updates` or the figures below, which are of those that rebuilt something.
     pub noop_updates: u32,
     pub blas_rebuilt: u64,
+    /// Of them, built at once because the group gained boxes or had no BLAS: what
+    /// `--hw-build-blas` cannot spread (#236).
+    pub blas_urgent: u64,
     pub prims_rebuilt: u64,
     pub tlas_rebuilds: u32,
     /// BLASes rebuilt by an update, mean and most.
@@ -223,9 +234,11 @@ impl AccelSummary {
             .sum();
         let per: Vec<u32> = done.iter().map(|u| u.blas_rebuilt).collect();
         Self {
+            group_regions: String::new(),
             updates: done.len() as u32,
             noop_updates: (updates.len() - done.len()) as u32,
             blas_rebuilt: per.iter().map(|&n| u64::from(n)).sum(),
+            blas_urgent: done.iter().map(|u| u64::from(u.blas_urgent)).sum(),
             prims_rebuilt: done.iter().map(|u| u.prims_rebuilt).sum(),
             tlas_rebuilds: done.iter().filter(|u| u.tlas_rebuilt).count() as u32,
             blas_rebuilt_per_update_mean: (!per.is_empty())
@@ -271,6 +284,8 @@ pub struct HwFrame {
     pub wait: f64,
     /// BLASes built and the boxes in them, and the submits made (updates that did something).
     pub blas: u32,
+    /// Of them, the urgent ones.
+    pub blas_urgent: u32,
     pub boxes: u64,
     pub submits: u32,
     /// The TLAS's instances at the end of the frame, and the draw's own submit (`frame_parts.submit`,
@@ -293,6 +308,7 @@ impl HwFrame {
             f.submit += ms(u.phases.submit);
             f.wait += ms(u.phases.wait);
             f.blas += u.blas_rebuilt;
+            f.blas_urgent += u.blas_urgent;
             f.boxes += u.prims_rebuilt;
             f.submits += u32::from(u.kind != "none");
         }
@@ -367,6 +383,7 @@ pub struct PathHardware {
     pub update_rest: Spread,
     /// BLASes and boxes built per frame, and the submits made.
     pub blas: Count,
+    pub blas_urgent: Count,
     pub boxes: Count,
     pub submits: Count,
     /// The TLAS's instances, and the draw's own submit in ms (`frame_parts.submit`: with the
@@ -412,6 +429,7 @@ impl PathHardware {
                     .collect::<Vec<_>>(),
             ),
             blas: Count::of(&col(|h| f64::from(h.blas))),
+            blas_urgent: Count::of(&col(|h| f64::from(h.blas_urgent))),
             boxes: Count::of(&col(|h| h.boxes as f64)),
             submits: Count::of(&col(|h| f64::from(h.submits))),
             tlas_instances: Count::of(&col(|h| f64::from(h.tlas_instances))),
@@ -434,6 +452,9 @@ impl PathHardware {
 /// in the flight, and the Edit stress's.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct AccelReport {
+    /// The BLAS size (`--hw-group-regions`' syntax) of the context that made all of this, read from
+    /// the context itself and not from what the flag said (#236).
+    pub group_regions: String,
     pub initial: AccelUpdate,
     /// The updates of the measured frames, but the first of each mode: the flight.
     pub flight: AccelSummary,
@@ -547,6 +568,11 @@ pub struct Comparison {
     /// The Edit stress on the hardware backend (the compute one's is the report's `edits`): its
     /// budgets are not gated, the compute run's are. Null on `--short`.
     pub hw_edits: Option<EditsReport>,
+    /// The Edit stress again on the hardware backend with the camera by the ground (2.4 m up), where
+    /// the Edits are in level 0 and in the finest BLASes: what a BLAS of `rt.hw_group_regions`
+    /// regions costs to make again by an Edit (`accel` has the builds, `frame_thread` the Edit
+    /// +BVH on the frame thread). Null on `--short`.
+    pub hw_edits_ground: Option<EditsReport>,
 }
 
 impl Comparison {
@@ -589,6 +615,7 @@ impl Comparison {
             speedup,
             hw_accel,
             hw_edits,
+            hw_edits_ground: None,
         }
     }
 }
@@ -640,6 +667,7 @@ mod tests {
         HwUpdate {
             kind: "patch",
             blas_rebuilt: blas,
+            blas_urgent: blas / 2,
             prims_rebuilt: u64::from(blas) * 100,
             phases: render::HwPhases {
                 before: d(ms * 0.5),
@@ -664,6 +692,7 @@ mod tests {
             "{f:?}"
         );
         assert_eq!((f.blas, f.boxes, f.submits), (15, 1500, 2));
+        assert_eq!(f.blas_urgent, 5 + 2);
         assert_eq!(HwFrame::of(&[]), HwFrame::default());
     }
 
@@ -680,6 +709,7 @@ mod tests {
         assert!((h.update_rest.worst_ms - 2.0).abs() < 1e-9, "{h:?}");
         assert!((h.update_rest.mean_ms - 1.25).abs() < 1e-9, "{h:?}");
         assert_eq!((h.blas.max, h.blas.mean), (10.0, 5.0));
+        assert_eq!((h.blas_urgent.max, h.blas_urgent.mean), (5.0, 2.5));
         assert_eq!(h.submits.max, 1.0);
         // Over the frames that built: 10 ms / 10 BLAS = 1000 us each, 400 of them the submit.
         assert!((h.per_blas_us.total - 1000.0).abs() < 1e-6, "{h:?}");
@@ -730,6 +760,16 @@ mod tests {
             (750, 300)
         );
         assert_eq!((s.tlas_instances_max, s.prims_total_max), (500, 9000));
+    }
+
+    #[test]
+    fn a_summary_counts_the_blases_that_were_built_at_once() {
+        let urgent = |blas, urgent| HwUpdate {
+            blas_urgent: urgent,
+            ..update("patch", blas, 1)
+        };
+        let s = AccelSummary::of(&[urgent(5, 2), urgent(3, 3)]);
+        assert_eq!((s.blas_rebuilt, s.blas_urgent), (8, 5));
     }
 
     #[test]
@@ -801,6 +841,7 @@ mod tests {
             scene_update_ms: Stats::default(),
         };
         let accel = AccelReport {
+            group_regions: "16".into(),
             initial: AccelUpdate::default(),
             // 3 frames, and the updates cost 6 ms in all: 2 ms a frame on top of the hardware's 4.
             flight: AccelSummary::of(&[update("patch", 2, 4), update("patch", 1, 0)]),
