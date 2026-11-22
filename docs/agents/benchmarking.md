@@ -1496,6 +1496,17 @@ picture is `primary-converged.png` in the view's folder.
   it is no worse than `bias`, the denoiser adds no error of its own to the view and what is left is
   the light's.
 
+**What the settled residual is (#55, measured on the dev box at 640x360 against 1024-sample truths).**
+A settled frame's distance from the denoised mean is mostly the radiance cache's error, not the
+frame's noise: a cell's light is the mean of all its samples so far, so it is the same from frame to
+frame and the history cannot average it (a history cap of 64 instead of 32, or no rejection of
+history, changed the settled FLIP by under 0.0003, and a cache that forgets slower changed nothing in
+the golden and the pit). Only the filter, over the cells, can, so it runs on every pixel with a tight
+luminance stop (`PHI_LIGHT` 1.5): the first version left a pixel whose history was long alone, and the
+pit and the room paid for it (settled FLIP, dev box: pit 0.081 to 0.071, room 0.090 to 0.075, golden
+0.062 to 0.059, raw 0.091, 0.098 and 0.059). What remains beyond that is the cache's own noise and
+bias, which more GI samples a cell would take.
+
 The FLIP of a mean of a noisy image is not the mean of the FLIPs, so `bias` and `residual` do not add
 up to the settled FLIP; they say which of the two is the larger. The run adds `--converged-frames`
 frames a view, so the default 1024 makes the phase longer (it was not timed on the 4090). To measure

@@ -39,8 +39,10 @@
 //! left to the temporal kernel's own checks (the neighbourhood clamp and the adaptive reject follow
 //! light that changes by a few percent a frame, which the settled history lags by a frame or two).
 //!
-//! The filter's own gate (`QUIET_BELOW`, `NOISY_FROM` in the shader) leaves a pixel whose estimate
-//! is quiet alone: a blur of a long history takes detail and adds nothing.
+//! The filter runs on every pixel, a long history's too (there was a gate that left a quiet one
+//! alone; the 4090's pit and room said it cost more than it saved): what a long history has left is
+//! the radiance cache's own error, which is the same from frame to frame and so is not in the
+//! history's variance, and only the filter averages it.
 //!
 //! [`History`]: crate::upscale
 

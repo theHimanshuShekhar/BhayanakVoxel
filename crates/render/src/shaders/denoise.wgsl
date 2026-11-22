@@ -123,9 +123,14 @@ const SPATIAL_VARIANCE_SCALE = 3.0;
 
 // ---- The filter's edge stops.
 // SVGF's luminance stop: the difference over this many standard deviations of the centre's
-// (blurred) variance, with a floor so that a pixel with none still filters a little.
-const PHI_LIGHT = 4.0;
-const PHI_SUN = 4.0;
+// (blurred) variance, with a floor so that a pixel with none still filters a little. The stop is
+// tight (1.5, not SVGF's 4) because every pixel is filtered, a long history's too: what a settled
+// pixel has left is mostly the radiance cache's error, which is the same from frame to frame (a
+// cell's light is the mean of all its samples so far) and so is not in the history's own variance;
+// only the filter can average it, over the cells it is in, and a tight stop is what keeps an edge
+// or a texture from being blurred with it.
+const PHI_LIGHT = 1.5;
+const PHI_SUN = 1.5;
 const LIGHT_FLOOR = 0.002;
 const LIGHT_FLOOR_RELATIVE = 0.01;
 const SUN_FLOOR = 0.002;
@@ -133,15 +138,6 @@ const SUN_FLOOR = 0.002;
 // pixel's footprint a step of the filter (a curved surface leaves its tangent plane the farther the
 // tap is), in a Gaussian. The normal's: the cosine to this power.
 const PHI_PLANE = 2.0;
-// A pixel whose estimate is already quiet is not filtered: the share of the filter's result in the
-// pixel's own value goes from nothing, where the standard deviation of the estimate is under
-// QUIET_BELOW of its value (and a floor), to all of it, from NOISY_FROM on. A history that is long
-// has averaged its noise away, and a blur of it can only take detail (an edge, a thin shadow) from
-// it; what the filter is for is the pixels that have a few samples.
-const QUIET_BELOW = 0.03;
-const NOISY_FROM = 0.12;
-const QUIET_FLOOR_LIGHT = 0.02;
-const QUIET_FLOOR_SUN = 0.05;
 const NORMAL_POWER = 24.0;
 // The B3 spline's weights at 0, 1 and 2 taps from the centre.
 const ATROUS_KERNEL = array<f32, 3>(0.375, 0.25, 0.0625);
@@ -483,22 +479,7 @@ fn denoise_atrous(@builtin(global_invocation_id) id: vec3<u32>) {
     }
     // The centre's own weight is never zero, so the totals are positive.
     let filtered = vec4<f32>(sum_light / total_light, max(sum_sun / total_sun, 0.0));
-    // The deviation is in units of the filtered value, not of the pixel's own: a pixel that the
-    // noise made dark would otherwise count as noisier than one it made bright, be filtered more, and
-    // the mean of the pixels would rise.
-    let noise_light = sqrt(blurred.x) / (luma(filtered.xyz) + QUIET_FLOOR_LIGHT);
-    let noise_sun = sqrt(blurred.y) / (filtered.w + QUIET_FLOOR_SUN);
-    let noisy = smoothstep(vec2<f32>(QUIET_BELOW), vec2<f32>(NOISY_FROM), vec2<f32>(noise_light, noise_sun));
     let filtered_variance = vec2<f32>(var_light / (total_light * total_light), var_sun / (total_sun * total_sun));
-    let own_variance = textureLoad(variance, p, 0).xy;
-    textureStore(
-        signal_out,
-        p,
-        vec4<f32>(mix(centre.xyz, filtered.xyz, noisy.x), mix(centre.w, filtered.w, noisy.y)),
-    );
-    textureStore(
-        variance_next,
-        p,
-        vec4<f32>(mix(own_variance, filtered_variance, noisy), 0.0, 0.0),
-    );
+    textureStore(signal_out, p, filtered);
+    textureStore(variance_next, p, vec4<f32>(filtered_variance, 0.0, 0.0));
 }

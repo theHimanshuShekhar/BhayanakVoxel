@@ -569,15 +569,15 @@ fn the_filter_blurs_a_flat_wall_of_noise_and_keeps_its_mean() {
 }
 
 #[test]
-fn a_quiet_pixel_is_left_as_it_is_and_a_noisy_one_is_not() {
-    // What this guards: the filter's gate, which keeps a pixel whose estimate is already quiet (a
-    // standard deviation of a few percent of its value) out of the blur: a long history that has
-    // averaged its noise away has nothing a blur could add, and detail it could take. A wall of
-    // noise of 0.01 on 1.0 comes out as it went in; one of 0.5 does not (the test above). Without
-    // the gate the filter averages the 0.01 too, and every pixel moves.
+fn the_filter_smooths_the_small_noise_of_a_long_history_too() {
+    // What this guards: that the filter runs on every pixel. What a settled history has left is the
+    // radiance cache's error (a few percent, the same frame after frame), which only the filter can
+    // average. A wall of noise of 0.02 on 1.0 (the variance the filter is told is small) comes out
+    // with less than half the spread it went in with; with a gate that leaves a quiet pixel alone it
+    // comes out as it went in (the spread is a share of 1, as before).
     let mut rig = Rig::new();
     rig.wall(20.0);
-    let samples = rig.samples(0.01, |_, _| 1.0);
+    let samples = rig.samples(0.02, |_, _| 1.0);
     let written = rig.run(
         Denoise::Full,
         &Inputs {
@@ -591,12 +591,14 @@ fn a_quiet_pixel_is_left_as_it_is_and_a_noisy_one_is_not() {
         .flat_map(|y| (8..56).map(move |x| (x, y)))
         .map(|(x, y)| samples[(y * SIZE.0 + x) as usize])
         .collect();
-    let moved = values
-        .iter()
-        .zip(&before)
-        .map(|(a, b)| (a - b).abs())
-        .fold(0.0f32, f32::max);
-    assert!(moved < 0.002, "a quiet pixel moved by {moved}");
+    let spread = |v: &[f32]| {
+        let mean = v.iter().sum::<f32>() / v.len() as f32;
+        (v.iter().map(|x| (x - mean).powi(2)).sum::<f32>() / v.len() as f32).sqrt()
+    };
+    let (after, was) = (spread(&values), spread(&before));
+    assert!(after < 0.5 * was, "the spread went from {was} to {after}");
+    let mean = values.iter().sum::<f32>() / values.len() as f32;
+    assert!((mean - 1.0).abs() < 0.01, "the mean moved to {mean}");
 }
 
 #[test]
