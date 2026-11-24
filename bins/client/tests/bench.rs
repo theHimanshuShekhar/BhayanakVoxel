@@ -324,13 +324,16 @@ fn check_convergence(convergence: &Value, out: &Path) {
 }
 
 fn check_schema(report: &Value, out: &Path) {
-    assert_eq!(report["schema_version"], 32);
+    assert_eq!(report["schema_version"], 33);
     // The default is the compute backend, with no acceleration structures (#50).
     assert_eq!(report["rt"]["requested"], "compute");
     assert_eq!(report["rt"]["active"], "compute");
     assert!(report["rt"]["fallback"].is_null());
     assert!(report["rt"]["accel"].is_null());
     assert!(report["rt"]["comparison"].is_null());
+    // The day cycle is asked for (see its own test); the others do not.
+    assert!(report["day_cycle"].is_null());
+    assert!(report["config"]["time_of_day"].is_null());
     // The Edit stress is of the whole Planet, which the patch is not.
     assert!(report["edits"].is_null());
     // The streaming mode is asked for (see its own test); the other tests do not. The real-time
@@ -538,6 +541,64 @@ fn the_convergence_phase_can_be_left_out_and_a_truth_needs_the_phase() {
     assert_eq!(wrong.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&wrong.stderr).contains("--truth-spp"));
     let _ = std::fs::remove_dir_all(&out);
+}
+
+#[test]
+fn the_day_cycle_reports_a_sped_up_day_with_its_frames_exposure_and_cache() {
+    // #203: a day of 4 s (240 frames) on the test Planet, at night. The software renderer is far
+    // over 16.7 ms, which is the gate's business and not this test's: `--no-fail` ignores it.
+    let out = scratch("day-cycle");
+    let run = bench(&[
+        "--short",
+        "--no-fail",
+        "--no-convergence",
+        "--day-cycle",
+        "--day-seconds",
+        "4",
+        "--time-of-day",
+        "21",
+        "--out",
+        out.to_str().unwrap(),
+    ]);
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert_eq!(run.status.code(), Some(0), "{stderr}");
+    let report = read_report(&out);
+    assert_eq!(report["config"]["time_of_day"], 21.0);
+    let day = &report["day_cycle"];
+    assert_eq!(day["day_seconds"], 4.0);
+    // `--time-of-day` is where the cycle starts, as well as where the flight is lit.
+    assert_eq!(day["start_hours"], 21.0);
+    assert_eq!(day["frames"], 240);
+    assert_eq!(day["frame_ms"]["samples"], 240);
+    assert!(number(&day["frame_p99_ms"]) > 0.0);
+    // 1.5 degrees a frame at most, which is a drift; the first frame and the key light's two changes
+    // of hands are the only jumps.
+    assert!(number(&day["sun_step_max_degrees"]) < 2.0);
+    assert_eq!(day["sun_jumps"], 2);
+    assert!(day["exposure"]["samples"].as_u64().unwrap() >= 30);
+    // One rise and one fall: a handful of turns, not a wobble.
+    assert!(day["exposure"]["reversals"].as_u64().unwrap() <= 6, "{day}");
+    // The same day from a camera that does not move, where only the sky can change the exposure.
+    let fixed = &day["exposure_fixed_camera"];
+    assert!(fixed["samples"].as_u64().unwrap() >= 30, "{day}");
+    assert!(fixed["reversals"].as_u64().unwrap() <= 6, "{day}");
+    // The cache's follow: four times of day at the game's pace and at the sped-up one.
+    assert_eq!(day["cache_follow"].as_array().unwrap().len(), 8);
+    assert!(day["gates"]["over"].is_array());
+    assert!(stderr.contains("day cycle:"), "{stderr}");
+    let _ = std::fs::remove_dir_all(&out);
+}
+
+#[test]
+fn a_day_of_under_four_seconds_or_without_a_cycle_is_refused() {
+    for args in [
+        &["--day-cycle", "--day-seconds", "3"][..],
+        &["--day-seconds", "30"],
+        &["--time-of-day", "25"],
+    ] {
+        let run = bench(args);
+        assert_eq!(run.status.code(), Some(1), "{args:?}");
+    }
 }
 
 #[test]

@@ -56,6 +56,8 @@ struct Inputs {
     /// The camera of the frame before; the history is of its view. `None` is the same camera.
     previous: Option<Camera>,
     boost: Option<([i32; 3], [i32; 3])>,
+    /// Whether the smooth normals pass ran (`Rig::smooth_normals` has made them).
+    smooth: bool,
 }
 
 impl Inputs {
@@ -64,6 +66,7 @@ impl Inputs {
             has_history: true,
             previous: None,
             boost: None,
+            smooth: false,
         }
     }
 }
@@ -91,6 +94,21 @@ impl Rig {
             16,
         );
         rig
+    }
+
+    /// Smooth normals for the whole frame: `normal(x, y)` as the pass of the smooth normals would
+    /// write it (half floats, a one in w where it ran). Run with `Inputs { smooth: true, .. }`.
+    fn smooth_normals(&self, normal: impl Fn(u32, u32) -> [f32; 3]) {
+        let mut bytes = Vec::new();
+        for y in 0..SIZE.1 {
+            for x in 0..SIZE.0 {
+                let [nx, ny, nz] = normal(x, y);
+                for c in [nx, ny, nz, 1.0] {
+                    bytes.extend_from_slice(&to_half(c).to_le_bytes());
+                }
+            }
+        }
+        self.upload(&self.normals, &bytes, 8);
     }
 
     fn upload(&self, plane: &Plane, bytes: &[u8], bytes_per: u32) {
@@ -193,7 +211,7 @@ impl Rig {
                 shift,
                 params: [
                     u32::from(inputs.has_history),
-                    0,
+                    u32::from(inputs.smooth),
                     (MAX_HISTORY as f32).to_bits(),
                     (SETTLING_HISTORY as f32).to_bits(),
                 ],
@@ -287,6 +305,18 @@ impl Rig {
             })
             .collect()
     }
+}
+
+/// A half float's bits, for the values a test writes (normal numbers, rounded down).
+fn to_half(value: f32) -> u16 {
+    if value == 0.0 {
+        return 0;
+    }
+    let bits = value.to_bits();
+    let sign = ((bits >> 16) & 0x8000) as u16;
+    let exponent = ((bits >> 23) & 0xff) as i32 - 127 + 15;
+    assert!((1..31).contains(&exponent), "{value} is not a normal half");
+    sign | ((exponent as u16) << 10) | ((bits >> 13) & 0x3ff) as u16
 }
 
 fn mean(values: impl Iterator<Item = f32>) -> f32 {
@@ -430,6 +460,7 @@ fn a_new_history_is_the_samples_and_so_is_one_a_fast_turn_leaves() {
                 has_history,
                 previous: previous.or(Some(before)),
                 boost: None,
+                smooth: false,
             },
         );
         let light = rig.light(Denoise::Temporal, written);
@@ -485,6 +516,7 @@ fn a_surface_a_voxel_nearer_does_not_inherit_the_history_of_the_one_behind() {
                 has_history: true,
                 previous: Some(before),
                 boost: None,
+                smooth: false,
             },
         );
         let light = rig.light(Denoise::Temporal, written);
@@ -553,7 +585,7 @@ fn the_filter_keeps_a_step_in_the_light_on_one_plane_at_settled() {
         let far = mean(columns(&light, 32, 38, |p| p[channel]).into_iter());
         assert!(
             near - far > 0.09,
-            "the step of the {name} across the edge (0.4) is {} after the filter",
+            "the step of the {name} across the edge (0.1) is {} after the filter",
             near - far
         );
     }
@@ -588,6 +620,50 @@ fn the_filter_keeps_a_step_of_one_voxel_in_depth_that_the_light_does_not_show() 
         near - far > 0.95,
         "the step across the edge (3.0 to 2.0) is {} after the filter",
         near - far
+    );
+}
+
+/// Frames of a still view over a stair of one-Voxel steps with the smooth normals of a slope of
+/// 45 degrees (what the smooth-normal pass makes of a stair), 40 frames of noise of `sigma` on a
+/// flat light, through `Denoise::Full`: the spread of the light that comes out.
+fn stair_spread(sigma: f32) -> f32 {
+    let mut rig = Rig::new();
+    let camera = rig.camera;
+    // A step of 1 Voxel in depth every 8 pixels, from 8 Voxels away, a stair going away to the right.
+    rig.set_surfaces(|x, y| {
+        let distance = 8.0 + (x / 8) as f32;
+        (Rig::along_ray(&camera, (x, y), distance), PLUS_Z)
+    });
+    let slope = std::f32::consts::FRAC_1_SQRT_2;
+    rig.smooth_normals(|_, _| [-slope, 0.0, slope]);
+    let mut written = 0;
+    for frame in 0..40 {
+        rig.samples(sigma, |_, _| 1.0);
+        written = rig.run(
+            Denoise::Full,
+            &Inputs {
+                has_history: frame > 0,
+                smooth: true,
+                ..Inputs::still()
+            },
+        );
+    }
+    let light = rig.light(Denoise::Full, written);
+    std_dev(&columns(&light, 8, 56, |p| p[0]))
+}
+
+#[test]
+fn a_stair_of_smooth_normals_is_still_smoothed_at_the_planes_half_voxel() {
+    // What this guards: that the tight plane stop (`PLANE_TOLERANCE` and `PHI_PLANE`, half a Voxel)
+    // does not leave the noise on a stair, where the smooth normals tilt and the Voxels' steps are
+    // one Voxel apart: a flat light of 1.0 with a noise of 0.3 on a stair of steps 8 pixels wide,
+    // 40 frames in, comes out with a spread of 0.015 (0.010 with the stops at 2 Voxels as they were,
+    // 0.018 with `PHI_PLANE` at 0.25 and 0.020 at 0.1, against the 0.3 it went in with). A guard
+    // against a stop that is too tight for a slope, not a sharp one: it fails from `PHI_PLANE` 0.1.
+    let spread = stair_spread(0.3);
+    assert!(
+        spread < 0.019,
+        "the stair's light has a spread of {spread} (0.3 went in)"
     );
 }
 

@@ -1341,7 +1341,7 @@ run without it (0.178 ms at 1 ray on the 4090, 1440p) or from `--diag` runs of a
   the default 2 rays the first frame is **0.062** and the settled image **0.059**, so
   `meets_target` is false; 1 ray was 0.074 and 0.072 (`--shadow-rays 1`). The owner shipped 2 rays
   with the centre-cosine weight; its bias was the cause, and #55 made the unbiased per-sample weight
-  the default (0.021 settled on the 4090 with the denoiser at 70463f2, 0.026 before the filter's last change; ADR 0005's "Sun and shadows" row has the
+  the default (0.021 settled on the 4090 with the denoiser, measured at 4c02da7; 0.026 before the filter's last change; ADR 0005's "Sun and shadows" row has the
   numbers). `meets_target` is reported and printed only: it is not a
   gate and does not change the exit status, and the target is not loosened.
 - **The shadow-edge error** (`edge`). FLIP's mean over a whole image says little about the few
@@ -1407,7 +1407,7 @@ view's **truth A**, which the view's own run made, at the output size:
   settles after 15 frames (flat) or 18 (the game's path, with the patch's two-frame latency).
   `light_let_in_by_an_edit_shows_through_the_upscaler_within_half_a_second` holds it.
 - **The gates** (`convergence.gi.gates`, held with FLIP only, **exit status 2** if any is over, `--no-fail`
-  silences it): `primary-flip:VIEW` (**#55, schema 32:** the settled FLIP mean of Primary as the window draws it, with
+  silences it): `primary-flip:VIEW` (**#55, schema 33:** the settled FLIP mean of Primary as the window draws it, with
   the denoiser on, is 0.05 or under against the truth, in every view: the golden, the pit, the room and the
   sun-and-sky view `sun`; it was the room's 0.10 before the denoiser), `no-further:VIEW` (a view's settled GI image no further from truth than its flat
   one, for each of the three), `settle` (the dig settles within 500 ms), and `reference-room` (the
@@ -1454,7 +1454,7 @@ Primary as the game does calls `set_denoise(Denoise::Full)` next to `set_flat_am
 the look-dev sheet, the flight). The `denoise` pass (budget 1.0 ms in `bench-budgets.toml`) is in
 `passes[]`; it holds the frame's samples from the lattice, the temporal accumulation and the filter, and
 sits before the upscaler (`crates/render/src/denoise.rs` has the account).
-Cost: 0.228 ms mean (0.256 p95) on the 4090 at 2560x1440 with Primary traced at 1280x720 (70463f2).
+Cost: 0.227 ms mean (0.255 p95) on the 4090 at 2560x1440 with Primary traced at 1280x720 (measured at 4c02da7).
 It scales with the traced pixels, and **the review's estimate, not measured, is about 0.5 ms at 4K at the
 default 0.5 scale and about 2 ms at 4K native**, which is over the 1.0 ms budget.
 
@@ -1792,7 +1792,7 @@ they run in a Primary frame:
 | `atmosphere` | the tables of the atmosphere (#53): the sky-view table and the aerial-perspective volumes every frame, and the transmittance, multiple-scattering and sun-free tables only when the air or the sun's height changes. It runs first, in both views, and is a pass of its own, so it adds a line to `passes[]` and no field (no schema bump). The 0.3 ms budget is the issue's, **for the 4090**: the orchestrator measures it | 0.3 |
 | `shadows` | the sun's shadow: two shadow rays a pixel from the G-buffer (#52, **schema 24**; `--shadow-rays N` in the bench) | 0.4 |
 | `gi` | Primary's global illumination (#54, **schema 29**): one bounce and an emitter sample for **one pixel of every 2 x 2 block** (a different one each frame; the rest of the block is reconstructed in `shade_pass`) from the G-buffer, the world-space radiance cache that supplies the bounces after it, and the cache's per-frame resolve | 1.5 |
-| `denoise` | Primary's denoiser (#55, **schema 32**): the frame's samples of the sun's weight and the bounce light from the lattice (`gi_samples`, which `shade_pass` read from `gi`'s output before), the temporal accumulation with clamping, and four iterations of the variance-guided a-trous filter (A-SVGF), at the traced size and before the upscaler. **Always timed**, with the denoiser off too (then only `gi_samples` runs) | 1.0 |
+| `denoise` | Primary's denoiser (#55, **schema 33**): the frame's samples of the sun's weight and the bounce light from the lattice (`gi_samples`, which `shade_pass` read from `gi`'s output before), the temporal accumulation with clamping, and four iterations of the variance-guided a-trous filter (A-SVGF), at the traced size and before the upscaler. **Always timed**, with the denoiser off too (then only `gi_samples` runs) | 1.0 |
 | `shade` | the lit image, as linear light, from the G-buffer, the shadows and the denoised light | none yet |
 | `exposure`, `exposure_adapt` | the log-average luminance and the adapted exposure | none yet |
 | `bloom_down`, `bloom_h`, `bloom_v` | the bloom, at a quarter of the size | none yet |
@@ -1889,6 +1889,75 @@ lavapipe: `--shot` picks the shots whose names contain it), and look at the stri
 --test atmosphere sky_by_sun_elevation -- --ignored --nocapture` prints the sky's linear colour at the horizon,
 half way up and overhead for sun elevations from -12 to 60 degrees, untinted and tinted, and `horizon_profile`
 prints the rows of a level view through the horizon.
+
+### The day (#203): the cycle bench and the day sheet
+
+**`client bench --day-cycle`** runs, after the flight and before the GPU is let go, **a whole day of the
+world clock, sped up**, over the flight's path on its GPU, and adds a `day_cycle` block to `report.json`
+(schema 32). The clock runs on a fixed 60 Hz schedule (a frame is a sixtieth of the clock's second, whatever
+the wall clock says), so a day of `--day-seconds N` seconds (default 60, which is 30 times the game's half
+hour; at least 4, since a faster sun would jump) is `60 N` frames, each moving the sun by 360/(60 N) degrees:
+a drift, never a jump (the bench's `sun_step_max_degrees` and `sun_jumps` say so; the jumps are the first
+frame and the two times a day the key light changes hands). It reports:
+
+- `start_hours` (where the day began), `frame_ms` (mean, p95, max), `frame_p99_ms` and `frames_over_limit`: **the gate**. A frame over 16.7 ms
+  or a p99 over it is `day_cycle.gates.over` and exit status 2 (`--no-fail` as ever). This is the "no frame
+  over the limit" of #203's acceptance.
+- `exposure` and `exposure_fixed_camera`: the auto-exposure read back every 6 frames (outside the timed
+  part), twice: over the flight, and over the same day from **one camera that does not move** (the cache
+  follow's view; the exposure is let settle at the first sky for 450 frames before it is read). Each has
+  `min_stops`, `max_stops`, `max_stops_per_s` (the fastest it moved over a second of the clock),
+  `total_variation_stops`, `travel_over_range` (the path walked over the range: about 2 for one rise at
+  dusk and one fall at dawn; every wobble adds to it) and `reversals` (how many times it turned round by
+  more than 0.05 stops). The flight's cannot tell pumping from scenery (a ridge against the sky, a cave
+  mouth change the exposure too, which is the metering working), so **`exposure_fixed_camera` is the "no
+  exposure pumping" measure**: only the sky changes it, a day should have a handful of reversals (noon,
+  night, and the dusk and dawn knees) and `travel_over_range` near 2, and a pumping exposure has tens.
+  Neither is **gated** (there is no agreed number yet): the first 4090 run sets one.
+- `cache_follow`: the radiance cache against a drifting sun (#203's design problem 2). For four times of
+  day (before dawn, morning, afternoon, after dusk), at the game's half-hour pace and at the sped-up one,
+  the clock runs for 2 seconds (120 frames) with no boost, and the image is compared with the same time put
+  there by a jump and settled (`drifted_levels`, mean absolute 8-bit levels per channel; `floor_levels` is
+  two settled frames against each other, the noise to read it against). The exposure is held fixed for it.
+  On the dev box (lavapipe, 96x54): at the game's pace the drift is 0.2 to 1.3 levels (the sun moves 0.4
+  degrees in 2 s, within about 0.5 of the floor); sped up 30 times (12 degrees in 2 s) 0.5 to 2.4 against 2
+  to 5 for a cache that was not told at all. It is reported and not gated.
+
+`--time-of-day H` (hours, 0 to 24) also lights the ordinary flight, sweep and Edits by the world clock's
+sky at that time, stopped there, in place of the fixed hero sun, and **is where the day cycle starts** (the
+day runs from there round to there again; the default is midnight): `client bench --time-of-day 21` is a
+night flight (the frame times at night: the moon is the key light, the stars and the night floor are drawn).
+
+On the 4090 (the owner or the orchestrating agent; not run in CI beyond `--short`):
+
+```
+client.exe bench --day-cycle --out bench-day
+client.exe bench --day-cycle --day-seconds 120 --time-of-day 21 --no-convergence --out bench-night
+```
+
+The first is the day cycle after the ordinary bench; the second adds a 2-minute day and a night flight.
+`--short --day-cycle` runs on the test Planet as a smoke test (its day is 6 s).
+
+**`client lookdev --out DIR --day`** is the sheet for the eye: the shots **meadow** (ground), **pull-out
+to the Planet** (orbit: the Zoom's far end) and **crystal cave, cyan** at **dawn, golden hour (hero light B's
+sun, on its way down), noon, dusk and night**, each in the Reference view and in Primary settled, with the
+world clock stopped there. At night the sky's frame is turned so that the moon is in view. It needs the real
+Planet (25 s of world map), and on lavapipe at 320x180 and 8 samples took about 3 minutes:
+
+```
+cargo run --release -p client -- lookdev --out /tmp/lookdev-day --day --size 320x180 --spp 8
+client.exe lookdev --out DIR --day          (the 4090: 1280x720, 64 samples)
+```
+
+**Tests** (`crates/render/tests/daylight.rs`, lavapipe): a time of day is one look whatever came before it
+(set, drifted to or run to give the same frame bit for bit) and two goldens (`daylight_moon_*`,
+`daylight_golden_*`); the moon and the stars are in the night sky and not the day's; the Reference view shows
+the same moon as Primary; the pillar's shadow falls away from the sun by day and from the moon by night; the
+sun's epoch holds under a drift and moves for a set and for the key light's two changes of hands; the cache
+keeps up with a drift at the game's pace and a sped-up one; the Reference view starts when the sky holds still
+and never while it moves; and the exposure aims lower the darker the sky. `cargo test -p render --test
+daylight dump_the_day -- --ignored` writes a sheet of the ground and orbit at eight times of day to
+`$DAY_DUMP`.
 
 ## Tests
 

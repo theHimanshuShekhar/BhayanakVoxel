@@ -44,6 +44,10 @@ const BLOOM_DOWN: u32 = 4;
 
 /// The grey that auto-exposure puts the scene's mean at.
 pub const MIDDLE_GREY: f32 = 0.18;
+/// What the grey of the auto-exposure is at full night, as a share of [`MIDDLE_GREY`] (#203): the
+/// exposure that makes a night's dim scene as bright as a day's would show it as day, so the night
+/// is put under it (1.7 stops) and stays dark, and the sky's stars and the moon stand out of it.
+pub const NIGHT_GREY_SHARE: f32 = 0.3;
 /// The exposures auto-exposure may reach: -3 and +5 stops.
 pub const EXPOSURE_RANGE: (f32, f32) = (0.125, 32.0);
 /// The time constant of the exposure's adaptation, in seconds.
@@ -216,6 +220,12 @@ pub fn settled_exposure(mean_log_luminance: f32) -> f32 {
     (MIDDLE_GREY / mean_log_luminance.exp()).clamp(EXPOSURE_RANGE.0, EXPOSURE_RANGE.1)
 }
 
+/// The share of [`MIDDLE_GREY`] that auto-exposure aims at when the sky is `night_level` dark (0 to
+/// 1: [`crate::DaySky::night`]): 1 by day, [`NIGHT_GREY_SHARE`] at night, smooth between.
+pub fn grey_share(night_level: f32) -> f32 {
+    1.0 - (1.0 - NIGHT_GREY_SHARE) * night_level.clamp(0.0, 1.0)
+}
+
 /// The share of the way to the settled exposure that `dt` seconds covers: `1 - e^(-dt / tau)`.
 pub fn adaptation_rate(dt: f32) -> f32 {
     1.0 - (-dt.max(0.0) / ADAPTATION_TAU).exp()
@@ -352,6 +362,8 @@ pub(crate) struct Post {
     blur_h: Pipeline,
     blur_v: Pipeline,
     tone: Pipeline,
+    /// How dark the sky is, 0 to 1: it lowers the grey the exposure aims at ([`grey_share`]).
+    night_level: f32,
 }
 
 /// A compute pipeline and the layout of its one bind group.
@@ -361,6 +373,11 @@ struct Pipeline {
 }
 
 impl Post {
+    /// Says how dark the sky is, for the frames that follow.
+    pub fn set_night_level(&mut self, level: f32) {
+        self.night_level = level;
+    }
+
     pub fn new(device: &wgpu::Device) -> Self {
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("post"),
@@ -465,6 +482,7 @@ impl Post {
                     storage(15, wgpu::TextureFormat::Rgba8Unorm),
                 ],
             ),
+            night_level: 0.0,
         }
     }
 
@@ -518,7 +536,12 @@ impl Post {
                     f32::from(matches!(exposure, Metering::Hold)),
                     NEUTRAL_DESAT_KEPT,
                 ],
-                sigmas: [sigmas[0], sigmas[1], sigmas[2], 0.0],
+                sigmas: [
+                    sigmas[0],
+                    sigmas[1],
+                    sigmas[2],
+                    grey_share(self.night_level),
+                ],
                 counts: [
                     scratch.partial_count,
                     u32::from(view == Exposed::Reference),
@@ -661,6 +684,15 @@ mod tests {
         assert_eq!(bloom_sigmas(640), [2.5, 7.0, 18.0]);
         assert_eq!(bloom_sigmas(1280), [5.0, 14.0, 36.0]);
         assert_eq!(bloom_sigmas(2560), [10.0, 28.0, 72.0]);
+    }
+
+    #[test]
+    fn the_exposure_aims_lower_the_darker_the_sky() {
+        assert_eq!(grey_share(0.0), 1.0);
+        assert_eq!(grey_share(1.0), NIGHT_GREY_SHARE);
+        assert!(grey_share(0.5) < 1.0 && grey_share(0.5) > NIGHT_GREY_SHARE);
+        assert_eq!(grey_share(-3.0), 1.0, "clamped");
+        assert_eq!(grey_share(9.0), NIGHT_GREY_SHARE, "clamped");
     }
 
     #[test]

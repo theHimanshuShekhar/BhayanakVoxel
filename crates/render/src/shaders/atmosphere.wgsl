@@ -227,10 +227,10 @@ fn multiscatter_kernel(@builtin(global_invocation_id) id: vec3<u32>) {
 // into what `sky()` shows in the directions where nothing is drawn.
 fn tinted_sky(r: f32, angle: f32, mu_s: f32, dphi: f32) -> vec3<f32> {
     let soft_mu = cos(soft_angle(r, angle));
-    var sky = tint_sky(integrate_ray(r, soft_mu, mu_s, cos_between(soft_mu, mu_s, dphi), SKY_STEPS), soft_mu);
+    var sky = tint_sky(integrate_ray(r, soft_mu, mu_s, cos_between(soft_mu, mu_s, dphi), SKY_STEPS), soft_mu) + night_floor(r, soft_mu);
     if angle > horizon_angles(r).y {
         let mu = cos(angle);
-        let below = tint_sky(integrate_ray(r, mu, mu_s, cos_between(mu, mu_s, dphi), SKY_STEPS), mu);
+        let below = tint_sky(integrate_ray(r, mu, mu_s, cos_between(mu, mu_s, dphi), SKY_STEPS), mu) + night_floor(r, mu);
         sky = mix(below, sky, horizon_fill());
     }
     return sky;
@@ -262,7 +262,7 @@ fn ground_sky_kernel(@builtin(global_invocation_id) id: vec3<u32>) {
     let mu = (f32(id.y) + 0.5) / f32(GROUND_SKY_H);
     let mu_s = clamp(dot(atmo.sun_dir.xyz, atmo.up.xyz), -1.0, 1.0);
     let nu = cos_between(mu, mu_s, dphi);
-    textureStore(ground_sky_out, id.xy, vec4<f32>(tint_sky(integrate_ray(r, mu, mu_s, nu, SKY_STEPS), mu), 1.0));
+    textureStore(ground_sky_out, id.xy, vec4<f32>(tint_sky(integrate_ray(r, mu, mu_s, nu, SKY_STEPS), mu) + night_floor(r, mu), 1.0));
 }
 
 var<workgroup> row_sums: array<f32, 32>;

@@ -5,6 +5,7 @@ use serde::Serialize;
 
 use super::budget::{Budgets, Status, status};
 use super::convergence::ConvergenceReport;
+use super::daycycle::DayCycleReport;
 use super::edits::EditsReport;
 use super::realtime::RealTimeReport;
 use super::rt::RtReport;
@@ -168,10 +169,17 @@ use super::stream::StreamReport;
 /// `accel` and Edit stress). `edits.accel` is the Edit stress's updates of the
 /// acceleration structures (null on compute). Nothing else is changed.
 ///
-/// 32 (#55; 30 is #226's, merged, and 31 is #233's) adds the denoiser. A new pass line
+/// 32 (#203) adds the day cycle: the report's `day_cycle` (null without `--day-cycle`: a day of the
+/// world clock run fast over the flight, with the frames' times and their p99 and the number over
+/// 16.7 ms, the most the sun moved in a frame, the jumps of the sun, the exposure's stability, the
+/// radiance cache's lag behind a drifting sun against a jump, and its gates) and `config.time_of_day`
+/// (the hours `--time-of-day` put the flight's sky at, or null for the fixed hero light). Nothing
+/// else is changed.
+///
+/// 33 (#55; 30 is #226's, 31 is #233's and 32 is #203's, all merged) adds the denoiser. A new pass line
 /// `denoise` is in `passes[]` (the report lists passes generically), with its stage budget in the
 /// budgets file's `[passes]`. Primary is drawn denoised in the convergence phase's views and in every
-/// path of the flight, and **a number of schema 31 or before is not comparable with a Primary one**
+/// path of the flight, and **a number of schema 32 or before is not comparable with a Primary one**
 /// of this schema. In each view's `gi`: `gi` is now Primary with the denoiser on and the sun's shadow
 /// rays weighed as `shadow_weight` says (`--shadow-weight`, `per-sample` unless given); `raw` is
 /// the cache's GI with no denoiser (what `gi` was before); `other_weight` is `gi` with the other
@@ -182,13 +190,13 @@ use super::stream::StreamReport;
 /// `room_target_flip` is now `primary_target_flip` (0.05, every view's settled `gi` and the sun
 /// view's settled Primary; the gate `room-flip` is now `primary-flip:VIEW` with `sun` among the views).
 /// The `flat` variant (the baseline of the gate `no-further:VIEW`) is drawn with the centre-cosine
-/// weight whatever `--shadow-weight` says, as it was at schema 31 (the only weight there was).
+/// weight whatever `--shadow-weight` says, as it was at schema 32 (the only weight there was).
 /// Each view's `gi` and `convergence.shadows` have a `converged` (null with `--converged-frames 0`):
 /// Primary with no denoiser averaged over `--converged-frames` frames (default 1024) of the settled
 /// still view, with `frames`, `luminance_ratio`, `bias` (FLIP against truth A), `residual` (the
 /// denoised settled frame against it), `raw_residual`, `denoiser_shift` and `denoised_limit`
 /// (each a FLIP score set, or null with FLIP off). Nothing else is changed.
-pub const SCHEMA_VERSION: u32 = 32;
+pub const SCHEMA_VERSION: u32 = 33;
 
 /// One timed thing (a pass, or the GPU total of a profiler frame) in one mode, against its
 /// budget. In reference mode a profiler frame is one sample, so the entries of that mode have
@@ -442,6 +450,9 @@ pub struct Config {
     /// workers are as far ahead as they may be, in milliseconds: the client's
     /// (`scene_worker::BACKED_UP_SLICE`) unless `--stream-slice-ms` said (the real-time mode).
     pub stream_slice_ms: f64,
+    /// The time of day in hours (0 to 24) that `--time-of-day` put the flight's sky at (#203), or
+    /// null when the flight is lit by the fixed hero sun as it always was.
+    pub time_of_day: Option<f64>,
     /// The `--diag` switches that were on, as spelled there. Empty for a measurement; a report
     /// that has any is not one, and its budgets are not checked.
     pub diag: Vec<String>,
@@ -487,6 +498,9 @@ pub struct Report {
     pub streaming_real_time: Option<RealTimeReport>,
     /// How rays found the Planet in the flight, and what the hardware backend costs (#50).
     pub rt: RtReport,
+    /// The day cycle (`--day-cycle`, #203): a day of the world clock run fast over the flight. Null
+    /// without the flag.
+    pub day_cycle: Option<DayCycleReport>,
 }
 
 #[cfg(test)]
@@ -646,6 +660,7 @@ mod tests {
                 keyframes: 3,
                 bias: 1.0,
                 stream_slice_ms: 32.0,
+                time_of_day: None,
                 diag: Vec::new(),
             },
             modes: modes(0.5),
@@ -676,6 +691,7 @@ mod tests {
                 accel: None,
                 comparison: None,
             },
+            day_cycle: None,
         };
         let json = serde_json::to_value(&report).unwrap();
         let keys = |v: &serde_json::Value| -> Vec<String> {
@@ -690,6 +706,7 @@ mod tests {
                 "caves",
                 "config",
                 "convergence",
+                "day_cycle",
                 "edits",
                 "machine",
                 "modes",
@@ -700,9 +717,10 @@ mod tests {
                 "streaming_real_time"
             ]
         );
-        assert_eq!(json["schema_version"], 32);
+        assert_eq!(json["schema_version"], 33);
         assert_eq!(json["rt"]["active"], "compute");
         assert_eq!(json["rt"]["comparison"], serde_json::Value::Null);
+        assert_eq!(json["day_cycle"], serde_json::Value::Null);
         assert_eq!(json["convergence"], serde_json::Value::Null);
         assert_eq!(json["streaming"], serde_json::Value::Null);
         assert_eq!(json["streaming_real_time"], serde_json::Value::Null);

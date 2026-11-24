@@ -54,6 +54,19 @@ struct Frame {
     // The first Voxel of that box and one past its last (level 0 coordinates), then one unused each.
     boost_min: vec4<i32>,
     boost_max: vec4<i32>,
+    // The moon (daylight.rs, #203): the unit vector towards it, then the cosine of its disc's
+    // angular radius (2 with no moon: nothing is at that cosine).
+    moon: vec4<f32>,
+    // The colour of its disc (sky radiance), then 1 if there is a moon.
+    moon_disc: vec4<f32>,
+    // How visible the stars are, then how visible the moon's disc and halo are (0 to 1), then two
+    // unused.
+    night: vec4<f32>,
+    // The rows of the matrix from a world direction to the stars' own, which the sky turns with the
+    // time of day.
+    star_x: vec4<f32>,
+    star_y: vec4<f32>,
+    star_z: vec4<f32>,
 }
 
 @group(1) @binding(0) var<uniform> camera: Camera;
