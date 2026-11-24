@@ -3016,6 +3016,13 @@ fn run_once(
     let mut gpu = Offscreen::with_resolution(resolution, built.world.scene())
         .map_err(|e| failed("making the GPU context", e))?;
     gpu.set_flat_ambient(flat_ambient);
+    // The flight times the player's frame, which has the denoiser (#55; the flat ambient of
+    // before #54 had none).
+    gpu.set_denoise(if flat_ambient {
+        render::Denoise::Off
+    } else {
+        render::Denoise::Full
+    });
     // The atmosphere measures the camera's height from the Planet's sea level.
     gpu.set_ground_level(f64::from(if full {
         planet_gen::world_map::WORLD_RADIUS

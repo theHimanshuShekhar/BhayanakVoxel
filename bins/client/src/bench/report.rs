@@ -175,7 +175,28 @@ use super::stream::StreamReport;
 /// radiance cache's lag behind a drifting sun against a jump, and its gates) and `config.time_of_day`
 /// (the hours `--time-of-day` put the flight's sky at, or null for the fixed hero light). Nothing
 /// else is changed.
-pub const SCHEMA_VERSION: u32 = 32;
+///
+/// 33 (#55; 30 is #226's, 31 is #233's and 32 is #203's, all merged) adds the denoiser. A new pass line
+/// `denoise` is in `passes[]` (the report lists passes generically), with its stage budget in the
+/// budgets file's `[passes]`. Primary is drawn denoised in the convergence phase's views and in every
+/// path of the flight, and **a number of schema 32 or before is not comparable with a Primary one**
+/// of this schema. In each view's `gi`: `gi` is now Primary with the denoiser on and the sun's shadow
+/// rays weighed as `shadow_weight` says (`--shadow-weight`, `per-sample` unless given); `raw` is
+/// the cache's GI with no denoiser (what `gi` was before); `other_weight` is `gi` with the other
+/// weight (`other_shadow_weight`); `reference_64` is FLIP's mean of the Reference at 64 samples
+/// against truth A. In `convergence.shadows`: `first_frame` and `settled` are denoised with
+/// `shadow_weight`, and `other_weight` and `raw` (each with `first_frame` and `settled`), the two
+/// names and `reference_64` (mean and 99th percentile) are new. In `convergence.gi.gates`
+/// `room_target_flip` is now `primary_target_flip` (0.05, every view's settled `gi` and the sun
+/// view's settled Primary; the gate `room-flip` is now `primary-flip:VIEW` with `sun` among the views).
+/// The `flat` variant (the baseline of the gate `no-further:VIEW`) is drawn with the centre-cosine
+/// weight whatever `--shadow-weight` says, as it was at schema 32 (the only weight there was).
+/// Each view's `gi` and `convergence.shadows` have a `converged` (null with `--converged-frames 0`):
+/// Primary with no denoiser averaged over `--converged-frames` frames (default 1024) of the settled
+/// still view, with `frames`, `luminance_ratio`, `bias` (FLIP against truth A), `residual` (the
+/// denoised settled frame against it), `raw_residual`, `denoiser_shift` and `denoised_limit`
+/// (each a FLIP score set, or null with FLIP off). Nothing else is changed.
+pub const SCHEMA_VERSION: u32 = 33;
 
 /// One timed thing (a pass, or the GPU total of a profiler frame) in one mode, against its
 /// budget. In reference mode a profiler frame is one sample, so the entries of that mode have
@@ -696,7 +717,7 @@ mod tests {
                 "streaming_real_time"
             ]
         );
-        assert_eq!(json["schema_version"], 32);
+        assert_eq!(json["schema_version"], 33);
         assert_eq!(json["rt"]["active"], "compute");
         assert_eq!(json["rt"]["comparison"], serde_json::Value::Null);
         assert_eq!(json["day_cycle"], serde_json::Value::Null);

@@ -1340,8 +1340,9 @@ run without it (0.178 ms at 1 ray on the 4090, 1440p) or from `--diag` runs of a
   the target. **Where it stands (#52, 4090, 1440p, hero sun, 8192-sample truth, floor 0.0008):** at
   the default 2 rays the first frame is **0.062** and the settled image **0.059**, so
   `meets_target` is false; 1 ray was 0.074 and 0.072 (`--shadow-rays 1`). The owner shipped 2 rays
-  with the centre-cosine weight; its bias is the cause and #55 re-judges the weight (ADR 0005's
-  "Sun and shadows" row has the numbers). `meets_target` is reported and printed only: it is not a
+  with the centre-cosine weight; its bias was the cause, and #55 made the unbiased per-sample weight
+  the default (0.021 settled on the 4090 with the denoiser, measured at 4c02da7; 0.026 before the filter's last change; ADR 0005's "Sun and shadows" row has the
+  numbers). `meets_target` is reported and printed only: it is not a
   gate and does not change the exit status, and the target is not loosened.
 - **The shadow-edge error** (`edge`). FLIP's mean over a whole image says little about the few
   pixels of a shadow's edge, where Primary weighs its rays by the cosine at the disc's centre
@@ -1406,8 +1407,9 @@ view's **truth A**, which the view's own run made, at the output size:
   settles after 15 frames (flat) or 18 (the game's path, with the patch's two-frame latency).
   `light_let_in_by_an_edit_shows_through_the_upscaler_within_half_a_second` holds it.
 - **The gates** (`convergence.gi.gates`, held with FLIP only, **exit status 2** if any is over, `--no-fail`
-  silences it): `room-flip` (the room's settled GI image at FLIP mean 0.10 or under, 1440p, the ticket's;
-  #55 tightens it), `no-further:VIEW` (a view's settled GI image no further from truth than its flat
+  silences it): `primary-flip:VIEW` (**#55, schema 33:** the settled FLIP mean of Primary as the window draws it, with
+  the denoiser on, is 0.05 or under against the truth, in every view: the golden, the pit, the room and the
+  sun-and-sky view `sun`; it was the room's 0.10 before the denoiser), `no-further:VIEW` (a view's settled GI image no further from truth than its flat
   one, for each of the three), `settle` (the dig settles within 500 ms), and `reference-room` (the
   room's Reference view reaches FLIP 0.05 within **0.3 s of GPU time**: the line's `gpu_s`
   (`views[].lines[]`, `flip` 0.05: its samples times the Reference pass's mean GPU time), against
@@ -1443,6 +1445,75 @@ view's **truth A**, which the view's own run made, at the output size:
 The flight, the cave stills, the streaming mode, the real-time mode and the look-dev sheet draw Primary
 with the radiance cache (`set_flat_ambient(false)`), since that is the player's frame; the convergence
 views' Reference images do not depend on it.
+
+### The denoiser (#55)
+
+Primary is drawn **denoised** in every view of the phase and in the flight: `Offscreen` starts with
+`Denoise::Off` (the tests with answers worked out from the raw samples want it), so a caller that draws
+Primary as the game does calls `set_denoise(Denoise::Full)` next to `set_flat_ambient(false)` (the bench,
+the look-dev sheet, the flight). The `denoise` pass (budget 1.0 ms in `bench-budgets.toml`) is in
+`passes[]`; it holds the frame's samples from the lattice, the temporal accumulation and the filter, and
+sits before the upscaler (`crates/render/src/denoise.rs` has the account).
+Cost: 0.227 ms mean (0.255 p95) on the 4090 at 2560x1440 with Primary traced at 1280x720 (measured at 4c02da7).
+It scales with the traced pixels, and **the review's estimate, not measured, is about 0.5 ms at 4K at the
+default 0.5 scale and about 2 ms at 4K native**, which is over the 1.0 ms budget.
+
+What the 4090 runs for #55 (the orchestrator's, with the PR's Windows artifact):
+
+```
+client bench --truth-spp 8192                                  # the gate: per-sample weight (the default), every view
+client bench --truth-spp 8192 --shadow-weight centre-cosine    # the same, with #52's weight
+```
+
+Each run reports **both weights** and the denoiser off, so one run has the comparison:
+`convergence.shadows.{first_frame,settled}` are the chosen weight denoised, `other_weight` the other,
+`raw` the chosen weight with no denoiser, `reference_64` the Reference at 64 samples (reported, not
+gated); and each view's `gi.{gi,other_weight,raw,flat}` the same for the GI views, with `gi.reference_64`.
+The gate is on the weight that `--shadow-weight` chose; the run that gets the sun view under FLIP 0.05
+settled, in the other views too, is the weight to keep. The summary prints every line.
+The convergence views' pictures are the denoised ones (`primary-gi-*.png`, and for the other weight
+`primary-gi-per-sample-*.png` or `primary-gi-centre-cosine-*.png`), and the look-dev sheet's
+`primary.png` and `primary-settled.png` are drawn as a window draws a first frame and a settled one.
+
+**Primary converged: where a view's error is.** A denoiser takes noise away, not bias, so the gate's
+error is split in two in every view (the golden, the pit, the room, and the sun view's
+`convergence.shadows`), each run: `converged` is Primary with the denoiser off, in the weight of the
+run, drawn for `--converged-frames N` frames (default 1024; 0 leaves it out) of the still view after
+it has settled, and **averaged in linear light**: the mean that Primary's own samples converge to,
+with its own bias (the radiance cache's GI, the weight of the shadow rays, the upscaler's clamp). Its
+picture is `primary-converged.png` in the view's folder.
+
+- `converged.bias`: FLIP of it against truth A. What no denoiser can remove: if this is over 0.05 in
+  a view, the gate there needs work on the light (the GI), not on the denoiser.
+- `converged.residual`: FLIP of Primary denoised and settled (`gi.settled`, `settled` for the sun)
+  against it. What the denoiser leaves of the noise: this is the denoiser's to tune.
+- `converged.raw_residual`: the same for Primary with no denoiser (`raw.settled`): what the noise is
+  without it, so the denoiser's share is `raw_residual` against `residual`.
+- `converged.luminance_ratio`: its mean luminance over the truth's: how dark or bright the light is
+  as Primary draws it, with the noise averaged out (the room's 0.92 is the bias that the room's
+  GI has, not noise).
+- `converged.denoiser_shift`: FLIP of Primary denoised and averaged over the same frames against
+  `converged`: how far the denoiser moves the mean (its clamps, the rejection of history, the
+  filter's guide), with the noise averaged out.
+- `converged.denoised_limit`: FLIP of that denoised mean against truth A, to read against `bias`: if
+  it is no worse than `bias`, the denoiser adds no error of its own to the view and what is left is
+  the light's.
+
+**What the settled residual is (#55, measured on the dev box at 640x360 against 1024-sample truths).**
+A settled frame's distance from the denoised mean is mostly the radiance cache's error, not the
+frame's noise: a cell's light is the mean of all its samples so far, so it is the same from frame to
+frame and the history cannot average it (a history cap of 64 instead of 32, or no rejection of
+history, changed the settled FLIP by under 0.0003, and a cache that forgets slower changed nothing in
+the golden and the pit). Only the filter, over the cells, can, so it runs on every pixel with a tight
+luminance stop (`PHI_LIGHT` 1.5): the first version left a pixel whose history was long alone, and the
+pit and the room paid for it (settled FLIP, dev box: pit 0.081 to 0.071, room 0.090 to 0.075, golden
+0.062 to 0.059, raw 0.091, 0.098 and 0.059). What remains beyond that is the cache's own noise and
+bias, which more GI samples a cell would take.
+
+The FLIP of a mean of a noisy image is not the mean of the FLIPs, so `bias` and `residual` do not add
+up to the settled FLIP; they say which of the two is the larger. The run adds `--converged-frames`
+frames a view, so the default 1024 makes the phase longer (it was not timed on the 4090). To measure
+it alone with fewer: `client bench --truth-spp 8192 --converged-frames 256`.
 
 ## The hardware ray backend (#50)
 
@@ -1701,7 +1772,7 @@ a budget off.
 The numbers are the per-stage frame budget of the rendering decision (#10), on the RTX 4090 at 1440p
 output. Only `primary` (Primary visibility, 1.0 ms), `shadows` (the sun's shadow rays, two a pixel, 0.4 ms, #52),
 `atmosphere` (the atmosphere's tables, 0.3 ms, #53), `upscale` (the TAAU pass, 0.5 ms) and the total (8.6 ms) are live today, as those are the passes that
-exist, and `gi` (the radiance-cache GI, 1.5 ms, #54). The later stages (reflections 0.7, glass 0.7, volumetrics 1.0, denoise 1.0, edits 1.0, post 0.5)
+exist, `gi` (the radiance-cache GI, 1.5 ms, #54) and `denoise` (1.0 ms, #55). The later stages (reflections 0.7, glass 0.7, volumetrics 1.0, edits 1.0, post 0.5)
 are in the file as comments: **whoever adds a pass uncomments its budget and names it the same** (a
 pass is named by the string given to `Profiler::compute_pass`). `reference` has no budget in #10;
 its 3.0 ms (a sample, pass and total) catches a gross regression, set from the first real run on the
@@ -1721,7 +1792,8 @@ they run in a Primary frame:
 | `atmosphere` | the tables of the atmosphere (#53): the sky-view table and the aerial-perspective volumes every frame, and the transmittance, multiple-scattering and sun-free tables only when the air or the sun's height changes. It runs first, in both views, and is a pass of its own, so it adds a line to `passes[]` and no field (no schema bump). The 0.3 ms budget is the issue's, **for the 4090**: the orchestrator measures it | 0.3 |
 | `shadows` | the sun's shadow: two shadow rays a pixel from the G-buffer (#52, **schema 24**; `--shadow-rays N` in the bench) | 0.4 |
 | `gi` | Primary's global illumination (#54, **schema 29**): one bounce and an emitter sample for **one pixel of every 2 x 2 block** (a different one each frame; the rest of the block is reconstructed in `shade_pass`) from the G-buffer, the world-space radiance cache that supplies the bounces after it, and the cache's per-frame resolve | 1.5 |
-| `shade` | the lit image, as linear light, from the G-buffer, the shadows and the GI | none yet |
+| `denoise` | Primary's denoiser (#55, **schema 33**): the frame's samples of the sun's weight and the bounce light from the lattice (`gi_samples`, which `shade_pass` read from `gi`'s output before), the temporal accumulation with clamping, and four iterations of the variance-guided a-trous filter (A-SVGF), at the traced size and before the upscaler. **Always timed**, with the denoiser off too (then only `gi_samples` runs) | 1.0 |
+| `shade` | the lit image, as linear light, from the G-buffer, the shadows and the denoised light | none yet |
 | `exposure`, `exposure_adapt` | the log-average luminance and the adapted exposure | none yet |
 | `bloom_down`, `bloom_h`, `bloom_v` | the bloom, at a quarter of the size | none yet |
 | `tone` | exposure, bloom and tone curve into the encoded image | none yet |

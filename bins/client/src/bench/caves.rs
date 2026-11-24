@@ -231,6 +231,7 @@ pub fn run(
         fill(&mut current, &mut store, still.key.position)?;
         let mut gpu = Offscreen::with_resolution(resolution, &current)?;
         gpu.set_flat_ambient(false);
+        gpu.set_denoise(render::Denoise::Full);
         gpu.set_ground_level(f64::from(TEST_RADIUS));
         gpu.set_keep_history(true);
         let mut flight = Flight {

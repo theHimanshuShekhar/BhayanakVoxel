@@ -75,6 +75,11 @@ pub const ATMOSPHERE: &str = concat!(
 #[cfg(test)]
 pub const SAMPLING: &str = include_str!("shaders/sampling.wgsl");
 
+/// Primary's denoiser (#55): temporal accumulation and the variance-guided à-trous filter, on the
+/// two noisy signals of its light. It reads no Planet and no source of light of its own, so it is a
+/// module of its own, like the upscaler.
+pub const DENOISE: &str = include_str!("shaders/denoise.wgsl");
+
 /// The temporal upscaler: the compute kernel that builds the output image from the traced one.
 pub const UPSCALE: &str = include_str!("shaders/upscale.wgsl");
 
@@ -150,7 +155,14 @@ mod tests {
      {
         assert_eq!(
             entry_points(SHADE),
-            ["gi_resolve", "normals", "shadows", "shade_pass", "gi_trace"]
+            [
+                "gi_resolve",
+                "normals",
+                "shadows",
+                "shade_pass",
+                "gi_samples",
+                "gi_trace"
+            ]
         );
         // The smooth normal reads the Planet through `solid_at` of trace.wgsl, and the light is
         // drawn from what primary visibility found: the only rays of `shade.wgsl` are the sun's
@@ -229,6 +241,25 @@ mod tests {
     }
 
     #[test]
+    fn the_denoise_kernels_are_valid_wgsl_and_touch_neither_the_planet_nor_a_source_of_light() {
+        assert_eq!(
+            entry_points(DENOISE),
+            ["denoise_temporal", "denoise_atrous"]
+        );
+        for source in [
+            "trace(",
+            "scene.",
+            "bricks[",
+            "frame.",
+            "sky(",
+            "emission(",
+            "sun_radiance",
+        ] {
+            assert!(!DENOISE.contains(source), "denoise.wgsl reads {source}");
+        }
+    }
+
+    #[test]
     fn the_upscale_kernel_is_valid_wgsl_and_does_not_touch_the_planet() {
         assert_eq!(entry_points(UPSCALE), ["upscale_pass"]);
         assert!(!UPSCALE.contains("trace("));
@@ -296,7 +327,7 @@ mod tests {
     }
 
     /// What reads a source of light, and the feature it is: an identifier of the shaders.
-    const READS: [(&str, &str); 11] = [
+    const READS: [(&str, &str); 13] = [
         ("frame.sun", "sun and shadows"),
         // The sun's light at the hit, which `shadows` wrote: the lit image's read of it.
         ("textureLoad(sun_weights", "sun and shadows"),
@@ -304,6 +335,10 @@ mod tests {
         // light (#54).
         ("textureLoad(gi_light", "bounce light"),
         ("cache_incident(", "bounce light"),
+        // The denoiser's result as the lit image reads it (#55): the two signals, filtered, which
+        // carry the light of their own rows.
+        ("denoised_gi(", "bounce light"),
+        ("denoised_sun(", "sun and shadows"),
         ("sky(", "sky and atmosphere"),
         // The sun-free table that a ray that has bounced reads, and the air between the camera and
         // its first hit.
@@ -319,7 +354,7 @@ mod tests {
 
     /// The bindings the shaders have, none of which is a source of light that has no row. A new
     /// one fails the check until it is added here with a decision.
-    const BINDINGS: [&str; 28] = [
+    const BINDINGS: [&str; 30] = [
         "scene",
         "table",
         "regions",
@@ -361,11 +396,17 @@ mod tests {
         "gi_cache",
         "gi_out",
         "gi_light",
+        // The frame's samples of the two signals (`gi_samples` writes the incident light and the
+        // sun's weight, read from `gi_light` and `sun_weights`, marked there) and what `shade_pass`
+        // lights the image with (the denoiser's result of them, or the samples as they are, #55):
+        // "Bounce light" and "Sun and shadows", read through `denoised_gi(` and `denoised_sun(`.
+        "samples_out",
+        "denoised_light",
     ];
 
     /// The shader files, all of them known: a new one is neither of a view nor checked until it is
     /// listed here.
-    const FILES: [&str; 17] = [
+    const FILES: [&str; 18] = [
         "trace.wgsl",
         // The hardware backend of trace() (#50): lights nothing, joined to trace.wgsl by `hardware`.
         "trace_hw.wgsl",
@@ -388,6 +429,9 @@ mod tests {
         // Primary's bounce light (#54): the radiance cache and the kernel that finds the light.
         "cache.wgsl",
         "gi.wgsl",
+        // Primary's denoiser (#55): a module of its own over the two signals, which reads no source
+        // of light.
+        "denoise.wgsl",
     ];
 
     /// Whether `line` (trimmed, code) contains `needle` as a call or member, not in `fn needle(`.
