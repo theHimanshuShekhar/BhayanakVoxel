@@ -438,7 +438,9 @@ fn a_frame_runs_the_primary_pass_then_the_upscale_pass_and_times_both() {
     // image (#202); with its stages off (this test's light) only the tone pass's copy is left.
     assert_eq!(
         names,
-        ["primary", "shadows", "gi", "shade", "tone", "upscale"]
+        [
+            "primary", "shadows", "gi", "denoise", "shade", "tone", "upscale"
+        ]
     );
     if gpu.timers_supported() {
         for pass in gpu.timings().passes() {
