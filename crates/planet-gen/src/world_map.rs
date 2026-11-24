@@ -721,7 +721,7 @@ const PATCH_CELL: u32 = 16;
 /// in radius. So the land is in separate masses of 30 to 60 km, and there are more of them on a
 /// bigger Planet, where noise alone at the median would join half the land in one mass (it is the
 /// threshold at which a random field's land percolates).
-const CONTINENT_CELL: u32 = 19;
+fn continent_cell() -> u32 { static C: std::sync::OnceLock<u32> = std::sync::OnceLock::new(); *C.get_or_init(|| std::env::var("PROTO_CONTINENT_CELL").ok().and_then(|v| v.parse().ok()).unwrap_or(19)) } // PROTOTYPE
 /// The most of a cell's width that a continent's radius is.
 const CONTINENT_REACH: f64 = 0.55;
 const CONTINENT: u64 = 0x3c6e_f372_fe94_f82b;
@@ -735,14 +735,14 @@ const CONTINENT_SHARE: f64 = 0.62;
 
 /// The share of the Planet's area that is ocean. Not a half: land that is half of a random
 /// field's area joins in one mass, and the continents are separate masses.
-const OCEAN_SHARE: f64 = 0.54;
+fn ocean_share() -> f64 { std::env::var("PROTO_OCEAN_SHARE").ok().and_then(|v| v.parse().ok()).unwrap_or(0.54) } // PROTOTYPE
 
 /// The continents' shape at a lattice point of the sphere: 1 at the middle of a continent, falling
 /// smoothly to 0 at its edge and 0 where there is none; in `[0, 1]`. Deterministic: sums
 /// and products of integers and hashes, so the same on every machine.
 fn continents(seed: u64, point: [i32; 3]) -> f64 {
-    let cell = point.map(|p| p >> CONTINENT_CELL);
-    let width = f64::from(1u32 << CONTINENT_CELL);
+    let cell = point.map(|p| p >> continent_cell());
+    let width = f64::from(1u32 << continent_cell());
     let mut best: f64 = 0.0;
     for k in 0..27 {
         let at = [0, 1, 2].map(|a| cell[a] + (k / 3i32.pow(a as u32)) % 3 - 1);
@@ -804,7 +804,7 @@ fn normalise(raw: &[i32], size: u32) -> Vec<i16> {
     for (index, &value) in raw.iter().enumerate() {
         area[((value + OFFSET) >> SHIFT) as usize] += u64::from(weights[index % weights.len()]);
     }
-    let half = (area.iter().sum::<u64>() as f64 * OCEAN_SHARE) as u64;
+    let half = (area.iter().sum::<u64>() as f64 * ocean_share()) as u64;
     let mut below = 0;
     let median_bin = area
         .iter()
