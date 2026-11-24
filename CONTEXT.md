@@ -22,6 +22,18 @@ _Avoid_: Visible, surface Voxel
 Air that the generator carves under the Planet's land, in tunnels and chambers, some of which open to the surface as cave mouths. A part of the Planet's generated terrain, not an Edit.
 _Avoid_: Dungeon, hole (a hole is dug)
 
+**Climate**:
+The conditions at a point on the Planet: its temperature and its moisture. It chooses the Biome.
+_Avoid_: Weather, environment
+
+**Landform**:
+The kind of shape the land takes at a place, such as a range, plateau, canyon, valley, plains or coast.
+_Avoid_: Terrain type, relief
+
+**Biome**:
+A named kind of land with its own surface and life, chosen by the Climate from those its Landform allows (a canyon in a hot, dry Climate is badlands).
+_Avoid_: Zone, region (Regions are the fantasy masks)
+
 **Material**:
 The kind of matter a Voxel is made of (e.g. rock, sand, water, glass), carrying properties like hardness or emissiveness.
 _Avoid_: Block type, voxel type
