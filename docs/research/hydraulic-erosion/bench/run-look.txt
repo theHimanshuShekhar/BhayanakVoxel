@@ -1,0 +1,14 @@
+ 23:40:01 up 12 days, 47 min,  1 user,  load average: 40.82, 26.54, 13.28
+world map 2048: 87.7 s
+dx 245.4 m, land 46.2%
+erode-only 10 steps: 93.7 s, max change 948 m
+  uplift step 0: highest 196 m, largest change 196.0 m
+  uplift step 5: highest 1168 m, largest change 190.2 m
+  uplift step 10: highest 2044 m, largest change 199.6 m
+  uplift step 15: highest 2611 m, largest change 187.8 m
+  uplift step 20: highest 2736 m, largest change 197.4 m
+  uplift step 25: highest 2670 m, largest change 204.2 m
+  uplift step 30: highest 2603 m, largest change 173.3 m
+  uplift step 35: highest 2601 m, largest change 148.7 m
+uplift 40 steps: 466.7 s, highest 2601 m, last change 148.66 m
+ 23:50:52 up 12 days, 57 min,  1 user,  load average: 29.87, 39.12, 27.80

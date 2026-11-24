@@ -1,0 +1,14 @@
+[package]
+name = "hyd-proto"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+planet-gen = { path = "../../../../crates/planet-gen" }
+png = "0.18.1"
+
+[profile.release]
+debug = false
+
+[workspace]

@@ -1,0 +1,9 @@
+ 23:37:12 up 12 days, 44 min,  1 user,  load average: 30.10, 14.13, 7.29
+world map 2048: 86.4 s
+dx 245.4 m, land 46.2%
+fastscape [levels, 1 thread, 1 threads]: 2467 ms/step (receivers 130, donors 684, order 256, area 428, solve 884); levels 177; hash f495b6eb4614f51c
+fastscape [levels, 8 threads]: 2048 ms/step (receivers 80, donors 538, order 228, area 381, solve 756); levels 177; hash f495b6eb4614f51c
+fastscape [flood (serial), 8 threads]: 8565 ms/step (receivers 6856, donors 571, order 0, area 346, solve 733); levels 1; hash dc22b52506fa3e15
+schott jacobi [1 threads]: 815 ms/step; hash 98daadf7d469ad5a
+schott jacobi [8 threads]: 410 ms/step; hash 98daadf7d469ad5a
+ 23:39:34 up 12 days, 46 min,  1 user,  load average: 38.49, 24.97, 12.43
