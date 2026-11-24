@@ -104,6 +104,7 @@ const _: () = assert!(ROUGH_CELL.count_ones() == 1);
 /// Salts that tell the cave streams of randomness from the world map's and each other's.
 const SALT: u64 = 0xca5e_5bad_d00d_1e55;
 const ROUGH_SALT: u64 = 0x2545_f491_4f6c_dd1d;
+const SYSTEM_SALT: u64 = 0x5157_e11a_ce00_0001;
 
 /// A piece of tunnel: a segment from `a` to `b`, in Voxels from the Planet's centre, with the
 /// radius `ra` at one end and `rb` at the other, linearly between.
@@ -113,14 +114,18 @@ pub struct Tube {
     pub b: [f64; 3],
     pub ra: f64,
     pub rb: f64,
+    /// Which cave this is a piece of: the same for every tube of a system, and a hash of the seed,
+    /// the cube and the try that grew it, so no other system has it. What a cave has as a whole,
+    /// like the dominant hue of a crystal cave (#204), is made from it. Not part of
+    /// [`Caves::content_hash`], which is of the tubes' shapes.
+    pub system: u64,
 }
 
 impl Tube {
-    /// Whether the tube may carve a Voxel of the box from `low` to `high`, or one within `margin`
-    /// of it: whether its segment passes through the box grown by the tube's widest radius,
-    /// roughness and `margin`. It is a bound, not an exact test: a tube it says yes to need
-    /// not touch the box, and one that says no never does.
-    fn reaches(&self, low: [f64; 3], high: [f64; 3], margin: f64) -> bool {
+    /// The part of the tube's segment, as fractions `(from, to)` of its length, that is within the
+    /// box from `low` to `high` grown by the tube's widest radius, roughness and `margin`; `None`
+    /// if none is. A bound, not an exact test: see [`Tube::reaches`].
+    pub(crate) fn span_in(&self, low: [f64; 3], high: [f64; 3], margin: f64) -> Option<(f64, f64)> {
         let grow = self.ra.max(self.rb) + ROUGHNESS + margin;
         // The part of the segment, as fractions of its length, that is within the box so far.
         let (mut from, mut to) = (0.0_f64, 1.0_f64);
@@ -129,18 +134,34 @@ impl Tube {
             let (start, along) = (self.a[k], self.b[k] - self.a[k]);
             if along == 0.0 {
                 if start < lo || start > hi {
-                    return false;
+                    return None;
                 }
             } else {
                 let (u, v) = ((lo - start) / along, (hi - start) / along);
                 from = from.max(u.min(v));
                 to = to.min(u.max(v));
                 if from > to {
-                    return false;
+                    return None;
                 }
             }
         }
-        true
+        Some((from, to))
+    }
+
+    /// Whether the tube may carve a Voxel of the box from `low` to `high`, or one within `margin`
+    /// of it: whether its segment passes through the box grown by the tube's widest radius,
+    /// roughness and `margin`. It is a bound, not an exact test: a tube it says yes to need
+    /// not touch the box, and one that says no never does.
+    fn reaches(&self, low: [f64; 3], high: [f64; 3], margin: f64) -> bool {
+        self.span_in(low, high, margin).is_some()
+    }
+
+    /// The point of the axis at `t`, a fraction of the tube's length, and the radius there.
+    pub(crate) fn at(&self, t: f64) -> ([f64; 3], f64) {
+        (
+            plus(self.a, std::array::from_fn(|k| self.b[k] - self.a[k]), t),
+            self.ra + (self.rb - self.ra) * t,
+        )
     }
 
     /// The square of the distance from `point` to the tube's axis, and the radius there.
@@ -199,26 +220,26 @@ fn unit(v: [f64; 3]) -> Option<[f64; 3]> {
 }
 
 /// A stream of numbers in `[0, 1)`: each a hash of the seed, the cube and how many came before.
-struct Dice {
-    seed: u64,
-    cube: [i32; 3],
-    drawn: u64,
+pub(crate) struct Dice {
+    pub(crate) seed: u64,
+    pub(crate) cube: [i32; 3],
+    pub(crate) drawn: u64,
 }
 
 impl Dice {
-    fn next(&mut self) -> f64 {
+    pub(crate) fn next(&mut self) -> f64 {
         let salt = self.drawn.wrapping_mul(0x9e37_79b9_7f4a_7c15);
         self.drawn += 1;
         // The top 53 bits scaled by 2^-53 is exact.
         (hash(self.seed ^ salt, self.cube) >> 11) as f64 * (1.0 / 9_007_199_254_740_992.0)
     }
 
-    fn between(&mut self, (lo, hi): (f64, f64)) -> f64 {
+    pub(crate) fn between(&mut self, (lo, hi): (f64, f64)) -> f64 {
         lo + (hi - lo) * self.next()
     }
 
     /// A whole number from `lo` to `hi` inclusive.
-    fn count(&mut self, (lo, hi): (u64, u64)) -> u64 {
+    pub(crate) fn count(&mut self, (lo, hi): (u64, u64)) -> u64 {
         (lo + (self.next() * (hi - lo + 1) as f64) as u64).min(hi)
     }
 }
@@ -296,6 +317,7 @@ fn walk(
             b: to,
             ra: radius,
             rb: to_radius,
+            system: 0,
         });
         (at, radius) = (to, to_radius);
         ends.push((at, radius));
@@ -339,6 +361,7 @@ fn grow(
         ahead,
         aside,
     };
+    let first = tubes.len();
     let mut ends = Vec::new();
     let start = (anchor, end_radius(&mut dice), frame.heading(&mut dice));
     let segments = dice.count(WALK);
@@ -358,6 +381,14 @@ fn grow(
             tubes,
         );
     }
+    // One id for the whole system, its branches too: a hash of what grew it.
+    let system = hash(
+        seed ^ SALT ^ SYSTEM_SALT ^ attempt.wrapping_mul(0xd6e8_feb8_6659_fd93),
+        cube,
+    );
+    for tube in &mut tubes[first..] {
+        tube.system = system;
+    }
 }
 
 impl Caves {
@@ -372,6 +403,11 @@ impl Caves {
 
     fn seed(&self) -> u64 {
         self.map.seed()
+    }
+
+    /// Tells this Planet's caves from another's, in a thread's cache of what is made from them.
+    pub(crate) fn id(&self) -> u64 {
+        self.id
     }
 
     /// The cube `index` (in cubes of [`CELL`] Voxels): every tube of the systems grown in it, or
@@ -556,6 +592,39 @@ impl Caves {
         })
     }
 
+    /// The caves' density at `point`, from `tubes` (see [`Caves::near`]): how far inside the
+    /// nearest wall of a tube it is, in Voxels, roughness and all, so that it is above zero in a
+    /// cave and below it in the rock, and its gradient points into the cave, away from the wall.
+    /// It is [`Caves::carves`] for a Voxel of level 0 as a number: that is whether this is above
+    /// zero. Without the tubes, `f64::NEG_INFINITY`. It does not know the ground: a tube is air
+    /// only where the ground is above it (see `Planet::carved`).
+    pub(crate) fn density(
+        &self,
+        tubes: &[Tube],
+        point: [f64; 3],
+        cache: &mut Option<Corners>,
+    ) -> f64 {
+        let mut rough = None;
+        let mut best = f64::NEG_INFINITY;
+        for tube in tubes {
+            let (off2, radius) = tube.nearest(point);
+            let farthest = radius + ROUGHNESS;
+            if off2 >= farthest * farthest * 4.0 {
+                continue;
+            }
+            let rough = *rough.get_or_insert_with(|| {
+                value_noise(
+                    self.seed() ^ ROUGH_SALT,
+                    point.map(|c| c.floor() as i32),
+                    ROUGH_CELL,
+                    cache,
+                )
+            });
+            best = best.max(radius + ROUGHNESS * rough - off2.sqrt());
+        }
+        best
+    }
+
     /// FNV-1a hash of the tubes of the cubes that the box from `low` to `high` touches: the
     /// tubes' ends and radii, bit for bit, cube by cube. It is what the golden test
     /// (`tests/golden.rs`) holds the generator's walk to.
@@ -637,6 +706,7 @@ mod tests {
             b: random_point(dice, 300.0),
             ra: dice.between(PASSAGE),
             rb: dice.between(CHAMBER),
+            system: 0,
         }
     }
 
@@ -673,6 +743,7 @@ mod tests {
             b: [100.0, 0.0, 0.0],
             ra: 10.0,
             rb: 10.0,
+            system: 0,
         };
         let far = |at: [f64; 3]| tube.reaches(at, at.map(|c| c + 7.0), 1.0);
         assert!(far([50.0, 10.0, 0.0]));
@@ -716,6 +787,7 @@ mod tests {
             b: [400.0, 0.0, 0.0],
             ra: 40.0,
             rb: 40.0,
+            system: 0,
         };
         let (mut inside, mut outside) = (0, 0);
         for x in 0..200 {
