@@ -92,9 +92,10 @@ clock on by the pause. The stepped parts are in the shipped binary, since `clien
 ## No GPU on Windows
 
 The Windows runners have no Vulkan driver. So `windows-tests` does not run the `render` crate or
-`bins/client/tests/bench.rs`. It also skips five client unit tests by name, because they make an
+`bins/client/tests/bench.rs`. It also skips six client unit tests by name, because they make an
 `Offscreen` renderer: `bench::caves::tests::the_stills_are_timed_and_photographed`,
-`bench::landscape::the_landscape_from_the_ground_500_m_and_20_km_matches_the_approved_images` (#166) and
+`bench::landscape::the_landscape_from_the_ground_500_m_and_20_km_matches_the_approved_images` (#166),
+`bench::crystals::a_cluster_on_a_sunlit_slope_and_a_crystal_cave_match_the_approved_images` (#204) and
 `bench::edits::tests::the_largest_brush_is_dug_and_placed_in_turn_at_no_more_than_the_metric_rate`
 `bench::lookdev::run::tests::a_short_run_writes_a_folder_for_each_shot_and_a_sheet_that_names_every_image`
 (#202) and `bench::tests::the_flights_updates_are_logged_by_where_in_the_run_they_were_made` (#50).

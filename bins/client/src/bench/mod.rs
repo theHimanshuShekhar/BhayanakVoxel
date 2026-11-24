@@ -13,6 +13,8 @@ mod args;
 mod budget;
 mod caves;
 mod convergence;
+#[cfg(test)]
+mod crystals;
 mod daycycle;
 mod edits;
 #[cfg(test)]
