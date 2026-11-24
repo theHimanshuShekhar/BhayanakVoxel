@@ -416,7 +416,7 @@ mod tests {
 
     /// The shader files, all of them known: a new one is neither of a view nor checked until it is
     /// listed here.
-    const FILES: [&str; 18] = [
+    const FILES: [&str; 19] = [
         "trace.wgsl",
         // The hardware backend's boxes, made on the GPU (#236): lights nothing, joined to trace.wgsl by `boxes`.
         "hw_boxes.wgsl",
