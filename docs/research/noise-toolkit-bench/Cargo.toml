@@ -1,0 +1,11 @@
+# Throwaway microbenchmark for #240 (research branch only; never merged).
+[package]
+name = "noise-toolkit-bench"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[profile.release]
+debug = false
