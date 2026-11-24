@@ -1300,3 +1300,40 @@ fn the_groups_built_at_once_use_up_the_frames_box_budget() {
     // what the urgent ones were not charged.
     assert_eq!(moved(urgent / 2).unwrap(), (urgent, waiting));
 }
+
+/// An Edit of the ground by the camera, dug and placed in turn as the bench's Edit stress does,
+/// fits in the scene's buffers: none is made again bigger and copied (a growth is a new buffer, a
+/// copy and a new bind group, which the first Edit of a context that had not been where the others
+/// were would pay for, #236), on either backend.
+#[test]
+fn edits_by_the_ground_fit_in_the_scenes_buffers_on_either_backend() {
+    for backend in [RtBackend::Compute, RtBackend::Hardware] {
+        let (mut store, mut scene) = walking_scene();
+        let mut gpu = Offscreen::with_backend(Resolution::native(8, 8), &scene, backend).unwrap();
+        if gpu.rt().active != backend {
+            eprintln!("skipped: {:?}", gpu.rt().fallback);
+            continue;
+        }
+        for edit in 0..6 {
+            let mut changed = std::collections::BTreeSet::new();
+            for x in 0..40 {
+                for z in 0..40 {
+                    for y in 1500..1540 {
+                        let at = VoxelCoord([x, y, z]);
+                        store.set(at, (edit % 2 == 0).then_some(STONE));
+                        changed.insert(at.brick());
+                    }
+                }
+            }
+            let changed: Vec<BrickCoord> = changed.into_iter().collect();
+            store.refresh_lod(changed.iter().copied());
+            let update = scene.update(&store, &changed).unwrap();
+            gpu.update_scene(&scene, &update).unwrap();
+            assert_eq!(
+                gpu.last_grown_bytes(),
+                0,
+                "{backend:?}: Edit {edit} made a scene buffer bigger"
+            );
+        }
+    }
+}

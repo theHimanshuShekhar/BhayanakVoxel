@@ -1549,11 +1549,18 @@ Edits). All are on the same GPU, driver and clocks. Read `rt.comparison`:
   Edit by the ground. Every Edit stress (`edits`, `hw_edits`, both grounds) has
   **`frame_thread_parts`**, the frame thread by part, each a `Stats` over the Edits: `edit` (the
   Edit planned and level 0 written: the same on both backends), `scene_write` (the scene's
-  buffers; the same too), `flush` (the submit that sends them), `accel` (the hardware's update, less
+  buffers, what is left once the parts below are out; the same too), `scene_grow` (buffers that
+  grew: a new buffer, a copy, a new bind group), `scene_submit` (the host's time in the `Queue::submit`
+  of the scene's copies, where a driver that holds the submit up behind earlier GPU work shows),
+  `scene_emitters` (the emitter index), `flush` (the submit that sends them), `accel` (the hardware's update, less
   its wait: what a frame of the game pays), `accel_wait` (the stress waits for the GPU's builds, the
   game does not: **it is in `frame_thread` and in `accel.total_ms`, so the Edit+BVH figure is an
   upper bound**) and `edit_made`; and **`frame_thread_each`**, each Edit's frame-thread ms in order
-  (the first is the cold one).
+  (the first is the cold one), and **`grown_bytes_each`**, the bytes copied into buffers that grew.
+  The stress waits for the GPU to be idle before its first Edit (`Offscreen::wait_idle`), so that
+  the jump that brought the camera there, whose hardware builds are not waited for, is not in it:
+  on the 4090 the first hardware Edit by the ground was 5.7 ms (the others 1.4 to 2.0), 3.2 of them in
+  `scene_write`, and compute's 1.9 with 0.4.
 - `hw_edits`: the Edit stress on the hardware backend, in the report's `edits` shape, to put by
   `edits` (compute). **Both stress runs start from the same camera and rings**: the sweep's last
   height (20 000 Voxels over the pole), where the compute run ends the sweep, and the hardware run

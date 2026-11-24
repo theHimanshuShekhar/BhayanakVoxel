@@ -675,6 +675,10 @@ pub struct Tracer {
     /// How long the last [`Tracer::update_scene`] spent making the buffers that grew (making them
     /// and recording the copies), on the host.
     last_grow_time: std::time::Duration,
+    /// The host's time in the last scene update's submit of its copies (and the belt's recall).
+    last_upload_submit: std::time::Duration,
+    /// The host's time in the last scene update's emitter index (`update_emitters`).
+    last_emitters: std::time::Duration,
     /// The most bytes of GPU memory the scene's buffers have taken while a buffer grew: what they
     /// held before, and the new buffers made, with the old buffer and the new one both there while
     /// the copy into the bigger one is made. 0 if none has grown.
@@ -1468,6 +1472,8 @@ impl Tracer {
             last_writes: 0,
             last_grown: 0,
             last_grow_time: std::time::Duration::ZERO,
+            last_upload_submit: std::time::Duration::ZERO,
+            last_emitters: std::time::Duration::ZERO,
             peak_growth_bytes: 0,
             peak_rebuild_bytes: 0,
             belt,
@@ -2015,7 +2021,9 @@ impl Tracer {
     ) -> Result<()> {
         self.restart_reference();
         self.smooth_end = smooth_end(scene);
+        let emitting = std::time::Instant::now();
         self.update_emitters(device, scene, update);
+        self.last_emitters = emitting.elapsed();
         // Counted where each write is made, not summed from the patch's cost: [`upload_cost`] is
         // the other count, and the two are compared. Both go over `RingPatch::copies()`, so the
         // comparison does not check that list (the stepped tests' `GpuCopy::assert_is` does).
@@ -2024,6 +2032,7 @@ impl Tracer {
         self.last_writes = 0;
         self.last_grown = 0;
         self.last_grow_time = std::time::Duration::ZERO;
+        self.last_upload_submit = std::time::Duration::ZERO;
         match update {
             SceneUpdate::Rebuilt => {
                 let before = self.scene.bytes;
@@ -2080,9 +2089,11 @@ impl Tracer {
                     written += bytes.len() as u64;
                     writes += 1;
                 }
+                let submitting = std::time::Instant::now();
                 self.belt.finish();
                 queue.submit(std::iter::once(encoder.finish()));
                 self.belt.recall();
+                self.last_upload_submit = submitting.elapsed();
             }
             SceneUpdate::Patched {
                 regions,
@@ -2144,6 +2155,16 @@ impl Tracer {
     /// the copies into them, on the host (the GPU's copy is not in it). Zero if nothing grew.
     pub fn last_grow_time(&self) -> std::time::Duration {
         self.last_grow_time
+    }
+
+    /// The host's time in the emitter index of the last [`Tracer::update_scene`].
+    pub fn last_emitters(&self) -> std::time::Duration {
+        self.last_emitters
+    }
+
+    /// The host's time in the `Queue::submit` of the last [`Tracer::update_scene`]'s copies.
+    pub fn last_upload_submit(&self) -> std::time::Duration {
+        self.last_upload_submit
     }
 
     /// How many times each of the scene's table, regions, brick refs and bricks buffers has been

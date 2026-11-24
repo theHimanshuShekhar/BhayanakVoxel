@@ -58,6 +58,15 @@ pub struct FrameThreadParts {
     /// `Offscreen::update_scene` less the hardware's update: the writes of the scene's buffers
     /// (and a buffer that grew). The same on both backends.
     pub scene_write: Stats,
+    /// The scene's buffers that grew (a new buffer, the copy into it and a new bind group): 0 but
+    /// for the Edit that needs more room than they had, which on a context that has not been to
+    /// the ground yet is the first (`grown_bytes_each` says which).
+    pub scene_grow: Stats,
+    /// The host's time in the `Queue::submit` of the scene's copies: where a driver that holds the
+    /// submit up behind earlier GPU work (a jump's builds, not waited for) shows.
+    pub scene_submit: Stats,
+    /// The emitter index's update (the list of lights an Edit may change).
+    pub scene_emitters: Stats,
     /// The submit with no commands that sends them (`flush`): on the hardware backend it also
     /// has to get the box pass and the builds' commands to the driver.
     pub flush: Stats,
@@ -93,6 +102,8 @@ pub struct EditsReport {
     pub frame_thread_parts: FrameThreadParts,
     /// The frame-thread time of each Edit in ms, in order (the first is the cold one).
     pub frame_thread_each: Vec<f64>,
+    /// The bytes that each Edit's update copied on the GPU into scene buffers that grew, in order.
+    pub grown_bytes_each: Vec<u64>,
     /// CPU time of the part of each Edit that is the scene thread's: the coarse levels remade and
     /// the changed bricks packed. Not held to a budget.
     pub scene_thread: Stats,
@@ -117,10 +128,12 @@ impl EditsReport {
 
 /// The time of `Offscreen::update_scene` (`write`, which has the hardware's update in it) and of the
 /// hardware's updates (`prepare` + `build`, which has their `wait` in it) in the parts the stress
-/// reports: the scene's own writes, the hardware's update less its wait, and its wait.
-fn split_update(write: f64, accel_total: f64, wait: f64) -> (f64, f64, f64) {
+/// reports: the scene's own writes (what is left of `write` once the parts that have a part of their
+/// own are out of it: `grow`, the buffers that grew, and `named`, the submit and the emitter index),
+/// the hardware's update less its wait, and its wait.
+fn split_update(write: f64, grow: f64, named: f64, accel_total: f64, wait: f64) -> (f64, f64, f64) {
     let accel = (accel_total - wait).max(0.0);
-    ((write - accel_total).max(0.0), accel, wait)
+    ((write - accel_total - grow - named).max(0.0), accel, wait)
 }
 
 /// The mode of Edit number `edit` (from 0): `first`, then the other, in turn.
@@ -163,11 +176,16 @@ pub fn run(
     let mut allowance = sim::EditBudget::full();
     let (mut per_frame, mut per_edit) = (Vec::new(), Vec::new());
     let (mut frame_thread, mut scene_thread) = (Vec::new(), Vec::new());
-    let mut parts: [Vec<f64>; 6] = Default::default();
+    let mut parts: [Vec<f64>; 9] = Default::default();
+    let mut grown: Vec<u64> = Vec::new();
     let mut accel_log = Vec::new();
     let (mut edits, mut voxels) = (0u32, 0u64);
     // What the flight did to the acceleration structures is not the Edits'.
     gpu.take_hardware_updates();
+    // The moves that brought the camera here (a jump, whose builds on the hardware backend are not
+    // waited for) are over before the first Edit is timed, so that it is not timed behind them
+    // (#236: the first hardware Edit by the ground was 5.7 ms, 3.2 of them in the scene's write).
+    gpu.wait_idle();
     // An update of the hardware backend's structures does not wait for the GPU, so that a frame
     // never does; here it waits, so that the time of an Edit has the builds' own in it (#236). The
     // wait is for everything the queue holds, the previous frame's passes and the scene's own
@@ -201,9 +219,13 @@ pub fn run(
             gpu.edit_made(&changed);
             let done = began.elapsed();
             let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3;
+            let grow_ms = ms(gpu.last_grow_time());
+            grown.push(gpu.last_grown_bytes());
             let hw = gpu.take_hardware_updates();
             let (scene_write_ms, accel_ms, wait_ms) = split_update(
                 ms(gpu.last_update_times().write),
+                grow_ms,
+                ms(gpu.last_update_times().submit) + ms(gpu.last_update_times().emitters),
                 hw.iter().map(|u| ms(u.prepare + u.build)).sum(),
                 hw.iter().map(|u| ms(u.phases.wait)).sum(),
             );
@@ -214,6 +236,9 @@ pub fn run(
             parts[3].push(accel_ms);
             parts[4].push(ms(done - updated));
             parts[5].push(wait_ms);
+            parts[6].push(grow_ms);
+            parts[7].push(ms(times.submit));
+            parts[8].push(ms(times.emitters));
             accel_log.extend(hw);
             took = done.as_secs_f64() * 1e3;
             frame_thread.push(((done - packed) + written).as_secs_f64() * 1e3);
@@ -254,12 +279,16 @@ pub fn run(
         frame_thread_parts: FrameThreadParts {
             edit: Stats::of(&parts[0]),
             scene_write: Stats::of(&parts[1]),
+            scene_grow: Stats::of(&parts[6]),
+            scene_submit: Stats::of(&parts[7]),
+            scene_emitters: Stats::of(&parts[8]),
             flush: Stats::of(&parts[2]),
             accel: Stats::of(&parts[3]),
             accel_wait: Stats::of(&parts[5]),
             edit_made: Stats::of(&parts[4]),
         },
         frame_thread_each: frame_thread.clone(),
+        grown_bytes_each: grown,
         scene_thread: Stats::of(&scene_thread),
         per_frame: Entry {
             name: "edits".to_string(),
@@ -279,12 +308,12 @@ mod tests {
     #[test]
     fn an_updates_time_is_split_into_the_scenes_writes_the_hardwares_work_and_its_wait() {
         // 5 ms of the call: 1 of the scene's, and 4 of the hardware's, 3 of which were the wait.
-        let (scene, accel, wait) = split_update(5.0, 4.0, 3.0);
+        let (scene, accel, wait) = split_update(6.0, 0.5, 0.5, 4.0, 3.0);
         assert_eq!((scene, accel, wait), (1.0, 1.0, 3.0));
         // The three add up to the call.
-        assert_eq!(scene + accel + wait, 5.0);
+        assert_eq!(scene + accel + wait + 0.5 + 0.5, 6.0);
         // On compute there is no hardware: it is all the scene's.
-        assert_eq!(split_update(0.5, 0.0, 0.0), (0.5, 0.0, 0.0));
+        assert_eq!(split_update(0.5, 0.0, 0.0, 0.0, 0.0), (0.5, 0.0, 0.0));
     }
 
     #[test]
@@ -331,10 +360,20 @@ mod tests {
         // Each Edit's frame-thread time is kept, and its parts (one sample each) are no more than it:
         // the parts are the clock's reads between, so they add up to it but for the reads.
         assert_eq!(report.frame_thread_each.len(), report.edits as usize);
+        // No Edit needs a scene buffer that is bigger: a growth is a new buffer and a copy, which
+        // the first Edit of a context that has not been where the others were would pay.
+        assert_eq!(report.grown_bytes_each.len(), report.edits as usize);
+        assert!(
+            report.grown_bytes_each.iter().all(|&b| b == 0),
+            "{report:?}"
+        );
         let parts = &report.frame_thread_parts;
         for part in [
             &parts.edit,
             &parts.scene_write,
+            &parts.scene_grow,
+            &parts.scene_submit,
+            &parts.scene_emitters,
             &parts.flush,
             &parts.edit_made,
         ] {
@@ -344,6 +383,9 @@ mod tests {
         let sum = [
             &parts.edit,
             &parts.scene_write,
+            &parts.scene_grow,
+            &parts.scene_submit,
+            &parts.scene_emitters,
             &parts.flush,
             &parts.accel,
             &parts.accel_wait,

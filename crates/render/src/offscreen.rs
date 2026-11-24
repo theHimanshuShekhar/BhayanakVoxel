@@ -113,6 +113,12 @@ pub struct UpdateTimes {
     pub write: std::time::Duration,
     /// Sending them: the submit with no commands that follows (not made if flushing is off).
     pub flush: std::time::Duration,
+    /// Of `write`, the host's time in the emitter index (what the update does to the list of lights).
+    pub emitters: std::time::Duration,
+    /// Of `write`, the host's time in the `Queue::submit` of the copies (a ring update's own
+    /// command buffer), which is where a submit that the driver holds up behind earlier GPU work
+    /// shows.
+    pub submit: std::time::Duration,
     /// Copies written to the staging belt: each is a copy on the GPU with a barrier of its own. 0
     /// for a rebuild.
     pub writes: u32,
@@ -465,9 +471,19 @@ impl Offscreen {
         self.last_update = UpdateTimes {
             write: written,
             flush: began.elapsed() - written,
+            submit: self.tracer.last_upload_submit(),
+            emitters: self.tracer.last_emitters(),
             writes: self.tracer.last_writes(),
         };
         Ok(())
+    }
+
+    /// Waits until the GPU has done everything that was submitted, so that what comes next is not
+    /// timed behind it (the bench, after a jump whose builds are not waited for, #236).
+    pub fn wait_idle(&self) {
+        self.device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .expect("device poll failed");
     }
 
     /// Says that an Edit changed `bricks`, so that the radiance cache follows the light round them
