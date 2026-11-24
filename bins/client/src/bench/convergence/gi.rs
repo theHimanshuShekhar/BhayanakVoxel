@@ -9,7 +9,8 @@
 //! that the scores of one run say how the views stand and nothing else. Primary is drawn twice, on
 //! a GPU context of its own each:
 //! - **`flat`**: the flat ambient of 0.25 that main's Primary had before #54
-//!   ([`Offscreen::set_flat_ambient`]), the baseline, with no denoiser. It is not a mode of the game;
+//!   ([`Offscreen::set_flat_ambient`]), the baseline, with no denoiser and the centre-cosine sun weight (the only one before #55, whatever
+//!   `--shadow-weight` says). It is not a mode of the game;
 //!   it is here so that "no view moves further from the Reference than main's Primary" has a number
 //!   on the same build, and the report has each view's score before and after.
 //! - **`raw`**: the cache's GI with the denoiser off ([`render::Denoise::Off`]): Primary as #54 left
@@ -436,7 +437,9 @@ pub fn score_view(
         Lighting {
             flat: true,
             denoise: Denoise::Off,
-            shadow_weight: weight,
+            // The baseline `no-further:VIEW` holds Primary's GI to, as it was at schema 31 (the
+            // only weight there was): not the run's, which is noisier when it is per-sample.
+            shadow_weight: ShadowWeight::CentreCosine,
         },
     )?;
     let (raw, raw_settled) = variant("raw", lit(Denoise::Off, weight))?;

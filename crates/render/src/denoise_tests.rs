@@ -464,18 +464,113 @@ fn a_new_history_is_the_samples_and_so_is_one_a_fast_turn_leaves() {
 }
 
 #[test]
+fn a_surface_a_voxel_nearer_does_not_inherit_the_history_of_the_one_behind() {
+    // What this guards: `PLANE_TOLERANCE`, the distance from its plane at which a history stops being
+    // the pixel's. A terrace's edge, a stair or the floor of a dug voxel is one Voxel off the plane
+    // of what the pixel showed, and what it shows now is another surface with another light. A wall
+    // 2 Voxels away with a history of 1.0, then the same wall 1 Voxel nearer with samples of 0.4
+    // (noise 0.3): the history is not used, the result is the samples (0.41 measured; with the
+    // tolerance at 2 Voxels it is 0.95, the old light). The same wall where it was keeps the history
+    // (0.95), so that the tolerance is not simply shut.
+    let frame_with_wall_at = |distance: f32| {
+        let mut rig = Rig::new();
+        rig.wall(2.0);
+        still_frames(&mut rig, Denoise::Temporal, 40, 0.0, |_, _| 1.0);
+        let before = rig.camera;
+        rig.wall(distance);
+        rig.samples(0.3, |_, _| 0.4);
+        let written = rig.run(
+            Denoise::Temporal,
+            &Inputs {
+                has_history: true,
+                previous: Some(before),
+                boost: None,
+            },
+        );
+        let light = rig.light(Denoise::Temporal, written);
+        mean(columns(&light, 8, 56, |p| p[0]).into_iter())
+    };
+    let same = frame_with_wall_at(2.0);
+    assert!(same > 0.8, "the same wall keeps its history: {same}");
+    let nearer = frame_with_wall_at(1.0);
+    assert!(
+        nearer < 0.5,
+        "a wall a Voxel nearer has the old wall's light: {nearer}"
+    );
+}
+
+#[test]
 fn the_filter_keeps_an_edge_in_depth_that_the_light_does_not_show() {
     // What this guards: the plane-distance stop of the à-trous filter. Two walls side by side, one
     // 20 Voxels away and one 40, lit 3.0 and 2.0 with a noise of 1.0 on both (the luminance stop, which reads
     // the variance, is loose over that step: it is the geometry that must hold the edge). One
     // frame (no history, the variance from the neighbourhood) through the whole filter, whose
     // reach is 30 pixels: the six columns each side of the edge keep their step (1.0, to within the
-    // noise that is left, which the filter does not take out of pixels it finds quiet). Without the
+    // noise that is left). Without the
     // depth stop the step is under 0.95 (0.78 and 0.81 measured).
     let mut rig = Rig::new();
     let camera = rig.camera;
     rig.set_surfaces(|x, y| {
         let distance = if x < SIZE.0 / 2 { 20.0 } else { 40.0 };
+        (Rig::along_ray(&camera, (x, y), distance), PLUS_Z)
+    });
+    rig.samples(1.0, |x, _| if x < SIZE.0 / 2 { 3.0 } else { 2.0 });
+    let written = rig.run(
+        Denoise::Full,
+        &Inputs {
+            has_history: false,
+            ..Inputs::still()
+        },
+    );
+    let light = rig.light(Denoise::Full, written);
+    let near = mean(columns(&light, 26, 32, |p| p[0]).into_iter());
+    let far = mean(columns(&light, 32, 38, |p| p[0]).into_iter());
+    assert!(
+        near - far > 0.95,
+        "the step across the edge (3.0 to 2.0) is {} after the filter",
+        near - far
+    );
+}
+
+#[test]
+fn the_filter_keeps_a_step_in_the_light_on_one_plane_at_settled() {
+    // What this guards: the filter's luminance and sun stops (`PHI_LIGHT`, `PHI_SUN`, `LIGHT_FLOOR`,
+    // `SUN_FLOOR`), which are all that holds a shadow's edge or the edge of an emitter's pool of
+    // light on a flat surface (the plane and the normal are the same either side). A wall of one
+    // plane, lit 1.0 on the left and 0.9 on the right (in the light and in the sun's weight alike),
+    // with noise of 0.1, 40 frames of a still view in: the history's variance is small, so the stops
+    // are tight, and the step across the edge stays at 0.098 (of 0.1) over the six columns each
+    // side. Measured with the stops loosened: 0.081 at PHI 20, 0.066 at 50 and 0.028 at 1000, and
+    // 0.024 with any one of the floors at 1000 (the sun's floor only in the sun's channel), which
+    // no other test sees.
+    let mut rig = Rig::new();
+    rig.wall(20.0);
+    let step = |x: u32, _: u32| if x < SIZE.0 / 2 { 1.0 } else { 0.9 };
+    let written = still_frames(&mut rig, Denoise::Full, 40, 0.1, step);
+    let light = rig.light(Denoise::Full, written);
+    for (name, channel) in [("light", 0), ("sun", 3)] {
+        let near = mean(columns(&light, 26, 32, |p| p[channel]).into_iter());
+        let far = mean(columns(&light, 32, 38, |p| p[channel]).into_iter());
+        assert!(
+            near - far > 0.09,
+            "the step of the {name} across the edge (0.4) is {} after the filter",
+            near - far
+        );
+    }
+}
+
+#[test]
+fn the_filter_keeps_a_step_of_one_voxel_in_depth_that_the_light_does_not_show() {
+    // What this guards: `PHI_PLANE`, the width of the filter's plane stop, at the size of a Voxel's
+    // step (a stair, a terrace, the wall of a dug hole). Two walls side by side, 2 Voxels away and 1
+    // (the same plane, a Voxel apart), lit 3.0 and 2.0 with a noise of 1.0 so that the luminance stop
+    // is loose: one frame with no history through the whole filter, and the six columns each side of
+    // the edge keep their step (1.0, to within the noise that is left). With the plane stop as wide
+    // as it was at first (2 Voxels) a Voxel's step is crossed (0.90 measured).
+    let mut rig = Rig::new();
+    let camera = rig.camera;
+    rig.set_surfaces(|x, y| {
+        let distance = if x < SIZE.0 / 2 { 2.0 } else { 1.0 };
         (Rig::along_ray(&camera, (x, y), distance), PLUS_Z)
     });
     rig.samples(1.0, |x, _| if x < SIZE.0 / 2 { 3.0 } else { 2.0 });

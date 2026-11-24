@@ -97,7 +97,9 @@ override ATROUS_STEP = 1;
 // farther from its plane than this many Voxels (plus the pixel's footprint, which grows with the
 // distance and with how slanted the surface is), or with a normal whose cosine to the pixel's is
 // under NORMAL_MIN.
-const PLANE_TOLERANCE = 2.0;
+// Half a Voxel: a stair's or a terrace's step, or the floor of a dug voxel, is a Voxel off the plane of
+// what the pixel showed before, and is not the same surface (at 2 Voxels its history was kept).
+const PLANE_TOLERANCE = 0.5;
 const NORMAL_MIN = 0.9;
 // The neighbours that count for the pixel's neighbourhood (the 3 x 3 round it) are on its surface in
 // the same way, a little more loosely.
@@ -137,7 +139,7 @@ const SUN_FLOOR = 0.002;
 // The depth's: the distance to the centre's tangent plane over this many Voxels, plus a quarter of a
 // pixel's footprint a step of the filter (a curved surface leaves its tangent plane the farther the
 // tap is), in a Gaussian. The normal's: the cosine to this power.
-const PHI_PLANE = 2.0;
+const PHI_PLANE = 0.5;
 const NORMAL_POWER = 24.0;
 // The B3 spline's weights at 0, 1 and 2 taps from the centre.
 const ATROUS_KERNEL = array<f32, 3>(0.375, 0.25, 0.0625);

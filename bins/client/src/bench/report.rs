@@ -181,6 +181,8 @@ use super::stream::StreamReport;
 /// names and `reference_64` (mean and 99th percentile) are new. In `convergence.gi.gates`
 /// `room_target_flip` is now `primary_target_flip` (0.05, every view's settled `gi` and the sun
 /// view's settled Primary; the gate `room-flip` is now `primary-flip:VIEW` with `sun` among the views).
+/// The `flat` variant (the baseline of the gate `no-further:VIEW`) is drawn with the centre-cosine
+/// weight whatever `--shadow-weight` says, as it was at schema 31 (the only weight there was).
 /// Each view's `gi` and `convergence.shadows` have a `converged` (null with `--converged-frames 0`):
 /// Primary with no denoiser averaged over `--converged-frames` frames (default 1024) of the settled
 /// still view, with `frames`, `luminance_ratio`, `bias` (FLIP against truth A), `residual` (the

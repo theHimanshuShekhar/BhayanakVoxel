@@ -500,27 +500,6 @@ impl Offscreen {
         self.read_signals(&texture, true)
     }
 
-    /// The variance of the estimate the denoiser's temporal kernel made of each signal in the last
-    /// frame of [`Offscreen::render_upscaled`]: the light's luminance in x and the sun's weight in
-    /// y, for every pixel of the traced image. Zero with the denoiser off. For tests.
-    pub fn read_light_variance(&mut self) -> Vec<[f32; 2]> {
-        let size = self.target.resolution().internal;
-        let texture = self.tracer.light_variance(&self.target).texture.clone();
-        let encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
-        let bytes = read_texture(&self.device, &self.queue, encoder, &texture, size, 8);
-        bytes
-            .chunks(8)
-            .map(|t| {
-                [
-                    f32::from_le_bytes(t[0..4].try_into().unwrap()),
-                    f32::from_le_bytes(t[4..8].try_into().unwrap()),
-                ]
-            })
-            .collect()
-    }
-
     fn read_signals(&mut self, texture: &wgpu::Texture, wide: bool) -> Vec<[f32; 4]> {
         let size = self.target.resolution().internal;
         let encoder = self

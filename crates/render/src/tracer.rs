@@ -89,7 +89,7 @@ const DENOISED_BINDING: u32 = 23;
 /// The two agree in expectation where the surface faces the sun squarely, and differ by the change of
 /// the cosine over the sun's disc at a penumbra and where the surface is nearly edge-on to the sun,
 /// which is where #52's miss was. `PerSample` is the default (the 4090 of #55 measured the sun view's
-/// settled FLIP at 0.026 with it and the denoiser, against 0.055 with the centre cosine); the
+/// settled FLIP at 0.021 with it and the denoiser, against 0.055 with the centre cosine); the
 /// bench's `--shadow-weight` chooses, and reports both.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(u32)]
@@ -2241,11 +2241,6 @@ impl Tracer {
         let plane = target.denoise.result(self.denoise, self.denoise_written);
         let wide = plane.texture.format() == wgpu::TextureFormat::Rgba32Float;
         (plane, wide)
-    }
-
-    /// The variance that the denoiser's temporal kernel estimated for the last frame's light.
-    pub(crate) fn light_variance<'a>(&self, target: &'a Target) -> &'a Plane {
-        target.denoise.temporal_variance()
     }
 
     /// The frame's samples of the last frame of Primary, before the denoiser (half floats).

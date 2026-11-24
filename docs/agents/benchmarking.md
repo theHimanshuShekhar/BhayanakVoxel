@@ -1341,7 +1341,7 @@ run without it (0.178 ms at 1 ray on the 4090, 1440p) or from `--diag` runs of a
   the default 2 rays the first frame is **0.062** and the settled image **0.059**, so
   `meets_target` is false; 1 ray was 0.074 and 0.072 (`--shadow-rays 1`). The owner shipped 2 rays
   with the centre-cosine weight; its bias was the cause, and #55 made the unbiased per-sample weight
-  the default (0.026 settled on the 4090 with the denoiser; ADR 0005's "Sun and shadows" row has the
+  the default (0.021 settled on the 4090 with the denoiser at 70463f2, 0.026 before the filter's last change; ADR 0005's "Sun and shadows" row has the
   numbers). `meets_target` is reported and printed only: it is not a
   gate and does not change the exit status, and the target is not loosened.
 - **The shadow-edge error** (`edge`). FLIP's mean over a whole image says little about the few
@@ -1454,6 +1454,9 @@ Primary as the game does calls `set_denoise(Denoise::Full)` next to `set_flat_am
 the look-dev sheet, the flight). The `denoise` pass (budget 1.0 ms in `bench-budgets.toml`) is in
 `passes[]`; it holds the frame's samples from the lattice, the temporal accumulation and the filter, and
 sits before the upscaler (`crates/render/src/denoise.rs` has the account).
+Cost: 0.228 ms mean (0.256 p95) on the 4090 at 2560x1440 with Primary traced at 1280x720 (70463f2).
+It scales with the traced pixels, and **the review's estimate, not measured, is about 0.5 ms at 4K at the
+default 0.5 scale and about 2 ms at 4K native**, which is over the 1.0 ms budget.
 
 What the 4090 runs for #55 (the orchestrator's, with the PR's Windows artifact):
 

@@ -371,11 +371,13 @@ fn a_wall_a_pillar_uncovers_is_not_ghosted_by_the_pillar_through_the_denoiser() 
     // What this guards: no ghost after a fast move, where the history of one surface is in front of
     // another: a pillar between the camera and the wall behind it that the strafe moves across, and
     // the wall that it uncovers has the pillar in its history. The denoised light of the frame is
-    // closer to the view it is of (settled) than to the view of 8 frames before. It fails with the
-    // history reprojected to the wrong place (the camera's shift taken wrong) and with history
-    // that is never used up. The geometry checks that reject the pillar's history are
-    // `denoise.rs`'s `a_new_history_is_the_samples_and_so_is_one_a_fast_turn_leaves`: this room's
-    // light is too soft for their absence to show in a mean.
+    // closer to the view it is of (settled) than to the view of 8 frames before (0.0077 from its
+    // view and 0.0335 from the old one, measured). It fails with the history reprojected to the wrong
+    // place (the camera's shift taken wrong), with history that is never used up, and with the
+    // plane and normal checks off (`PLANE_TOLERANCE` huge and `NORMAL_MIN` below -1: 0.0135 and
+    // 0.0269, under the factor of 2 asked for). The checks are held more sharply, on a surface of
+    // known depth, by `a_new_history_is_the_samples_and_so_is_one_a_fast_turn_leaves` in
+    // `denoise_tests.rs`.
     let scene = Scene::new(&room(false, true), None);
     let (now, settled, old) = strafe(&scene, Denoise::Full, 16);
     let (to_now, to_old) = (difference(&now, &settled), difference(&now, &old));

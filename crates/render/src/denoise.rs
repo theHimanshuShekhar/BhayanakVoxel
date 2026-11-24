@@ -155,7 +155,9 @@ impl Buffers {
     }
 
     /// The variance of the estimate that the temporal kernel made last (x: the light's luminance, y:
-    /// the sun's weight), for tests.
+    /// the sun's weight), for tests. **Only meaningful after a `Denoise::Temporal` frame**: a `Full`
+    /// frame's filter writes its own variance over it.
+    #[cfg(test)]
     pub(crate) fn temporal_variance(&self) -> &Plane {
         &self.variance[0]
     }
