@@ -1818,6 +1818,75 @@ lavapipe: `--shot` picks the shots whose names contain it), and look at the stri
 half way up and overhead for sun elevations from -12 to 60 degrees, untinted and tinted, and `horizon_profile`
 prints the rows of a level view through the horizon.
 
+### The day (#203): the cycle bench and the day sheet
+
+**`client bench --day-cycle`** runs, after the flight and before the GPU is let go, **a whole day of the
+world clock, sped up**, over the flight's path on its GPU, and adds a `day_cycle` block to `report.json`
+(schema 32). The clock runs on a fixed 60 Hz schedule (a frame is a sixtieth of the clock's second, whatever
+the wall clock says), so a day of `--day-seconds N` seconds (default 60, which is 30 times the game's half
+hour; at least 4, since a faster sun would jump) is `60 N` frames, each moving the sun by 360/(60 N) degrees:
+a drift, never a jump (the bench's `sun_step_max_degrees` and `sun_jumps` say so; the jumps are the first
+frame and the two times a day the key light changes hands). It reports:
+
+- `start_hours` (where the day began), `frame_ms` (mean, p95, max), `frame_p99_ms` and `frames_over_limit`: **the gate**. A frame over 16.7 ms
+  or a p99 over it is `day_cycle.gates.over` and exit status 2 (`--no-fail` as ever). This is the "no frame
+  over the limit" of #203's acceptance.
+- `exposure` and `exposure_fixed_camera`: the auto-exposure read back every 6 frames (outside the timed
+  part), twice: over the flight, and over the same day from **one camera that does not move** (the cache
+  follow's view; the exposure is let settle at the first sky for 450 frames before it is read). Each has
+  `min_stops`, `max_stops`, `max_stops_per_s` (the fastest it moved over a second of the clock),
+  `total_variation_stops`, `travel_over_range` (the path walked over the range: about 2 for one rise at
+  dusk and one fall at dawn; every wobble adds to it) and `reversals` (how many times it turned round by
+  more than 0.05 stops). The flight's cannot tell pumping from scenery (a ridge against the sky, a cave
+  mouth change the exposure too, which is the metering working), so **`exposure_fixed_camera` is the "no
+  exposure pumping" measure**: only the sky changes it, a day should have a handful of reversals (noon,
+  night, and the dusk and dawn knees) and `travel_over_range` near 2, and a pumping exposure has tens.
+  Neither is **gated** (there is no agreed number yet): the first 4090 run sets one.
+- `cache_follow`: the radiance cache against a drifting sun (#203's design problem 2). For four times of
+  day (before dawn, morning, afternoon, after dusk), at the game's half-hour pace and at the sped-up one,
+  the clock runs for 2 seconds (120 frames) with no boost, and the image is compared with the same time put
+  there by a jump and settled (`drifted_levels`, mean absolute 8-bit levels per channel; `floor_levels` is
+  two settled frames against each other, the noise to read it against). The exposure is held fixed for it.
+  On the dev box (lavapipe, 96x54): at the game's pace the drift is 0.2 to 1.3 levels (the sun moves 0.4
+  degrees in 2 s, within about 0.5 of the floor); sped up 30 times (12 degrees in 2 s) 0.5 to 2.4 against 2
+  to 5 for a cache that was not told at all. It is reported and not gated.
+
+`--time-of-day H` (hours, 0 to 24) also lights the ordinary flight, sweep and Edits by the world clock's
+sky at that time, stopped there, in place of the fixed hero sun, and **is where the day cycle starts** (the
+day runs from there round to there again; the default is midnight): `client bench --time-of-day 21` is a
+night flight (the frame times at night: the moon is the key light, the stars and the night floor are drawn).
+
+On the 4090 (the owner or the orchestrating agent; not run in CI beyond `--short`):
+
+```
+client.exe bench --day-cycle --out bench-day
+client.exe bench --day-cycle --day-seconds 120 --time-of-day 21 --no-convergence --out bench-night
+```
+
+The first is the day cycle after the ordinary bench; the second adds a 2-minute day and a night flight.
+`--short --day-cycle` runs on the test Planet as a smoke test (its day is 6 s).
+
+**`client lookdev --out DIR --day`** is the sheet for the eye: the shots **meadow** (ground), **pull-out
+to the Planet** (orbit: the Zoom's far end) and **crystal cave, cyan** at **dawn, golden hour (hero light B's
+sun, on its way down), noon, dusk and night**, each in the Reference view and in Primary settled, with the
+world clock stopped there. At night the sky's frame is turned so that the moon is in view. It needs the real
+Planet (25 s of world map), and on lavapipe at 320x180 and 8 samples took about 3 minutes:
+
+```
+cargo run --release -p client -- lookdev --out /tmp/lookdev-day --day --size 320x180 --spp 8
+client.exe lookdev --out DIR --day          (the 4090: 1280x720, 64 samples)
+```
+
+**Tests** (`crates/render/tests/daylight.rs`, lavapipe): a time of day is one look whatever came before it
+(set, drifted to or run to give the same frame bit for bit) and two goldens (`daylight_moon_*`,
+`daylight_golden_*`); the moon and the stars are in the night sky and not the day's; the Reference view shows
+the same moon as Primary; the pillar's shadow falls away from the sun by day and from the moon by night; the
+sun's epoch holds under a drift and moves for a set and for the key light's two changes of hands; the cache
+keeps up with a drift at the game's pace and a sped-up one; the Reference view starts when the sky holds still
+and never while it moves; and the exposure aims lower the darker the sky. `cargo test -p render --test
+daylight dump_the_day -- --ignored` writes a sheet of the ground and orbit at eight times of day to
+`$DAY_DUMP`.
+
 ## Tests
 
 The statistics, budget evaluation and exit status, camera path, argument parsing and report shape
