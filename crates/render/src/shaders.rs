@@ -306,7 +306,7 @@ mod tests {
     }
 
     /// What reads a source of light, and the feature it is: an identifier of the shaders.
-    const READS: [(&str, &str); 10] = [
+    const READS: [(&str, &str); 11] = [
         ("frame.sun", "sun and shadows"),
         // The sun's light at the hit, which `shadows` wrote: the lit image's read of it.
         ("textureLoad(sun_weights", "sun and shadows"),
@@ -319,6 +319,9 @@ mod tests {
         // its first hit.
         ("escaped_sky(", "sky and atmosphere"),
         ("hazed(", "sky and atmosphere"),
+        // The moon's disc and halo and the stars, which the camera ray sees where it finds no
+        // hit (#203). The moon's *light* is the key light, read as `frame.sun`.
+        ("night_marks(", "moon and stars"),
         ("emission(", "emissive voxels"),
         ("surface_albedo(", "per-voxel colour variation"),
         ("varied_albedo(", "per-voxel colour variation"),

@@ -7,6 +7,7 @@ mod ground;
 mod movement;
 mod prediction;
 mod server;
+mod world_clock;
 
 use std::time::Duration;
 
@@ -25,6 +26,7 @@ pub use ground::{Footing, Ground};
 pub use movement::{ConfigError, Movement, MovementConfig};
 pub use prediction::{Predictor, SharedStore};
 pub use server::{Outcome, Server, ServerHandle, TICK_RATE_HZ, spawn};
+pub use world_clock::{DEFAULT_DAY_LENGTH_SECONDS, WorldClock};
 
 /// Fixed-timestep accumulator: turns elapsed wall-clock time into a whole number of ticks.
 pub struct FixedTimestep {

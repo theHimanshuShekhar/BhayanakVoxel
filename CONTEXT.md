@@ -76,6 +76,13 @@ _Avoid_: Real-time view, game view
 The unbiased view of the same world that the Primary view is measured against. It is shown when the view is Still and the scene has caught up with the camera (or the catch-up cap has passed, ADR 0005), and gets cleaner the longer it stays so.
 _Avoid_: Ground truth, path-traced mode, reference mode
 
+**World clock**:
+The time of day of the Planet: a fraction of the day (0 midnight, 0.25 sunrise, 0.5 noon, 0.75 sunset), the day's length in seconds (30 minutes by default), whether it is paused, and how many times it has been set. A plain value, so that in M2 the server holds it and sends it. It moves the sun and the moon (#203). **Setting** it (or a step that takes the sun far) is a *jump*: the light caches forget at once. **Running** it is a *drift*: they follow by their normal updates. It always runs, whatever the camera does; what is *shown* is held only while the Reference view is accumulating a Still view (the gate of the scene's hold), and catches up with the clock when the view moves again (a jump if far).
+_Avoid_: Game time, sun position
+
+**Moon**:
+A dim, cool directional light and a soft disc in the sky at night, opposite the sun and a little behind it in phase. It is the one shadowed **key light** when it is stronger than the sun at the camera (not simply when the sun is down: at dusk it takes over while the sun is still about a degree up). The one going out fades to nothing before the other takes over, so the shadows turn while there is no key light; the fade dims a low moon (under about 4.7 degrees) too, so there is effectively no key light for the last part of the night before dawn (about t = 0.20 to 0.25), and the sky and the cache light the ground then. It costs no second shadow ray. Not physical: the hero look over physical blue (#203).
+
 **Still**:
 The camera, the sun and the window have not changed for 2 frames and no Edit has happened. The Reference view is shown only while the view is Still, and after a flight only once the scene has caught up with the camera; any change cuts to the Primary view at once and the Reference view starts again from sample 0.
 _Avoid_: Idle, paused

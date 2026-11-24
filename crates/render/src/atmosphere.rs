@@ -177,6 +177,36 @@ const HERO_TINT: Tint = Tint {
     ],
 };
 
+/// The night sky's own light (#203): what the air shows when the sun's glow has gone, which the
+/// physical model leaves black. The art direction wants lilac, violet and mauve when it is dark, not
+/// a physical dark blue, so the night has a floor: a soft gradient, as much of it as the sky's
+/// night level ([`AtmosphereView::night_level`]) says, added to the sky and to the haze that far
+/// ground fades into. Both views read it from the tables, as they read the tint.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct NightFloor {
+    /// The floor's radiance at the horizon and at the zenith (linear RGB, in the units of the sun's
+    /// light on a surface), and between them by a smoothstep of the sine of the elevation, as the
+    /// tint is.
+    pub horizon: [f32; 3],
+    pub zenith: [f32; 3],
+}
+
+impl NightFloor {
+    /// No floor: the physical night.
+    pub const NONE: NightFloor = NightFloor {
+        horizon: [0.0; 3],
+        zenith: [0.0; 3],
+    };
+}
+
+/// The hero night floor: a pastel lilac, brighter and mauve at the horizon, where the haze is, and
+/// a deeper violet overhead. Set by eye on the look-dev sheet's night shots, with the moon's light
+/// (`daylight::MOON_LIGHT`) and the exposure that settles on them.
+const HERO_NIGHT_FLOOR: NightFloor = NightFloor {
+    horizon: [0.040, 0.026, 0.062],
+    zenith: [0.012, 0.007, 0.030],
+};
+
 /// The air, as the model reads it. Rates are per metre.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Atmosphere {
@@ -206,6 +236,8 @@ pub struct Atmosphere {
     pub observer_height: f32,
     /// The look's tint on the sky and the haze (see [`Tint`]).
     pub tint: Tint,
+    /// The night sky's own light (see [`NightFloor`]).
+    pub night_floor: NightFloor,
 }
 
 impl Atmosphere {
@@ -232,6 +264,7 @@ impl Atmosphere {
         ground_albedo: [0.5, 0.5, 0.5],
         observer_height: 2.0,
         tint: Tint::NONE,
+        night_floor: NightFloor::NONE,
     };
 
     /// The air of hero light B: [`Atmosphere::PHYSICAL`] with the owner's tint (see [`Tint`]), which
@@ -239,6 +272,7 @@ impl Atmosphere {
     /// look-dev sheet shows today's gradient, the untinted air and this).
     pub const HERO: Atmosphere = Atmosphere {
         tint: HERO_TINT,
+        night_floor: HERO_NIGHT_FLOOR,
         ..Self::PHYSICAL
     };
 
@@ -308,6 +342,8 @@ pub struct AtmosphereView {
     pub sun_direction: [f32; 3],
     /// The image's width over its height, which the aerial perspective volume's rays follow.
     pub aspect: f32,
+    /// How much of the night sky's floor there is, 0 to 1 (see [`NightFloor`]).
+    pub night_level: f32,
 }
 
 impl AtmosphereView {
@@ -334,6 +370,8 @@ pub struct AtmosphereUniform {
     ground: [f32; 4],
     tint_horizon: [f32; 4],
     tint_zenith: [f32; 4],
+    night_horizon: [f32; 4],
+    night_zenith: [f32; 4],
 }
 
 impl Atmosphere {
@@ -362,6 +400,8 @@ impl Atmosphere {
             ground: v3(self.ground_albedo, 0.0),
             tint_horizon: v3(tint.sky_horizon, tint.haze_per_metre),
             tint_zenith: v3(tint.sky_zenith, tint.pastel),
+            night_horizon: v3(self.night_floor.horizon, view.night_level),
+            night_zenith: v3(self.night_floor.zenith, 0.0),
         }
     }
 }
@@ -381,7 +421,7 @@ pub struct AtmosphereTables {
     kernels: Kernels,
     /// What the once-only and the slow tables were filled for: the air, and the sun's cosine.
     filled_for: Option<Atmosphere>,
-    ground_filled_for: Option<(Atmosphere, u32)>,
+    ground_filled_for: Option<(Atmosphere, u32, u32)>,
 }
 
 /// A table's texture and a view of all of it.
@@ -691,7 +731,7 @@ impl AtmosphereTables {
     ) {
         queue.write_buffer(&self.uniform, 0, bytemuck::bytes_of(&air.uniform(view)));
         let once = self.filled_for != Some(*air);
-        let ground_key = (*air, view.mu_s().to_bits());
+        let ground_key = (*air, view.mu_s().to_bits(), view.night_level.to_bits());
         let ground = once || self.ground_filled_for != Some(ground_key);
         self.filled_for = Some(*air);
         self.ground_filled_for = Some(ground_key);
@@ -830,8 +870,8 @@ mod tests {
 
     #[test]
     fn the_uniform_is_the_size_the_shader_declares() {
-        // Eleven vec4s: `Atmo` in atmosphere_model.wgsl.
-        assert_eq!(size_of::<AtmosphereUniform>(), 11 * 16);
+        // Thirteen vec4s: `Atmo` in atmosphere_model.wgsl.
+        assert_eq!(size_of::<AtmosphereUniform>(), 13 * 16);
     }
 
     #[test]

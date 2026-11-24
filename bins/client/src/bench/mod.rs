@@ -13,6 +13,7 @@ mod args;
 mod budget;
 mod caves;
 mod convergence;
+mod daycycle;
 mod edits;
 #[cfg(test)]
 mod landscape;
@@ -202,7 +203,7 @@ fn run(args: &Args) -> Result<u8, Box<dyn Error>> {
         );
     }
     let initial_accel = gpu.take_hardware_updates().into_iter().next();
-    prepare(&mut gpu, &plan);
+    prepare(&mut gpu, &plan, args.time_of_day);
     eprintln!(
         "the Planet takes {:.1} MiB of GPU memory",
         gpu.scene_bytes() as f64 / (1024.0 * 1024.0)
@@ -250,6 +251,33 @@ fn run(args: &Args) -> Result<u8, Box<dyn Error>> {
         eprintln!("edits: the largest Brush at the metric rate...");
         settle_for_edits(&mut gpu, &mut flight, EDIT_HEIGHTS[1])?;
         edits::run(&mut gpu, &mut flight, &budgets, EditMode::Dig)?
+    };
+    // The day cycle (#203) is on the flight's GPU and path, after everything that is timed against
+    // the budgets and before the GPU is let go; its own gates are its own.
+    let day_cycle = if args.day_cycle {
+        let seconds = args.day_seconds.unwrap_or(if plan.patch {
+            daycycle::DEFAULT_DAY_SECONDS / 10.0
+        } else {
+            daycycle::DEFAULT_DAY_SECONDS
+        });
+        let follow_camera = plan.path.camera_at(0, 2);
+        match daycycle::run(
+            &mut gpu,
+            &mut flight,
+            &plan.path,
+            seconds,
+            // The cycle starts where `--time-of-day` lit the flight, or at midnight.
+            args.time_of_day.map_or(0.0, |hours| hours / 24.0),
+            &follow_camera,
+        ) {
+            Ok(report) => Some(report),
+            Err(e) => {
+                eprintln!("warning: the day cycle failed, and is left out of the report: {e}");
+                None
+            }
+        }
+    } else {
+        None
     };
     let timers_supported = gpu.timers_supported();
     let main_accel = choice
@@ -383,6 +411,7 @@ fn run(args: &Args) -> Result<u8, Box<dyn Error>> {
             path: plan.path_name.to_string(),
             keyframes: plan.path.keyframes(),
             bias: args.bias,
+            time_of_day: args.time_of_day,
             stream_slice_ms: stream_slice
                 .unwrap_or(crate::scene_worker::BACKED_UP_SLICE)
                 .as_secs_f64()
@@ -405,6 +434,7 @@ fn run(args: &Args) -> Result<u8, Box<dyn Error>> {
         streaming,
         streaming_real_time,
         rt,
+        day_cycle,
     };
     let json = serde_json::to_string_pretty(&report)?;
     let file = args.out.join(REPORT_FILE);
@@ -476,11 +506,20 @@ fn run(args: &Args) -> Result<u8, Box<dyn Error>> {
             c.gi.gates.over.join(", ")
         );
     }
+    // The day cycle's gates (#203): a frame over the limit, a p99 over it.
+    let day_code = match &report.day_cycle {
+        Some(d) if !d.gates.over.is_empty() => {
+            eprintln!("day cycle: over its gates: {}", d.gates.over.join(", "));
+            if args.no_fail { 0 } else { 2 }
+        }
+        _ => 0,
+    };
     let code = code
         .max(streaming_code)
         .max(real_time_code)
         .max(real_time_hw_code)
-        .max(gi_code);
+        .max(gi_code)
+        .max(day_code);
     // An error of the real-time mode is exit status 1, not 2 (a gate that is over): nothing says
     // whether its gates would have held.
     // The hardware half of `--rt-backend both` is the same (an adapter with no ray queries stops it
@@ -544,7 +583,7 @@ fn new_flight(plan: &Plan, args: &Args) -> Result<Flight, Box<dyn Error>> {
 }
 
 /// What the flight needs of a context before it is timed.
-fn prepare(gpu: &mut Offscreen, plan: &Plan) {
+fn prepare(gpu: &mut Offscreen, plan: &Plan, time_of_day: Option<f64>) {
     // The flight times what the player's frame costs, and the player's Primary has the radiance
     // cache's GI (#54): an `Offscreen` starts with the flat ambient of before it.
     gpu.set_flat_ambient(false);
@@ -553,6 +592,12 @@ fn prepare(gpu: &mut Offscreen, plan: &Plan) {
         gpu.set_ground_level(f64::from(planet_gen::world_map::WORLD_RADIUS));
     }
     gpu.set_keep_history(true);
+    // `--time-of-day`: the flight is lit by the world clock's sky at that time, stopped there.
+    if let Some(hours) = time_of_day {
+        let mut daylight = render::Daylight::new();
+        let drive = daylight.step(hours / 24.0, 0);
+        gpu.set_day_sky(drive.sky, drive.jumped);
+    }
 }
 
 /// The hardware backend's acceleration structures over a run: its first build, the updates of the
@@ -603,7 +648,7 @@ fn fly_hardware(
         return Ok(Err(gpu.rt().fallback.clone()));
     }
     let initial = gpu.take_hardware_updates().into_iter().next();
-    prepare(&mut gpu, plan);
+    prepare(&mut gpu, plan, args.time_of_day);
     gpu.set_flush_scene_updates(!args.diag.no_flush);
     let primary = run_mode(
         &mut gpu,
@@ -727,7 +772,7 @@ fn patch_scene() -> Scene {
 }
 
 /// The Planet being flown over: its packed bricks and, for rings, the bricks they are made from.
-struct Flight {
+pub(crate) struct Flight {
     scene: Scene,
     store: Option<BrickStore>,
     /// What `--diag` asked for.
@@ -788,7 +833,7 @@ impl Flight {
 /// Draws a frame, and returns its image if `read_back`. Primary mode only reads the image back
 /// for a screenshot: at 1440p it is 15 MB a frame, which would be most of the CPU time of the
 /// frame and leave the GPU idle between frames (and so at lower clocks than a real frame has).
-fn draw(
+pub(crate) fn draw(
     gpu: &mut Offscreen,
     mode: Mode,
     camera: &Camera,
@@ -1053,6 +1098,46 @@ fn write_png(path: &Path, image: &Image) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+/// The day cycle's lines (#203).
+fn print_day_cycle(d: &daycycle::DayCycleReport) {
+    let (e, fixed) = (&d.exposure, &d.exposure_fixed_camera);
+    eprintln!(
+        "\nday cycle: a day of {} s, {} frames: frame p99 {:.2} ms, max {:.2} ms, {} over {} ms; the \
+         sun moved at most {:.2} deg a frame, {} jumps; exposure {:.2} to {:.2} stops, at most {:.2} \
+         stops/s, travel {:.2} of its range, {} reversals; from a fixed camera {:.2} to {:.2} stops, \
+         at most {:.2} stops/s, travel {:.2} of its range, {} reversals",
+        d.day_seconds,
+        d.frames,
+        d.frame_p99_ms,
+        d.frame_ms.max_ms.unwrap_or(0.0),
+        d.frames_over_limit,
+        daycycle::FRAME_LIMIT_MS,
+        d.sun_step_max_degrees,
+        d.sun_jumps,
+        e.min_stops,
+        e.max_stops,
+        e.max_stops_per_s,
+        e.travel_over_range,
+        e.reversals,
+        fixed.min_stops,
+        fixed.max_stops,
+        fixed.max_stops_per_s,
+        fixed.travel_over_range,
+        fixed.reversals
+    );
+    for f in &d.cache_follow {
+        eprintln!(
+            "  cache follow, {} s day from {:.2} (sun {:+.0} deg, {:.1} deg drift): {:.2} levels from a jump's, the floor {:.2}",
+            f.day_seconds,
+            f.time_of_day,
+            f.sun_elevation,
+            f.drifted_degrees,
+            f.drifted_levels,
+            f.floor_levels
+        );
+    }
+}
+
 /// The report in brief, for whoever is watching the run.
 fn print_summary(report: &Report) {
     let ms = |v: Option<f64>| v.map_or("n/a".to_string(), |v| format!("{v:.3}"));
@@ -1062,6 +1147,9 @@ fn print_summary(report: &Report) {
              checked, and these times are for finding out where time goes",
             report.config.diag.join(",")
         );
+    }
+    if let Some(d) = &report.day_cycle {
+        print_day_cycle(d);
     }
     if let Some(s) = &report.streaming {
         print_streaming(s);

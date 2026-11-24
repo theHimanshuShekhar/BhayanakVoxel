@@ -5,6 +5,7 @@ use serde::Serialize;
 
 use super::budget::{Budgets, Status, status};
 use super::convergence::ConvergenceReport;
+use super::daycycle::DayCycleReport;
 use super::edits::EditsReport;
 use super::realtime::RealTimeReport;
 use super::rt::RtReport;
@@ -168,7 +169,14 @@ use super::stream::StreamReport;
 /// `accel` and Edit stress). `edits.accel` is the Edit stress's updates of the
 /// acceleration structures (null on compute). Nothing else is changed.
 ///
-/// 33 (#236; 32 is #234's and #203's) keeps the hardware backend's acceleration structures in step
+/// 32 (#203) adds the day cycle: the report's `day_cycle` (null without `--day-cycle`: a day of the
+/// world clock run fast over the flight, with the frames' times and their p99 and the number over
+/// 16.7 ms, the most the sun moved in a frame, the jumps of the sun, the exposure's stability, the
+/// radiance cache's lag behind a drifting sun against a jump, and its gates) and `config.time_of_day`
+/// (the hours `--time-of-day` put the flight's sky at, or null for the fixed hero light). Nothing
+/// else is changed.
+///
+/// 33 (#236, on #203's 32) keeps the hardware backend's acceleration structures in step
 /// off the frame thread: `rt.accel` gains `sweep` (the sweep's own updates, no longer counted as
 /// the flight's or its warm-up's), each update `pending` (groups waiting for their rebuild) and
 /// each summary `pending_max` and `updates_waiting` (the updates that left groups waiting); the streaming real-time run takes `--rt-backend` (`streaming_real_time.rt`:
@@ -433,6 +441,9 @@ pub struct Config {
     /// workers are as far ahead as they may be, in milliseconds: the client's
     /// (`scene_worker::BACKED_UP_SLICE`) unless `--stream-slice-ms` said (the real-time mode).
     pub stream_slice_ms: f64,
+    /// The time of day in hours (0 to 24) that `--time-of-day` put the flight's sky at (#203), or
+    /// null when the flight is lit by the fixed hero sun as it always was.
+    pub time_of_day: Option<f64>,
     /// The `--diag` switches that were on, as spelled there. Empty for a measurement; a report
     /// that has any is not one, and its budgets are not checked.
     pub diag: Vec<String>,
@@ -478,6 +489,9 @@ pub struct Report {
     pub streaming_real_time: Option<RealTimeReport>,
     /// How rays found the Planet in the flight, and what the hardware backend costs (#50).
     pub rt: RtReport,
+    /// The day cycle (`--day-cycle`, #203): a day of the world clock run fast over the flight. Null
+    /// without the flag.
+    pub day_cycle: Option<DayCycleReport>,
 }
 
 #[cfg(test)]
@@ -637,6 +651,7 @@ mod tests {
                 keyframes: 3,
                 bias: 1.0,
                 stream_slice_ms: 32.0,
+                time_of_day: None,
                 diag: Vec::new(),
             },
             modes: modes(0.5),
@@ -669,6 +684,7 @@ mod tests {
                 real_time_hw: None,
                 hw_group_regions: "4".into(),
             },
+            day_cycle: None,
         };
         let json = serde_json::to_value(&report).unwrap();
         let keys = |v: &serde_json::Value| -> Vec<String> {
@@ -683,6 +699,7 @@ mod tests {
                 "caves",
                 "config",
                 "convergence",
+                "day_cycle",
                 "edits",
                 "machine",
                 "modes",
@@ -697,6 +714,7 @@ mod tests {
         assert_eq!(json["rt"]["active"], "compute");
         assert_eq!(json["rt"]["comparison"], serde_json::Value::Null);
         assert_eq!(json["rt"]["real_time_hw"], serde_json::Value::Null);
+        assert_eq!(json["day_cycle"], serde_json::Value::Null);
         assert_eq!(json["convergence"], serde_json::Value::Null);
         assert_eq!(json["streaming"], serde_json::Value::Null);
         assert_eq!(json["streaming_real_time"], serde_json::Value::Null);

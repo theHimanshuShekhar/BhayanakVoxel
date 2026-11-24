@@ -28,7 +28,8 @@ struct Post {
     // How much of the bloom is added; the adaptation rate k (1 sets the exposure at once); 1 if the
     // exposure is held as it is; the share of colour that curve 3 keeps.
     params: vec4<f32>,
-    // The three bloom blurs' standard deviations, in pixels of the bloom images; one unused.
+    // The three bloom blurs' standard deviations, in pixels of the bloom images; then the share of
+    // middle grey that the exposure aims at (1 by day, less at night).
     sigmas: vec4<f32>,
     // The number of partial sums (the workgroups of `exposure`); 1 if the exposure is metered on
     // 4 x 4 boxes of pixels (the Reference view's), 0 if on pixels; then two unused.
@@ -65,8 +66,10 @@ fn luminance(c: vec3<f32>) -> f32 {
 }
 
 // The exposure that puts the mean of the log luminance at middle grey, within its range.
-fn settled_exposure(mean_log_luminance: f32) -> f32 {
-    return clamp(MIDDLE_GREY / exp(mean_log_luminance), MIN_EXPOSURE, MAX_EXPOSURE);
+// `grey_share` is how much of middle grey it aims at: 1 by day, less at night (#203), so a night's
+// dim scene is not shown as bright as a day's.
+fn settled_exposure(mean_log_luminance: f32, grey_share: f32) -> f32 {
+    return clamp(MIDDLE_GREY * grey_share / exp(mean_log_luminance), MIN_EXPOSURE, MAX_EXPOSURE);
 }
 
 var<workgroup> sums: array<f32, 256>;
@@ -136,7 +139,7 @@ fn exposure_adapt(@builtin(local_invocation_index) local: u32) {
         if post.counts.y != 0u {
             pixels = f32(post.sizes.z) * f32(post.sizes.w);
         }
-        let target_stops = log2(settled_exposure(sums[0] / pixels));
+        let target_stops = log2(settled_exposure(sums[0] / pixels, post.sigmas.w));
         // The eye adapts in stops, so a step of N stops takes the same time to cross whether the
         // image went brighter or darker. The first frame has nothing to adapt from.
         var stops = target_stops;
