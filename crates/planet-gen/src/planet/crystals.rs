@@ -640,8 +640,11 @@ impl Planet {
 
     /// How far above the ground a Voxel of the brick or box from `low` to `high` of mip `level`
     /// may be and still be a cluster's: [`REACH`] if clusters can be there, which is where the box
-    /// is within the reach of crystal country and a level that has them, and 0 if not.
+    /// is within the reach of crystal country and a level that has them, and 0 if not: a cluster
+    /// grows on ground that is in the country and its edge is up to [`REACH`] to the side of it
+    /// (the box is grown by that, as [`Planet::crystal_at`] has it).
     pub(super) fn crystal_reach(&self, level: usize, low: [f64; 3], high: [f64; 3]) -> f64 {
+        let (low, high) = (low.map(|c| c - REACH), high.map(|c| c + REACH));
         if level > MAX_LEVEL || !self.crystal_country(&Self::box_points(low, high)) {
             return 0.0;
         }
@@ -1112,6 +1115,21 @@ pub(super) mod tests {
                     match site.place {
                         Place::Ground => ground.push(site),
                         Place::Cave(_) => cave.push(site),
+                    }
+                }
+            }
+            // Caves go 300 m down: more of their clusters, from boxes of 256 m at 75 m and 175 m
+            // under the ground, which are few near the surface.
+            for d in lit.iter().step_by(lit.len() / 12) {
+                let up = unit(*d).unwrap();
+                for depth in [1500.0, 3500.0] {
+                    let at =
+                        up.map(|u| u * (planet.sea_radius() + planet.ground_height(up) - depth));
+                    let (low, high) = (at.map(|c| c - 2560.0), at.map(|c| c + 2560.0));
+                    for site in planet.crystal_sites(low, high) {
+                        if matches!(site.place, Place::Cave(_)) && !cave.contains(&site) {
+                            cave.push(site);
+                        }
                     }
                 }
             }
@@ -1702,27 +1720,152 @@ pub(super) mod tests {
     }
 
     #[test]
+    fn no_ground_cluster_grows_on_a_beach_below_land_min() {
+        // Sunlit crystal country that is above the sea but less than `LAND_MIN` above it: low
+        // ground is a beach or a shore, where the rules want no clusters. Boxes round such
+        // places hold no ground cluster whose anchor is that low, and the rules would make some
+        // there without the gate: there are lit places enough to hold candidates.
+        let planet = planet();
+        let map = planet.map();
+        let mut low_lit = Vec::new();
+        for face in 0..6 {
+            for j in 0..map.size() {
+                for i in 0..map.size() {
+                    if !map
+                        .texel(face, i, j)
+                        .regions
+                        .contains(Regions::CRYSTAL_CAVES)
+                    {
+                        continue;
+                    }
+                    let d = map.texel_direction(face, i, j);
+                    let height = planet.ground_height(d);
+                    if (0.0..LAND_MIN).contains(&height) && planet.sunlit_at(d).is_lit() {
+                        low_lit.push(d);
+                    }
+                }
+            }
+        }
+        assert!(low_lit.len() >= 5, "{} low lit texels", low_lit.len());
+        let mut clusters = 0;
+        for d in &low_lit {
+            let up = unit(*d).unwrap();
+            let at = up.map(|u| u * (planet.sea_radius() + planet.ground_height(up)));
+            let (low, high) = (at.map(|c| c - 1280.0), at.map(|c| c + 1280.0));
+            for site in planet.crystal_sites(low, high) {
+                if site.place == Place::Ground {
+                    clusters += 1;
+                    let up = unit(site.anchor).unwrap();
+                    let height = distance(site.anchor) - planet.sea_radius();
+                    assert!(height >= LAND_MIN - 1e-6, "{height} at {up:?}");
+                }
+            }
+        }
+        // Clusters nearby on higher ground are fine, but the boxes must have some, or this
+        // is not a test of the boxes' ground.
+        assert!(clusters > 0, "no cluster in {} boxes", low_lit.len());
+    }
+
+    #[test]
+    fn a_brick_just_outside_the_crystal_country_has_the_reach_of_a_cluster_that_grows_in_it() {
+        // A cluster grows on ground in the country and its edge is up to `REACH` outside: the
+        // reach of a brick that none of its own corners and middle is in the country for, but a
+        // `REACH` away is, is `REACH`; and the reach of one a good way off is 0.
+        let planet = planet();
+        let scan = scan();
+        let mut found = 0;
+        for site in scan.ground.iter().step_by(7) {
+            let up = unit(site.anchor).unwrap();
+            let (ahead, aside) = tangents(up);
+            for direction in [ahead, aside, ahead.map(|c| -c), aside.map(|c| -c)] {
+                let country = |d: f64| {
+                    planet
+                        .map()
+                        .sample(plus(site.anchor, direction, d))
+                        .regions
+                        .contains(Regions::CRYSTAL_CAVES)
+                };
+                // Out from the anchor, by a thousand Voxels at a time, to the first place that is
+                // not the country, and from there back to the edge to a hundredth of a Voxel.
+                let Some(out) = (1..400)
+                    .map(|i| f64::from(i) * 1000.0)
+                    .find(|d| !country(*d))
+                else {
+                    continue;
+                };
+                let (mut inside, mut outside) = (out - 1000.0, out);
+                while outside - inside > 0.01 {
+                    let middle = (inside + outside) / 2.0;
+                    if country(middle) {
+                        inside = middle;
+                    } else {
+                        outside = middle;
+                    }
+                }
+                // A level 0 brick, 8 Voxels wide, whose near face is `gap` Voxels from the edge.
+                let brick_at = |gap: f64| {
+                    let middle = plus(site.anchor, direction, outside + gap + 4.0);
+                    (middle.map(|c| c - 4.0), middle.map(|c| c + 4.0))
+                };
+                let (low, high) = brick_at(10.0);
+                if Planet::box_points(low, high).iter().any(|p| {
+                    planet
+                        .map()
+                        .sample(*p)
+                        .regions
+                        .contains(Regions::CRYSTAL_CAVES)
+                }) {
+                    continue;
+                }
+                found += 1;
+                // 10 Voxels from the edge, in `REACH` (48): not in the country, but a cluster of
+                // the country's last ground can reach it.
+                assert_eq!(planet.crystal_reach(0, low, high), REACH);
+                // 4 times `REACH` from it: nothing is in reach, and no level changes that.
+                let (far_low, far_high) = brick_at(4.0 * REACH);
+                if !Planet::box_points(far_low, far_high).iter().any(|p| {
+                    planet
+                        .map()
+                        .sample(*p)
+                        .regions
+                        .contains(Regions::CRYSTAL_CAVES)
+                }) {
+                    assert_eq!(planet.crystal_reach(0, far_low, far_high), 0.0);
+                }
+                // A level above the clusters' has no reach, whatever is round it.
+                assert_eq!(planet.crystal_reach(MAX_LEVEL + 1, low, high), 0.0);
+            }
+        }
+        assert!(found >= 3, "{found} edges of the country");
+    }
+
+    #[test]
     fn air_below_is_never_claimed_for_a_brick_with_a_cluster_in_it() {
         let planet = planet();
         let scan = scan();
         let mut checked = 0;
+        // Up the principal prism to near its apex: the highest brick of a cluster is the one that
+        // an `air_below` without the whole of `REACH` above the ground would call air.
         for site in scan.all() {
-            for level in 0..=MAX_LEVEL {
-                let coord = brick_of(along_prism(site), level);
-                let brick = if level == 0 {
-                    planet.brick(coord)
-                } else {
-                    planet.coarse_brick(level, coord)
-                };
-                if (0..512usize).any(|i| {
-                    is_crystal(brick.get([(i % 8) as u8, (i / 8 % 8) as u8, (i / 64) as u8]))
-                }) {
-                    checked += 1;
-                    assert!(!planet.air_below(level, coord), "{level} {coord:?}");
+            for along in [0.5, 0.7, 0.85, 0.97] {
+                let point = plus(site.anchor, site.normal, (site.length - EMBED) * along);
+                for level in 0..=MAX_LEVEL {
+                    let coord = brick_of(point, level);
+                    let brick = if level == 0 {
+                        planet.brick(coord)
+                    } else {
+                        planet.coarse_brick(level, coord)
+                    };
+                    if (0..512usize).any(|i| {
+                        is_crystal(brick.get([(i % 8) as u8, (i / 8 % 8) as u8, (i / 64) as u8]))
+                    }) {
+                        checked += 1;
+                        assert!(!planet.air_below(level, coord), "{level} {coord:?} {along}");
+                    }
                 }
             }
         }
-        assert!(checked > 50, "{checked}");
+        assert!(checked > 200, "{checked}");
         // The tallest cluster and the highest brick it can be in: the shortcut for the sky does
         // not clip it.
         let top = scan
