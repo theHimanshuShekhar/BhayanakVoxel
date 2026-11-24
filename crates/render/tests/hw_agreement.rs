@@ -468,7 +468,7 @@ fn groupings() -> [Grouping; 3] {
     [
         Grouping::default(),
         Grouping::uniform(8).unwrap(),
-        Grouping::split(4, 32, 2).unwrap(),
+        Grouping::tiers(4, &[(16, 1), (32, 2)]).unwrap(),
     ]
 }
 

@@ -528,6 +528,13 @@ fn a_blas_is_a_cube_of_cells_that_is_a_function_of_the_cells_coordinate_and_the_
 }
 
 #[test]
+fn the_programs_grouping_is_16_regions_for_levels_0_and_1_and_32_above() {
+    let g = Grouping::parse(PRODUCTION_GROUPING).unwrap();
+    assert_eq!([0, 1, 2, 3, 17].map(|l| g.regions(l)), [16, 16, 32, 32, 32]);
+    assert_eq!(g.describe(), PRODUCTION_GROUPING);
+}
+
+#[test]
 fn the_grouping_flag_takes_a_size_or_a_size_below_a_level_and_another_from_it() {
     assert_eq!(Grouping::parse("4").unwrap(), Grouping::default());
     assert_eq!(Grouping::parse("8").unwrap(), Grouping::uniform(8).unwrap());
@@ -541,7 +548,27 @@ fn the_grouping_flag_takes_a_size_or_a_size_below_a_level_and_another_from_it() 
     );
     assert_eq!(Grouping::parse("32").unwrap().regions(0), 32);
     assert_eq!(Grouping::uniform(32).unwrap().cells(1, [0; 3]).count(), 512);
-    for bad in ["", "3", "64", "8:16", "8:16@x", "a:b@1", "8:5@1"] {
+    // A third size from a second level up.
+    let three = Grouping::parse("8:16@1:32@3").unwrap();
+    assert_eq!(
+        [0, 1, 2, 3, 4].map(|l| three.regions(l)),
+        [8, 16, 16, 32, 32]
+    );
+    assert_eq!(three.describe(), "8:16@1:32@3");
+    assert_eq!(Grouping::parse(&three.describe()).unwrap(), three);
+    assert_eq!(Grouping::parse("16:32@2").unwrap().describe(), "16:32@2");
+    for bad in [
+        "",
+        "3",
+        "64",
+        "8:16",
+        "8:16@x",
+        "a:b@1",
+        "8:5@1",
+        "8:16@3:32@2",
+        "8:16@1:64@3",
+        "8:16@1:32",
+    ] {
         assert!(Grouping::parse(bad).is_err(), "{bad}");
     }
 }

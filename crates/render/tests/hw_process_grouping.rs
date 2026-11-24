@@ -4,7 +4,7 @@
 
 use brick_store::BrickCoord;
 use planet_gen::generate_region;
-use render::hw::{Grouping, PRODUCTION_REGIONS, process_grouping, set_process_grouping};
+use render::hw::{Grouping, PRODUCTION_GROUPING, process_grouping, set_process_grouping};
 use render::lod::Bands;
 use render::scene::{Bound, Scene};
 use render::{Offscreen, Resolution, RtBackend};
@@ -24,7 +24,7 @@ fn a_context_made_after_the_process_grouping_is_set_has_it_and_its_first_build_i
     // Nothing set: the program's size.
     assert_eq!(
         process_grouping(),
-        Grouping::uniform(PRODUCTION_REGIONS).unwrap()
+        Grouping::parse(PRODUCTION_GROUPING).unwrap()
     );
     let wanted = Grouping::parse("8:32@2").unwrap();
     assert_ne!(wanted, process_grouping());

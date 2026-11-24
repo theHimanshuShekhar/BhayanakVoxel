@@ -82,9 +82,10 @@ Options:
                    acceleration structures cost to update
   --hw-group-regions G
                    How the hardware backend (--rt-backend hw|both) makes its BLASes (#236): G
-                   regions along an edge of each, 4, 8, 16 (the default) or 32, or NEAR:FAR@LEVEL
-                   (levels below LEVEL have BLASes of NEAR regions an edge, the others FAR, e.g.
-                   4:16@6). Fewer, larger BLASes cost the frame thread less and the GPU more; the
+                   regions along an edge of each, 4, 8, 16 or 32, or NEAR:FAR@LEVEL (levels below
+                   LEVEL have BLASes of NEAR regions an edge, the others FAR, e.g. 4:16@6), or
+                   NEAR:MID@LEVEL:FAR@LEVEL (a third size from the second LEVEL up). The default
+                   is 16:32@2. Fewer, larger BLASes cost the frame thread less and the GPU more; the
                    report's `rt.hw_group_regions` says what ran
   --hw-build-blas N
                    The most BLASes a frame builds of the groups that may wait (#236), default no
@@ -157,7 +158,7 @@ pub struct Args {
     /// `--rt-backend` (#50): how rays find the Planet.
     pub rt: RtMode,
     /// `--hw-group-regions` (#236): how the hardware backend's BLASes are made of the cells; None
-    /// is the default, 16 regions an edge.
+    /// is the default, `PRODUCTION_GROUPING`.
     pub hw_group: Option<render::hw::Grouping>,
     /// `--hw-build-blas` (#236): the most BLASes a frame builds of the groups that may wait.
     pub hw_blas_budget: Option<u32>,

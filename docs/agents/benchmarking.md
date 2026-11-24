@@ -67,7 +67,7 @@ release: a debug build's CPU side is slow enough to distort the frame times.
 | `--no-convergence` | Leave out the convergence phase (below), which otherwise runs after the caves. |
 | `--truth-spp N` | Samples of each of the convergence phase's two truths (the emissive room's have at least 8192 with FLIP, `ROOM_TRUTH_SPP`). Default 1024; ADR 0005's is 8192, which takes eight times as long (`client.exe bench --truth-spp 8192` is the 4090 baseline). At least 1024, the last checkpoint. |
 | `--rt-backend B` | How rays find the Planet (#50, a spike): `compute` (the default: the compute-shader DDA, the reference), `hw` (ray queries over the bricks' tight boxes, shadow rays ending at the first hit, for the flight, the sweep and the Edit stress, and for `--streaming --real-time`'s runs, #236), `hw-nearest` (`hw` with shadow rays that look for the nearest hit) or `both` (the bench as for `compute`, then the same flight and Edit stress on `hw` and the flight on `hw-nearest`, each on a context of its own, and the three compared). An adapter without ray queries runs compute with a warning and the reason in `rt.fallback`, not an error. See "The hardware ray backend" below. |
-| `--hw-group-regions G` | How the hardware backend makes its BLASes (#236): `G` regions along an edge of each, `4` (one cell), `8`, `16` (the default: the 4090's sweep found it the cheapest for the frame thread that keeps the GPU under compute's) or `32`, or `NEAR:FAR@LEVEL` (levels below LEVEL have BLASes of NEAR regions, the others FAR: `4:16@6`, `16:32@2`). A BLAS is built again whole when any cell of it is stale, so bigger ones cost the frame thread less (fewer builds to record, fewer instances for a submit that traces to check) and the GPU more (more boxes a patch). The report's `rt.hw_group_regions` and `streaming_real_time.rt.hw_group_regions` say what the flag said, and `rt.comparison.hw_accel.group_regions` and the `group_regions` of an Edit stress's or a real-time run's `accel` what the context that ran had. |
+| `--hw-group-regions G` | How the hardware backend makes its BLASes (#236): `G` regions along an edge of each, `4` (one cell), `8`, `16` or `32`, or `NEAR:FAR@LEVEL` (levels below LEVEL have BLASes of NEAR regions, the others FAR: `4:16@6`), or `NEAR:MID@LEVEL:FAR@LEVEL` (a third size from the second LEVEL up: `8:16@1:32@3`). **The default is `16:32@2`** (`PRODUCTION_GROUPING`): 16 regions for levels 0 and 1, 32 from level 2. The 4090's sweeps of #236: every real-time gate passes, its update `p95` is the lowest of the sizes tried (worst path 0.55 ms; 16 everywhere 0.91, 32 everywhere 0.57 with a soft-miss gate missed), 43% fewer BLASes than 16 everywhere, and its level 0 is 16's, whose Edit by the ground (`hw_edits_ground`) is 0.97 ms at `p95` (a finer level 0, `4:16@1`, 0.73). A BLAS is built again whole when any cell of it is stale, so bigger ones cost the frame thread less (fewer builds to record, fewer instances for a submit that traces to check) and the GPU more (more boxes a patch). The report's `rt.hw_group_regions` and `streaming_real_time.rt.hw_group_regions` say what the flag said, and `rt.comparison.hw_accel.group_regions` and the `group_regions` of an Edit stress's or a real-time run's `accel` what the context that ran had. |
 | `--hw-build-blas N` | The most BLASes a frame builds of the groups that may wait (#236), default no bound; the groups that may not wait (they gained boxes or have no BLAS, or waited too long) are built at once whatever it is, and a frame that built nothing builds one. It spreads a burst of builds over frames without breaking the hole rule: `accel.*.blas_urgent` and the paths' `hardware.blas_urgent` are what it cannot spread. |
 | `--no-fail` | Exit with status 0 even if a pass is over budget, a frame of the streaming mode has a hole, or a gate of the real-time mode is over. |
 
@@ -1536,7 +1536,24 @@ Edits). All are on the same GPU, driver and clocks. Read `rt.comparison`:
     queued, the scene's uploads included). Only in the Edit stress, which sets `set_wait(true)`,
     does it include the GPU's own time to finish them, so that the Edit+BVH cost there is the
     builds' own.
-- `hw_edits_ground`: the same stress again on the hardware backend with the camera **by the ground** (48 Voxels, 2.4 m, over the pole; `both` only, null on `--short`), where its Edits are in level 0 and in the finest BLASes. **`hw_edits`' camera is a kilometre up, so its Edits are in the coarse levels, whose few cells are in the same BLASes at every `--hw-group-regions`: it does not measure what a BLAS of 16 x 16 x 16 regions costs an Edit to build again; this one does** (its `accel` has the builds, its `frame_thread` the Edit+BVH). It goes on from where `hw_edits` left the Planet (it starts with the mode that undoes the last Edit).
+- `edits_ground` (the report's top level, on the run's own backend: **compute's** in `both`) and
+  `hw_edits_ground`: the same stress again with the camera **by the ground** (48 Voxels, 2.4 m,
+  over the pole; null on `--short`), where its Edits are in level 0 and in the finest BLASes, and
+  three times as long (`GROUND_FRAMES`: about a dozen Edits, not four, since it is the one the
+  BLAS sizes are judged by). **`hw_edits`' camera is a kilometre up, so its Edits are in the coarse
+  levels, whose few cells are in the same BLASes at every `--hw-group-regions`: it does not measure
+  what a BLAS of 16 x 16 x 16 regions costs an Edit to build again; `hw_edits_ground` does** (its
+  `accel` has the builds, its `frame_thread` the Edit+BVH). It goes on from where the altitude
+  stress left the Planet (it starts with the mode that undoes the last Edit). Not gated: put
+  `edits_ground.frame_thread` by `hw_edits_ground.frame_thread` for what the hardware adds to an
+  Edit by the ground. Every Edit stress (`edits`, `hw_edits`, both grounds) has
+  **`frame_thread_parts`**, the frame thread by part, each a `Stats` over the Edits: `edit` (the
+  Edit planned and level 0 written: the same on both backends), `scene_write` (the scene's
+  buffers; the same too), `flush` (the submit that sends them), `accel` (the hardware's update, less
+  its wait: what a frame of the game pays), `accel_wait` (the stress waits for the GPU's builds, the
+  game does not: **it is in `frame_thread` and in `accel.total_ms`, so the Edit+BVH figure is an
+  upper bound**) and `edit_made`; and **`frame_thread_each`**, each Edit's frame-thread ms in order
+  (the first is the cold one).
 - `hw_edits`: the Edit stress on the hardware backend, in the report's `edits` shape, to put by
   `edits` (compute). **Both stress runs start from the same camera and rings**: the sweep's last
   height (20 000 Voxels over the pole), where the compute run ends the sweep, and the hardware run
@@ -1600,7 +1617,7 @@ runs fly on the hardware backend. The report's `streaming_real_time.rt` has `req
 `fallback` and each run's `accel` summary (null on compute). `both` runs the whole mode twice, on
 compute (`streaming_real_time`) and then on hardware (`rt.real_time_hw`, the same shape), one after
 the other on contexts of their own. The acceptance of #236 reads each path's `frame_parts.update`
-(`mean_ms` and `p95_ms`: **`Spread` has `p95_ms` since schema 33**) and `frame_time`: the hardware's
+(`mean_ms` and `p95_ms`: **`Spread` has `p95_ms` since schema 34**) and `frame_time`: the hardware's
 update is to be within 1.0 ms of compute's at the mean and at p95, and every gate holds with
 `--rt-backend hw`. The summary prints "frame thread's scene update" under each path's mean frame.
 Each run's `accel` has `pending_max` and `updates_waiting` (the updates that left groups waiting)
@@ -1610,7 +1627,7 @@ adapter's reason, exit status 1): its gates would be compute's, and say nothing 
 
 **BLAS size** (`--hw-group-regions`, #236): the scene thread lists and counts **cells** of 4 x 4 x 4
 regions (`RingPatch::groups`), whatever the BLASes are; `HwScene` keeps each cell's count and a BLAS
-is 1, 2, 4 or 8 cells along an edge (4, 8, 16 or 32 regions) of them, set by level (16 in the program unless `--hw-group-regions` says otherwise). The cells of a BLAS are kept as a map per BLAS (`HwScene::members`), updated as the patches come, so that a BLAS's count and its box pass's jobs do not look up every cell it could have. A BLAS with a stale cell
+is 1, 2, 4 or 8 cells along an edge (4, 8, 16 or 32 regions) of them, set by level (`16:32@2` in the program unless `--hw-group-regions` says otherwise). The cells of a BLAS are kept as a map per BLAS (`HwScene::members`), updated as the patches come, so that a BLAS's count and its box pass's jobs do not look up every cell it could have. A BLAS with a stale cell
 is built again whole, from all its cells (the box pass has a job a cell, which writes its boxes after
 the cells before it, from the BLAS's corner); it may not wait if a cell of it gained boxes, as ever.
 `accel.*.blas_rebuilt_by_level` and `prims_rebuilt_by_level` say where the builds are (index 0 is
@@ -1670,7 +1687,7 @@ rays; those that need ray queries skip themselves, printing why, where there are
 
 ```
 {
-  "schema_version": 33,
+  "schema_version": 34,
   "build":   { "version", "commit" },          // commit: CI builds only, else null; on a PR
                                                // build it is GitHub's merge commit, not the head
   "machine": { "gpu", "device_type", "driver", "driver_info", "backend", "os", "arch",
@@ -1690,6 +1707,7 @@ rays; those that need ray queries skip themselves, printing why, where there are
   "screenshots": [ "primary-frame0000.png", ..., "primary-cave-mouth.png", ... ],
   "budgets": { "source", "ok", "failed": ["primary/primary"], "unmatched": [] },
   "edits":   { ... } | null,                       // the Edit stress; null for --short
+  "edits_ground": { ... } | null,                  // the same by the ground (level 0), on the run's backend; null for --short
   "convergence": { "width", "height", "scene", "checkpoints", "truth_spp", "seeds", "flip",
                    "flip_gamma22",
                    "lines", "min_line_over_floor", "folder", "csv", "wall_s",

@@ -176,7 +176,7 @@ use super::stream::StreamReport;
 /// (the hours `--time-of-day` put the flight's sky at, or null for the fixed hero light). Nothing
 /// else is changed.
 ///
-/// 33 (#236, on #203's 32) keeps the hardware backend's acceleration structures in step
+/// 34 (#236, after #55's 33 on #203's 32; #55's note is its own paragraph) keeps the hardware backend's acceleration structures in step
 /// off the frame thread: `rt.accel` gains `sweep` (the sweep's own updates, no longer counted as
 /// the flight's or its warm-up's), each update `pending` (groups waiting for their rebuild) and
 /// each summary `pending_max` and `updates_waiting` (the updates that left groups waiting); the streaming real-time run takes `--rt-backend` (`streaming_real_time.rt`:
@@ -184,10 +184,10 @@ use super::stream::StreamReport;
 /// every `Spread` has `p95_ms`; the real-time `frame_parts.update` counts the hardware
 /// backend's builds wherever they are encoded (also those of the draw), each path has `hardware` (null on
 /// compute: that cost by part per frame, the draw's submit and the TLAS's instances, `update_rest`, the BLASes and boxes a frame, the cost per BLAS), each
-/// summary `blas_urgent`, `blas_rebuilt_by_level`, `prims_rebuilt_by_level`, `tlas_instances_max`, `prims_total_max` and `phases_ms`, each Edit's update `phases_ms`, `rt.comparison.hw_edits_ground` (the Edit stress by the ground, on hw), `group_regions` of `rt.comparison.hw_accel` and of the Edit stress's and real-time runs' `accel` (the context's own), `rt.hw_group_regions` and `streaming_real_time.rt.hw_group_regions` (what `--hw-group-regions` said), and an adapter that cannot
+/// summary `blas_urgent`, `blas_rebuilt_by_level`, `prims_rebuilt_by_level`, `tlas_instances_max`, `prims_total_max` and `phases_ms`, each Edit's update `phases_ms`, `edits_ground` and `rt.comparison.hw_edits_ground` (the Edit stress by the ground, on the run's backend and on hw, three times as long), each Edit stress's `frame_thread_parts` and `frame_thread_each` (where an Edit's frame thread went), `group_regions` of `rt.comparison.hw_accel` and of the Edit stress's and real-time runs' `accel` (the context's own), `rt.hw_group_regions` and `streaming_real_time.rt.hw_group_regions` (what `--hw-group-regions` said), and an adapter that cannot
 /// run the hardware backend stops a real-time run that asked for it (an `error`, exit status 1). The `prepare_ms`/`build_ms` of an update are the frame thread's cost
 /// only; the GPU's own time is only in the Edit stress (it waits there).
-pub const SCHEMA_VERSION: u32 = 33;
+pub const SCHEMA_VERSION: u32 = 34;
 
 /// One timed thing (a pass, or the GPU total of a profiler frame) in one mode, against its
 /// budget. In reference mode a profiler frame is one sample, so the entries of that mode have
@@ -476,6 +476,11 @@ pub struct Report {
     /// The Edit stress: the largest Brush, dug and placed in turn at the metric rate, on the
     /// whole Planet; null for `--short`.
     pub edits: Option<EditsReport>,
+    /// The Edit stress again with the camera by the ground (2.4 m up), where the Edits are in
+    /// level 0 (`edits`' camera is a kilometre up, in the coarse levels); on the run's own backend:
+    /// `rt.comparison.hw_edits_ground` is the hardware's, to put by it (#236). Not held to a
+    /// budget. Null for `--short`.
+    pub edits_ground: Option<EditsReport>,
     /// The convergence phase (#187, left out by `--no-convergence`): how fast the Reference view
     /// gets clean, in two still views, scored against a truth. Not held to any budget; null with
     /// `--no-convergence` or when the phase fails (an error or a panic: the rest is still written).
@@ -672,6 +677,7 @@ mod tests {
             screenshots: vec!["primary-0.png".into()],
             budgets: summarize("embedded", &budgets(), &modes(0.5), &[], &[]),
             edits: None,
+            edits_ground: None,
             convergence: None,
             streaming: None,
             streaming_real_time: None,
@@ -701,6 +707,7 @@ mod tests {
                 "convergence",
                 "day_cycle",
                 "edits",
+                "edits_ground",
                 "machine",
                 "modes",
                 "rt",
@@ -710,7 +717,7 @@ mod tests {
                 "streaming_real_time"
             ]
         );
-        assert_eq!(json["schema_version"], 33);
+        assert_eq!(json["schema_version"], 34);
         assert_eq!(json["rt"]["active"], "compute");
         assert_eq!(json["rt"]["comparison"], serde_json::Value::Null);
         assert_eq!(json["rt"]["real_time_hw"], serde_json::Value::Null);

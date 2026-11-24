@@ -250,7 +250,22 @@ fn run(args: &Args) -> Result<u8, Box<dyn Error>> {
     } else {
         eprintln!("edits: the largest Brush at the metric rate...");
         settle_for_edits(&mut gpu, &mut flight, EDIT_HEIGHTS[1])?;
-        edits::run(&mut gpu, &mut flight, &budgets, EditMode::Dig)?
+        edits::run(
+            &mut gpu,
+            &mut flight,
+            &budgets,
+            EditMode::Dig,
+            edits::FRAMES,
+        )?
+    };
+    // The same stress by the ground, where its Edits are in level 0 (see `ground_edits`): on the
+    // run's own backend, so that `--rt-backend both` has compute's to put by hw's.
+    let edits_ground = match &edits {
+        Some(first) => {
+            eprintln!("edits: by the ground...");
+            ground_edits(&mut gpu, &mut flight, &budgets, first)?
+        }
+        None => None,
     };
     // The day cycle (#203) is on the flight's GPU and path, after everything that is timed against
     // the budgets and before the GPU is let go; its own gates are its own.
@@ -429,6 +444,7 @@ fn run(args: &Args) -> Result<u8, Box<dyn Error>> {
             &args.diag.switches(),
         ),
         edits,
+        edits_ground,
         convergence,
         modes,
         streaming,
@@ -664,7 +680,7 @@ fn fly_hardware(
     } else {
         eprintln!("rt: edits on the {} backend...", backend.name());
         settle_for_edits(&mut gpu, &mut flight, EDIT_HEIGHTS[1])?;
-        edits::run(&mut gpu, &mut flight, budgets, EditMode::Dig)?
+        edits::run(&mut gpu, &mut flight, budgets, EditMode::Dig, edits::FRAMES)?
     };
     // The Edits of the compute run's stress are in the coarse levels (the camera is a kilometre
     // up); a BLAS of level 0 is made again by an Edit by the ground, which this stress has: the
@@ -675,13 +691,7 @@ fn fly_hardware(
                 "rt: edits by the ground on the {} backend...",
                 backend.name()
             );
-            settle_for_edits(&mut gpu, &mut flight, EDIT_HEIGHTS[0])?;
-            let start = if first.edits.is_multiple_of(2) {
-                EditMode::Dig
-            } else {
-                EditMode::Place
-            };
-            edits::run(&mut gpu, &mut flight, budgets, start)?
+            ground_edits(&mut gpu, &mut flight, budgets, first)?
         }
         _ => None,
     };
@@ -970,6 +980,24 @@ fn sweep_keyframe(height: f64) -> Keyframe {
         position: [0.0, radius + height, 0.0],
         target: [0.0, radius, -1500.0],
     }
+}
+
+/// The Edit stress again with the camera by the ground (2.4 m up), where its Edits are in level 0
+/// and in the finest BLASes (the altitude stress's are in the coarse levels: #236). It goes on from
+/// where `first`, the altitude stress, left the Planet, with the Edit that undoes its last.
+fn ground_edits(
+    gpu: &mut Offscreen,
+    flight: &mut Flight,
+    budgets: &Budgets,
+    first: &edits::EditsReport,
+) -> Result<Option<edits::EditsReport>, Box<dyn Error>> {
+    settle_for_edits(gpu, flight, EDIT_HEIGHTS[0])?;
+    let start = if first.edits.is_multiple_of(2) {
+        EditMode::Dig
+    } else {
+        EditMode::Place
+    };
+    edits::run(gpu, flight, budgets, start, edits::GROUND_FRAMES)
 }
 
 /// Puts the rings where the Edit stress starts from, on either backend: the camera of the sweep's

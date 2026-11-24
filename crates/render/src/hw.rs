@@ -81,10 +81,14 @@ pub const GROUP_BRICKS: i32 = GROUP_REGIONS * REGION_BRICKS;
 /// The most cells along an edge of a BLAS, as a power of two (8: 32 regions, 256 bricks, which a
 /// box word's 8 bits an axis hold).
 pub const MAX_BLAS_SHIFT: u8 = 3;
-/// Regions along an edge of a BLAS in the program (what [`process_grouping`] is if nothing sets
-/// it): the 4090's sweep of #236 found BLASes of 16 the cheapest for the frame thread that
-/// keeps the GPU's time under compute's.
-pub const PRODUCTION_REGIONS: i32 = 16;
+/// The grouping of the program (what [`process_grouping`] is if nothing sets it), from the 4090's
+/// sweeps of #236, as `--hw-group-regions` takes it: BLASes of 16 regions an edge for levels 0 and
+/// 1, where the Edits and the finest builds are, and 32 from level 2 up, where a build is of boxes
+/// that no Edit touches and the frame thread pays by the BLAS and the TLAS's instance. Every real-time
+/// gate passes with it, its update `p95` is the lowest of the sizes tried (0.55 ms against 0.91 at 16
+/// for the worst path), and it builds 43% fewer BLASes than 16 everywhere. 32 everywhere missed a
+/// gate (soft misses), and a finer level 0 is the Edit stress's.
+pub const PRODUCTION_GROUPING: &str = "16:32@2";
 /// The TLAS's origin is a multiple of this many Voxels of level 0, nearest to the camera.
 pub const ANCHOR_SNAP: i32 = 4096;
 /// How many boxes of BLASes a **frame** builds of the groups that may wait (see the module's
@@ -125,7 +129,7 @@ pub fn group_origin(level: u8, group: [i32; 3]) -> [i32; 3] {
 /// How the cells of each level go into BLASes: a BLAS is a cube of `1 << shift` cells along each
 /// edge (4, 8, 16 or 32 regions), a regular grid like the cells', so which BLAS a brick is in is
 /// still a function of its coordinate and nothing else. The `Default` is one cell a BLAS (what the
-/// tests that read cells are written for); the program's is [`PRODUCTION_REGIONS`]
+/// tests that read cells are written for); the program's is [`PRODUCTION_GROUPING`]
 /// ([`process_grouping`]).
 ///
 /// Fewer, larger BLASes cost the frame thread less (the builds are recorded and submitted a BLAS
@@ -145,23 +149,40 @@ impl Default for Grouping {
     }
 }
 
+/// The shift (log2 of the cells along an edge) of a BLAS of `regions` regions an edge.
+fn blas_shift(regions: i32) -> std::result::Result<u8, String> {
+    match regions {
+        4 => Ok(0),
+        8 => Ok(1),
+        16 => Ok(2),
+        32 => Ok(3),
+        _ => Err(format!(
+            "a BLAS of {regions} regions an edge: only 4, 8, 16 or 32"
+        )),
+    }
+}
+
 impl Grouping {
     /// Levels below `from` have BLASes of `near` regions along an edge, and the others `far`
     /// (each 4, 8, 16 or 32).
     pub fn split(near: i32, far: i32, from: usize) -> std::result::Result<Self, String> {
-        let shift = |regions: i32| match regions {
-            4 => Ok(0),
-            8 => Ok(1),
-            16 => Ok(2),
-            32 => Ok(3),
-            _ => Err(format!(
-                "a BLAS of {regions} regions an edge: only 4, 8, 16 or 32"
-            )),
-        };
-        let (near, far) = (shift(near)?, shift(far)?);
+        Self::tiers(near, &[(far, from)])
+    }
+
+    /// The first levels have BLASes of `first` regions along an edge, and each `(regions, from)`
+    /// of `then` (with `from` rising) is the size from level `from` up to the next one.
+    pub fn tiers(first: i32, then: &[(i32, usize)]) -> std::result::Result<Self, String> {
         let mut g = Self::default();
-        for (level, s) in g.shift.iter_mut().enumerate() {
-            *s = if level < from { near } else { far };
+        g.shift.fill(blas_shift(first)?);
+        let mut last = 0;
+        for &(regions, from) in then {
+            if from < last {
+                return Err(format!("the levels {from} and {last} are not in order"));
+            }
+            last = from;
+            let s = blas_shift(regions)?;
+            let at = from.min(g.shift.len());
+            g.shift[at..].fill(s);
         }
         Ok(g)
     }
@@ -171,40 +192,32 @@ impl Grouping {
         Self::split(regions, regions, 0)
     }
 
-    /// `N` (every level), or `NEAR:FAR@LEVEL` (levels below LEVEL have BLASes of NEAR regions an
-    /// edge, the others FAR): the value of `--hw-group-regions`.
+    /// `N` (every level), `NEAR:FAR@LEVEL` (levels below LEVEL have BLASes of NEAR regions an
+    /// edge, the others FAR) or `NEAR:MID@LEVEL:FAR@LEVEL` (a third size from the second LEVEL up):
+    /// the value of `--hw-group-regions`.
     pub fn parse(text: &str) -> std::result::Result<Self, String> {
-        let number = |t: &str| {
-            t.trim()
-                .parse::<i32>()
-                .map_err(|_| format!("`{text}` is not N or NEAR:FAR@LEVEL"))
-        };
-        match text.split_once(':') {
-            None => Self::uniform(number(text)?),
-            Some((near, rest)) => {
-                let (far, level) = rest
-                    .split_once('@')
-                    .ok_or_else(|| format!("`{text}` is not N or NEAR:FAR@LEVEL"))?;
-                let level = level
-                    .trim()
-                    .parse::<usize>()
-                    .map_err(|_| format!("`{text}` is not N or NEAR:FAR@LEVEL"))?;
-                Self::split(number(near)?, number(far)?, level)
-            }
+        let bad = || format!("`{text}` is not N, NEAR:FAR@LEVEL or NEAR:MID@LEVEL:FAR@LEVEL");
+        let number = |t: &str| t.trim().parse::<i32>().map_err(|_| bad());
+        let mut parts = text.split(':');
+        let first = number(parts.next().ok_or_else(bad)?)?;
+        let mut then = Vec::new();
+        for part in parts {
+            let (regions, level) = part.split_once('@').ok_or_else(bad)?;
+            let level = level.trim().parse::<usize>().map_err(|_| bad())?;
+            then.push((number(regions)?, level));
         }
+        Self::tiers(first, &then)
     }
 
     /// The text [`Grouping::parse`] takes, for the report.
     pub fn describe(&self) -> String {
-        let first = self.shift[0];
-        match self.shift.iter().position(|&s| s != first) {
-            None => format!("{}", GROUP_REGIONS << first),
-            Some(at) => format!(
-                "{}:{}@{at}",
-                GROUP_REGIONS << first,
-                GROUP_REGIONS << self.shift[at]
-            ),
+        let mut text = format!("{}", GROUP_REGIONS << self.shift[0]);
+        for (level, pair) in self.shift.windows(2).enumerate() {
+            if pair[1] != pair[0] {
+                text.push_str(&format!(":{}@{}", GROUP_REGIONS << pair[1], level + 1));
+            }
         }
+        text
     }
 
     fn shift(&self, level: u8) -> u8 {
@@ -272,13 +285,12 @@ pub fn process_blas_budget() -> u32 {
     PROCESS_BLAS_BUDGET.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// The grouping a hardware backend starts with: the process's, or [`PRODUCTION_REGIONS`] regions
-/// an edge.
+/// The grouping a hardware backend starts with: the process's, or [`PRODUCTION_GROUPING`].
 pub fn process_grouping() -> Grouping {
     PROCESS_GROUPING
         .get()
         .copied()
-        .unwrap_or_else(|| Grouping::uniform(PRODUCTION_REGIONS).expect("a size that there is"))
+        .unwrap_or_else(|| Grouping::parse(PRODUCTION_GROUPING).expect("a grouping that there is"))
 }
 
 /// The smallest and largest Voxel (as local coordinates 0..=7) that a brick's 512-bit occupancy
