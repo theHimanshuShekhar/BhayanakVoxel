@@ -237,15 +237,18 @@ fn mse(a: &Image, b: &Image) -> f64 {
 }
 
 /// Whether the middle of the view, where the camera looks (at the middle of the cluster), is
-/// glowing: some pixel within 8 of the centre has a channel at 200 or more, which an emissive
-/// crystal reaches and the ground and the rock of the views (their brightest channel is under
-/// 170) do not.
-fn glows_at_the_centre(image: &Image) -> bool {
+/// a crystal's colour: some pixel within 8 of the centre has its brightest and dimmest channels
+/// 100 or more apart, which a deep crystal hue reaches (115 to 118 in the views) and the grass,
+/// the rock and the sky of the views do not (at most 62 over nine tenths of the image). It
+/// is not a glow test: at 1.5 under the AgX-like curve a hue's emission is not brighter than
+/// the ground.
+fn crystal_at_the_centre(image: &Image) -> bool {
     let (cx, cy) = (image.width as i32 / 2, image.height as i32 / 2);
     (-8..=8).any(|dy| {
         (-8..=8).any(|dx| {
             let at = ((cy + dy) as usize * image.width as usize + (cx + dx) as usize) * 4;
-            image.rgba[at..at + 3].iter().any(|&c| c >= 200)
+            let rgb = &image.rgba[at..at + 3];
+            rgb.iter().max().unwrap() - rgb.iter().min().unwrap() >= 100
         })
     })
 }
@@ -276,9 +279,9 @@ fn a_cluster_on_a_sunlit_slope_and_a_crystal_cave_match_the_approved_images() {
             eprintln!("wrote {}", path.display());
             continue;
         }
-        // The cluster is in the view, in the middle, and glows.
+        // The cluster is in the view, in the middle.
         assert!(
-            glows_at_the_centre(image),
+            crystal_at_the_centre(image),
             "{name}: no crystal at the centre"
         );
         let error = mse(image, &read_png(&path));
