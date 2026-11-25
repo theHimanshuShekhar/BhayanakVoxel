@@ -656,6 +656,13 @@ pub struct HwUpdate {
     /// builds' (the first submit's end to the second's start): the CPU's wait wake-up and
     /// recording of the builds, and whatever the GPU did before the builds' first command.
     pub gpu_gap: Duration,
+    /// With `--hw-wait`: the memory blocks the device's allocator made while the update was
+    /// recorded (a scratch buffer that fits in none makes one, and a block that is empty again is
+    /// given back), the bytes they reserve, and the biggest allocation made while recording that is
+    /// still there: the scratch buffer of the builds, as a rule.
+    pub blocks_made: u32,
+    pub reserved_grew: u64,
+    pub scratch_bytes: u64,
     pub prims_rebuilt: u64,
     /// The same by level: BLASes and boxes built of each.
     pub blas_by_level: [u32; crate::lod::LEVELS],
@@ -749,6 +756,43 @@ impl BuildTimer {
             ns(ticks[1], ticks[2]),
             ns(ticks[2], ticks[3]),
         )
+    }
+}
+
+/// What the device's allocator had at a moment: how many memory blocks and how many bytes they
+/// reserve, and the sizes of the allocations (sorted), for the diagnosis of an update that waits
+/// (#236).
+#[derive(Clone, Debug, Default)]
+struct Reserve {
+    blocks: usize,
+    bytes: u64,
+    sizes: Vec<u64>,
+}
+
+impl Reserve {
+    fn of(device: &wgpu::Device) -> Option<Self> {
+        let report = device.generate_allocator_report()?;
+        let mut sizes: Vec<u64> = report.allocations.iter().map(|a| a.size).collect();
+        sizes.sort_unstable();
+        Some(Self {
+            blocks: report.blocks.len(),
+            bytes: report.total_reserved_bytes,
+            sizes,
+        })
+    }
+
+    /// The biggest allocation that `self` has and `before` did not (as multisets of sizes): what
+    /// was allocated in between that is still there, such as the scratch buffer of a build that
+    /// was recorded and is not done.
+    fn largest_new(&self, before: &Self) -> u64 {
+        let mut old = before.sizes.iter().rev().peekable();
+        for &size in self.sizes.iter().rev() {
+            while old.next_if(|&&o| o > size).is_some() {}
+            if old.next_if(|&&o| o == size).is_none() {
+                return size;
+            }
+        }
+        0
     }
 }
 
@@ -1496,6 +1540,7 @@ impl HwScene {
         limit: Limit,
     ) {
         let all = matches!(limit, Limit::All);
+        let reserve_before = if self.wait { Reserve::of(device) } else { None };
         let entered = Instant::now();
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("acceleration structures"),
@@ -1717,6 +1762,21 @@ impl HwScene {
         let recorded = Instant::now();
         let commands = encoder.finish();
         let finished = Instant::now();
+        // The diagnosis: what the allocator did for the calls that were recorded (wgpu makes their
+        // scratch buffers as the encoder is finished): blocks it made, and the biggest scratch.
+        let looked = Instant::now();
+        let (blocks_made, reserved_grew, scratch) = match (self.wait, reserve_before) {
+            (true, Some(before)) => {
+                let after = Reserve::of(device).unwrap_or_else(|| before.clone());
+                (
+                    after.blocks.saturating_sub(before.blocks) as u32,
+                    after.bytes.saturating_sub(before.bytes),
+                    after.largest_new(&before),
+                )
+            }
+            _ => (0, 0, 0),
+        };
+        let looking = looked.elapsed();
         queue.submit(std::iter::once(commands));
         let submitted = Instant::now();
         if self.wait {
@@ -1728,6 +1788,9 @@ impl HwScene {
             Some(timer) => timer.read(device),
             None => (Duration::ZERO, Duration::ZERO, Duration::ZERO),
         };
+        // The look at the allocator is between the box pass's end and the builds' start, and is not
+        // the GPU's: it is left out of the gap.
+        let gpu_gap = gpu_gap.saturating_sub(looking);
         let done = Instant::now();
         let mut blas_by_level = [0u32; crate::lod::LEVELS];
         let mut prims_by_level = [0u64; crate::lod::LEVELS];
@@ -1757,6 +1820,9 @@ impl HwScene {
             gpu_gap,
             gpu_blas,
             gpu_tlas,
+            blocks_made,
+            reserved_grew,
+            scratch_bytes: scratch,
             prims_rebuilt: built.iter().map(|&(_, n)| u64::from(n)).sum(),
             blas_by_level,
             prims_by_level,

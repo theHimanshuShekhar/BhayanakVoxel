@@ -634,6 +634,14 @@ pub struct SlowFrame {
     pub hw_gpu_tlas_ms: Option<f64>,
     /// The GPU's time from the box pass's end to the builds' start (`hardware.gpu_gap`), ms.
     pub hw_gpu_gap_ms: Option<f64>,
+    /// With `--hw-wait`: the memory blocks the allocator made for the frame's recording, the
+    /// bytes they reserve and the biggest scratch buffer (`hardware.scratch_bytes`), and the CPU's
+    /// finishing of the command buffer and its submit (where wgpu makes the scratch buffers).
+    pub hw_blocks_made: Option<u32>,
+    pub hw_reserved_grew: Option<u64>,
+    pub hw_scratch_bytes: Option<u64>,
+    pub hw_finish_ms: Option<f64>,
+    pub hw_submit_ms: Option<f64>,
 }
 
 /// How many frames of a path were of each kind of update.
@@ -2319,6 +2327,11 @@ impl<'a> Session<'a> {
             hw_gpu_blas_ms: gpu.accel.map(|h| h.gpu_blas),
             hw_gpu_tlas_ms: gpu.accel.map(|h| h.gpu_tlas),
             hw_gpu_gap_ms: gpu.accel.map(|h| h.gpu_gap),
+            hw_blocks_made: gpu.accel.map(|h| h.blocks_made),
+            hw_reserved_grew: gpu.accel.map(|h| h.reserved_grew),
+            hw_scratch_bytes: gpu.accel.map(|h| h.scratch_bytes),
+            hw_finish_ms: gpu.accel.map(|h| h.finish),
+            hw_submit_ms: gpu.accel.map(|h| h.submit),
         };
         let slept = Instant::now();
         let asked = FRAME.saturating_sub(slept - began);
@@ -3465,6 +3478,11 @@ mod tests {
             hw_gpu_blas_ms: None,
             hw_gpu_tlas_ms: None,
             hw_gpu_gap_ms: None,
+            hw_blocks_made: None,
+            hw_reserved_grew: None,
+            hw_scratch_bytes: None,
+            hw_finish_ms: None,
+            hw_submit_ms: None,
         }
     }
 
@@ -4126,12 +4144,17 @@ mod tests {
                 "hole_look",
                 "hw_blas",
                 "hw_blas_urgent",
+                "hw_blocks_made",
                 "hw_boxes",
                 "hw_created",
+                "hw_finish_ms",
                 "hw_gpu_blas_ms",
                 "hw_gpu_gap_ms",
                 "hw_gpu_tlas_ms",
                 "hw_pool_grew",
+                "hw_reserved_grew",
+                "hw_scratch_bytes",
+                "hw_submit_ms",
                 "hw_submits",
                 "hw_tlas_made",
                 "index",

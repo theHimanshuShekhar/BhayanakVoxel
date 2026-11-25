@@ -600,3 +600,19 @@ fn the_builds_are_recorded_in_calls_of_so_many_blases_and_so_many_boxes() {
         assert_eq!(flat, (0..7).collect::<Vec<_>>(), "{chunk} {boxes}");
     }
 }
+
+#[test]
+fn the_biggest_allocation_that_is_new_is_told_from_the_sizes_before() {
+    let at = |sizes: &[u64]| Reserve {
+        sizes: sizes.to_vec(),
+        ..Reserve::default()
+    };
+    // Nothing new, and a scratch buffer that is.
+    assert_eq!(at(&[4, 8, 8]).largest_new(&at(&[4, 8, 8])), 0);
+    assert_eq!(at(&[4, 8, 8, 4096]).largest_new(&at(&[4, 8, 8])), 4096);
+    // A size that was there once and is there twice now is new.
+    assert_eq!(at(&[4, 8, 8]).largest_new(&at(&[4, 8])), 8);
+    // Allocations that are gone are not new, and the new one may be the smallest.
+    assert_eq!(at(&[2, 4]).largest_new(&at(&[1, 4, 9])), 2);
+    assert_eq!(at(&[]).largest_new(&at(&[5])), 0);
+}

@@ -310,6 +310,11 @@ pub struct HwFrame {
     /// The GPU's time from the end of the box pass's commands to the start of the builds' (see
     /// `HwUpdate::gpu_gap`).
     pub gpu_gap: f64,
+    /// With `--hw-wait`: the memory blocks the allocator made for the frame's recording, the bytes
+    /// they reserve and the biggest scratch buffer (see `HwUpdate::blocks_made`).
+    pub blocks_made: u32,
+    pub reserved_grew: u64,
+    pub scratch_bytes: u64,
 }
 
 impl HwFrame {
@@ -336,6 +341,9 @@ impl HwFrame {
             f.gpu_blas += ms(u.gpu_blas);
             f.gpu_tlas += ms(u.gpu_tlas);
             f.gpu_gap += ms(u.gpu_gap);
+            f.blocks_made += u.blocks_made;
+            f.reserved_grew += u.reserved_grew;
+            f.scratch_bytes = f.scratch_bytes.max(u.scratch_bytes);
         }
         f
     }
@@ -427,6 +435,12 @@ pub struct PathHardware {
     /// The GPU's time from the box pass's end to the builds' start (what the CPU's recording of
     /// the builds and whatever the GPU did before them take).
     pub gpu_gap: Spread,
+    /// `gpu_gap` of the frames in which the allocator made a memory block while the builds were
+    /// recorded, and of those in which it did not (`--hw-wait`).
+    pub gap_new_blocks: Spread,
+    pub gap_no_new_blocks: Spread,
+    /// The biggest scratch buffer of a frame's builds, in bytes (`--hw-wait`).
+    pub scratch_bytes: Count,
     /// `frame_parts.wait_not_passes` of the frames, by what the frame built (#236): the GPU's
     /// time that is not the passes lands in the wait, and this says which frames carry it.
     pub wait_not_passes: WaitByBuilds,
@@ -524,6 +538,23 @@ impl PathHardware {
             gpu_blas: Spread::of(&col(|h| h.gpu_blas)),
             gpu_tlas: Spread::of(&col(|h| h.gpu_tlas)),
             gpu_gap: Spread::of(&col(|h| h.gpu_gap)),
+            gap_new_blocks: Spread::of(
+                &frames
+                    .iter()
+                    .map(|(_, h)| h)
+                    .filter(|h| h.blocks_made > 0)
+                    .map(|h| h.gpu_gap)
+                    .collect::<Vec<_>>(),
+            ),
+            gap_no_new_blocks: Spread::of(
+                &frames
+                    .iter()
+                    .map(|(_, h)| h)
+                    .filter(|h| h.blocks_made == 0)
+                    .map(|h| h.gpu_gap)
+                    .collect::<Vec<_>>(),
+            ),
+            scratch_bytes: Count::of(&col(|h| h.scratch_bytes as f64)),
             wait_not_passes: WaitByBuilds::of(frames),
             per_blas_us: PerBlasUs {
                 total: per(HwFrame::total),

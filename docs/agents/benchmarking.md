@@ -1762,7 +1762,13 @@ the GPU's clock says the BLAS builds and the TLAS build took (the slowest frames
 the builds then recorded in calls of their own, the TLAS in the last; `hardware.gpu_gap` (slowest frames:
 `hw_gpu_gap_ms`) is the GPU clock's time from the end of the box pass's commands to the start of the builds'
 (the CPU's wake-up from its wait and its recording of the builds are in it, a few tenths of a millisecond; more is
-what the GPU did before the builds' first command); zero where the device has none;
+what the GPU did before the builds' first command; the look at the allocator below is left out of it); zero where the
+device has none. With `--hw-wait` the frame also looks at wgpu's allocator before the update and after its command
+buffer is finished (where wgpu makes the scratch buffers of the builds): `hardware.gap_new_blocks` and
+`hardware.gap_no_new_blocks` are `gpu_gap` of the frames in which it made a memory block and of those in which it
+did not, `hardware.scratch_bytes` the biggest allocation made while recording (the scratch buffer, as a rule), and the
+slowest frames list `hw_blocks_made`, `hw_reserved_grew` (bytes), `hw_scratch_bytes`, and the CPU's
+`hw_finish_ms` and `hw_submit_ms`;
 `per_blas_us` the parts over the BLASes built,
 in microseconds, over the frames that built (so the cost can be read per BLAS). **The `submit` of
 the hardware's command buffer also sends the `write_buffer`s of the frame's update that were
