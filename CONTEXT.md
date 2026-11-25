@@ -34,6 +34,14 @@ _Avoid_: Terrain type, relief
 A named kind of land with its own surface and life, chosen by the Climate from those its Landform allows (a canyon in a hot, dry Climate is badlands).
 _Avoid_: Zone, region (Regions are the fantasy masks)
 
+**Relief**:
+The height of the Planet's solid surface at each place, the sea floor included: one height per place, so it has no overhangs. Most of the terrain is the Relief alone.
+_Avoid_: Heightfield, ground (the Ground is what is generated around a character), elevation (the world map's coarse share of it)
+
+**Formation**:
+A 3D shape the generator adds to the Relief or carves from it, only where a Landform or a landmark asks for one: a leaning cliff, a spire, an arch, a sky island. A place is solid when it is under the Relief or inside an added Formation, and not inside a carved one; carving wins. Caves are carved Formations. Part of the generated terrain, not an Edit.
+_Avoid_: Overhang (one kind), stamp, 3D layer
+
 **Material**:
 The kind of matter a Voxel is made of (e.g. rock, sand, water, glass), carrying properties like hardness or emissiveness.
 _Avoid_: Block type, voxel type
