@@ -65,6 +65,9 @@ pub struct FrameThreadParts {
     /// The host's time in the `Queue::submit` of the scene's copies: where a driver that holds the
     /// submit up behind earlier GPU work (a jump's builds, not waited for) shows.
     pub scene_submit: Stats,
+    /// Of `scene_submit`, the `Queue::submit` alone (the belt's finish and recall are the rest): it
+    /// is not added in the sum of the parts.
+    pub scene_queue_submit: Stats,
     /// The emitter index's update (the list of lights an Edit may change).
     pub scene_emitters: Stats,
     /// The submit with no commands that sends them (`flush`): on the hardware backend it also
@@ -176,7 +179,7 @@ pub fn run(
     let mut allowance = sim::EditBudget::full();
     let (mut per_frame, mut per_edit) = (Vec::new(), Vec::new());
     let (mut frame_thread, mut scene_thread) = (Vec::new(), Vec::new());
-    let mut parts: [Vec<f64>; 9] = Default::default();
+    let mut parts: [Vec<f64>; 10] = Default::default();
     let mut grown: Vec<u64> = Vec::new();
     let mut accel_log = Vec::new();
     let (mut edits, mut voxels) = (0u32, 0u64);
@@ -235,6 +238,7 @@ pub fn run(
             parts[6].push(grow_ms);
             parts[7].push(ms(times.submit));
             parts[8].push(ms(times.emitters));
+            parts[9].push(ms(times.queue_submit));
             accel_log.extend(hw);
             took = done.as_secs_f64() * 1e3;
             frame_thread.push(((done - packed) + written).as_secs_f64() * 1e3);
@@ -251,7 +255,7 @@ pub fn run(
     let seconds = f64::from(frames) / 60.0;
     let stats = Stats::of(&per_frame);
     let budget_ms = budgets.passes.get("edits").copied();
-    gpu.set_hardware_wait(false);
+    gpu.set_hardware_wait(render::hw::process_wait());
     let accel = accel_log;
     let frame_thread_stats = Stats::of(&frame_thread);
     let frame_thread_budget_ms = budgets.passes.get(FRAME_THREAD_BUDGET).copied();
@@ -277,6 +281,7 @@ pub fn run(
             scene_write: Stats::of(&parts[1]),
             scene_grow: Stats::of(&parts[6]),
             scene_submit: Stats::of(&parts[7]),
+            scene_queue_submit: Stats::of(&parts[9]),
             scene_emitters: Stats::of(&parts[8]),
             flush: Stats::of(&parts[2]),
             accel: Stats::of(&parts[3]),
@@ -369,6 +374,7 @@ mod tests {
             &parts.scene_write,
             &parts.scene_grow,
             &parts.scene_submit,
+            &parts.scene_queue_submit,
             &parts.scene_emitters,
             &parts.flush,
             &parts.edit_made,

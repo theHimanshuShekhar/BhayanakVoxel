@@ -119,6 +119,8 @@ pub struct UpdateTimes {
     /// command buffer), which is where a submit that the driver holds up behind earlier GPU work
     /// shows.
     pub submit: std::time::Duration,
+    /// Of `submit`, the `Queue::submit` alone: the belt's finish and recall are the rest.
+    pub queue_submit: std::time::Duration,
     /// Copies written to the staging belt: each is a copy on the GPU with a barrier of its own. 0
     /// for a rebuild.
     pub writes: u32,
@@ -476,6 +478,7 @@ impl Offscreen {
             write: written,
             flush: began.elapsed() - written,
             submit: self.tracer.last_upload_submit(),
+            queue_submit: self.tracer.last_queue_submit(),
             emitters: self.tracer.last_emitters(),
             writes: self.tracer.last_writes(),
         };

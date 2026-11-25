@@ -616,6 +616,13 @@ pub struct SlowFrame {
     /// is not that it blocked the frame, and a look that began after the frame's start and was done
     /// before its end is missed.
     pub hole_look: bool,
+    /// On the hardware backend, what the frame built (#236): BLASes, of them the ones that could
+    /// not wait, their boxes, and the submits of acceleration structures. Null on the compute
+    /// backend. A frame whose `wait_not_passes_ms` is long says here whether it built much.
+    pub hw_blas: Option<u32>,
+    pub hw_blas_urgent: Option<u32>,
+    pub hw_boxes: Option<u64>,
+    pub hw_submits: Option<u32>,
 }
 
 /// How many frames of a path were of each kind of update.
@@ -1840,6 +1847,10 @@ impl Capture {
         self.recentre_ms.push(frame.parts.recentre_ms);
         self.update_all_ms.push(frame.parts.update_ms);
         if let Some(hw) = frame.hw {
+            let hw = HwFrame {
+                wait_not_passes: frame.parts.wait_not_passes_ms.unwrap_or(0.0),
+                ..hw
+            };
             self.hardware.push((frame.parts.update_ms, hw));
         }
         self.encode_ms.push(frame.parts.encode_ms);
@@ -2287,6 +2298,10 @@ impl<'a> Session<'a> {
             grown_bytes: gpu.grown_bytes,
             over_budget,
             hole_look: looking,
+            hw_blas: gpu.accel.map(|h| h.blas),
+            hw_blas_urgent: gpu.accel.map(|h| h.blas_urgent),
+            hw_boxes: gpu.accel.map(|h| h.boxes),
+            hw_submits: gpu.accel.map(|h| h.submits),
         };
         let slept = Instant::now();
         let asked = FRAME.saturating_sub(slept - began);
@@ -3423,6 +3438,10 @@ mod tests {
             grown_bytes: 0,
             over_budget: None,
             hole_look: false,
+            hw_blas: None,
+            hw_blas_urgent: None,
+            hw_boxes: None,
+            hw_submits: None,
         }
     }
 
@@ -4082,6 +4101,10 @@ mod tests {
                 "grown_bytes",
                 "harness_ms",
                 "hole_look",
+                "hw_blas",
+                "hw_blas_urgent",
+                "hw_boxes",
+                "hw_submits",
                 "index",
                 "lengthen_ms",
                 "other_ms",

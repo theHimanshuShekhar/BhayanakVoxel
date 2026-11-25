@@ -91,6 +91,10 @@ Options:
                    The most BLASes a frame builds of the groups that may wait (#236), default no
                    bound; the groups that may not wait (they gained boxes, or have no BLAS) are built
                    at once whatever it is. The report counts them as `blas_urgent`
+  --hw-wait        A diagnosis (#236): every update of the hardware backend waits for the GPU, so that
+                   the paths' `hardware.wait` (and the slowest frames' `wait_ms`) is the GPU's time of
+                   the boxes' pass, the BLAS builds and the TLAS of the frame. It is not a player's
+                   frame: the gates mean nothing with it
   --time-of-day H  Light the flight (primary and reference, the sweep and the edits) by the sky of the
                    world clock at H hours (0 to 24: 0 midnight, 6 sunrise, 12 noon, 18 sunset) in
                    place of the fixed hero sun, with the clock stopped there (#203)
@@ -172,6 +176,9 @@ pub struct Args {
     pub hw_group: Option<render::hw::Grouping>,
     /// `--hw-build-blas` (#236): the most BLASes a frame builds of the groups that may wait.
     pub hw_blas_budget: Option<u32>,
+    /// `--hw-wait` (#236): every update of the hardware backend waits for the GPU, a diagnosis of
+    /// what the GPU's time of the boxes, builds and TLAS is (not a player's frame).
+    pub hw_wait: bool,
     /// `--time-of-day`: the hours at which the flight's sky is put (#203).
     pub time_of_day: Option<f64>,
     /// `--day-cycle` and `--day-seconds`: the day cycle phase, and the length of its day if said.
@@ -217,6 +224,7 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Parsed, String> {
         rt: RtMode::default(),
         hw_group: None,
         hw_blas_budget: None,
+        hw_wait: false,
         time_of_day: None,
         day_cycle: false,
         day_seconds: None,
@@ -261,6 +269,7 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Parsed, String> {
                         .ok_or("--hw-build-blas takes a whole number of at least 1")?,
                 );
             }
+            "--hw-wait" => parsed.hw_wait = true,
             "--time-of-day" => parsed.time_of_day = Some(time_of_day(&value("--time-of-day")?)?),
             "--day-cycle" => parsed.day_cycle = true,
             "--day-seconds" => parsed.day_seconds = Some(day_seconds(&value("--day-seconds")?)?),
@@ -487,6 +496,7 @@ mod tests {
                 rt: RtMode::Compute,
                 hw_group: None,
                 hw_blas_budget: None,
+                hw_wait: false,
                 time_of_day: None,
                 day_cycle: false,
                 day_seconds: None,
@@ -554,6 +564,8 @@ mod tests {
         );
         assert_eq!(run(&[]).hw_blas_budget, None);
         assert_eq!(run(&["--hw-build-blas", "12"]).hw_blas_budget, Some(12));
+        assert!(!run(&[]).hw_wait);
+        assert!(run(&["--hw-wait"]).hw_wait);
         for bad in [
             &["--hw-group-regions"][..],
             &["--hw-group-regions", "5"],

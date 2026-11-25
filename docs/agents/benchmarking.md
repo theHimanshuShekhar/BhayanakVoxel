@@ -69,6 +69,7 @@ release: a debug build's CPU side is slow enough to distort the frame times.
 | `--rt-backend B` | How rays find the Planet (#50, a spike): `compute` (the default: the compute-shader DDA, the reference), `hw` (ray queries over the bricks' tight boxes, shadow rays ending at the first hit, for the flight, the sweep and the Edit stress, and for `--streaming --real-time`'s runs, #236), `hw-nearest` (`hw` with shadow rays that look for the nearest hit) or `both` (the bench as for `compute`, then the same flight and Edit stress on `hw` and the flight on `hw-nearest`, each on a context of its own, and the three compared). An adapter without ray queries runs compute with a warning and the reason in `rt.fallback`, not an error. See "The hardware ray backend" below. |
 | `--hw-group-regions G` | How the hardware backend makes its BLASes (#236): `G` regions along an edge of each, `4` (one cell), `8`, `16` or `32`, or `NEAR:FAR@LEVEL` (levels below LEVEL have BLASes of NEAR regions, the others FAR: `4:16@6`), or `NEAR:MID@LEVEL:FAR@LEVEL` (a third size from the second LEVEL up: `8:16@1:32@3`). **The default is `16:32@2`** (`PRODUCTION_GROUPING`): 16 regions for levels 0 and 1, 32 from level 2. The 4090's sweeps of #236: every real-time gate passes, its update `p95` is the lowest of the sizes tried (worst path 0.55 ms; 16 everywhere 0.91, 32 everywhere 0.57 with a soft-miss gate missed), 43% fewer BLASes than 16 everywhere, and its level 0 is 16's, whose Edit by the ground (`hw_edits_ground`) is 0.97 ms at `p95` (a finer level 0, `4:16@1`, 0.73). A BLAS is built again whole when any cell of it is stale, so bigger ones cost the frame thread less (fewer builds to record, fewer instances for a submit that traces to check) and the GPU more (more boxes a patch). The report's `rt.hw_group_regions` and `streaming_real_time.rt.hw_group_regions` say what the flag said, and `rt.comparison.hw_accel.group_regions` and the `group_regions` of an Edit stress's or a real-time run's `accel` what the context that ran had. |
 | `--hw-build-blas N` | The most BLASes a frame builds of the groups that may wait (#236), default no bound; the groups that may not wait (they gained boxes or have no BLAS, or waited too long) are built at once whatever it is, and a frame that built nothing builds one. It spreads a burst of builds over frames without breaking the hole rule: `accel.*.blas_urgent` and the paths' `hardware.blas_urgent` are what it cannot spread. |
+| `--hw-wait` | A diagnosis, not a measurement of the frame (#236): every update of the hardware backend waits for the GPU, so the paths' `hardware.wait` (and the slowest frames' `wait_ms`) is the GPU's time of the frame's boxes' pass, BLAS builds and TLAS. Use it to see whether a frame's `wait_not_passes` is the builds. The gates mean nothing with it. |
 | `--no-fail` | Exit with status 0 even if a pass is over budget, a frame of the streaming mode has a hole, or a gate of the real-time mode is over. |
 
 It runs unattended. Without the convergence phase it takes a minute or so (generating the whole Planet is about 22 s of it); the convergence phase, on by default, adds about 45 s on the 4090 at the default `--truth-spp`, and more on a slower GPU or with a larger `--truth-spp`.
@@ -1622,7 +1623,9 @@ Edits). All are on the same GPU, driver and clocks. Read `rt.comparison`:
   Edit planned and level 0 written: the same on both backends), `scene_write` (the scene's
   buffers, what is left once the parts below are out; the same too), `scene_grow` (buffers that
   grew: a new buffer, a copy, a new bind group), `scene_submit` (the host's time in the `Queue::submit`
-  of the scene's copies, where a driver that holds the submit up behind earlier GPU work shows),
+  of the scene's copies, where a driver that holds the submit up behind earlier GPU work shows;
+  `scene_queue_submit` is the `Queue::submit` call alone, the rest being the belt's finish and recall, and is
+  not in the sum of the parts),
   `scene_emitters` (the emitter index), `flush` (the submit that sends them), `accel` (the hardware's update, less
   its wait: what a frame of the game pays), `accel_wait` (the stress waits for the GPU's builds, the
   game does not: **it is in `frame_thread` and in `accel.total_ms`, so the Edit+BVH figure is an
@@ -1639,6 +1642,12 @@ Edits). All are on the same GPU, driver and clocks. Read `rt.comparison`:
   that no Edit makes a device allocation of a MiB or more (the small ones an Edit makes are wgpu's
   own staging and build scratch, sub-allocated, which a first Edit and a later one both make). If the first hardware Edit is still over on the 4090, its
   `scene_write`, `scene_submit` and `scene_grow` say which part it is.
+  **The first Edit's submit** (on the 4090 at fbc133e: 5.8 ms on compute and 7.0 on hardware by the
+  ground, against 0.06 on the Edits after it and on the altitude stress's) follows the jump to the
+  ground, whose upload, freed buffers and builds the GPU and driver are still on: `settle_for_edits`
+  now draws six frames after the jump, as the game does before a dig (each waits for the GPU), and
+  prints their times (`settle:` on stderr). `scene_queue_submit` says whether the time is in
+  `Queue::submit` itself.
 - `hw_edits`: the Edit stress on the hardware backend, in the report's `edits` shape, to put by
   `edits` (compute). **Both stress runs start from the same camera and rings**: the sweep's last
   height (20 000 Voxels over the pole), where the compute run ends the sweep, and the hardware run
@@ -1735,7 +1744,13 @@ each a `Spread` with `mean_ms`, `p95_ms`, `p99_ms`, `worst_ms`. `update_rest` is
 `frame_parts.update - total` per frame: what the compute backend pays as well (the scene's write
 and flush), so it is to match compute's `frame_parts.update`, and the rest of the gap is what the
 parts do not cover. `blas`, `boxes` and `submits` are per frame `{mean, p95, max}`;
-`frames_with_builds` the frames with a BLAS built; `per_blas_us` the parts over the BLASes built,
+`frames_with_builds` the frames with a BLAS built; `wait_not_passes` is `frame_parts.wait_not_passes` (the
+GPU's wait that is not the passes: the boxes' pass, the builds and the TLAS of the frame land in it) as a
+`Spread` over the frames of each kind: `idle` (no BLAS built), `waiting_only` (only groups that could wait),
+`urgent` (at least one that could not), `big` (boxes at or over the build budget) and `several_submits`, so that
+a p99 of it says which frames carry it; the slowest frames list `hw_blas`, `hw_blas_urgent`, `hw_boxes` and
+`hw_submits` (null on compute); with `--hw-wait` the `wait` part is the GPU's time of the builds;
+`per_blas_us` the parts over the BLASes built,
 in microseconds, over the frames that built (so the cost can be read per BLAS). **The `submit` of
 the hardware's command buffer also sends the `write_buffer`s of the frame's update that were
 queued before it** (the scene's upload), which on compute go in the draw's submit: read

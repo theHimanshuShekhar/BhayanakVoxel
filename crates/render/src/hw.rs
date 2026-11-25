@@ -285,6 +285,20 @@ pub fn process_blas_budget() -> u32 {
     PROCESS_BLAS_BUDGET.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+static PROCESS_WAIT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Makes every hardware backend made after it wait for the GPU after each update (see
+/// [`HwScene::set_wait`]): a diagnosis for the benchmark (`--hw-wait`, #236), whose `wait` part
+/// then is the GPU's time of the boxes, the builds and the TLAS, and not a player's frame.
+pub fn set_process_wait(wait: bool) {
+    PROCESS_WAIT.store(wait, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// What [`set_process_wait`] set (false if nothing did).
+pub fn process_wait() -> bool {
+    PROCESS_WAIT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// The grouping a hardware backend starts with: the process's, or [`PRODUCTION_GROUPING`].
 pub fn process_grouping() -> Grouping {
     PROCESS_GROUPING
@@ -1032,7 +1046,7 @@ impl HwScene {
             spent: 0,
             built: 0,
             frame: None,
-            wait: false,
+            wait: process_wait(),
             last: HwUpdate::default(),
             cost: Duration::ZERO,
             log: VecDeque::new(),

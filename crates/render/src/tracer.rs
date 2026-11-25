@@ -729,6 +729,8 @@ pub struct Tracer {
     last_grow_time: std::time::Duration,
     /// The host's time in the last scene update's submit of its copies (and the belt's recall).
     last_upload_submit: std::time::Duration,
+    /// Of that, the `Queue::submit` alone (not the belt's finish and recall).
+    last_queue_submit: std::time::Duration,
     /// The host's time in the last scene update's emitter index (`update_emitters`).
     last_emitters: std::time::Duration,
     /// The most bytes of GPU memory the scene's buffers have taken while a buffer grew: what they
@@ -1577,6 +1579,7 @@ impl Tracer {
             last_grown: 0,
             last_grow_time: std::time::Duration::ZERO,
             last_upload_submit: std::time::Duration::ZERO,
+            last_queue_submit: std::time::Duration::ZERO,
             last_emitters: std::time::Duration::ZERO,
             peak_growth_bytes: 0,
             peak_rebuild_bytes: 0,
@@ -2153,6 +2156,7 @@ impl Tracer {
         self.last_grown = 0;
         self.last_grow_time = std::time::Duration::ZERO;
         self.last_upload_submit = std::time::Duration::ZERO;
+        self.last_queue_submit = std::time::Duration::ZERO;
         match update {
             SceneUpdate::Rebuilt => {
                 let before = self.scene.bytes;
@@ -2211,7 +2215,9 @@ impl Tracer {
                 }
                 let submitting = std::time::Instant::now();
                 self.belt.finish();
+                let queued = std::time::Instant::now();
                 queue.submit(std::iter::once(encoder.finish()));
+                self.last_queue_submit = queued.elapsed();
                 self.belt.recall();
                 self.last_upload_submit = submitting.elapsed();
             }
@@ -2285,6 +2291,11 @@ impl Tracer {
     /// The host's time in the `Queue::submit` of the last [`Tracer::update_scene`]'s copies.
     pub fn last_upload_submit(&self) -> std::time::Duration {
         self.last_upload_submit
+    }
+
+    /// Of [`Tracer::last_upload_submit`], the `Queue::submit` alone.
+    pub fn last_queue_submit(&self) -> std::time::Duration {
+        self.last_queue_submit
     }
 
     /// How many times each of the scene's table, regions, brick refs and bricks buffers has been

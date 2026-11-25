@@ -292,6 +292,10 @@ pub struct HwFrame {
     /// in ms), which on this backend checks every instance of the TLAS it traces (#236).
     pub tlas_instances: u32,
     pub draw_submit: f64,
+    /// The frame's wait for the GPU less what its passes took (`frame_parts.wait_not_passes`): the
+    /// part of the wait that is the update's boxes, builds and copies, the driver and the rest.
+    /// Zero where the device has no timers.
+    pub wait_not_passes: f64,
 }
 
 impl HwFrame {
@@ -391,6 +395,48 @@ pub struct PathHardware {
     pub tlas_instances: Count,
     pub draw_submit: Spread,
     pub per_blas_us: PerBlasUs,
+    /// `frame_parts.wait_not_passes` of the frames, by what the frame built (#236): the GPU's
+    /// time that is not the passes lands in the wait, and this says which frames carry it.
+    pub wait_not_passes: WaitByBuilds,
+}
+
+/// The frames of a path in which the GPU's wait was longer than its passes, by what they built:
+/// each is a `Spread` of `wait_not_passes` over the frames of that kind (empty, so all zero, where
+/// there were none). The kinds overlap: `big` and `urgent` frames are `built` frames too.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize)]
+pub struct WaitByBuilds {
+    /// No BLAS was built.
+    pub idle: Spread,
+    /// Some were, all of them groups that could wait.
+    pub waiting_only: Spread,
+    /// At least one that could not wait was built.
+    pub urgent: Spread,
+    /// The frame's boxes were at or over [`render::hw::BUILD_BUDGET`].
+    pub big: Spread,
+    /// The frame made more than one submit of the acceleration structures.
+    pub several_submits: Spread,
+}
+
+impl WaitByBuilds {
+    fn of(frames: &[(f64, HwFrame)]) -> Self {
+        let of = |keep: fn(&HwFrame) -> bool| {
+            Spread::of(
+                &frames
+                    .iter()
+                    .map(|(_, h)| h)
+                    .filter(|h| keep(h))
+                    .map(|h| h.wait_not_passes)
+                    .collect::<Vec<_>>(),
+            )
+        };
+        Self {
+            idle: of(|h| h.blas == 0),
+            waiting_only: of(|h| h.blas > 0 && h.blas_urgent == 0),
+            urgent: of(|h| h.blas_urgent > 0),
+            big: of(|h| h.boxes >= render::hw::BUILD_BUDGET),
+            several_submits: of(|h| h.submits > 1),
+        }
+    }
 }
 
 impl PathHardware {
@@ -434,6 +480,7 @@ impl PathHardware {
             submits: Count::of(&col(|h| f64::from(h.submits))),
             tlas_instances: Count::of(&col(|h| f64::from(h.tlas_instances))),
             draw_submit: Spread::of(&col(|h| h.draw_submit)),
+            wait_not_passes: WaitByBuilds::of(frames),
             per_blas_us: PerBlasUs {
                 total: per(HwFrame::total),
                 before: per(|h| h.before),
@@ -734,6 +781,39 @@ mod tests {
         assert_eq!(h.tlas_instances.mean, 10_000.0);
         assert!((h.draw_submit.mean_ms - 0.7).abs() < 1e-9, "{h:?}");
         assert_eq!(h.draw_submit.samples, 2);
+    }
+
+    #[test]
+    fn the_waits_that_are_not_passes_are_told_by_what_the_frame_built() {
+        let frame = |blas, urgent, boxes, submits, wait| HwFrame {
+            blas,
+            blas_urgent: urgent,
+            boxes,
+            submits,
+            wait_not_passes: wait,
+            ..HwFrame::default()
+        };
+        let big = render::hw::BUILD_BUDGET;
+        let h = PathHardware::of(&[
+            (0.0, frame(0, 0, 0, 0, 0.1)),
+            (0.0, frame(0, 0, 0, 0, 0.3)),
+            (0.0, frame(4, 0, 1000, 1, 0.5)),
+            (0.0, frame(4, 2, 1000, 1, 2.0)),
+            (0.0, frame(9, 9, big, 2, 8.0)),
+        ]);
+        let w = h.wait_not_passes;
+        assert_eq!((w.idle.samples, w.idle.worst_ms), (2, 0.3));
+        assert_eq!((w.waiting_only.samples, w.waiting_only.worst_ms), (1, 0.5));
+        assert_eq!((w.urgent.samples, w.urgent.worst_ms), (2, 8.0));
+        assert_eq!((w.big.samples, w.big.worst_ms), (1, 8.0));
+        assert_eq!(
+            (w.several_submits.samples, w.several_submits.worst_ms),
+            (1, 8.0)
+        );
+        assert_eq!(
+            PathHardware::of(&[]).wait_not_passes,
+            WaitByBuilds::default()
+        );
     }
 
     #[test]

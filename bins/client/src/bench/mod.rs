@@ -152,6 +152,7 @@ fn run(args: &Args) -> Result<u8, Box<dyn Error>> {
     if let Some(blas) = args.hw_blas_budget {
         render::hw::set_process_blas_budget(blas);
     }
+    render::hw::set_process_wait(args.hw_wait);
     let (budgets, source) = match &args.budgets {
         Some(file) => {
             let text = fs::read_to_string(file)
@@ -1027,8 +1028,33 @@ fn settle_for_edits(
     flight.accel.warmup.extend(gpu.take_hardware_updates());
     flight.follow(gpu, &camera)?;
     flight.accel.settle.extend(gpu.take_hardware_updates());
+    // A dig is never in the frame of the jump: the game draws frames in between, and each waits
+    // for the GPU, so what the jump left behind (its upload, the old buffers it freed, the
+    // hardware's builds) is paid for in those frames and not in the first Edit's (#236: that Edit's
+    // submit was 5.8 ms on compute and 7.0 on hardware, against 0.06 on the Edits after it, with
+    // the stress going on at once). What they cost is printed.
+    let frame_ms: Vec<f64> = (0..SETTLE_FRAMES)
+        .map(|_| {
+            let began = Instant::now();
+            gpu.draw_upscaled(&camera);
+            began.elapsed().as_secs_f64() * 1e3
+        })
+        .collect();
+    eprintln!(
+        "settle: {SETTLE_FRAMES} frames drawn before the Edits, in ms: {}",
+        frame_ms
+            .iter()
+            .map(|ms| format!("{ms:.1}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
+    flight.accel.settle.extend(gpu.take_hardware_updates());
     Ok(())
 }
+
+/// The frames drawn between the jump to where the Edit stress starts and its first Edit (see
+/// `settle_for_edits`).
+const SETTLE_FRAMES: u32 = 6;
 
 /// The test Planet from a still camera at each of [`SWEEP_HEIGHTS`], looking at the ground that
 /// slopes away towards the horizon: both modes' passes timed there, over a few dozen frames, and
