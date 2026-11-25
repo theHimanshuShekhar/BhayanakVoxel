@@ -296,6 +296,13 @@ pub struct HwFrame {
     /// part of the wait that is the update's boxes, builds and copies, the driver and the rest.
     /// Zero where the device has no timers.
     pub wait_not_passes: f64,
+    /// BLASes made (not only built) in the frame, the updates in which the box pool grew and those
+    /// in which the TLAS was made again for more instances: the frame's allocations.
+    pub blas_created: u32,
+    pub pool_grew: u32,
+    pub tlas_made: u32,
+    /// With `--hw-wait`: the GPU's time of the box pass alone, which `wait` then leaves out.
+    pub wait_boxes: f64,
 }
 
 impl HwFrame {
@@ -315,6 +322,10 @@ impl HwFrame {
             f.blas_urgent += u.blas_urgent;
             f.boxes += u.prims_rebuilt;
             f.submits += u32::from(u.kind != "none");
+            f.blas_created += u.blas_created;
+            f.pool_grew += u32::from(u.pool_grew);
+            f.tlas_made += u32::from(u.tlas_made);
+            f.wait_boxes += ms(u.phases.wait_boxes);
         }
         f
     }
@@ -329,6 +340,7 @@ impl HwFrame {
             + self.finish
             + self.submit
             + self.wait
+            + self.wait_boxes
     }
 }
 
@@ -395,6 +407,9 @@ pub struct PathHardware {
     pub tlas_instances: Count,
     pub draw_submit: Spread,
     pub per_blas_us: PerBlasUs,
+    /// With `--hw-wait`: the GPU's time of the box pass alone per frame (`wait` is then the
+    /// builds' and the TLAS's); zero without it.
+    pub wait_boxes: Spread,
     /// `frame_parts.wait_not_passes` of the frames, by what the frame built (#236): the GPU's
     /// time that is not the passes lands in the wait, and this says which frames carry it.
     pub wait_not_passes: WaitByBuilds,
@@ -415,6 +430,11 @@ pub struct WaitByBuilds {
     pub big: Spread,
     /// The frame made more than one submit of the acceleration structures.
     pub several_submits: Spread,
+    /// At least one BLAS was made (allocated) in the frame, the box pool grew, the TLAS was made
+    /// again.
+    pub created: Spread,
+    pub pool_grew: Spread,
+    pub tlas_made: Spread,
 }
 
 impl WaitByBuilds {
@@ -435,6 +455,9 @@ impl WaitByBuilds {
             urgent: of(|h| h.blas_urgent > 0),
             big: of(|h| h.boxes >= render::hw::BUILD_BUDGET),
             several_submits: of(|h| h.submits > 1),
+            created: of(|h| h.blas_created > 0),
+            pool_grew: of(|h| h.pool_grew > 0),
+            tlas_made: of(|h| h.tlas_made > 0),
         }
     }
 }
@@ -480,6 +503,7 @@ impl PathHardware {
             submits: Count::of(&col(|h| f64::from(h.submits))),
             tlas_instances: Count::of(&col(|h| f64::from(h.tlas_instances))),
             draw_submit: Spread::of(&col(|h| h.draw_submit)),
+            wait_boxes: Spread::of(&col(|h| h.wait_boxes)),
             wait_not_passes: WaitByBuilds::of(frames),
             per_blas_us: PerBlasUs {
                 total: per(HwFrame::total),
@@ -725,6 +749,7 @@ mod tests {
                 finish: d(ms),
                 submit: d(ms * 4.0),
                 wait: Duration::ZERO,
+                wait_boxes: Duration::ZERO,
             },
             ..HwUpdate::default()
         }

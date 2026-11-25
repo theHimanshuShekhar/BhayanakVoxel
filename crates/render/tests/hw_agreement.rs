@@ -1088,8 +1088,15 @@ fn the_phases_of_an_update_add_up_to_what_it_cost() {
     assert!(!built.is_empty(), "{log:?}");
     for u in &log {
         let p = u.phases;
-        let sum =
-            p.before + p.plan + p.instances + p.boxes + p.builds + p.finish + p.submit + p.wait;
+        let sum = p.before
+            + p.plan
+            + p.instances
+            + p.boxes
+            + p.wait_boxes
+            + p.builds
+            + p.finish
+            + p.submit
+            + p.wait;
         assert_eq!(sum, u.prepare + u.build, "{u:?}");
     }
     for u in built {
@@ -1100,6 +1107,52 @@ fn the_phases_of_an_update_add_up_to_what_it_cost() {
                 && p.submit > std::time::Duration::ZERO,
             "{u:?}"
         );
+    }
+}
+
+/// The diagnosis of the GPU's time (#236): with the update waiting, the box pass is waited for
+/// apart from the builds; and the updates count the BLASes they made (not only built).
+#[test]
+fn waiting_for_the_gpu_tells_the_box_pass_from_the_builds_and_the_updates_count_what_they_made() {
+    let (store, mut scene) = walking_scene();
+    let mut hw =
+        Offscreen::with_backend(Resolution::native(8, 8), &scene, RtBackend::Hardware).unwrap();
+    if hw.rt().active != RtBackend::Hardware {
+        eprintln!("skipped: {:?}", hw.rt().fallback);
+        return;
+    }
+    hw.take_hardware_updates();
+    let mut walk = |hw: &mut Offscreen, wait: bool, from: i32| {
+        hw.set_hardware_wait(wait);
+        for step in from..from + 6 {
+            let camera = [
+                -60.0 + f64::from(step) * 14.0,
+                1565.0,
+                -60.0 + f64::from(step) * 9.0,
+            ];
+            if let Some(update) = scene.recentre(&store, camera).unwrap() {
+                hw.update_scene(&scene, &update).unwrap();
+            }
+        }
+        hw.take_hardware_updates()
+    };
+    let free = walk(&mut hw, false, 1);
+    let built: Vec<_> = free.iter().filter(|u| u.blas_rebuilt > 0).collect();
+    assert!(!built.is_empty(), "{free:?}");
+    assert!(
+        built.iter().any(|u| u.blas_created > 0),
+        "a walk makes BLASes for the groups that are new: {free:?}"
+    );
+    for u in &free {
+        assert!(u.blas_created <= u.blas_rebuilt, "{u:?}");
+        assert_eq!(u.phases.wait_boxes, std::time::Duration::ZERO, "{u:?}");
+    }
+    let waited = walk(&mut hw, true, 7);
+    let built: Vec<_> = waited.iter().filter(|u| u.blas_rebuilt > 0).collect();
+    assert!(!built.is_empty(), "{waited:?}");
+    for u in built {
+        assert!(u.phases.wait_boxes > std::time::Duration::ZERO, "{u:?}");
+        assert!(u.phases.wait > std::time::Duration::ZERO, "{u:?}");
     }
 }
 

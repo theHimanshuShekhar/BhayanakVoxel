@@ -623,6 +623,11 @@ pub struct SlowFrame {
     pub hw_blas_urgent: Option<u32>,
     pub hw_boxes: Option<u64>,
     pub hw_submits: Option<u32>,
+    /// Of `hw_blas`, the BLASes **made** (allocated), and the updates that grew the box pool or
+    /// made the TLAS again (#236).
+    pub hw_created: Option<u32>,
+    pub hw_pool_grew: Option<u32>,
+    pub hw_tlas_made: Option<u32>,
 }
 
 /// How many frames of a path were of each kind of update.
@@ -2302,6 +2307,9 @@ impl<'a> Session<'a> {
             hw_blas_urgent: gpu.accel.map(|h| h.blas_urgent),
             hw_boxes: gpu.accel.map(|h| h.boxes),
             hw_submits: gpu.accel.map(|h| h.submits),
+            hw_created: gpu.accel.map(|h| h.blas_created),
+            hw_pool_grew: gpu.accel.map(|h| h.pool_grew),
+            hw_tlas_made: gpu.accel.map(|h| h.tlas_made),
         };
         let slept = Instant::now();
         let asked = FRAME.saturating_sub(slept - began);
@@ -3442,6 +3450,9 @@ mod tests {
             hw_blas_urgent: None,
             hw_boxes: None,
             hw_submits: None,
+            hw_created: None,
+            hw_pool_grew: None,
+            hw_tlas_made: None,
         }
     }
 
@@ -4104,7 +4115,10 @@ mod tests {
                 "hw_blas",
                 "hw_blas_urgent",
                 "hw_boxes",
+                "hw_created",
+                "hw_pool_grew",
                 "hw_submits",
+                "hw_tlas_made",
                 "index",
                 "lengthen_ms",
                 "other_ms",

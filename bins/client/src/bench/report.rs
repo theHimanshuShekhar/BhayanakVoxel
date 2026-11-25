@@ -207,7 +207,7 @@ use super::stream::StreamReport;
 /// compute: `wait_not_passes` by what the frame built, that cost by part per frame, the draw's submit and the TLAS's instances, `update_rest`, the BLASes and boxes a frame, the cost per BLAS), each
 /// summary `blas_urgent`, `blas_rebuilt_by_level`, `prims_rebuilt_by_level`, `tlas_instances_max`, `prims_total_max` and `phases_ms`, each Edit's update `phases_ms`, `edits_ground` and `rt.comparison.hw_edits_ground` (the Edit stress by the ground, on the run's backend and on hw, three times as long), each Edit stress's `frame_thread_parts`, `frame_thread_each` and `grown_bytes_each` (where an Edit's frame thread went), `group_regions` of `rt.comparison.hw_accel` and of the Edit stress's and real-time runs' `accel` (the context's own), `rt.hw_group_regions` and `streaming_real_time.rt.hw_group_regions` (what `--hw-group-regions` said), and an adapter that cannot
 /// run the hardware backend stops a real-time run that asked for it (an `error`, exit status 1); the slowest frames
-/// have `hw_blas`, `hw_blas_urgent`, `hw_boxes` and `hw_submits` (null on compute), and `--hw-wait` makes the hardware's `wait` the GPU's. The `prepare_ms`/`build_ms` of an update are the frame thread's cost
+/// have `hw_blas`, `hw_blas_urgent`, `hw_boxes`, `hw_submits`, `hw_created`, `hw_pool_grew` and `hw_tlas_made` (null on compute), and `--hw-wait` makes the hardware's `wait` (and `wait_boxes`) the GPU's. The `prepare_ms`/`build_ms` of an update are the frame thread's cost
 /// only; the GPU's own time is only in the Edit stress (it waits there).
 pub const SCHEMA_VERSION: u32 = 34;
 

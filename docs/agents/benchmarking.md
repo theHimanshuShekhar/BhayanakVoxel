@@ -1747,9 +1747,13 @@ parts do not cover. `blas`, `boxes` and `submits` are per frame `{mean, p95, max
 `frames_with_builds` the frames with a BLAS built; `wait_not_passes` is `frame_parts.wait_not_passes` (the
 GPU's wait that is not the passes: the boxes' pass, the builds and the TLAS of the frame land in it) as a
 `Spread` over the frames of each kind: `idle` (no BLAS built), `waiting_only` (only groups that could wait),
-`urgent` (at least one that could not), `big` (boxes at or over the build budget) and `several_submits`, so that
+`urgent` (at least one that could not), `big` (boxes at or over the build budget), `several_submits`, and the
+allocations: `created` (a BLAS was made, not only built), `pool_grew` (the box pool grew and was copied) and
+`tlas_made` (the TLAS was made again for more instances), so that
 a p99 of it says which frames carry it; the slowest frames list `hw_blas`, `hw_blas_urgent`, `hw_boxes` and
-`hw_submits` (null on compute); with `--hw-wait` the `wait` part is the GPU's time of the builds;
+`hw_submits`, `hw_created`, `hw_pool_grew` and `hw_tlas_made` (null on compute); with `--hw-wait` the box pass
+(and a pool's copy) is submitted and waited for before the builds are recorded: `hardware.wait_boxes` is the GPU's
+time of it and `hardware.wait` the builds' and the TLAS's alone;
 `per_blas_us` the parts over the BLASes built,
 in microseconds, over the frames that built (so the cost can be read per BLAS). **The `submit` of
 the hardware's command buffer also sends the `write_buffer`s of the frame's update that were

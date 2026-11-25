@@ -558,7 +558,13 @@ pub struct HwPhases {
     /// the frame's own submit is cheaper for it.
     pub submit: Duration,
     /// Waiting for the GPU to be done: zero, but in the Edit stress ([`HwScene::set_wait`]).
+    /// Where the box pass and the BLASes are waited for apart ([`HwPhases::wait_boxes`]) this is
+    /// the builds' and the TLAS's alone.
     pub wait: Duration,
+    /// With [`HwScene::set_wait`] only: the box pass (and the copy of a pool that grew), submitted
+    /// and waited for before the builds are recorded, so that the GPU's time is told apart (#236).
+    /// Zero without it.
+    pub wait_boxes: Duration,
 }
 
 /// Every BLAS that the scene has a cell in under `grouping`, with how many boxes it has: what a
@@ -583,6 +589,12 @@ pub struct HwUpdate {
     /// How many of them could not wait (see [`HwScene::update`]): the rest were built because
     /// the frame's budget had room.
     pub blas_urgent: u32,
+    /// Of the BLASes built, how many were **made** by this update (a group with none, or one whose
+    /// boxes outgrew its BLAS), whether the pool of boxes grew, and whether the TLAS was made again
+    /// for more instances: the allocations of the update (#236).
+    pub blas_created: u32,
+    pub pool_grew: bool,
+    pub tlas_made: bool,
     pub prims_rebuilt: u64,
     /// The same by level: BLASes and boxes built of each.
     pub blas_by_level: [u32; crate::lod::LEVELS],
@@ -1385,6 +1397,8 @@ impl HwScene {
             } => (left, blas, at_least_one),
         };
         let mut urgent_built = 0u32;
+        let mut created = 0u32;
+        let mut pool_grew = false;
         let mut spent = 0u64;
         // The BLASes to build (and their boxes), and the box pass's jobs: a job a cell of them.
         let mut built: Vec<(GroupKey, u32)> = Vec::new();
@@ -1422,6 +1436,7 @@ impl HwScene {
                         })
                     });
                     let capacity = capacity_for(count);
+                    created += 1;
                     (Self::blas(device, capacity), slot, capacity)
                 }
             };
@@ -1429,6 +1444,7 @@ impl HwScene {
                 if let Some(start) = self.pool.alloc(capacity) {
                     break start;
                 }
+                pool_grew = true;
                 self.grow_pool(device, &mut encoder, capacity);
             };
             if self.slot_key.len() <= slot as usize {
@@ -1472,7 +1488,9 @@ impl HwScene {
         self.spent += spent;
         self.built += built.len() as u32;
         let planned = Instant::now();
+        let tlas_before = self.tlas_capacity;
         self.sync_instances(device, queue, touched);
+        let tlas_made = self.tlas_capacity != tlas_before;
         let synced = Instant::now();
         let kind = if built.is_empty() { "anchor" } else { "patch" };
         self.boxes.encode(
@@ -1484,6 +1502,21 @@ impl HwScene {
             &jobs,
         );
         let boxed = Instant::now();
+        // For the diagnosis of the GPU's time: the box pass (and a pool's copy) alone first.
+        let boxed_done = if self.wait {
+            let commands = encoder.finish();
+            queue.submit(std::iter::once(commands));
+            device
+                .poll(wgpu::PollType::wait_indefinitely())
+                .expect("device poll failed");
+            encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("acceleration structures"),
+            });
+            Instant::now()
+        } else {
+            boxed
+        };
+        let wait_boxes = boxed_done - boxed;
         let sizes: Vec<wgpu::BlasAABBGeometrySizeDescriptor> = built
             .iter()
             .map(|&(_, count)| blas_descriptor(count))
@@ -1527,16 +1560,20 @@ impl HwScene {
             plan: planned - entered,
             instances: synced - planned,
             boxes: boxed - synced,
-            builds: recorded - boxed,
+            builds: recorded - boxed_done,
             finish: finished - recorded,
             submit: submitted - finished,
             wait: done - submitted,
+            wait_boxes,
         };
         self.tlas_stale = false;
         self.record(HwUpdate {
             kind: if all { "build" } else { kind },
             blas_rebuilt: built.len() as u32,
             blas_urgent: urgent_built,
+            blas_created: created,
+            pool_grew,
+            tlas_made,
             prims_rebuilt: built.iter().map(|&(_, n)| u64::from(n)).sum(),
             blas_by_level,
             prims_by_level,
