@@ -482,12 +482,14 @@ impl Offscreen {
         Ok(())
     }
 
-    /// The device's live allocations (how many, and their bytes), as the Vulkan allocator counts
-    /// them, or `None` where it does not: what a test compares to see that an Edit made none.
-    pub fn device_allocations(&self) -> Option<(usize, u64)> {
-        self.device
-            .generate_allocator_report()
-            .map(|r| (r.allocations.len(), r.total_allocated_bytes))
+    /// The sizes in bytes of the device's live allocations, as the Vulkan allocator counts them
+    /// (sorted), or `None` where it does not count: what a test compares to see what an Edit
+    /// allocated.
+    pub fn device_allocation_sizes(&self) -> Option<Vec<u64>> {
+        let report = self.device.generate_allocator_report()?;
+        let mut sizes: Vec<u64> = report.allocations.iter().map(|a| a.size).collect();
+        sizes.sort_unstable();
+        Some(sizes)
     }
 
     /// Says that an Edit changed `bricks`, so that the radiance cache follows the light round them

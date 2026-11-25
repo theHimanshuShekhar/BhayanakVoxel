@@ -1636,7 +1636,8 @@ Edits). All are on the same GPU, driver and clocks. Read `rt.comparison`:
   or whose chunks the GPU still held, did that in its first Edit's frame (compute's first write does
   it too on a fresh context: 2.9 ms there). The belt now has three chunks before the first update
   (`BELT_WARM_CHUNKS`), and `edits_by_the_ground_fit_in_the_scenes_buffers_on_either_backend` asserts
-  that no Edit allocates on the device. If the first hardware Edit is still over on the 4090, its
+  that no Edit makes a device allocation of a MiB or more (the small ones an Edit makes are wgpu's
+  own staging and build scratch, sub-allocated, which a first Edit and a later one both make). If the first hardware Edit is still over on the 4090, its
   `scene_write`, `scene_submit` and `scene_grow` say which part it is.
 - `hw_edits`: the Edit stress on the hardware backend, in the report's `edits` shape, to put by
   `edits` (compute). **Both stress runs start from the same camera and rings**: the sweep's last

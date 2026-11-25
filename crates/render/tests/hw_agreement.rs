@@ -1304,8 +1304,8 @@ fn the_groups_built_at_once_use_up_the_frames_box_budget() {
 /// An Edit of the ground by the camera, dug and placed in turn as the bench's Edit stress does,
 /// fits in the scene's buffers: none is made again bigger and copied (a growth is a new buffer, a
 /// copy and a new bind group, which the first Edit of a context that had not been where the others
-/// were would pay for, #236), on either backend, and make no allocation on the device (a staging
-/// belt with no free chunk makes one of 4 MiB: 2 to 3 ms in the first Edit).
+/// were would pay for, #236), on either backend, and make no device allocation of a MiB or more (a
+/// staging belt with no free chunk makes one of 4 MiB: 2 to 3 ms in the first Edit).
 #[test]
 fn edits_by_the_ground_fit_in_the_scenes_buffers_on_either_backend() {
     for backend in [RtBackend::Compute, RtBackend::Hardware] {
@@ -1329,15 +1329,28 @@ fn edits_by_the_ground_fit_in_the_scenes_buffers_on_either_backend() {
             let changed: Vec<BrickCoord> = changed.into_iter().collect();
             store.refresh_lod(changed.iter().copied());
             let update = scene.update(&store, &changed).unwrap();
-            let before = gpu.device_allocations();
+            let before = gpu.device_allocation_sizes();
             gpu.update_scene(&scene, &update).unwrap();
             // The staging belt has its chunks before the first Edit: a chunk made for it is a
             // device allocation of 4 MiB, and 2 to 3 ms of the Edit's frame (a cold belt's first
-            // Edit, #236). Where the allocator does not count, there is nothing to compare.
-            if let (Some(before), Some(after)) = (before, gpu.device_allocations()) {
+            // Edit, #236). What the Edit allocates and is small is wgpu's own (a staging buffer
+            // for a small write, the scratch of a build: some hundred bytes to some tens of KB,
+            // sub-allocated, and which of them are live depends on when the GPU gave the last
+            // ones back), so it is allocations of a MiB or more that are looked for. Where the
+            // allocator does not count, there is nothing to compare.
+            if let (Some(mut before), Some(after)) = (before, gpu.device_allocation_sizes()) {
+                let mut made = Vec::new();
+                for size in after {
+                    match before.iter().position(|&b| b == size) {
+                        Some(at) => {
+                            before.remove(at);
+                        }
+                        None => made.push(size),
+                    }
+                }
                 assert!(
-                    after.1 <= before.1,
-                    "{backend:?}: Edit {edit} allocated on the device ({before:?} -> {after:?})"
+                    made.iter().all(|&size| size < 1 << 20),
+                    "{backend:?}: Edit {edit} made a device allocation of a MiB or more: {made:?}"
                 );
             }
             assert_eq!(
