@@ -282,7 +282,8 @@ fn a_cluster_on_a_sunlit_slope_and_a_crystal_cave_match_the_approved_images() {
         // The cluster is in the view, in the middle.
         assert!(
             crystal_at_the_centre(image),
-            "{name}: no crystal at the centre"
+            "{name}: no crystal colour at the centre (a crystal may be there but too grey or white for \
+this check, which wants a spread of 100 between the brightest and dimmest channel)"
         );
         let error = mse(image, &read_png(&path));
         if error > MAX_MSE {
@@ -388,7 +389,7 @@ fn stamp_cluster(
         (state >> 40) as f64 / f64::from(1u32 << 24)
     };
     for k in 0..5 {
-        let (length, radius, lean) = if k == 0 {
+        let (height, radius, lean) = if k == 0 {
             (1.4 * m, 0.13 * m, (0.0, 0.0))
         } else {
             (
@@ -406,7 +407,7 @@ fn stamp_cluster(
             up[c] + a[c] * lean.0 + b[c] * lean.1
         }));
         let base = plus(plus(anchor, a, spread.0), b, spread.1);
-        let reach = length + 3.0;
+        let reach = height + 3.0;
         let low: [i32; 3] = std::array::from_fn(|c| (base[c] - reach).floor() as i32);
         let high: [i32; 3] = std::array::from_fn(|c| (base[c] + reach).ceil() as i32);
         for x in low[0]..=high[0] {
@@ -415,11 +416,11 @@ fn stamp_cluster(
                     let p = [f64::from(x), f64::from(y), f64::from(z)];
                     let d: [f64; 3] = std::array::from_fn(|c| p[c] - base[c]);
                     let t: f64 = d.iter().zip(axis).map(|(u, v)| u * v).sum();
-                    if t > length {
+                    if t > height {
                         continue;
                     }
-                    let across = length_of(plus(d, axis, -t));
-                    let wide = radius * (1.0 - t.max(0.0) / length).powf(0.7);
+                    let across = length(plus(d, axis, -t));
+                    let wide = radius * (1.0 - t.max(0.0) / height).powf(0.7);
                     if t >= -2.0 && across <= wide.max(0.5) {
                         let coord = VoxelCoord([x, y, z]);
                         if store.brick(coord.brick()).is_none() {
@@ -436,10 +437,6 @@ fn stamp_cluster(
     }
 }
 
-fn length_of(a: [f64; 3]) -> f64 {
-    length(a)
-}
-
 /// The check sheet of the crystal hues (#204), for the owner to judge the colours of the
 /// Materials against the game's tone curve: a row of one cluster of each of the eight hues on
 /// sunlit ground, in the order of the table, and a view along a cave wall for each hue that has
@@ -448,7 +445,6 @@ fn length_of(a: [f64; 3]) -> f64 {
 #[test]
 #[ignore = "renders images for a decision; writes PNGs"]
 fn crystal_hue_sheet() {
-    use render::Resolution;
     let planet = Planet::new(WorldMap::with_radius(
         crate::SEED,
         TEST_MAP_SIZE,
@@ -467,7 +463,6 @@ fn crystal_hue_sheet() {
         fill(&mut scene, &mut store, key.position).unwrap();
         let camera = CameraPath::new(vec![key, key]).radial().camera_at(0, 1);
         let mut gpu = Offscreen::new(WIDTH * 2, HEIGHT * 2, &scene).unwrap();
-        let _ = Resolution::native(1, 1);
         let image = gpu.render(&camera);
         let path = out.join(format!("{name}.png"));
         write_png(&path, &image).unwrap();

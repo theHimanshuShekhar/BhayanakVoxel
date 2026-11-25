@@ -2188,16 +2188,17 @@ mod tests {
     /// [`CRYSTAL_MAX_LEVEL`], in the bricks of the longest clusters on the ground and, apart, in
     /// caves: the numbers measured (printed by the test below) with a margin. A cluster is made of
     /// thin prisms, so most of its Voxels are at an edge, which is more than the ground has and
-    /// why these are higher than [`TOLERANCE`]. The test also holds the amount of crystal to
-    /// within half again: sampling a coarse Voxel only when a ball of 0.55 of its half-width fits
+    /// why these are higher than [`TOLERANCE`]. The test also bounds the amount of crystal (the
+    /// larger count at most 1.5 times the smaller plus 20 Voxels, so a loose bound where counts are small): sampling a coarse Voxel only when a ball of 0.55 of its half-width fits
     /// in a prism (the first try) made 10% to 55% of the pyramid's crystal at levels 1 to 3 and
     /// differed in 27% to 60% of the Voxels.
     ///
     /// Caves at level 3 have none, by the owner's decision of 2026-11-25: at 80 cm Voxels a cave
     /// cluster is 1 to 4 Voxels across, so per-Voxel agreement there is edge noise (58% of 124
     /// Voxels differ, nearly all of them the edge of a prism that one makes and the other does
-    /// not). Only the amount of crystal is held there, to within half again (94 made, 82
-    /// downsampled). Ground clusters keep the whole check at every level, and caves at 1 and 2.
+    /// not). Only the amount of crystal is bounded there, by the larger count being at most 1.5
+    /// times the smaller plus 20 Voxels (94 made, 82 downsampled; at 82 downsampled that accepts
+    /// 42 to 143 made). Ground clusters keep the whole check at every level, and caves at 1 and 2.
     const CRYSTAL_TOLERANCE: [(&str, [Option<f64>; 3]); 2] = [
         ("ground", [Some(0.12), Some(0.26), Some(0.45)]),
         ("cave", [Some(0.12), Some(0.26), None]),
@@ -2259,7 +2260,8 @@ mod tests {
                 if let Some(tolerance) = tolerance[level - 1] {
                     assert!(fraction <= tolerance, "{name} level {level}: {fraction}");
                 }
-                // The volume agrees too: neither makes far more crystal than the other.
+                // The volume agrees too, loosely: the larger count is at most 1.5 times the smaller plus 20
+                // Voxels (the 20 is what keeps the few Voxels of a coarse level from failing it).
                 let (low, high) = (made.min(real), made.max(real));
                 assert!(
                     high as f64 <= low as f64 * 1.5 + 20.0,
