@@ -302,6 +302,41 @@ pub fn process_wait() -> bool {
 static PROCESS_FAST_BUILD: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 static PROCESS_BUILD_CHUNK: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static PROCESS_BUILD_CHUNK_BOXES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Records the BLAS builds of a frame in calls of at most this many boxes each, at least a BLAS
+/// to a call (`--hw-build-chunk-boxes`, an experiment of #236's: a call's scratch buffer is as big
+/// as its builds'); 0, the default, is no bound.
+pub fn set_process_build_chunk_boxes(boxes: u64) {
+    PROCESS_BUILD_CHUNK_BOXES.store(boxes, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The calls the builds of `counts` boxes each are recorded in, as the ranges of the entries each
+/// has: `chunk` BLASes at the most (0, all of them) and `boxes` boxes at the most (0, no bound; a
+/// BLAS over it has a call of its own).
+fn build_calls(counts: &[u32], chunk: usize, boxes: u64) -> Vec<Range<usize>> {
+    let chunk = if chunk == 0 {
+        counts.len().max(1)
+    } else {
+        chunk
+    };
+    let mut calls = Vec::new();
+    let (mut first, mut spent) = (0usize, 0u64);
+    for (i, &count) in counts.iter().enumerate() {
+        let full =
+            i - first >= chunk || (boxes > 0 && i > first && spent + u64::from(count) > boxes);
+        if full {
+            calls.push(first..i);
+            (first, spent) = (i, 0);
+        }
+        spent += u64::from(count);
+    }
+    if first < counts.len() {
+        calls.push(first..counts.len());
+    }
+    calls
+}
 
 /// Makes the BLASes of every hardware backend made after it `PREFER_FAST_BUILD` and not
 /// `PREFER_FAST_TRACE` (`--hw-fast-build`, an experiment of #236's: the builds are quicker, the
@@ -617,6 +652,10 @@ pub struct HwUpdate {
     /// BLAS builds took, and the TLAS build (the device's clock; zero without them).
     pub gpu_blas: Duration,
     pub gpu_tlas: Duration,
+    /// With the same: the GPU's time from the end of the box pass's commands to the start of the
+    /// builds' (the first submit's end to the second's start): the CPU's wait wake-up and
+    /// recording of the builds, and whatever the GPU did before the builds' first command.
+    pub gpu_gap: Duration,
     pub prims_rebuilt: u64,
     /// The same by level: BLASes and boxes built of each.
     pub blas_by_level: [u32; crate::lod::LEVELS],
@@ -652,7 +691,7 @@ struct BuildTimer {
 }
 
 impl BuildTimer {
-    const QUERIES: u32 = 3;
+    const QUERIES: u32 = 4;
     const BYTES: u64 = Self::QUERIES as u64 * 8;
 
     fn new(device: &wgpu::Device, queue: &wgpu::Queue) -> Option<Self> {
@@ -682,8 +721,10 @@ impl BuildTimer {
         encoder.copy_buffer_to_buffer(&self.resolve, 0, &self.read, 0, Self::BYTES);
     }
 
-    /// The BLAS builds' and the TLAS build's GPU time, once the commands are done.
-    fn read(&self, device: &wgpu::Device) -> (Duration, Duration) {
+    /// The GPU's time between the end of the box pass's commands and the start of the builds'
+    /// (the CPU's recording of the builds is in it), the BLAS builds' and the TLAS build's, once
+    /// the commands are done.
+    fn read(&self, device: &wgpu::Device) -> (Duration, Duration, Duration) {
         let slice = self.read.slice(..);
         slice.map_async(wgpu::MapMode::Read, |_| {});
         device
@@ -703,7 +744,11 @@ impl BuildTimer {
                 (to.saturating_sub(from) as f64 * f64::from(self.period_ns)) as u64,
             )
         };
-        (ns(ticks[0], ticks[1]), ns(ticks[1], ticks[2]))
+        (
+            ns(ticks[0], ticks[1]),
+            ns(ticks[1], ticks[2]),
+            ns(ticks[2], ticks[3]),
+        )
     }
 }
 
@@ -1603,6 +1648,9 @@ impl HwScene {
         let boxed = Instant::now();
         // For the diagnosis of the GPU's time: the box pass (and a pool's copy) alone first.
         let boxed_done = if self.wait {
+            if let Some(timer) = &self.timer {
+                encoder.write_timestamp(&timer.set, 0);
+            }
             let commands = encoder.finish();
             queue.submit(std::iter::once(commands));
             device
@@ -1637,30 +1685,32 @@ impl HwScene {
             })
             .collect();
         let timer = if self.wait { self.timer.as_ref() } else { None };
-        let chunk = match PROCESS_BUILD_CHUNK.load(std::sync::atomic::Ordering::Relaxed) {
-            0 => entries.len().max(1),
-            n => n as usize,
-        };
-        if timer.is_none() && chunk >= entries.len() {
+        let counts: Vec<u32> = built.iter().map(|&(_, count)| count).collect();
+        let calls = build_calls(
+            &counts,
+            PROCESS_BUILD_CHUNK.load(std::sync::atomic::Ordering::Relaxed) as usize,
+            PROCESS_BUILD_CHUNK_BOXES.load(std::sync::atomic::Ordering::Relaxed),
+        );
+        if timer.is_none() && calls.len() <= 1 {
             encoder.build_acceleration_structures(entries.iter(), std::iter::once(&self.tlas));
         } else {
             // In calls of their own (each with its scratch buffer, and its barrier), and the TLAS
             // after them: so that the timestamps can be between them.
             if let Some(timer) = timer {
-                encoder.write_timestamp(&timer.set, 0);
+                encoder.write_timestamp(&timer.set, 1);
             }
-            for part in entries.chunks(chunk) {
-                encoder.build_acceleration_structures(part.iter(), std::iter::empty());
+            for call in calls {
+                encoder.build_acceleration_structures(entries[call].iter(), std::iter::empty());
             }
             if let Some(timer) = timer {
-                encoder.write_timestamp(&timer.set, 1);
+                encoder.write_timestamp(&timer.set, 2);
             }
             encoder.build_acceleration_structures(
                 std::iter::empty::<&wgpu::BlasBuildEntry<'_>>(),
                 std::iter::once(&self.tlas),
             );
             if let Some(timer) = timer {
-                encoder.write_timestamp(&timer.set, 2);
+                encoder.write_timestamp(&timer.set, 3);
                 timer.resolve(&mut encoder);
             }
         }
@@ -1674,9 +1724,9 @@ impl HwScene {
                 .poll(wgpu::PollType::wait_indefinitely())
                 .expect("device poll failed");
         }
-        let (gpu_blas, gpu_tlas) = match timer {
+        let (gpu_gap, gpu_blas, gpu_tlas) = match timer {
             Some(timer) => timer.read(device),
-            None => (Duration::ZERO, Duration::ZERO),
+            None => (Duration::ZERO, Duration::ZERO, Duration::ZERO),
         };
         let done = Instant::now();
         let mut blas_by_level = [0u32; crate::lod::LEVELS];
@@ -1704,6 +1754,7 @@ impl HwScene {
             blas_created: created,
             pool_grew,
             tlas_made,
+            gpu_gap,
             gpu_blas,
             gpu_tlas,
             prims_rebuilt: built.iter().map(|&(_, n)| u64::from(n)).sum(),

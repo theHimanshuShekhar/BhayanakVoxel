@@ -49,6 +49,18 @@ fn the_builds_in_calls_of_two_make_what_the_scene_has_and_the_gpu_times_them_whe
     }
     for u in built {
         assert!(!u.gpu_blas.is_zero() && !u.gpu_tlas.is_zero(), "{u:?}");
+        // From the box pass's end to the builds' start: the wait and the recording are in it, and
+        // it is before the builds' own time, which is not in it.
+        assert!(!u.gpu_gap.is_zero(), "{u:?}");
+        assert!(
+            u.gpu_gap + u.gpu_blas + u.gpu_tlas
+                <= u.phases.wait
+                    + u.phases.wait_boxes
+                    + u.phases.builds
+                    + u.phases.finish
+                    + u.phases.submit,
+            "{u:?}"
+        );
         // The GPU's time of the builds is inside the update's wait for it.
         assert!(
             u.gpu_blas + u.gpu_tlas <= u.phases.wait + u.phases.wait_boxes,

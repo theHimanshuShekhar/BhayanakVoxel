@@ -632,6 +632,8 @@ pub struct SlowFrame {
     /// `hardware.gpu_blas`), ms.
     pub hw_gpu_blas_ms: Option<f64>,
     pub hw_gpu_tlas_ms: Option<f64>,
+    /// The GPU's time from the box pass's end to the builds' start (`hardware.gpu_gap`), ms.
+    pub hw_gpu_gap_ms: Option<f64>,
 }
 
 /// How many frames of a path were of each kind of update.
@@ -2316,6 +2318,7 @@ impl<'a> Session<'a> {
             hw_tlas_made: gpu.accel.map(|h| h.tlas_made),
             hw_gpu_blas_ms: gpu.accel.map(|h| h.gpu_blas),
             hw_gpu_tlas_ms: gpu.accel.map(|h| h.gpu_tlas),
+            hw_gpu_gap_ms: gpu.accel.map(|h| h.gpu_gap),
         };
         let slept = Instant::now();
         let asked = FRAME.saturating_sub(slept - began);
@@ -3461,6 +3464,7 @@ mod tests {
             hw_tlas_made: None,
             hw_gpu_blas_ms: None,
             hw_gpu_tlas_ms: None,
+            hw_gpu_gap_ms: None,
         }
     }
 
@@ -4125,6 +4129,7 @@ mod tests {
                 "hw_boxes",
                 "hw_created",
                 "hw_gpu_blas_ms",
+                "hw_gpu_gap_ms",
                 "hw_gpu_tlas_ms",
                 "hw_pool_grew",
                 "hw_submits",

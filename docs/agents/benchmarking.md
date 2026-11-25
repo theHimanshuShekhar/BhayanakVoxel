@@ -72,6 +72,7 @@ release: a debug build's CPU side is slow enough to distort the frame times.
 | `--hw-wait` | A diagnosis, not a measurement of the frame (#236): every update of the hardware backend waits for the GPU, so the paths' `hardware.wait` (and the slowest frames' `wait_ms`) is the GPU's time of the frame's boxes' pass, BLAS builds and TLAS. Use it to see whether a frame's `wait_not_passes` is the builds. The gates mean nothing with it. |
 | `--hw-fast-build` | An experiment (#236): the hardware backend's BLASes are `PREFER_FAST_BUILD` and not `PREFER_FAST_TRACE`. Read the paths' `hardware.wait`/`gpu_blas` and the passes' `primary` with it: the builds may be quicker and the trace slower. |
 | `--hw-build-chunk N` | An experiment (#236): a frame's BLAS builds are recorded `N` BLASes to a `build_acceleration_structures` call (each call has a scratch buffer and a barrier of its own), default all of them in one. |
+| `--hw-build-chunk-boxes N` | An experiment (#236): a frame's BLAS builds are recorded in `build_acceleration_structures` calls of `N` boxes at the most (a BLAS over it has a call of its own), so that no call has a big scratch buffer (a call's scratch is the sum of its builds'); with `--hw-build-chunk`, whichever bound is reached first. |
 | `--no-fail` | Exit with status 0 even if a pass is over budget, a frame of the streaming mode has a hole, or a gate of the real-time mode is over. |
 
 It runs unattended. Without the convergence phase it takes a minute or so (generating the whole Planet is about 22 s of it); the convergence phase, on by default, adds about 45 s on the 4090 at the default `--truth-spp`, and more on a slower GPU or with a larger `--truth-spp`.
@@ -1758,7 +1759,10 @@ a p99 of it says which frames carry it; the slowest frames list `hw_blas`, `hw_b
 time of it and `hardware.wait` the builds' and the TLAS's alone; on a device with timestamps in encoders
 (`TIMESTAMP_QUERY_INSIDE_ENCODERS`, asked for with `--hw-wait`) `hardware.gpu_blas` and `hardware.gpu_tlas` are what
 the GPU's clock says the BLAS builds and the TLAS build took (the slowest frames: `hw_gpu_blas_ms`, `hw_gpu_tlas_ms`),
-the builds then recorded in calls of their own, the TLAS in the last; zero where the device has none;
+the builds then recorded in calls of their own, the TLAS in the last; `hardware.gpu_gap` (slowest frames:
+`hw_gpu_gap_ms`) is the GPU clock's time from the end of the box pass's commands to the start of the builds'
+(the CPU's wake-up from its wait and its recording of the builds are in it, a few tenths of a millisecond; more is
+what the GPU did before the builds' first command); zero where the device has none;
 `per_blas_us` the parts over the BLASes built,
 in microseconds, over the frames that built (so the cost can be read per BLAS). **The `submit` of
 the hardware's command buffer also sends the `write_buffer`s of the frame's update that were

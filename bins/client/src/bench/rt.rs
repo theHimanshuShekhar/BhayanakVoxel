@@ -307,6 +307,9 @@ pub struct HwFrame {
     /// and of the TLAS build (both inside `wait`).
     pub gpu_blas: f64,
     pub gpu_tlas: f64,
+    /// The GPU's time from the end of the box pass's commands to the start of the builds' (see
+    /// `HwUpdate::gpu_gap`).
+    pub gpu_gap: f64,
 }
 
 impl HwFrame {
@@ -332,6 +335,7 @@ impl HwFrame {
             f.wait_boxes += ms(u.phases.wait_boxes);
             f.gpu_blas += ms(u.gpu_blas);
             f.gpu_tlas += ms(u.gpu_tlas);
+            f.gpu_gap += ms(u.gpu_gap);
         }
         f
     }
@@ -420,6 +424,9 @@ pub struct PathHardware {
     /// and the TLAS build took, per frame (zero otherwise).
     pub gpu_blas: Spread,
     pub gpu_tlas: Spread,
+    /// The GPU's time from the box pass's end to the builds' start (what the CPU's recording of
+    /// the builds and whatever the GPU did before them take).
+    pub gpu_gap: Spread,
     /// `frame_parts.wait_not_passes` of the frames, by what the frame built (#236): the GPU's
     /// time that is not the passes lands in the wait, and this says which frames carry it.
     pub wait_not_passes: WaitByBuilds,
@@ -516,6 +523,7 @@ impl PathHardware {
             wait_boxes: Spread::of(&col(|h| h.wait_boxes)),
             gpu_blas: Spread::of(&col(|h| h.gpu_blas)),
             gpu_tlas: Spread::of(&col(|h| h.gpu_tlas)),
+            gpu_gap: Spread::of(&col(|h| h.gpu_gap)),
             wait_not_passes: WaitByBuilds::of(frames),
             per_blas_us: PerBlasUs {
                 total: per(HwFrame::total),
