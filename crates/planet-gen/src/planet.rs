@@ -2193,10 +2193,11 @@ mod tests {
     /// in a prism (the first try) made 10% to 55% of the pyramid's crystal at levels 1 to 3 and
     /// differed in 27% to 60% of the Voxels.
     ///
-    /// Caves at level 3 have none: 58% of 124 Voxels differ (the edges of prisms that one makes
-    /// and the other does not: a cave's clusters are shorter than the ground's, so their Voxels
-    /// at 80 cm are few), so only the amount of crystal is held there, to within half again (94
-    /// made, 82 downsampled).
+    /// Caves at level 3 have none, by the owner's decision of 2026-11-25: at 80 cm Voxels a cave
+    /// cluster is 1 to 4 Voxels across, so per-Voxel agreement there is edge noise (58% of 124
+    /// Voxels differ, nearly all of them the edge of a prism that one makes and the other does
+    /// not). Only the amount of crystal is held there, to within half again (94 made, 82
+    /// downsampled). Ground clusters keep the whole check at every level, and caves at 1 and 2.
     const CRYSTAL_TOLERANCE: [(&str, [Option<f64>; 3]); 2] = [
         ("ground", [Some(0.12), Some(0.26), Some(0.45)]),
         ("cave", [Some(0.12), Some(0.26), None]),

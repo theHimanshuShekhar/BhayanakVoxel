@@ -300,7 +300,11 @@ fn a_cluster_on_a_sunlit_slope_and_a_crystal_cave_match_the_approved_images() {
 /// out from the wall and 2.5 m behind the cluster, looking along the wall and a little into it,
 /// so that the prisms, their tips and their hues show in profile. Only a way that has air all
 /// along the sight line is taken.
-fn cave_along(planet: &Planet, sites: &[CrystalSite]) -> Keyframe {
+fn cave_along(
+    planet: &Planet,
+    sites: &[CrystalSite],
+    hue: Option<brick_store::Material>,
+) -> Option<Keyframe> {
     let m = VOXELS_PER_METRE;
     let caves: Vec<&CrystalSite> = sites
         .iter()
@@ -312,7 +316,10 @@ fn cave_along(planet: &Planet, sites: &[CrystalSite]) -> Keyframe {
             .is_none()
     };
     let mut best: Option<(usize, Keyframe)> = None;
-    for site in caves.iter().filter(|s| s.length >= 10.0) {
+    for site in caves
+        .iter()
+        .filter(|s| s.length >= 10.0 && hue.is_none_or(|h| s.material == h))
+    {
         let (t1, t2) = tangents(site.normal);
         for k in 0..8 {
             let angle = f64::from(k) * std::f64::consts::FRAC_PI_4;
@@ -352,85 +359,158 @@ fn cave_along(planet: &Planet, sites: &[CrystalSite]) -> Keyframe {
             }
         }
     }
-    best.expect("a cave cluster with air along its wall").1
+    best.map(|(_, key)| key)
 }
 
-/// The look of the crystals at several emission strengths and tone curves, for the owner to
-/// choose from (#204): the slope and a view along a cave wall, at an `emissive_intensity` of 1.0,
-/// 1.5 and 3.0 (the table's), with the game's tone curve and with Neutral (which keeps a
-/// saturated colour's hue where the AgX-like one takes it towards white). The PNGs are in
-/// `target/crystal-look/`, not committed: `cargo test -p client --bin client crystal_look --
-/// --ignored`.
+/// One cluster of `material` for the hue sheet, stood on the ground at `anchor` (the way
+/// `up` faces): five tapering spires, one tall and four leaning, as the look-dev stamp has them
+/// (this is not the generator's cluster, which has its own geometry: it is as much as it takes
+/// to judge a hue). Only air is written.
+fn stamp_cluster(
+    store: &mut brick_store::BrickStore,
+    anchor: [f64; 3],
+    up: [f64; 3],
+    material: brick_store::Material,
+    seed: usize,
+) {
+    use brick_store::VoxelCoord;
+    let (a, b) = tangents(up);
+    let m = VOXELS_PER_METRE;
+    // A stream of numbers that is the same every run.
+    let mut state = 0x9E37_79B9_7F4A_7C15u64 ^ (seed as u64 + 1).wrapping_mul(0x1000_0000_01B3);
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        (state >> 40) as f64 / f64::from(1u32 << 24)
+    };
+    for k in 0..5 {
+        let (length, radius, lean) = if k == 0 {
+            (1.4 * m, 0.13 * m, (0.0, 0.0))
+        } else {
+            (
+                (0.5 + 0.5 * next()) * m,
+                (0.07 + 0.04 * next()) * m,
+                (next() - 0.5, next() - 0.5),
+            )
+        };
+        let spread = if k == 0 {
+            (0.0, 0.0)
+        } else {
+            ((next() - 0.5) * 0.4 * m, (next() - 0.5) * 0.4 * m)
+        };
+        let axis = unit(std::array::from_fn(|c| {
+            up[c] + a[c] * lean.0 + b[c] * lean.1
+        }));
+        let base = plus(plus(anchor, a, spread.0), b, spread.1);
+        let reach = length + 3.0;
+        let low: [i32; 3] = std::array::from_fn(|c| (base[c] - reach).floor() as i32);
+        let high: [i32; 3] = std::array::from_fn(|c| (base[c] + reach).ceil() as i32);
+        for x in low[0]..=high[0] {
+            for y in low[1]..=high[1] {
+                for z in low[2]..=high[2] {
+                    let p = [f64::from(x), f64::from(y), f64::from(z)];
+                    let d: [f64; 3] = std::array::from_fn(|c| p[c] - base[c]);
+                    let t: f64 = d.iter().zip(axis).map(|(u, v)| u * v).sum();
+                    if t > length {
+                        continue;
+                    }
+                    let across = length_of(plus(d, axis, -t));
+                    let wide = radius * (1.0 - t.max(0.0) / length).powf(0.7);
+                    if t >= -2.0 && across <= wide.max(0.5) {
+                        let coord = VoxelCoord([x, y, z]);
+                        if store.brick(coord.brick()).is_none() {
+                            let made = store.brick_at(0, coord.brick()).into_owned();
+                            store.insert(coord.brick(), made);
+                        }
+                        if store.get(coord).is_none() {
+                            store.set(coord, Some(material));
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn length_of(a: [f64; 3]) -> f64 {
+    length(a)
+}
+
+/// The check sheet of the crystal hues (#204), for the owner to judge the colours of the
+/// Materials against the game's tone curve: a row of one cluster of each of the eight hues on
+/// sunlit ground, in the order of the table, and a view along a cave wall for each hue that has
+/// a cave with clusters of it. The PNGs are in `target/crystal-hues/`, not committed:
+/// `cargo test --release -p client --bin client crystal_hue_sheet -- --ignored --nocapture`.
 #[test]
-#[ignore = "renders twelve images for a decision; writes PNGs"]
-fn crystal_look_comparison() {
-    use render::{Resolution, Stages, ToneCurve};
+#[ignore = "renders images for a decision; writes PNGs"]
+fn crystal_hue_sheet() {
+    use render::Resolution;
     let planet = Planet::new(WorldMap::with_radius(
         crate::SEED,
         TEST_MAP_SIZE,
         TEST_RADIUS,
     ));
     let sites = sites(&planet);
-    let views = [
-        ("slope", slope(&planet, &sites)),
-        ("cave", cave_along(&planet, &sites)),
-    ];
-    let out = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/crystal-look");
+    let out = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/crystal-hues");
     std::fs::create_dir_all(&out).unwrap();
-    let toml = include_str!("../../../../crates/materials/materials.toml");
-    let with_intensity = |intensity: f32| {
-        let text: Vec<String> = toml
-            .split("[[material]]")
-            .map(|block| {
-                if block.contains("name = \"crystal ") {
-                    block
-                        .lines()
-                        .map(|l| {
-                            if l.starts_with("emissive_intensity") {
-                                format!("emissive_intensity = {intensity}")
-                            } else {
-                                l.to_string()
-                            }
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                } else {
-                    block.to_string()
-                }
-            })
-            .collect();
-        materials::MaterialTable::parse(&text.join("[[material]]")).unwrap()
+    let draw = |name: &str, key: Keyframe, stamps: &dyn Fn(&mut brick_store::BrickStore)| {
+        let mut store = planet.crust_around(key.target, RING, crate::RING_LEVELS - 1);
+        crate::loader::hold_guard(&mut store, &planet, GUARD_FIRST);
+        stamps(&mut store);
+        let bands = Bands::with_d0(D0 * 2.0);
+        let mut scene =
+            crate::planet_scene(&store, key.position, bands, planet.max_radius()).unwrap();
+        fill(&mut scene, &mut store, key.position).unwrap();
+        let camera = CameraPath::new(vec![key, key]).radial().camera_at(0, 1);
+        let mut gpu = Offscreen::new(WIDTH * 2, HEIGHT * 2, &scene).unwrap();
+        let _ = Resolution::native(1, 1);
+        let image = gpu.render(&camera);
+        let path = out.join(format!("{name}.png"));
+        write_png(&path, &image).unwrap();
+        eprintln!("wrote {}", path.canonicalize().unwrap().display());
     };
-    for intensity in [1.0f32, 1.5, 3.0] {
-        let table = with_intensity(intensity);
-        for (curve_name, curve) in [("agx", ToneCurve::Agx), ("neutral", ToneCurve::Neutral)] {
-            for (name, key) in views {
-                let path = out.join(format!("{name}_{intensity}_{curve_name}.png"));
-                // A run that was cut short is carried on with `LOOK_KEEP=1`.
-                if std::env::var_os("LOOK_KEEP").is_some() && path.exists() {
-                    continue;
-                }
-                let mut store = planet.crust_around(key.target, RING, crate::RING_LEVELS - 1);
-                crate::loader::hold_guard(&mut store, &planet, GUARD_FIRST);
-                let bands = Bands::with_d0(D0 * 2.0);
-                let mut scene =
-                    crate::planet_scene(&store, key.position, bands, planet.max_radius()).unwrap();
-                fill(&mut scene, &mut store, key.position).unwrap();
-                let camera = CameraPath::new(vec![key, key]).radial().camera_at(0, 1);
-                let mut gpu = Offscreen::with_materials(
-                    Resolution::native(WIDTH * 2, HEIGHT * 2),
-                    &scene,
-                    &table,
-                )
-                .unwrap();
-                gpu.set_stages(Stages {
-                    curve,
-                    ..Stages::default()
-                });
-                let image = gpu.render(&camera);
-                write_png(&path, &image).unwrap();
-                eprintln!("wrote {}", path.canonicalize().unwrap().display());
-            }
+    // The row: eight clusters 1.15 m apart across the slope's, seen from 7 m off.
+    let site = sites
+        .iter()
+        .filter(|s| s.place == Place::Ground)
+        .max_by(|a, b| {
+            a.length
+                .total_cmp(&b.length)
+                .then(a.anchor[0].total_cmp(&b.anchor[0]))
+        })
+        .expect("a cluster on lit ground");
+    let m = VOXELS_PER_METRE;
+    let up = unit(site.anchor);
+    let (ahead, aside) = tangents(up);
+    let on_ground = |point: [f64; 3]| {
+        let d = unit(point);
+        d.map(|u| u * (planet.sea_radius() + planet.ground_height(d)))
+    };
+    // The row is 6 m to one side of the generated cluster, and the eye 7 m to the other.
+    let centre = on_ground(plus(site.anchor, aside, -6.0 * m));
+    let eye_at = on_ground(plus(centre, aside, -7.0 * m));
+    let key = Keyframe {
+        position: plus(eye_at, unit(eye_at), 1.4 * m),
+        target: plus(centre, unit(centre), 0.6 * m),
+    };
+    let hues = planet_gen::planet::HUES;
+    let names = planet_gen::planet::HUE_NAMES;
+    let anchors: Vec<[f64; 3]> = (0..8)
+        .map(|i| on_ground(plus(centre, ahead, (f64::from(i) - 3.5) * 1.15 * m)))
+        .collect();
+    draw("row", key, &|store| {
+        for (i, anchor) in anchors.iter().enumerate() {
+            stamp_cluster(store, *anchor, unit(*anchor), hues[i], i);
+        }
+    });
+    eprintln!("row, left to right: {names:?}");
+    // A cave of each hue.
+    for (hue, name) in hues.into_iter().zip(names) {
+        if let Some(key) = cave_along(&planet, &sites, Some(hue)) {
+            draw(&format!("cave_{}", name.replace(' ', "_")), key, &|_| {});
+        } else {
+            eprintln!("no cave cluster of {name}");
         }
     }
 }
