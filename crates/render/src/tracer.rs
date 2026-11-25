@@ -763,6 +763,29 @@ struct HwLayout {
 /// The size of a chunk of the staging belt, in bytes: a patch is written to a few of them.
 const BELT_CHUNK: u64 = 4 << 20;
 
+/// The chunks the staging belt has before the first scene update: a chunk is a device allocation
+/// of [`BELT_CHUNK`] bytes (2 to 3 ms on the 4090's driver and on lavapipe), and the belt makes
+/// one when it has none that the GPU is done with. The first Edit of a context that had not
+/// uploaded much, or whose earlier uploads the GPU still held, paid for that in its frame (#236: the
+/// first hardware Edit by the ground was 5.7 ms, 3.2 of them in the write, and compute's 1.9 with
+/// 0.4). Three are one in use, one the GPU has, and one to spare; a belt that needs more keeps them.
+const BELT_WARM_CHUNKS: usize = 3;
+
+/// Gives `belt` [`BELT_WARM_CHUNKS`] chunks that are free to be written to.
+fn warm_belt(device: &wgpu::Device, belt: &mut wgpu::util::StagingBelt) {
+    let size = wgpu::BufferSize::new(BELT_CHUNK).expect("a chunk is not empty");
+    let align = wgpu::BufferSize::new(4).expect("a word");
+    // A request of a whole chunk fills the one it is given, so that the next makes another.
+    for _ in 0..BELT_WARM_CHUNKS {
+        belt.allocate(size, align);
+    }
+    belt.finish();
+    belt.recall();
+    // A chunk is free for the belt once the device has told it so, which it does when it is
+    // polled: without this the first write would find none, and make one.
+    let _ = device.poll(wgpu::PollType::wait_indefinitely());
+}
+
 /// Where the emitters' buffer is bound, in group 1 of the kernels that sample them (`emitters` in
 /// `emitters.wgsl`).
 pub(crate) const EMITTERS_BINDING: u32 = 18;
@@ -1272,7 +1295,8 @@ impl Tracer {
             _ => None,
         };
         let scene_bytes = scene_buffers.bytes;
-        let belt = wgpu::util::StagingBelt::new(device.clone(), BELT_CHUNK);
+        let mut belt = wgpu::util::StagingBelt::new(device.clone(), BELT_CHUNK);
+        warm_belt(device, &mut belt);
 
         let camera_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("camera, image, accumulation, materials and G-buffer"),

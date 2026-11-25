@@ -182,10 +182,6 @@ pub fn run(
     let (mut edits, mut voxels) = (0u32, 0u64);
     // What the flight did to the acceleration structures is not the Edits'.
     gpu.take_hardware_updates();
-    // The moves that brought the camera here (a jump, whose builds on the hardware backend are not
-    // waited for) are over before the first Edit is timed, so that it is not timed behind them
-    // (#236: the first hardware Edit by the ground was 5.7 ms, 3.2 of them in the scene's write).
-    gpu.wait_idle();
     // An update of the hardware backend's structures does not wait for the GPU, so that a frame
     // never does; here it waits, so that the time of an Edit has the builds' own in it (#236). The
     // wait is for everything the queue holds, the previous frame's passes and the scene's own

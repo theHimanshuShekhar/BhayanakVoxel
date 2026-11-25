@@ -1628,10 +1628,16 @@ Edits). All are on the same GPU, driver and clocks. Read `rt.comparison`:
   game does not: **it is in `frame_thread` and in `accel.total_ms`, so the Edit+BVH figure is an
   upper bound**) and `edit_made`; and **`frame_thread_each`**, each Edit's frame-thread ms in order
   (the first is the cold one), and **`grown_bytes_each`**, the bytes copied into buffers that grew.
-  The stress waits for the GPU to be idle before its first Edit (`Offscreen::wait_idle`), so that
-  the jump that brought the camera there, whose hardware builds are not waited for, is not in it:
-  on the 4090 the first hardware Edit by the ground was 5.7 ms (the others 1.4 to 2.0), 3.2 of them in
-  `scene_write`, and compute's 1.9 with 0.4.
+  The stress does **not** wait for the GPU before its first Edit: the first hardware Edit by the
+  ground on the 4090 was 5.7 ms (the others 1.4 to 2.0), 3.2 of them in `scene_write`, and compute's
+  1.9 with 0.4, and a wait would have hidden what a player pays the first time they dig. The cause
+  found (on lavapipe, with the device's allocator report) is the scene upload's staging belt: it
+  made a 4 MiB chunk, a device allocation, when it had none free, and a context whose belt was cold,
+  or whose chunks the GPU still held, did that in its first Edit's frame (compute's first write does
+  it too on a fresh context: 2.9 ms there). The belt now has three chunks before the first update
+  (`BELT_WARM_CHUNKS`), and `edits_by_the_ground_fit_in_the_scenes_buffers_on_either_backend` asserts
+  that no Edit allocates on the device. If the first hardware Edit is still over on the 4090, its
+  `scene_write`, `scene_submit` and `scene_grow` say which part it is.
 - `hw_edits`: the Edit stress on the hardware backend, in the report's `edits` shape, to put by
   `edits` (compute). **Both stress runs start from the same camera and rings**: the sweep's last
   height (20 000 Voxels over the pole), where the compute run ends the sweep, and the hardware run

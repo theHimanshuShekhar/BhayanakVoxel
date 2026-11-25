@@ -482,12 +482,12 @@ impl Offscreen {
         Ok(())
     }
 
-    /// Waits until the GPU has done everything that was submitted, so that what comes next is not
-    /// timed behind it (the bench, after a jump whose builds are not waited for, #236).
-    pub fn wait_idle(&self) {
+    /// The device's live allocations (how many, and their bytes), as the Vulkan allocator counts
+    /// them, or `None` where it does not: what a test compares to see that an Edit made none.
+    pub fn device_allocations(&self) -> Option<(usize, u64)> {
         self.device
-            .poll(wgpu::PollType::wait_indefinitely())
-            .expect("device poll failed");
+            .generate_allocator_report()
+            .map(|r| (r.allocations.len(), r.total_allocated_bytes))
     }
 
     /// Says that an Edit changed `bricks`, so that the radiance cache follows the light round them
