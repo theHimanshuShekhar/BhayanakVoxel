@@ -22,6 +22,13 @@ _Avoid_: Visible, surface Voxel
 Air that the generator carves under the Planet's land, in tunnels and chambers, some of which open to the surface as cave mouths. A part of the Planet's generated terrain, not an Edit.
 _Avoid_: Dungeon, hole (a hole is dug)
 
+**Crystal cluster**:
+A few radiating hexagonal prisms with pointed tips, of one of eight emissive crystal Materials, that the generator grows from a sunlit slope or the wall of a Cave in the world map's crystal-caves region, along the surface's normal. Part of the generated terrain (it fills air only, and is in the levels of detail up to 3), not an Edit. Each Cave has a dominant hue.
+_Avoid_: Crystal (the Material of one prism), geode
+
+**Placement rule**:
+A test of a place that depends on the seed alone (the world map and the Caves' density, never the order bricks are made in), so that every brick, at any level, and the server agree on what is there: sunlit (slope, aspect, open sky), Cave wall (the density's gradient) and room (the local density). Content is placed by them.
+
 **Material**:
 The kind of matter a Voxel is made of (e.g. rock, sand, water, glass), carrying properties like hardness or emissiveness.
 _Avoid_: Block type, voxel type

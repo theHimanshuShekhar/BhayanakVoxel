@@ -4,53 +4,17 @@
 //! scene is built. Nothing here is the design of M1b's stamps: it is as much as it takes for a
 //! frame to look like a place.
 //!
-//! The crystal Materials are the prototype's own, and are not in `materials.toml` (that is M1b's):
-//! [`table`] is the shipped table with them added, which only the look-dev render uses.
-
-use std::fmt::Write as _;
-use std::sync::OnceLock;
+//! The crystal Materials are the shipped table's (ids 56 to 63, which #204 made from the
+//! prototype's own): [`table`] is the shipped table, which the generator's clusters use too.
 
 use brick_store::{BrickStore, Material, VoxelCoord};
 use materials::MaterialTable;
 
 use super::{Hue, Place, Stamp};
 
-/// The shipped `materials.toml`, which the table below adds to.
-const SHIPPED: &str = include_str!("../../../../../crates/materials/materials.toml");
-
-/// The first id of the look-dev's crystals: the one after the shipped table's last.
-const FIRST_CRYSTAL_ID: u16 = 56;
-
-/// The crystals' name, colour and emitted colour (the prototype's, as the owner saw them).
-const CRYSTALS: [(&str, [f32; 3], [f32; 3]); 8] = [
-    ("crystal blue", [0.4, 0.55, 0.95], [0.25, 0.45, 1.0]),
-    ("crystal cyan", [0.45, 0.85, 0.9], [0.2, 0.9, 0.95]),
-    ("crystal green", [0.45, 0.9, 0.55], [0.25, 1.0, 0.4]),
-    ("crystal magenta", [0.9, 0.45, 0.85], [1.0, 0.2, 0.85]),
-    ("crystal red", [0.95, 0.4, 0.4], [1.0, 0.15, 0.15]),
-    ("crystal amber", [0.95, 0.75, 0.35], [1.0, 0.6, 0.12]),
-    ("crystal white", [0.92, 0.92, 0.95], [1.0, 0.98, 0.95]),
-    ("crystal violet", [0.65, 0.45, 0.95], [0.55, 0.2, 1.0]),
-];
-
-/// The shipped Materials and the eight crystals: opaque, glossy, emissive (intensity 3), natural.
+/// The shipped `materials.toml`.
 pub fn table() -> &'static MaterialTable {
-    static TABLE: OnceLock<MaterialTable> = OnceLock::new();
-    TABLE.get_or_init(|| {
-        let mut text = SHIPPED.to_string();
-        for (n, (name, colour, emissive)) in CRYSTALS.iter().enumerate() {
-            let id = FIRST_CRYSTAL_ID as usize + n;
-            let _ = write!(
-                text,
-                "\n[[material]]\nid = {id}\nname = \"{name}\"\ncategory = \"natural\"\n\
-                 colour = {colour:?}\nnoise_scale = 4.0\nhue_jitter = 6.0\nvalue_jitter = 0.08\n\
-                 roughness = 0.15\nmetalness = 0.0\nemissive = {emissive:?}\n\
-                 emissive_intensity = 3.0\ntransparency = 0.0\nior = 1.0\nhardness = 4.0\n\
-                 density = 2650.0\nfluid = \"none\"\n"
-            );
-        }
-        MaterialTable::parse(&text).expect("the look-dev's Material table is valid")
-    })
+    MaterialTable::built_in()
 }
 
 fn id(name: &str) -> Material {
@@ -279,16 +243,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_table_adds_the_eight_crystals_after_the_shipped_materials() {
-        let shipped = MaterialTable::built_in();
-        let last = shipped.defs().last().unwrap().id;
-        assert_eq!(
-            last + 1,
-            FIRST_CRYSTAL_ID,
-            "the crystals follow the shipped Materials"
-        );
-        assert_eq!(table().defs().len(), shipped.defs().len() + 8);
-        for hue in [
+    fn the_shipped_table_has_the_eight_crystals_that_the_generator_makes() {
+        // In the order of the generator's hues: blue, cyan, green, magenta, red, amber, white,
+        // violet.
+        let hues = [
             Hue::Blue,
             Hue::Cyan,
             Hue::Green,
@@ -297,9 +255,12 @@ mod tests {
             Hue::Amber,
             Hue::White,
             Hue::Violet,
-        ] {
+        ];
+        for (n, hue) in hues.into_iter().enumerate() {
             let def = table().get(crystal(hue)).unwrap();
             assert!(def.emissive_intensity > 0.0, "{}", def.name);
+            assert_eq!(crystal(hue), planet_gen::planet::HUES[n], "{}", def.name);
+            assert_eq!(def.name, planet_gen::planet::HUE_NAMES[n]);
         }
     }
 }
