@@ -1989,6 +1989,12 @@ impl Tracer {
         self.hw.as_ref().map_or(0, |h| h.scene.pending())
     }
 
+    /// Whether the hardware backend times its builds apart when it waits (see
+    /// [`crate::hw::HwScene::times_builds`]); false on the compute backend.
+    pub fn hardware_times_builds(&self) -> bool {
+        self.hw.as_ref().is_some_and(|h| h.scene.times_builds())
+    }
+
     /// Builds every group of the hardware backend's acceleration structures that is stale, at
     /// once, whatever the budget (a no-op on the compute backend): for tests and for the
     /// benchmark's settle.

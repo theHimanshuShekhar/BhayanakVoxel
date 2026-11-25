@@ -299,6 +299,24 @@ pub fn process_wait() -> bool {
     PROCESS_WAIT.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+static PROCESS_FAST_BUILD: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+static PROCESS_BUILD_CHUNK: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Makes the BLASes of every hardware backend made after it `PREFER_FAST_BUILD` and not
+/// `PREFER_FAST_TRACE` (`--hw-fast-build`, an experiment of #236's: the builds are quicker, the
+/// trace may not be).
+pub fn set_process_fast_build(fast: bool) {
+    PROCESS_FAST_BUILD.store(fast, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Records the BLAS builds of a frame in calls of this many BLASes each (`--hw-build-chunk`, an
+/// experiment of #236's: each call has a scratch buffer of its own, and a barrier after it); 0, the
+/// default, is one call for all of them.
+pub fn set_process_build_chunk(chunk: u32) {
+    PROCESS_BUILD_CHUNK.store(chunk, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// The grouping a hardware backend starts with: the process's, or [`PRODUCTION_GROUPING`].
 pub fn process_grouping() -> Grouping {
     PROCESS_GROUPING
@@ -595,6 +613,10 @@ pub struct HwUpdate {
     pub blas_created: u32,
     pub pool_grew: bool,
     pub tlas_made: bool,
+    /// With [`HwScene::set_wait`] on a device with timestamps in encoders: what the GPU says the
+    /// BLAS builds took, and the TLAS build (the device's clock; zero without them).
+    pub gpu_blas: Duration,
+    pub gpu_tlas: Duration,
     pub prims_rebuilt: u64,
     /// The same by level: BLASes and boxes built of each.
     pub blas_by_level: [u32; crate::lod::LEVELS],
@@ -617,6 +639,72 @@ pub struct HwUpdate {
     pub build: Duration,
     /// `prepare + build` in the parts of the work.
     pub phases: HwPhases,
+}
+
+/// Timestamps around the BLAS builds and the TLAS build of an update that waits, for the
+/// diagnosis of what the GPU's time is (#236).
+struct BuildTimer {
+    set: wgpu::QuerySet,
+    resolve: wgpu::Buffer,
+    read: wgpu::Buffer,
+    /// Nanoseconds per tick.
+    period_ns: f32,
+}
+
+impl BuildTimer {
+    const QUERIES: u32 = 3;
+    const BYTES: u64 = Self::QUERIES as u64 * 8;
+
+    fn new(device: &wgpu::Device, queue: &wgpu::Queue) -> Option<Self> {
+        device
+            .features()
+            .contains(wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS)
+            .then(|| Self {
+                set: device.create_query_set(&wgpu::QuerySetDescriptor {
+                    label: Some("hardware build timers"),
+                    ty: wgpu::QueryType::Timestamp,
+                    count: Self::QUERIES,
+                }),
+                resolve: device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("hardware build timers resolved"),
+                    size: Self::BYTES,
+                    usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
+                    mapped_at_creation: false,
+                }),
+                read: crate::staging_buffer(device, Self::BYTES),
+                period_ns: queue.get_timestamp_period(),
+            })
+    }
+
+    /// Resolves the three timestamps into the readback buffer (before the encoder is finished).
+    fn resolve(&self, encoder: &mut wgpu::CommandEncoder) {
+        encoder.resolve_query_set(&self.set, 0..Self::QUERIES, &self.resolve, 0);
+        encoder.copy_buffer_to_buffer(&self.resolve, 0, &self.read, 0, Self::BYTES);
+    }
+
+    /// The BLAS builds' and the TLAS build's GPU time, once the commands are done.
+    fn read(&self, device: &wgpu::Device) -> (Duration, Duration) {
+        let slice = self.read.slice(..);
+        slice.map_async(wgpu::MapMode::Read, |_| {});
+        device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .expect("device poll failed");
+        let ticks: Vec<u64> = {
+            let data = slice.get_mapped_range().expect("the timestamps are mapped");
+            data.as_chunks::<8>()
+                .0
+                .iter()
+                .map(|b| u64::from_le_bytes(*b))
+                .collect()
+        };
+        self.read.unmap();
+        let ns = |from: u64, to: u64| {
+            Duration::from_nanos(
+                (to.saturating_sub(from) as f64 * f64::from(self.period_ns)) as u64,
+            )
+        };
+        (ns(ticks[0], ticks[1]), ns(ticks[1], ticks[2]))
+    }
 }
 
 /// One cell's job for the box pass.
@@ -937,6 +1025,8 @@ pub struct HwScene {
     /// (another view) has no budget of its own.
     frame: Option<u64>,
     wait: bool,
+    /// Timestamps for the updates that wait, where the device has them in encoders.
+    timer: Option<BuildTimer>,
     last: HwUpdate,
     /// What the updates since [`HwScene::take_cost`] cost the frame thread, in all.
     cost: Duration,
@@ -1059,6 +1149,9 @@ impl HwScene {
             built: 0,
             frame: None,
             wait: process_wait(),
+            timer: process_wait()
+                .then(|| BuildTimer::new(device, queue))
+                .flatten(),
             last: HwUpdate::default(),
             cost: Duration::ZERO,
             log: VecDeque::new(),
@@ -1099,6 +1192,12 @@ impl HwScene {
     /// How many groups are stale and wait for a later update's budget.
     pub fn pending(&self) -> usize {
         self.pending.len()
+    }
+
+    /// Whether an update that waits times the BLAS builds and the TLAS build apart: the device has
+    /// timestamps in encoders, and `--hw-wait` ([`set_process_wait`]) asked for them.
+    pub fn times_builds(&self) -> bool {
+        self.timer.is_some()
     }
 
     /// The most boxes an update builds (see [`BUILD_BUDGET`]), for tests that want a queue.
@@ -1537,7 +1636,34 @@ impl HwScene {
                 }
             })
             .collect();
-        encoder.build_acceleration_structures(entries.iter(), std::iter::once(&self.tlas));
+        let timer = if self.wait { self.timer.as_ref() } else { None };
+        let chunk = match PROCESS_BUILD_CHUNK.load(std::sync::atomic::Ordering::Relaxed) {
+            0 => entries.len().max(1),
+            n => n as usize,
+        };
+        if timer.is_none() && chunk >= entries.len() {
+            encoder.build_acceleration_structures(entries.iter(), std::iter::once(&self.tlas));
+        } else {
+            // In calls of their own (each with its scratch buffer, and its barrier), and the TLAS
+            // after them: so that the timestamps can be between them.
+            if let Some(timer) = timer {
+                encoder.write_timestamp(&timer.set, 0);
+            }
+            for part in entries.chunks(chunk) {
+                encoder.build_acceleration_structures(part.iter(), std::iter::empty());
+            }
+            if let Some(timer) = timer {
+                encoder.write_timestamp(&timer.set, 1);
+            }
+            encoder.build_acceleration_structures(
+                std::iter::empty::<&wgpu::BlasBuildEntry<'_>>(),
+                std::iter::once(&self.tlas),
+            );
+            if let Some(timer) = timer {
+                encoder.write_timestamp(&timer.set, 2);
+                timer.resolve(&mut encoder);
+            }
+        }
         let recorded = Instant::now();
         let commands = encoder.finish();
         let finished = Instant::now();
@@ -1548,6 +1674,10 @@ impl HwScene {
                 .poll(wgpu::PollType::wait_indefinitely())
                 .expect("device poll failed");
         }
+        let (gpu_blas, gpu_tlas) = match timer {
+            Some(timer) => timer.read(device),
+            None => (Duration::ZERO, Duration::ZERO),
+        };
         let done = Instant::now();
         let mut blas_by_level = [0u32; crate::lod::LEVELS];
         let mut prims_by_level = [0u64; crate::lod::LEVELS];
@@ -1574,6 +1704,8 @@ impl HwScene {
             blas_created: created,
             pool_grew,
             tlas_made,
+            gpu_blas,
+            gpu_tlas,
             prims_rebuilt: built.iter().map(|&(_, n)| u64::from(n)).sum(),
             blas_by_level,
             prims_by_level,
@@ -1596,7 +1728,11 @@ impl HwScene {
         device.create_blas(
             &wgpu::CreateBlasDescriptor {
                 label: Some("brick boxes"),
-                flags: wgpu::AccelerationStructureFlags::PREFER_FAST_TRACE,
+                flags: if PROCESS_FAST_BUILD.load(std::sync::atomic::Ordering::Relaxed) {
+                    wgpu::AccelerationStructureFlags::PREFER_FAST_BUILD
+                } else {
+                    wgpu::AccelerationStructureFlags::PREFER_FAST_TRACE
+                },
                 update_mode: wgpu::AccelerationStructureUpdateMode::Build,
             },
             wgpu::BlasGeometrySizeDescriptors::AABBs {

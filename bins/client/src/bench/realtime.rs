@@ -628,6 +628,10 @@ pub struct SlowFrame {
     pub hw_created: Option<u32>,
     pub hw_pool_grew: Option<u32>,
     pub hw_tlas_made: Option<u32>,
+    /// With `--hw-wait`: the GPU's time of the frame's BLAS builds and TLAS build (see
+    /// `hardware.gpu_blas`), ms.
+    pub hw_gpu_blas_ms: Option<f64>,
+    pub hw_gpu_tlas_ms: Option<f64>,
 }
 
 /// How many frames of a path were of each kind of update.
@@ -2310,6 +2314,8 @@ impl<'a> Session<'a> {
             hw_created: gpu.accel.map(|h| h.blas_created),
             hw_pool_grew: gpu.accel.map(|h| h.pool_grew),
             hw_tlas_made: gpu.accel.map(|h| h.tlas_made),
+            hw_gpu_blas_ms: gpu.accel.map(|h| h.gpu_blas),
+            hw_gpu_tlas_ms: gpu.accel.map(|h| h.gpu_tlas),
         };
         let slept = Instant::now();
         let asked = FRAME.saturating_sub(slept - began);
@@ -3453,6 +3459,8 @@ mod tests {
             hw_created: None,
             hw_pool_grew: None,
             hw_tlas_made: None,
+            hw_gpu_blas_ms: None,
+            hw_gpu_tlas_ms: None,
         }
     }
 
@@ -4116,6 +4124,8 @@ mod tests {
                 "hw_blas_urgent",
                 "hw_boxes",
                 "hw_created",
+                "hw_gpu_blas_ms",
+                "hw_gpu_tlas_ms",
                 "hw_pool_grew",
                 "hw_submits",
                 "hw_tlas_made",

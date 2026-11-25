@@ -207,6 +207,11 @@ fn request_gpu_for(
             wgpu::Features::EXPERIMENTAL_RAY_QUERY
         } else {
             wgpu::Features::empty()
+        } | if choice.active.is_hardware() && hw::process_wait() {
+            // The diagnosis of the builds' GPU time (`--hw-wait`) puts timestamps between them.
+            adapter.features() & wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS
+        } else {
+            wgpu::Features::empty()
         },
         // The Planet's bricks are one big storage buffer, well over the portable 128 MiB limit.
         required_limits: adapter.limits(),

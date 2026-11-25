@@ -262,6 +262,12 @@ impl Offscreen {
         self.tracer.hardware_pending()
     }
 
+    /// Whether the hardware backend times its builds apart when it waits (see
+    /// [`crate::hw::HwScene::times_builds`]).
+    pub fn hardware_times_builds(&self) -> bool {
+        self.tracer.hardware_times_builds()
+    }
+
     /// Builds every stale group of the hardware backend's acceleration structures at once,
     /// whatever the budget (a no-op on the compute backend).
     pub fn settle_hardware(&mut self) {

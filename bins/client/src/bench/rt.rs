@@ -303,6 +303,10 @@ pub struct HwFrame {
     pub tlas_made: u32,
     /// With `--hw-wait`: the GPU's time of the box pass alone, which `wait` then leaves out.
     pub wait_boxes: f64,
+    /// With `--hw-wait` on a device with timestamps in encoders: the GPU's time of the BLAS builds
+    /// and of the TLAS build (both inside `wait`).
+    pub gpu_blas: f64,
+    pub gpu_tlas: f64,
 }
 
 impl HwFrame {
@@ -326,6 +330,8 @@ impl HwFrame {
             f.pool_grew += u32::from(u.pool_grew);
             f.tlas_made += u32::from(u.tlas_made);
             f.wait_boxes += ms(u.phases.wait_boxes);
+            f.gpu_blas += ms(u.gpu_blas);
+            f.gpu_tlas += ms(u.gpu_tlas);
         }
         f
     }
@@ -410,6 +416,10 @@ pub struct PathHardware {
     /// With `--hw-wait`: the GPU's time of the box pass alone per frame (`wait` is then the
     /// builds' and the TLAS's); zero without it.
     pub wait_boxes: Spread,
+    /// With `--hw-wait` on a device with timestamps in encoders: what the GPU says the BLAS builds
+    /// and the TLAS build took, per frame (zero otherwise).
+    pub gpu_blas: Spread,
+    pub gpu_tlas: Spread,
     /// `frame_parts.wait_not_passes` of the frames, by what the frame built (#236): the GPU's
     /// time that is not the passes lands in the wait, and this says which frames carry it.
     pub wait_not_passes: WaitByBuilds,
@@ -504,6 +514,8 @@ impl PathHardware {
             tlas_instances: Count::of(&col(|h| f64::from(h.tlas_instances))),
             draw_submit: Spread::of(&col(|h| h.draw_submit)),
             wait_boxes: Spread::of(&col(|h| h.wait_boxes)),
+            gpu_blas: Spread::of(&col(|h| h.gpu_blas)),
+            gpu_tlas: Spread::of(&col(|h| h.gpu_tlas)),
             wait_not_passes: WaitByBuilds::of(frames),
             per_blas_us: PerBlasUs {
                 total: per(HwFrame::total),
