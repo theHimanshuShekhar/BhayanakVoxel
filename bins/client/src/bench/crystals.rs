@@ -294,3 +294,143 @@ fn a_cluster_on_a_sunlit_slope_and_a_crystal_cave_match_the_approved_images() {
         out.display()
     );
 }
+
+/// The view along a cave wall (for the look comparison below): the cave cluster with most others
+/// in a box that runs 7 m ahead along the wall and 2.5 m each side of the line, seen from 0.8 m
+/// out from the wall and 2.5 m behind the cluster, looking along the wall and a little into it,
+/// so that the prisms, their tips and their hues show in profile. Only a way that has air all
+/// along the sight line is taken.
+fn cave_along(planet: &Planet, sites: &[CrystalSite]) -> Keyframe {
+    let m = VOXELS_PER_METRE;
+    let caves: Vec<&CrystalSite> = sites
+        .iter()
+        .filter(|s| matches!(s.place, Place::Cave(_)))
+        .collect();
+    let air = |at: [f64; 3]| {
+        planet
+            .voxel(brick_store::VoxelCoord(at.map(|c| c.round() as i32)))
+            .is_none()
+    };
+    let mut best: Option<(usize, Keyframe)> = None;
+    for site in caves.iter().filter(|s| s.length >= 10.0) {
+        let (t1, t2) = tangents(site.normal);
+        for k in 0..8 {
+            let angle = f64::from(k) * std::f64::consts::FRAC_PI_4;
+            let (c, s_) = (angle.cos(), angle.sin());
+            let along_wall: [f64; 3] = std::array::from_fn(|a| t1[a] * c + t2[a] * s_);
+            let eye = plus(
+                plus(site.anchor, along_wall, -2.5 * m),
+                site.normal,
+                0.8 * m,
+            );
+            let target = plus(plus(eye, along_wall, 6.0 * m), site.normal, -0.3 * m);
+            let clear = (0..=24).all(|n| {
+                let at: [f64; 3] =
+                    std::array::from_fn(|a| eye[a] + (target[a] - eye[a]) * f64::from(n) / 24.0);
+                air(at)
+            });
+            if !clear {
+                continue;
+            }
+            let seen = caves
+                .iter()
+                .filter(|o| {
+                    let d: [f64; 3] = std::array::from_fn(|a| o.anchor[a] - site.anchor[a]);
+                    let ahead: f64 = d.iter().zip(along_wall).map(|(x, y)| x * y).sum();
+                    let lateral = length(plus(d, along_wall, -ahead));
+                    (0.0..7.0 * m).contains(&ahead) && lateral < 2.5 * m
+                })
+                .count();
+            if best.as_ref().is_none_or(|(n, _)| seen > *n) {
+                best = Some((
+                    seen,
+                    Keyframe {
+                        position: eye,
+                        target,
+                    },
+                ));
+            }
+        }
+    }
+    best.expect("a cave cluster with air along its wall").1
+}
+
+/// The look of the crystals at several emission strengths and tone curves, for the owner to
+/// choose from (#204): the slope and a view along a cave wall, at an `emissive_intensity` of 1.0,
+/// 1.5 and 3.0 (the table's), with the game's tone curve and with Neutral (which keeps a
+/// saturated colour's hue where the AgX-like one takes it towards white). The PNGs are in
+/// `target/crystal-look/`, not committed: `cargo test -p client --bin client crystal_look --
+/// --ignored`.
+#[test]
+#[ignore = "renders twelve images for a decision; writes PNGs"]
+fn crystal_look_comparison() {
+    use render::{Resolution, Stages, ToneCurve};
+    let planet = Planet::new(WorldMap::with_radius(
+        crate::SEED,
+        TEST_MAP_SIZE,
+        TEST_RADIUS,
+    ));
+    let sites = sites(&planet);
+    let views = [
+        ("slope", slope(&planet, &sites)),
+        ("cave", cave_along(&planet, &sites)),
+    ];
+    let out = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/crystal-look");
+    std::fs::create_dir_all(&out).unwrap();
+    let toml = include_str!("../../../../crates/materials/materials.toml");
+    let with_intensity = |intensity: f32| {
+        let text: Vec<String> = toml
+            .split("[[material]]")
+            .map(|block| {
+                if block.contains("name = \"crystal ") {
+                    block
+                        .lines()
+                        .map(|l| {
+                            if l.starts_with("emissive_intensity") {
+                                format!("emissive_intensity = {intensity}")
+                            } else {
+                                l.to_string()
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                } else {
+                    block.to_string()
+                }
+            })
+            .collect();
+        materials::MaterialTable::parse(&text.join("[[material]]")).unwrap()
+    };
+    for intensity in [1.0f32, 1.5, 3.0] {
+        let table = with_intensity(intensity);
+        for (curve_name, curve) in [("agx", ToneCurve::Agx), ("neutral", ToneCurve::Neutral)] {
+            for (name, key) in views {
+                let path = out.join(format!("{name}_{intensity}_{curve_name}.png"));
+                // A run that was cut short is carried on with `LOOK_KEEP=1`.
+                if std::env::var_os("LOOK_KEEP").is_some() && path.exists() {
+                    continue;
+                }
+                let mut store = planet.crust_around(key.target, RING, crate::RING_LEVELS - 1);
+                crate::loader::hold_guard(&mut store, &planet, GUARD_FIRST);
+                let bands = Bands::with_d0(D0 * 2.0);
+                let mut scene =
+                    crate::planet_scene(&store, key.position, bands, planet.max_radius()).unwrap();
+                fill(&mut scene, &mut store, key.position).unwrap();
+                let camera = CameraPath::new(vec![key, key]).radial().camera_at(0, 1);
+                let mut gpu = Offscreen::with_materials(
+                    Resolution::native(WIDTH * 2, HEIGHT * 2),
+                    &scene,
+                    &table,
+                )
+                .unwrap();
+                gpu.set_stages(Stages {
+                    curve,
+                    ..Stages::default()
+                });
+                let image = gpu.render(&camera);
+                write_png(&path, &image).unwrap();
+                eprintln!("wrote {}", path.canonicalize().unwrap().display());
+            }
+        }
+    }
+}
