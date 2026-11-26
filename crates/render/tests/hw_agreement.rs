@@ -132,6 +132,83 @@ fn the_shadows_of_both_hardware_variants_are_the_compute_backends() {
     }
 }
 
+/// A flat stone floor with a tall pillar at its middle, in a world whose up is +y: a long shadow.
+fn pillar_scene() -> Scene {
+    let mut store = BrickStore::new();
+    for x in -40..40 {
+        for z in -40..40 {
+            store.set(VoxelCoord([x, -1, z]), Some(STONE));
+        }
+    }
+    for y in 0..30 {
+        for x in 0..8 {
+            for z in 0..8 {
+                store.set(VoxelCoord([x, y, z]), Some(STONE));
+            }
+        }
+    }
+    Scene::new(&store, None)
+}
+
+/// The linear light of the frame, the post stages off: one number a pixel (the green channel).
+fn linear_green(gpu: &mut Offscreen, camera: &Camera) -> Vec<f32> {
+    gpu.set_stages(render::Stages::NONE);
+    gpu.render(camera);
+    let ((_, _, light), _) = gpu.read_hdr_and_bloom();
+    light.iter().map(|p| p[1]).collect()
+}
+
+/// The moon is the key light by night (#203): the same shadow ray goes towards it, on each backend,
+/// and finds what the compute walk finds. The frame is of a pillar on a floor (a long shadow), in
+/// linear light (a night's shadows are not lost in the 8-bit encoding), with the sun and the sky
+/// alone: a backend that cast no shadows would light every pixel the moon cannot reach.
+#[test]
+fn the_moons_shadows_are_the_same_on_the_hardware_backend_as_on_compute() {
+    const SIZE: u32 = 96;
+    let scene = pillar_scene();
+    let camera = Camera::looking_at([4.0, 100.0, 4.4], [4.0, 0.0, 4.0]);
+    let sky = render::daylight::DaySky::at(0.9);
+    assert!(sky.moon[1] > 0.2, "the moon is up at 0.9: {:?}", sky.moon);
+    let mut compute = Offscreen::new(SIZE, SIZE, &scene).unwrap();
+    compute.set_sun_and_sky_only(true);
+    compute.set_day_sky(sky, true);
+    assert!(
+        compute.key_light(&camera).is_moon,
+        "the key at 0.9 is the moon"
+    );
+    let want = linear_green(&mut compute, &camera);
+    // There is a shadow to agree on: a good share of the pixels are far darker than the lit floor.
+    let lit = want.iter().copied().fold(0.0f32, f32::max);
+    let shadowed = want.iter().filter(|&&l| l < 0.5 * lit).count();
+    assert!(
+        shadowed > want.len() / 50,
+        "{shadowed} of {} pixels in shadow",
+        want.len()
+    );
+    for backend in [RtBackend::Hardware, RtBackend::HardwareNearest] {
+        let mut gpu =
+            Offscreen::with_backend(Resolution::native(SIZE, SIZE), &scene, backend).unwrap();
+        if gpu.rt().active != backend {
+            eprintln!("skipped: {:?}", gpu.rt().fallback);
+            return;
+        }
+        gpu.set_sun_and_sky_only(true);
+        gpu.set_day_sky(sky, true);
+        assert!(gpu.key_light(&camera).is_moon);
+        let got = linear_green(&mut gpu, &camera);
+        let differing = got
+            .iter()
+            .zip(&want)
+            .filter(|(g, w)| (**g - **w).abs() > 0.05 * g.max(**w) + 1e-6)
+            .count();
+        assert!(
+            differing <= want.len() / 200,
+            "{backend:?}: {differing} of {} pixels differ from compute's by the moon",
+            want.len()
+        );
+    }
+}
+
 /// Rays through a patch of the test Planet, a core and a hand-made scene, from far and near,
 /// along the axes and not.
 fn rays_for(scene_name: &str) -> Vec<render::reference::Ray> {

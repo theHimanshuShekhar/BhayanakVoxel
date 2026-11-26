@@ -42,6 +42,10 @@ struct Atmo {
     // the tinted light is taken toward grey, which makes it pastel (w).
     tint_horizon: vec4<f32>,
     tint_zenith: vec4<f32>,
+    // The night sky's own light (atmosphere.rs `NightFloor`, #203): its radiance at the horizon
+    // (rgb) and how much of it there is, 0 (day) to 1 (night) (w), then at the zenith (rgb).
+    night_horizon: vec4<f32>,
+    night_zenith: vec4<f32>,
 }
 
 // The tables' sizes. Keep in step with atmosphere.rs.
@@ -120,6 +124,27 @@ fn air_segment(r: f32, mu: f32) -> vec2<f32> {
         t1 = min(t1, ground.x);
     }
     return vec2<f32>(t0, t1);
+}
+
+// How far into the air a ray goes for the night's floor to be all there, in metres: a ray that
+// meets no air (the space over a Planet seen from orbit) has none of the floor, one that crosses
+// the air has all of it, and a graze of the limb a part.
+const NIGHT_AIR_SCALE = 15000.0;
+
+// The night sky's own light along the ray (r, mu): a lilac gradient by the elevation (the sine, as
+// the tint's), as much of it as the night level says and as the ray has air. Added to the tinted
+// sky wherever the sky is made, so the sky, the haze that far ground fades into and what a surface
+// sees of the sky all hold it, and both views read it from the tables.
+fn night_floor(r: f32, mu: f32) -> vec3<f32> {
+    let level = atmo.night_horizon.w;
+    if level <= 0.0 {
+        return vec3<f32>(0.0);
+    }
+    let seg = air_segment(r, mu);
+    let air = 1.0 - exp(-max(seg.y - seg.x, 0.0) / NIGHT_AIR_SCALE);
+    let s = clamp(mu, 0.0, 1.0);
+    let colour = mix(atmo.night_horizon.xyz, atmo.night_zenith.xyz, s * s * (3.0 - 2.0 * s));
+    return colour * (level * air);
 }
 
 struct Medium {

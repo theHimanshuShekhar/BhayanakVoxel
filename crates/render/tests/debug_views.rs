@@ -1,9 +1,12 @@
 //! The debug views on a hand-made scene, where each can be worked out. Needs a Vulkan device
 //! (lavapipe in CI). That the default view is unchanged is the job of the golden images.
+//!
+//! The lit floors use the sun's centre cosine: the per-sample weight (the default since #55) is
+//! noise on a floor at one sample a pixel, and these tests work out a floor's light as one value.
 
 use brick_store::{BrickStore, Material, VoxelCoord};
 use materials::MaterialTable;
-use render::{Camera, DebugView, Image, Offscreen, Scene, Sun};
+use render::{Camera, DebugView, Image, Offscreen, Scene, ShadowWeight, Sun};
 
 const STONE: Material = Material(1);
 /// Rock in `materials.toml`.
@@ -39,6 +42,7 @@ fn skyward() -> Camera {
 fn gpu(view: DebugView) -> Offscreen {
     let mut gpu = Offscreen::new(SIZE, SIZE, &floor()).unwrap();
     gpu.use_legacy_light();
+    gpu.set_shadow_weight(ShadowWeight::CentreCosine);
     gpu.set_debug_view(view);
     gpu
 }
@@ -140,6 +144,7 @@ fn material_id(name: &str) -> Material {
 fn of_floor(name: &str, view: DebugView) -> Image {
     let mut gpu = Offscreen::new(SIZE, SIZE, &floor_of(material_id(name))).unwrap();
     gpu.use_legacy_light();
+    gpu.set_shadow_weight(ShadowWeight::CentreCosine);
     gpu.set_debug_view(view);
     gpu.render(&overhead())
 }
@@ -208,6 +213,7 @@ fn the_variation_follows_the_voxel_not_the_view() {
     let height = 16.0 / (70f64.to_radians() / 2.0).tan();
     let mut gpu = Offscreen::new(SIZE, SIZE, &floor()).unwrap();
     gpu.use_legacy_light();
+    gpu.set_shadow_weight(ShadowWeight::CentreCosine);
     let mut from = |x: f64| gpu.render(&Camera::looking_at([x, height, 16.0], [x, 0.0, 16.0]));
     let (a, b) = (from(16.0), from(19.0));
 
@@ -253,6 +259,8 @@ fn an_emissive_material_adds_its_light_to_the_lit_image() {
     let lit_red = |name: &str| {
         let mut gpu = Offscreen::new(SIZE, SIZE, &floor_of(material_id(name))).unwrap();
         gpu.use_legacy_light();
+        gpu.set_shadow_weight(ShadowWeight::CentreCosine);
+        gpu.set_shadow_weight(ShadowWeight::CentreCosine);
         gpu.set_sun(Sun::from_angles(0.0, -0.5, 0.04));
         linear(pixel(&gpu.render(&overhead()), 16, 16)[0])
     };

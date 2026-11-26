@@ -22,9 +22,11 @@ use std::time::{Duration, Instant};
 use brick_store::{BrickStore, VOXELS_PER_METRE};
 use planet_gen::planet::Planet;
 use planet_gen::world_map::{TEST_MAP_SIZE, TEST_RADIUS, WORLD_MAP_SIZE, WorldMap};
+use render::LocalFrame;
+use render::daylight::hero_time_of_day;
 use render::lod::Bands;
 use render::sun::DEFAULT_ANGULAR_RADIUS;
-use render::{Camera, Look, NormalBias, Offscreen, Resolution, Stages, Sun, ToneCurve};
+use render::{Camera, DaySky, Look, NormalBias, Offscreen, Resolution, Stages, Sun, ToneCurve};
 
 use super::stamps;
 use super::{Hue, Place, SHOTS, Shot, Stamp};
@@ -49,8 +51,27 @@ const STRIP_SHOTS: [&str; 2] = ["forest floor", "canyon with haze"];
 /// crystals directly since #54, and the light that reaches the far side of a cave takes more).
 const CAVE_SPP_FACTOR: u32 = 4;
 
-const USAGE: &str = "usage: client lookdev --out DIR [--size WxH] [--spp N] [--compare DIR] [--atmosphere] [--untinted] [--landform] [--shot NAME]...\n  \
---landform (#246, a prototype): the landform model's shots (orbit, 30 km over the continent, the greatest range at noon and dusk, a valley floor, a plateau edge, a river mouth, a canyon rim), each found by searching the world map\n  \
+/// The day sheet's shots (#203): a meadow on the ground, the Zoom's far end (from orbit) and a crystal
+/// cave, at each of [`day_times`].
+const DAY_SHOTS: [&str; 3] = ["meadow", "pull-out to the Planet", "crystal cave, cyan"];
+
+/// The day sheet's times of day, as fractions of the day: dawn, the golden hour (hero light B's
+/// sun, on its way down), noon, dusk and night.
+fn day_times() -> [(&'static str, f64); 5] {
+    [
+        ("dawn", 0.255),
+        ("golden hour", hero_time_of_day()),
+        ("noon", 0.5),
+        ("dusk", 0.78),
+        ("night", 0.92),
+    ]
+}
+
+const USAGE: &str = "usage: client lookdev --out DIR [--size WxH] [--spp N] [--compare DIR] [--atmosphere] [--day] [--untinted] [--landform] [--shot NAME]...\n  \
+--day (#203): instead of the combinations, the world clock's sky at dawn, the golden hour, noon, dusk and night\n  \
+(Reference and settled Primary) from the meadow, from orbit (the Zoom's far end) and in the cyan crystal cave\n  \
+(on lavapipe: client lookdev --out DIR --day --size 480x270 --spp 16)\n  \
+  --landform (#246, a prototype): the landform model's shots (orbit, 30 km over the continent, the greatest range at noon and dusk, a valley floor, a plateau edge, a river mouth, a canyon rim), each found by searching the world map\n  \
 the 4090: client.exe lookdev --out DIR [--compare OLD_SHEET_DIR]   (1280x720, 64 spp)\n  \
 --gi (#54): instead of the combinations, each shot (and the emissive room) at the game's settings as the Reference\n  \
 has it, as Primary was before the radiance cache (the flat ambient of 0.25), and as it is with the cache's GI\n  \
@@ -137,6 +158,9 @@ pub struct Options {
     /// The atmosphere's sheet (#53): each shot in both views under hero light B's gradient (what
     /// the renderer had) and under the atmosphere, side by side, in place of the combinations.
     pub atmosphere: bool,
+    /// The day sheet (#203): the sky of the world clock at dawn, the golden hour, noon, dusk and
+    /// night, in both views, from the ground, from orbit and in a cave, in place of the combinations.
+    pub day: bool,
     /// The GI sheet (#54): each shot, and the emissive room, as the Reference has it, as Primary was
     /// with the flat ambient, and as Primary is with the radiance cache, in place of the
     /// combinations.
@@ -161,6 +185,7 @@ fn parse(args: impl IntoIterator<Item = String>) -> Result<Options, String> {
         compare: None,
         descent_frames: 12,
         atmosphere: false,
+        day: false,
         gi: false,
         untinted: false,
         only: Vec::new(),
@@ -188,6 +213,7 @@ fn parse(args: impl IntoIterator<Item = String>) -> Result<Options, String> {
             "--compare" => options.compare = Some(value("a directory")?.into()),
             "--short" => options.short = true,
             "--atmosphere" => options.atmosphere = true,
+            "--day" => options.day = true,
             "--gi" => options.gi = true,
             "--landform" => options.landform = true,
             "--untinted" => options.untinted = true,
@@ -476,6 +502,7 @@ pub fn run(options: &Options) -> Result<PathBuf, Box<dyn Error>> {
     // `--shot`: only the shots with those names in them, in a short run too.
     let shots: Vec<usize> = shots
         .into_iter()
+        .filter(|&n| !options.day || options.short || DAY_SHOTS.contains(&SHOTS[n].name))
         .filter(|&n| {
             options.only.is_empty()
                 || options
@@ -503,6 +530,7 @@ pub fn run(options: &Options) -> Result<PathBuf, Box<dyn Error>> {
         // The shipped Materials and the prototype's eight crystals.
         let mut gpu = Offscreen::with_materials(Resolution::native(w, h), &scene, stamps::table())?;
         gpu.set_flat_ambient(false);
+        gpu.set_denoise(render::Denoise::Full);
         eprintln!(
             "[{n}] {}: {written} stamp Voxels, ready in {:.0} s; {}",
             shot.name,
@@ -542,6 +570,16 @@ pub fn run(options: &Options) -> Result<PathBuf, Box<dyn Error>> {
             sections.push(section);
             continue;
         }
+        if options.day {
+            day_strip(&mut gpu, shot, &dir, options, &mut section)?;
+            eprintln!(
+                "[{n}] {}: done in {:.0} s",
+                shot.name,
+                t.elapsed().as_secs_f64()
+            );
+            sections.push(section);
+            continue;
+        }
         if options.atmosphere {
             versus(&mut gpu, shot, &dir, options, &mut section)?;
             if STRIP_SHOTS.contains(&shot.name) {
@@ -571,6 +609,8 @@ pub fn run(options: &Options) -> Result<PathBuf, Box<dyn Error>> {
     if options.gi {
         sections.push(emissive_room(options)?);
         write_gi_sheet(&options.out, &sections, options, began.elapsed())?;
+    } else if options.day {
+        write_day_sheet(&options.out, &sections, options, began.elapsed())?;
     } else if options.atmosphere {
         write_atmosphere_sheet(&options.out, &sections, options, began.elapsed())?;
     } else {
@@ -608,6 +648,12 @@ fn gi_versus(
     let mut images = vec![("reference", reference)];
     for (slug, flat) in [("primary-flat", true), ("primary-gi", false)] {
         gpu.set_flat_ambient(flat);
+        // The flat baseline is main's Primary of before the denoiser; the GI image is the game's.
+        gpu.set_denoise(if flat {
+            render::Denoise::Off
+        } else {
+            render::Denoise::Full
+        });
         // A new history, and a cache with nothing in it.
         gpu.reset_accumulation();
         let mut settled = gpu.render_upscaled(camera);
@@ -617,6 +663,7 @@ fn gi_versus(
         images.push((slug, settled));
     }
     gpu.set_flat_ambient(false);
+    gpu.set_denoise(render::Denoise::Full);
     for (slug, image) in images {
         let file = format!("{dir}/{slug}.png");
         write_png(&options.out.join(&file), &image)?;
@@ -635,6 +682,7 @@ fn emissive_room(options: &Options) -> Result<Section, Box<dyn Error>> {
     let (w, h) = options.size;
     let mut gpu = Offscreen::with_resolution(Resolution::native(w, h), &view.scene)?;
     gpu.set_flat_ambient(false);
+    gpu.set_denoise(render::Denoise::Full);
     let dir = "room";
     std::fs::create_dir_all(options.out.join(dir))?;
     let mut section = Section {
@@ -814,6 +862,163 @@ fn time_of_day(
     Ok(())
 }
 
+/// The camera of the day sheet's shot: its still camera, or for the Zoom's far end, the last frame of
+/// its path, over 3 Planet radii out.
+fn day_camera(shot: &Shot) -> Camera {
+    if shot.name.starts_with("pull-out") {
+        shot.path().camera_at(shot.frames - 1, shot.frames)
+    } else {
+        still_camera(shot)
+    }
+}
+
+/// The frame that puts the day's sky in a shot's own: the evening's sun [`SUN_FROM_FORWARD`] degrees
+/// from the camera's forward on its left (as [`sun_for`] has it), so that the golden hour is hero
+/// light B's. At night, `face_moon` turns the frame about the up so that the moon is 25 degrees to the
+/// side of forward, in view: the day's turn is where the stars are and not where the camera looks, so
+/// the night is shown the way the player would turn to the moon.
+fn sky_frame(camera: &Camera, sky: &DaySky, face_moon: bool) -> LocalFrame {
+    let up = camera.horizon_up;
+    let forward = camera.forward();
+    let tilt = dot(forward, up);
+    // A camera looking straight down (from orbit) has no heading of its own: the frame's is the
+    // zero-yaw one.
+    let flat = if tilt.abs() > 0.999 {
+        camera.back.map(|c| -c)
+    } else {
+        unit(std::array::from_fn(|a| forward[a] - up[a] * tilt))
+    };
+    let side = cross(up, flat);
+    let mut frame = LocalFrame {
+        side,
+        up,
+        back: flat.map(|c| -c),
+    };
+    if face_moon {
+        // The moon's azimuth from `back` towards `side`, and the turn that puts it at 155 degrees.
+        let m = frame.to_local(sky.moon);
+        let turn = f64::from(m[0]).atan2(f64::from(m[2])) - 155f64.to_radians();
+        let (s, c) = turn.sin_cos();
+        let (back, side) = (frame.back, frame.side);
+        frame.back = std::array::from_fn(|a| back[a] * c + side[a] * s);
+        frame.side = std::array::from_fn(|a| side[a] * c - back[a] * s);
+    }
+    frame
+}
+
+/// The shot at each of [`day_times`], in both views at the game's settings: the Reference image,
+/// and Primary settled (the window's view of a camera that has stopped), with the world clock
+/// stopped at the time. The exposure is set at once for each (the Reference holds the one it meters,
+/// and Primary's first frame has nothing to adapt from), so each image is the one a player
+/// who has been there a few seconds sees.
+fn day_strip(
+    gpu: &mut Offscreen,
+    shot: &Shot,
+    dir: &str,
+    options: &Options,
+    section: &mut Section,
+) -> Result<(), Box<dyn Error>> {
+    let camera = day_camera(shot);
+    gpu.set_stages(Stages::default());
+    let spp = if shot.cave.is_some() {
+        options.spp * CAVE_SPP_FACTOR
+    } else {
+        options.spp
+    };
+    for (view, reference) in [("reference", true), ("primary", false)] {
+        for (name, time) in day_times() {
+            let t = Instant::now();
+            let sky = DaySky::at(time);
+            gpu.set_sky_frame(Some(sky_frame(&camera, &sky, name == "night")));
+            gpu.set_day_sky(sky, true);
+            let image = if reference {
+                gpu.render_reference(&camera, spp)
+            } else {
+                gpu.reset_accumulation();
+                // One frame with nothing carried over sets the exposure at once.
+                gpu.render(&camera);
+                let mut settled = gpu.render_upscaled(&camera);
+                for _ in 1..settle_frames(options) {
+                    settled = gpu.render_upscaled(&camera);
+                }
+                settled
+            };
+            let file = format!("{dir}/{view}-{}.png", slug(name));
+            write_png(&options.out.join(&file), &image)?;
+            section.strip.push(Figure {
+                path: file,
+                label: format!("{name} ({:.1} h)", time * 24.0),
+            });
+            eprintln!("    {view}, {name}: {:.0} s", t.elapsed().as_secs_f64());
+        }
+    }
+    gpu.set_sky_frame(None);
+    Ok(())
+}
+
+fn write_day_sheet(
+    out: &Path,
+    sections: &[Section],
+    options: &Options,
+    took: Duration,
+) -> Result<(), Box<dyn Error>> {
+    let mut html = String::new();
+    html.push_str(
+        "<!doctype html><meta charset=utf-8><title>look-dev: the day (#203)</title>\
+         <style>body{font:14px system-ui;margin:1.5em;background:#16171a;color:#ddd}\
+         h1{font-weight:600}p.d{max-width:90ch;color:#aaa}\
+         table{border-collapse:collapse}th,td{vertical-align:top;padding:4px 6px;border-top:1px solid #444}\
+         th{font-size:12px;font-weight:500;color:#aaa;text-align:left;max-width:300px}\
+         td.name{max-width:190px;font-size:12px;color:#aaa;position:sticky;left:0;background:#16171a}\
+         td.name b{color:#ddd;font-size:15px}img{display:block;width:300px;height:auto}</style>",
+    );
+    let (w, h) = options.size;
+    let _ = write!(
+        html,
+        "<h1>The day (#203)</h1>\
+         <p class=d>Rendered at {w}&times;{h} at the game's settings by the renderer's own pipeline, the world \
+         clock stopped at each time of day: the sun through the art direction's palette (hero light B near the \
+         golden hour, then dusk, then night), the moon (a dim, cool key light that is the one shadowed light \
+         while the sun is down), the stars and the violet night sky. For each shot, the Reference ({} samples a \
+         pixel, {}&times; that in the cave) over Primary settled after {} frames of a still camera. At night the \
+         view is turned to the moon. Took {:.0} s.{}</p>",
+        options.spp,
+        CAVE_SPP_FACTOR,
+        settle_frames(options),
+        took.as_secs_f64(),
+        if options.short {
+            " <b>A smoke test: tiny images, of nothing in particular.</b>"
+        } else {
+            ""
+        }
+    );
+    html.push_str("<table>");
+    for section in sections {
+        let columns = day_times().len();
+        for (row, view) in ["Reference", "Primary (settled)"].iter().enumerate() {
+            html.push_str("<tr>");
+            if row == 0 {
+                let _ = write!(
+                    html,
+                    "<td class=name rowspan=2><b>{}</b><br>{}</td>",
+                    section.name, section.subject
+                );
+            }
+            for figure in section.strip[row * columns..][..columns].iter() {
+                let _ = write!(
+                    html,
+                    "<td><a href=\"{0}\"><img src=\"{0}\" loading=lazy></a>{1} &mdash; {2}</td>",
+                    figure.path, view, figure.label
+                );
+            }
+            html.push_str("</tr>");
+        }
+    }
+    html.push_str("</table>");
+    std::fs::write(out.join("index.html"), html)?;
+    Ok(())
+}
+
 fn write_atmosphere_sheet(
     out: &Path,
     sections: &[Section],
@@ -935,7 +1140,9 @@ pub(super) fn settle_frames(options: &Options) -> u32 {
 }
 
 /// The shot's Primary image from its still camera, at the game's settings: one frame, which has
-/// the sun's shadows from two samples of the disc a pixel (#52), and the same view after
+/// the sun's shadows from two samples of the disc a pixel (#52) and goes through the denoiser's
+/// filter with no history (#55: `render` has no denoiser, so the frame is drawn as a window draws
+/// its first), and the same view after
 /// [`SETTLE_FRAMES`] frames of a camera that has not moved, which is what a window shows a view that
 /// has stopped.
 fn primary_still(
@@ -948,7 +1155,8 @@ fn primary_still(
     let camera = still_camera(shot);
     gpu.set_stages(Stages::default());
     gpu.set_sun(sun_for(&camera));
-    let primary = gpu.render(&camera);
+    gpu.reset_accumulation();
+    let primary = gpu.render_upscaled(&camera);
     let file = format!("{dir}/primary.png");
     write_png(&options.out.join(&file), &primary)?;
     section.stills.push(Figure {
@@ -1212,6 +1420,22 @@ mod tests {
         assert!(images.contains(&"00-forest-floor/reference-untinted.png"));
         for image in &images {
             assert!(versus.join(image).exists(), "{image}");
+        }
+        // The day sheet (#203): each shot at five times of day, in both views.
+        let day = out.join("day");
+        let options = parse(args(&["--out", day.to_str().unwrap(), "--short", "--day"])).unwrap();
+        assert!(options.day);
+        let html = std::fs::read_to_string(run(&options).unwrap()).unwrap();
+        let images: Vec<&str> = html
+            .split("src=\"")
+            .skip(1)
+            .map(|s| s.split('"').next().unwrap())
+            .collect();
+        assert_eq!(images.len(), 2 * 2 * 5, "{images:?}");
+        assert!(images.contains(&"00-forest-floor/reference-golden-hour.png"));
+        assert!(images.contains(&"00-forest-floor/primary-night.png"));
+        for image in &images {
+            assert!(day.join(image).exists(), "{image}");
         }
         // The GI sheet (#54): each shot and the emissive room in three images.
         let gi = out.join("gi");

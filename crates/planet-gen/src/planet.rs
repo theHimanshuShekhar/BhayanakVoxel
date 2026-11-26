@@ -32,6 +32,14 @@
 use std::fmt;
 use std::sync::Arc;
 
+mod crystals;
+pub use crystals::{
+    ACCENT_SHARE, CAVE_CHANCE, CAVE_SPACING, CrystalSite, GROUND_CHANCE, HUE_NAMES, HUES,
+    MAX_LEVEL as CRYSTAL_MAX_LEVEL, MAX_PRISM_LENGTH, MIN_PRISM_LENGTH, Place,
+    REACH as CRYSTAL_REACH, Room, SITE_CELL, SUN_FACING_MIN, SUN_OPENNESS_MIN, SUN_SLOPE, Sunlit,
+    Wall,
+};
+
 use brick_store::{BRICK_SIZE, Brick, BrickCoord, BrickSource, BrickStore, Material, VoxelCoord};
 
 pub use crate::SOIL;
@@ -81,10 +89,10 @@ pub const fn interior_radius(radius: i32) -> i32 {
 }
 
 /// Every Voxel of a Planet of `radius` Voxels is within this many Voxels of its centre: sea
-/// level's radius plus the highest its ground goes. Nothing is generated beyond it, so a ray need
-/// not be walked further.
+/// level's radius plus the highest its ground goes, and the crystals that can stand on it (#204).
+/// Nothing is generated beyond it, so a ray need not be walked further.
 pub const fn max_radius(radius: i32) -> i32 {
-    radius + PEAK + DETAIL_REACH
+    radius + PEAK + DETAIL_REACH + crystals::REACH as i32 + 1
 }
 
 /// The default Planet's [`max_radius`].
@@ -482,16 +490,9 @@ impl Planet {
     /// [`Planet::material_at`] for a Voxel `size` Voxels wide (see [`Samples`]): the Material that
     /// a brick sampled so far apart has at `point`, with the detail and the caves that it has.
     fn material_sized(&self, point: [f64; 3], size: f64) -> Option<Material> {
-        let ground = self.ground_at(point, size, &mut detail::Cache::default());
-        if ground.is_none() {
-            return ground;
-        }
-        let half = (size - 1.0) / 2.0;
-        let tubes = self.caves.near(point, point, 1.0);
-        if !tubes.is_empty() && self.carved(point, half, &tubes, &mut None) {
-            return None;
-        }
-        ground
+        // Only air can be a crystal's (see `crystals`): the terrain first.
+        self.terrain_sized(point, size)
+            .or_else(|| self.crystal_at(point, size))
     }
 
     /// Whether the Voxel sampled at `point`, a solid one of the ground, is a cave: inside one of
@@ -615,10 +616,21 @@ impl Planet {
         self.generate(level, coord)
     }
 
-    /// The brick at `coord` of mip `level`: [`Planet::brick`] and [`Planet::coarse_brick`].
+    /// The brick at `coord` of mip `level`: [`Planet::brick`] and [`Planet::coarse_brick`]. The
+    /// terrain, and the crystal clusters (#204) in the air of it, which are in levels up to
+    /// [`CRYSTAL_MAX_LEVEL`] only: a brick that is all one solid Material has no air for them.
     fn generate(&self, level: usize, coord: BrickCoord) -> Brick {
         #[cfg(test)]
         BRICKS_MADE.with(|made| made.set(made.get() + 1));
+        let mut brick = self.terrain(level, coord);
+        if level <= CRYSTAL_MAX_LEVEL && (brick.is_air() || !brick.is_uniform()) {
+            self.plant_crystals(level, coord, &mut brick);
+        }
+        brick
+    }
+
+    /// The terrain of the brick at `coord` of mip `level`, without clusters.
+    fn terrain(&self, level: usize, coord: BrickCoord) -> Brick {
         let samples = Samples::new(level, coord);
         let (near, far) = samples.radii();
         let shape = self.shape;
@@ -1088,6 +1100,17 @@ impl Planet {
         store
     }
 
+    /// Distance along the region's axis of the top of a region round `spawn`, `across` wide, whose
+    /// ground is at most `high` above the sea: a brick above that, and the crystal clusters that
+    /// stand on the ground below it where the region is in or near crystal country (#204): the
+    /// country test is of the corners and middle of the cube that holds the region's width.
+    fn region_top(&self, high: f64, spawn: [f64; 3], across: f64) -> f64 {
+        let top = self.shape.sea + high.max(0.0) + f64::from(BRICK_SIZE);
+        let low = spawn.map(|c| c - across);
+        let high_corner = spawn.map(|c| c + across);
+        top + self.crystal_reach(0, low, high_corner)
+    }
+
     /// The bricks of [`Planet::region_around`] and what that store reads where it holds none.
     fn region_bricks(
         &self,
@@ -1100,8 +1123,8 @@ impl Planet {
         // of the cylinder, by a few Voxels) to a brick above the highest ground or the sea;
         // across it, `reach` and a brick.
         let bottom = self.shape.sea + low - f64::from(STRATA_DEPTH + 2 * BRICK_SIZE);
-        let top = self.shape.sea + high.max(0.0) + f64::from(BRICK_SIZE);
         let across = f64::from(reach + BRICK_SIZE) + REACH;
+        let top = self.region_top(high, spawn, across);
         let ends = [bottom, top].map(|a| up.map(|u| u * a));
         let corner = |pick: fn(f64, f64) -> f64, margin: f64| {
             BrickCoord(std::array::from_fn(|a| {
@@ -1194,7 +1217,8 @@ impl Planet {
 
     /// Whether every Voxel of level 0 under the brick at `coord` of mip `level` is air, for
     /// certain: it is wholly above the highest ground that its box is over (from the few texels of
-    /// the world map that the box is over, as [`Planet::solid_below`] has it) and above the sea.
+    /// the world map that the box is over, as [`Planet::solid_below`] has it), and the crystals on
+    /// it where there may be some, and above the sea.
     /// Water and ice below sea level are solid, so the box must be out of the sea, and caves only
     /// carve, so they do not matter. `false` means that it is not known, not that there is ground:
     /// a coarse brick over a slope reads as air where the ground pokes up half a Voxel into it,
@@ -1212,11 +1236,20 @@ impl Planet {
         if near < self.shape.sea {
             return false;
         }
+        // A crystal cluster (#204) stands up to its reach above the ground, in the air of a brick
+        // of its levels, and grows on ground that is up to its reach to the side.
+        let reach = self.crystal_reach(level, low, high);
         let corners: [[f64; 3]; 8] = std::array::from_fn(|i| {
-            std::array::from_fn(|a| if i >> a & 1 == 0 { low[a] } else { high[a] })
+            std::array::from_fn(|a| {
+                if i >> a & 1 == 0 {
+                    low[a] - reach
+                } else {
+                    high[a] + reach
+                }
+            })
         });
         let (_, highest) = self.ground_range(&corners, 1.0);
-        near >= self.shape.sea + highest + SLACK
+        near >= self.shape.sea + highest + reach + SLACK
     }
 
     /// A brick of the Guard, if `coord` of `level` is one: as [`Planet::coarse_brick`] makes it,
@@ -1490,7 +1523,7 @@ mod tests {
     /// Voxels around the spawn the tests take: the world map of the tests is too coarse for more.
     const SPAWN_REACH: i32 = 100;
 
-    fn planet() -> &'static Planet {
+    pub(super) fn planet() -> &'static Planet {
         static PLANET: OnceLock<Planet> = OnceLock::new();
         PLANET.get_or_init(|| Planet::new(WorldMap::with_radius(SEED, SIZE, TEST_RADIUS)))
     }
@@ -1857,6 +1890,68 @@ mod tests {
         assert_eq!(voxel(3.0), None);
     }
 
+    #[test]
+    fn a_region_is_as_tall_as_its_clusters_only_in_and_near_crystal_country() {
+        use crate::planet::crystals::tests::scan;
+        let planet = planet();
+        let across = f64::from(SPAWN_REACH + BRICK_SIZE) + REACH;
+        let plain = planet.shape.sea + 30.0 + f64::from(BRICK_SIZE);
+        // Round a cluster of the country: a brick above the ground and what a cluster stands up.
+        for site in scan().ground.iter().take(5) {
+            assert_eq!(
+                planet.region_top(30.0, site.anchor, across),
+                plain + crystals::REACH
+            );
+        }
+        // Where the country is not near, it is the brick: the sea's side of every texel that is
+        // not the country and has none within the region's width and the reach of a cluster.
+        let map = planet.map();
+        let mut clear = 0;
+        for face in 0..6 {
+            for j in (0..map.size()).step_by(7) {
+                for i in (0..map.size()).step_by(7) {
+                    let up = map.texel_direction(face, i, j);
+                    let spawn = up.map(|c| c * (planet.shape.sea + 100.0));
+                    // Every point of a grid of the region's width, and twice that.
+                    let near = (0..125).any(|n| {
+                        let p: [f64; 3] = std::array::from_fn(|a| {
+                            let step = (n / 5usize.pow(a as u32) % 5) as f64 - 2.0;
+                            spawn[a] + step * across
+                        });
+                        map.sample(p)
+                            .regions
+                            .contains(crate::world_map::Regions::CRYSTAL_CAVES)
+                    });
+                    if !near {
+                        clear += 1;
+                        assert_eq!(planet.region_top(30.0, spawn, across), plain);
+                    }
+                }
+            }
+        }
+        assert!(clear > 10, "{clear} places away from the country");
+    }
+
+    #[test]
+    fn a_region_in_crystal_country_has_the_bricks_of_the_tops_of_its_clusters() {
+        use crate::planet::crystals::tests::{brick_of, scan};
+        let planet = planet();
+        let mut checked = 0;
+        for site in scan().ground.iter().take(3) {
+            let store = planet.region_around(site.anchor, SPAWN_REACH);
+            let point: [f64; 3] = std::array::from_fn(|a| {
+                site.anchor[a] + site.normal[a] * (site.length - 3.0) * 0.9
+            });
+            let coord = brick_of(point, 0);
+            let brick = planet.brick(coord);
+            if !brick.is_air() {
+                checked += 1;
+                assert_eq!(store.brick(coord), Some(&brick), "{coord:?}");
+            }
+        }
+        assert!(checked > 0);
+    }
+
     fn region() -> &'static BrickStore {
         static REGION: OnceLock<BrickStore> = OnceLock::new();
         REGION.get_or_init(|| {
@@ -2085,6 +2180,94 @@ mod tests {
     fn a_coarse_brick_over_the_ground_is_the_planets_downsampled_but_for_a_few_voxels() {
         for level in 1..=3 {
             assert!(differing(level) <= TOLERANCE[level - 1], "level {level}");
+        }
+    }
+
+    /// Most of the Voxels with a crystal in them, in either brick, that may differ between
+    /// [`Planet::coarse_brick`] and [`downsampled`], as a fraction, at levels 1 to
+    /// [`CRYSTAL_MAX_LEVEL`], in the bricks of the longest clusters on the ground and, apart, in
+    /// caves: the numbers measured (printed by the test below) with a margin. A cluster is made of
+    /// thin prisms, so most of its Voxels are at an edge, which is more than the ground has and
+    /// why these are higher than [`TOLERANCE`]. The test also bounds the amount of crystal (the
+    /// larger count at most 1.5 times the smaller plus 20 Voxels, so a loose bound where counts are small): sampling a coarse Voxel only when a ball of 0.55 of its half-width fits
+    /// in a prism (the first try) made 10% to 55% of the pyramid's crystal at levels 1 to 3 and
+    /// differed in 27% to 60% of the Voxels.
+    ///
+    /// Caves at level 3 have none, by the owner's decision of 2026-11-25: at 80 cm Voxels a cave
+    /// cluster is 1 to 4 Voxels across, so per-Voxel agreement there is edge noise (58% of 124
+    /// Voxels differ, nearly all of them the edge of a prism that one makes and the other does
+    /// not). Only the amount of crystal is bounded there, by the larger count being at most 1.5
+    /// times the smaller plus 20 Voxels (94 made, 82 downsampled; at 82 downsampled that accepts
+    /// 42 to 143 made). Ground clusters keep the whole check at every level, and caves at 1 and 2.
+    const CRYSTAL_TOLERANCE: [(&str, [Option<f64>; 3]); 2] = [
+        ("ground", [Some(0.12), Some(0.26), Some(0.45)]),
+        ("cave", [Some(0.12), Some(0.26), None]),
+    ];
+
+    /// How the crystal Voxels of the coarse bricks at `coords` of mip `level` differ from the
+    /// pyramid's: (differ, compared, crystal Voxels made, crystal Voxels downsampled).
+    fn crystal_difference(level: usize, coords: &[BrickCoord]) -> (usize, usize, usize, usize) {
+        let is_crystal = |m: Option<Material>| m.is_some_and(|m| crystals::HUES.contains(&m));
+        let (mut differ, mut total, mut made_crystal, mut real_crystal) = (0, 0, 0, 0);
+        for coord in coords {
+            let made = planet().coarse_brick(level, *coord);
+            let real = downsampled(level, *coord);
+            for l in locals() {
+                let (m, r) = (made.get(l), real.get(l));
+                made_crystal += usize::from(is_crystal(m));
+                real_crystal += usize::from(is_crystal(r));
+                if is_crystal(m) || is_crystal(r) {
+                    total += 1;
+                    differ += usize::from(m != r);
+                }
+            }
+        }
+        (differ, total, made_crystal, real_crystal)
+    }
+
+    #[test]
+    fn a_coarse_brick_with_crystals_is_the_planets_downsampled_but_for_the_edges_of_the_clusters() {
+        use crate::planet::crystals::tests::{along_prism, brick_of, scan};
+        let scan = scan();
+        for (set, (name, tolerance)) in [&scan.ground, &scan.cave]
+            .into_iter()
+            .zip(CRYSTAL_TOLERANCE)
+        {
+            let mut sites: Vec<_> = set.iter().collect();
+            // The longest clusters first: at level 3 only they are more than a Voxel or two.
+            sites.sort_by(|a, b| b.length.total_cmp(&a.length));
+            for level in 1..=CRYSTAL_MAX_LEVEL {
+                let mut coords: Vec<BrickCoord> = Vec::new();
+                for site in &sites {
+                    let coord = brick_of(along_prism(site), level);
+                    if !coords.contains(&coord) {
+                        coords.push(coord);
+                    }
+                }
+                // A brick of level 3 is 512 bricks of level 0 to downsample.
+                coords.truncate([40, 60, 160][level - 1]);
+                let (differ, total, made, real) = crystal_difference(level, &coords);
+                let fraction = differ as f64 / total.max(1) as f64;
+                eprintln!(
+                    "{name} level {level}: {differ} of {total} crystal Voxels differ, {fraction:.4} \
+                     ({} bricks, {made} made, {real} downsampled)",
+                    coords.len()
+                );
+                assert!(
+                    total >= [1000, 500, 80][level - 1],
+                    "{name} level {level}: only {total} Voxels compared"
+                );
+                if let Some(tolerance) = tolerance[level - 1] {
+                    assert!(fraction <= tolerance, "{name} level {level}: {fraction}");
+                }
+                // The volume agrees too, loosely: the larger count is at most 1.5 times the smaller plus 20
+                // Voxels (the 20 is what keeps the few Voxels of a coarse level from failing it).
+                let (low, high) = (made.min(real), made.max(real));
+                assert!(
+                    high as f64 <= low as f64 * 1.5 + 20.0,
+                    "{name} level {level}: {made} made and {real} downsampled"
+                );
+            }
         }
     }
 

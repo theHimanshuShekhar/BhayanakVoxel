@@ -34,7 +34,7 @@ pub use caves::Tube;
 /// the Planet's radius a value passed to the generator. 6 has continents of 30 to 60 km (a ball
 /// to a 52 km cell) and the detail shaped by the map's slope, biome and drainage as well as its
 /// height.
-pub const GENERATOR_VERSION: u32 = 7;
+pub const GENERATOR_VERSION: u32 = 8;
 
 /// Mean radius of the test Planet in Voxels: 75 m at 5 cm Voxels, so 150 m across.
 pub const PLANET_RADIUS: i32 = 1500;

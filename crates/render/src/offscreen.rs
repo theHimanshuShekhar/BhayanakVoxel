@@ -2,6 +2,7 @@
 
 use crate::camera::Camera;
 use crate::composite::Composite;
+use crate::daylight::{DaySky, LocalFrame, Night};
 use crate::debug_view::DebugView;
 use crate::profiler::Profiler;
 use crate::reference::{Hit, Ray};
@@ -16,7 +17,7 @@ use crate::{
 };
 
 /// A half-precision float's value.
-fn half_to_f32(bits: u16) -> f32 {
+pub(crate) fn half_to_f32(bits: u16) -> f32 {
     let sign = if bits & 0x8000 != 0 { -1.0 } else { 1.0 };
     let (exponent, fraction) = (i32::from((bits >> 10) & 0x1f), f32::from(bits & 0x3ff));
     match exponent {
@@ -29,7 +30,7 @@ fn half_to_f32(bits: u16) -> f32 {
 
 /// Copies a `width` x `height` texture of `bytes` per texel to the CPU after the work in
 /// `encoder`, tightly packed, rows from the top.
-fn read_texture(
+pub(crate) fn read_texture(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     mut encoder: wgpu::CommandEncoder,
@@ -183,6 +184,10 @@ pub struct Offscreen {
     /// The sun's azimuth, elevation and radius in the camera's local frame, if it follows the
     /// camera's up ([`Offscreen::set_local_sun`]); it replaces `sun` then.
     local_sun: Option<(f32, f32, f32)>,
+    /// The sky of the world clock's time of day ([`Offscreen::set_day_sky`]), which replaces the sun
+    /// above while there is one, and the frame that it is in (the camera's own if none is set).
+    day_sky: Option<DaySky>,
+    sky_frame: Option<LocalFrame>,
     /// Whether `update_scene` sends its writes at once; see `set_flush_scene_updates`.
     flush_scene_updates: bool,
     last_update: UpdateTimes,
@@ -319,6 +324,10 @@ impl Offscreen {
         // the scene alone (GI is a noisy sample that depends on the cache's history), and goldens
         // of them stay as they were. The bench and the look-dev sheet turn GI on.
         tracer.set_flat_ambient(true);
+        // And no denoiser (#55), for the same reason: a frame that is a function of the scene alone
+        // is the frame's samples as they are. The bench and the look-dev sheet draw Primary as the
+        // game does and turn it on (`set_denoise`).
+        tracer.set_denoise(crate::denoise::Denoise::Off);
         let profiler = Profiler::new(&device, &queue);
         let target = if full_reference {
             Target::with_full_reference(&device, resolution)
@@ -335,12 +344,25 @@ impl Offscreen {
             target,
             sun: Sun::default(),
             local_sun: None,
+            day_sky: None,
+            sky_frame: None,
             flush_scene_updates: true,
             last_update: UpdateTimes::default(),
             last_draw: DrawTimes::default(),
             last_passes: Vec::new(),
             presenter: None,
         })
+    }
+
+    /// Replaces the Planet being drawn, as the window's `Renderer::set_scene` does when the Planet
+    /// it was loading is ready: the same call, so that a test of the window's sky setup (a ground
+    /// level and a day sky set on the empty scene the window starts with, then the Planet) is of
+    /// the window's code. Only with the compute backend, which is the window's.
+    pub fn set_scene(&mut self, scene: &Scene) -> Result<()> {
+        if self.rt.active.is_hardware() {
+            return Err("set_scene is the window's path, which has the compute backend".into());
+        }
+        self.tracer.replace_scene(&self.device, scene)
     }
 
     /// Brings the GPU copy of the Planet up to date with `scene`, after `update` (the result of
@@ -394,11 +416,12 @@ impl Offscreen {
 
     /// Changes the sun that both ways of rendering light the Planet with.
     pub fn set_sun(&mut self, sun: Sun) {
-        if self.local_sun.is_some() || sun != self.sun {
+        if self.local_sun.is_some() || self.day_sky.is_some() || sun != self.sun {
             self.tracer.sun_changed();
         }
         self.sun = sun;
         self.local_sun = None;
+        self.day_sky = None;
     }
 
     /// Puts the sun at `azimuth` and `elevation` radians in the camera's local frame, `radius`
@@ -406,10 +429,66 @@ impl Offscreen {
     /// camera that is carried over a Planet has a sun whose direction moves a little on every
     /// frame. That is not a change of the sun, and keeps the upscaler's history.
     pub fn set_local_sun(&mut self, azimuth: f32, elevation: f32, radius: f32) {
-        if self.local_sun != Some((azimuth, elevation, radius)) {
+        if self.day_sky.is_some() || self.local_sun != Some((azimuth, elevation, radius)) {
             self.tracer.sun_changed();
         }
         self.local_sun = Some((azimuth, elevation, radius));
+        self.day_sky = None;
+    }
+
+    /// Puts the sky at the world clock's time of day (#203): the sun, the moon, the night's floor
+    /// and the stars, in the camera's local frame ([`LocalFrame::of`], or the one of
+    /// [`Offscreen::set_sky_frame`]). It replaces [`Offscreen::set_sun`] and
+    /// [`Offscreen::set_local_sun`]. Call it every frame with what [`Daylight::step`] said:
+    /// **`jumped` is the signal that the sun was put somewhere** (the clock was set, or the step was
+    /// big): the radiance cache forgets at once and the upscaler's history starts over. A sky that
+    /// only drifted on from the last frame's is followed by the caches' normal updates. The
+    /// Reference view starts over whenever the sky changes at all.
+    ///
+    /// [`Daylight::step`]: crate::Daylight::step
+    pub fn set_day_sky(&mut self, sky: DaySky, jumped: bool) {
+        if jumped || self.day_sky.is_none() {
+            self.tracer.sun_changed();
+        }
+        self.day_sky = Some(sky);
+        self.local_sun = None;
+    }
+
+    /// The frame that the day's sky is in, in place of each camera's own: for a view whose sun is
+    /// put relative to where it looks (the look-dev sheet's), not to the Planet's zero-yaw heading.
+    pub fn set_sky_frame(&mut self, frame: Option<LocalFrame>) {
+        self.sky_frame = frame;
+    }
+
+    /// The light that casts the shadows of a frame of `camera` now: the sun or the moon, with the
+    /// radiance it is given (see [`KeyLight`](crate::tracer::KeyLight)).
+    pub fn key_light(&mut self, camera: &Camera) -> crate::tracer::KeyLight {
+        let sun = self.lit_sun(camera);
+        self.tracer.key_light(camera, &sun)
+    }
+
+    /// How many times the sun has jumped: see [`Tracer::sun_epoch`].
+    pub fn sun_epoch(&self) -> u64 {
+        self.tracer.sun_epoch()
+    }
+
+    /// The sun for a frame seen from `camera`, and (as a side effect) the night's sky given to the
+    /// tracer: what every frame of this renderer is lit by.
+    fn lit_sun(&mut self, camera: &Camera) -> Sun {
+        let (sun, night) = if let Some(sky) = &self.day_sky {
+            let frame = self.sky_frame.unwrap_or_else(|| LocalFrame::of(camera));
+            (sky.sun_in(&frame), sky.night_in(&frame))
+        } else {
+            let sun = match self.local_sun {
+                Some((azimuth, elevation, radius)) => {
+                    Sun::local(camera, azimuth, elevation, radius)
+                }
+                None => self.sun,
+            };
+            (sun, Night::NONE)
+        };
+        self.tracer.set_night(night);
+        sun
     }
 
     /// Starts the upscaler's history over, and the Reference's image: the next frame is the first
@@ -467,6 +546,54 @@ impl Offscreen {
     /// [`Tracer::set_shadow_rays`]). The bench's `--shadow-rays` uses it (#52).
     pub fn set_shadow_rays(&mut self, rays: u32) {
         self.tracer.set_shadow_rays(rays);
+    }
+
+    /// Chooses how much of Primary's denoiser runs (see [`Tracer::set_denoise`]). **An `Offscreen`
+    /// starts with it off**, like the flat ambient and for the same reason: a caller that draws
+    /// Primary as the game does (the bench, the look-dev sheet) calls
+    /// `set_denoise(Denoise::Full)`. The window's tracer has it on from the start.
+    pub fn set_denoise(&mut self, mode: crate::denoise::Denoise) {
+        self.tracer.set_denoise(mode);
+    }
+
+    /// Chooses how the sun's shadow rays are weighed (see [`Tracer::set_shadow_weight`]).
+    pub fn set_shadow_weight(&mut self, weight: crate::tracer::ShadowWeight) {
+        self.tracer.set_shadow_weight(weight);
+    }
+
+    /// The light that the last frame of [`Offscreen::render_upscaled`] was lit with: the incident
+    /// light in xyz and the sun's weight in w for every pixel of the traced image, rows from the
+    /// top, after the denoiser (or as the frame's samples are where it is off). For tests.
+    pub fn read_light_signals(&mut self) -> Vec<[f32; 4]> {
+        let (plane, wide) = self.tracer.light_signals(&self.target);
+        self.read_signals(&plane.texture.clone(), wide)
+    }
+
+    /// The frame's samples of the same two signals before the denoiser. For tests.
+    pub fn read_frame_samples(&mut self) -> Vec<[f32; 4]> {
+        let texture = self.tracer.frame_samples(&self.target).texture.clone();
+        self.read_signals(&texture, true)
+    }
+
+    fn read_signals(&mut self, texture: &wgpu::Texture, wide: bool) -> Vec<[f32; 4]> {
+        let size = self.target.resolution().internal;
+        let encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        let bytes_per = if wide { 16 } else { 8 };
+        let bytes = read_texture(&self.device, &self.queue, encoder, texture, size, bytes_per);
+        bytes
+            .chunks(bytes_per as usize)
+            .map(|texel| {
+                std::array::from_fn(|c| {
+                    if wide {
+                        f32::from_le_bytes(texel[4 * c..4 * c + 4].try_into().unwrap())
+                    } else {
+                        half_to_f32(u16::from_le_bytes([texel[2 * c], texel[2 * c + 1]]))
+                    }
+                })
+            })
+            .collect()
     }
 
     /// Chooses what is drawn: the lit image, or one of the debug views.
@@ -660,13 +787,14 @@ impl Offscreen {
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
         self.profiler.begin_frame();
+        let sun = self.lit_sun(camera);
         self.tracer.encode_primary(
             &self.device,
             &self.queue,
             &mut self.profiler,
             &mut encoder,
             camera,
-            &sun_for(self.local_sun, self.sun, camera),
+            &sun,
             &self.target,
         );
         let size = self.target.resolution().internal;
@@ -684,13 +812,14 @@ impl Offscreen {
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
         self.profiler.begin_frame();
+        let sun = self.lit_sun(camera);
         self.tracer.encode_upscaled(
             &self.device,
             &self.queue,
             &mut self.profiler,
             &mut encoder,
             camera,
-            &sun_for(self.local_sun, self.sun, camera),
+            &sun,
             &self.target,
         );
         let size = self.target.resolution().output;
@@ -715,13 +844,14 @@ impl Offscreen {
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
         self.profiler.begin_frame();
+        let sun = self.lit_sun(camera);
         self.tracer.encode_upscaled(
             &self.device,
             &self.queue,
             &mut self.profiler,
             &mut encoder,
             camera,
-            &sun_for(self.local_sun, self.sun, camera),
+            &sun,
             &self.target,
         );
         self.profiler.resolve(&mut encoder);
@@ -836,13 +966,14 @@ impl Offscreen {
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
         self.profiler.begin_frame();
+        let sun = self.lit_sun(camera);
         self.tracer.encode_reference(
             &self.device,
             &self.queue,
             &mut self.profiler,
             &mut encoder,
             camera,
-            &sun_for(self.local_sun, self.sun, camera),
+            &sun,
             &self.target,
         );
         self.profiler.resolve(&mut encoder);
@@ -898,13 +1029,14 @@ impl Offscreen {
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
         self.profiler.begin_frame();
+        let sun = self.lit_sun(camera);
         let taken = self.tracer.encode_reference_batch(
             &self.device,
             &self.queue,
             &mut self.profiler,
             &mut encoder,
             camera,
-            &sun_for(self.local_sun, self.sun, camera),
+            &sun,
             &self.target,
             samples,
         );
@@ -931,13 +1063,14 @@ impl Offscreen {
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
         self.profiler.begin_frame();
+        let sun = self.lit_sun(camera);
         let plan = self.tracer.encode_frame(
             &self.device,
             &self.queue,
             &mut self.profiler,
             &mut encoder,
             camera,
-            &sun_for(self.local_sun, self.sun, camera),
+            &sun,
             &self.target,
             reference,
             now,
@@ -1146,12 +1279,4 @@ fn scene_centre(scene: &Scene) -> [f64; 3] {
             (f64::from(l.occupied_first[a]) + f64::from(l.occupied_end[a])) * 32.0
         })
     })
-}
-
-/// The sun for a frame seen from `camera`: the local one if there is one.
-fn sun_for(local: Option<(f32, f32, f32)>, sun: Sun, camera: &Camera) -> Sun {
-    match local {
-        Some((azimuth, elevation, radius)) => Sun::local(camera, azimuth, elevation, radius),
-        None => sun,
-    }
 }

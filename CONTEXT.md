@@ -22,6 +22,13 @@ _Avoid_: Visible, surface Voxel
 Air that the generator carves under the Planet's land, in tunnels and chambers, some of which open to the surface as cave mouths. A part of the Planet's generated terrain, not an Edit.
 _Avoid_: Dungeon, hole (a hole is dug)
 
+**Crystal cluster**:
+A few radiating hexagonal prisms with pointed tips, of one of eight emissive crystal Materials, that the generator grows from a sunlit slope or the wall of a Cave in the world map's crystal-caves region, along the surface's normal. Part of the generated terrain (it fills air only, and is in the levels of detail up to 3), not an Edit. Each Cave has a dominant hue.
+_Avoid_: Crystal (the Material of one prism), geode
+
+**Placement rule**:
+A test of a place that depends on the seed alone (the world map and the Caves' density, never the order bricks are made in), so that every brick, at any level, and the server agree on what is there: sunlit (slope, aspect, open sky), Cave wall (the density's gradient) and room (the local density). Content is placed by them.
+
 **Material**:
 The kind of matter a Voxel is made of (e.g. rock, sand, water, glass), carrying properties like hardness or emissiveness.
 _Avoid_: Block type, voxel type
@@ -75,6 +82,13 @@ _Avoid_: Real-time view, game view
 **Reference view**:
 The unbiased view of the same world that the Primary view is measured against. It is shown when the view is Still and the scene has caught up with the camera (or the catch-up cap has passed, ADR 0005), and gets cleaner the longer it stays so.
 _Avoid_: Ground truth, path-traced mode, reference mode
+
+**World clock**:
+The time of day of the Planet: a fraction of the day (0 midnight, 0.25 sunrise, 0.5 noon, 0.75 sunset), the day's length in seconds (30 minutes by default), whether it is paused, and how many times it has been set. A plain value, so that in M2 the server holds it and sends it. It moves the sun and the moon (#203). **Setting** it (or a step that takes the sun far) is a *jump*: the light caches forget at once. **Running** it is a *drift*: they follow by their normal updates. It always runs, whatever the camera does; what is *shown* is held only while the Reference view is accumulating a Still view (the gate of the scene's hold), and catches up with the clock when the view moves again (a jump if far).
+_Avoid_: Game time, sun position
+
+**Moon**:
+A dim, cool directional light and a soft disc in the sky at night, opposite the sun and a little behind it in phase. It is the one shadowed **key light** when it is stronger than the sun at the camera (not simply when the sun is down: at dusk it takes over while the sun is still about a degree up). The one going out fades to nothing before the other takes over, so the shadows turn while there is no key light; the fade dims a low moon (under about 4.7 degrees) too, so there is effectively no key light for the last part of the night before dawn (about t = 0.20 to 0.25), and the sky and the cache light the ground then. It costs no second shadow ray. Not physical: the hero look over physical blue (#203).
 
 **Still**:
 The camera, the sun and the window have not changed for 2 frames and no Edit has happened. The Reference view is shown only while the view is Still, and after a flight only once the scene has caught up with the camera; any change cuts to the Primary view at once and the Reference view starts again from sample 0.

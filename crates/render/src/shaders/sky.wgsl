@@ -40,6 +40,100 @@ fn gradient_sky(dir: vec3<f32>) -> vec3<f32> {
     return mix(frame.horizon.xyz, frame.zenith.xyz, height);
 }
 
+// ---- The night's marks on the sky (#203): the moon's disc and halo, and the stars. They are what the
+// camera sees where its ray escapes, in both views, from the same functions of the direction: a
+// pure function of the direction and of the frame's time of day, with no random number in it, so
+// that the Reference and Primary draw the same ones. They are not in the tables: the tables are the
+// sky as a surface sees it, and the moon's light is the key light's (the moon disc is not lit twice).
+
+// The stars: cells of the sphere of directions scaled up by STAR_CELLS, each with one star (or
+// none) placed in it, so a star is a soft round dot a fraction of a degree wide and none is the
+// same as the next. The dot is a Gaussian a tenth of a cell across, held 0.3 of a cell from the
+// cell's faces, so only the cell the pixel is in can have one.
+const STAR_CELLS = 34.0;
+const STAR_DENSITY = 0.55;
+const STAR_SIGMA = 0.12;
+
+fn star_hash(cell: vec3<i32>, salt: u32) -> u32 {
+    var h = hash_voxel(cell) ^ (salt * 0x9e3779b9u);
+    h ^= h >> 16u;
+    h *= 0x7feb352du;
+    h ^= h >> 15u;
+    h *= 0x846ca68bu;
+    return h ^ (h >> 16u);
+}
+
+fn unit_of(h: u32) -> f32 {
+    return f32(h >> 8u) / 16777216.0;
+}
+
+// The light of the stars in the direction `dir` (before they are hidden by the air and the sky's
+// own light): a pale lilac-white or a pale warm one, each its own brightness, mostly dim.
+fn star_light(dir: vec3<f32>) -> vec3<f32> {
+    let p = vec3<f32>(
+        dot(frame.star_x.xyz, dir),
+        dot(frame.star_y.xyz, dir),
+        dot(frame.star_z.xyz, dir),
+    );
+    let q = p * STAR_CELLS;
+    let cell = vec3<i32>(floor(q));
+    if unit_of(star_hash(cell, 0u)) > STAR_DENSITY {
+        return vec3<f32>(0.0);
+    }
+    let centre = vec3<f32>(cell) + 0.3 + 0.4 * vec3<f32>(
+        unit_of(star_hash(cell, 1u)),
+        unit_of(star_hash(cell, 2u)),
+        unit_of(star_hash(cell, 3u)),
+    );
+    let d = q - centre;
+    let dot_light = exp(-dot(d, d) / (2.0 * STAR_SIGMA * STAR_SIGMA));
+    let rank = unit_of(star_hash(cell, 4u));
+    // Most are dim, a few bright: the fourth power of a uniform number.
+    let brightness = 0.012 + 0.10 * rank * rank * rank * rank;
+    let warm = unit_of(star_hash(cell, 5u));
+    let colour = mix(vec3<f32>(0.85, 0.80, 1.0), vec3<f32>(1.0, 0.88, 0.78), warm);
+    return colour * (brightness * dot_light);
+}
+
+// The moon's disc and halo in the direction `dir`: a soft-edged disc a little darker at its limb,
+// and a wide faint glow round it that falls off with the angle.
+fn moon_light(dir: vec3<f32>) -> vec3<f32> {
+    if frame.moon_disc.w == 0.0 || frame.night.y <= 0.0 {
+        return vec3<f32>(0.0);
+    }
+    let c = clamp(dot(dir, frame.moon.xyz), -1.0, 1.0);
+    let radius = acos(clamp(frame.moon.w, -1.0, 1.0));
+    let angle = acos(c);
+    // The disc: full inside 0.85 of its radius, gone at 1.1 of it.
+    let cover = 1.0 - smoothstep(0.85 * radius, 1.1 * radius, angle);
+    let rho = clamp(angle / max(radius, 1e-4), 0.0, 1.0);
+    let limb = 0.78 + 0.22 * sqrt(1.0 - rho * rho);
+    let glow = 1.0 / (1.0 + (angle / (2.2 * radius)) * (angle / (2.2 * radius)) * 6.0);
+    let halo = 0.16 * glow * glow;
+    return frame.moon_disc.xyz * ((cover * limb + halo) * frame.night.y);
+}
+
+// How much of the night's marks the air in front of them lets through: for a camera near the ground
+// they fade out toward the horizon, where the ray crosses the thickest air; from orbit there is no
+// horizon of the sort, and the marks are seen against the dark.
+fn night_veil(dir: vec3<f32>) -> f32 {
+    let mu = dot(dir, atmo.up.xyz);
+    return mix(1.0, smoothstep(0.0, 0.22, mu), horizon_fill());
+}
+
+fn night_marks(dir: vec3<f32>, sky_light: vec3<f32>) -> vec3<f32> {
+    if frame.moon_disc.w == 0.0 && frame.night.x <= 0.0 {
+        return vec3<f32>(0.0);
+    }
+    var marks = moon_light(dir);
+    if frame.night.x > 0.0 {
+        // A star is lost in the sky's own light: gone where that is as bright as the twilight glow.
+        let own = dot(sky_light, vec3<f32>(0.2126, 0.7152, 0.0722));
+        marks += star_light(dir) * (frame.night.x * exp(-own / 0.045));
+    }
+    return marks * night_veil(dir);
+}
+
 // What the camera sees where its ray hits nothing.
 fn sky(dir: vec3<f32>) -> vec3<f32> {
     if !atmosphere_on() {
@@ -48,7 +142,9 @@ fn sky(dir: vec3<f32>) -> vec3<f32> {
     let angles = dir_to_sky_angles(dir);
     let uv = sky_view_uv(atmo.radii.z, angles.x, angles.y);
     let at = vec2<f32>(to_sub_uv(uv.x, SKY_VIEW_SIZE.x), to_sub_uv(uv.y, SKY_VIEW_SIZE.y));
-    return textureSampleLevel(sky_view, sky_sampler, at, 0.0).xyz;
+    let table = textureSampleLevel(sky_view, sky_sampler, at, 0.0).xyz;
+    // lighting: Moon and stars
+    return table + night_marks(dir, table);
 }
 
 // What a ray that has bounced and escapes sees: the sun-free table, below the horizon too, where it

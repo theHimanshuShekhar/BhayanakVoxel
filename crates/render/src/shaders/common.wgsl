@@ -47,11 +47,26 @@ struct Frame {
     light: vec4<u32>,
     // Primary's radiance cache (gi.wgsl): the number of the frame (it counts every frame of
     // Primary, from 1, whatever the upscaler's history does), then 1 for the frames after an Edit
-    // or a new sun, when the cells of the box below forget faster, then two unused.
+    // or a new sun, when the cells of the box below forget faster, then how `shadows` weighs each
+    // ray of the sun (0: the cosine at the disc's centre; 1: the ray's own cosine, as the
+    // Reference's samples are), then one unused.
     gi: vec4<u32>,
     // The first Voxel of that box and one past its last (level 0 coordinates), then one unused each.
     boost_min: vec4<i32>,
     boost_max: vec4<i32>,
+    // The moon (daylight.rs, #203): the unit vector towards it, then the cosine of its disc's
+    // angular radius (2 with no moon: nothing is at that cosine).
+    moon: vec4<f32>,
+    // The colour of its disc (sky radiance), then 1 if there is a moon.
+    moon_disc: vec4<f32>,
+    // How visible the stars are, then how visible the moon's disc and halo are (0 to 1), then two
+    // unused.
+    night: vec4<f32>,
+    // The rows of the matrix from a world direction to the stars' own, which the sky turns with the
+    // time of day.
+    star_x: vec4<f32>,
+    star_y: vec4<f32>,
+    star_z: vec4<f32>,
 }
 
 @group(1) @binding(0) var<uniform> camera: Camera;

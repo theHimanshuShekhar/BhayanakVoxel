@@ -677,16 +677,23 @@ mod tests {
             material: Material(material),
             ..EditOp::dig_sphere(VoxelCoord([0; 3]), 3)
         };
-        // 1 is rock and 55 the last light, both in the table; 0 and 56 are not.
+        // 1 is rock and `last` is the table's last Material, both in the table; 0 and the id after
+        // the last are not (the table's own ids, so a Material added to it does not break this).
+        let last = materials::MaterialTable::built_in()
+            .defs()
+            .iter()
+            .map(|d| d.id)
+            .max()
+            .expect("the table has Materials");
         for mode in [EditMode::Place, EditMode::Flatten] {
             assert_eq!(validate(&place(mode, 1)), Ok(()));
-            assert_eq!(validate(&place(mode, 55)), Ok(()));
+            assert_eq!(validate(&place(mode, last)), Ok(()));
             assert_eq!(
                 validate(&place(mode, 0)),
                 Err(RejectReason::UnknownMaterial)
             );
             assert_eq!(
-                validate(&place(mode, 56)),
+                validate(&place(mode, last + 1)),
                 Err(RejectReason::UnknownMaterial)
             );
         }

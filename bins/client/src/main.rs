@@ -1,5 +1,6 @@
 mod bench;
 mod clock;
+mod day;
 mod dig;
 mod editor;
 mod fly;
@@ -20,6 +21,7 @@ use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 
 use brick_store::{BrickStore, Budget, VOXELS_PER_METRE};
+use day::DayClock;
 use dig::Dig;
 use editor::{Editor, Grab, Input};
 use fly::{Action, Fly};
@@ -29,12 +31,15 @@ use net::{EditMode, Leash};
 use planet_gen::planet::Planet;
 use planet_gen::world_map::{WORLD_MAP_SIZE, WORLD_RADIUS, WorldMap};
 use render::cpu::{CpuBreakdown, Row};
+use render::daylight::hero_time_of_day;
 use render::lod::{self, Bands};
-use render::overlay::{self, Controls, Hud, HudEvent, LodInfo, SceneMemory};
+use render::overlay::{self, Controls, DayControls, Hud, HudEvent, LodInfo, SceneMemory};
 use render::scene::Bound;
 use render::tracer::View;
-use render::{Camera, Mode, Renderer, RingsFull, Scene, SceneUpdate, Sun};
-use sim::{FixedTimestep, Predictor, ServerHandle, TICK_RATE_HZ};
+use render::{Camera, Mode, Renderer, RingsFull, Scene, SceneUpdate};
+use sim::{
+    DEFAULT_DAY_LENGTH_SECONDS, FixedTimestep, Predictor, ServerHandle, TICK_RATE_HZ, WorldClock,
+};
 use winit::application::ApplicationHandler;
 use winit::event::{
     DeviceEvent, DeviceId, ElementState, MouseButton, MouseScrollDelta, WindowEvent,
@@ -76,8 +81,9 @@ const DROP_HEIGHT: f64 = 0.3 * VOXELS_PER_METRE;
 /// After a stall, run at most this many character ticks to catch up and drop the rest.
 const MAX_TICKS_PER_FRAME: u32 = 5;
 
-/// Radians the sun turns per arrow key press (and per repeat while it is held).
-const SUN_STEP: f32 = 0.05;
+/// How much of a day the arrow keys move the time of day by, per press (and per repeat while held):
+/// half an hour of a 24-hour day.
+const TIME_STEP: f64 = 1.0 / 48.0;
 
 /// Mip levels the client draws the Planet in: the LOD bands pick one for each brick from its
 /// distance (see [`render::lod`]), 0 to 13, which reaches orbit at 50 Planet radii.
@@ -672,8 +678,11 @@ struct App {
     dig_seconds: f64,
     /// Whether `Alt` is held, which makes the wheel size the Brush.
     alt: bool,
-    /// The sun as an azimuth and an elevation, which the arrow keys turn.
-    sun: (f32, f32),
+    /// The world clock (#203), which always runs, and the hold of the sky it shows while the
+    /// Reference view accumulates a Still view. The key is the view's without the sun: the camera,
+    /// the LOD bias, the Edits made and the reference image's size (what the scene's key has, so
+    /// the sky is held for exactly as long as the Reference view of it is).
+    day: DayClock<(Camera, f32, u64, (u32, u32))>,
     /// The LOD bias in use: output pixels one Voxel may cover. The overlay changes it.
     bias: f32,
     /// How long the view the reference image is of (and the bias) has been still, and with no
@@ -761,7 +770,12 @@ impl App {
             dig: Dig::default(),
             dig_seconds: 0.0,
             alt: false,
-            sun: Sun::default().angles(),
+            // The morning's golden hour: the sun where hero light B has it, on its way up (the
+            // evening's would be a minute from sunset, at the default pace).
+            day: DayClock::new(WorldClock::new(
+                1.0 - hero_time_of_day(),
+                DEFAULT_DAY_LENGTH_SECONDS,
+            )),
             bias: DEFAULT_BIAS,
             still: Stillness::default(),
             title: String::new(),
@@ -1071,17 +1085,27 @@ impl App {
         }
     }
 
-    /// Turns the sun by `azimuth` and `elevation` radians, keeping it from going past the poles.
-    fn turn_sun(&mut self, azimuth: f32, elevation: f32) {
-        self.set_sun(self.sun.0 + azimuth, self.sun.1 + elevation);
+    /// Sets the world clock to `time_of_day` (wrapped into a day): the sun and the moon jump to
+    /// where they are then.
+    fn set_time_of_day(&mut self, time_of_day: f64) {
+        self.day.clock_mut().set_time_of_day(time_of_day);
     }
 
-    /// Points the sun at `azimuth` and `elevation` radians, keeping it from going past the poles.
-    fn set_sun(&mut self, azimuth: f32, elevation: f32) {
-        self.sun = normalize_sun(azimuth, elevation);
+    /// Runs the world clock for the frame and gives the renderer the sky: the clock's, unless the
+    /// Reference view is accumulating a Still view, when the sky shown is held (see [`day`]). Before
+    /// [`App::hold_still`], whose view has the sun in it.
+    fn step_day(&mut self, seconds: f64) {
+        let edits = self.world.as_ref().map_or(0, World::edits_made);
+        let mode = self.renderer.as_ref().map_or(Mode::Primary, Renderer::mode);
+        let size = self
+            .renderer
+            .as_ref()
+            .map_or((0, 0), Renderer::reference_size);
+        let drive = self
+            .day
+            .frame(seconds, (self.camera, self.bias, edits, size), mode);
         if let Some(renderer) = &mut self.renderer {
-            // In the camera's local frame, so the sun keeps its height over the whole Planet.
-            renderer.set_local_sun(self.sun.0, self.sun.1, Sun::default().angular_radius());
+            renderer.set_day_sky(drive.sky, drive.jumped);
         }
     }
 
@@ -1132,7 +1156,11 @@ impl App {
         let before = Controls {
             mode: renderer.mode(),
             debug_view: renderer.debug_view(),
-            sun: self.sun,
+            day: DayControls {
+                hours: (self.day.clock().time_of_day() * f64::from(DayControls::HOURS)) as f32,
+                day_minutes: (self.day.clock().day_length_seconds() / 60.0) as f32,
+                paused: self.day.clock().is_paused(),
+            },
             stages: renderer.stages(),
             bias: self.bias,
         };
@@ -1200,8 +1228,15 @@ impl App {
         if controls.stages != before.stages {
             renderer.set_stages(controls.stages);
         }
-        if controls.sun != before.sun {
-            self.set_sun(controls.sun.0, controls.sun.1);
+        let day = self.day.clock_mut();
+        if controls.day.hours != before.day.hours {
+            day.set_time_of_day(f64::from(controls.day.hours) / f64::from(DayControls::HOURS));
+        }
+        if controls.day.day_minutes != before.day.day_minutes {
+            day.set_day_length_seconds(f64::from(controls.day.day_minutes) * 60.0);
+        }
+        if controls.day.paused != before.day.paused {
+            day.set_paused(controls.day.paused);
         }
         if controls.bias != before.bias
             && let Err(err) = self.set_bias(controls.bias)
@@ -1245,22 +1280,6 @@ fn lod_info(world: &World) -> Option<LodInfo> {
         switch_m: bands.floor(1) / VOXELS_PER_METRE,
         bricks: (0..RING_LEVELS).map(|l| world.level_bricks(l)).collect(),
     })
-}
-
-/// The azimuth wrapped into (-pi, pi], which is the range of the overlay's slider, and the
-/// elevation kept from going past the poles. A slider clamps what it is given, so an azimuth
-/// outside its range would be snapped back, restarting the reference image.
-fn normalize_sun(azimuth: f32, elevation: f32) -> (f32, f32) {
-    use std::f32::consts::{FRAC_PI_2, PI, TAU};
-    let azimuth = if azimuth > -PI && azimuth <= PI {
-        // Left alone, so that arithmetic cannot nudge a value that was already in range.
-        azimuth
-    } else {
-        let wrapped = (azimuth + PI).rem_euclid(TAU) - PI;
-        // The shift above gives [-pi, pi); -pi is the same direction as pi.
-        if wrapped <= -PI { PI } else { wrapped }
-    };
-    (azimuth, elevation.clamp(-FRAC_PI_2, FRAC_PI_2))
 }
 
 fn action_for(code: KeyCode) -> Option<Action> {
@@ -1349,10 +1368,20 @@ impl ApplicationHandler for App {
                                     });
                                 }
                             }
-                            KeyCode::ArrowLeft => self.turn_sun(-SUN_STEP, 0.0),
-                            KeyCode::ArrowRight => self.turn_sun(SUN_STEP, 0.0),
-                            KeyCode::ArrowUp => self.turn_sun(0.0, SUN_STEP),
-                            KeyCode::ArrowDown => self.turn_sun(0.0, -SUN_STEP),
+                            // The time of day, by half an hour of the 24.
+                            KeyCode::ArrowLeft | KeyCode::ArrowDown => {
+                                let t = self.day.clock().time_of_day();
+                                self.set_time_of_day(t - TIME_STEP);
+                            }
+                            KeyCode::ArrowRight | KeyCode::ArrowUp => {
+                                let t = self.day.clock().time_of_day();
+                                self.set_time_of_day(t + TIME_STEP);
+                            }
+                            // Stops and starts the world clock.
+                            KeyCode::KeyP if !event.repeat => {
+                                let clock = self.day.clock_mut();
+                                clock.set_paused(!clock.is_paused());
+                            }
                             // The editor's keys; the ones that size and pick may repeat.
                             code if !event.repeat || editor::repeats(code) => {
                                 self.editor.input(Input::Key(code), self.grabbed);
@@ -1447,6 +1476,7 @@ impl ApplicationHandler for App {
                 let overlay = self.run_overlay();
                 self.cpu.finish(Row::Egui, span, 0.0);
                 let scene_started = Instant::now();
+                self.step_day(dt);
                 let span = self.cpu.start();
                 self.hold_still();
                 let recentred = self.recentre();
@@ -1528,8 +1558,6 @@ fn main() -> Result<ExitCode, Box<dyn Error>> {
 
 #[cfg(test)]
 mod tests {
-    use std::f32::consts::{FRAC_PI_2, PI};
-
     use brick_store::VoxelCoord;
 
     use super::*;
@@ -1672,30 +1700,5 @@ mod tests {
         assert!(is_rebuild(8192, 4096));
         assert!(!is_rebuild(4095, 4096));
         assert!(!is_rebuild(0, 0));
-    }
-
-    #[test]
-    fn an_azimuth_past_a_half_turn_wraps_round_instead_of_leaving_the_sliders_range() {
-        let (azimuth, _) = normalize_sun(PI + 0.1, 0.0);
-        assert!((azimuth - (-PI + 0.1)).abs() < 1e-5, "{azimuth}");
-        let (azimuth, _) = normalize_sun(-PI - 0.1, 0.0);
-        assert!((azimuth - (PI - 0.1)).abs() < 1e-5, "{azimuth}");
-        let (azimuth, _) = normalize_sun(5.0 * PI + 0.2, 0.0);
-        assert!((azimuth - (-PI + 0.2)).abs() < 1e-4, "{azimuth}");
-    }
-
-    #[test]
-    fn an_azimuth_in_range_is_unchanged_and_the_range_is_open_at_minus_pi() {
-        for azimuth in [0.0, 1.0, -1.0, PI] {
-            assert_eq!(normalize_sun(azimuth, 0.0).0, azimuth);
-        }
-        assert_eq!(normalize_sun(-PI, 0.0).0, PI);
-    }
-
-    #[test]
-    fn the_elevation_stops_at_the_poles() {
-        assert_eq!(normalize_sun(0.0, 3.0).1, FRAC_PI_2);
-        assert_eq!(normalize_sun(0.0, -3.0).1, -FRAC_PI_2);
-        assert_eq!(normalize_sun(0.0, 0.3).1, 0.3);
     }
 }

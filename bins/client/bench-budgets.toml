@@ -54,11 +54,16 @@ atmosphere = 0.3
 # are in it).
 gi = 1.5
 
+# The denoiser (#55, spec "Denoise budget 1.0 ms"): the `denoise` pass, which makes the frame's
+# samples of the sun's weight and the bounce light from the lattice (what `shade` read from `gi`'s
+# output before), accumulates them over the history, and filters them (A-SVGF: four iterations of
+# the variance-guided a-trous filter). It is before the upscaler, at the traced size.
+denoise = 1.0
+
 # M1 stages from #10, for when the passes exist (the names are suggestions):
 # reflections  = 0.7
 # glass        = 0.7
 # volumetrics  = 1.0
-# denoise      = 1.0
 # post         = 0.5   # post-processing and UI (the window's blit and overlay passes are not
 #                      # run by the offscreen bench)
 
