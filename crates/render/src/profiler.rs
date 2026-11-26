@@ -108,6 +108,8 @@ pub struct Profiler {
     /// The times of frames that had a tag, as they came in, until
     /// [`Profiler::take_tagged`] takes them: at most [`MAX_TAGGED`].
     tagged: Vec<(u64, FrameTimes)>,
+    /// How many frames have begun.
+    begun: u64,
 }
 
 /// Tagged frames kept until they are taken: more than the ring holds, and a caller that never
@@ -131,6 +133,7 @@ impl Profiler {
             this_frame: None,
             tag: 0,
             tagged: Vec::new(),
+            begun: 0,
         }
     }
 
@@ -164,6 +167,7 @@ impl Profiler {
     /// [`resolve`](Self::resolve). It also times the CPU side of the frame, from the previous
     /// call.
     pub fn begin_frame(&mut self) {
+        self.begun += 1;
         let now = Instant::now();
         if let Some(last) = self.last_frame.replace(now) {
             self.timings
@@ -171,6 +175,12 @@ impl Profiler {
         }
         self.slots.clear();
         self.tag = 0;
+    }
+
+    /// How many frames have begun: the draws of one frame have the same count, and it is not
+    /// the same in two frames.
+    pub fn frames_begun(&self) -> u64 {
+        self.begun
     }
 
     /// Labels the frame being built with `tag` (not 0), to be handed back with its times by

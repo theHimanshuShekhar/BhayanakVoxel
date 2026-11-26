@@ -727,6 +727,12 @@ pub struct Tracer {
     /// How long the last [`Tracer::update_scene`] spent making the buffers that grew (making them
     /// and recording the copies), on the host.
     last_grow_time: std::time::Duration,
+    /// The host's time in the last scene update's submit of its copies (and the belt's recall).
+    last_upload_submit: std::time::Duration,
+    /// Of that, the `Queue::submit` alone (not the belt's finish and recall).
+    last_queue_submit: std::time::Duration,
+    /// The host's time in the last scene update's emitter index (`update_emitters`).
+    last_emitters: std::time::Duration,
     /// The most bytes of GPU memory the scene's buffers have taken while a buffer grew: what they
     /// held before, and the new buffers made, with the old buffer and the new one both there while
     /// the copy into the bigger one is made. 0 if none has grown.
@@ -758,6 +764,29 @@ struct HwLayout {
 
 /// The size of a chunk of the staging belt, in bytes: a patch is written to a few of them.
 const BELT_CHUNK: u64 = 4 << 20;
+
+/// The chunks the staging belt has before the first scene update: a chunk is a device allocation
+/// of [`BELT_CHUNK`] bytes (2 to 3 ms on the 4090's driver and on lavapipe), and the belt makes
+/// one when it has none that the GPU is done with. The first Edit of a context that had not
+/// uploaded much, or whose earlier uploads the GPU still held, paid for that in its frame (#236: the
+/// first hardware Edit by the ground was 5.7 ms, 3.2 of them in the write, and compute's 1.9 with
+/// 0.4). Three are one in use, one the GPU has, and one to spare; a belt that needs more keeps them.
+const BELT_WARM_CHUNKS: usize = 3;
+
+/// Gives `belt` [`BELT_WARM_CHUNKS`] chunks that are free to be written to.
+fn warm_belt(device: &wgpu::Device, belt: &mut wgpu::util::StagingBelt) {
+    let size = wgpu::BufferSize::new(BELT_CHUNK).expect("a chunk is not empty");
+    let align = wgpu::BufferSize::new(4).expect("a word");
+    // A request of a whole chunk fills the one it is given, so that the next makes another.
+    for _ in 0..BELT_WARM_CHUNKS {
+        belt.allocate(size, align);
+    }
+    belt.finish();
+    belt.recall();
+    // A chunk is free for the belt once the device has told it so, which it does when it is
+    // polled: without this the first write would find none, and make one.
+    let _ = device.poll(wgpu::PollType::wait_indefinitely());
+}
 
 /// Where the emitters' buffer is bound, in group 1 of the kernels that sample them (`emitters` in
 /// `emitters.wgsl`).
@@ -1240,13 +1269,6 @@ impl Tracer {
             layout: crate::hw::bind_group_layout(device),
             any_hit_shadows,
         });
-        let hw = match (hardware, &hw_layout) {
-            (Some((queue, camera, _)), Some(hw)) => Some(Hardware {
-                scene: crate::hw::HwScene::new(device, queue, hw.layout.clone(), scene, camera)?,
-                layout: hw.clone(),
-            }),
-            _ => None,
-        };
         let scene_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("scene"),
             entries: &[
@@ -1258,8 +1280,25 @@ impl Tracer {
             ],
         });
         let scene_buffers = SceneBuffers::new(device, None, &scene_layout, scene)?;
+        // The hardware backend makes its boxes on the GPU, from the scene's buffers.
+        let hw = match (hardware, &hw_layout) {
+            (Some((queue, camera, _)), Some(hw)) => Some(Hardware {
+                scene: crate::hw::HwScene::new(
+                    device,
+                    queue,
+                    hw.layout.clone(),
+                    &scene_layout,
+                    &scene_buffers.group,
+                    scene,
+                    camera,
+                )?,
+                layout: hw.clone(),
+            }),
+            _ => None,
+        };
         let scene_bytes = scene_buffers.bytes;
-        let belt = wgpu::util::StagingBelt::new(device.clone(), BELT_CHUNK);
+        let mut belt = wgpu::util::StagingBelt::new(device.clone(), BELT_CHUNK);
+        warm_belt(device, &mut belt);
 
         let camera_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("camera, image, accumulation, materials and G-buffer"),
@@ -1539,6 +1578,9 @@ impl Tracer {
             last_writes: 0,
             last_grown: 0,
             last_grow_time: std::time::Duration::ZERO,
+            last_upload_submit: std::time::Duration::ZERO,
+            last_queue_submit: std::time::Duration::ZERO,
+            last_emitters: std::time::Duration::ZERO,
             peak_growth_bytes: 0,
             peak_rebuild_bytes: 0,
             belt,
@@ -1591,7 +1633,12 @@ impl Tracer {
     ) {
         self.gi_frame += 1;
         self.camera_position = camera.position;
-        self.follow_hw(device, queue, camera.position);
+        self.follow_hw(
+            device,
+            queue,
+            Some(profiler.frames_begun()),
+            camera.position,
+        );
         let key = self.settle_key(camera, sun);
         self.write_uniforms(queue, camera, &key, (0, CENTRE, 0), 0);
         self.encode_atmosphere(
@@ -1664,7 +1711,12 @@ impl Tracer {
         frame.light_settling(self.edit_settling > 0);
         self.gi_frame += 1;
         self.camera_position = camera.position;
-        self.follow_hw(device, queue, camera.position);
+        self.follow_hw(
+            device,
+            queue,
+            Some(profiler.frames_begun()),
+            camera.position,
+        );
         self.write_uniforms(
             queue,
             camera,
@@ -1745,7 +1797,12 @@ impl Tracer {
         let samples = batch_of(samples, target.reference_size);
         let view = View::new(camera, sun, &self.night, target);
         let first = self.accumulator.begin_batch(&view, samples);
-        self.follow_hw(device, queue, camera.position);
+        self.follow_hw(
+            device,
+            queue,
+            Some(profiler.frames_begun()),
+            camera.position,
+        );
         let key = self.settle_key(camera, sun);
         self.write_uniforms(queue, camera, &key, (first, CENTRE, samples), 0);
         self.encode_atmosphere(
@@ -1898,7 +1955,8 @@ impl Tracer {
     ) -> Result<()> {
         self.update_scene_buffers(device, queue, scene, update)?;
         if let Some(hw) = &mut self.hw {
-            hw.scene.update(device, queue, scene, update);
+            hw.scene
+                .update(device, queue, &self.scene.group, scene, update);
         }
         Ok(())
     }
@@ -1917,6 +1975,149 @@ impl Tracer {
             .map_or_else(Vec::new, |h| h.scene.take_log())
     }
 
+    /// What the updates of the hardware backend's acceleration structures since the last call cost
+    /// the frame thread, whichever call made them (zero on the compute backend).
+    pub fn take_hardware_cost(&mut self) -> std::time::Duration {
+        self.hw
+            .as_mut()
+            .map_or(std::time::Duration::ZERO, |h| h.scene.take_cost())
+    }
+
+    /// How many groups of the hardware backend's acceleration structures are stale and wait for
+    /// the budget of a later update (0 on the compute backend).
+    pub fn hardware_pending(&self) -> usize {
+        self.hw.as_ref().map_or(0, |h| h.scene.pending())
+    }
+
+    /// Whether the hardware backend times its builds apart when it waits (see
+    /// [`crate::hw::HwScene::times_builds`]); false on the compute backend.
+    pub fn hardware_times_builds(&self) -> bool {
+        self.hw.as_ref().is_some_and(|h| h.scene.times_builds())
+    }
+
+    /// Builds every group of the hardware backend's acceleration structures that is stale, at
+    /// once, whatever the budget (a no-op on the compute backend): for tests and for the
+    /// benchmark's settle.
+    pub fn settle_hardware(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
+        if let Some(hw) = &mut self.hw {
+            hw.scene.flush(device, queue, &self.scene.group);
+        }
+    }
+
+    /// Changes how the hardware backend's BLASes are made of the scene's cells and builds them all
+    /// again at once ([`crate::hw::Grouping`]; a no-op on the compute backend).
+    pub fn set_hardware_grouping(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        scene: &crate::Scene,
+        grouping: crate::hw::Grouping,
+    ) {
+        if let Some(hw) = &mut self.hw {
+            hw.scene.set_grouping(grouping, scene);
+            hw.scene.flush(device, queue, &self.scene.group);
+        }
+    }
+
+    /// How the hardware backend's cells go into BLASes (the default on the compute backend).
+    pub fn hardware_grouping(&self) -> crate::hw::Grouping {
+        self.hw
+            .as_ref()
+            .map_or_else(Default::default, |h| h.scene.grouping())
+    }
+
+    /// The instances of the hardware backend's TLAS (0 on the compute backend).
+    pub fn hardware_instances(&self) -> u32 {
+        self.hw.as_ref().map_or(0, |h| h.scene.instances())
+    }
+
+    /// Sets the most BLASes a frame of the hardware backend builds of the groups that may wait.
+    pub fn set_hardware_blas_budget(&mut self, blas: u32) {
+        if let Some(hw) = &mut self.hw {
+            hw.scene.set_blas_budget(blas);
+        }
+    }
+
+    /// Sets the most boxes an update of the hardware backend builds (see [`crate::hw::BUILD_BUDGET`]).
+    pub fn set_hardware_budget(&mut self, boxes: u64) {
+        if let Some(hw) = &mut self.hw {
+            hw.scene.set_budget(boxes);
+        }
+    }
+
+    /// Whether the hardware backend's updates wait for the GPU, so that their time is the
+    /// builds' own (see [`crate::hw::HwScene::set_wait`]).
+    pub fn set_hardware_wait(&mut self, wait: bool) {
+        if let Some(hw) = &mut self.hw {
+            hw.scene.set_wait(wait);
+        }
+    }
+
+    /// The groups of the hardware backend that are built, and the boxes each was built from.
+    pub fn hardware_groups(&self) -> std::collections::BTreeMap<crate::hw::GroupKey, u32> {
+        self.hw
+            .as_ref()
+            .map_or_else(Default::default, |h| h.scene.built())
+    }
+
+    /// The boxes of every built group of the hardware backend as the GPU has them (waits).
+    pub fn hardware_boxes(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+    ) -> std::collections::BTreeMap<crate::hw::GroupKey, Vec<[u32; 8]>> {
+        self.hw
+            .as_ref()
+            .map_or_else(Default::default, |h| h.scene.read_boxes(device, queue))
+    }
+
+    /// The boxes that the GPU's box pass makes for `jobs` (level, group, box count) from the
+    /// scene as the GPU has it, read back: needs no ray queries (waits). For the test that holds
+    /// the pass to `hw::group_prims`.
+    pub fn box_pass_boxes(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        jobs: &[(u8, [i32; 3], u32)],
+    ) -> Vec<Vec<[u32; 8]>> {
+        self.box_pass_boxes_chunked(device, queue, jobs, usize::MAX)
+    }
+
+    /// [`Tracer::box_pass_boxes`] with `chunk` jobs to a dispatch.
+    pub fn box_pass_boxes_chunked(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        jobs: &[(u8, [i32; 3], u32)],
+        chunk: usize,
+    ) -> Vec<Vec<[u32; 8]>> {
+        let mut pass = crate::hw::BoxPass::new(device, &self.scene_layout);
+        if chunk != usize::MAX {
+            pass.set_chunk(chunk);
+        }
+        pass.make(device, queue, &self.scene.group, jobs)
+    }
+
+    /// Follows the camera as a draw of frame `frame` would (see [`crate::hw::HwScene::follow`]),
+    /// for tests that stand for the draws of a frame: a view after the first of a frame has no
+    /// budget of its own.
+    pub fn follow_hardware(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        frame: Option<u64>,
+        position: [f64; 3],
+    ) {
+        self.follow_hw(device, queue, frame, position);
+    }
+
+    /// The frames a group of the hardware backend that only lost may wait for its build.
+    pub fn set_hardware_max_wait(&mut self, frames: u32) {
+        if let Some(hw) = &mut self.hw {
+            hw.scene.set_max_wait(frames);
+        }
+    }
+
     /// Binds the hardware backend's group (2) in `pass`, if there is one.
     fn bind_hw(&self, pass: &mut wgpu::ComputePass<'_>) {
         if let Some(hw) = &self.hw {
@@ -1924,10 +2125,19 @@ impl Tracer {
         }
     }
 
-    /// Moves the hardware backend's frame to the camera, if it has one.
-    fn follow_hw(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, position: [f64; 3]) {
+    /// Moves the hardware backend's frame to the camera, if it has one, and builds the next groups
+    /// that wait. `frame`: which frame of the profiler this draw is of, or `None` for one that is not (see
+    /// [`crate::hw::HwScene::follow`]).
+    fn follow_hw(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        frame: Option<u64>,
+        position: [f64; 3],
+    ) {
         if let Some(hw) = &mut self.hw {
-            hw.scene.follow(device, queue, position);
+            hw.scene
+                .follow(device, queue, &self.scene.group, frame, position);
         }
     }
 
@@ -1940,7 +2150,9 @@ impl Tracer {
     ) -> Result<()> {
         self.restart_reference();
         self.smooth_end = smooth_end(scene);
+        let emitting = std::time::Instant::now();
         self.update_emitters(device, scene, update);
+        self.last_emitters = emitting.elapsed();
         // Counted where each write is made, not summed from the patch's cost: [`upload_cost`] is
         // the other count, and the two are compared. Both go over `RingPatch::copies()`, so the
         // comparison does not check that list (the stepped tests' `GpuCopy::assert_is` does).
@@ -1949,6 +2161,8 @@ impl Tracer {
         self.last_writes = 0;
         self.last_grown = 0;
         self.last_grow_time = std::time::Duration::ZERO;
+        self.last_upload_submit = std::time::Duration::ZERO;
+        self.last_queue_submit = std::time::Duration::ZERO;
         match update {
             SceneUpdate::Rebuilt => {
                 let before = self.scene.bytes;
@@ -2005,9 +2219,13 @@ impl Tracer {
                     written += bytes.len() as u64;
                     writes += 1;
                 }
+                let submitting = std::time::Instant::now();
                 self.belt.finish();
+                let queued = std::time::Instant::now();
                 queue.submit(std::iter::once(encoder.finish()));
+                self.last_queue_submit = queued.elapsed();
                 self.belt.recall();
+                self.last_upload_submit = submitting.elapsed();
             }
             SceneUpdate::Patched {
                 regions,
@@ -2069,6 +2287,21 @@ impl Tracer {
     /// the copies into them, on the host (the GPU's copy is not in it). Zero if nothing grew.
     pub fn last_grow_time(&self) -> std::time::Duration {
         self.last_grow_time
+    }
+
+    /// The host's time in the emitter index of the last [`Tracer::update_scene`].
+    pub fn last_emitters(&self) -> std::time::Duration {
+        self.last_emitters
+    }
+
+    /// The host's time in the `Queue::submit` of the last [`Tracer::update_scene`]'s copies.
+    pub fn last_upload_submit(&self) -> std::time::Duration {
+        self.last_upload_submit
+    }
+
+    /// Of [`Tracer::last_upload_submit`], the `Queue::submit` alone.
+    pub fn last_queue_submit(&self) -> std::time::Duration {
+        self.last_queue_submit
     }
 
     /// How many times each of the scene's table, regions, brick refs and bricks buffers has been
@@ -2909,7 +3142,7 @@ impl Tracer {
             return Vec::new();
         }
         // The hardware backend's frame is round the first ray's cell.
-        self.follow_hw(device, queue, rays[0].cell.map(f64::from));
+        self.follow_hw(device, queue, None, rays[0].cell.map(f64::from));
         // Three vec4s per ray: cell, origin, direction.
         let input: Vec<[u32; 4]> = rays
             .iter()

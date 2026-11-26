@@ -53,7 +53,7 @@ pub use camera::Camera;
 pub use daylight::{DaySky, Daylight, Drive, LocalFrame, Moon, Night};
 pub use debug_view::DebugView;
 pub use denoise::Denoise;
-pub use hw::HwUpdate;
+pub use hw::{HwPhases, HwUpdate};
 pub use look::Look;
 pub use offscreen::{DrawTimes, FrameDrawn, GpuInfo, GpuPasses, Image, Offscreen, UpdateTimes};
 pub use post::{NormalBias, Stages, ToneCurve};
@@ -205,6 +205,11 @@ fn request_gpu_for(
             wgpu::Features::empty()
         } | if choice.active.is_hardware() {
             wgpu::Features::EXPERIMENTAL_RAY_QUERY
+        } else {
+            wgpu::Features::empty()
+        } | if choice.active.is_hardware() && hw::process_wait() {
+            // The diagnosis of the builds' GPU time (`--hw-wait`) puts timestamps between them.
+            adapter.features() & wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS
         } else {
             wgpu::Features::empty()
         },

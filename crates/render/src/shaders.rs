@@ -97,6 +97,16 @@ pub const PROBE: &str = concat!(
 /// a module that has `trace.wgsl` in it by [`hardware`].
 const TRACE_HW: &str = include_str!("shaders/trace_hw.wgsl");
 
+/// The pass that makes the hardware backend's boxes on the GPU (`hw::BoxPass`, #236): trace.wgsl's
+/// scene buffers and `find_region`, and `box_main`.
+pub fn boxes() -> String {
+    format!(
+        "{}\n{}",
+        include_str!("shaders/trace.wgsl"),
+        include_str!("shaders/hw_boxes.wgsl")
+    )
+}
+
 /// `source` (a module with `trace.wgsl` in it) with `trace_within`, the one function that walks the
 /// Planet, replaced by the ray-query one: the compute walk is kept as `trace_within_compute`. The
 /// shadow rays' `occluded` is the ray-query one that ends at the first hit with `any_hit_shadows`
@@ -406,8 +416,10 @@ mod tests {
 
     /// The shader files, all of them known: a new one is neither of a view nor checked until it is
     /// listed here.
-    const FILES: [&str; 18] = [
+    const FILES: [&str; 19] = [
         "trace.wgsl",
+        // The hardware backend's boxes, made on the GPU (#236): lights nothing, joined to trace.wgsl by `boxes`.
+        "hw_boxes.wgsl",
         // The hardware backend of trace() (#50): lights nothing, joined to trace.wgsl by `hardware`.
         "trace_hw.wgsl",
         "common.wgsl",
@@ -851,5 +863,17 @@ mod tests {
                     .unwrap_or_else(|e| panic!("{name}: {e}"));
             }
         }
+    }
+
+    #[test]
+    fn the_box_pass_is_valid_wgsl_that_needs_no_ray_queries_and_has_its_one_entry() {
+        let source = boxes();
+        assert!(!source.contains("ray_query") && !source.contains("rayQuery"));
+        assert_eq!(entry_points(&source), vec!["box_main".to_string()]);
+        let module = naga::front::wgsl::parse_str(&source)
+            .unwrap_or_else(|e| panic!("{}", e.emit_to_string(&source)));
+        Validator::new(ValidationFlags::all(), Capabilities::empty())
+            .validate(&module)
+            .unwrap_or_else(|e| panic!("{}", e.emit_to_string(&source)));
     }
 }

@@ -45,13 +45,17 @@ use net::{ServerEnd, loopback};
 use planet_gen::planet::tangents;
 use planet_gen::world_map::{WORLD_MAP_SIZE, WorldMap};
 use render::reference::{Ray, trace};
-use render::{Camera, GpuPasses, Mode, Offscreen, Rebuild, Resolution, Scene, SceneUpdate, camera};
+use render::{
+    Camera, GpuPasses, Mode, Offscreen, Rebuild, Resolution, RtBackend, RtChoice, Scene,
+    SceneUpdate, camera,
+};
 use serde::Serialize;
 use serde_json::Value;
 use sim::Predictor;
 
 use super::budget::{EXIT_OVER_BUDGET, StreamingBudgets};
 use super::process;
+use super::rt::{AccelSummary, HwFrame, PathHardware};
 use super::stream::{
     Constants, Series, Sizing, Start, TestPlanet, measure_sizes, over_the_ground, percentile_99,
     test_planet, within_reach,
@@ -152,6 +156,12 @@ pub trait Gpu {
         0
     }
 
+    /// What the device's allocator keeps (`Offscreen::device_memory`): `None` with no GPU or where
+    /// it cannot say.
+    fn device_memory(&self) -> Option<render::hw::DeviceMemory> {
+        None
+    }
+
     /// The GPU's own time of each pass of the frame just drawn, by the pass's name, in
     /// milliseconds: empty with no GPU, no timers, or where this frame's times did not come in.
     fn pass_times(&self) -> Vec<(String, f64)> {
@@ -183,17 +193,37 @@ pub struct GpuFrame {
     /// that were copied. Zero if no buffer grew.
     pub grow: Duration,
     pub grown_bytes: u64,
+    /// What the hardware backend's acceleration structures took in the frame outside the update's
+    /// call: the groups built as the draw followed the camera (#236). It is not in `encode`, and
+    /// the frame's update is `write + flush + hardware`, wherever the builds were encoded.
+    pub hardware: Duration,
+    /// The same by part, from every update of the frame (the call's and the draw's), for a frame
+    /// on the hardware backend; None on the compute one (see [`PathReport::hardware`]).
+    pub accel: Option<HwFrame>,
 }
 
 impl GpuFrame {
     /// The CPU's part: all but the wait.
     fn cpu(&self) -> Duration {
-        self.write + self.flush + self.encode + self.submit
+        self.write + self.flush + self.hardware + self.encode + self.submit
     }
 }
 
-/// The offscreen GPU of the bench.
-pub struct OffscreenGpu<'a>(pub &'a mut Offscreen);
+/// The offscreen GPU of the bench, and the updates of the hardware backend's acceleration
+/// structures that it has taken from the GPU (every frame: the GPU keeps a few thousand).
+pub struct OffscreenGpu<'a> {
+    pub gpu: &'a mut Offscreen,
+    pub accel: Vec<render::HwUpdate>,
+}
+
+impl<'a> OffscreenGpu<'a> {
+    pub fn new(gpu: &'a mut Offscreen) -> Self {
+        Self {
+            gpu,
+            accel: Vec::new(),
+        }
+    }
+}
 
 impl Gpu for OffscreenGpu<'_> {
     fn frame(
@@ -204,33 +234,49 @@ impl Gpu for OffscreenGpu<'_> {
     ) -> Result<GpuFrame, Box<dyn Error>> {
         let mut frame = GpuFrame::default();
         if let Some(update) = update {
-            self.0.update_scene(scene, update)?;
-            let times = self.0.last_update_times();
+            self.gpu.update_scene(scene, update)?;
+            let times = self.gpu.last_update_times();
             frame.write = times.write;
             frame.flush = times.flush;
             frame.writes = times.writes;
-            frame.grow = self.0.last_grow_time();
-            frame.grown_bytes = self.0.last_grown_bytes();
+            frame.grow = self.gpu.last_grow_time();
+            frame.grown_bytes = self.gpu.last_grown_bytes();
         }
-        self.0.draw_upscaled_timed(camera);
-        let drawn = self.0.last_draw_times();
-        frame.encode = drawn.encode;
+        self.gpu.draw_upscaled_timed(camera);
+        let drawn = self.gpu.last_draw_times();
+        // The groups the draw built as it followed the camera are the frame's update, as the
+        // ones of the update's own call are (#236): out of the encode, into `hardware`.
+        frame.hardware = drawn.hardware;
+        frame.encode = drawn.encode.saturating_sub(drawn.hardware);
         frame.submit = drawn.submit;
         frame.wait = drawn.wait;
         frame.passes = drawn.gpu;
+        let updates = self.gpu.take_hardware_updates();
+        if self.gpu.rt().active.is_hardware() {
+            frame.accel = Some(HwFrame {
+                tlas_instances: self.gpu.hardware_instances(),
+                draw_submit: drawn.submit.as_secs_f64() * 1e3,
+                ..HwFrame::of(&updates)
+            });
+        }
+        self.accel.extend(updates);
         Ok(frame)
     }
 
     fn peak_growth_bytes(&self) -> u64 {
-        self.0.peak_growth_bytes()
+        self.gpu.peak_growth_bytes()
     }
 
     fn pass_times(&self) -> Vec<(String, f64)> {
-        self.0.last_draw_pass_times().to_vec()
+        self.gpu.last_draw_pass_times().to_vec()
     }
 
     fn peak_rebuild_bytes(&self) -> u64 {
-        self.0.peak_rebuild_bytes()
+        self.gpu.peak_rebuild_bytes()
+    }
+
+    fn device_memory(&self) -> Option<render::hw::DeviceMemory> {
+        self.gpu.device_memory()
     }
 }
 
@@ -250,12 +296,14 @@ impl Gpu for NoGpu {
     }
 }
 
-/// Times in milliseconds of the frames of a path: the 99th percentile (nearest rank), the worst
-/// and the mean.
+/// Times in milliseconds of the frames of a path: the 95th and 99th percentiles (nearest rank),
+/// the worst and the mean.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize)]
 pub struct Spread {
     pub samples: usize,
     pub mean_ms: f64,
+    /// The 95th percentile (#236 holds the frame thread's update to compute's at it).
+    pub p95_ms: f64,
     pub p99_ms: f64,
     pub worst_ms: f64,
 }
@@ -268,9 +316,11 @@ impl Spread {
         let mut sorted = times.to_vec();
         sorted.sort_by(f64::total_cmp);
         let rank = (sorted.len() * 99).div_ceil(100);
+        let rank95 = (sorted.len() * 95).div_ceil(100);
         Self {
             samples: sorted.len(),
             mean_ms: sorted.iter().sum::<f64>() / sorted.len() as f64,
+            p95_ms: sorted[rank95 - 1],
             p99_ms: sorted[rank - 1],
             worst_ms: sorted[sorted.len() - 1],
         }
@@ -576,6 +626,32 @@ pub struct SlowFrame {
     /// is not that it blocked the frame, and a look that began after the frame's start and was done
     /// before its end is missed.
     pub hole_look: bool,
+    /// On the hardware backend, what the frame built (#236): BLASes, of them the ones that could
+    /// not wait, their boxes, and the submits of acceleration structures. Null on the compute
+    /// backend. A frame whose `wait_not_passes_ms` is long says here whether it built much.
+    pub hw_blas: Option<u32>,
+    pub hw_blas_urgent: Option<u32>,
+    pub hw_boxes: Option<u64>,
+    pub hw_submits: Option<u32>,
+    /// Of `hw_blas`, the BLASes **made** (allocated), and the updates that grew the box pool or
+    /// made the TLAS again (#236).
+    pub hw_created: Option<u32>,
+    pub hw_pool_grew: Option<u32>,
+    pub hw_tlas_made: Option<u32>,
+    /// With `--hw-wait`: the GPU's time of the frame's BLAS builds and TLAS build (see
+    /// `hardware.gpu_blas`), ms.
+    pub hw_gpu_blas_ms: Option<f64>,
+    pub hw_gpu_tlas_ms: Option<f64>,
+    /// The GPU's time from the box pass's end to the builds' start (`hardware.gpu_gap`), ms.
+    pub hw_gpu_gap_ms: Option<f64>,
+    /// With `--hw-wait`: the memory blocks the allocator made for the frame's recording, the
+    /// bytes they reserve and the biggest scratch buffer (`hardware.scratch_bytes`), and the CPU's
+    /// finishing of the command buffer and its submit (where wgpu makes the scratch buffers).
+    pub hw_blocks_made: Option<u32>,
+    pub hw_reserved_grew: Option<u64>,
+    pub hw_scratch_bytes: Option<u64>,
+    pub hw_finish_ms: Option<f64>,
+    pub hw_submit_ms: Option<f64>,
 }
 
 /// How many frames of a path were of each kind of update.
@@ -765,6 +841,10 @@ pub struct PathReport {
     /// to the GPU, the encoding, the submit, the wait for the GPU, or what the GPU says its passes
     /// took. The slowest frames have the same parts one by one; this is all of them.
     pub frame_parts: FrameParts,
+    /// Where the hardware backend's part of `frame_parts.update` went, by what the frame thread
+    /// did (host prep, recording, finish, submit), and how much it built a frame (#236); null on
+    /// the compute backend.
+    pub hardware: Option<PathHardware>,
     /// The GPU's own time of each pass, by the pass's name, over the frames whose times came in
     /// (#54: GI is passes `gi` and `shade`, and the frame's cost is read against main's here).
     pub gpu_passes: std::collections::BTreeMap<String, Spread>,
@@ -993,6 +1073,22 @@ pub struct Memory {
     /// is the VRAM the scene takes, after its growths (a buffer that fills grows, #145: the most
     /// of the frames' is given). Reported; not gated.
     pub scene_reserved_mib: f64,
+    /// What the device's allocator keeps at the end of the run, all of the GPU's buffers and not
+    /// the scene's alone (#236): the memory blocks it holds, what they reserve, and what is
+    /// allocated in them. The allocator **keeps up to two empty blocks** of a memory type (the
+    /// patched `gpu-allocator`, `third_party/gpu-allocator/PATCH.md`), and the hardware backend makes
+    /// the blocks of `hw::SPARE_BUFFERS` buffers of 60 MiB before its first build (two blocks, 384
+    /// to 512 MiB), so this is the memory that the fix for the stall of a block made on a frame
+    /// costs. `None` where the allocator cannot say. Reported; not gated (`scene_used_peak_mib` is).
+    pub device_blocks: Option<u64>,
+    pub device_reserved_mib: Option<f64>,
+    pub device_allocated_mib: Option<f64>,
+    /// How many of `device_blocks` have nothing allocated in them, and what they reserve: the
+    /// part of the reserve that is kept and not used (the allocator keeps at most two of a memory
+    /// type, `third_party/gpu-allocator/PATCH.md`); the rest of `device_reserved_mib` less
+    /// `device_allocated_mib` is free space inside blocks that are used.
+    pub device_empty_blocks: Option<u64>,
+    pub device_empty_mib: Option<f64>,
     /// The peak **during a growth** (ADR 0004's accounting is of the buffers after it): the GPU's
     /// buffers at the most while a buffer grew, the old buffer and the new one both counted
     /// (`Tracer::peak_growth_bytes`: what the buffers held before, plus the new ones; 0 if none
@@ -1287,6 +1383,28 @@ pub struct RealTimeReport {
     /// Set when a run did not finish: the runs above are those that did (and the gates are held to
     /// those only), and the exit status is 1.
     pub error: Option<Failure>,
+    /// Which way rays found the Planet in the runs (`--rt-backend`, #236), and what their
+    /// acceleration structures did; null for a report that was not made by [`run`].
+    pub rt: Option<RtRealTime>,
+}
+
+/// The ray backend of the real-time mode's runs (#236): the report's `rt` block, for the mode.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct RtRealTime {
+    /// What `--rt-backend` asked for the runs: `compute`, `hw`, `hw-nearest`.
+    pub requested: String,
+    /// What ran: `hw` only if asked for and the adapter has ray queries; else `compute`.
+    pub active: String,
+    /// Why not what was asked for, if it did not run.
+    pub fallback: Option<String>,
+    /// Each run's updates of the hardware backend's acceleration structures, over the whole run
+    /// (the cold start, the paths, the catching up between them and the Edit): `updates` the ones
+    /// that built something, `pending_max` the most groups that waited for a later frame's budget,
+    /// `prepare_ms` and `build_ms` what the frame thread spent (`build_ms` is recording and
+    /// submitting: nothing waits for the GPU). Null for a run on `compute`.
+    pub accel: Vec<Option<AccelSummary>>,
+    /// What `--hw-group-regions` said (`4` if nothing did): see [`super::rt::RtReport`].
+    pub hw_group_regions: String,
 }
 
 impl RealTimeReport {
@@ -1310,7 +1428,14 @@ impl RealTimeReport {
             min,
             max,
             error: None,
+            rt: None,
         }
+    }
+
+    /// This report, with the ray backend the runs were on.
+    pub fn with_rt(mut self, rt: RtRealTime) -> Self {
+        self.rt = Some(rt);
+        self
     }
 
     /// The report of a mode that stopped on `failure`.
@@ -1553,6 +1678,8 @@ struct Frame {
     /// Whether the drawn scene's lag was over what level 0 reaches (see
     /// [`PathReport::lag_over_floor_frames`]); false when nothing is scored.
     lag_over_floor: bool,
+    /// The hardware backend's cost in the frame, by part (None on the compute backend).
+    hw: Option<HwFrame>,
     /// Whether the frame's update was the scene made again for a depth that was given back
     /// ([`Rebuild::Release`]).
     release_rebuild: bool,
@@ -1610,6 +1737,8 @@ struct Capture {
     /// The parts of every frame, and the GPU's time of every pass.
     recentre_ms: Vec<f64>,
     update_all_ms: Vec<f64>,
+    /// Each frame's update and its hardware parts, for a path on the hardware backend.
+    hardware: Vec<(f64, HwFrame)>,
     encode_ms: Vec<f64>,
     submit_ms: Vec<f64>,
     wait_ms: Vec<f64>,
@@ -1699,6 +1828,7 @@ impl Capture {
             frame_ms: Vec::new(),
             recentre_ms: Vec::new(),
             update_all_ms: Vec::new(),
+            hardware: Vec::new(),
             encode_ms: Vec::new(),
             submit_ms: Vec::new(),
             wait_ms: Vec::new(),
@@ -1761,6 +1891,13 @@ impl Capture {
         self.cpu_ms.push(frame.cpu_ms);
         self.recentre_ms.push(frame.parts.recentre_ms);
         self.update_all_ms.push(frame.parts.update_ms);
+        if let Some(hw) = frame.hw {
+            let hw = HwFrame {
+                wait_not_passes: frame.parts.wait_not_passes_ms.unwrap_or(0.0),
+                ..hw
+            };
+            self.hardware.push((frame.parts.update_ms, hw));
+        }
         self.encode_ms.push(frame.parts.encode_ms);
         self.submit_ms.push(frame.parts.submit_ms);
         self.wait_ms.push(frame.parts.wait_ms);
@@ -1852,6 +1989,7 @@ impl Capture {
                 gpu_total: Spread::of(&self.gpu_total_ms),
                 wait_not_passes: Spread::of(&self.wait_not_passes_ms),
             },
+            hardware: (!self.hardware.is_empty()).then(|| PathHardware::of(&self.hardware)),
             gpu_passes: self
                 .pass_series
                 .iter()
@@ -2174,7 +2312,7 @@ impl<'a> Session<'a> {
             cpu_ms: ms(followed + gpu.cpu()),
             camera_ms: ms(camera_wait),
             recentre_ms: ms(followed),
-            update_ms: ms(gpu.write + gpu.flush),
+            update_ms: ms(gpu.write + gpu.flush + gpu.hardware),
             update_write_ms: ms(gpu.write),
             update_flush_ms: ms(gpu.flush),
             writes: gpu.writes,
@@ -2205,6 +2343,21 @@ impl<'a> Session<'a> {
             grown_bytes: gpu.grown_bytes,
             over_budget,
             hole_look: looking,
+            hw_blas: gpu.accel.map(|h| h.blas),
+            hw_blas_urgent: gpu.accel.map(|h| h.blas_urgent),
+            hw_boxes: gpu.accel.map(|h| h.boxes),
+            hw_submits: gpu.accel.map(|h| h.submits),
+            hw_created: gpu.accel.map(|h| h.blas_created),
+            hw_pool_grew: gpu.accel.map(|h| h.pool_grew),
+            hw_tlas_made: gpu.accel.map(|h| h.tlas_made),
+            hw_gpu_blas_ms: gpu.accel.map(|h| h.gpu_blas),
+            hw_gpu_tlas_ms: gpu.accel.map(|h| h.gpu_tlas),
+            hw_gpu_gap_ms: gpu.accel.map(|h| h.gpu_gap),
+            hw_blocks_made: gpu.accel.map(|h| h.blocks_made),
+            hw_reserved_grew: gpu.accel.map(|h| h.reserved_grew),
+            hw_scratch_bytes: gpu.accel.map(|h| h.scratch_bytes),
+            hw_finish_ms: gpu.accel.map(|h| h.finish),
+            hw_submit_ms: gpu.accel.map(|h| h.submit),
         };
         let slept = Instant::now();
         let asked = FRAME.saturating_sub(slept - began);
@@ -2229,6 +2382,7 @@ impl<'a> Session<'a> {
             soft_misses: self.world.stats().soft_misses,
             camera_soft_miss: self.score_camera
                 && soft_miss_under(self.world.scene(), camera, self.world.bands()),
+            hw: gpu.accel,
             release_rebuild: kind == "rebuild"
                 && self.world.scene().rebuild_reason() == Some(Rebuild::Release),
             lag_over_floor: self.score_camera
@@ -2881,6 +3035,7 @@ impl<'a> Session<'a> {
 
         let work = self.world.stats().work;
         let mib = |bytes: u64| bytes as f64 / MIB;
+        let device = self.gpu.device_memory();
         let memory = Memory {
             resident_peak_mib: self.resident_peak.map(mib),
             whole_process_peak_mib: self.whole_process_peak.map(mib),
@@ -2888,6 +3043,11 @@ impl<'a> Session<'a> {
             scene_used_peak_in: self.scene_used_peak_in.clone(),
             scene_used_peak_level_bricks: self.scene_used_peak_levels.clone(),
             scene_reserved_mib: mib(self.scene_reserved_bytes),
+            device_blocks: device.map(|d| d.blocks as u64),
+            device_reserved_mib: device.map(|d| mib(d.reserved_bytes)),
+            device_allocated_mib: device.map(|d| mib(d.allocated_bytes)),
+            device_empty_blocks: device.map(|d| d.empty_blocks as u64),
+            device_empty_mib: device.map(|d| mib(d.empty_bytes)),
             scene_gpu_peak_growth_mib: mib(self.gpu.peak_growth_bytes()),
             scene_gpu_peak_rebuild_mib: mib(self.gpu.peak_rebuild_bytes()),
             scene_host_peak_growth_mib: mib(self.scene_host_peak_bytes),
@@ -2982,11 +3142,20 @@ fn whole_run(
     flat_ambient: bool,
     script: &Script,
     limit_ms: f64,
-) -> Result<(RunReport, f64), Failure> {
+    backend: RtBackend,
+) -> Result<(RunReport, f64, RtChoice, Option<AccelSummary>), Failure> {
     // What the paths do is caught where the step is known; this catches the rest (making the
     // world, the GPU, and ending the run, which drops them).
     catch_unwind(AssertUnwindSafe(|| {
-        run_once(full, run, resolution, flat_ambient, script, limit_ms)
+        run_once(
+            full,
+            run,
+            resolution,
+            flat_ambient,
+            script,
+            limit_ms,
+            backend,
+        )
     }))
     .unwrap_or_else(|payload| {
         Err(Failure {
@@ -2997,6 +3166,21 @@ fn whole_run(
     })
 }
 
+/// Whether the GPU context is on the backend that the run asked for. The hardware backend with no
+/// ray queries on the adapter would run on compute, and its gates would pass for the wrong thing:
+/// that is an error, and the reason is the adapter's.
+fn ran_as_asked(asked: RtBackend, choice: &RtChoice) -> Result<(), String> {
+    if asked.is_hardware() && !choice.active.is_hardware() {
+        return Err(format!(
+            "--rt-backend {} was asked for, and the adapter cannot do it ({}): this would be a \
+             compute run, and its gates would say nothing of the hardware backend",
+            backend_name(asked),
+            choice.fallback.as_deref().unwrap_or("no reason given")
+        ));
+    }
+    Ok(())
+}
+
 fn run_once(
     full: bool,
     run: u32,
@@ -3004,7 +3188,8 @@ fn run_once(
     flat_ambient: bool,
     script: &Script,
     limit_ms: f64,
-) -> Result<(RunReport, f64), Failure> {
+    backend: RtBackend,
+) -> Result<(RunReport, f64, RtChoice, Option<AccelSummary>), Failure> {
     let failed = |step: &str, error: Box<dyn Error>| Failure {
         run,
         step: step.to_string(),
@@ -3013,8 +3198,14 @@ fn run_once(
     let built = if full { build_full() } else { build_test() }
         .map_err(|e| failed("building the world", e))?;
     let d0 = built.setup.d0;
-    let mut gpu = Offscreen::with_resolution(resolution, built.world.scene())
+    let mut gpu = Offscreen::with_backend(resolution, built.world.scene(), backend)
         .map_err(|e| failed("making the GPU context", e))?;
+    let choice = gpu.rt().clone();
+    // A run that was asked to be on the hardware backend and is not has gates that say nothing of
+    // it: it stops here, with the reason, and the mode exits with an error (status 1).
+    ran_as_asked(backend, &choice).map_err(|why| failed("making the GPU context", why.into()))?;
+    // The first build is the world's, not the run's: the log is of what the run did.
+    gpu.take_hardware_updates();
     gpu.set_flat_ambient(flat_ambient);
     // The flight times the player's frame, which has the denoiser (#55; the flat ambient of
     // before #54 had none).
@@ -3031,9 +3222,16 @@ fn run_once(
     }));
     // A growth is cut to what a buffer of this GPU may hold (see `Scene::set_buffer_limit`).
     built.world.set_buffer_limit(gpu.buffer_limit_words());
-    let report = one_run(built, &mut OffscreenGpu(&mut gpu), script, limit_ms)
+    // What the context has, not what the flag said (#236).
+    let group_regions = gpu.hardware_grouping().describe();
+    let mut gpu = OffscreenGpu::new(&mut gpu);
+    let report = one_run(built, &mut gpu, script, limit_ms)
         .map_err(|stopped| failed(&stopped.step, stopped.error))?;
-    Ok((report, d0))
+    let accel = choice.active.is_hardware().then(|| AccelSummary {
+        group_regions: group_regions.clone(),
+        ..AccelSummary::of(&gpu.accel)
+    });
+    Ok((report, d0, choice, accel))
 }
 
 /// Runs the real-time mode: `runs` runs of the paths, each on a world of its own and a GPU of its
@@ -3050,6 +3248,7 @@ pub fn run(
     flat_ambient: bool,
     budgets: &StreamingBudgets,
     stream_slice: Option<Duration>,
+    backend: RtBackend,
 ) -> RealTimeReport {
     let mut script = if full {
         Script::full()
@@ -3060,6 +3259,8 @@ pub fn run(
         script.stream_slice = slice;
     }
     let mut reports = Vec::new();
+    let mut accel = Vec::new();
+    let mut choice = None;
     let mut d0 = 0.0;
     let mut failure = None;
     for run in 1..=runs {
@@ -3072,11 +3273,14 @@ pub fn run(
             flat_ambient,
             &script,
             budgets.frame_time_p99_ms,
+            backend,
         ) {
-            Ok((report, d)) => {
+            Ok((report, d, rt, summary)) => {
                 d0 = d;
                 eprintln!("real time: run {run} took {:.0?}", began.elapsed());
                 reports.push(report);
+                accel.push(summary);
+                choice = Some(rt);
             }
             Err(f) => {
                 eprintln!(
@@ -3098,10 +3302,27 @@ pub fn run(
     if flat_ambient {
         planet.push_str(", flat ambient");
     }
-    let report = RealTimeReport::new(planet, d0, reports, budgets);
+    let rt = RtRealTime {
+        requested: backend_name(choice.as_ref().map_or(backend, |c| c.requested)).to_string(),
+        active: backend_name(choice.as_ref().map_or(RtBackend::Compute, |c| c.active)).to_string(),
+        fallback: choice.and_then(|c| c.fallback),
+        accel,
+        hw_group_regions: render::hw::process_grouping().describe(),
+    };
+    planet.push_str(&format!(", rays by {}", rt.active));
+    let report = RealTimeReport::new(planet, d0, reports, budgets).with_rt(rt);
     match failure {
         Some(failure) => report.failed(failure),
         None => report,
+    }
+}
+
+/// The name `--rt-backend` gives `backend`.
+fn backend_name(backend: RtBackend) -> &'static str {
+    match backend {
+        RtBackend::Compute => "compute",
+        RtBackend::Hardware => "hw",
+        RtBackend::HardwareNearest => "hw-nearest",
     }
 }
 
@@ -3162,22 +3383,26 @@ mod tests {
             frame_time: Spread {
                 samples: 600,
                 mean_ms: frame_p99 / 2.0,
+                p95_ms: frame_p99 * 0.9,
                 p99_ms: frame_p99,
                 worst_ms: frame_p99 * 2.0,
             },
             frame_cpu: Spread {
                 samples: 600,
                 mean_ms: cpu_p99 / 2.0,
+                p95_ms: cpu_p99 * 0.9,
                 p99_ms: cpu_p99,
                 worst_ms: cpu_p99 * 2.0,
             },
             frame_parts: FrameParts::default(),
+            hardware: None,
             // A `gi` pass well inside its gate.
             gpu_passes: [(
                 "gi".to_string(),
                 Spread {
                     samples: 600,
                     mean_ms: 1.0,
+                    p95_ms: 1.5,
                     p99_ms: 2.0,
                     worst_ms: 3.0,
                 },
@@ -3275,6 +3500,21 @@ mod tests {
             grown_bytes: 0,
             over_budget: None,
             hole_look: false,
+            hw_blas: None,
+            hw_blas_urgent: None,
+            hw_boxes: None,
+            hw_submits: None,
+            hw_created: None,
+            hw_pool_grew: None,
+            hw_tlas_made: None,
+            hw_gpu_blas_ms: None,
+            hw_gpu_tlas_ms: None,
+            hw_gpu_gap_ms: None,
+            hw_blocks_made: None,
+            hw_reserved_grew: None,
+            hw_scratch_bytes: None,
+            hw_finish_ms: None,
+            hw_submit_ms: None,
         }
     }
 
@@ -3335,6 +3575,11 @@ mod tests {
                 scene_used_peak_in: String::new(),
                 scene_used_peak_level_bricks: Vec::new(),
                 scene_reserved_mib: 560.0,
+                device_blocks: None,
+                device_reserved_mib: None,
+                device_allocated_mib: None,
+                device_empty_blocks: None,
+                device_empty_mib: None,
                 scene_gpu_peak_growth_mib: 600.0,
                 scene_gpu_peak_rebuild_mib: 0.0,
                 scene_host_peak_growth_mib: 600.0,
@@ -3585,6 +3830,7 @@ mod tests {
                         Spread {
                             samples: 600,
                             mean_ms,
+                            p95_ms: p99_ms * 0.9,
                             p99_ms,
                             worst_ms: p99_ms * 2.0,
                         },
@@ -3774,9 +4020,12 @@ mod tests {
                 "min",
                 "mode",
                 "planet",
+                "rt",
                 "runs"
             ]
         );
+        // No ray backend was asked for (#236): `rt` is null until `with_rt` says which ran.
+        assert!(json["rt"].is_null());
         assert_eq!(json["mode"], "real-time");
         assert_eq!(json["deterministic"], false);
         assert!(json["error"].is_null());
@@ -3803,6 +4052,11 @@ mod tests {
         assert_eq!(
             keys(&json["runs"][0]["memory"]),
             [
+                "device_allocated_mib",
+                "device_blocks",
+                "device_empty_blocks",
+                "device_empty_mib",
+                "device_reserved_mib",
                 "resident_peak_mib",
                 "scene_gpu_peak_growth_mib",
                 "scene_gpu_peak_rebuild_mib",
@@ -3839,6 +4093,7 @@ mod tests {
                 "frames_over_limit_by_update",
                 "generated_bricks",
                 "gpu_passes",
+                "hardware",
                 "hole_looks",
                 "holes",
                 "holes_per_frame",
@@ -3929,6 +4184,21 @@ mod tests {
                 "grown_bytes",
                 "harness_ms",
                 "hole_look",
+                "hw_blas",
+                "hw_blas_urgent",
+                "hw_blocks_made",
+                "hw_boxes",
+                "hw_created",
+                "hw_finish_ms",
+                "hw_gpu_blas_ms",
+                "hw_gpu_gap_ms",
+                "hw_gpu_tlas_ms",
+                "hw_pool_grew",
+                "hw_reserved_grew",
+                "hw_scratch_bytes",
+                "hw_submit_ms",
+                "hw_submits",
+                "hw_tlas_made",
                 "index",
                 "lengthen_ms",
                 "other_ms",
@@ -4076,6 +4346,24 @@ mod tests {
     }
 
     #[test]
+    fn a_run_asked_for_the_hardware_backend_on_an_adapter_without_it_is_an_error() {
+        let choice = |active, fallback: Option<&str>| RtChoice {
+            requested: RtBackend::Hardware,
+            active,
+            fallback: fallback.map(str::to_string),
+        };
+        assert!(ran_as_asked(RtBackend::Hardware, &choice(RtBackend::Hardware, None)).is_ok());
+        let no_queries = choice(RtBackend::Compute, Some("the adapter has no ray queries"));
+        let why = ran_as_asked(RtBackend::Hardware, &no_queries).unwrap_err();
+        assert!(
+            why.contains("no ray queries") && why.contains("hw"),
+            "{why}"
+        );
+        // Compute asked for, compute run: nothing to say.
+        assert!(ran_as_asked(RtBackend::Compute, &choice(RtBackend::Compute, None)).is_ok());
+    }
+
+    #[test]
     fn a_gpu_frames_cpu_part_is_all_but_the_wait() {
         let ms = Duration::from_millis;
         let frame = GpuFrame {
@@ -4088,9 +4376,12 @@ mod tests {
             passes: None,
             grow: ms(50),
             grown_bytes: 1 << 20,
+            hardware: ms(16),
+            accel: None,
         };
-        // The growth is inside the write: it is not another part of the CPU's time.
-        assert_eq!(frame.cpu(), ms(15));
+        // The growth is inside the write: it is not another part of the CPU's time. The hardware
+        // backend's builds are (outside the encode they were measured in).
+        assert_eq!(frame.cpu(), ms(31));
         assert_eq!(GpuFrame::default().cpu(), Duration::ZERO);
     }
 

@@ -324,7 +324,7 @@ fn check_convergence(convergence: &Value, out: &Path) {
 }
 
 fn check_schema(report: &Value, out: &Path) {
-    assert_eq!(report["schema_version"], 33);
+    assert_eq!(report["schema_version"], 34);
     // The default is the compute backend, with no acceleration structures (#50).
     assert_eq!(report["rt"]["requested"], "compute");
     assert_eq!(report["rt"]["active"], "compute");
@@ -336,6 +336,7 @@ fn check_schema(report: &Value, out: &Path) {
     assert!(report["config"]["time_of_day"].is_null());
     // The Edit stress is of the whole Planet, which the patch is not.
     assert!(report["edits"].is_null());
+    assert!(report["edits_ground"].is_null());
     // The streaming mode is asked for (see its own test); the other tests do not. The real-time
     // mode takes minutes even on the test Planet, with real threads: it is not run here (a unit
     // test of the client runs it, outside the gating jobs), so its section is null, and a report of

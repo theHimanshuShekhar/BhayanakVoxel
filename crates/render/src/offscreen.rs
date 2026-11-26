@@ -113,6 +113,14 @@ pub struct UpdateTimes {
     pub write: std::time::Duration,
     /// Sending them: the submit with no commands that follows (not made if flushing is off).
     pub flush: std::time::Duration,
+    /// Of `write`, the host's time in the emitter index (what the update does to the list of lights).
+    pub emitters: std::time::Duration,
+    /// Of `write`, the host's time in the `Queue::submit` of the copies (a ring update's own
+    /// command buffer), which is where a submit that the driver holds up behind earlier GPU work
+    /// shows.
+    pub submit: std::time::Duration,
+    /// Of `submit`, the `Queue::submit` alone: the belt's finish and recall are the rest.
+    pub queue_submit: std::time::Duration,
     /// Copies written to the staging belt: each is a copy on the GPU with a barrier of its own. 0
     /// for a rebuild.
     pub writes: u32,
@@ -137,6 +145,11 @@ pub struct DrawTimes {
     /// Making the commands: the passes' encoding, the timer queries' resolving, and finishing the
     /// command buffer.
     pub encode: std::time::Duration,
+    /// How much of `encode` the hardware backend's acceleration structures took: the groups it
+    /// builds as the draw follows the camera (the box pass, the BLAS builds, the TLAS's build and
+    /// its submit), which the benchmark counts with the update of the scene, whichever call it
+    /// is made in. Zero on the compute backend.
+    pub hardware: std::time::Duration,
     /// `Queue::submit` of them.
     pub submit: std::time::Duration,
     /// Waiting for the GPU: the passes' times being read back, and then the device having nothing
@@ -241,6 +254,96 @@ impl Offscreen {
     /// update, or the camera leaving the TLAS's frame): `None` on the compute backend.
     pub fn hardware_update(&self) -> Option<&crate::hw::HwUpdate> {
         self.tracer.hardware_update()
+    }
+
+    /// How many groups of the hardware backend's acceleration structures are stale and wait for
+    /// a later update's budget (0 on the compute backend).
+    pub fn hardware_pending(&self) -> usize {
+        self.tracer.hardware_pending()
+    }
+
+    /// Whether the hardware backend times its builds apart when it waits (see
+    /// [`crate::hw::HwScene::times_builds`]).
+    pub fn hardware_times_builds(&self) -> bool {
+        self.tracer.hardware_times_builds()
+    }
+
+    /// Builds every stale group of the hardware backend's acceleration structures at once,
+    /// whatever the budget (a no-op on the compute backend).
+    pub fn settle_hardware(&mut self) {
+        self.tracer.settle_hardware(&self.device, &self.queue);
+    }
+
+    /// Follows the camera at `position` as a draw of frame `frame` does (see
+    /// [`crate::hw::HwScene::follow`]): for tests that stand for the draws of a frame.
+    pub fn follow_hardware(&mut self, frame: Option<u64>, position: [f64; 3]) {
+        self.tracer
+            .follow_hardware(&self.device, &self.queue, frame, position);
+    }
+
+    /// Sets the frames a group of the hardware backend that only lost may wait for its build.
+    pub fn set_hardware_max_wait(&mut self, frames: u32) {
+        self.tracer.set_hardware_max_wait(frames);
+    }
+
+    /// Changes how the hardware backend's BLASes are made of the scene's cells (`scene` is the one
+    /// this was made for or updated to), and builds them all again (a no-op on compute).
+    pub fn set_hardware_grouping(&mut self, scene: &Scene, grouping: crate::hw::Grouping) {
+        self.tracer
+            .set_hardware_grouping(&self.device, &self.queue, scene, grouping);
+    }
+
+    /// How the hardware backend's cells go into BLASes.
+    pub fn hardware_grouping(&self) -> crate::hw::Grouping {
+        self.tracer.hardware_grouping()
+    }
+
+    /// The instances of the hardware backend's TLAS (0 on the compute backend).
+    pub fn hardware_instances(&self) -> u32 {
+        self.tracer.hardware_instances()
+    }
+
+    /// Sets the most BLASes a frame of the hardware backend builds of the groups that may wait.
+    pub fn set_hardware_blas_budget(&mut self, blas: u32) {
+        self.tracer.set_hardware_blas_budget(blas);
+    }
+
+    /// Sets the most boxes an update of the hardware backend builds.
+    pub fn set_hardware_budget(&mut self, boxes: u64) {
+        self.tracer.set_hardware_budget(boxes);
+    }
+
+    /// Whether the hardware backend's updates wait for the GPU (so that their time is the
+    /// builds' own; see [`crate::hw::HwScene::set_wait`]).
+    pub fn set_hardware_wait(&mut self, wait: bool) {
+        self.tracer.set_hardware_wait(wait);
+    }
+
+    /// The groups of the hardware backend that are built, and the boxes each was built from.
+    pub fn hardware_groups(&self) -> std::collections::BTreeMap<crate::hw::GroupKey, u32> {
+        self.tracer.hardware_groups()
+    }
+
+    /// The boxes of every built group of the hardware backend as the GPU has them (waits).
+    pub fn hardware_boxes(&self) -> std::collections::BTreeMap<crate::hw::GroupKey, Vec<[u32; 8]>> {
+        self.tracer.hardware_boxes(&self.device, &self.queue)
+    }
+
+    /// The boxes that the GPU makes for `jobs` (level, group, box count) from the scene it has,
+    /// read back, on any backend: for the test that holds the box pass to
+    /// [`crate::hw::group_prims`].
+    pub fn box_pass_boxes(&self, jobs: &[(u8, [i32; 3], u32)]) -> Vec<Vec<[u32; 8]>> {
+        self.tracer.box_pass_boxes(&self.device, &self.queue, jobs)
+    }
+
+    /// [`Offscreen::box_pass_boxes`] with `chunk` jobs to a dispatch.
+    pub fn box_pass_boxes_chunked(
+        &self,
+        jobs: &[(u8, [i32; 3], u32)],
+        chunk: usize,
+    ) -> Vec<Vec<[u32; 8]>> {
+        self.tracer
+            .box_pass_boxes_chunked(&self.device, &self.queue, jobs, chunk)
     }
 
     /// Like [`Offscreen::with_resolution`], with the Reference view traced at the **output**
@@ -380,9 +483,28 @@ impl Offscreen {
         self.last_update = UpdateTimes {
             write: written,
             flush: began.elapsed() - written,
+            submit: self.tracer.last_upload_submit(),
+            queue_submit: self.tracer.last_queue_submit(),
+            emitters: self.tracer.last_emitters(),
             writes: self.tracer.last_writes(),
         };
         Ok(())
+    }
+
+    /// What the device's allocator keeps: its memory blocks, what they reserve and what is
+    /// allocated in them, or `None` where it does not count (see [`crate::hw::DeviceMemory`]).
+    pub fn device_memory(&self) -> Option<crate::hw::DeviceMemory> {
+        crate::hw::DeviceMemory::of(&self.device)
+    }
+
+    /// The sizes in bytes of the device's live allocations, as the Vulkan allocator counts them
+    /// (sorted), or `None` where it does not count: what a test compares to see what an Edit
+    /// allocated.
+    pub fn device_allocation_sizes(&self) -> Option<Vec<u64>> {
+        let report = self.device.generate_allocator_report()?;
+        let mut sizes: Vec<u64> = report.allocations.iter().map(|a| a.size).collect();
+        sizes.sort_unstable();
+        Some(sizes)
     }
 
     /// Says that an Edit changed `bricks`, so that the radiance cache follows the light round them
@@ -844,6 +966,8 @@ impl Offscreen {
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
         self.profiler.begin_frame();
+        // What the update before the draw cost is the update's: the draw's is what follows.
+        self.tracer.take_hardware_cost();
         let sun = self.lit_sun(camera);
         self.tracer.encode_upscaled(
             &self.device,
@@ -854,6 +978,7 @@ impl Offscreen {
             &sun,
             &self.target,
         );
+        let hardware = self.tracer.take_hardware_cost();
         self.profiler.resolve(&mut encoder);
         let commands = encoder.finish();
         let encoded = began.elapsed();
@@ -895,6 +1020,7 @@ impl Offscreen {
         });
         self.last_draw = DrawTimes {
             encode: encoded,
+            hardware,
             submit: submitted - encoded,
             wait: waited,
             gpu,

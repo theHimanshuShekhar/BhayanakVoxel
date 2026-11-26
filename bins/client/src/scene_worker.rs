@@ -1604,7 +1604,7 @@ impl Drop for SceneWorker {
 /// What the scene changed since the last publish.
 enum Changes {
     None,
-    Patch(RingPatch),
+    Patch(Box<RingPatch>),
     /// Packed again, so what the frame thread has is of no use.
     Rebuilt,
 }
@@ -2250,7 +2250,7 @@ impl Engine {
                     }
                 }
                 match &mut self.changes {
-                    Changes::None => self.changes = Changes::Patch(patch),
+                    Changes::None => self.changes = Changes::Patch(Box::new(patch)),
                     Changes::Patch(before) => before.merge(patch),
                     Changes::Rebuilt => {}
                 }
@@ -3323,6 +3323,7 @@ impl Engine {
                 outbox.ready.patch = None;
             }
             (Changes::Patch(patch), None) => {
+                let patch = *patch;
                 if let Some(mirror) = outbox.ready.mirror.as_mut() {
                     // A copy of all of the scene is waiting: the changes go into it.
                     let _ = mirror.paste(&self.scene.copy_patch_into(patch, PatchCopy::default()));
