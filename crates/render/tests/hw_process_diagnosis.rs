@@ -1,12 +1,12 @@
 //! The experiments of #236's diagnosis of the hardware backend's GPU time, set for the whole
-//! process (the benchmark's `--hw-wait`, `--hw-build-chunk` and `--hw-fast-build`): a context made
-//! afterwards builds what the scene has, in calls of a few BLASes each, and says what the GPU
+//! process (the benchmark's `--hw-wait`): a context made
+//! afterwards builds what the scene has, and says what the GPU
 //! took for the BLAS builds and for the TLAS. In a test binary of its own: they are made once per
 //! process.
 
 use brick_store::BrickCoord;
 use planet_gen::generate_region;
-use render::hw::{blas_counts, set_process_build_chunk, set_process_fast_build, set_process_wait};
+use render::hw::{blas_counts, set_process_wait};
 use render::lod::Bands;
 use render::scene::{Bound, Scene};
 use render::{Offscreen, Resolution, RtBackend};
@@ -22,10 +22,8 @@ fn scene() -> Scene {
 }
 
 #[test]
-fn the_builds_in_calls_of_two_make_what_the_scene_has_and_the_gpu_times_them_where_it_can() {
+fn waiting_for_the_gpu_the_builds_make_what_the_scene_has_and_the_gpu_times_them_where_it_can() {
     set_process_wait(true);
-    set_process_build_chunk(2);
-    set_process_fast_build(true);
     let scene = scene();
     let mut hw =
         Offscreen::with_backend(Resolution::native(8, 8), &scene, RtBackend::Hardware).unwrap();

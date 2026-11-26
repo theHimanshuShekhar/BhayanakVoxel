@@ -1075,15 +1075,20 @@ pub struct Memory {
     pub scene_reserved_mib: f64,
     /// What the device's allocator keeps at the end of the run, all of the GPU's buffers and not
     /// the scene's alone (#236): the memory blocks it holds, what they reserve, and what is
-    /// allocated in them. The allocator **keeps a block that has become empty** (the patched
-    /// `gpu-allocator`, `third_party/gpu-allocator/PATCH.md`), and the hardware backend makes
-    /// `hw::SPARE_BLOCKS` blocks of 256 MiB before its first build, so this is the memory that the
-    /// fix for the stall of a block made on a frame costs: `device_reserved_mib` less
-    /// `device_allocated_mib` is what is kept and not used. `None` where the allocator cannot say.
-    /// Reported; not gated (`scene_used_peak_mib` is).
+    /// allocated in them. The allocator **keeps up to two empty blocks** of a memory type (the
+    /// patched `gpu-allocator`, `third_party/gpu-allocator/PATCH.md`), and the hardware backend makes
+    /// the blocks of `hw::SPARE_BUFFERS` buffers of 60 MiB before its first build (two blocks, 384
+    /// to 512 MiB), so this is the memory that the fix for the stall of a block made on a frame
+    /// costs. `None` where the allocator cannot say. Reported; not gated (`scene_used_peak_mib` is).
     pub device_blocks: Option<u64>,
     pub device_reserved_mib: Option<f64>,
     pub device_allocated_mib: Option<f64>,
+    /// How many of `device_blocks` have nothing allocated in them, and what they reserve: the
+    /// part of the reserve that is kept and not used (the allocator keeps at most two of a memory
+    /// type, `third_party/gpu-allocator/PATCH.md`); the rest of `device_reserved_mib` less
+    /// `device_allocated_mib` is free space inside blocks that are used.
+    pub device_empty_blocks: Option<u64>,
+    pub device_empty_mib: Option<f64>,
     /// The peak **during a growth** (ADR 0004's accounting is of the buffers after it): the GPU's
     /// buffers at the most while a buffer grew, the old buffer and the new one both counted
     /// (`Tracer::peak_growth_bytes`: what the buffers held before, plus the new ones; 0 if none
@@ -3041,6 +3046,8 @@ impl<'a> Session<'a> {
             device_blocks: device.map(|d| d.blocks as u64),
             device_reserved_mib: device.map(|d| mib(d.reserved_bytes)),
             device_allocated_mib: device.map(|d| mib(d.allocated_bytes)),
+            device_empty_blocks: device.map(|d| d.empty_blocks as u64),
+            device_empty_mib: device.map(|d| mib(d.empty_bytes)),
             scene_gpu_peak_growth_mib: mib(self.gpu.peak_growth_bytes()),
             scene_gpu_peak_rebuild_mib: mib(self.gpu.peak_rebuild_bytes()),
             scene_host_peak_growth_mib: mib(self.scene_host_peak_bytes),
@@ -3571,6 +3578,8 @@ mod tests {
                 device_blocks: None,
                 device_reserved_mib: None,
                 device_allocated_mib: None,
+                device_empty_blocks: None,
+                device_empty_mib: None,
                 scene_gpu_peak_growth_mib: 600.0,
                 scene_gpu_peak_rebuild_mib: 0.0,
                 scene_host_peak_growth_mib: 600.0,
@@ -4045,6 +4054,8 @@ mod tests {
             [
                 "device_allocated_mib",
                 "device_blocks",
+                "device_empty_blocks",
+                "device_empty_mib",
                 "device_reserved_mib",
                 "resident_peak_mib",
                 "scene_gpu_peak_growth_mib",

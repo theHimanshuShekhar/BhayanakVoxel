@@ -574,34 +574,6 @@ fn the_grouping_flag_takes_a_size_or_a_size_below_a_level_and_another_from_it() 
 }
 
 #[test]
-fn the_builds_are_recorded_in_calls_of_so_many_blases_and_so_many_boxes() {
-    let counts = [10u32, 10, 10, 10, 10];
-    // No bound: one call (and none for nothing).
-    assert_eq!(build_calls(&counts, 0, 0), vec![0..5]);
-    assert_eq!(build_calls(&[], 0, 0), Vec::<Range<usize>>::new());
-    // So many BLASes to a call.
-    assert_eq!(build_calls(&counts, 2, 0), [0..2, 2..4, 4..5]);
-    // So many boxes: 25 holds two of 10, and a call has a BLAS at least, however big.
-    assert_eq!(build_calls(&counts, 0, 25), [0..2, 2..4, 4..5]);
-    // Exactly full is full, and not over.
-    assert_eq!(build_calls(&counts, 0, 20), [0..2, 2..4, 4..5]);
-    assert_eq!(build_calls(&counts, 0, 5), [0..1, 1..2, 2..3, 3..4, 4..5]);
-    assert_eq!(build_calls(&[100, 1, 1], 0, 50), [0..1, 1..3]);
-    // Both bounds: whichever is reached first.
-    assert_eq!(build_calls(&counts, 3, 25), [0..2, 2..4, 4..5]);
-    assert_eq!(
-        build_calls(&counts, 1, 1000),
-        [0..1, 1..2, 2..3, 3..4, 4..5]
-    );
-    // Every entry is in exactly one call, in order.
-    for (chunk, boxes) in [(0, 0), (1, 0), (3, 0), (0, 7), (2, 15), (4, 100)] {
-        let calls = build_calls(&[3, 9, 1, 40, 2, 2, 8], chunk, boxes);
-        let flat: Vec<usize> = calls.into_iter().flatten().collect();
-        assert_eq!(flat, (0..7).collect::<Vec<_>>(), "{chunk} {boxes}");
-    }
-}
-
-#[test]
 fn the_biggest_allocation_that_is_new_is_told_from_the_sizes_before() {
     let at = |sizes: &[u64]| Reserve {
         sizes: sizes.to_vec(),

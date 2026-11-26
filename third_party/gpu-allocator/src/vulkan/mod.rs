@@ -446,6 +446,10 @@ impl MemoryBlock {
     }
 }
 
+/// How many empty blocks that support sub-allocations a memory type keeps (BhayanakVoxel #236, see
+/// `PATCH.md`): the rest are destroyed when they empty, as upstream does.
+pub const KEPT_EMPTY_BLOCKS: usize = 2;
+
 #[derive(Debug)]
 pub(crate) struct MemoryType {
     pub(crate) memory_blocks: Vec<Option<MemoryBlock>>,
@@ -664,14 +668,26 @@ impl MemoryType {
 
         mem_block.sub_allocator.free(allocation.chunk_id)?;
 
-        // PATCHED (BhayanakVoxel #236, see ../PATCH.md): an empty block that supports
-        // sub-allocations is kept, not destroyed. Upstream destroys it when it is not the last one,
-        // and the next allocation that finds no room makes it again: a 256 MiB `vkAllocateMemory`
-        // whose first use stalls the GPU for about 6.5 ms on the frame that needs it. A block that
-        // is dedicated or personal to one allocation is still freed with it.
-        if mem_block.sub_allocator.is_empty()
-            && !mem_block.sub_allocator.supports_general_allocations()
-        {
+        // PATCHED (BhayanakVoxel #236, see ../PATCH.md): up to `KEPT_EMPTY_BLOCKS` empty blocks
+        // that support sub-allocations are kept, per memory type, and the rest are destroyed as
+        // upstream does. Upstream destroys an empty block when it is not the last one, and the next
+        // allocation that finds no room makes it again: a 256 MiB `vkAllocateMemory` whose first use
+        // stalls the GPU for about 6.5 ms on the frame that needs it. A block that is dedicated or
+        // personal to one allocation is still freed with it.
+        let general = mem_block.sub_allocator.supports_general_allocations();
+        let emptied = mem_block.sub_allocator.is_empty();
+        let empty_general = if emptied && general {
+            self.memory_blocks
+                .iter()
+                .flatten()
+                .filter(|b| {
+                    b.sub_allocator.supports_general_allocations() && b.sub_allocator.is_empty()
+                })
+                .count()
+        } else {
+            0
+        };
+        if emptied && (!general || empty_general > KEPT_EMPTY_BLOCKS) {
             let block = self.memory_blocks[block_idx]
                 .take()
                 .ok_or_else(|| AllocationError::Internal("Memory block must be Some.".into()))?;

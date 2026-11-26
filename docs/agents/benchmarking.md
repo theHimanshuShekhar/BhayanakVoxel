@@ -70,9 +70,6 @@ release: a debug build's CPU side is slow enough to distort the frame times.
 | `--hw-group-regions G` | How the hardware backend makes its BLASes (#236): `G` regions along an edge of each, `4` (one cell), `8`, `16` or `32`, or `NEAR:FAR@LEVEL` (levels below LEVEL have BLASes of NEAR regions, the others FAR: `4:16@6`), or `NEAR:MID@LEVEL:FAR@LEVEL` (a third size from the second LEVEL up: `8:16@1:32@3`). **The default is `16:32@2`** (`PRODUCTION_GROUPING`): 16 regions for levels 0 and 1, 32 from level 2. The 4090's sweeps of #236: every real-time gate passes, its update `p95` is the lowest of the sizes tried (worst path 0.55 ms; 16 everywhere 0.91, 32 everywhere 0.57 with a soft-miss gate missed), 43% fewer BLASes than 16 everywhere, and its level 0 is 16's, whose Edit by the ground (`hw_edits_ground`) is 0.97 ms at `p95` (a finer level 0, `4:16@1`, 0.73). A BLAS is built again whole when any cell of it is stale, so bigger ones cost the frame thread less (fewer builds to record, fewer instances for a submit that traces to check) and the GPU more (more boxes a patch). The report's `rt.hw_group_regions` and `streaming_real_time.rt.hw_group_regions` say what the flag said, and `rt.comparison.hw_accel.group_regions` and the `group_regions` of an Edit stress's or a real-time run's `accel` what the context that ran had. |
 | `--hw-build-blas N` | The most BLASes a frame builds of the groups that may wait (#236), default no bound; the groups that may not wait (they gained boxes or have no BLAS, or waited too long) are built at once whatever it is, and a frame that built nothing builds one. It spreads a burst of builds over frames without breaking the hole rule: `accel.*.blas_urgent` and the paths' `hardware.blas_urgent` are what it cannot spread. |
 | `--hw-wait` | A diagnosis, not a measurement of the frame (#236): every update of the hardware backend waits for the GPU, so the paths' `hardware.wait` (and the slowest frames' `wait_ms`) is the GPU's time of the frame's boxes' pass, BLAS builds and TLAS. Use it to see whether a frame's `wait_not_passes` is the builds. The gates mean nothing with it. |
-| `--hw-fast-build` | An experiment (#236): the hardware backend's BLASes are `PREFER_FAST_BUILD` and not `PREFER_FAST_TRACE`. Read the paths' `hardware.wait`/`gpu_blas` and the passes' `primary` with it: the builds may be quicker and the trace slower. |
-| `--hw-build-chunk N` | An experiment (#236): a frame's BLAS builds are recorded `N` BLASes to a `build_acceleration_structures` call (each call has a scratch buffer and a barrier of its own), default all of them in one. |
-| `--hw-build-chunk-boxes N` | An experiment (#236): a frame's BLAS builds are recorded in `build_acceleration_structures` calls of `N` boxes at the most (a BLAS over it has a call of its own), so that no call has a big scratch buffer (a call's scratch is the sum of its builds'); with `--hw-build-chunk`, whichever bound is reached first. |
 | `--no-fail` | Exit with status 0 even if a pass is over budget, a frame of the streaming mode has a hole, or a gate of the real-time mode is over. |
 
 It runs unattended. Without the convergence phase it takes a minute or so (generating the whole Planet is about 22 s of it); the convergence phase, on by default, adds about 45 s on the 4090 at the default `--truth-spp`, and more on a slower GPU or with a larger `--truth-spp`.
@@ -741,17 +738,20 @@ camera, and `holes_after_catch_up` the holes the look after it found, which must
     word). The buffers are allocated whole and change only when one grows (#145), so this is the
     most over the run, after the growths. This is the VRAM the scene takes (at full size the
     bricks buffer alone is about 587 MB). Reported, not gated.
-  - `device_blocks`, `device_reserved_mib` and `device_allocated_mib` (#236): what the device's
-    allocator keeps at the end of the run, for **all** of the GPU's buffers, not the scene's: the
-    memory blocks it holds, what they reserve, and what is allocated in them (`null` where the
-    allocator cannot say). The allocator is the patched `gpu-allocator`
-    (`third_party/gpu-allocator/PATCH.md`), which **keeps a block that has become empty** instead of
-    destroying it and making it again, as the published crate does: a block made on a frame stalled
-    the GPU for 6.5 to 7 ms before the builds' first command (`hardware.gap_new_blocks`), on about
-    1% of the frames of cold start and of a flight. The hardware backend also makes the blocks of
-    `hw::SPARE_BUFFERS` buffers of 60 MiB when its scene is made (two blocks, **384 MiB of VRAM** on
-    a GPU, where blocks are 128 MiB and then 256), so the first builds find them. So
-    `device_reserved_mib` less `device_allocated_mib` is the memory the fix keeps and does not use.
+  - `device_blocks`, `device_reserved_mib`, `device_allocated_mib`, `device_empty_blocks` and
+    `device_empty_mib` (#236): what the device's allocator keeps at the end of the run, for **all**
+    of the GPU's buffers, not the scene's: the memory blocks it holds, what they reserve, what is
+    allocated in them, and how many of the blocks have nothing in them and what those reserve
+    (`null` where the allocator cannot say). The allocator is the patched `gpu-allocator`
+    (`third_party/gpu-allocator/PATCH.md`), which **keeps up to two empty blocks** of a memory type
+    and destroys the rest, where the published crate destroys every empty block but the last: a
+    block made on a frame stalled the GPU for 6.5 to 7 ms before the builds' first command
+    (`hardware.gap_new_blocks`), on about 1% of the frames of cold start and of a flight. The
+    hardware backend also makes the blocks of `hw::SPARE_BUFFERS` buffers of 60 MiB when its scene
+    is made (two blocks, **384 to 512 MiB of VRAM** on a GPU, where blocks are 128 MiB and then
+    256), so the first builds find them. `device_empty_mib` is what is kept and nothing uses;
+    `device_reserved_mib` less `device_allocated_mib` less that is free space in blocks that are
+    used. A compute run reports them too, which is the compute default's reserve with the patch.
     Reported, not gated (the gate is `scene_used_peak_mib`).
   - `scene_gpu_peak_growth_mib`, `scene_host_peak_growth_mib` and `scene_gpu_peak_rebuild_mib`:
     **the peak during a growth**, which `scene_reserved_mib` is not (it is the size after). While

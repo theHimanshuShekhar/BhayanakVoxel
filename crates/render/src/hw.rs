@@ -299,59 +299,6 @@ pub fn process_wait() -> bool {
     PROCESS_WAIT.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-static PROCESS_FAST_BUILD: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-static PROCESS_BUILD_CHUNK: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-static PROCESS_BUILD_CHUNK_BOXES: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-
-/// Records the BLAS builds of a frame in calls of at most this many boxes each, at least a BLAS
-/// to a call (`--hw-build-chunk-boxes`, an experiment of #236's: a call's scratch buffer is as big
-/// as its builds'); 0, the default, is no bound.
-pub fn set_process_build_chunk_boxes(boxes: u64) {
-    PROCESS_BUILD_CHUNK_BOXES.store(boxes, std::sync::atomic::Ordering::Relaxed);
-}
-
-/// The calls the builds of `counts` boxes each are recorded in, as the ranges of the entries each
-/// has: `chunk` BLASes at the most (0, all of them) and `boxes` boxes at the most (0, no bound; a
-/// BLAS over it has a call of its own).
-fn build_calls(counts: &[u32], chunk: usize, boxes: u64) -> Vec<Range<usize>> {
-    let chunk = if chunk == 0 {
-        counts.len().max(1)
-    } else {
-        chunk
-    };
-    let mut calls = Vec::new();
-    let (mut first, mut spent) = (0usize, 0u64);
-    for (i, &count) in counts.iter().enumerate() {
-        let full =
-            i - first >= chunk || (boxes > 0 && i > first && spent + u64::from(count) > boxes);
-        if full {
-            calls.push(first..i);
-            (first, spent) = (i, 0);
-        }
-        spent += u64::from(count);
-    }
-    if first < counts.len() {
-        calls.push(first..counts.len());
-    }
-    calls
-}
-
-/// Makes the BLASes of every hardware backend made after it `PREFER_FAST_BUILD` and not
-/// `PREFER_FAST_TRACE` (`--hw-fast-build`, an experiment of #236's: the builds are quicker, the
-/// trace may not be).
-pub fn set_process_fast_build(fast: bool) {
-    PROCESS_FAST_BUILD.store(fast, std::sync::atomic::Ordering::Relaxed);
-}
-
-/// Records the BLAS builds of a frame in calls of this many BLASes each (`--hw-build-chunk`, an
-/// experiment of #236's: each call has a scratch buffer of its own, and a barrier after it); 0, the
-/// default, is one call for all of them.
-pub fn set_process_build_chunk(chunk: u32) {
-    PROCESS_BUILD_CHUNK.store(chunk, std::sync::atomic::Ordering::Relaxed);
-}
-
 /// The grouping a hardware backend starts with: the process's, or [`PRODUCTION_GROUPING`].
 pub fn process_grouping() -> Grouping {
     PROCESS_GROUPING
@@ -722,7 +669,7 @@ impl BuildTimer {
             })
     }
 
-    /// Resolves the three timestamps into the readback buffer (before the encoder is finished).
+    /// Resolves the four timestamps into the readback buffer (before the encoder is finished).
     fn resolve(&self, encoder: &mut wgpu::CommandEncoder) {
         encoder.resolve_query_set(&self.set, 0..Self::QUERIES, &self.resolve, 0);
         encoder.copy_buffer_to_buffer(&self.resolve, 0, &self.read, 0, Self::BYTES);
@@ -796,13 +743,20 @@ impl Reserve {
     }
 }
 
+/// The usages of the pool of boxes (and of the spare buffers, see [`make_spare_blocks`]).
+const POOL_USAGES: wgpu::BufferUsages = wgpu::BufferUsages::STORAGE
+    .union(wgpu::BufferUsages::BLAS_INPUT)
+    .union(wgpu::BufferUsages::COPY_SRC)
+    .union(wgpu::BufferUsages::COPY_DST);
+
 /// How many buffers, each [`SPARE_BUFFER_BYTES`], are made and freed before the first build so
 /// that the allocator has the memory blocks for the builds' scratch buffers and the BLAS pool's
 /// growth, instead of making one on a frame (#236). The allocator keeps an empty block
-/// (`third_party/gpu-allocator/PATCH.md`), so they are there for the life of the device. On a GPU
-/// (blocks of 128 MiB and then 256) six of them are two blocks, **384 MiB of VRAM** that the first
-/// builds' 10 to 100 MB of scratch and the pool's buffers fill as they come; a buffer of the
-/// hardware backend that does not fit makes a block that is kept in its turn.
+/// (`third_party/gpu-allocator/PATCH.md`: up to two empty blocks of a memory type), so they are
+/// there for the life of the device. On a GPU the first block is 128 MiB and the ones after it 256,
+/// so 360 MiB of buffers are **two blocks, 384 to 512 MiB of VRAM** (a 128 and a 256, or two
+/// 256s, if the device already has a block) that the first builds' 10 to 100 MB of scratch and the
+/// pool's buffers fill as they come.
 pub const SPARE_BUFFERS: usize = 6;
 
 /// The size of a spare buffer: under the first block of the smallest kind the allocator makes (64
@@ -827,7 +781,11 @@ fn make_spare_blocks(device: &wgpu::Device, queue: &wgpu::Queue) {
             device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("hardware spare block"),
                 size: SPARE_BUFFER_BYTES,
-                usage: wgpu::BufferUsages::COPY_DST,
+                // The pool's usages, the buffer of the hardware backend that the builds read: the
+                // scratch and BLAS buffers wgpu makes itself have usages of its own that no
+                // buffer descriptor can ask for, and on the 4090 the blocks of these were the ones
+                // the scratch buffers found (`hardware.gap_new_blocks` was empty).
+                usage: POOL_USAGES,
                 mapped_at_creation: false,
             })
         })
@@ -856,6 +814,11 @@ pub struct DeviceMemory {
     pub blocks: usize,
     pub reserved_bytes: u64,
     pub allocated_bytes: u64,
+    /// The blocks with no allocation in them, and what they reserve: what the allocator keeps
+    /// and nothing uses (at most two of a memory type, `KEPT_EMPTY_BLOCKS` of the patched
+    /// `gpu-allocator`).
+    pub empty_blocks: usize,
+    pub empty_bytes: u64,
 }
 
 impl DeviceMemory {
@@ -863,10 +826,13 @@ impl DeviceMemory {
     /// [`wgpu::Device::generate_allocator_report`]).
     pub fn of(device: &wgpu::Device) -> Option<Self> {
         let report = device.generate_allocator_report()?;
+        let empty = report.blocks.iter().filter(|b| b.allocations.is_empty());
         Some(Self {
             blocks: report.blocks.len(),
             reserved_bytes: report.total_reserved_bytes,
             allocated_bytes: report.total_allocated_bytes,
+            empty_blocks: empty.clone().count(),
+            empty_bytes: empty.map(|b| b.size).sum(),
         })
     }
 }
@@ -1409,10 +1375,7 @@ impl HwScene {
         device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("hardware boxes' pool"),
             size: u64::from(boxes) * BOX_BYTES,
-            usage: wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::BLAS_INPUT
-                | wgpu::BufferUsages::COPY_SRC
-                | wgpu::BufferUsages::COPY_DST,
+            usage: POOL_USAGES,
             mapped_at_creation: false,
         })
     }
@@ -1806,31 +1769,20 @@ impl HwScene {
             })
             .collect();
         let timer = if self.wait { self.timer.as_ref() } else { None };
-        let counts: Vec<u32> = built.iter().map(|&(_, count)| count).collect();
-        let calls = build_calls(
-            &counts,
-            PROCESS_BUILD_CHUNK.load(std::sync::atomic::Ordering::Relaxed) as usize,
-            PROCESS_BUILD_CHUNK_BOXES.load(std::sync::atomic::Ordering::Relaxed),
-        );
-        if timer.is_none() && calls.len() <= 1 {
-            encoder.build_acceleration_structures(entries.iter(), std::iter::once(&self.tlas));
-        } else {
-            // In calls of their own (each with its scratch buffer, and its barrier), and the TLAS
-            // after them: so that the timestamps can be between them.
-            if let Some(timer) = timer {
+        match timer {
+            None => {
+                encoder.build_acceleration_structures(entries.iter(), std::iter::once(&self.tlas))
+            }
+            Some(timer) => {
+                // The BLASes and the TLAS in calls of their own, so that the timestamps can be
+                // between them.
                 encoder.write_timestamp(&timer.set, 1);
-            }
-            for call in calls {
-                encoder.build_acceleration_structures(entries[call].iter(), std::iter::empty());
-            }
-            if let Some(timer) = timer {
+                encoder.build_acceleration_structures(entries.iter(), std::iter::empty());
                 encoder.write_timestamp(&timer.set, 2);
-            }
-            encoder.build_acceleration_structures(
-                std::iter::empty::<&wgpu::BlasBuildEntry<'_>>(),
-                std::iter::once(&self.tlas),
-            );
-            if let Some(timer) = timer {
+                encoder.build_acceleration_structures(
+                    std::iter::empty::<&wgpu::BlasBuildEntry<'_>>(),
+                    std::iter::once(&self.tlas),
+                );
                 encoder.write_timestamp(&timer.set, 3);
                 timer.resolve(&mut encoder);
             }
@@ -1921,11 +1873,7 @@ impl HwScene {
         device.create_blas(
             &wgpu::CreateBlasDescriptor {
                 label: Some("brick boxes"),
-                flags: if PROCESS_FAST_BUILD.load(std::sync::atomic::Ordering::Relaxed) {
-                    wgpu::AccelerationStructureFlags::PREFER_FAST_BUILD
-                } else {
-                    wgpu::AccelerationStructureFlags::PREFER_FAST_TRACE
-                },
+                flags: wgpu::AccelerationStructureFlags::PREFER_FAST_TRACE,
                 update_mode: wgpu::AccelerationStructureUpdateMode::Build,
             },
             wgpu::BlasGeometrySizeDescriptors::AABBs {

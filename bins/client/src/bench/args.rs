@@ -97,15 +97,6 @@ Options:
                    frame: the gates mean nothing with it. On a device with timestamps in encoders it
                    also times the BLAS builds and the TLAS build apart (`hardware.gpu_blas`,
                    `hardware.gpu_tlas`)
-  --hw-fast-build  An experiment (#236): the hardware backend's BLASes are built PREFER_FAST_BUILD, not
-                   PREFER_FAST_TRACE (the builds may be quicker, the trace slower)
-  --hw-build-chunk-boxes N
-                   An experiment (#236): a frame's BLAS builds are recorded in calls of N boxes at the
-                   most (a BLAS over it has a call of its own), so that no call has a big scratch
-                   buffer; with --hw-build-chunk, whichever bound is reached first
-  --hw-build-chunk N
-                   An experiment (#236): a frame's BLAS builds are recorded N BLASes to a call (each call
-                   has a scratch buffer and a barrier of its own), default all in one
   --time-of-day H  Light the flight (primary and reference, the sweep and the edits) by the sky of the
                    world clock at H hours (0 to 24: 0 midnight, 6 sunrise, 12 noon, 18 sunset) in
                    place of the fixed hero sun, with the clock stopped there (#203)
@@ -190,12 +181,6 @@ pub struct Args {
     /// `--hw-wait` (#236): every update of the hardware backend waits for the GPU, a diagnosis of
     /// what the GPU's time of the boxes, builds and TLAS is (not a player's frame).
     pub hw_wait: bool,
-    /// `--hw-fast-build` (#236): the hardware backend's BLASes prefer a fast build to a fast trace.
-    pub hw_fast_build: bool,
-    /// `--hw-build-chunk` (#236): the BLASes a call of the builds has (None, all of them).
-    pub hw_build_chunk: Option<u32>,
-    /// `--hw-build-chunk-boxes` (#236): the boxes a call of the builds has at the most.
-    pub hw_build_chunk_boxes: Option<u64>,
     /// `--time-of-day`: the hours at which the flight's sky is put (#203).
     pub time_of_day: Option<f64>,
     /// `--day-cycle` and `--day-seconds`: the day cycle phase, and the length of its day if said.
@@ -242,9 +227,6 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Parsed, String> {
         hw_group: None,
         hw_blas_budget: None,
         hw_wait: false,
-        hw_fast_build: false,
-        hw_build_chunk: None,
-        hw_build_chunk_boxes: None,
         time_of_day: None,
         day_cycle: false,
         day_seconds: None,
@@ -290,25 +272,6 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Parsed, String> {
                 );
             }
             "--hw-wait" => parsed.hw_wait = true,
-            "--hw-fast-build" => parsed.hw_fast_build = true,
-            "--hw-build-chunk-boxes" => {
-                parsed.hw_build_chunk_boxes = Some(
-                    value("--hw-build-chunk-boxes")?
-                        .parse::<u64>()
-                        .ok()
-                        .filter(|&n| n >= 1)
-                        .ok_or("--hw-build-chunk-boxes takes a whole number of at least 1")?,
-                );
-            }
-            "--hw-build-chunk" => {
-                parsed.hw_build_chunk = Some(
-                    value("--hw-build-chunk")?
-                        .parse::<u32>()
-                        .ok()
-                        .filter(|&n| n >= 1)
-                        .ok_or("--hw-build-chunk takes a whole number of at least 1")?,
-                );
-            }
             "--time-of-day" => parsed.time_of_day = Some(time_of_day(&value("--time-of-day")?)?),
             "--day-cycle" => parsed.day_cycle = true,
             "--day-seconds" => parsed.day_seconds = Some(day_seconds(&value("--day-seconds")?)?),
@@ -536,9 +499,6 @@ mod tests {
                 hw_group: None,
                 hw_blas_budget: None,
                 hw_wait: false,
-                hw_fast_build: false,
-                hw_build_chunk: None,
-                hw_build_chunk_boxes: None,
                 time_of_day: None,
                 day_cycle: false,
                 day_seconds: None,
@@ -608,14 +568,6 @@ mod tests {
         assert_eq!(run(&["--hw-build-blas", "12"]).hw_blas_budget, Some(12));
         assert!(!run(&[]).hw_wait);
         assert!(run(&["--hw-wait"]).hw_wait);
-        assert!(!run(&[]).hw_fast_build && run(&["--hw-fast-build"]).hw_fast_build);
-        assert_eq!(run(&[]).hw_build_chunk, None);
-        assert_eq!(run(&["--hw-build-chunk", "4"]).hw_build_chunk, Some(4));
-        assert_eq!(run(&[]).hw_build_chunk_boxes, None);
-        assert_eq!(
-            run(&["--hw-build-chunk-boxes", "20000"]).hw_build_chunk_boxes,
-            Some(20_000)
-        );
         for bad in [
             &["--hw-group-regions"][..],
             &["--hw-group-regions", "5"],
@@ -624,10 +576,6 @@ mod tests {
             &["--hw-build-blas"],
             &["--hw-build-blas", "0"],
             &["--hw-build-blas", "x"],
-            &["--hw-build-chunk"],
-            &["--hw-build-chunk", "0"],
-            &["--hw-build-chunk-boxes"],
-            &["--hw-build-chunk-boxes", "0"],
         ] {
             assert!(parse_all(bad).is_err(), "{bad:?}");
         }

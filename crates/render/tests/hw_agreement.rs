@@ -1076,8 +1076,14 @@ fn the_hardware_backend_has_its_spare_blocks_and_its_updates_make_no_block() {
         eprintln!("skipped: the allocator cannot say what it has");
         return;
     };
-    // Six buffers of 60 MiB, in whatever blocks the device makes of them.
-    assert!(start.reserved_bytes >= 360 << 20, "{start:?}");
+    // Six buffers of 60 MiB, in whatever blocks the device makes of them, and the allocator keeps
+    // two of the blocks that are empty again (a GPU's are 128 and 256 MiB, or two 256s; a CPU's
+    // are 64 and 128, so 128 MiB is the least that is surely there).
+    assert!(
+        start.empty_blocks >= 1 && start.empty_bytes >= 128 << 20,
+        "{start:?}"
+    );
+    assert!(start.empty_blocks <= 2, "{start:?}");
     assert_eq!(
         render::hw::SPARE_BUFFERS as u64 * render::hw::SPARE_BUFFER_BYTES,
         360 << 20

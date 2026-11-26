@@ -155,9 +155,6 @@ fn run(args: &Args) -> Result<u8, Box<dyn Error>> {
         render::hw::set_process_blas_budget(blas);
     }
     render::hw::set_process_wait(args.hw_wait);
-    render::hw::set_process_fast_build(args.hw_fast_build);
-    render::hw::set_process_build_chunk(args.hw_build_chunk.unwrap_or(0));
-    render::hw::set_process_build_chunk_boxes(args.hw_build_chunk_boxes.unwrap_or(0));
     let (budgets, source) = match &args.budgets {
         Some(file) => {
             let text = fs::read_to_string(file)
