@@ -305,6 +305,8 @@ fn find(ground: &Ground) -> (Vec<Found>, Vec<String>) {
         None => missing.push("30 km over the biggest continent: there is no land".into()),
     }
 
+    const RANGE_DISTANCE_KM: f64 = 20.0;
+
     // 3 and 4. The greatest range: the highest node, refined on the map's own texels.
     let top = (0..survey.dirs.len())
         .max_by(|&a, &b| survey.height[a].total_cmp(&survey.height[b]))
@@ -325,16 +327,16 @@ fn find(ground: &Ground) -> (Vec<Found>, Vec<String>) {
     }
     let (peak_dir, peak_h) = peak;
     let (la, lo) = lat_lon(peak_dir);
-    // The side to look from: the lowest ground 40 km out, which leaves the range in view.
+    // The side to look from: the lowest ground RANGE_DISTANCE_KM km out, which leaves the range in view.
     let side = (0..16)
         .map(|b| f64::from(b) * std::f64::consts::TAU / 16.0)
         .min_by(|&a, &b| {
             ground
-                .height(walk(peak_dir, a, 40.0))
-                .total_cmp(&ground.height(walk(peak_dir, b, 40.0)))
+                .height(walk(peak_dir, a, RANGE_DISTANCE_KM))
+                .total_cmp(&ground.height(walk(peak_dir, b, RANGE_DISTANCE_KM)))
         })
         .unwrap();
-    let camera_dir = walk(peak_dir, side, 40.0);
+    let camera_dir = walk(peak_dir, side, RANGE_DISTANCE_KM);
     let camera_alt = 5_000f64.max(ground.height(camera_dir) + 800.0);
     let camera = ground.above_sea(camera_dir, camera_alt);
     let massif = survey
@@ -346,7 +348,7 @@ fn find(ground: &Ground) -> (Vec<Found>, Vec<String>) {
         (
             "greatest range, noon",
             NOON,
-            "the greatest range from 5 km up, 40 km out",
+            "the greatest range from 5 km up, 20 km out, aimed at the highest peak",
         ),
         (
             "greatest range, dusk",
