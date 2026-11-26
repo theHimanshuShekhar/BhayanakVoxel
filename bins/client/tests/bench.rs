@@ -324,7 +324,7 @@ fn check_convergence(convergence: &Value, out: &Path) {
 }
 
 fn check_schema(report: &Value, out: &Path) {
-    assert_eq!(report["schema_version"], 34);
+    assert_eq!(report["schema_version"], 35);
     // The default is the compute backend, with no acceleration structures (#50).
     assert_eq!(report["rt"]["requested"], "compute");
     assert_eq!(report["rt"]["active"], "compute");

@@ -599,6 +599,21 @@ camera, and `holes_after_catch_up` the holes the look after it found, which must
     side** (the scene thread's following: the long slice's giving way to a camera that moves is
     for it), a miss in any other is **loader side** (a brick that the bands ask for is not there:
     the generator; decision A's curve, 3 levels at 50 m/s on levels 0 to 4, is in). The two add up to `camera_soft_miss_frames`.
+  - `loader_latency`, `loader_ahead_*`, `camera_soft_miss_by_level` and `by_second` (#251, schema 35;
+    reported, not gated, of the machine's clock): for telling why a flight has camera misses.
+    `loader_latency` is how long the jobs that the scene thread took in during the path waited,
+    by class (`drawn`: the bands split the brick; `margin`; `prefetch`) and by part: `outbox` (asked
+    for, until a sync handed it to the workers: a sync that finds them busy with the queue leaves it
+    there), `queued` (in the workers' queue until one took it), `made` (being generated), `waited` (made, in
+    the channel until the scene thread took it in) and `total`; each with `mean_ms`, `p99_ms` (the
+    upper bound of the bin that holds it: 0.5, 1, 2.5, 5, 10, 25, 50, 100, 250 ms, and 500 for over
+    250) and `over_100_ms`. `loader_ahead_mean`/`_max` and `loader_frames_at_max_ahead` are the jobs
+    the workers have taken that the scene thread has not (at `MAX_AHEAD`, 512, they wait).
+    `camera_soft_miss_by_level` is the camera misses by the level of the brick that was drawn whole
+    under the camera. `by_second` is a flight's seconds one by one (`second`, `frames`,
+    `camera_soft_misses`, `loader_queue_mean`/`_max`, `loader_ahead_mean`, `arrived_bricks`, the
+    scene thread's `scene_follow_ms`, `scene_pack_ms` and `scene_reband_ms`, `lag_d0_max`), to see
+    what the second of a miss looked like against the others. The summary prints all of it.
   - `scene_release_rebuilds`, `release_frame_ms_max` and `release_update_ms_max` (#168): how many
     times a finer depth made the scene again (`Rebuild::Release`, `scene_worker.rs` `RELEASE_REBUILD_OVER`,
     500 thousand nodes) instead of looking at its nodes again, and the frame thread's cost of the
@@ -1818,7 +1833,7 @@ rays; those that need ray queries skip themselves, printing why, where there are
 
 ```
 {
-  "schema_version": 34,
+  "schema_version": 35,
   "build":   { "version", "commit" },          // commit: CI builds only, else null; on a PR
                                                // build it is GitHub's merge commit, not the head
   "machine": { "gpu", "device_type", "driver", "driver_info", "backend", "os", "arch",
