@@ -27,7 +27,7 @@
 
 use brick_store::VOXELS_PER_METRE;
 
-use crate::world_map::{ELEVATION_UNITS_PER_METRE, FieldRange, Fields};
+use crate::world_map::{FieldRange, Fields, LATTICE_POINTS_PER_METRE};
 use crate::{Corners, value_noise};
 
 /// An octave: its cell in lattice points (10 cm, a power of two) and whether it is ridged.
@@ -55,7 +55,7 @@ const OCTAVES: [Octave; 7] = [
 const AMPLITUDE: f64 = 0.05;
 
 /// Voxels in one lattice point: 2 for 5 cm Voxels.
-const VOXELS_PER_POINT: f64 = VOXELS_PER_METRE / ELEVATION_UNITS_PER_METRE as f64;
+const VOXELS_PER_POINT: f64 = VOXELS_PER_METRE / LATTICE_POINTS_PER_METRE as f64;
 
 /// An octave's amplitude in Voxels.
 const fn amplitude(o: Octave) -> f64 {

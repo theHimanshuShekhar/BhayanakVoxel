@@ -32,10 +32,17 @@ use super::{corner_value, value_noise};
 
 /// Elevations in the map's texels are whole numbers of this many to the metre: 10 cm, whatever
 /// the size of a Voxel. An `i16` holds 3.27 km of them, enough for the 2 km peak.
-pub const ELEVATION_UNITS_PER_METRE: i32 = 10;
+pub const ELEVATION_UNITS_PER_METRE: i32 = 4;
 
-/// Voxels in one elevation unit: 2 for 5 cm Voxels, a whole number so that converting is exact.
+/// PROTOTYPE (#246): the noise lattice is still 10 cm, as before, but the stored elevation is in
+/// 25 cm units, so that an `i16` holds 8.19 km (the peaks) and not 3.27 km.
+pub const LATTICE_POINTS_PER_METRE: i32 = 10;
+
+/// Voxels in one elevation unit: 5 for 5 cm Voxels, a whole number so that converting is exact.
 const VOXELS_PER_UNIT: f64 = VOXELS_PER_METRE / ELEVATION_UNITS_PER_METRE as f64;
+
+/// Voxels in one lattice point of the noise: 2 for 5 cm Voxels.
+const VOXELS_PER_LATTICE_POINT: f64 = VOXELS_PER_METRE / LATTICE_POINTS_PER_METRE as f64;
 
 /// Whole Voxels in `metres`, rounded to the nearest: the way the generator turns a size in metres
 /// into the integer it works with.
@@ -70,13 +77,16 @@ pub const TEST_MAP_SIZE: u32 = WORLD_MAP_SIZE / 8;
 /// Elevation of the sea surface. Texel elevations are in units of 10 cm above or below it.
 pub const SEA_LEVEL: i16 = 0;
 
-/// Height of the highest peak above sea level, in Voxels (2 km).
-pub const PEAK: i32 = voxels(2_000.0);
+/// Bound on the height of the highest peak above sea level, in Voxels (8.19 km, what an `i16` of
+/// 25 cm holds). PROTOTYPE (#246): was 2 km.
+pub const PEAK: i32 = voxels(8_190.0);
 
-/// Depth of the deepest trench below sea level, in Voxels (1 km).
-pub const TRENCH: i32 = voxels(1_000.0);
+/// Bound on the depth of the deepest trench below sea level, in Voxels (4.2 km; the landform
+/// model's trenches reach 3.8 km). PROTOTYPE (#246): was 1 km.
+pub const TRENCH: i32 = voxels(4_200.0);
 
-/// [`PEAK`] and [`TRENCH`] in the map's elevation units.
+/// The relief of the noise-only map (the test Planets and the small maps): 2 km and 1 km, in the
+/// map's elevation units.
 const PEAK_UNITS: i32 = units(2_000.0);
 const TRENCH_UNITS: i32 = units(1_000.0);
 
@@ -86,7 +96,7 @@ const TRENCH_UNITS: i32 = units(1_000.0);
 /// fixed size in metres, not a share of the radius: a bigger Planet has more continents, not
 /// bigger ones.
 const fn lattice_radius(radius: i32) -> i32 {
-    (radius as f64 / VOXELS_PER_UNIT + 0.5) as i32
+    (radius as f64 / VOXELS_PER_LATTICE_POINT + 0.5) as i32
 }
 
 /// Faces as (normal, u axis, v axis), each a signed unit vector along one of x, y and z. A face
@@ -269,6 +279,10 @@ impl WorldMap {
         );
         let noise = lattice_radius(radius);
         let count = 6 * (size as usize).pow(2);
+        // PROTOTYPE (#246): the real Planet's map comes from the landform model.
+        if radius == WORLD_RADIUS && size >= 256 {
+            return Self::from_landform(seed, size, radius, noise, threads);
+        }
         let mut raw = vec![0; count];
         par_fill(&mut raw, threads, |index| {
             let (face, i, j) = split(size, index);
@@ -293,6 +307,64 @@ impl WorldMap {
             let direction = centre(size, face, i, j);
             let elevation = eroded[index];
             let biome = biome(seed, noise, direction, elevation);
+            Texel {
+                elevation,
+                erosion: (i32::from(base[index]) - i32::from(elevation)) as i16,
+                biome,
+                regions: regions(seed, noise, direction),
+                rough: roughness(slope(&eroded, size, noise, index), biome, drainage[index]),
+                drainage: drainage[index],
+            }
+        });
+        WorldMap {
+            seed,
+            size,
+            radius,
+            texels,
+        }
+    }
+
+    /// PROTOTYPE (#246): the map of the landform model. The model runs on its own grid of at most
+    /// 1024 texels a face (490 m, where erosion takes about a minute), and the map's texels
+    /// (245 m at 2048) are read from it bilinearly. Biomes come from the model's wind-band climate
+    /// and placeholder Biome table, roughed up with the old volcanic hot spots.
+    fn from_landform(seed: u64, size: u32, radius: i32, noise: i32, threads: usize) -> WorldMap {
+        let count = 6 * (size as usize).pow(2);
+        let lf = crate::landform_proto::generate((size as usize).min(1024));
+        // The model's highest peak is a little over what an `i16` of 25 cm holds: above 6.5 km
+        // heights are squeezed smoothly (not clipped) so that the highest is 8.15 km.
+        let top = lf.h.iter().copied().fold(f32::MIN, f32::max);
+        let squeeze = if top > 8_150.0 { (8_150.0 - 6_500.0) / (top - 6_500.0) } else { 1.0 };
+        eprintln!("landform: highest {top:.0} m, squeezed above 6.5 km by {squeeze:.3}");
+        let to_units = |m: f32| {
+            let m = if m > 6_500.0 { 6_500.0 + (m - 6_500.0) * squeeze } else { m };
+            (m * ELEVATION_UNITS_PER_METRE as f32).round().clamp(-32_000.0, f64::from(units(8_190.0)) as f32)
+        };
+        let mut eroded = vec![0i16; count];
+        par_fill(&mut eroded, threads, |index| {
+            let (face, i, j) = split(size, index);
+            to_units(lf.height_at(centre(size, face, i, j))) as i16
+        });
+        let mut base = vec![0i16; count];
+        par_fill(&mut base, threads, |index| {
+            let (face, i, j) = split(size, index);
+            to_units(lf.height0_at(centre(size, face, i, j))) as i16
+        });
+        let blank = Texel {
+            elevation: 0,
+            erosion: 0,
+            biome: Biome::Temperate,
+            regions: Regions::default(),
+            rough: 0,
+            drainage: 0,
+        };
+        let drainage = drainage(&eroded, size);
+        let mut texels = vec![blank; count];
+        par_fill(&mut texels, threads, |index| {
+            let (face, i, j) = split(size, index);
+            let direction = centre(size, face, i, j);
+            let elevation = eroded[index];
+            let biome = landform_biome(&lf, seed, noise, direction, elevation);
             Texel {
                 elevation,
                 erosion: (i32::from(base[index]) - i32::from(elevation)) as i16,
@@ -841,7 +913,8 @@ fn erode(heights: &mut Vec<i16>, size: u32, noise: i32, threads: usize) {
     // A slope of 0.2 (11 degrees) across one texel, which is a quarter of the circumference of
     // sea level (pi / 2 of the radius, 251,327 units at 16 km), divided by `size`, wide.
     let quarter = i64::from(noise) * 1_570_796 / 1_000_000;
-    let talus = (quarter / i64::from(size)) as i32 / 5;
+    // In elevation units (25 cm), not lattice points (10 cm).
+    let talus = ((quarter / i64::from(size)) as i32 / 5 * LATTICE_POINTS_PER_METRE / ELEVATION_UNITS_PER_METRE / 2).max(1);
     let mut next = vec![0i16; heights.len()];
     for _ in 0..size / 16 {
         par_fill(&mut next, threads, |index| {
@@ -873,7 +946,8 @@ fn slope(heights: &[i16], size: u32, noise: i32, index: usize) -> f64 {
         .max()
         .unwrap_or(0);
     let run = f64::from(noise) * std::f64::consts::FRAC_PI_2 / f64::from(size);
-    f64::from(rise) / run
+    // The rise is in elevation units and the run in lattice points: both to metres.
+    f64::from(rise) / f64::from(ELEVATION_UNITS_PER_METRE) / (run / f64::from(LATTICE_POINTS_PER_METRE))
 }
 
 /// How rough the ground between the texels is made, from the slope (a share of the steepest the
@@ -966,6 +1040,49 @@ fn biome(seed: u64, noise: i32, direction: [f64; 3], elevation: i16) -> Biome {
     } else if warmth < 0.2 {
         Biome::Snow
     } else if land && warmth > 0.4 && aridity > 0.3 {
+        Biome::Desert
+    } else {
+        Biome::Temperate
+    }
+}
+
+/// The biome of a landform-model texel: the placeholder Biome table's entry says snow, desert or
+/// neither, and the old volcanic hot spots stay. Oceans are ice where the model's sea is frozen.
+fn landform_biome(
+    lf: &crate::landform_proto::Landform,
+    seed: u64,
+    noise: i32,
+    direction: [f64; 3],
+    elevation: i16,
+) -> Biome {
+    let land = elevation >= SEA_LEVEL;
+    let name = lf.biome_at(direction);
+    let temp = lf.temp_at(direction);
+    if land && fractal(seed ^ VOLCANISM, noise, direction, PATCH_CELL, 4) > 0.5 && temp > -3.0 {
+        return Biome::Volcanic;
+    }
+    let snow = [
+        "GLACIAL PEAKS",
+        "ALPINE TUNDRA",
+        "ICE PLATEAU",
+        "FROZEN CANYON",
+        "GLACIAL VALLEY",
+        "ICE SHEET",
+        "TUNDRA",
+        "POLAR COAST",
+        "FROZEN SEA",
+    ];
+    let dry = [
+        "ROCKY BARRENS",
+        "MESA BADLANDS",
+        "BADLANDS CANYON",
+        "DRY VALLEY",
+        "DESERT",
+        "DUNE COAST",
+    ];
+    if snow.contains(&name) {
+        Biome::Snow
+    } else if dry.contains(&name) {
         Biome::Desert
     } else {
         Biome::Temperate
