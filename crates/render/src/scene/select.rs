@@ -1980,8 +1980,11 @@ impl Selection {
         beside.dedup();
         for key in beside {
             // Only a brick that is full can be buried, which is all that the children have
-            // changed for it.
-            if store.is_full_known(key.0, key.1) && self.nodes.contains_key(&key) {
+            // changed for it. The node is looked at first: most of the bricks beside the children
+            // have none, and asking the store about a brick it does not hold asks the source
+            // whether it is solid all the way down, which cost 1.1 µs a brick (1.5 s of the
+            // scene thread's 10 s in the 2 m flight, 60% of taking the children in, #251).
+            if self.nodes.contains_key(&key) && store.is_full_known(key.0, key.1) {
                 self.recheck(store, key, &mut diff);
             }
         }
@@ -4369,6 +4372,79 @@ mod tests {
             assert_eq!(made.load(AtomicOrdering::Relaxed), 0, "round {rounds}");
         }
         assert!(rounds > 1, "{rounds}");
+    }
+
+    /// Counts what it is asked about the bricks it does not hold: [`BrickStore::is_full_known`]
+    /// asks `solid_below` of a brick the store does not have, and that is the Planet's terrain.
+    #[derive(Debug)]
+    struct AsksSolid(std::sync::Arc<AtomicUsize>);
+
+    impl brick_store::BrickSource for AsksSolid {
+        fn brick(&self, _: usize, coord: BrickCoord) -> Brick {
+            if coord.0[1] < -1 {
+                Brick::solid(ROCK)
+            } else {
+                Brick::AIR
+            }
+        }
+
+        fn solid_below(&self, _: usize, coord: BrickCoord) -> bool {
+            self.0.fetch_add(1, AtomicOrdering::Relaxed);
+            coord.0[1] < -1
+        }
+    }
+
+    /// Taking children in looks at the bricks beside them to see if they are buried now, and most
+    /// have no node (they are not drawn, nor split, nor waiting): the selection looks at the node
+    /// first, so the source is not asked whether those are solid all the way down, which cost
+    /// 1.5 s of the scene thread's 10 s in the 2 m flight (#251). The selection it comes to is
+    /// the same as it was.
+    #[test]
+    fn taking_in_bricks_asks_the_source_only_about_the_bricks_beside_them_that_have_nodes() {
+        let asked = std::sync::Arc::new(AtomicUsize::new(0));
+        let mut store = flat(4, 4);
+        store.set_source(AsksSolid(asked.clone()));
+        store.stream_from(3);
+        let source = store.source().expect("a source");
+        for x in -3..3 {
+            for y in -3..3 {
+                for z in -3..3 {
+                    let coord = BrickCoord([x, y, z]);
+                    if !store.holds(3, coord) {
+                        let brick = source.brick(3, coord);
+                        if !brick.is_air() {
+                            store.hold(3, coord, brick, source.solid_below(3, coord));
+                        }
+                    }
+                }
+            }
+        }
+        let mut selection = select(&store, [0.5, 20.0, 0.5], D0);
+        let (mut during, mut parents) = (0, 0);
+        loop {
+            let wanted = selection.take_wanted();
+            if wanted.is_empty() {
+                break;
+            }
+            for &(level, coord) in &wanted {
+                let bricks = brick_store::children_from(&*source, level, coord, |c| {
+                    store.holds(level - 1, c)
+                });
+                store.hold_children(level, coord, bricks);
+            }
+            parents += wanted.len();
+            let before = asked.load(AtomicOrdering::Relaxed);
+            selection.arrived(&store, wanted);
+            during += asked.load(AtomicOrdering::Relaxed) - before;
+        }
+        // Measured on this world: 9.5 asks a parent with the node looked at first, 13.4 with the
+        // source asked first (the other asks are the split's own: what its children are). The
+        // 2 m flight's world has more bricks beside each that the scene knows nothing of.
+        assert!(parents > 100, "{parents}");
+        assert!(
+            during * 100 < parents * 1100,
+            "{during} asks for {parents} parents"
+        );
     }
 
     /// Rock under y = -8 (the top of the level 0 bricks at y = -2), at every level: a brick wholly
