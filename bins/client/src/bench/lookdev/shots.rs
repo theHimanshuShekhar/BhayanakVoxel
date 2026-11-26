@@ -4,7 +4,7 @@
 use super::{CavePalette, Hue, Key, Place, Shot, Stamp};
 
 /// The `GENERATOR_VERSION` the places were found on.
-pub const RECORDED_FOR: u32 = 6;
+pub const RECORDED_FOR: u32 = 7;
 
 /// The seed and radius (Voxels) of the Planet they are on, which a test holds to the client's own.
 pub const RECORDED_SEED: u64 = 0xB4A7A9AC;
