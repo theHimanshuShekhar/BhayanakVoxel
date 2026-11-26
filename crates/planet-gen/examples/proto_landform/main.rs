@@ -34,7 +34,7 @@ struct Args {
 }
 
 fn parse() -> Args {
-    let mut a = Args { res: 512, out: PathBuf::from("target/landform-proto"), only: "ABC".into(), steps: 36, k: 0.02, u: 10.0, skip_views: false };
+    let mut a = Args { res: 512, out: PathBuf::from("target/landform-proto"), only: "A,B,C,C2".into(), steps: 36, k: 0.02, u: 10.0, skip_views: false };
     let mut it = std::env::args().skip(1);
     while let Some(x) = it.next() {
         let mut v = || it.next().expect("value");
@@ -80,11 +80,13 @@ struct Result {
 struct Summary {
     ocean: f64,
     continents: Vec<f64>,
+    cores: Vec<f64>,
     islands: usize,
     highest: f64,
     deepest: f64,
     highest_at: (f64, f64),
     massifs_6km: usize,
+    ranges_6km: usize,
     fam_share: Vec<f64>,
     range_relief_med: f64,
     range_relief_p90: f64,
@@ -160,11 +162,12 @@ fn run_variant(g: &Grid, plates: &Plates, v: Variant, args: &Args) -> Result {
     let mut t = Instant::now();
     let raw = match v {
         Variant::A => raw_a(g),
-        Variant::B => raw_plates(g, plates),
+        Variant::B => raw_plates(g, plates, false),
         Variant::C => raw_c(g, plates),
+        Variant::C2 => raw_c2(g, plates),
     };
     let shape = match v {
-        Variant::A | Variant::C => shape_spline(g, &raw),
+        Variant::A | Variant::C | Variant::C2 => shape_spline(g, &raw),
         Variant::B => shape_plate(g, &raw),
     };
     lap("land model", &mut t);
@@ -201,11 +204,31 @@ fn run_variant(g: &Grid, plates: &Plates, v: Variant, args: &Args) -> Result {
     }
     let continents: Vec<f64> = lands.iter().filter(|l| l.area >= 20000.0).map(|l| l.area).collect();
     let islands = lands.iter().filter(|l| l.area < 20000.0 && l.area >= 200.0).count();
+    // Continent cores: land at least ~30 km from any water, so isthmuses and spits do not join continents.
+    let core_passes = (30.0 / (std::f64::consts::FRAC_PI_2 * R / args.res as f64)).round() as usize;
+    let mut core = land.clone();
+    for _ in 0..core_passes {
+        let prev = core.clone();
+        for k in 0..g.total() {
+            if prev[k] && g.nbr[k].iter().any(|&m| !prev[m as usize]) {
+                core[k] = false;
+            }
+        }
+    }
+    let cores: Vec<f64> = components(g, &core).into_iter().filter(|l| l.area >= 3000.0).map(|l| l.area).collect();
     let (hk, hmax) = h.iter().enumerate().fold((0, f32::MIN), |b, (k, &x)| if x > b.1 { (k, x) } else { b });
     let lat = g.dir[hk][1].asin().to_degrees();
     let lon = g.dir[hk][2].atan2(g.dir[hk][0]).to_degrees();
     let high: Vec<bool> = h.iter().map(|&x| x > 6000.0).collect();
-    let massifs_6km = components(g, &high).iter().filter(|c| c.area > 50.0).count();
+    let massif_list: Vec<Land> = components(g, &high).into_iter().filter(|c| c.area > 50.0).collect();
+    let massifs_6km = massif_list.len();
+    let mut ranges: Vec<V3> = Vec::new();
+    for l in &massif_list {
+        if !ranges.iter().any(|c| dot(*c, l.centroid).clamp(-1.0, 1.0).acos() * R < 160.0) {
+            ranges.push(l.centroid);
+        }
+    }
+    let ranges_6km = ranges.len();
     let land_area: f64 = (0..g.total()).filter(|&k| land[k]).map(|k| f64::from(g.area[k])).sum();
     let fam_share: Vec<f64> = (0..6)
         .map(|f| (0..g.total()).filter(|&k| fam[k] == f).map(|k| f64::from(g.area[k])).sum::<f64>() / land_area)
@@ -241,10 +264,12 @@ fn run_variant(g: &Grid, plates: &Plates, v: Variant, args: &Args) -> Result {
         ocean,
         continents,
         islands,
+        cores,
         highest: f64::from(hmax),
         deepest: f64::from(h.iter().cloned().fold(f32::MAX, f32::min)),
         highest_at: (lat, lon),
         massifs_6km,
+        ranges_6km,
         fam_share,
         range_relief_med: percentile(&mut reliefs.clone(), 0.5),
         range_relief_p90: percentile(&mut reliefs, 0.9),
@@ -273,7 +298,8 @@ fn numbers_md(r: &Result, res: usize) -> String {
         s.continents.iter().map(|a| format!("{:.0}", (4.0 * a / std::f64::consts::PI).sqrt())).collect::<Vec<_>>().join(", "),
         s.islands
     );
-    o += &format!("- Highest point: **{:.0} m** at {:.0} N, {:.0} E; separate massifs above 6 km: {}\n", s.highest, s.highest_at.0, s.highest_at.1, s.massifs_6km);
+    o += &format!("- Continent cores (land 30 km from water, >= 3,000 km2, so isthmuses do not join them): **{}**, areas {} km2\n", s.cores.len(), s.cores.iter().map(|a| format!("{a:.0}")).collect::<Vec<_>>().join(", "));
+    o += &format!("- Highest point: **{:.0} m** at {:.0} N, {:.0} E; separate massifs above 6 km: {} (in {} ranges, massifs within 160 km counted as one range)\n", s.highest, s.highest_at.0, s.highest_at.1, s.massifs_6km, s.ranges_6km);
     o += &format!("- Deepest point: {:.0} m\n", s.deepest);
     o += &format!("- Land above 4 km: {:.2}% of land; above 6 km: {:.2}%; mean land elevation {:.0} m\n", s.land_above_4km * 100.0, s.land_above_6km * 100.0, s.mean_land_elev);
     o += &format!(
@@ -522,19 +548,20 @@ fn main() {
         let tot: f64 = g.area.iter().map(|&a| f64::from(a)).sum();
         eprintln!("nbr_d max {mx} mean {mean}; total area {tot} (expect {})", 4.0 * std::f64::consts::PI * R * R);
     }
-    let plates = make_plates(&g);
+    let plates = make_plates(&g, false);
+    let plates2 = make_plates(&g, true);
     let out = args.out.clone();
     ensure(&out);
     let mut results: Vec<Result> = Vec::new();
     let mut orbits: Vec<Vec<Img>> = Vec::new();
     let mut conts: Vec<Vec<Img>> = Vec::new();
     let mut fams: Vec<Img> = Vec::new();
-    for v in [Variant::A, Variant::B, Variant::C] {
-        if !args.only.contains(v.name()) {
+    for v in [Variant::A, Variant::B, Variant::C, Variant::C2] {
+        if !args.only.split(',').any(|x| x == v.name()) {
             continue;
         }
         eprintln!("variant {} ...", v.name());
-        let mut r = run_variant(&g, &plates, v, &args);
+        let mut r = run_variant(&g, if v == Variant::C2 { &plates2 } else { &plates }, v, &args);
         eprintln!("  [{}] built in {:.1} s ({})", v.name(), r.build_s, r.steps.iter().map(|(n, t)| format!("{n} {t:.1}")).collect::<Vec<_>>().join(", "));
         r.numbers = numbers_md(&r, args.res);
         eprint!("{}", r.numbers);
@@ -547,7 +574,28 @@ fn main() {
     }
     // ---- contact sheets
     let titles: Vec<&str> = results.iter().map(|r| r.variant.title()).collect();
-    if orbits.len() == 3 {
+    let idx = |name: &str| results.iter().position(|r| r.variant.name() == name);
+    if let (Some(c), Some(c2)) = (idx("C"), idx("C2")) {
+        let both = [c, c2];
+        let mut rows: Vec<Vec<&Img>> = vec![both.iter().map(|&i| &orbits[i][0]).collect(), both.iter().map(|&i| &orbits[i][1]).collect()];
+        if !args.skip_views && both.iter().all(|&i| conts[i].len() == 4) {
+            rows.push(both.iter().map(|&i| &conts[i][2]).collect());
+            rows.push(both.iter().map(|&i| &conts[i][3]).collect());
+        }
+        let fl: Vec<Img> = both.iter().map(|&i| label(&fams[i].resized(1024, 512), &format!("{}  LANDFORM FAMILY", results[i].variant.title()))).collect();
+        rows.push(fl.iter().collect());
+        sheet(&rows, 960).save(&out.join("sheet-c-vs-c2.png"));
+        for i in both {
+            let d = out.join(results[i].variant.name().to_lowercase());
+            let _ = std::fs::write(d.join("numbers.md"), &results[i].numbers);
+        }
+    }
+    let abc: Vec<usize> = ["A", "B", "C"].iter().filter_map(|n| idx(n)).collect();
+    if abc.len() == 3 {
+        let orbits: Vec<&Vec<Img>> = abc.iter().map(|&i| &orbits[i]).collect();
+        let conts: Vec<&Vec<Img>> = abc.iter().map(|&i| &conts[i]).collect();
+        let fams: Vec<&Img> = abc.iter().map(|&i| &fams[i]).collect();
+        let titles: Vec<&str> = abc.iter().map(|&i| results[i].variant.title()).collect();
         let r0: Vec<&Img> = orbits.iter().map(|o| &o[0]).collect();
         let r1: Vec<&Img> = orbits.iter().map(|o| &o[1]).collect();
         sheet(&[r0, r1], 640).save(&out.join("sheet-orbit.png"));

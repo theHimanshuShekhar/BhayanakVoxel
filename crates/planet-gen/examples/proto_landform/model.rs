@@ -11,6 +11,7 @@ pub enum Variant {
     A,
     B,
     C,
+    C2,
 }
 impl Variant {
     pub fn name(self) -> &'static str {
@@ -18,6 +19,7 @@ impl Variant {
             Variant::A => "A",
             Variant::B => "B",
             Variant::C => "C",
+            Variant::C2 => "C2",
         }
     }
     pub fn title(self) -> &'static str {
@@ -25,6 +27,7 @@ impl Variant {
             Variant::A => "A NOISE AND SPLINES",
             Variant::B => "B PLATES",
             Variant::C => "C HYBRID",
+            Variant::C2 => "C2 HYBRID, A COASTS",
         }
     }
 }
@@ -41,6 +44,8 @@ pub struct Raw {
     pub range_b: Vec<f32>, // plate collision belt 0..1 (B, C)
     pub plateau_b: Vec<f32>,
     pub rift_b: Vec<f32>,
+    pub giant: Vec<f32>,   // C2: the one or two greatest ranges
+    pub v2: bool,          // C2 tuning
     pub conv: Vec<f32>, // strength of the plate collision, for the giant-range term
 }
 
@@ -116,7 +121,8 @@ pub fn ridge_fn(p: V3, seed: u32) -> f64 {
 
 // ---------------------------------------------------------------- A: noise + splines
 
-pub fn raw_a(g: &Grid) -> Raw {
+/// A's coasts: warped continentalness noise (unit std) and the island-arc chains.
+pub fn noise_land(g: &Grid) -> (Vec<f32>, Vec<f32>) {
     let n = g.total();
     let seed = SEED;
     let cn: Vec<f32> = par_map(n, |k| {
@@ -132,17 +138,23 @@ pub fn raw_a(g: &Grid) -> Raw {
         (smoothstep(0.78, 0.93, a) * smoothstep(-0.25, 0.08, m)) as f32
     });
     let sd = std_of(&cn);
+    (cn.iter().map(|x| x / sd).collect(), arcs)
+}
+
+pub fn raw_a(g: &Grid) -> Raw {
+    let n = g.total();
+    let seed = SEED;
+    let (cstd, arcs) = noise_land(g);
     let mut c: Vec<f32> = (0..n)
         .map(|k| {
-            let x = f64::from(cn[k] / sd);
-            // Island arcs and archipelagos rise out of the shallow edge of the sea.
+            let x = f64::from(cstd[k]);
             let band = smoothstep(-1.7, -1.1, x) * (1.0 - smoothstep(-0.55, -0.15, x));
             (x + 2.2 * band * f64::from(arcs[k])) as f32
         })
         .collect();
     let arc: Vec<f32> = (0..n)
         .map(|k| {
-            let x = f64::from(cn[k] / sd);
+            let x = f64::from(cstd[k]);
             let band = smoothstep(-1.7, -1.1, x) * (1.0 - smoothstep(-0.55, 0.3, x));
             (band * f64::from(arcs[k])) as f32
         })
@@ -176,6 +188,8 @@ pub fn raw_a(g: &Grid) -> Raw {
         plateau_b: vec![0.0; n],
         rift_b: vec![0.0; n],
         conv: vec![0.0; n],
+        giant: vec![0.0; n],
+        v2: false,
     }
 }
 
@@ -215,7 +229,15 @@ fn plate_warp(p: V3) -> V3 {
     warp(warp(p, 70.0, 1.0 / 230.0, SEED + 71), 22.0, 1.0 / 75.0, SEED + 75)
 }
 
-pub fn make_plates(g: &Grid) -> Plates {
+fn envf(k: &str, d: f64) -> f64 {
+    std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
+}
+
+fn plate_warp2(p: V3) -> V3 {
+    warp(warp(p, 78.0, 1.0 / 240.0, SEED + 71), 26.0, 1.0 / 78.0, SEED + 75)
+}
+
+pub fn make_plates(g: &Grid, compact: bool) -> Plates {
     let mut rng = Rng(u64::from(SEED) * 7919 + 13);
     // Best-candidate sites: evenly spread but not a lattice.
     let mut sites: Vec<V3> = vec![mul(rng.unit(), R)];
@@ -259,7 +281,7 @@ pub fn make_plates(g: &Grid) -> Plates {
         }
     }
     // Continents: grow K seed plates through their nearest unassigned neighbours.
-    let k_cont = 7usize;
+    let k_cont = if compact { envf("LP_K", 8.0) as usize } else { 7usize };
     let mut cont = vec![false; N_PLATES];
     let mut group = vec![usize::MAX; N_PLATES];
     let mut seeds: Vec<usize> = Vec::new();
@@ -279,20 +301,30 @@ pub fn make_plates(g: &Grid) -> Plates {
         cont[best.0] = true;
         group[best.0] = seeds.len() - 1;
     }
-    let target = 0.58 * total;
+    let target = if compact { envf("LP_T", 0.48) } else { 0.58 } * total;
     let mut have: f64 = seeds.iter().map(|&s| area[s]).sum();
     let mut turn = 0;
     while have < target {
         let gi = turn % k_cont;
         turn += 1;
         let mut best = (usize::MAX, f64::MAX);
+        // Compact continents: grow towards the group's centroid, and stop a group at its area cap.
+        let members: Vec<usize> = (0..N_PLATES).filter(|&j| group[j] == gi).collect();
+        let garea: f64 = members.iter().map(|&j| area[j]).sum();
+        if compact && garea > envf("LP_CAP", 1.0) * target / k_cont as f64 {
+            if turn > 200 {
+                break;
+            }
+            continue;
+        }
+        let cen = norm(members.iter().fold([0.0; 3], |a, &j| add(a, norm(sites[j]))));
         for i in 0..N_PLATES {
             if cont[i] {
                 continue;
             }
             for j in 0..N_PLATES {
                 if group[j] == gi {
-                    let d = len(sub(sites[i], sites[j]));
+                    let d = if compact { len(sub(sites[i], mul(cen, R))) + 0.25 * len(sub(sites[i], sites[j])) } else { len(sub(sites[i], sites[j])) };
                     if d < best.1 {
                         best = (i, d);
                     }
@@ -317,7 +349,7 @@ pub fn make_plates(g: &Grid) -> Plates {
     Plates { sites, cont, omega, rank, group }
 }
 
-pub fn raw_plates(g: &Grid, pl: &Plates) -> Raw {
+pub fn raw_plates(g: &Grid, pl: &Plates, v2: bool) -> Raw {
     let n = g.total();
     let seed = SEED;
     #[derive(Clone, Default)]
@@ -331,9 +363,10 @@ pub fn raw_plates(g: &Grid, pl: &Plates) -> Raw {
         oridge: f32,
         conv: f32,
     }
+    let strait = envf("LP_S", 60.0);
     let out: Vec<Out> = par_map(n, |k| {
         let p = g.position(k);
-        let q = plate_warp(p);
+        let q = if v2 { plate_warp2(p) } else { plate_warp(p) };
         let qh = norm(q);
         let mut d2 = [0.0f64; N_PLATES];
         let mut own = 0;
@@ -358,7 +391,7 @@ pub fn raw_plates(g: &Grid, pl: &Plates) -> Raw {
                 coast = coast.min(db);
             } else if own_cont && pl.group[j] != pl.group[own] {
                 // Touching continents get a strait between them.
-                coast = coast.min(db - 38.0);
+                coast = coast.min(db - if v2 { strait } else { 38.0 });
             }
             if db > 380.0 {
                 continue;
@@ -407,12 +440,33 @@ pub fn raw_plates(g: &Grid, pl: &Plates) -> Raw {
         (a * 0.9 + b * 0.45) as f32
     });
     // Continentalness: signed distance to the coast, roughened; then calibrated to 55% sea.
+    let (_, arcs_n) = if v2 { noise_land(g) } else { (Vec::new(), Vec::new()) };
+    // C2: A's coast-shaping noise (same warps, finer scale), so coasts wander like A's.
+    let cstd: Vec<f32> = if v2 {
+        let hf: Vec<f32> = par_map(n, |k| {
+            let p = g.position(k);
+            let q = warp(warp(p, 70.0, 1.0 / 250.0, seed + 1), 24.0, 1.0 / 90.0, seed + 4);
+            fbm1(q, 1.0 / 115.0, 4, 0.5, seed + 8) as f32
+        });
+        let sd = std_of(&hf);
+        hf.iter().map(|x| x / sd).collect()
+    } else {
+        Vec::new()
+    };
+    let (wn, bh0, bh1, ah) = (envf("LP_W", 0.25), envf("LP_B0", -0.6), envf("LP_B1", -0.3), envf("LP_AH", 1.5));
     let mut c: Vec<f32> = (0..n)
         .map(|k| {
             let sc = f64::from(out[k].sc);
             // Arcs and island chains lift themselves clear of the sea.
             let isl = f64::from(out[k].arc);
-            (sc / 130.0 + f64::from(noise[k]) * 0.8 + 2.0 * isl) as f32
+            if v2 {
+                // Plates place the continents; A's warped noise draws the coasts and the archipelagos.
+                let base = 0.9 * (sc / 190.0).clamp(-1.4, 1.4) + wn * f64::from(cstd[k]);
+                let band = smoothstep(-1.1, -0.6, base) * (1.0 - smoothstep(bh0, bh1, base));
+                (base + ah * band * f64::from(arcs_n[k]) + 2.0 * isl) as f32
+            } else {
+                (sc / 130.0 + f64::from(noise[k]) * 0.8 + 2.0 * isl) as f32
+            }
         })
         .collect();
     calibrate_c(g, &mut c, 0.55);
@@ -432,7 +486,16 @@ pub fn raw_plates(g: &Grid, pl: &Plates) -> Raw {
         e: en,
         psel: ps,
         arc: (0..n)
-            .map(|k| out[k].arc * smoothstep(-0.12, 0.2, fbm1(g.position(k), 1.0 / 85.0, 2, 0.5, seed + 91)) as f32)
+            .map(|k| {
+                let plate = out[k].arc * smoothstep(-0.12, 0.2, fbm1(g.position(k), 1.0 / 85.0, 2, 0.5, seed + 91)) as f32;
+                if v2 {
+                    let base = 0.9 * f64::from(out[k].sc / 190.0).clamp(-1.4, 1.4) + wn * f64::from(cstd[k]);
+                    let band = smoothstep(-1.1, -0.6, base) * (1.0 - smoothstep(-0.3, 0.2, base));
+                    plate.max((band * f64::from(arcs_n[k])) as f32)
+                } else {
+                    plate
+                }
+            })
             .collect(),
         trench: out.iter().map(|o| o.trench).collect(),
         oridge: out.iter().map(|o| o.oridge).collect(),
@@ -440,12 +503,14 @@ pub fn raw_plates(g: &Grid, pl: &Plates) -> Raw {
         plateau_b: out.iter().map(|o| o.plateau).collect(),
         rift_b: out.iter().map(|o| o.rift).collect(),
         conv: out.iter().map(|o| o.conv).collect(),
+        giant: vec![0.0; n],
+        v2,
     }
 }
 
 /// C: plates give the continents and the lines of the big ranges; noise gives the rest.
 pub fn raw_c(g: &Grid, pl: &Plates) -> Raw {
-    let mut r = raw_plates(g, pl);
+    let mut r = raw_plates(g, pl, false);
     let n = g.total();
     for k in 0..n {
         let belt = f64::from(r.range_b[k]).clamp(0.0, 1.0);
@@ -453,6 +518,41 @@ pub fn raw_c(g: &Grid, pl: &Plates) -> Raw {
         r.e[k] = e.clamp(-2.2, 1.0) as f32;
         let ps = f64::from(r.psel[k]) + 1.5 * f64::from(r.plateau_b[k]);
         r.psel[k] = ps.clamp(-1.0, 1.4) as f32;
+    }
+    r
+}
+
+/// C2: C with A's coasts and archipelagos, fewer plateaus, and only the greatest one or two ranges
+/// reaching 6-8 km.
+pub fn raw_c2(g: &Grid, pl: &Plates) -> Raw {
+    let mut r = raw_plates(g, pl, true);
+    let n = g.total();
+    for k in 0..n {
+        let belt = f64::from(r.range_b[k]).clamp(0.0, 1.0);
+        let e = f64::from(r.e[k]) * 0.8 - 1.5 * belt * (0.5 + 0.5 * f64::from(r.conv[k])) + 0.1;
+        r.e[k] = e.clamp(-2.2, 1.0) as f32;
+        let ps = f64::from(r.psel[k]) + envf("LP_PW", 1.2) * f64::from(r.plateau_b[k]);
+        r.psel[k] = ps.clamp(-1.0, 1.4) as f32;
+    }
+    // The two strongest collision points, at least a quarter of the planet apart, mark the giants.
+    let score: Vec<f32> = (0..n).map(|k| r.range_b[k] * r.conv[k] * smoothstep(-0.02, 0.1, f64::from(r.c[k])) as f32).collect();
+    let k1 = (0..n).max_by(|&a, &b| score[a].total_cmp(&score[b])).unwrap();
+    let k2 = (0..n)
+        .filter(|&k| dot(g.dir[k], g.dir[k1]) < 0.15)
+        .max_by(|&a, &b| score[a].total_cmp(&score[b]))
+        .unwrap();
+    if std::env::var("LP_DEBUG").is_ok() {
+        for &k in &[k1, k2] {
+            eprintln!("giant at lat {:.0} lon {:.0}: c {:.2} e {:.2} range_b {:.2} conv {:.2}", g.dir[k][1].asin().to_degrees(), g.dir[k][2].atan2(g.dir[k][0]).to_degrees(), r.c[k], r.e[k], r.range_b[k], r.conv[k]);
+        }
+    }
+    for k in 0..n {
+        let near = |c: usize| {
+            let d = dot(g.dir[k], g.dir[c]).clamp(-1.0, 1.0).acos() * R;
+            gauss(d, 0.0, 85.0)
+        };
+        let m = near(k1).max(near(k2));
+        r.giant[k] = (m * f64::from(r.range_b[k]).sqrt().min(1.0)) as f32;
     }
     r
 }
@@ -519,10 +619,12 @@ pub fn shape_spline(g: &Grid, r: &Raw) -> Shape {
         let rugged = 1.0 - smoothstep(-0.8, -0.1, e);
         let mt = rugged * inland;
         let rid = ridge_fn(p, seed + 100);
-        let amp = sp.amp.eval(e);
-        let crest = mt * amp * (0.06 + 0.94 * rid);
+        let amp = if r.v2 { sp.amp.eval(e).min(4600.0) } else { sp.amp.eval(e) };
+        let giant = if r.v2 { envf("LP_G", 4700.0) * f64::from(r.giant[k]) * (0.15 + 0.85 * rid) * smoothstep(0.0, 0.08, c) } else { 0.0 };
+        let crest = mt * amp * (0.06 + 0.94 * rid) + giant;
         // Plateau: a raised tableland with a steep rim and terraces.
-        let pm = smoothstep(0.26, 0.62, ps) * smoothstep(0.12, 0.35, c) * (1.0 - smoothstep(0.35, 0.8, mt));
+        let (plo, phi) = if r.v2 { (0.42, 0.78) } else { (0.26, 0.62) };
+        let pm = smoothstep(plo, phi, ps) * smoothstep(0.12, 0.35, c) * (1.0 - smoothstep(0.35, 0.8, mt));
         let terr = smoothstep(0.62, 0.74, ps);
         let plat = pm * (1050.0 + 450.0 * terr + 120.0 * fbm1(p, 1.0 / 40.0, 2, 0.5, seed + 120));
         // Canyons: narrow cuts along the zero line of a warped noise, inside tablelands and uplands.
@@ -545,8 +647,12 @@ pub fn shape_spline(g: &Grid, r: &Raw) -> Shape {
         let arc = f64::from(r.arc[k]);
         h += arc * (700.0 + 900.0 * rid) * smoothstep(-0.2, 0.02, c).max(0.5);
         let ocean = 1.0 - smoothstep(-0.12, -0.02, c);
-        let tr = f64::from(r.trench[k]) * ocean * smoothstep(-0.42, -0.3, c) * (1.0 - smoothstep(-0.25, -0.12, c));
-        h -= 1900.0 * tr;
+        let tr = if r.v2 {
+            f64::from(r.trench[k]) * ocean * smoothstep(-0.85, -0.4, c) * (1.0 - smoothstep(-0.3, -0.15, c))
+        } else {
+            f64::from(r.trench[k]) * ocean * smoothstep(-0.42, -0.3, c) * (1.0 - smoothstep(-0.25, -0.12, c))
+        };
+        h -= if r.v2 { 1750.0 } else { 1900.0 } * tr;
         h += 1300.0 * f64::from(r.oridge[k]) * ocean * smoothstep(-0.9, -0.5, c);
         O {
             h: h as f32,
