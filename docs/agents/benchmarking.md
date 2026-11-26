@@ -741,6 +741,18 @@ camera, and `holes_after_catch_up` the holes the look after it found, which must
     word). The buffers are allocated whole and change only when one grows (#145), so this is the
     most over the run, after the growths. This is the VRAM the scene takes (at full size the
     bricks buffer alone is about 587 MB). Reported, not gated.
+  - `device_blocks`, `device_reserved_mib` and `device_allocated_mib` (#236): what the device's
+    allocator keeps at the end of the run, for **all** of the GPU's buffers, not the scene's: the
+    memory blocks it holds, what they reserve, and what is allocated in them (`null` where the
+    allocator cannot say). The allocator is the patched `gpu-allocator`
+    (`third_party/gpu-allocator/PATCH.md`), which **keeps a block that has become empty** instead of
+    destroying it and making it again, as the published crate does: a block made on a frame stalled
+    the GPU for 6.5 to 7 ms before the builds' first command (`hardware.gap_new_blocks`), on about
+    1% of the frames of cold start and of a flight. The hardware backend also makes the blocks of
+    `hw::SPARE_BUFFERS` buffers of 60 MiB when its scene is made (two blocks, **384 MiB of VRAM** on
+    a GPU, where blocks are 128 MiB and then 256), so the first builds find them. So
+    `device_reserved_mib` less `device_allocated_mib` is the memory the fix keeps and does not use.
+    Reported, not gated (the gate is `scene_used_peak_mib`).
   - `scene_gpu_peak_growth_mib`, `scene_host_peak_growth_mib` and `scene_gpu_peak_rebuild_mib`:
     **the peak during a growth**, which `scene_reserved_mib` is not (it is the size after). While
     a buffer grows the old one and the new one both exist: the GPU's is the buffers' bytes before

@@ -491,6 +491,12 @@ impl Offscreen {
         Ok(())
     }
 
+    /// What the device's allocator keeps: its memory blocks, what they reserve and what is
+    /// allocated in them, or `None` where it does not count (see [`crate::hw::DeviceMemory`]).
+    pub fn device_memory(&self) -> Option<crate::hw::DeviceMemory> {
+        crate::hw::DeviceMemory::of(&self.device)
+    }
+
     /// The sizes in bytes of the device's live allocations, as the Vulkan allocator counts them
     /// (sorted), or `None` where it does not count: what a test compares to see what an Edit
     /// allocated.

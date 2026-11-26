@@ -57,6 +57,9 @@ fn the_builds_in_calls_of_two_make_what_the_scene_has_and_the_gpu_times_them_whe
             u.scratch_bytes > 0 || hw.device_allocation_sizes().is_none(),
             "{u:?}"
         );
+        // And it found room: the blocks made before the first build (and kept) took the scratch
+        // buffer, so the GPU had no new memory to wait for (#236).
+        assert_eq!((u.blocks_made, u.reserved_grew), (0, 0), "{u:?}");
         assert!(
             u.gpu_gap + u.gpu_blas + u.gpu_tlas
                 <= u.phases.wait

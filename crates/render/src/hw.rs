@@ -796,6 +796,81 @@ impl Reserve {
     }
 }
 
+/// How many buffers, each [`SPARE_BUFFER_BYTES`], are made and freed before the first build so
+/// that the allocator has the memory blocks for the builds' scratch buffers and the BLAS pool's
+/// growth, instead of making one on a frame (#236). The allocator keeps an empty block
+/// (`third_party/gpu-allocator/PATCH.md`), so they are there for the life of the device. On a GPU
+/// (blocks of 128 MiB and then 256) six of them are two blocks, **384 MiB of VRAM** that the first
+/// builds' 10 to 100 MB of scratch and the pool's buffers fill as they come; a buffer of the
+/// hardware backend that does not fit makes a block that is kept in its turn.
+pub const SPARE_BUFFERS: usize = 6;
+
+/// The size of a spare buffer: under the first block of the smallest kind the allocator makes (64
+/// MiB, where all the memory can be mapped), so that none has a block of its own that is freed
+/// with it, whatever the size of the blocks.
+pub const SPARE_BUFFER_BYTES: u64 = 60 << 20;
+
+/// Makes the allocator's blocks for [`SPARE_BUFFERS`] buffers and touches them with the GPU, which
+/// is what makes a block resident (a block that is made on a frame stalls the GPU for about 6.5 ms
+/// before the first command that uses it, #236); then frees the buffers, and the blocks stay. Blocks
+/// that are there and empty are used by the buffers, so a second call makes none. A device that
+/// cannot say what its allocator has (not Vulkan) or has no room is left as it was.
+fn make_spare_blocks(device: &wgpu::Device, queue: &wgpu::Queue) {
+    if device.generate_allocator_report().is_none()
+        || device.limits().max_buffer_size < SPARE_BUFFER_BYTES
+    {
+        return;
+    }
+    let scope = device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+    let spares: Vec<wgpu::Buffer> = (0..SPARE_BUFFERS)
+        .map(|_| {
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("hardware spare block"),
+                size: SPARE_BUFFER_BYTES,
+                usage: wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            })
+        })
+        .collect();
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("hardware spare blocks"),
+    });
+    for b in &spares {
+        encoder.clear_buffer(b, 0, Some(256));
+    }
+    queue.submit([encoder.finish()]);
+    drop(spares);
+    // The buffers are freed when the GPU is done with them, in the poll.
+    if device.poll(wgpu::PollType::wait_indefinitely()).is_err() {
+        return;
+    }
+    if let Some(error) = pollster::block_on(scope.pop()) {
+        eprintln!("the spare blocks of the allocator were not made: {error}");
+    }
+}
+
+/// What the device's allocator has, for the report: how many blocks it keeps, what they reserve
+/// and what is allocated in them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DeviceMemory {
+    pub blocks: usize,
+    pub reserved_bytes: u64,
+    pub allocated_bytes: u64,
+}
+
+impl DeviceMemory {
+    /// What `device`'s allocator has, or `None` where it cannot say (see
+    /// [`wgpu::Device::generate_allocator_report`]).
+    pub fn of(device: &wgpu::Device) -> Option<Self> {
+        let report = device.generate_allocator_report()?;
+        Some(Self {
+            blocks: report.blocks.len(),
+            reserved_bytes: report.total_reserved_bytes,
+            allocated_bytes: report.total_allocated_bytes,
+        })
+    }
+}
+
 /// One cell's job for the box pass.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BoxJob {
@@ -1183,6 +1258,7 @@ impl HwScene {
         scene: &Scene,
         position: [f64; 3],
     ) -> Result<Self> {
+        make_spare_blocks(device, queue);
         let anchor = anchor_for(position);
         let tlas = Self::tlas(device, 1);
         let instances = Self::instance_buffer(device, 1);

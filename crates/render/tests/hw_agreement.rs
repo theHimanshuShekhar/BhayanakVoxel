@@ -1060,6 +1060,44 @@ fn a_draw_that_builds_a_group_that_waited_counts_it_as_the_hardwares() {
     );
 }
 
+/// The allocator has the memory blocks before the first build and keeps them (#236): the builds'
+/// scratch buffers and the pool's buffers find room, and none of the updates makes a block, which
+/// stalled the GPU for about 6.5 ms on the frame that did on the 4090.
+#[test]
+fn the_hardware_backend_has_its_spare_blocks_and_its_updates_make_no_block() {
+    let (store, mut scene) = walking_scene();
+    let mut hw =
+        Offscreen::with_backend(Resolution::native(8, 8), &scene, RtBackend::Hardware).unwrap();
+    if hw.rt().active != RtBackend::Hardware {
+        eprintln!("skipped: {:?}", hw.rt().fallback);
+        return;
+    }
+    let Some(start) = hw.device_memory() else {
+        eprintln!("skipped: the allocator cannot say what it has");
+        return;
+    };
+    // Six buffers of 60 MiB, in whatever blocks the device makes of them.
+    assert!(start.reserved_bytes >= 360 << 20, "{start:?}");
+    assert_eq!(
+        render::hw::SPARE_BUFFERS as u64 * render::hw::SPARE_BUFFER_BYTES,
+        360 << 20
+    );
+    for step in 1..=6 {
+        let camera = [
+            -60.0 + f64::from(step) * 14.0,
+            1565.0,
+            -60.0 + f64::from(step) * 9.0,
+        ];
+        if let Some(update) = scene.recentre(&store, camera).unwrap() {
+            hw.update_scene(&scene, &update).unwrap();
+        }
+    }
+    let log = hw.take_hardware_updates();
+    assert!(log.iter().any(|u| u.blas_rebuilt > 0), "{log:?}");
+    let end = hw.device_memory().unwrap();
+    assert_eq!(end.blocks, start.blocks, "{start:?} then {end:?}");
+}
+
 /// An update's phases are the parts of its cost: they add up to `prepare + build` (the bench's
 /// split of the hardware backend's frame-thread time is of these, #236), and an update that built
 /// something spent time in the plan, the recording and the submit.

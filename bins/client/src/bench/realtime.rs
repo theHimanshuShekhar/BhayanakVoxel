@@ -156,6 +156,12 @@ pub trait Gpu {
         0
     }
 
+    /// What the device's allocator keeps (`Offscreen::device_memory`): `None` with no GPU or where
+    /// it cannot say.
+    fn device_memory(&self) -> Option<render::hw::DeviceMemory> {
+        None
+    }
+
     /// The GPU's own time of each pass of the frame just drawn, by the pass's name, in
     /// milliseconds: empty with no GPU, no timers, or where this frame's times did not come in.
     fn pass_times(&self) -> Vec<(String, f64)> {
@@ -267,6 +273,10 @@ impl Gpu for OffscreenGpu<'_> {
 
     fn peak_rebuild_bytes(&self) -> u64 {
         self.gpu.peak_rebuild_bytes()
+    }
+
+    fn device_memory(&self) -> Option<render::hw::DeviceMemory> {
+        self.gpu.device_memory()
     }
 }
 
@@ -1063,6 +1073,17 @@ pub struct Memory {
     /// is the VRAM the scene takes, after its growths (a buffer that fills grows, #145: the most
     /// of the frames' is given). Reported; not gated.
     pub scene_reserved_mib: f64,
+    /// What the device's allocator keeps at the end of the run, all of the GPU's buffers and not
+    /// the scene's alone (#236): the memory blocks it holds, what they reserve, and what is
+    /// allocated in them. The allocator **keeps a block that has become empty** (the patched
+    /// `gpu-allocator`, `third_party/gpu-allocator/PATCH.md`), and the hardware backend makes
+    /// `hw::SPARE_BLOCKS` blocks of 256 MiB before its first build, so this is the memory that the
+    /// fix for the stall of a block made on a frame costs: `device_reserved_mib` less
+    /// `device_allocated_mib` is what is kept and not used. `None` where the allocator cannot say.
+    /// Reported; not gated (`scene_used_peak_mib` is).
+    pub device_blocks: Option<u64>,
+    pub device_reserved_mib: Option<f64>,
+    pub device_allocated_mib: Option<f64>,
     /// The peak **during a growth** (ADR 0004's accounting is of the buffers after it): the GPU's
     /// buffers at the most while a buffer grew, the old buffer and the new one both counted
     /// (`Tracer::peak_growth_bytes`: what the buffers held before, plus the new ones; 0 if none
@@ -3009,6 +3030,7 @@ impl<'a> Session<'a> {
 
         let work = self.world.stats().work;
         let mib = |bytes: u64| bytes as f64 / MIB;
+        let device = self.gpu.device_memory();
         let memory = Memory {
             resident_peak_mib: self.resident_peak.map(mib),
             whole_process_peak_mib: self.whole_process_peak.map(mib),
@@ -3016,6 +3038,9 @@ impl<'a> Session<'a> {
             scene_used_peak_in: self.scene_used_peak_in.clone(),
             scene_used_peak_level_bricks: self.scene_used_peak_levels.clone(),
             scene_reserved_mib: mib(self.scene_reserved_bytes),
+            device_blocks: device.map(|d| d.blocks as u64),
+            device_reserved_mib: device.map(|d| mib(d.reserved_bytes)),
+            device_allocated_mib: device.map(|d| mib(d.allocated_bytes)),
             scene_gpu_peak_growth_mib: mib(self.gpu.peak_growth_bytes()),
             scene_gpu_peak_rebuild_mib: mib(self.gpu.peak_rebuild_bytes()),
             scene_host_peak_growth_mib: mib(self.scene_host_peak_bytes),
@@ -3543,6 +3568,9 @@ mod tests {
                 scene_used_peak_in: String::new(),
                 scene_used_peak_level_bricks: Vec::new(),
                 scene_reserved_mib: 560.0,
+                device_blocks: None,
+                device_reserved_mib: None,
+                device_allocated_mib: None,
                 scene_gpu_peak_growth_mib: 600.0,
                 scene_gpu_peak_rebuild_mib: 0.0,
                 scene_host_peak_growth_mib: 600.0,
@@ -4015,6 +4043,9 @@ mod tests {
         assert_eq!(
             keys(&json["runs"][0]["memory"]),
             [
+                "device_allocated_mib",
+                "device_blocks",
+                "device_reserved_mib",
                 "resident_peak_mib",
                 "scene_gpu_peak_growth_mib",
                 "scene_gpu_peak_rebuild_mib",
