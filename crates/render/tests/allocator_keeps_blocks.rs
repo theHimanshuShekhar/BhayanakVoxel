@@ -1,7 +1,8 @@
-//! The allocator keeps a memory block that has become empty (#236): the patched `gpu-allocator`
-//! (`third_party/gpu-allocator/PATCH.md`). The published crate destroys it when it is not the last
-//! one, and the next allocation that finds no room makes it again, which stalled the GPU for about
-//! 6.5 ms on the 4090 on the frame that needed it.
+//! The allocator keeps up to two memory blocks per memory type that have become empty (#236): the
+//! patched `gpu-allocator` (`third_party/gpu-allocator/PATCH.md`). The published crate destroys an
+//! empty block unless it is the type's last active general block, and the next allocation that
+//! finds no room makes it again, which stalled the GPU for about 6.5 ms on the 4090 on the frame
+//! that needed it.
 
 use render::hw::DeviceMemory;
 
@@ -51,7 +52,8 @@ fn two_blocks_that_are_empty_again_are_kept_and_the_rest_are_freed() {
         .expect("device poll failed");
     let after = DeviceMemory::of(&device).unwrap();
     assert_eq!(after.allocated_bytes, before.allocated_bytes, "{after:?}");
-    // Two are kept, empty (upstream keeps one: the last), and the others are gone.
+    // Two are kept, empty, and the others are gone (upstream keeps none here: the device has
+    // another block in use, so none of these is the last one).
     assert_eq!(
         (after.blocks, after.empty_blocks),
         (before.blocks + 2, 2),
