@@ -198,9 +198,18 @@ pub fn found() -> Profile {
     *FOUND.get().expect("profile() sets what it found")
 }
 
-/// Whether [`profile`] is lower than the machine: a flag or the environment held it down.
+/// Whether [`profile`] is different from the machine: a flag or the environment held something
+/// down (threads, memory, video memory or ray queries).
 pub fn constrained() -> bool {
     profile() != found()
+}
+
+/// Whether [`profile`] has fewer threads or less memory than the machine was found to have: the
+/// run is on a smaller machine than this one, which is what a benchmark's gates are not budgeted
+/// for. (Turning off ray queries or limiting video memory alone leaves the machine as it is.)
+pub fn lowered() -> bool {
+    let (profile, found) = (profile(), found());
+    profile.threads < found.threads || profile.memory < found.memory
 }
 
 /// `found` held to what the environment asks, read through `get` (a function, so that a test does
@@ -266,16 +275,7 @@ pub fn available_memory() -> Option<u64> {
         let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
         let free = meminfo_kib(&meminfo, "MemAvailable")? << 10;
         let read = |path: &str| std::fs::read_to_string(path).ok();
-        let room = cgroup_room(
-            read("/sys/fs/cgroup/memory.max").as_deref(),
-            read("/sys/fs/cgroup/memory.current").as_deref(),
-        )
-        .or_else(|| {
-            cgroup_room(
-                read("/sys/fs/cgroup/memory/memory.limit_in_bytes").as_deref(),
-                read("/sys/fs/cgroup/memory/memory.usage_in_bytes").as_deref(),
-            )
-        });
+        let room = container_room(read, &read("/proc/self/cgroup").unwrap_or_default());
         Some(room.map_or(free, |room| room.min(free)))
     }
     #[cfg(windows)]
@@ -300,17 +300,94 @@ pub fn available_memory() -> Option<u64> {
     None
 }
 
-/// What is left of a container's memory limit, from the texts of the limit and of the use: cgroup
-/// v2's `memory.max` (a number or `max`) and `memory.current`, or v1's `memory.limit_in_bytes`
-/// (a number near 2^63 when there is no limit) and `memory.usage_in_bytes`. `None` if there is no
-/// limit, or the texts are not numbers.
+/// What is left of a memory limit, from the texts of the limit and of the use, less the page cache
+/// that the kernel can take back (`inactive_file` of `memory.stat`, `stat` and `cache_key`: it is
+/// counted in the use and is not used memory, so a container that has only read files is not
+/// short). cgroup v2's `memory.max` is a number or `max` and v1's `memory.limit_in_bytes` is a
+/// number near 2^63 when there is no limit. `None` if there is no limit, or the texts are not
+/// numbers.
 #[cfg(any(target_os = "linux", test))]
-fn cgroup_room(limit: Option<&str>, used: Option<&str>) -> Option<u64> {
+fn cgroup_room(
+    limit: Option<&str>,
+    used: Option<&str>,
+    stat: Option<&str>,
+    cache_key: &str,
+) -> Option<u64> {
     /// v1 says "no limit" as the largest page-aligned number; nothing has this much memory.
     const NO_LIMIT: u64 = 1 << 60;
     let limit: u64 = limit?.trim().parse().ok().filter(|&l| l < NO_LIMIT)?;
     let used: u64 = used?.trim().parse().ok()?;
-    Some(limit.saturating_sub(used))
+    let cache = stat
+        .and_then(|text| stat_value(text, cache_key))
+        .unwrap_or(0);
+    Some(limit.saturating_sub(used.saturating_sub(cache)))
+}
+
+/// The number after `key` in the text of a `memory.stat`.
+#[cfg(any(target_os = "linux", test))]
+fn stat_value(text: &str, key: &str) -> Option<u64> {
+    text.lines().find_map(|line| {
+        let (name, value) = line.split_once(' ')?;
+        (name == key).then(|| value.trim().parse().ok())?
+    })
+}
+
+/// The directories of `path` and of each ancestor of it, up to the root (`/`), nearest first:
+/// `/a/b` is `/a/b`, `/a` and `/`.
+#[cfg(any(target_os = "linux", test))]
+fn with_ancestors(path: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut at = path.trim_end_matches('/');
+    loop {
+        out.push(if at.is_empty() { "/" } else { at }.to_string());
+        match at.rfind('/') {
+            Some(cut) => at = &at[..cut],
+            None => return out,
+        }
+    }
+}
+
+/// The room the cgroups of the process leave it: the least, over the process's own cgroup and each
+/// of its ancestors up to the root, of each one's limit less its use, in either version of cgroups
+/// (a limit may be on any of them: a container's is on the group the container's runtime made, and
+/// the process may be in a group below it). `proc_cgroup` is the text of `/proc/self/cgroup` and
+/// `read` reads a file. `None` if no group has a limit. A directory that is not there is skipped
+/// (inside a container the namespace's root is `/`, and the paths of the host are not visible).
+#[cfg(any(target_os = "linux", test))]
+fn container_room(read: impl Fn(&str) -> Option<String>, proc_cgroup: &str) -> Option<u64> {
+    let mut rooms = Vec::new();
+    for line in proc_cgroup.lines() {
+        let mut parts = line.splitn(3, ':');
+        let (_id, controllers, path) = (parts.next(), parts.next()?, parts.next()?);
+        // v2 is `0::/path`; v1 has a line for each set of controllers, and ours has `memory`.
+        let (root, limit, used, cache_key) = if controllers.is_empty() {
+            (
+                "/sys/fs/cgroup",
+                "memory.max",
+                "memory.current",
+                "inactive_file",
+            )
+        } else if controllers.split(',').any(|c| c == "memory") {
+            (
+                "/sys/fs/cgroup/memory",
+                "memory.limit_in_bytes",
+                "memory.usage_in_bytes",
+                "total_inactive_file",
+            )
+        } else {
+            continue;
+        };
+        for dir in with_ancestors(path) {
+            let file = |name: &str| read(&format!("{root}{}/{name}", dir.trim_end_matches('/')));
+            rooms.extend(cgroup_room(
+                file(limit).as_deref(),
+                file(used).as_deref(),
+                file("memory.stat").as_deref(),
+                cache_key,
+            ));
+        }
+    }
+    rooms.into_iter().min()
 }
 
 /// The kibibytes of `key` in the text of `/proc/meminfo`.
@@ -330,7 +407,8 @@ pub enum Pinning {
     /// The profile has all the machine's processors, or the system has no way to hold a process
     /// to some (neither is a failure).
     NotNeeded,
-    /// The process, with every thread it has and will make, runs on these logical processors only.
+    /// The process, with the threads it has and will make, runs on these logical processors only
+    /// (on Linux but for a thread that sets its own mask, as Mesa's shader cache does).
     Pinned(Vec<usize>),
     /// The system refused or could not say which processors the process may use: the process runs
     /// as before, on all of them, with [`threads`] threads of work.
@@ -365,11 +443,16 @@ pub fn cpus_for(allowed: &[usize], wanted: usize) -> Option<Vec<usize>> {
 }
 
 /// Holds the process to [`threads`] logical processors when the profile has fewer than the machine
-/// ([`constrained`]), so that **every** thread of it (the frame thread, the scene thread, the
-/// simulation, the driver's and the system's helpers) competes for them, as it would on a machine
+/// ([`constrained`]), so that the threads of it (the frame thread, the scene thread, the
+/// simulation, the driver's and the system's helpers) compete for them, as they would on a machine
 /// that small, and not only the threads that [`threads`] counts (#264). Call it first thing in
 /// `main`, after [`take_flags`], before any thread is made: threads inherit the mask (on Linux the
 /// ones already there are held too). It cannot raise what the process may use.
+///
+/// **On Windows the process's mask binds every thread. On Linux a thread can set its own mask, and
+/// one does: Mesa's shader disk-cache thread (`client:disk$0`) resets its affinity, so it runs on
+/// any processor and escapes the pin** (it is a thread of little work). The threads the game
+/// makes stay on the processors.
 pub fn pin_to_profile() -> Pinning {
     PINNING
         .get_or_init(|| {

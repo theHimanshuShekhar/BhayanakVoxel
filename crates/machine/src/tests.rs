@@ -125,26 +125,189 @@ fn the_machine_has_threads_and_memory() {
 }
 
 #[test]
-fn a_containers_room_is_its_limit_less_its_use_in_either_version_of_cgroups() {
+fn a_limits_room_is_the_limit_less_the_use_that_is_not_page_cache_in_either_version_of_cgroups() {
+    let room = |limit, used, stat, key| cgroup_room(limit, used, stat, key);
     // v2: `memory.max` is a number or `max`.
     assert_eq!(
-        cgroup_room(Some("8589934592\n"), Some("1073741824\n")),
+        room(
+            Some("8589934592\n"),
+            Some("1073741824\n"),
+            None,
+            "inactive_file"
+        ),
         Some(7 * GIB)
     );
-    assert_eq!(cgroup_room(Some("max\n"), Some("1073741824\n")), None);
+    assert_eq!(
+        room(Some("max\n"), Some("1073741824\n"), None, "inactive_file"),
+        None
+    );
     // v1: the limit is a number near 2^63 when there is none.
     assert_eq!(
-        cgroup_room(Some("4294967296"), Some("1073741824")),
+        room(
+            Some("4294967296"),
+            Some("1073741824"),
+            None,
+            "total_inactive_file"
+        ),
         Some(3 * GIB)
     );
     assert_eq!(
-        cgroup_room(Some("9223372036854771712"), Some("1073741824")),
+        room(Some("9223372036854771712"), Some("1073741824"), None, "x"),
         None
     );
+    // The page cache the kernel can take back is not used memory: 1 GiB used, 600 MiB of it
+    // inactive files, so 3 GiB + 600 MiB of a 4 GiB limit is left.
+    let stat = "anon 100\nfile 700\ninactive_file 629145600\nactive_file 5\n";
+    assert_eq!(
+        room(
+            Some("4294967296"),
+            Some("1073741824"),
+            Some(stat),
+            "inactive_file"
+        ),
+        Some(3 * GIB + 600 * (1 << 20))
+    );
+    // v1 names it `total_inactive_file`, and `inactive_file` there (this group's only) is not it.
+    let v1 = "cache 1\ninactive_file 1\ntotal_inactive_file 629145600\n";
+    assert_eq!(
+        room(
+            Some("4294967296"),
+            Some("1073741824"),
+            Some(v1),
+            "total_inactive_file"
+        ),
+        Some(3 * GIB + 600 * (1 << 20))
+    );
+    // A key that is missing, or more cache than use, is no change or no room taken, not a wrap.
+    assert_eq!(
+        room(Some("1000"), Some("500"), Some("anon 1\n"), "inactive_file"),
+        Some(500)
+    );
+    assert_eq!(
+        room(
+            Some("1000"),
+            Some("500"),
+            Some("inactive_file 900\n"),
+            "inactive_file"
+        ),
+        Some(1000)
+    );
     // Use over the limit is no room, not a wrap; a missing file or text is no limit.
-    assert_eq!(cgroup_room(Some("1000"), Some("5000")), Some(0));
-    assert_eq!(cgroup_room(None, Some("1")), None);
-    assert_eq!(cgroup_room(Some("1000"), None), None);
+    assert_eq!(room(Some("1000"), Some("5000"), None, "x"), Some(0));
+    assert_eq!(room(None, Some("1"), None, "x"), None);
+    assert_eq!(room(Some("1000"), None, None, "x"), None);
+    assert_eq!(stat_value("a 1\nb 22\n", "b"), Some(22));
+    assert_eq!(stat_value("a 1\nab 22\n", "b"), None);
+}
+
+#[test]
+fn the_ancestors_of_a_cgroup_path_go_up_to_the_root() {
+    assert_eq!(with_ancestors("/"), ["/"]);
+    assert_eq!(with_ancestors(""), ["/"]);
+    assert_eq!(
+        with_ancestors("/user.slice/user-1000.slice/session-2.scope"),
+        [
+            "/user.slice/user-1000.slice/session-2.scope",
+            "/user.slice/user-1000.slice",
+            "/user.slice",
+            "/"
+        ]
+    );
+    assert_eq!(with_ancestors("/a/"), ["/a", "/"]);
+}
+
+/// A fake file system of the files that matter to the memory read.
+fn files<'a>(list: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+    move |path| {
+        list.iter()
+            .find(|(name, _)| *name == path)
+            .map(|(_, text)| text.to_string())
+    }
+}
+
+#[test]
+fn the_room_is_the_least_over_the_processs_own_cgroup_and_its_ancestors_in_v2() {
+    // The process is in /a/b/c. The limit of 2 GiB is on /a, which the container's runtime made;
+    // /a/b/c has none (`max`) and the root has none (no file). /a/b/c has used 1.5 GiB, 1 GiB of
+    // it page cache; /a has used 1.5 GiB of its own, 0.25 of it cache. The nearest group alone
+    // says no limit; the least is /a's: 2 GiB less 1.25.
+    let proc_cgroup = "0::/a/b/c\n";
+    let fs = files(&[
+        ("/sys/fs/cgroup/a/b/c/memory.max", "max\n"),
+        ("/sys/fs/cgroup/a/b/c/memory.current", "1610612736\n"),
+        (
+            "/sys/fs/cgroup/a/b/c/memory.stat",
+            "inactive_file 1073741824\n",
+        ),
+        ("/sys/fs/cgroup/a/memory.max", "2147483648\n"),
+        ("/sys/fs/cgroup/a/memory.current", "1610612736\n"),
+        ("/sys/fs/cgroup/a/memory.stat", "inactive_file 268435456\n"),
+    ]);
+    assert_eq!(
+        container_room(&fs, proc_cgroup),
+        Some(GIB * 2 - (GIB + GIB / 4))
+    );
+    // A nearer, smaller limit wins.
+    let fs = files(&[
+        ("/sys/fs/cgroup/a/b/c/memory.max", "1073741824"),
+        ("/sys/fs/cgroup/a/b/c/memory.current", "536870912"),
+        ("/sys/fs/cgroup/a/memory.max", "2147483648"),
+        ("/sys/fs/cgroup/a/memory.current", "0"),
+    ]);
+    assert_eq!(container_room(&fs, proc_cgroup), Some(GIB / 2));
+    // No limit anywhere is none; a path that is not visible (a container's namespace) is skipped
+    // and the namespace's root is read.
+    assert_eq!(container_room(files(&[]), proc_cgroup), None);
+    let fs = files(&[
+        ("/sys/fs/cgroup/memory.max", "4294967296"),
+        ("/sys/fs/cgroup/memory.current", "1073741824"),
+    ]);
+    assert_eq!(container_room(&fs, proc_cgroup), Some(3 * GIB));
+    assert_eq!(container_room(&fs, "0::/\n"), Some(3 * GIB));
+}
+
+#[test]
+fn the_room_is_read_in_v1_from_the_memory_controllers_own_group_and_a_hybrid_has_both() {
+    let proc_cgroup = "12:cpu,cpuacct:/docker/x\n11:memory:/docker/x\n0::/system.slice/x\n";
+    let fs = files(&[
+        // The cpu line is not read.
+        (
+            "/sys/fs/cgroup/cpu,cpuacct/docker/x/memory.limit_in_bytes",
+            "1",
+        ),
+        (
+            "/sys/fs/cgroup/memory/docker/x/memory.limit_in_bytes",
+            "3221225472",
+        ),
+        (
+            "/sys/fs/cgroup/memory/docker/x/memory.usage_in_bytes",
+            "2147483648",
+        ),
+        (
+            "/sys/fs/cgroup/memory/docker/x/memory.stat",
+            "total_inactive_file 536870912\n",
+        ),
+        // No limit on the parent (v1's "no limit").
+        (
+            "/sys/fs/cgroup/memory/docker/memory.limit_in_bytes",
+            "9223372036854771712",
+        ),
+        (
+            "/sys/fs/cgroup/memory/docker/memory.usage_in_bytes",
+            "2147483648",
+        ),
+        // And a v2 group of the hybrid, with the least room of them.
+        ("/sys/fs/cgroup/system.slice/x/memory.max", "1073741824"),
+        ("/sys/fs/cgroup/system.slice/x/memory.current", "1073741824"),
+    ]);
+    // v1: 3 GiB less (2 GiB less 0.5 cache) = 1.5 GiB; v2: 0. The least.
+    assert_eq!(container_room(&fs, proc_cgroup), Some(0));
+    assert_eq!(
+        container_room(&fs, "11:memory:/docker/x\n"),
+        Some(3 * GIB / 2)
+    );
+    // Lines that are not understood are skipped.
+    assert_eq!(container_room(&fs, "nonsense\n\n"), None);
 }
 
 #[test]
@@ -277,4 +440,40 @@ fn flags_are_taken_out_of_the_arguments_wherever_they_are_and_the_rest_is_kept_i
 fn the_low_end_profile_describes_itself() {
     let text = Profile::LOW_END.describe();
     assert!(text.contains("4 threads") && text.contains("5.0 GiB") && text.contains("off"));
+}
+
+/// The mask is really set on Windows: the process is held to one processor, reads it back, and is
+/// let go (nextest runs each test in a process of its own, and the mask is put back for `cargo
+/// test`, which does not).
+#[cfg(windows)]
+#[test]
+fn the_process_is_held_to_the_processor_it_is_pinned_to() {
+    use windows_sys::Win32::System::Threading::{
+        GetCurrentProcess, GetProcessAffinityMask, SetProcessAffinityMask,
+    };
+    // SAFETY: the pseudo-handle of the current process is valid, and the masks are plain integers.
+    let mask = || unsafe {
+        let (mut mine, mut system) = (0usize, 0usize);
+        assert_ne!(
+            GetProcessAffinityMask(GetCurrentProcess(), &mut mine, &mut system),
+            0
+        );
+        mine
+    };
+    let before = mask();
+    let allowed: Vec<usize> = (0..usize::BITS as usize)
+        .filter(|&cpu| before >> cpu & 1 == 1)
+        .collect();
+    if allowed.len() < 2 {
+        return; // a runner of one processor has nothing to cut
+    }
+    let pinned = pin(1);
+    let now = mask();
+    // SAFETY: as above, putting back what was read.
+    unsafe {
+        assert_ne!(SetProcessAffinityMask(GetCurrentProcess(), before), 0);
+    }
+    assert_eq!(pinned, Pinning::Pinned(vec![allowed[0]]));
+    assert_eq!(now, 1usize << allowed[0]);
+    assert_eq!(mask(), before);
 }
