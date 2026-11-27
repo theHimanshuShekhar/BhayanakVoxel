@@ -1683,7 +1683,15 @@ fn main() -> Result<ExitCode, Box<dyn Error>> {
     // `--profile low-end`, `--threads N` and the rest of the machine's overrides (#264), before
     // anything reads the machine.
     let args = machine::take_flags(std::env::args().skip(1).collect())?;
-    eprintln!("machine: {}", machine::profile().describe());
+    // A constrained profile holds the whole process to its threads' processors, so that the frame
+    // thread, the scene thread, the simulation and the driver's threads share them too.
+    let pinning = machine::pin_to_profile();
+    eprintln!(
+        "machine: {}; {}; starting LOD bias {}",
+        machine::profile().describe(),
+        pinning.describe(),
+        default_bias()
+    );
     let mut args = args.into_iter();
     match args.next().as_deref() {
         Some("bench") => return Ok(bench::main(args)),
@@ -1715,9 +1723,9 @@ mod tests {
         for memory in [8 * gib, 16 * gib, 64 * gib, u64::MAX] {
             assert_eq!(bias_for(memory), DEFAULT_BIAS, "{memory} bytes");
         }
-        // The low-end reference (8 GB, about 6 GiB free): coarser, but not by much.
+        // The low-end reference (8 GB, 5 GiB free): coarser, but not by much.
         let low = bias_for(machine::Profile::LOW_END.memory);
-        assert!((1.1..=1.3).contains(&low), "{low}");
+        assert!((1.3..=1.4).contains(&low), "{low}");
         // Less and less memory is coarser and coarser, to a ceiling, and nothing makes it fail.
         let mut last = low;
         for memory in [4 * gib, 3 * gib, 2 * gib, gib, 0] {
