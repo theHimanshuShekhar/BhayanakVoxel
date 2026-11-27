@@ -16,9 +16,14 @@ Add to it when you find another or change one.
   agent to report (below).
 - **Per-thread CPU:** `/proc/PID/task/*/stat` sampled every 250 ms (the process's CPU use and how
   many of its threads were running). A stage on "1.0 cores" is serial.
-- **Low end:** `--profile low-end` (or `BHAYANAK_PROFILE=low-end`): 4 threads, 6 GiB of memory, 4 GB
-  of video memory and no ray queries. Here it runs on the same CPU held to 4 threads; it is not a
-  slower CPU, so the low-end times are what 4 threads of this CPU do.
+- **Low end:** `--profile low-end` (or `BHAYANAK_PROFILE=low-end`): 4 threads, 5 GiB of free memory (the
+  8 GB machine's: Windows at idle leaves 4.5 to 5 GiB), 4 GB of video memory and no ray queries.
+  The process is **pinned to 4 logical processors** (`sched_setaffinity` on Linux,
+  `SetProcessAffinityMask` on Windows), so that every thread of it (the frame thread, the scene
+  thread, the simulation, the driver's) competes for them as on a 4-thread machine; the processors
+  are the first 4 the process was allowed (here 2 to 5) and are reported in
+  `machine.profile.pinned_cpus`. It is not a slower CPU, so the low-end times are what 4 threads of
+  this CPU do. If the system refuses, the run goes on unpinned and says so.
 - **Before** is `main` at 89273fd, **after** is this branch, the same box and seed (`0x5e17b93e79b28f9e`
   is the hash of the 2048-texel map at both, and at 1, 4 and 8 threads).
 
@@ -32,7 +37,8 @@ Everything below that says "from the machine" reads it in `crates/machine` and n
 | `threads()` | the machine's | 4 (or fewer if the machine has fewer) | 1 |
 | `bulk_threads()` (work the frame thread must not wait behind) | threads − 1 | 3 | 1 |
 | `loader_workers()` | threads − 2 | 2 | 1 |
-| memory | `MemAvailable` (and the cgroup's limit; Windows `GlobalMemoryStatusEx`) | 6 GiB | 1 GiB, in `bias_for` |
+| memory | the least of `MemAvailable` and the cgroup's room (v2 `memory.max` less `memory.current`, v1 `memory.limit_in_bytes` less `memory.usage_in_bytes`); Windows `GlobalMemoryStatusEx` | 5 GiB | 1 GiB, in `bias_for` |
+| processors | all the process may use | pinned to 4 of them | |
 | video memory | not read (see below) | 4 GiB | none read |
 | ray queries | the adapter's | off (the compute tracer) | |
 
@@ -47,14 +53,14 @@ prints the profile it runs with on its first line (`machine: ...`).
 
 | # | Where | Before | After | Low end | High end |
 | --- | --- | --- | --- | --- | --- |
-| 1 | `WorldMap` build, `crates/planet-gen/src/world_map.rs` (`erode`, `drainage`, `normalise`, `area_weights`) | **23.7 s** at 2048 on 8 threads: raw 4.7 s, normalise 0.15 s, **erode 14.6 s, drainage 1.4 s** (the sampler saw one or two threads busy in them), texels 2.8 s | **11.0 s** (12.6 s with the box busy): raw 4.95 s, normalise 37 ms, **erode 2.96 s, drainage 0.41 s**, texels 2.64 s. The same hash | 4 threads: 17.1 s, the same hash | pieces are fixed: 8 192 texels (`PIECE`), 8 rows for the erosion, so more threads are used up to the pieces |
-| 2 | The map's disk cache, `world_map/cache.rs` | every launch built the map: 24 s before the first frame | **hit 157 ms** (a 201 MB file, read and checked on all threads; 80 times faster than the build), written in 236 ms, the same hash | the same file (the key is the generator version, a hash of the parameters, seed, size, radius) | a corrupt, short or other-key file is rebuilt and written over; `BHAYANAK_NO_MAP_CACHE=1` turns it off |
+| 1 | `WorldMap` build, `crates/planet-gen/src/world_map.rs` (`erode`, `drainage`, `normalise`, `area_weights`) | **23.7 s** at 2048 on 8 threads: raw 4.7 s, normalise 0.15 s, **erode 14.6 s, drainage 1.4 s**, texels 2.8 s. On `main` the erosion already ran on all threads (`par_fill`: one contiguous share a thread, threads made again for each of its 128 passes) and was the slow stage because each texel found its 4 neighbours through `split`, `step` and `join`; `normalise`, `area_weights` and the drainage (a serial highest-first walk) were serial | **11.0 s** (12.6 s with the box busy): raw 4.95 s, normalise 37 ms, **erode 2.96 s, drainage 0.41 s**, texels 2.64 s. The same hash. **The erosion's gain is from reading the interior texels' neighbours by index (the seams still use `step`) and from fixed pieces, and I did not separate the two**; the drainage's is from the leaf-first rounds on all threads, `normalise` and `area_weights` from pieces | 4 threads pinned to 4 processors: 17.8 to 19.5 s, the same hash (4 unpinned, earlier: 17.1 s) | pieces are fixed: 8 192 texels (`PIECE`), 8 rows for the erosion, so more threads are used up to the pieces |
+| 2 | The map's disk cache, `world_map/cache.rs` | every launch built the map: 24 s before the first frame | **hit 157 ms** (a 201 MB file, read and checked on all threads; 80 times faster than the build), written in 236 ms, the same hash | the same file. The key is the generator version, the seed, size and radius, and the hash of a 16-texel map that the build makes at the radius (a few ms) with a hash of its main constants: any input of the build that reaches a texel is another key, version bump or not | a corrupt, short or other-key file is rebuilt and written over; temporary files of killed launches older than 5 minutes are deleted on the next write; the folder keeps the 3 maps used last (a hit is a use); `BHAYANAK_NO_MAP_CACHE=1` turns it off |
 | 3 | `caves::fill`, `bins/client/src/bench/caves.rs`, which the look-dev's shot build runs | **362.75 s on exactly one core** at the first shot (no worker alive): one thread made every child of every brick in turn | **92 to 131 s**, 3.4 to 3.7 cores. Children are made on `bulk_threads()` in rounds of 400 and held in the order the 400 were taken in. What is left is row 7 | 3 generating threads, the same order and bricks | bounded by row 7, not by generation (48 to 62 s of it on 7 threads) |
 | 4 | `look_at_due`, `holes`, `par_map` and `map_shared`, `crates/render/src/scene/select.rs` | `MOST_THREADS = 4` (and half the machine's) for the look at due entries; `PARALLEL_FROM` 32 768; the holes: every thread walked the whole table to take every n-th node (more threads were no faster); a share a thread, so a share with a slow node left the rest idle | all `bulk_threads()`; pieces of a fixed 2 048 entries (`LOOK_PIECE`), the next free thread takes the next, results in piece order; `PARALLEL_FROM` is two pieces; the holes list the split keys in one pass and share them in pieces | 3 threads | 31 on a 32-thread machine, not 4. **Not measured on the 4090** |
 | 5 | `par_bricks` (the spawn ring, `generate_region`, `generate_planet`, `Planet::guard`) and `Planet::guard_in` (the Guard's cells), `planet-gen` | slabs of constant x (about a hundred for the spawn ring, so that a slab that held the surface left the others idle at the end) | columns of constant x and y, the next free thread takes the next; a cell a piece in `guard_in`. Output in the order of x, y, z whatever the threads (it was in no order) | `threads()` = 4 | all `threads()` |
 | 6 | `loader::workers_for`, `GUARD_WORKERS` | `cores − 2`; the Guard's background share 2 workers whatever the workers | `workers_for` is `machine::loader_workers_for`, so a constrained profile gets 2 workers on 4 threads; the Guard's share is `max(2, workers / 3)` (`guard_share`) | 2 workers; the Guard has all but one when the queue is empty, one beside it | 30 workers on a 32-thread machine, 10 on the Guard beside the queue (was 2) |
 | 7 | **Not fixed:** `Selection::arrived` and `Scene::arrive`, the scene thread's tree update (`select.rs:1911`, `rings.rs`) | 43 to 54 s of the shot fill's 92 to 131 s, on one core | the same: 40 s of it is `revisit_whole_as` (about 17 ms per round of 400 parents), 11.7 s the recheck of the neighbours; `show_diff` (region repacking, `rings.rs:1316`) another 10 to 11 s | | follow-up 1 below |
-| 8 | The LOD bias the client starts at, `bias_for` in `bins/client/src/main.rs` | 1.0 whatever the memory | 1.0 where the machine has the room (`MEMORY_AT_DEFAULT_BIAS` 7 GiB, with 1 GiB kept free); coarser in the square root of the shortfall, up to 3.0, below that. The tables (`room_for`, `budget_for`, `expected_words`) scale with `d0²`, so a larger bias is a smaller resident set. A multiple of 0.05 | the low-end reference (6 GiB) gets **1.2**; never fails, never below the Guard and the ring | the ceiling is the default 1.0: spending spare memory and GPU on quality is #230's |
+| 8 | The LOD bias the client starts at, `bias_for` in `bins/client/src/main.rs` | 1.0 whatever the memory | 1.0 where the machine has the room (`MEMORY_AT_DEFAULT_BIAS` 7 GiB with 1 GiB kept free: **8 GiB free**); coarser in the square root of the shortfall, up to 3.0, below that. The tables (`room_for`, `budget_for`, `expected_words`) scale with `d0²`, so a larger bias is a smaller resident set. A multiple of 0.05. **The report says it** (`machine.profile.starting_bias`) and a full-size real-time run of the default profile that did not start at 1.0 has `starting_bias` in `gates.over`: the gates are budgeted for 1.0 | the low-end reference (5 GiB) gets **1.35**; never fails, never below the Guard and the ring | the ceiling is the default 1.0: spending spare memory and GPU on quality is #230's |
 | 9 | The constrained profile's ray queries, `request_gpu_for` in `crates/render/src/lib.rs` | the adapter's | `ray_queries = false` removes `EXPERIMENTAL_RAY_QUERY` from the requested features, so the compute tracer runs on any machine | the compute tracer | the adapter's |
 
 Rows 1 to 3 are what the owner saw: the load, and the look-dev's shot build.
@@ -72,8 +78,8 @@ For the owner. None is filed (the ticket said to list them).
    ticket of its own. A round of 4 000 instead of 400 took the fill from 110 s to 92.65 s (the
    part of `arrive` that grows with the number of rounds falls) but it changes the order the bricks
    are loaded in, which the look-dev's stills depend on, so it is not done here.
-2. **Video memory is not read.** `wgpu` does not expose it. `Profile::video_memory` exists as an
-   override (`--video-memory-mib`) and **no budget reads it yet**: the scene's buffers and the
+2. **Video memory is not read.** `wgpu` does not expose it. `Profile::video_memory` is only what
+   `--video-memory-mib` or the low-end profile's 4 GiB says, and **no budget reads it**: the scene's buffers and the
    resident set are sized from the system memory and `d0²`. A read through the adapter's raw handle
    (Vulkan's memory heaps, DXGI's `QueryVideoMemoryInfo`) is a ticket; the 4 GB low-end figure is
    what the compute tracer's budgets should then be checked against on a GTX 1650.
@@ -110,10 +116,19 @@ Windows artifact: `client.exe --profile low-end bench --streaming --real-time`):
 - **The CPU utilisation during the load:** per-thread CPU of the client process from the start to
   the first frame (how many threads were at 100%, not Task Manager's total). Before this change the
   map's erosion and drainage ran at about one core for 16 s of the 24 on the dev box.
-- **`resident_peak_mib` on the low-end profile:** it must be under the profile's 6 GiB. The 7 GiB of
+- **`resident_peak_mib` on the low-end profile:** it must be under the profile's 5 GiB (it starts at
+  bias 1.35, which the estimate puts at about 3.9 GiB). The 7 GiB of
   `MEMORY_AT_DEFAULT_BIAS` is derived from the 6.66 GiB measured after the fill (#167) and is the
-  estimate this run checks; the Windows memory read (`GlobalMemoryStatusEx`) was written on Linux
-  and is checked by `machine: ...` on that run's first line.
+  estimate this run checks. The report's `machine.profile` says the profile, the processors the run
+  was pinned to, the memory found and the starting bias; the Windows memory read
+  (`GlobalMemoryStatusEx`) and the pinning (`SetProcessAffinityMask`) are run by CI's tests and by
+  this run, and `machine: ...` on its first line says what they found.
+- **The scene's lag and the scene thread's latency**, against `main`: `gates.scene_lag_d0_max` (and
+  every latency of the scene thread the report has: the paths' `scene_lag_d0_max`, the settle times,
+  the soft misses of the scene thread). The look at due entries went from at most 4 threads at normal
+  priority, starting at 32 768 entries, to `bulk_threads()` at the lowered priority of the client's
+  workers, starting at 4 096. It should be faster on the 4090 (more threads) and is not measured
+  there: the run compares it with `main`'s, and a rise is this change's.
 
 ## Rules this file keeps
 
