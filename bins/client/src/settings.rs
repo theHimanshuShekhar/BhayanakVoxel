@@ -5,7 +5,8 @@
 //! queries do not suit. The overlay changes it at run time and the window saves it at once.
 //!
 //! It is one small TOML file, `settings.toml`, in the platform's per-user config directory:
-//! `%APPDATA%\BhayanakVoxel\` on Windows, `$XDG_CONFIG_HOME/BhayanakVoxel/` or
+//! `%LOCALAPPDATA%\BhayanakVoxel\` on Windows (not the roaming `%APPDATA%`: the setting depends on
+//! this machine's GPU, so it must not follow the player to another one), `$XDG_CONFIG_HOME/BhayanakVoxel/` or
 //! `~/.config/BhayanakVoxel/` elsewhere. `BHAYANAK_SETTINGS` names another file (for a test, or a
 //! machine with no home). A file that is missing is the defaults; one that cannot be read or parsed
 //! is the defaults too, with a warning, and is left as it is until the player changes a setting. A key that
@@ -13,7 +14,7 @@
 
 use std::ffi::OsString;
 use std::fs;
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use render::RtBackend;
@@ -115,13 +116,21 @@ impl Settings {
         if let Some(directory) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
             fs::create_dir_all(directory)?;
         }
+        // A name of this process's own, so that two games saving at once do not write one file.
         let mut temporary: OsString = path.as_os_str().to_owned();
-        temporary.push(".tmp");
+        temporary.push(format!(".{}.tmp", std::process::id()));
         let temporary = PathBuf::from(temporary);
-        fs::write(&temporary, self.to_text())?;
-        fs::rename(&temporary, path).inspect_err(|_| {
-            let _ = fs::remove_file(&temporary);
-        })
+        let written = (|| {
+            let mut file = fs::File::create(&temporary)?;
+            file.write_all(self.to_text().as_bytes())?;
+            // On the disk before the rename, so that a crash leaves the old file or the new one.
+            file.sync_all()
+        })();
+        written
+            .and_then(|()| fs::rename(&temporary, path))
+            .inspect_err(|_| {
+                let _ = fs::remove_file(&temporary);
+            })
     }
 }
 
@@ -134,7 +143,7 @@ pub fn path_in(var: impl Fn(&str) -> Option<OsString>, windows: bool) -> Option<
         return Some(PathBuf::from(path));
     }
     let directory = if windows {
-        PathBuf::from(set("APPDATA")?)
+        PathBuf::from(set("LOCALAPPDATA")?)
     } else if let Some(config) = set("XDG_CONFIG_HOME") {
         PathBuf::from(config)
     } else {
@@ -270,10 +279,20 @@ mod tests {
             Some(PathBuf::from("/x/BhayanakVoxel/settings.toml"))
         );
         assert_eq!(
-            path_in(env(&[("APPDATA", "C:/Users/p/AppData/Roaming")]), true),
+            path_in(
+                env(&[
+                    ("LOCALAPPDATA", "C:/Users/p/AppData/Local"),
+                    ("APPDATA", "C:/Users/p/AppData/Roaming")
+                ]),
+                true
+            ),
             Some(PathBuf::from(
-                "C:/Users/p/AppData/Roaming/BhayanakVoxel/settings.toml"
+                "C:/Users/p/AppData/Local/BhayanakVoxel/settings.toml"
             ))
+        );
+        assert_eq!(
+            path_in(env(&[("APPDATA", "C:/Users/p/AppData/Roaming")]), true),
+            None
         );
         assert_eq!(path_in(env(&[]), false), None);
         assert_eq!(path_in(env(&[("HOME", "")]), false), None);

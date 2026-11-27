@@ -1,7 +1,9 @@
-//! Which way rays find the Planet, and what the hardware way costs (#50, a spike): the report's
-//! `rt` block. `--rt-backend compute|hw|both` (see `docs/agents/benchmarking.md`).
+//! Which way rays find the Planet, and what the hardware way costs (#50): the report's
+//! `rt` block. `--rt-backend auto|compute|hw|hw-nearest|both` (see `docs/agents/benchmarking.md`).
 //!
-//! * `compute` is the default: the report says so, and has no acceleration structures.
+//! * `auto` is the default, and is what the player gets: the hardware backend where the adapter has
+//!   ray queries, else compute with a warning and the reason in `rt.fallback`.
+//! * `compute` says so in the report, and has no acceleration structures.
 //! * `hw` runs the flight, the sweep and the Edit stress on the hardware backend (ray queries over
 //!   the bricks' tight boxes, `render::hw`), or on the compute one, with a warning and the reason
 //!   in `rt.fallback`, if the adapter has no ray queries. The convergence phase, the cave stills
@@ -759,12 +761,12 @@ impl Comparison {
 /// The report's `rt` block.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct RtReport {
-    /// What `--rt-backend` said: `compute` (the default), `hw` or `both`.
+    /// What `--rt-backend` said: `auto` (the default), `compute`, `hw`, `hw-nearest` or `both`.
     pub requested: String,
     /// The backend the flight, the sweep and the Edit stress ran on: `hw` only if it was asked for
-    /// and the adapter has ray queries.
+    /// (or `auto`) and the adapter has ray queries.
     pub active: String,
-    /// Why not `hw`, when it was asked for and did not run: the run is then a compute run.
+    /// Why not `hw`, when it was asked for (or `auto`) and did not run: the run is then a compute run.
     pub fallback: Option<String>,
     /// The acceleration structures of the main run; null unless it was on `hw`.
     pub accel: Option<AccelReport>,

@@ -1,6 +1,6 @@
-// The hardware backend of trace() (#50, a spike): ray queries over procedural AABBs, one per
-// non-empty brick of each level (hw.rs), with the compute path's in-brick DDA (`hit_brick`)
-// run on each candidate and its hit committed with `rayQueryGenerateIntersection`.
+// The hardware backend of trace() (#50), the default where the adapter has ray queries: ray queries
+// over procedural AABBs, one per non-empty brick of each level (hw.rs), with the compute path's
+// in-brick DDA (`walk_brick`, entered through the brick's tight box) run on each candidate and its hit committed with `rayQueryGenerateIntersection`.
 //
 // `shaders::hardware` joins this to trace.wgsl, with trace.wgsl's `trace_within` renamed
 // `trace_within_compute`; this file defines the `trace_within` that `trace` calls, so the passes

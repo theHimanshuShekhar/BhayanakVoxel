@@ -1,10 +1,11 @@
-//! The hardware ray-tracing backend behind `trace(ray) -> Hit` (#50, a spike; #236).
+//! The hardware ray-tracing backend behind `trace(ray) -> Hit` (#50; #236). It is the default backend where the adapter has ray queries (#50, Part 2).
 //!
 //! Ray queries (`wgpu::Features::EXPERIMENTAL_RAY_QUERY`, Vulkan only) over **procedural AABBs,
 //! one per non-empty brick** of each level; a ray query reports each box it enters as a candidate
 //! and the shader (`shaders/trace_hw.wgsl`) runs the same in-brick DDA as the compute path on it
-//! (`hit_brick`), then `rayQueryGenerateIntersection`s the hit. The compute `trace()` stays the
-//! default, the fallback and the CPU-checkable reference (`reference.rs`).
+//! (`walk_brick`, entered through the brick's tight box as `hit_brick` does), then
+//! `rayQueryGenerateIntersection`s the hit. The compute `trace()` is the fallback, for an adapter
+//! with no ray queries or a player who chose it, and the CPU-checkable reference (`reference.rs`).
 //!
 //! Shadow rays (`occluded` in the shaders) end at the first hit with `RtBackend::Hardware`
 //! (`RAY_FLAG_TERMINATE_ON_FIRST_HIT`), as the compute walk does, and look for the nearest like

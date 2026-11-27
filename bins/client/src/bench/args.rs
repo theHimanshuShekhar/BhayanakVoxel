@@ -516,7 +516,7 @@ mod tests {
     }
 
     #[test]
-    fn the_ray_backend_is_compute_unless_asked_and_a_bad_one_is_refused() {
+    fn the_ray_backend_is_auto_unless_asked_and_a_bad_one_is_refused() {
         // The default is what the player gets (#50): ray queries where the adapter has them.
         assert_eq!(run(&[]).rt, RtMode::Auto);
         assert_eq!(run(&["--rt-backend", "auto"]).rt, RtMode::Auto);

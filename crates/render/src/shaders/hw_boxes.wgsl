@@ -12,9 +12,8 @@
 // for a candidate (`Prim::words`). A region's boxes come after the boxes of the regions before it
 // in the group, in the order of its mask's bits, a box for each: a brick that is one Material is
 // its whole brick, a mixed one the min and max of the Voxels its occupancy mask sets, as the scene
-// packed it into the brick's header (a mask that sets none, which no scene lists, is its whole brick), and a region that is one
-// Material
-// is one box of 64 Voxels.
+// packed it into the brick's header (a mask that sets none, which no scene lists, is its whole
+// brick), and a region that is one Material is one box of 64 Voxels.
 
 struct BoxJob {
     // The first region of the group's cube, in regions of its level.

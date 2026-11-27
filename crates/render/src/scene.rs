@@ -72,8 +72,11 @@ pub const REGION_FIRST_REF: usize = REGION_WORDS - 1;
 pub const BRICK_HEADER_WORD: usize = 16;
 /// Where a mixed brick's palette starts, in words from its start.
 pub const BRICK_PALETTE_WORD: usize = 17;
-/// The longest palette a mixed brick's header can say (10 bits); a brick has 512 Voxels, and the
-/// Materials of a palette are the table's, which has far fewer.
+/// The longest palette a mixed brick's header can say (10 bits). A brick's palette only grows (an
+/// entry is not taken out when its Voxels are overwritten), so what bounds it is the number of
+/// distinct Materials, which is the Material table's: about 65 now, and the server turns down an
+/// id the table does not define. [`encode_mixed`] asserts it, and the test
+/// `the_material_table_fits_a_bricks_palette` fails long before a table could break it.
 pub const MAX_PALETTE: usize = 1023;
 /// Set in a brick entry for a brick that is one Material throughout.
 pub const SOLID_FLAG: u32 = 0x8000_0000;
@@ -325,24 +328,26 @@ pub fn header_box(header: u32) -> ([u8; 3], [u8; 3]) {
 /// mask has set, as `[x, y, z]` corners, or `None` for an empty mask. `mask` is the 16 words of a
 /// mixed brick (Voxel `x | y << 3 | z << 6` is bit `i % 32` of word `i / 32`).
 pub fn tight_box(mask: &[u32]) -> Option<([u8; 3], [u8; 3])> {
-    let mut lo = [u8::MAX; 3];
-    let mut hi = [0u8; 3];
-    let mut any = false;
-    for (w, &word) in mask.iter().take(16).enumerate() {
-        let mut bits = word;
-        while bits != 0 {
-            let b = bits.trailing_zeros() as usize;
-            bits &= bits - 1;
-            let i = w * 32 + b;
-            let v = [(i & 7) as u8, (i >> 3 & 7) as u8, (i >> 6) as u8];
-            for a in 0..3 {
-                lo[a] = lo[a].min(v[a]);
-                hi[a] = hi[a].max(v[a]);
+    // One bit a coordinate: which x, y and z have a set Voxel. Word `w` is z = `w >> 1` and the
+    // rows y = `(w & 1) * 4 + 0..4` (a byte each), whose bits are the x of the Voxels.
+    let (mut xs, mut ys, mut zs) = (0u32, 0u32, 0u32);
+    for (w, &bits) in mask.iter().take(16).enumerate() {
+        if bits == 0 {
+            continue;
+        }
+        zs |= 1 << (w >> 1);
+        xs |= (bits | bits >> 8 | bits >> 16 | bits >> 24) & 0xff;
+        for y in 0..4 {
+            if (bits >> (y * 8)) & 0xff != 0 {
+                ys |= 1 << ((w & 1) * 4 + y);
             }
-            any = true;
         }
     }
-    any.then_some((lo, hi))
+    (xs != 0).then(|| {
+        let lo = [xs, ys, zs].map(|m| m.trailing_zeros() as u8);
+        let hi = [xs, ys, zs].map(|m| (31 - m.leading_zeros()) as u8);
+        (lo, hi)
+    })
 }
 
 /// Appends the words of a mixed brick to `out`, laid out as in the table in the module docs.
@@ -1061,6 +1066,70 @@ mod tests {
         assert_same_voxels(&scene, &fresh, [190, 0, 0], [225, 12, 12]);
         // Beyond what was edited nothing differs either.
         assert_same_voxels(&scene, &fresh, [60, 60, 60], [70, 70, 70]);
+    }
+
+    /// The box of a mask Voxel by Voxel: the oracle of [`tight_box`], which works a word at a time.
+    fn tight_box_per_voxel(mask: &[u32; 16]) -> Option<([u8; 3], [u8; 3])> {
+        let mut found: Option<([u8; 3], [u8; 3])> = None;
+        for i in 0..512usize {
+            if mask[i / 32] >> (i % 32) & 1 == 0 {
+                continue;
+            }
+            let v = [(i & 7) as u8, (i >> 3 & 7) as u8, (i >> 6) as u8];
+            found = Some(match found {
+                None => (v, v),
+                Some((lo, hi)) => (
+                    std::array::from_fn(|a| lo[a].min(v[a])),
+                    std::array::from_fn(|a| hi[a].max(v[a])),
+                ),
+            });
+        }
+        found
+    }
+
+    #[test]
+    fn the_material_table_fits_a_bricks_palette() {
+        let defined = materials::MaterialTable::built_in().defs().len();
+        assert!(
+            defined * 4 <= MAX_PALETTE,
+            "{defined} Materials: a brick's palette may hold them all, and its header says {MAX_PALETTE}"
+        );
+    }
+
+    #[test]
+    fn the_tight_box_of_a_mask_is_what_looking_at_every_voxel_finds() {
+        // A small generator of our own (xorshift): masks that are empty, sparse (a few Voxels,
+        // which is where the corners are), dense, and one Voxel of each of the 512.
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        assert_eq!(tight_box(&[0; 16]), None);
+        for i in 0..512usize {
+            let mut mask = [0u32; 16];
+            mask[i / 32] = 1 << (i % 32);
+            let v = [(i & 7) as u8, (i >> 3 & 7) as u8, (i >> 6) as u8];
+            assert_eq!(tight_box(&mask), Some((v, v)), "Voxel {i}");
+        }
+        for round in 0..4000 {
+            let mut mask = [0u32; 16];
+            match round % 4 {
+                0 => mask.iter_mut().for_each(|w| *w = next() as u32),
+                1 => mask
+                    .iter_mut()
+                    .for_each(|w| *w = (next() & next() & next()) as u32),
+                _ => {
+                    for _ in 0..1 + next() % 6 {
+                        let i = (next() % 512) as usize;
+                        mask[i / 32] |= 1 << (i % 32);
+                    }
+                }
+            }
+            assert_eq!(tight_box(&mask), tight_box_per_voxel(&mask), "{mask:08x?}");
+        }
     }
 
     /// Fails unless the header of every mixed brick that `scene` lists says the tight box of the
