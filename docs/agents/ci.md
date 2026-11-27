@@ -5,14 +5,39 @@ The workflow is `.github/workflows/ci.yml`. It runs on every pull request and on
 
 ## Which jobs gate
 
-These must be green to merge:
+No ruleset requires status checks (the ruleset has only deletion and non-fast-forward), so which
+jobs gate is by convention: these must be green to merge. The tests run with
+[cargo-nextest](https://nexte.st), each test in its own process, and the long jobs are split into
+shards that run in parallel (#263).
 
 | Job | What it runs |
 | --- | --- |
-| `linux` | `cargo fmt --check`, clippy with `-D warnings`, `cargo test --workspace` on lavapipe (software Vulkan) without the real-thread tests (hardware ray queries are the game's default backend since #50 Part 2, and lavapipe has them where its Mesa does: the goldens are matched on both backends, and `hw_agreement` holds the backends to each other; on a runner whose lavapipe has no ray queries those tests skip, and the log says `SKIPPED ...: why`, which is the "CI falls back to compute and says so" of the ticket), the check that no line of the real-thread list matches a test outside the client binary, and the check that `server` does not depend on wgpu or winit. |
-| `windows-tests` | Tests of `brick-store`, `materials`, `net`, `planet-gen`, `sim`, `prefetch-sim` and `server`, and the client's unit tests that need no GPU and are not in the real-thread list. The stepped streaming tests are among them. |
+| `linux` | `cargo fmt --check`, clippy with `-D warnings`, `cargo test --doc --workspace` (nextest does not run doctests), the checks of the real-thread list (below), and the check that `server` does not depend on wgpu or winit. It runs no other tests. |
+| `linux-tests (1/3)`, `(2/3)`, `(3/3)` | `cargo nextest run --workspace` on lavapipe (software Vulkan) without the real-thread tests, a third of the tests each (hardware ray queries are the game's default backend since #50 Part 2, and lavapipe has them where its Mesa does: the goldens are matched on both backends, and `hw_agreement` holds the backends to each other; on a runner whose lavapipe has no ray queries those tests skip, and the log says `SKIPPED ...: why`, which is the "CI falls back to compute and says so" of the ticket). All three must be green. |
+| `windows-tests (1/2)`, `(2/2)` | Tests of `brick-store`, `materials`, `net`, `planet-gen`, `sim`, `prefetch-sim` and `server`, and the client's unit tests that need no GPU and are not in the real-thread list, half of them each. The stepped streaming tests are among them. Shard 1 also runs their doctests. |
 | `windows-client` | Builds the release client and uploads it as the `client-windows` artifact, which the benchmark uses. |
-| `determinism` | The golden hash tests of `planet-gen` and `sim`, in debug and release, on Linux and Windows. |
+| `determinism` | The golden hash tests of `planet-gen` and `sim`, in debug and release, on Linux and Windows. (These run with `cargo test`, not nextest.) |
+
+The shards are `cargo nextest run --partition hash:N/M`: a test's shard is a hash of its binary and
+name, so it is the same on every run, and the shards together run every test once. A test that is
+slow is a floor under a shard's wall time, so a new very long test is better split in two than added.
+cargo-nextest is pinned in `.github/actions/setup-nextest` (the version and the `taiki-e/install-action`
+commit), and the job installs the release binary, not a build.
+
+### Run the same split locally
+
+```
+cargo install cargo-nextest --version 0.9.152 --locked      # or a release binary from nexte.st
+filterset=$(bash .github/scripts/real-thread-filterset.sh)
+cargo nextest run --workspace --no-fail-fast -E "not ($filterset)"                       # all of linux-tests
+cargo nextest run --workspace --no-fail-fast --partition hash:1/3 -E "not ($filterset)"  # linux-tests (1/3)
+cargo test --doc --workspace
+bash .github/scripts/check-real-thread-list.sh all     # counts per side; needs cargo-nextest and jq
+```
+
+`cargo nextest list --workspace -E "not ($filterset)"` shows which tests gate. A test that has to wait on
+the wall clock in the gating jobs (it should not: see below) can be given a lower parallelism with
+a `test-groups` entry in `.config/nextest.toml`; the test itself is not to be weakened.
 
 ## Which job does not gate
 
@@ -43,15 +68,20 @@ gating test: put the counted part in the gating one and the timed part in an `#[
 that this job runs.
 
 The list of these tests is `.github/real-thread-tests.txt`, one test-name filter per line. The
-gating jobs `--skip` each line and `real-thread-tests` runs only those lines, so every client test
-runs in exactly one place.
+gating jobs skip each line, as a nextest filterset made by `.github/scripts/real-thread-filterset.sh`
+(`not (test(~line) | ...)`: `~` is "contains", as libtest's filter is), and `real-thread-tests`
+runs only those lines with `cargo test` (libtest), so every client test runs in exactly one place.
+A line is a string of letters, digits, `_`, `:` and `.` only, since nextest cannot take a quoted
+name here.
 
-Two checks keep the list honest (`.github/scripts/check-real-thread-list.sh`). The
+Three checks keep the list honest (`.github/scripts/check-real-thread-list.sh`). The
 `real-thread-tests` job fails when a line matches no test of the client binary: a test was
 renamed or removed, and its line is stale. The `linux` job fails when a line matches a test outside
 the client binary: the gating jobs skip a line in the whole workspace but the real-thread job runs
-it in the client binary only, so that test would run nowhere. The script prints how many tests gate
-and how many run in the real-thread job.
+it in the client binary only, so that test would run nowhere. The `linux` job also checks that
+nextest and libtest see the same tests, and that the filterset and the libtest filters select the same
+ones in the client binary. The script prints how many tests gate and how many run in the real-thread
+job (on 2026-11-27: 1539 and 16, the same under libtest and nextest), and how many gate in each crate.
 
 ## Stepped tests and real-thread tests
 

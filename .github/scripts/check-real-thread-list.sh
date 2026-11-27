@@ -6,16 +6,21 @@
 #   outside    no line matches a test outside the client binary. The gating jobs skip a line in the
 #              whole workspace but the real-thread job runs it in the client binary only, so a test
 #              of another crate that a line matches would run nowhere.
-#   all        both (the default).
+#   agree      the nextest filterset made from the list (real-thread-filterset.sh), which the gating
+#              jobs run as `not (...)`, selects the same tests as the libtest filters, which the
+#              real-thread job runs, and nextest sees the same tests in the workspace as libtest
+#              does. Counts of what each side runs are printed, per crate.
+#   all        all three (the default).
 #
-# Usage: check-real-thread-list.sh [unmatched|outside|all] [list-file]
-# Run it where the workspace builds: it lists the tests with `cargo test -- --list`.
+# Usage: check-real-thread-list.sh [unmatched|outside|agree|all] [list-file]
+# Run it where the workspace builds: it lists the tests with `cargo test -- --list`, and with
+# `cargo nextest list` for `agree` (which needs cargo-nextest and jq).
 set -euo pipefail
 
 mode=${1:-all}
 list=${2:-.github/real-thread-tests.txt}
-case "$mode" in unmatched | outside | all) ;; *)
-  echo "usage: $0 [unmatched|outside|all] [list-file]" >&2
+case "$mode" in unmatched | outside | agree | all) ;; *)
+  echo "usage: $0 [unmatched|outside|agree|all] [list-file]" >&2
   exit 2
   ;;
 esac
@@ -39,11 +44,11 @@ failed=0
 for filter in "${filters[@]}"; do
   in_client=$(matches "$filter" "$client")
   in_workspace=$(matches "$filter" "$workspace")
-  if [[ $mode != outside && $in_client -eq 0 ]]; then
+  if [[ $mode != outside && $mode != agree && $in_client -eq 0 ]]; then
     echo "::error file=$list::'$filter' matches no test of the client binary (a test that was renamed or removed?)"
     failed=1
   fi
-  if [[ $mode != unmatched && $in_workspace -gt $in_client ]]; then
+  if [[ $mode != unmatched && $mode != agree && $in_workspace -gt $in_client ]]; then
     echo "::error file=$list::'$filter' matches $((in_workspace - in_client)) test(s) outside the client binary, which would run in no job"
     failed=1
   fi
@@ -56,5 +61,45 @@ real=$(grep -cFf "${TMPDIR:-/tmp}/real-thread-filters.$$" <<<"$client" || true)
 rm -f "${TMPDIR:-/tmp}/real-thread-filters.$$"
 total=$(grep -c . <<<"$workspace" || true)
 echo "$total tests in the workspace: $((total - real)) gate, $real run in the real-thread job"
+
+if [[ $mode == agree || $mode == all ]]; then
+  here=$(dirname "${BASH_SOURCE[0]}")
+  filterset=$("$here/real-thread-filterset.sh" "$list")
+  # `--run-ignored all` makes nextest list the `#[ignore]`d tests too, as libtest's `--list` does,
+  # and judge each against the filterset. The names are `<binary id> <test name>`.
+  listing() {
+    cargo nextest list --workspace --run-ignored all --message-format json -E "$1" 2>/dev/null |
+      jq -r '."rust-suites" | to_entries[] | .key as $b | .value.testcases | to_entries[] |
+             select(.value."filter-match".status == "matches") | "\($b) \(.key)"'
+  }
+  all_nextest=$(listing 'all()')
+  real_nextest=$(listing "$filterset")
+  gate_nextest=$(listing "not ($filterset)")
+  n_all=$(grep -c . <<<"$all_nextest" || true)
+  n_real=$(grep -c . <<<"$real_nextest" || true)
+  n_gate=$(grep -c . <<<"$gate_nextest" || true)
+  echo "nextest: $n_all tests in the workspace: $n_gate gate, $n_real run in the real-thread job"
+  if [[ $n_all -ne $total || $n_real -ne $real || $n_gate -ne $((total - real)) ]]; then
+    echo "::error file=$list::nextest and libtest disagree on the tests ($n_all/$n_gate/$n_real against $total/$((total - real))/$real: all/gate/real-thread)"
+    failed=1
+  fi
+  # The real-thread job runs the client binary only: nextest's selection must be inside it, and be
+  # the very tests libtest's filters select there.
+  if grep -v '^client::bin/client ' <<<"$real_nextest" | grep -q .; then
+    echo "::error file=$list::the filterset selects a test outside the client binary:"
+    grep -v '^client::bin/client ' <<<"$real_nextest" >&2
+    failed=1
+  fi
+  libtest_real=$(grep -F -- "$(tr -d '\r' <"$list" | grep -vE '^\s*(#|$)')" <<<"$client" | sort || true)
+  nextest_real=$(sed -n 's/^client::bin\/client //p' <<<"$real_nextest" | sort)
+  if [[ $libtest_real != "$nextest_real" ]]; then
+    echo "::error file=$list::the filterset and the libtest filters select different tests of the client binary:"
+    diff <(echo "$libtest_real") <(echo "$nextest_real") >&2 || true
+    failed=1
+  fi
+  # How many tests of each crate gate (the crate is what comes before `::` or ` ` of the binary id).
+  echo "gating tests per crate:"
+  sed 's/[: ].*//' <<<"$gate_nextest" | sort | uniq -c | sed 's/^/  /'
+fi
 
 exit "$failed"
