@@ -47,7 +47,7 @@ jobs:
           fi
 
   # Every test of the workspace but the real-thread ones, with cargo-nextest, in five shards that run
-  # in parallel (`--partition hash`: a test's shard is a hash of its name, so it is the same on every
+  # in parallel (`--partition hash`: a test's shard is a hash of its binary and name, so it is the same on every
   # run, and the five together run every test once). This includes the bench smoke test
   # (bins/client/tests/bench.rs): `client bench --short` on lavapipe, with the report's schema checked.
   # Its timings are not looked at. The client tests that are about real threads or real time are left
@@ -158,7 +158,12 @@ jobs:
             partition: hash:3/3
     steps:
       - uses: actions/checkout@v4
+      # The one `nextest -p ... -p client` run resolves the crates' features differently from the old two
+      # `cargo test` commands (it builds windows-sys, egui-winit and ctrlc again), so it has a cache of its
+      # own: rust-cache would otherwise match the old `windows-tests` key and never save this build.
       - uses: ./.github/actions/setup-rust
+        with:
+          cache-key: nextest
       - uses: ./.github/actions/setup-nextest
       - name: Tests that need no GPU, without the real-thread tests
         shell: bash

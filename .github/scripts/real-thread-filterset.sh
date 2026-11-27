@@ -17,7 +17,7 @@ fi
 
 expr=""
 for f in "${filters[@]}"; do
-  # Unquoted, because nextest takes `~"..."` as no match at all (0.9.152). Anything outside this set
+  # Unquoted, because nextest takes `~"..."` as no match at all (as of the pinned nextest). Anything outside this set
   # could be read as filterset syntax, so a line with one is refused.
   if [[ ! $f =~ ^[A-Za-z0-9_:.]+$ ]]; then
     echo "::error::'$f' has a character that is not a letter, a digit, _, : or ., which the filterset cannot take unquoted" >&2

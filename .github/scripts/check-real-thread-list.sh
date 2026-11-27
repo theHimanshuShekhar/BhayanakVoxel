@@ -14,7 +14,7 @@
 #
 # Usage: check-real-thread-list.sh [unmatched|outside|agree|all] [list-file]
 # Run it where the workspace builds: it lists the tests with `cargo test -- --list`, and with
-# `cargo nextest list` for `agree` (which needs cargo-nextest and jq).
+# `cargo nextest list` for `agree` (which needs cargo-nextest and jq). Doctests are left out of both.
 set -euo pipefail
 
 mode=${1:-all}
@@ -32,8 +32,9 @@ if [ "${#filters[@]}" -eq 0 ]; then
 fi
 
 # libtest prints `name: test` for a test (an ignored one too), on stdout; what it says of the
-# binaries it runs goes to stderr.
-test_names() { sed -n 's/: test$//p'; }
+# binaries it runs goes to stderr. A doctest is listed too (`src/lib.rs - item (line 3): test`),
+# which nextest never runs or lists and the real-thread list is not about, so it is left out.
+test_names() { sed -n 's/: test$//p' | grep -vE ' - .*\(line [0-9]+\)' || true; }
 client=$(cargo test -p client --bin client -- --list 2>/dev/null | test_names)
 workspace=$(cargo test --workspace -- --list 2>/dev/null | test_names)
 
@@ -68,7 +69,8 @@ if [[ $mode == agree || $mode == all ]]; then
   # `--run-ignored all` makes nextest list the `#[ignore]`d tests too, as libtest's `--list` does,
   # and judge each against the filterset. The names are `<binary id> <test name>`.
   listing() {
-    cargo nextest list --workspace --run-ignored all --message-format json -E "$1" 2>/dev/null |
+    # nextest's own messages (a compile error, a bad filterset) go to stderr, which stays in the log.
+    cargo nextest list --workspace --run-ignored all --message-format json -E "$1" |
       jq -r '."rust-suites" | to_entries[] | .key as $b | .value.testcases | to_entries[] |
              select(.value."filter-match".status == "matches") | "\($b) \(.key)"'
   }

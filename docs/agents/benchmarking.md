@@ -1660,7 +1660,7 @@ ray queries, or limits of 0, is the compute backend with a reason, never an erro
 lavapipe has ray queries depends on its Mesa (the dev box's, 25.0.7, has them); the tests that
 compare the backends skip themselves, printing `SKIPPED ...: why`, where it has none, and the
 fallback is tested through a device made without the feature (`Offscreen::without_ray_queries`).
-**CI's `linux` job** runs the goldens on both backends (`golden.rs`'s `..._on_the_hardware_backend_`
+**CI's `linux-tests` shards** run the goldens on both backends (`golden.rs`'s `..._on_the_hardware_backend_`
 tests) and the whole of `hw_agreement`; it falls back to compute and says so in the log when the
 runner's lavapipe has no ray queries.
 

@@ -136,7 +136,7 @@ The Windows runners have no Vulkan driver. So `windows-tests` does not run the `
 `bench::edits::tests::the_largest_brush_is_dug_and_placed_in_turn_at_no_more_than_the_metric_rate`
 `bench::lookdev::run::tests::a_short_run_writes_a_folder_for_each_shot_and_a_sheet_that_names_every_image`
 (#202) and `bench::tests::the_flights_updates_are_logged_by_where_in_the_run_they_were_made` (#50).
-A new client test that needs a GPU must be skipped there too. The `linux` job runs all of them.
+A new client test that needs a GPU must be skipped there too. The `linux-tests` shards run all of them.
 
 ## Pins
 
@@ -145,6 +145,10 @@ A new client test that needs a GPU must be skipped there too. The `linux` job ru
   `dtolnay/rust-toolchain`, which ignores that file. Every job prints `rustc --version` first.
 - **Runner images** are named in `ci.yml`: `ubuntu-24.04` and `windows-2025-vs2026`. The second is
   what `windows-latest` was on 2026-11-11.
+
+- **cargo-nextest** is pinned in `.github/actions/setup-nextest` (`nextest@0.9.152`, installed as a
+  release binary by `taiki-e/install-action`, itself pinned by commit). The version is also named in
+  the local-run command above. Every job that uses it prints `cargo nextest --version`.
 
 To bump Rust: change `channel` in `rust-toolchain.toml` to the new exact version. Fix any new
 clippy warnings in the same PR. Check that every job's log shows the new `rustc --version`.

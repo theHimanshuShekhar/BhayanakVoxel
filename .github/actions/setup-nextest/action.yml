@@ -1,7 +1,8 @@
 name: Set up cargo-nextest
 description: >
   Installs cargo-nextest at the pinned version, from the release binary (it does not compile it).
-  Run it after setup-rust. To bump it, change `version` here and nowhere else (docs/agents/ci.md).
+  Run it after setup-rust. To bump it, change `nextest@...` below and the two places in docs/agents/ci.md that name
+  the version (the Pins section and the local-run command).
 
 runs:
   using: composite
