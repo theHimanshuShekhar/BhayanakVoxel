@@ -346,18 +346,22 @@ struct Patch {
     bricks: Vec<Range<usize>>,
     /// The regions of level 0 with bricks rewritten in place (see [`RingPatch::rewritten`]).
     rewritten: BTreeSet<[i32; 3]>,
-    /// The same for the coarse levels (see [`RingPatch::rewritten_coarse`]).
-    rewritten_coarse: BTreeSet<(usize, [i32; 3])>,
+    /// Every region, by level and key, whose bricks, list of entries or mask `write_region` wrote
+    /// or unlisted since the last patch: what the hardware backend's boxes depend on (see
+    /// [`RingPatch::groups`]).
+    touched: BTreeSet<(usize, [i32; 3])>,
+    /// The regions of `touched` that may have a box that is not inside the boxes they had (see
+    /// [`RingPatch::grown`]).
+    grown: BTreeSet<(usize, [i32; 3])>,
     levels: bool,
 }
 
 impl Patch {
-    /// Notes that mixed bricks of the region `key` of `level` had their words written in place.
+    /// Notes that mixed bricks of the region `key` of `level` had their words written in place:
+    /// the emitters' index (level 0's) reads it.
     fn note_rewritten(&mut self, level: usize, key: [i32; 3]) {
         if level == 0 {
             self.rewritten.insert(key);
-        } else {
-            self.rewritten_coarse.insert((level, key));
         }
     }
 }
@@ -401,11 +405,22 @@ pub struct RingPatch {
     /// `bricks` do not say which region they are in, and what a Voxel is made of may have changed
     /// (the emitters' index reads this).
     pub rewritten: Vec<[i32; 3]>,
-    /// The same for the coarse levels, by level and key (ascending): `rewritten` is level 0's
-    /// only, since the emitters' index is. The hardware ray backend's boxes (#50) are as tight as
-    /// the words they were made from, so a coarse brick that reads differently in place moves its
-    /// box, with no word of `regions` or `brick_refs` written.
-    pub rewritten_coarse: Vec<(usize, [i32; 3])>,
+    /// The acceleration structure groups of the hardware ray backend (#50, #236) whose boxes this
+    /// patch made stale, by level and group (ascending), with how many boxes each has now (0: the
+    /// group is gone): one for each brick a region of the group lists, or one for a region that
+    /// is one Material. Worked out by the thread that made the patch, from the regions it wrote,
+    /// unlisted or rewrote in place (a brick that reads differently in place moves its box, with
+    /// no word of `regions` or `brick_refs` written), so that the frame thread need not search
+    /// the scene for what to build again.
+    pub groups: Vec<(crate::hw::GroupKey, u32)>,
+    /// The groups of `groups` (ascending) that may have a box now that the boxes they had do not
+    /// cover: a brick that is new or that has Voxels where it had none, a region that is new. A
+    /// group that is not here only lost: every box it has now lies inside one it had, so that
+    /// rays against its old boxes miss nothing that is there, and the hardware backend may keep
+    /// them for a few frames while it builds other groups (#236). One that is here is built before
+    /// the next frame is drawn. A group is here if any write to one of its regions since the last
+    /// patch may have grown a box (it is the or of the writes, not what they come to).
+    pub grown: Vec<crate::hw::GroupKey>,
     /// Whether [`Scene::levels`] changed: the boxes walked, the holes, or the ball that rays are
     /// clipped to.
     pub levels: bool,
@@ -540,9 +555,16 @@ impl RingPatch {
         rewritten.sort_unstable();
         rewritten.dedup();
         self.rewritten = rewritten;
-        self.rewritten_coarse.extend(later.rewritten_coarse);
-        self.rewritten_coarse.sort_unstable();
-        self.rewritten_coarse.dedup();
+        // A group the later patch has is counted as the scene is then.
+        let mut groups: std::collections::BTreeMap<_, _> =
+            std::mem::take(&mut self.groups).into_iter().collect();
+        groups.extend(later.groups);
+        self.groups = groups.into_iter().collect();
+        let mut grown = std::mem::take(&mut self.grown);
+        grown.extend(later.grown);
+        grown.sort_unstable();
+        grown.dedup();
+        self.grown = grown;
         self.levels |= later.levels;
         // The buffers only grow, so the later lengths are the longer.
         self.sizes = later.sizes.or(self.sizes);
@@ -1697,6 +1719,47 @@ impl Scene {
         Ok(())
     }
 
+    /// Whether writing `changed` to the region at record `found` (see [`Scene::write_region`]) may
+    /// give it a box that the boxes it has now do not cover, as the hardware backend makes them
+    /// (see [`crate::hw`]): a brick that is not there, a brick that was mixed and is solid, a mixed
+    /// brick whose tight box is not inside the one it had. A region that is one Material has the
+    /// box of its whole 64 Voxels, which nothing it holds afterwards can be outside of. False is
+    /// exact; true is allowed to be more than there is.
+    fn box_may_grow(
+        &self,
+        found: Option<usize>,
+        old: Option<&[Option<u32>]>,
+        changed: &[(usize, Want)],
+        words: &[u32],
+    ) -> bool {
+        let uniform = found.is_some_and(|index| {
+            self.regions[index * REGION_WORDS + REGION_FIRST_REF] & SOLID_FLAG != 0
+        });
+        if uniform {
+            return false;
+        }
+        const WHOLE: ([u8; 3], [u8; 3]) = ([0; 3], [7; 3]);
+        let tight = |mask: Option<&[u32]>| mask.and_then(crate::hw::tight_box).unwrap_or(WHOLE);
+        changed.iter().any(|(bit, want)| {
+            let before = old.and_then(|entries| entries[*bit]);
+            match (want, before) {
+                (Want::Absent, _) => false,
+                (_, None) => true,
+                // A solid brick is its whole box, as it was if it was one.
+                (Want::Solid(_), Some(entry)) => entry & SOLID_FLAG == 0,
+                // A mixed brick is inside its whole box, and else inside the one it had if it is
+                // inside it in each axis.
+                (Want::Mixed(_), Some(entry)) if entry & SOLID_FLAG != 0 => false,
+                (Want::Mixed(range), Some(entry)) => {
+                    let at = entry as usize;
+                    let (lo, hi) = tight(self.bricks.get(at..at + 16));
+                    let (new_lo, new_hi) = tight(words.get(range.start..range.start + 16));
+                    (0..3).any(|a| new_lo[a] < lo[a] || new_hi[a] > hi[a])
+                }
+            }
+        })
+    }
+
     /// Makes the region of `level` at `key`, which is at record `found` of `regions` if the scene
     /// lists it, with `old` as the `brick_refs` entry of each of its 512 bricks, have the bricks
     /// `changed` (by mask bit) as they say, whose words (for the mixed) are the ranges of `words`.
@@ -1712,6 +1775,10 @@ impl Scene {
     ) -> Result<(), RingsFull> {
         if changed.is_empty() {
             return Ok(());
+        }
+        self.patch().touched.insert((level, key));
+        if self.box_may_grow(found, old, changed, words) {
+            self.patch().grown.insert((level, key));
         }
         // The usual case: the same bricks are in the region, and some of them read differently, with
         // the words they had or none. Then the list of entries stays where it is, and only those
@@ -2250,6 +2317,29 @@ impl Scene {
             }
             patch.levels |= self.occupy(&rescan);
         }
+        // The groups of the hardware backend that those regions are in, counted in the scene as it
+        // is now (the regions' keys fix them, and what they hold fixes the count).
+        let touched: BTreeSet<crate::hw::GroupKey> = patch
+            .touched
+            .iter()
+            .map(|&(level, key)| (level as u8, crate::hw::group_of(key)))
+            .collect();
+        let grown: Vec<crate::hw::GroupKey> = patch
+            .grown
+            .iter()
+            .map(|&(level, key)| (level as u8, crate::hw::group_of(key)))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let groups = touched
+            .into_iter()
+            .map(|(level, group)| {
+                (
+                    (level, group),
+                    crate::hw::group_box_count(self, level as usize, group),
+                )
+            })
+            .collect();
         let now = Lengths::of(self);
         let rings = self.rings.as_mut().expect("a scene of rings");
         let sizes = (now != rings.reported).then_some(now);
@@ -2260,7 +2350,8 @@ impl Scene {
             brick_refs: merged(patch.brick_refs),
             bricks: merged(patch.bricks),
             rewritten: patch.rewritten.into_iter().collect(),
-            rewritten_coarse: patch.rewritten_coarse.into_iter().collect(),
+            groups,
+            grown,
             levels: patch.levels,
             sizes,
         }

@@ -34,7 +34,10 @@ struct Mixed {
     /// Bit `i` is set when Voxel `i` is solid.
     occupancy: [u64; 8],
     /// Materials used in this brick, in first-use order. Entries are never removed, so after
-    /// Voxels are overwritten some may be unused until the brick collapses to a flag.
+    /// Voxels are overwritten some may be unused until the brick collapses to a flag. It can thus
+    /// hold every Material of the table: the renderer's packing says at most 1023 (the 10 bits of
+    /// its header, `render::scene::MAX_PALETTE`) and asserts it, which the table, of about 65,
+    /// stays far below (a test in `render` checks it).
     palette: Vec<Material>,
     /// Bits per palette index.
     bits: u32,

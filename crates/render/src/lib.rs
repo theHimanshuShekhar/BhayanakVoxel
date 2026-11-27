@@ -53,9 +53,11 @@ pub use camera::Camera;
 pub use daylight::{DaySky, Daylight, Drive, LocalFrame, Moon, Night};
 pub use debug_view::DebugView;
 pub use denoise::Denoise;
-pub use hw::HwUpdate;
+pub use hw::{HwPhases, HwUpdate};
 pub use look::Look;
-pub use offscreen::{DrawTimes, FrameDrawn, GpuInfo, GpuPasses, Image, Offscreen, UpdateTimes};
+pub use offscreen::{
+    BACKEND_VARIABLE, DrawTimes, FrameDrawn, GpuInfo, GpuPasses, Image, Offscreen, UpdateTimes,
+};
 pub use post::{NormalBias, Stages, ToneCurve};
 pub use profiler::Profiler;
 pub use scene::{
@@ -98,16 +100,19 @@ fn shared_instance() -> &'static wgpu::Instance {
     INSTANCE.get_or_init(create_instance)
 }
 
-/// How rays find the Planet's bricks (#50): the compute-shader DDA, which is the default, the
-/// fallback and the CPU-checkable reference; or hardware ray queries over the bricks' boxes
-/// ([`hw`]), which need an adapter with `EXPERIMENTAL_RAY_QUERY`.
+/// How rays find the Planet's bricks (#50): hardware ray queries over the bricks' boxes ([`hw`]),
+/// which need an adapter with `EXPERIMENTAL_RAY_QUERY` and are **the default** wherever the
+/// adapter has them (the owner, 2026-11-21: "RT default but customizable to fallback to
+/// compute"); or the compute-shader DDA, which is the fallback, the player's setting for a GPU
+/// that ray queries do not suit, and the CPU-checkable reference.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum RtBackend {
-    #[default]
+    /// The compute-shader DDA.
     Compute,
     /// Ray queries. A shadow ray (the sun's, in `shade.wgsl` and the GI's) ends at the first box
     /// it hits that has a Voxel in its way (`RAY_FLAG_TERMINATE_ON_FIRST_HIT`): all it needs to know
     /// is that something is there, as the compute walk, which goes front to back, does.
+    #[default]
     Hardware,
     /// Ray queries, with shadow rays that look for the nearest hit like any other ray: what
     /// `Hardware` was before it had the early-out, kept to tell what the early-out is worth.
@@ -166,6 +171,7 @@ pub fn choose_backend(
 
 /// Requests a device on a Vulkan adapter, presentable to `surface` if one is given. With
 /// `timers`, it has timestamp queries if the adapter does.
+#[cfg(test)]
 fn request_gpu(
     instance: &wgpu::Instance,
     surface: Option<&wgpu::Surface<'_>>,
@@ -207,13 +213,20 @@ fn request_gpu_for(
             wgpu::Features::EXPERIMENTAL_RAY_QUERY
         } else {
             wgpu::Features::empty()
+        } | if choice.active.is_hardware() && hw::process_wait() {
+            // The diagnosis of the builds' GPU time (`--hw-wait`) puts timestamps between them.
+            adapter.features() & wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS
+        } else {
+            wgpu::Features::empty()
         },
         // The Planet's bricks are one big storage buffer, well over the portable 128 MiB limit.
         required_limits: adapter.limits(),
         experimental_features: if choice.active.is_hardware() {
             // SAFETY: ray queries are experimental in wgpu 30 (ADR 0001): they may hit bugs of
-            // wgpu's that are undefined behaviour from safe code. Opted into only for the
-            // hardware backend, which is a spike (#50) and never the default.
+            // wgpu's that are undefined behaviour from safe code. Opted into only when the
+            // hardware backend is asked for and the adapter has ray queries: the window asks for
+            // it always (#50, adopted: it is the default, and the player's setting for compute can
+            // change at run time), and the compute fallback needs none of it.
             unsafe { wgpu::ExperimentalFeatures::enabled() }
         } else {
             wgpu::ExperimentalFeatures::disabled()

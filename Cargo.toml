@@ -1,6 +1,7 @@
 [workspace]
 resolver = "3"
 members = ["crates/*", "bins/*"]
+exclude = ["third_party"]
 
 [workspace.package]
 version = "0.1.0"
@@ -26,6 +27,11 @@ winit = "0.30.13"
 egui = { version = "=0.37.0", features = ["default_fonts"] }
 egui-wgpu = { version = "=0.37.0", default-features = false }
 egui-winit = { version = "=0.37.0", default-features = false, features = ["x11", "wayland"] }
+
+# gpu-allocator 0.28.0 with one change: an empty memory block is kept, not destroyed and made again
+# on the frame that needs it (#236). See third_party/gpu-allocator/PATCH.md.
+[patch.crates-io]
+gpu-allocator = { path = "third_party/gpu-allocator" }
 
 [profile.dev]
 # Keeps the shared target dir from filling the disk.

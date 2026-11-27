@@ -331,9 +331,11 @@ pub struct LoaderStats {
     /// they may be (see [`Loader::busy`]).
     pub generating_us: u64,
     pub held_back_us: u64,
-    /// Jobs the workers have taken that have not been taken in.
-    #[cfg(test)]
+    /// Jobs the workers have taken that have not been taken in (at [`crate::loader::MAX_AHEAD`]
+    /// they wait for the scene thread).
     pub ahead: usize,
+    /// How long the jobs that were taken in waited, by class and part (#251).
+    pub latency: crate::loader::Latency,
     /// Jobs a worker has taken and not finished.
     #[cfg(test)]
     pub in_flight: usize,
@@ -356,8 +358,8 @@ impl LoaderStats {
             generated: loader.generated(),
             generating_us: (generating * 1e6) as u64,
             held_back_us: (held_back * 1e6) as u64,
-            #[cfg(test)]
             ahead: loader.ahead(),
+            latency: loader.latency(),
             #[cfg(test)]
             in_flight: loader.in_flight(),
             #[cfg(test)]
@@ -495,9 +497,17 @@ enum Part {
     /// listing that was not looked at, and the selection and packing from nothing. The copy that
     /// is made for the frame thread is [`Part::Publish`].
     Release,
+    /// What [`Part::Pack`] is made of (#251), each a part of it and not added to it: asking the
+    /// loader for what the scene wants and handing the workers the jobs, taking arrivals from the
+    /// channel, holding their bricks in the store, and the scene splitting the bricks they are under
+    /// and packing the change.
+    PackRequest,
+    PackReceive,
+    PackHold,
+    PackArrive,
 }
 
-const PARTS: usize = 8;
+const PARTS: usize = 12;
 
 /// How long the scene thread spent on each part of its rounds since timing was turned on
 /// ([`SceneWorker::time_work`]): the real-time bench's scene-thread time by category (#162).
@@ -514,6 +524,13 @@ pub struct Spent {
     /// would have looked at, and the selection and packing from nothing), not the copy for the
     /// frame thread, which is in `publish`.
     pub release: Duration,
+    /// What `pack` is made of (#251): asking the loader and handing over jobs, taking arrivals from
+    /// the channel, holding their bricks in the store, and splitting and packing in the scene.
+    /// Parts of `pack`, not added to it.
+    pub pack_request: Duration,
+    pub pack_receive: Duration,
+    pub pack_hold: Duration,
+    pub pack_arrive: Duration,
 }
 
 /// The longest round and the longest update of the scene thread over a time (see
@@ -1320,6 +1337,10 @@ impl SceneWorker {
             hole_scan: part(Part::HoleScan),
             reband: part(Part::Reband),
             release: part(Part::Release),
+            pack_request: part(Part::PackRequest),
+            pack_receive: part(Part::PackReceive),
+            pack_hold: part(Part::PackHold),
+            pack_arrive: part(Part::PackArrive),
         }
     }
 
@@ -1604,7 +1625,7 @@ impl Drop for SceneWorker {
 /// What the scene changed since the last publish.
 enum Changes {
     None,
-    Patch(RingPatch),
+    Patch(Box<RingPatch>),
     /// Packed again, so what the frame thread has is of no use.
     Rebuilt,
 }
@@ -2250,7 +2271,7 @@ impl Engine {
                     }
                 }
                 match &mut self.changes {
-                    Changes::None => self.changes = Changes::Patch(patch),
+                    Changes::None => self.changes = Changes::Patch(Box::new(patch)),
                     Changes::Patch(before) => before.merge(patch),
                     Changes::Rebuilt => {}
                 }
@@ -2681,6 +2702,7 @@ impl Engine {
             return Ok(false);
         };
         let started = self.clock.now();
+        let request_began = self.began();
         // The reach first: what is asked for is classed by it.
         self.loader.set_reach(self.scene.reach());
         {
@@ -2695,6 +2717,7 @@ impl Engine {
         self.loader.sync(camera, bands);
         // A stepped loader has no workers: they do their jobs here, as far ahead as they may go.
         self.loader.step(STEP_JOBS);
+        self.spend(Part::PackRequest, request_began);
         if self.paused {
             return Ok(false);
         }
@@ -2737,7 +2760,9 @@ impl Engine {
             let mut resident = Vec::new();
             // The cells of the Guard that came in this batch (#220).
             let mut cells = Vec::new();
+            let receive_began = self.began();
             let arrivals = self.loader.receive(most);
+            self.spend(Part::PackReceive, receive_began);
             if arrivals.is_empty() {
                 break;
             }
@@ -2767,6 +2792,7 @@ impl Engine {
                     }
                 }
             }
+            let hold_began = self.began();
             {
                 let mut store = self
                     .store
@@ -2793,10 +2819,12 @@ impl Engine {
                     }
                 }
             }
+            self.spend(Part::PackHold, hold_began);
             if resident.is_empty() && cells.is_empty() {
                 continue;
             }
             took = true;
+            let arrive_began = self.began();
             let store = self.store.read().expect("the store's lock is not poisoned");
             let before = self.scene.bricks_changed();
             let rooted = if cells.is_empty() {
@@ -2823,6 +2851,7 @@ impl Engine {
             self.work.pack_steps += 1;
             self.work.pack_bricks += self.scene.bricks_changed() - before;
             self.note(Cause::Arrival, update);
+            self.spend(Part::PackArrive, arrive_began);
             worst =
                 worst.max(self.clock.since(batch_started) / (resident.len() + cells.len()) as u32);
         }
@@ -3323,6 +3352,7 @@ impl Engine {
                 outbox.ready.patch = None;
             }
             (Changes::Patch(patch), None) => {
+                let patch = *patch;
                 if let Some(mirror) = outbox.ready.mirror.as_mut() {
                     // A copy of all of the scene is waiting: the changes go into it.
                     let _ = mirror.paste(&self.scene.copy_patch_into(patch, PatchCopy::default()));

@@ -36,6 +36,7 @@ use std::process::ExitCode;
 use std::time::Instant;
 
 use brick_store::BrickStore;
+use net::EditMode;
 use render::{Camera, HwUpdate, Image, Mode, Offscreen, Resolution, RtBackend, Scene};
 
 use args::{Args, Diag, Parsed, USAGE};
@@ -146,6 +147,14 @@ pub fn main(args: impl IntoIterator<Item = String>) -> ExitCode {
 }
 
 fn run(args: &Args) -> Result<u8, Box<dyn Error>> {
+    // Every hardware backend of the run is made with it (#236).
+    if let Some(grouping) = args.hw_group {
+        render::hw::set_process_grouping(grouping);
+    }
+    if let Some(blas) = args.hw_blas_budget {
+        render::hw::set_process_blas_budget(blas);
+    }
+    render::hw::set_process_wait(args.hw_wait);
     let (budgets, source) = match &args.budgets {
         Some(file) => {
             let text = fs::read_to_string(file)
@@ -243,8 +252,23 @@ fn run(args: &Args) -> Result<u8, Box<dyn Error>> {
         None
     } else {
         eprintln!("edits: the largest Brush at the metric rate...");
-        settle_for_edits(&mut gpu, &mut flight)?;
-        edits::run(&mut gpu, &mut flight, &budgets)?
+        settle_for_edits(&mut gpu, &mut flight, EDIT_HEIGHTS[1])?;
+        edits::run(
+            &mut gpu,
+            &mut flight,
+            &budgets,
+            EditMode::Dig,
+            edits::FRAMES,
+        )?
+    };
+    // The same stress by the ground, where its Edits are in level 0 (see `ground_edits`): on the
+    // run's own backend, so that `--rt-backend both` has compute's to put by hw's.
+    let edits_ground = match &edits {
+        Some(first) => {
+            eprintln!("edits: by the ground...");
+            ground_edits(&mut gpu, &mut flight, &budgets, first)?
+        }
+        None => None,
     };
     // The day cycle (#203) is on the flight's GPU and path, after everything that is timed against
     // the budgets and before the GPU is let go; its own gates are its own.
@@ -277,7 +301,7 @@ fn run(args: &Args) -> Result<u8, Box<dyn Error>> {
     let main_accel = choice
         .active
         .is_hardware()
-        .then(|| accel_report(initial_accel.as_ref(), &flight, edits.as_ref()));
+        .then(|| accel_report(initial_accel.as_ref(), &flight, edits.as_ref(), &gpu));
     // The cave stills are of another scene, and another GPU context: this one's is done with.
     drop(gpu);
     drop(flight);
@@ -301,12 +325,14 @@ fn run(args: &Args) -> Result<u8, Box<dyn Error>> {
     } else {
         (None, None)
     };
-    let rt = RtReport {
+    let mut rt = RtReport {
         requested: args.rt.name().to_string(),
         active: choice.active.name().to_string(),
         fallback: choice.fallback.clone().or(compare_fallback),
         accel: main_accel,
         comparison,
+        real_time_hw: None,
+        hw_group_regions: render::hw::process_grouping().describe(),
     };
     // The convergence phase (#187) has GPU contexts of its own, one for each of its views, and
     // runs after everything that is timed against the budgets, so that it cannot
@@ -367,6 +393,27 @@ fn run(args: &Args) -> Result<u8, Box<dyn Error>> {
             args.flat_ambient,
             &budgets,
             stream_slice,
+            realtime::Asked {
+                backend: args.rt.main_backend(),
+                may_fall_back: args.rt.may_fall_back(),
+            },
+        )),
+        _ => None,
+    };
+    // `--rt-backend both` with the real-time mode (#236): the same runs again, on the hardware
+    // backend, to put its frame thread's update and its frame time beside the compute backend's.
+    rt.real_time_hw = match real_time_budgets {
+        Some(budgets) if args.real_time && args.rt == RtMode::Both => Some(realtime::run(
+            !plan.patch,
+            args.runs,
+            resolution,
+            args.flat_ambient,
+            &budgets,
+            stream_slice,
+            realtime::Asked {
+                backend: RtBackend::Hardware,
+                may_fall_back: false,
+            },
         )),
         _ => None,
     };
@@ -414,6 +461,7 @@ fn run(args: &Args) -> Result<u8, Box<dyn Error>> {
             &args.diag.switches(),
         ),
         edits,
+        edits_ground,
         convergence,
         modes,
         streaming,
@@ -463,6 +511,21 @@ fn run(args: &Args) -> Result<u8, Box<dyn Error>> {
             r.gates.over.join(", ")
         );
     }
+    // The hardware run of `--rt-backend both` is held to the same gates (#236): it is the one
+    // that must pass them with the acceleration structures on.
+    let real_time_hw_code = report
+        .rt
+        .real_time_hw
+        .as_ref()
+        .map_or(0, |r| realtime::exit_code(r, args.no_fail));
+    if real_time_hw_code != 0
+        && let Some(r) = &report.rt.real_time_hw
+    {
+        eprintln!(
+            "streaming (real time, hardware rays): over its gates: {}",
+            r.gates.over.join(", ")
+        );
+    }
     // A gate of the GI (#54) is a failure whatever `--diag` said: it holds Primary to the Reference.
     let gi_code = report
         .convergence
@@ -487,12 +550,27 @@ fn run(args: &Args) -> Result<u8, Box<dyn Error>> {
     let code = code
         .max(streaming_code)
         .max(real_time_code)
+        .max(real_time_hw_code)
         .max(gi_code)
         .max(day_code);
     // An error of the real-time mode is exit status 1, not 2 (a gate that is over): nothing says
     // whether its gates would have held.
+    // The hardware half of `--rt-backend both` is the same (an adapter with no ray queries stops it
+    // with its reason, #236: its gates would have been compute's).
+    let hw_error = report
+        .rt
+        .real_time_hw
+        .as_ref()
+        .and_then(|r| r.error.as_ref());
+    if let Some(e) = hw_error {
+        eprintln!(
+            "streaming (real time, hardware rays) stopped at `{}`: {}",
+            e.step, e.message
+        );
+    }
     let code = match &report.streaming_real_time {
         Some(r) if r.error.is_some() => 1,
+        _ if hw_error.is_some() => 1,
         _ => code,
     };
     if code != 0 {
@@ -563,13 +641,16 @@ fn accel_report(
     initial: Option<&HwUpdate>,
     flight: &Flight,
     edits: Option<&edits::EditsReport>,
+    gpu: &Offscreen,
 ) -> AccelReport {
     AccelReport {
+        group_regions: gpu.hardware_grouping().describe(),
         initial: initial.map(AccelUpdate::from).unwrap_or_default(),
         flight: AccelSummary::of(&flight.accel.measured),
         flight_frames: flight.accel.measured_frames,
         warmup: AccelSummary::of(&flight.accel.warmup),
         first_frame: AccelSummary::of(&flight.accel.first_frame),
+        sweep: AccelSummary::of(&flight.accel.sweep),
         settle: AccelSummary::of(&flight.accel.settle),
         edits: edits.and_then(|e| e.accel.clone()),
     }
@@ -581,6 +662,8 @@ struct HardwareFlight {
     times: BackendTimes,
     accel: AccelReport,
     edits: Option<edits::EditsReport>,
+    /// The Edit stress again with the camera by the ground, where the Edits are in level 0.
+    ground: Option<edits::EditsReport>,
 }
 
 /// The flight (and with `with_edits` the Edit stress) on the hardware backend `backend`, on a
@@ -615,13 +698,27 @@ fn fly_hardware(
         None
     } else {
         eprintln!("rt: edits on the {} backend...", backend.name());
-        settle_for_edits(&mut gpu, &mut flight)?;
-        edits::run(&mut gpu, &mut flight, budgets)?
+        settle_for_edits(&mut gpu, &mut flight, EDIT_HEIGHTS[1])?;
+        edits::run(&mut gpu, &mut flight, budgets, EditMode::Dig, edits::FRAMES)?
+    };
+    // The Edits of the compute run's stress are in the coarse levels (the camera is a kilometre
+    // up); a BLAS of level 0 is made again by an Edit by the ground, which this stress has: the
+    // Edit+BVH of the BLAS sizes (#236). It goes on from where the first left the Planet.
+    let ground = match &edits {
+        Some(first) if with_edits => {
+            eprintln!(
+                "rt: edits by the ground on the {} backend...",
+                backend.name()
+            );
+            ground_edits(&mut gpu, &mut flight, budgets, first)?
+        }
+        _ => None,
     };
     Ok(Ok(HardwareFlight {
         times: BackendTimes::of(backend.name(), &primary),
-        accel: accel_report(initial.as_ref(), &flight, edits.as_ref()),
+        accel: accel_report(initial.as_ref(), &flight, edits.as_ref(), &gpu),
         edits,
+        ground,
     }))
 }
 
@@ -660,13 +757,14 @@ fn compare_hardware(
             None
         }
     };
-    let comparison = Comparison::new(
+    let mut comparison = Comparison::new(
         BackendTimes::of("compute", compute),
         hw.times,
         nearest,
         hw.accel,
         hw.edits,
     );
+    comparison.hw_edits_ground = hw.ground;
     Ok((Some(comparison), None))
 }
 
@@ -728,6 +826,10 @@ struct AccelLog {
     /// How many frames `measured` is of (the measured frames of every mode flown, less the first of
     /// each).
     measured_frames: u32,
+    /// Everything the sweep made (its still frames and its jumps to each height and back):
+    /// `sweep` calls `run_mode` eight times, and without this its frames would be counted as the
+    /// flight's and its jumps as the warm-up's.
+    sweep: Vec<HwUpdate>,
     /// Moving to where the Edit stress starts (`settle_for_edits`).
     settle: Vec<HwUpdate>,
 }
@@ -887,6 +989,10 @@ fn run_mode(
 /// Voxels (see [`planet_gen`]), so these are too, whatever a Voxel measures.
 const SWEEP_HEIGHTS: [f64; 4] = [48.0, 1000.0, 5000.0, 20000.0];
 
+/// The heights the Edit stress is run from: by the ground (2.4 m), where its Edits are in level 0 and
+/// the finest BLASes, and the sweep's last (1 km), where they are in the coarse levels only.
+const EDIT_HEIGHTS: [f64; 2] = [SWEEP_HEIGHTS[0], SWEEP_HEIGHTS[3]];
+
 /// The camera of the sweep at `height` Voxels over the pole.
 fn sweep_keyframe(height: f64) -> Keyframe {
     let radius = f64::from(planet_gen::PLANET_RADIUS);
@@ -896,19 +1002,67 @@ fn sweep_keyframe(height: f64) -> Keyframe {
     }
 }
 
+/// The Edit stress again with the camera by the ground (2.4 m up), where its Edits are in level 0
+/// and in the finest BLASes (the altitude stress's are in the coarse levels: #236). It goes on from
+/// where `first`, the altitude stress, left the Planet, with the Edit that undoes its last.
+fn ground_edits(
+    gpu: &mut Offscreen,
+    flight: &mut Flight,
+    budgets: &Budgets,
+    first: &edits::EditsReport,
+) -> Result<Option<edits::EditsReport>, Box<dyn Error>> {
+    settle_for_edits(gpu, flight, EDIT_HEIGHTS[0])?;
+    let start = if first.edits.is_multiple_of(2) {
+        EditMode::Dig
+    } else {
+        EditMode::Place
+    };
+    edits::run(gpu, flight, budgets, start, edits::GROUND_FRAMES)
+}
+
 /// Puts the rings where the Edit stress starts from, on either backend: the camera of the sweep's
 /// last height. The compute run reaches the stress from the sweep, which ends there, so this does
 /// nothing to it; the hardware run of `--rt-backend both` has no sweep, and without this it would
 /// start from the low end of the flight, with its Edits in level 0 and not in the coarse levels the
 /// compute run's are in (#50), and `hw_edits` and `edits` would be of different Edits.
-fn settle_for_edits(gpu: &mut Offscreen, flight: &mut Flight) -> Result<(), Box<dyn Error>> {
-    let at = sweep_keyframe(SWEEP_HEIGHTS[SWEEP_HEIGHTS.len() - 1]);
+fn settle_for_edits(
+    gpu: &mut Offscreen,
+    flight: &mut Flight,
+    height: f64,
+) -> Result<(), Box<dyn Error>> {
+    let at = sweep_keyframe(height);
     let camera = CameraPath::new(vec![at, at]).camera_at(0, 2);
-    gpu.take_hardware_updates();
+    // Anything still logged is the last part's tail, and a jump's: with the warm-up's.
+    flight.accel.warmup.extend(gpu.take_hardware_updates());
     flight.follow(gpu, &camera)?;
+    flight.accel.settle.extend(gpu.take_hardware_updates());
+    // A dig is never in the frame of the jump: the game draws frames in between, and each waits
+    // for the GPU, so what the jump left behind (its upload, the old buffers it freed, the
+    // hardware's builds) is paid for in those frames and not in the first Edit's (#236: that Edit's
+    // submit was 5.8 ms on compute and 7.0 on hardware, against 0.06 on the Edits after it, with
+    // the stress going on at once). What they cost is printed.
+    let frame_ms: Vec<f64> = (0..SETTLE_FRAMES)
+        .map(|_| {
+            let began = Instant::now();
+            gpu.draw_upscaled(&camera);
+            began.elapsed().as_secs_f64() * 1e3
+        })
+        .collect();
+    eprintln!(
+        "settle: {SETTLE_FRAMES} frames drawn before the Edits, in ms: {}",
+        frame_ms
+            .iter()
+            .map(|ms| format!("{ms:.1}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
     flight.accel.settle.extend(gpu.take_hardware_updates());
     Ok(())
 }
+
+/// The frames drawn between the jump to where the Edit stress starts and its first Edit (see
+/// `settle_for_edits`).
+const SETTLE_FRAMES: u32 = 6;
 
 /// The test Planet from a still camera at each of [`SWEEP_HEIGHTS`], looking at the ground that
 /// slopes away towards the horizon: both modes' passes timed there, over a few dozen frames, and
@@ -928,6 +1082,8 @@ fn sweep(
         warmup: 2,
         spp: 2,
     };
+    // The flight's log is set aside, and the sweep's is its own.
+    let outside = std::mem::take(&mut flight.accel);
     let mut altitudes = Vec::new();
     for height in SWEEP_HEIGHTS {
         let at = sweep_keyframe(height);
@@ -949,6 +1105,16 @@ fn sweep(
             reference: pass_stats(&reference, "reference"),
         });
     }
+    let swept = std::mem::replace(&mut flight.accel, outside);
+    flight.accel.sweep.extend(
+        swept
+            .warmup
+            .into_iter()
+            .chain(swept.first_frame)
+            .chain(swept.measured)
+            .chain(swept.settle)
+            .chain(swept.sweep),
+    );
     Ok(altitudes)
 }
 
@@ -1062,6 +1228,10 @@ fn print_summary(report: &Report) {
         print_streaming(s);
     }
     if let Some(r) = &report.streaming_real_time {
+        print_real_time(r);
+    }
+    if let Some(r) = &report.rt.real_time_hw {
+        eprintln!("the same real-time runs on the hardware backend (--rt-backend both):");
         print_real_time(r);
     }
     if let Some(c) = &report.convergence {
@@ -1219,6 +1389,35 @@ fn print_real_time(r: &realtime::RealTimeReport) {
                 m.gpu_total.mean_ms,
                 m.wait_not_passes.mean_ms,
             );
+            eprintln!(
+                "        frame thread's scene update: mean {:.2} p95 {:.2} max {:.2} ms",
+                m.update.mean_ms, m.update.p95_ms, m.update.worst_ms,
+            );
+            if let Some(h) = &p.hardware {
+                eprintln!(
+                    "        hardware per frame, mean (p95) ms: total {:.2} ({:.2}) = before {:.2} + plan {:.2} + instances {:.2} + boxes pass {:.2} + builds {:.2} + finish {:.2} + submit {:.2} ({:.2}); update less hardware {:.2}; BLAS {:.1} (p95 {:.0}, max {}; urgent {:.1}), {} us each, {} frames with builds; draw submit {:.2} ({:.2}) with {:.0} TLAS instances",
+                    h.total.mean_ms,
+                    h.total.p95_ms,
+                    h.before.mean_ms,
+                    h.plan.mean_ms,
+                    h.instances.mean_ms,
+                    h.boxes_pass.mean_ms,
+                    h.builds.mean_ms,
+                    h.finish.mean_ms,
+                    h.submit.mean_ms,
+                    h.submit.p95_ms,
+                    h.update_rest.mean_ms,
+                    h.blas.mean,
+                    h.blas.p95,
+                    h.blas.max,
+                    h.blas_urgent.mean,
+                    h.per_blas_us.total.round(),
+                    h.frames_with_builds,
+                    h.draw_submit.mean_ms,
+                    h.draw_submit.p95_ms,
+                    h.tlas_instances.mean,
+                );
+            }
             if !p.gpu_passes.is_empty() {
                 let passes: Vec<String> = p
                     .gpu_passes
@@ -1239,6 +1438,7 @@ fn print_real_time(r: &realtime::RealTimeReport) {
                     s.walk_s, s.reband_s, s.fill_s
                 ))
             );
+            eprint_loader_detail(p);
             // Where the time of the slowest frames went, when there were frames over the limit.
             if p.frames_over_limit > 0 {
                 for f in p.slowest.iter().take(3) {
@@ -1411,6 +1611,73 @@ fn print_streaming(s: &stream::StreamReport) {
     }
 }
 
+/// What the loader's jobs waited for in a path, by class, the camera misses by level and a flight's
+/// seconds (#251), on stderr: for the summary and for the ignored full-size run with no GPU.
+pub(crate) fn eprint_loader_detail(p: &realtime::PathReport) {
+    if p.scene_thread.pack_ms > 0.0 {
+        eprintln!(
+            "        scene thread pack {:.0} ms = request {:.0} + receive {:.0} + hold {:.0} + arrive {:.0} (the rest is waiting for locks and the loop)",
+            p.scene_thread.pack_ms,
+            p.scene_thread.pack_request_ms,
+            p.scene_thread.pack_receive_ms,
+            p.scene_thread.pack_hold_ms,
+            p.scene_thread.pack_arrive_ms,
+        );
+    }
+    // What the loader's jobs waited for, by class (#251): the mean and the 99th percentile's
+    // bin of the queue, the making, the channel and all of them, and the jobs over 100 ms.
+    let l = &p.loader_latency;
+    if l.drawn.jobs + l.margin.jobs + l.prefetch.jobs > 0 {
+        eprintln!(
+            "        loader jobs ahead of the scene thread: mean {:.0}, max {}, at the most in {} frames",
+            p.loader_ahead_mean, p.loader_ahead_max, p.loader_frames_at_max_ahead
+        );
+        for (name, c) in [
+            ("drawn", &l.drawn),
+            ("margin", &l.margin),
+            ("prefetch", &l.prefetch),
+        ] {
+            eprintln!(
+                "        {name:>8} jobs {:>7}: mean/p99 ms: outbox {:.1}/{:.1}, queued {:.1}/{:.1}, made {:.1}/{:.1}, waited {:.1}/{:.1}, total {:.1}/{:.1}; {} over 100 ms",
+                c.jobs,
+                c.outbox.mean_ms,
+                c.outbox.p99_ms,
+                c.queued.mean_ms,
+                c.queued.p99_ms,
+                c.made.mean_ms,
+                c.made.p99_ms,
+                c.waited.mean_ms,
+                c.waited.p99_ms,
+                c.total.mean_ms,
+                c.total.p99_ms,
+                c.total.over_100_ms,
+            );
+        }
+    }
+    if !p.camera_soft_miss_by_level.is_empty() {
+        eprintln!(
+            "        camera misses by the level drawn whole: {:?}",
+            p.camera_soft_miss_by_level
+        );
+    }
+    for s in &p.by_second {
+        eprintln!(
+            "        second {:>2}: {:>3} frames, camera misses {:>3}, queue mean {:>5.0} max {:>5}, ahead {:>4.0}, arrived {:>6} bricks, scene thread follow {:>5.0} pack {:>5.0} reband {:>5.0} ms, lag max {:.2} d0",
+            s.second,
+            s.frames,
+            s.camera_soft_misses,
+            s.loader_queue_mean,
+            s.loader_queue_max,
+            s.loader_ahead_mean,
+            s.arrived_bricks,
+            s.scene_follow_ms,
+            s.scene_pack_ms,
+            s.scene_reband_ms,
+            s.lag_d0_max,
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1479,9 +1746,19 @@ mod tests {
         assert_eq!(log.measured_frames, 5);
         assert!(log.settle.is_empty());
         // And what the report sums is the steady flight's alone.
-        let accel = accel_report(None, &flight, None);
+        let accel = accel_report(None, &flight, None, &gpu);
+        // What the report says of the BLAS size is the context's own.
+        assert_eq!(accel.group_regions, gpu.hardware_grouping().describe());
         assert_eq!(accel.flight.updates as usize, log.measured.len());
         assert_eq!(accel.flight_frames, 5);
         assert_eq!(accel.warmup.updates as usize, log.warmup.len());
+        // Moving to where the Edit stress starts keeps what was still queued, in the warm-up's
+        // part (#236: it used to throw it away).
+        let before = flight.accel.warmup.len();
+        gpu.update_scene(&flight.scene, &render::SceneUpdate::Rebuilt)
+            .unwrap();
+        settle_for_edits(&mut gpu, &mut flight, EDIT_HEIGHTS[1]).unwrap();
+        assert_eq!(flight.accel.warmup.len(), before + 1);
+        assert_eq!(flight.accel.warmup.last().map(|u| u.kind), Some("build"));
     }
 }

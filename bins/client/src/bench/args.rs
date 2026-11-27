@@ -69,15 +69,38 @@ Options:
                    phase's sun-and-sky view (#52), 1 to 16 [default: the renderer's, 2]. The
                    report's `convergence.shadows.shadow_rays` says which; run it with 1 and with 2
                    to compare them
-  --rt-backend B   How rays find the Planet (#50): compute (the default: the compute-shader DDA),
-                   hw (ray queries over the bricks' tight boxes, with shadow rays that end at the
-                   first hit, for the flight, the sweep and the Edit stress; the compute path, with
-                   a warning and the reason in the report's `rt.fallback`, if the adapter has no
-                   ray queries), hw-nearest (hw with shadow rays that look for the nearest hit) or
-                   both (the bench as for compute, then the same flight and Edit stress on hw, and
-                   the flight on hw-nearest, each on a context of its own, and the passes that cast
-                   rays compared: `rt.comparison`). The report's `rt` says which ran and what the
-                   acceleration structures cost to update
+  --rt-backend B   How rays find the Planet (#50): auto (the default, and what the game does:
+                   ray queries where the adapter has them, else the compute path with a warning
+                   and the reason in the report's `rt.fallback`), compute (the compute-shader DDA:
+                   the game's setting for compute, and the reference), hw (ray queries over the
+                   bricks' tight boxes, with shadow rays that end at the first hit, for the flight,
+                   the sweep and the Edit stress and for the runs of `--streaming --real-time`,
+                   #236; the same as auto on an adapter with ray queries, and on one without them
+                   the compute path with a warning, and an error in the real-time mode, whose gates
+                   would say nothing of hw), hw-nearest (hw with shadow rays that look for the
+                   nearest hit) or both (the bench as for compute, then the same flight and Edit
+                   stress on hw, and the flight on hw-nearest, each on a context of its own, and
+                   the passes that cast rays compared: `rt.comparison`; with `--streaming
+                   --real-time`, the real-time runs on compute and then on hw:
+                   `rt.real_time_hw`). The report's `rt` says which ran and what the acceleration
+                   structures cost to update
+  --hw-group-regions G
+                   How the hardware backend (--rt-backend hw|both) makes its BLASes (#236): G
+                   regions along an edge of each, 4, 8, 16 or 32, or NEAR:FAR@LEVEL (levels below
+                   LEVEL have BLASes of NEAR regions an edge, the others FAR, e.g. 4:16@6), or
+                   NEAR:MID@LEVEL:FAR@LEVEL (a third size from the second LEVEL up). The default
+                   is 16:32@2. Fewer, larger BLASes cost the frame thread less and the GPU more; the
+                   report's `rt.hw_group_regions` says what ran
+  --hw-build-blas N
+                   The most BLASes a frame builds of the groups that may wait (#236), default no
+                   bound; the groups that may not wait (they gained boxes, or have no BLAS) are built
+                   at once whatever it is. The report counts them as `blas_urgent`
+  --hw-wait        A diagnosis (#236): every update of the hardware backend waits for the GPU, so that
+                   the paths' `hardware.wait` (and the slowest frames' `wait_ms`) is the GPU's time of
+                   the boxes' pass, the BLAS builds and the TLAS of the frame. It is not a player's
+                   frame: the gates mean nothing with it. On a device with timestamps in encoders it
+                   also times the BLAS builds and the TLAS build apart (`hardware.gpu_blas`,
+                   `hardware.gpu_tlas`)
   --time-of-day H  Light the flight (primary and reference, the sweep and the edits) by the sky of the
                    world clock at H hours (0 to 24: 0 midnight, 6 sunrise, 12 noon, 18 sunset) in
                    place of the fixed hero sun, with the clock stopped there (#203)
@@ -154,6 +177,14 @@ pub struct Args {
     pub shadow_rays: Option<u32>,
     /// `--rt-backend` (#50): how rays find the Planet.
     pub rt: RtMode,
+    /// `--hw-group-regions` (#236): how the hardware backend's BLASes are made of the cells; None
+    /// is the default, `PRODUCTION_GROUPING`.
+    pub hw_group: Option<render::hw::Grouping>,
+    /// `--hw-build-blas` (#236): the most BLASes a frame builds of the groups that may wait.
+    pub hw_blas_budget: Option<u32>,
+    /// `--hw-wait` (#236): every update of the hardware backend waits for the GPU, a diagnosis of
+    /// what the GPU's time of the boxes, builds and TLAS is (not a player's frame).
+    pub hw_wait: bool,
     /// `--time-of-day`: the hours at which the flight's sky is put (#203).
     pub time_of_day: Option<f64>,
     /// `--day-cycle` and `--day-seconds`: the day cycle phase, and the length of its day if said.
@@ -177,7 +208,7 @@ pub const DEFAULT_RUNS: u32 = 3;
 #[derive(Debug, PartialEq)]
 pub enum Parsed {
     Help,
-    Run(Args),
+    Run(Box<Args>),
 }
 
 /// Parses what follows `bench` on the command line.
@@ -197,6 +228,9 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Parsed, String> {
         flip_gamma22: false,
         shadow_rays: None,
         rt: RtMode::default(),
+        hw_group: None,
+        hw_blas_budget: None,
+        hw_wait: false,
         time_of_day: None,
         day_cycle: false,
         day_seconds: None,
@@ -229,6 +263,19 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Parsed, String> {
             "--truth-spp" => parsed.truth_spp = Some(truth_spp(&value("--truth-spp")?)?),
             "--shadow-rays" => parsed.shadow_rays = Some(shadow_rays(&value("--shadow-rays")?)?),
             "--rt-backend" => parsed.rt = RtMode::parse(&value("--rt-backend")?)?,
+            "--hw-group-regions" => {
+                parsed.hw_group = Some(render::hw::Grouping::parse(&value("--hw-group-regions")?)?);
+            }
+            "--hw-build-blas" => {
+                parsed.hw_blas_budget = Some(
+                    value("--hw-build-blas")?
+                        .parse::<u32>()
+                        .ok()
+                        .filter(|&n| n >= 1)
+                        .ok_or("--hw-build-blas takes a whole number of at least 1")?,
+                );
+            }
+            "--hw-wait" => parsed.hw_wait = true,
             "--time-of-day" => parsed.time_of_day = Some(time_of_day(&value("--time-of-day")?)?),
             "--day-cycle" => parsed.day_cycle = true,
             "--day-seconds" => parsed.day_seconds = Some(day_seconds(&value("--day-seconds")?)?),
@@ -301,7 +348,7 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Parsed, String> {
                 .into(),
         );
     }
-    Ok(Parsed::Run(parsed))
+    Ok(Parsed::Run(Box::new(parsed)))
 }
 
 /// `--runs`: at least 1.
@@ -429,7 +476,7 @@ mod tests {
 
     fn run(args: &[&str]) -> Args {
         match parse_all(args) {
-            Ok(Parsed::Run(args)) => args,
+            Ok(Parsed::Run(args)) => *args,
             other => panic!("{other:?}"),
         }
     }
@@ -452,7 +499,10 @@ mod tests {
                 truth_spp: None,
                 flip_gamma22: false,
                 shadow_rays: None,
-                rt: RtMode::Compute,
+                rt: RtMode::Auto,
+                hw_group: None,
+                hw_blas_budget: None,
+                hw_wait: false,
                 time_of_day: None,
                 day_cycle: false,
                 day_seconds: None,
@@ -466,8 +516,10 @@ mod tests {
     }
 
     #[test]
-    fn the_ray_backend_is_compute_unless_asked_and_a_bad_one_is_refused() {
-        assert_eq!(run(&[]).rt, RtMode::Compute);
+    fn the_ray_backend_is_auto_unless_asked_and_a_bad_one_is_refused() {
+        // The default is what the player gets (#50): ray queries where the adapter has them.
+        assert_eq!(run(&[]).rt, RtMode::Auto);
+        assert_eq!(run(&["--rt-backend", "auto"]).rt, RtMode::Auto);
         assert_eq!(run(&["--rt-backend", "compute"]).rt, RtMode::Compute);
         assert_eq!(run(&["--rt-backend", "hw"]).rt, RtMode::Hardware);
         assert_eq!(
@@ -497,6 +549,39 @@ mod tests {
             &["--streaming", "--flat-ambient"],
             // The diagnostic switches say the budgets are not checked, which the gates always are.
             &["--streaming", "--real-time", "--diag", "no-flush"],
+        ] {
+            assert!(parse_all(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn the_hardware_grouping_is_read_as_a_size_or_a_split_and_bad_ones_are_refused() {
+        use render::hw::Grouping;
+        assert_eq!(run(&[]).hw_group, None);
+        assert_eq!(
+            run(&["--hw-group-regions", "8"]).hw_group,
+            Some(Grouping::uniform(8).unwrap())
+        );
+        assert_eq!(
+            run(&["--hw-group-regions", "4:16@6"]).hw_group,
+            Some(Grouping::split(4, 16, 6).unwrap())
+        );
+        assert_eq!(
+            run(&["--hw-group-regions", "16:32@2"]).hw_group,
+            Some(Grouping::split(16, 32, 2).unwrap())
+        );
+        assert_eq!(run(&[]).hw_blas_budget, None);
+        assert_eq!(run(&["--hw-build-blas", "12"]).hw_blas_budget, Some(12));
+        assert!(!run(&[]).hw_wait);
+        assert!(run(&["--hw-wait"]).hw_wait);
+        for bad in [
+            &["--hw-group-regions"][..],
+            &["--hw-group-regions", "5"],
+            &["--hw-group-regions", "64"],
+            &["--hw-group-regions", "4:16"],
+            &["--hw-build-blas"],
+            &["--hw-build-blas", "0"],
+            &["--hw-build-blas", "x"],
         ] {
             assert!(parse_all(bad).is_err(), "{bad:?}");
         }
