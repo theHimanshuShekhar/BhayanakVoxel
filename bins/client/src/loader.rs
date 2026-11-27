@@ -85,8 +85,18 @@ pub fn hold_guard(
 /// (#220): the rest of the Guard is made in the background, 2 of the 6 workers at eight cores, and
 /// the ring's children are not made later for it. Never more than all but one of the workers
 /// ([`guard_may_start`]), so that the streaming queue always has one: with 4 or 5 cores that is 1
-/// of 2 or 3 workers.
+/// of 2 or 3 workers. This is the least of it, which is a stepped loader's, so that the stepped
+/// counts do not depend on the machine; with more than six workers it is a third of them
+/// ([`guard_share`]), so that the Guard on a 16-thread machine is made in the background by four
+/// workers and not by two (#264).
 pub const GUARD_WORKERS: usize = 2;
+
+/// How many of `workers` make cells of the Guard beside the queue's jobs: [`GUARD_WORKERS`], and a
+/// third of the workers when that is more. The floor is the two that were always given, the
+/// ceiling is the third that leaves the ring's children their share.
+pub fn guard_share(workers: usize) -> usize {
+    GUARD_WORKERS.max(workers / 3)
+}
 
 /// With a single worker (three cores or fewer) the Guard has no share while there is other work, so
 /// it is given a cell after this many of the queue's jobs, not to wait for a fill that takes
@@ -104,7 +114,7 @@ fn guard_may_start(workers: usize, guarding: usize, queue_empty: bool, since: us
     if queue_empty {
         guarding < all_but_one.max(1)
     } else {
-        let share = GUARD_WORKERS.min(all_but_one);
+        let share = guard_share(workers).min(all_but_one);
         guarding < share || (share == 0 && since >= GUARD_EVERY)
     }
 }
@@ -453,9 +463,10 @@ pub struct Loader {
 }
 
 /// Workers for `cores` cores: two fewer, so that the simulation and the frame thread always have
-/// one each, and at least one.
+/// one each, and at least one. `cores` is [`machine::threads`], which is the machine's, held to the
+/// constrained profile if there is one (#264).
 pub fn workers_for(cores: usize) -> usize {
-    cores.saturating_sub(2).max(1)
+    machine::loader_workers_for(cores)
 }
 
 impl Loader {
@@ -1415,6 +1426,17 @@ mod tests {
         assert_eq!(workers_for(3), 1);
         assert_eq!(workers_for(2), 1);
         assert_eq!(workers_for(1), 1);
+        assert_eq!(workers_for(32), 30);
+    }
+
+    #[test]
+    fn the_guard_has_two_workers_up_to_six_and_a_third_of_more() {
+        for (workers, share) in [(1, 2), (2, 2), (6, 2), (8, 2), (9, 3), (14, 4), (30, 10)] {
+            assert_eq!(guard_share(workers), share, "{workers} workers");
+        }
+        // Beside the queue on 14 workers, four are on cells and the fifth waits.
+        assert!(guard_may_start(14, 3, false, 0));
+        assert!(!guard_may_start(14, 4, false, 0));
     }
 
     /// Solid bricks from any level, counting what it was asked for.

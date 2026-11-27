@@ -45,7 +45,7 @@ use brick_store::{Budget, VOXELS_PER_METRE};
 use net::{ServerEnd, loopback};
 use planet_gen::cost::{ExtraCost, ExtraCostStats};
 use planet_gen::planet::{interior_radius_for, max_radius_for, tangents};
-use planet_gen::world_map::{Relief, TEST_RADIUS, WORLD_MAP_SIZE, WORLD_RADIUS, WorldMap};
+use planet_gen::world_map::{Relief, TEST_RADIUS, WORLD_RADIUS, WorldMap};
 use render::reference::{Ray, trace};
 use render::{
     Camera, GpuPasses, Mode, Offscreen, Rebuild, Resolution, RtBackend, RtChoice, Scene,
@@ -1129,8 +1129,9 @@ struct SecondSum {
 /// The cold start: the world made, and the frames at the Spawn until the resident set is complete.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize)]
 pub struct ColdStart {
-    /// Generating the world map, which the client does before it loads the Planet: not in the time
-    /// to control. Null for the test Planet's.
+    /// Making the world map, which the client does before it loads the Planet: not in the time
+    /// to control. Built, or read from the cache folder (#264: the stderr line says which, and
+    /// `BHAYANAK_NO_MAP_CACHE=1` makes it built every time). Null for the test Planet's.
     pub world_map_s: Option<f64>,
     /// [`crate::load`]: the spawn ring, the Guard, and the first scene.
     pub load_s: f64,
@@ -1698,10 +1699,9 @@ struct Setup {
 
 /// The Planet of the client, at full size: made as `main.rs` makes it.
 fn build_full(hooks: &GenHooks) -> Result<Built, Box<dyn Error>> {
-    eprintln!("real time: generating the world map...");
-    let began = Instant::now();
-    let map = hooks.relief(WorldMap::generate(crate::SEED, WORLD_MAP_SIZE));
-    let world_map = began.elapsed();
+    eprintln!("real time: making the world map (read from the cache if it is there)...");
+    let (map, world_map) = crate::world_map();
+    let map = hooks.relief(map);
     eprintln!("real time: loading the Planet...");
     let extra = hooks.extra();
     let began = Instant::now();
@@ -1769,7 +1769,7 @@ fn build_test(hooks: &GenHooks) -> Result<Built, Box<dyn Error>> {
     let source = store
         .source()
         .ok_or("the test Planet's store has a source")?;
-    let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let cores = machine::threads();
     let loader = Loader::new(source, spawn.position, bands, workers_for(cores));
     let (client, server) = loopback();
     let world = World::new(scene, Predictor::new(store), client).with_loader(loader);
