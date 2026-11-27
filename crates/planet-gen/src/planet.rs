@@ -1381,31 +1381,27 @@ impl Planet {
         top: usize,
         cells: &[BrickCoord],
     ) -> Vec<(usize, BrickCoord, Brick, bool)> {
-        let next = std::sync::atomic::AtomicUsize::new(0);
-        let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
-        let parts: Vec<Vec<(usize, Vec<_>)>> = std::thread::scope(|scope| {
-            let workers: Vec<_> = (0..threads.min(cells.len().max(1)))
-                .map(|_| {
-                    scope.spawn(|| {
-                        let mut made = Vec::new();
-                        loop {
-                            let at = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            let Some(&cell) = cells.get(at) else {
-                                return made;
-                            };
-                            made.push((at, self.guard_cell(levels.clone(), top, cell)));
-                        }
-                    })
-                })
-                .collect();
-            workers
-                .into_iter()
-                .map(|worker| worker.join().expect("generator thread panicked"))
-                .collect()
-        });
-        let mut by_cell: Vec<_> = parts.into_iter().flatten().collect();
-        by_cell.sort_by_key(|&(at, _)| at);
-        by_cell.into_iter().flat_map(|(_, made)| made).collect()
+        self.guard_in_on(machine::threads(), levels, top, cells)
+    }
+
+    /// [`Planet::guard_in`] on `threads` threads (the tests make the same Guard on one, four and
+    /// all).
+    fn guard_in_on(
+        &self,
+        threads: usize,
+        levels: std::ops::RangeInclusive<usize>,
+        top: usize,
+        cells: &[BrickCoord],
+    ) -> Vec<(usize, BrickCoord, Brick, bool)> {
+        // A cell a piece, taken by the next free thread (a cell is thousands of bricks and costs
+        // what its ground costs, so a share a thread would leave all but one waiting at the end),
+        // and the cells come back in order.
+        machine::par_pieces(cells.len(), threads, |at| {
+            self.guard_cell(levels.clone(), top, cells[at])
+        })
+        .into_iter()
+        .flatten()
+        .collect()
     }
 }
 
@@ -3038,6 +3034,14 @@ mod tests {
             .flat_map(|&cell| planet().guard_cell(12..=top, top, cell))
             .collect();
         assert_eq!(shared, alone);
+        // And the same on one, four and three times all the threads.
+        for threads in [1, 4, 3 * machine::threads()] {
+            assert_eq!(
+                planet().guard_in_on(threads, 12..=top, top, &cells),
+                alone,
+                "{threads} threads"
+            );
+        }
         // A cell that is the ball's: every brick of the top level that the ball touches is one,
         // and the others are not.
         let size = f64::from(BRICK_SIZE << top);

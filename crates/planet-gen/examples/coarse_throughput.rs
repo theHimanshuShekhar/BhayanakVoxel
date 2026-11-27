@@ -28,7 +28,7 @@ fn main() {
         .map_or(0xB4A7_A9AC, |s| s.parse().expect("SEED"));
     let started = Instant::now();
     let planet = Planet::new(WorldMap::generate(seed, size));
-    let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let threads = machine::threads();
     println!(
         "world map of {size} texels generated in {:.1?}; {threads} threads",
         started.elapsed()

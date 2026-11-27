@@ -34,7 +34,7 @@ fn main() {
         None => (9..=top).collect(),
     };
     let size: u32 = args.next().map_or(2048, |s| s.parse().expect("SIZE"));
-    let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let threads = machine::threads();
     let load = std::fs::read_to_string("/proc/loadavg").unwrap_or_default();
     println!(
         "{threads} threads, load average at the start: {}",
