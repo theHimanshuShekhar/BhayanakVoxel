@@ -84,41 +84,6 @@ jobs:
           path: golden-failures
           if-no-files-found: ignore
 
-  # The client tests that are about real threads or real time are skipped here; the
-      # real-thread-tests job runs them (.github/real-thread-tests.txt lists them). The streaming
-      # tests that are about behaviour run stepped (no threads, no sleeps) and are run here.
-      - name: cargo test --workspace, without the real-thread tests
-        shell: bash
-        run: |
-          set -euo pipefail
-          mapfile -t filters < <(tr -d '\r' < .github/real-thread-tests.txt | grep -vE '^\s*(#|$)')
-          skips=()
-          for f in "${filters[@]}"; do skips+=(--skip "$f"); done
-          cargo test --workspace -- "${skips[@]}"
-        env:
-          # Where the golden image test writes actual.png, expected.png and diff.png on a mismatch.
-          GOLDEN_FAILURE_DIR: ${{ github.workspace }}/golden-failures
-      # The gating jobs skip a listed filter in the whole workspace, the real-thread job runs it in
-      # the client binary only: a line that matches another crate's test would run it nowhere.
-      - name: Real-thread list matches no test outside the client binary
-        run: bash .github/scripts/check-real-thread-list.sh outside
-      - name: Upload golden image failures
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: golden-image-failures
-          path: golden-failures
-          if-no-files-found: ignore
-      - name: Server must not depend on wgpu or winit
-        shell: bash
-        run: |
-          set -euo pipefail
-          deps=$(cargo tree -p server -e normal --prefix none --target all)
-          if grep -E '^(wgpu|winit)' <<<"$deps"; then
-            echo "::error::server must not depend on wgpu or winit"
-            exit 1
-          fi
-
   # The client tests that are about real threads or real time (the frame thread's milliseconds, a thread that is busy or panics), and the
   # sim's two wall-clock tests (an ignored test each: the kilometre walk's tick time and the server thread's 60 Hz), on both platforms. Some of
   # them wait on wall-clock time and so fail now and then. `continue-on-error` keeps a failure here from failing the workflow. The
