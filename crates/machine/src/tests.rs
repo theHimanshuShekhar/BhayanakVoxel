@@ -109,6 +109,93 @@ fn the_machine_has_threads_and_memory() {
     let found = detect();
     assert!(found.threads >= 1);
     assert!(found.memory > 0);
+    // On the systems the game runs on the read of free memory works (on Windows this is
+    // `GlobalMemoryStatusEx`, which CI is the first to run), and it is not the fallback's guess.
+    if cfg!(any(target_os = "linux", windows)) {
+        let free = available_memory().expect("the system says how much memory is free");
+        assert!(free > 0);
+        // Free memory moves between two reads, but it is the system's figure, not the fallback's
+        // guess (the profile's 5 GiB): within a quarter of itself.
+        assert!(
+            found.memory.abs_diff(free) < free / 4,
+            "{} and {free}",
+            found.memory
+        );
+    }
+}
+
+#[test]
+fn a_containers_room_is_its_limit_less_its_use_in_either_version_of_cgroups() {
+    // v2: `memory.max` is a number or `max`.
+    assert_eq!(
+        cgroup_room(Some("8589934592\n"), Some("1073741824\n")),
+        Some(7 * GIB)
+    );
+    assert_eq!(cgroup_room(Some("max\n"), Some("1073741824\n")), None);
+    // v1: the limit is a number near 2^63 when there is none.
+    assert_eq!(
+        cgroup_room(Some("4294967296"), Some("1073741824")),
+        Some(3 * GIB)
+    );
+    assert_eq!(
+        cgroup_room(Some("9223372036854771712"), Some("1073741824")),
+        None
+    );
+    // Use over the limit is no room, not a wrap; a missing file or text is no limit.
+    assert_eq!(cgroup_room(Some("1000"), Some("5000")), Some(0));
+    assert_eq!(cgroup_room(None, Some("1")), None);
+    assert_eq!(cgroup_room(Some("1000"), None), None);
+}
+
+#[test]
+fn the_processors_to_pin_to_are_the_first_of_those_allowed_and_none_if_there_is_nothing_to_cut() {
+    let allowed = [2, 3, 4, 5, 6, 7];
+    assert_eq!(cpus_for(&allowed, 4), Some(vec![2, 3, 4, 5]));
+    assert_eq!(cpus_for(&allowed, 1), Some(vec![2]));
+    assert_eq!(cpus_for(&allowed, 6), None);
+    assert_eq!(cpus_for(&allowed, 9), None);
+    assert_eq!(cpus_for(&allowed, 0), None);
+    assert_eq!(Pinning::NotNeeded.describe(), "not pinned");
+    assert_eq!(Pinning::Pinned(vec![0, 1]).describe(), "pinned to cpus 0,1");
+}
+
+/// The mask is really set: a thread of ours is held to two processors and reads them back. (The
+/// whole process is not pinned here: that would hold every other test.)
+#[cfg(target_os = "linux")]
+#[test]
+fn a_thread_is_held_to_the_processors_it_is_pinned_to() {
+    std::thread::spawn(|| {
+        // SAFETY: `cpu_set_t` is plain data.
+        let allowed: Vec<usize> = unsafe {
+            let mut set: libc::cpu_set_t = std::mem::zeroed();
+            assert_eq!(
+                libc::sched_getaffinity(0, size_of::<libc::cpu_set_t>(), &mut set),
+                0
+            );
+            (0..libc::CPU_SETSIZE as usize)
+                .filter(|&cpu| libc::CPU_ISSET(cpu, &set))
+                .collect()
+        };
+        if allowed.len() < 3 {
+            return; // a box of one or two processors has nothing to cut to two
+        }
+        let pinned = pin_tasks(2, &[0]);
+        assert_eq!(pinned, Pinning::Pinned(allowed[..2].to_vec()));
+        // SAFETY: as above.
+        let now: Vec<usize> = unsafe {
+            let mut set: libc::cpu_set_t = std::mem::zeroed();
+            assert_eq!(
+                libc::sched_getaffinity(0, size_of::<libc::cpu_set_t>(), &mut set),
+                0
+            );
+            (0..libc::CPU_SETSIZE as usize)
+                .filter(|&cpu| libc::CPU_ISSET(cpu, &set))
+                .collect()
+        };
+        assert_eq!(now, allowed[..2]);
+    })
+    .join()
+    .unwrap();
 }
 
 /// Work whose cost is very uneven: the pieces at the start are slow.
@@ -189,5 +276,5 @@ fn flags_are_taken_out_of_the_arguments_wherever_they_are_and_the_rest_is_kept_i
 #[test]
 fn the_low_end_profile_describes_itself() {
     let text = Profile::LOW_END.describe();
-    assert!(text.contains("4 threads") && text.contains("6.0 GiB") && text.contains("off"));
+    assert!(text.contains("4 threads") && text.contains("5.0 GiB") && text.contains("off"));
 }

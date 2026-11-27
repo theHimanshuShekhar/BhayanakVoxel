@@ -8,8 +8,11 @@
 //! * [`profile`] is the machine's [`Profile`]: its threads, its free memory, its video memory and
 //!   whether it has ray queries, after the override of [`ENV_PROFILE`] and its siblings, or of
 //!   [`constrain`] (a flag). The constrained profile is how the low-end reference machine
-//!   ([`Profile::LOW_END`]: 4 threads, 8 GiB, 4 GiB of video memory, no ray queries) is run on any
+//!   ([`Profile::LOW_END`]: 4 threads, 5 GiB free of 8 GB, 4 GiB of video memory, no ray queries) is run on any
 //!   machine: it only ever lowers what was found, never raises it.
+//!   [`pin_to_profile`] then holds the process to that many logical processors, so that every
+//!   thread (the frame thread, the scene thread, the simulation, the driver's) shares them, as on
+//!   a real machine of that size.
 //! * [`threads`], [`bulk_threads`] and [`loader_workers`] are the thread counts the rest of the
 //!   workspace derives from it: no `available_parallelism` call is made elsewhere.
 //! * [`par_pieces`], [`par_map`] and [`par_fill`] share work among those threads **deterministically**:
@@ -31,8 +34,10 @@ pub struct Profile {
     /// Memory the process may use, in bytes: what is free of the machine's, or of the container's
     /// limit.
     pub memory: u64,
-    /// Video memory, in bytes, if the machine says (the adapter's, read by the renderer: this crate
-    /// has no GPU). `None` is not known, and sized for as [`Profile::LOW_END`]'s.
+    /// Video memory, in bytes: only what a flag or the environment says (`--video-memory-mib`) or
+    /// [`Profile::LOW_END`]'s 4 GiB, since no adapter's figure is read yet (`wgpu` does not give
+    /// one: `docs/perf/resource-audit.md`). **Nothing sizes a budget from it yet.** `None` is not
+    /// known.
     pub video_memory: Option<u64>,
     /// Whether the adapter has the ray queries that the hardware backend needs. Read by the
     /// renderer, which only ever turns it off here.
@@ -45,11 +50,11 @@ pub const GIB: u64 = 1 << 30;
 impl Profile {
     /// The low-end machine that the game is sized to run on (the owner's, #264): a GTX 1650 or
     /// RX 570 class PC, 4 threads, 8 GB of RAM, 4 GB of video memory, no ray queries, so the
-    /// compute tracer. [`Profile::memory`] is what is free, not what is fitted: 6 GiB of the
-    /// 8 GB, the rest being the system's and the browser the player left open.
+    /// compute tracer. [`Profile::memory`] is what is free, not what is fitted: 5 GiB of the
+    /// 8 GB (Windows at idle leaves about 4.5 to 5 GiB free on one), the rest being the system's.
     pub const LOW_END: Profile = Profile {
         threads: 4,
-        memory: 6 * GIB,
+        memory: 5 * GIB,
         video_memory: Some(4 * GIB),
         ray_queries: false,
     };
@@ -163,6 +168,7 @@ pub fn take_flags(args: Vec<String>) -> Result<Vec<String>, String> {
 }
 
 static PROFILE: OnceLock<Profile> = OnceLock::new();
+static FOUND: OnceLock<Profile> = OnceLock::new();
 static LIMIT: OnceLock<Profile> = OnceLock::new();
 
 /// Holds the profile to `limit` for the whole run: the flag form of [`ENV_PROFILE`]. It has to be
@@ -177,11 +183,24 @@ pub fn constrain(limit: Profile) -> bool {
 pub fn profile() -> Profile {
     *PROFILE.get_or_init(|| {
         let mut found = detect();
+        let _ = FOUND.set(found);
         if let Some(limit) = LIMIT.get() {
             found = found.limited_to(*limit);
         }
         from_environment(found, |name| std::env::var(name).ok())
     })
+}
+
+/// What the machine has, as [`profile`] found it before any flag or environment variable held it
+/// down (read once, with the profile).
+pub fn found() -> Profile {
+    profile();
+    *FOUND.get().expect("profile() sets what it found")
+}
+
+/// Whether [`profile`] is lower than the machine: a flag or the environment held it down.
+pub fn constrained() -> bool {
+    profile() != found()
 }
 
 /// `found` held to what the environment asks, read through `get` (a function, so that a test does
@@ -246,10 +265,18 @@ pub fn available_memory() -> Option<u64> {
     {
         let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
         let free = meminfo_kib(&meminfo, "MemAvailable")? << 10;
-        let limit = std::fs::read_to_string("/sys/fs/cgroup/memory.max")
-            .ok()
-            .and_then(|s| s.trim().parse::<u64>().ok());
-        Some(limit.map_or(free, |l| l.min(free)))
+        let read = |path: &str| std::fs::read_to_string(path).ok();
+        let room = cgroup_room(
+            read("/sys/fs/cgroup/memory.max").as_deref(),
+            read("/sys/fs/cgroup/memory.current").as_deref(),
+        )
+        .or_else(|| {
+            cgroup_room(
+                read("/sys/fs/cgroup/memory/memory.limit_in_bytes").as_deref(),
+                read("/sys/fs/cgroup/memory/memory.usage_in_bytes").as_deref(),
+            )
+        });
+        Some(room.map_or(free, |room| room.min(free)))
     }
     #[cfg(windows)]
     {
@@ -273,6 +300,19 @@ pub fn available_memory() -> Option<u64> {
     None
 }
 
+/// What is left of a container's memory limit, from the texts of the limit and of the use: cgroup
+/// v2's `memory.max` (a number or `max`) and `memory.current`, or v1's `memory.limit_in_bytes`
+/// (a number near 2^63 when there is no limit) and `memory.usage_in_bytes`. `None` if there is no
+/// limit, or the texts are not numbers.
+#[cfg(any(target_os = "linux", test))]
+fn cgroup_room(limit: Option<&str>, used: Option<&str>) -> Option<u64> {
+    /// v1 says "no limit" as the largest page-aligned number; nothing has this much memory.
+    const NO_LIMIT: u64 = 1 << 60;
+    let limit: u64 = limit?.trim().parse().ok().filter(|&l| l < NO_LIMIT)?;
+    let used: u64 = used?.trim().parse().ok()?;
+    Some(limit.saturating_sub(used))
+}
+
 /// The kibibytes of `key` in the text of `/proc/meminfo`.
 #[cfg(any(target_os = "linux", test))]
 fn meminfo_kib(text: &str, key: &str) -> Option<u64> {
@@ -282,6 +322,149 @@ fn meminfo_kib(text: &str, key: &str) -> Option<u64> {
         .next()?
         .parse()
         .ok()
+}
+
+/// What [`pin_to_profile`] did.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Pinning {
+    /// The profile has all the machine's processors, or the system has no way to hold a process
+    /// to some (neither is a failure).
+    NotNeeded,
+    /// The process, with every thread it has and will make, runs on these logical processors only.
+    Pinned(Vec<usize>),
+    /// The system refused or could not say which processors the process may use: the process runs
+    /// as before, on all of them, with [`threads`] threads of work.
+    Failed(String),
+}
+
+impl Pinning {
+    /// The mask in one line for the log and the report: `cpus 0,1,2,3`, `not pinned` or what failed.
+    pub fn describe(&self) -> String {
+        match self {
+            Pinning::NotNeeded => "not pinned".to_string(),
+            Pinning::Pinned(cpus) => format!(
+                "pinned to cpus {}",
+                cpus.iter()
+                    .map(usize::to_string)
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ),
+            Pinning::Failed(why) => format!("pinning failed ({why}); not pinned"),
+        }
+    }
+}
+
+/// The logical processors to hold a process to for `wanted` threads: the first `wanted` of the
+/// `allowed` ones, in order (the processors the process may already use, which a container or an
+/// earlier mask may have cut down). None if it has no more than `wanted` of them: there is nothing
+/// to cut. The first of them are the nearest to each other on the machines that number a core's
+/// hardware threads together, so on one with SMT `wanted` threads may be fewer cores than that:
+/// the harder way to be a small machine, and not the easier.
+pub fn cpus_for(allowed: &[usize], wanted: usize) -> Option<Vec<usize>> {
+    (wanted >= 1 && allowed.len() > wanted).then(|| allowed[..wanted].to_vec())
+}
+
+/// Holds the process to [`threads`] logical processors when the profile has fewer than the machine
+/// ([`constrained`]), so that **every** thread of it (the frame thread, the scene thread, the
+/// simulation, the driver's and the system's helpers) competes for them, as it would on a machine
+/// that small, and not only the threads that [`threads`] counts (#264). Call it first thing in
+/// `main`, after [`take_flags`], before any thread is made: threads inherit the mask (on Linux the
+/// ones already there are held too). It cannot raise what the process may use.
+pub fn pin_to_profile() -> Pinning {
+    PINNING
+        .get_or_init(|| {
+            if constrained() {
+                pin(threads())
+            } else {
+                Pinning::NotNeeded
+            }
+        })
+        .clone()
+}
+
+static PINNING: OnceLock<Pinning> = OnceLock::new();
+
+/// What [`pin_to_profile`] did (it has not been called: [`Pinning::NotNeeded`]), for the report.
+pub fn pinning() -> Pinning {
+    PINNING.get().cloned().unwrap_or(Pinning::NotNeeded)
+}
+
+#[cfg(target_os = "linux")]
+fn pin(wanted: usize) -> Pinning {
+    // `sched_setaffinity(0)` is the calling thread's, and the threads made later inherit it: the
+    // ones that are already there are held one by one.
+    let mut tasks: Vec<i32> = std::fs::read_dir("/proc/self/task")
+        .map(|dir| {
+            dir.filter_map(|e| e.ok()?.file_name().to_str()?.parse().ok())
+                .collect()
+        })
+        .unwrap_or_default();
+    tasks.push(0);
+    pin_tasks(wanted, &tasks)
+}
+
+/// [`pin`] on the Linux threads `tasks` (0 is the caller).
+#[cfg(target_os = "linux")]
+fn pin_tasks(wanted: usize, tasks: &[i32]) -> Pinning {
+    // SAFETY: `cpu_set_t` is plain data, and the calls are given the set's size.
+    unsafe {
+        let mut set: libc::cpu_set_t = std::mem::zeroed();
+        if libc::sched_getaffinity(0, size_of::<libc::cpu_set_t>(), &mut set) != 0 {
+            return Pinning::Failed(std::io::Error::last_os_error().to_string());
+        }
+        let allowed: Vec<usize> = (0..libc::CPU_SETSIZE as usize)
+            .filter(|&cpu| libc::CPU_ISSET(cpu, &set))
+            .collect();
+        let Some(chosen) = cpus_for(&allowed, wanted) else {
+            return Pinning::NotNeeded;
+        };
+        let mut mask: libc::cpu_set_t = std::mem::zeroed();
+        for &cpu in &chosen {
+            libc::CPU_SET(cpu, &mut mask);
+        }
+        let mut failed = None;
+        for &tid in tasks {
+            if libc::sched_setaffinity(tid, size_of::<libc::cpu_set_t>(), &mask) != 0 {
+                failed.get_or_insert(std::io::Error::last_os_error().to_string());
+            }
+        }
+        match failed {
+            Some(why) => Pinning::Failed(why),
+            None => Pinning::Pinned(chosen),
+        }
+    }
+}
+
+#[cfg(windows)]
+fn pin(wanted: usize) -> Pinning {
+    use windows_sys::Win32::System::Threading::{
+        GetCurrentProcess, GetProcessAffinityMask, SetProcessAffinityMask,
+    };
+    // SAFETY: the pseudo-handle of the current process is valid for these calls, and the masks are
+    // plain integers the calls write to.
+    unsafe {
+        let process = GetCurrentProcess();
+        let (mut mine, mut system) = (0usize, 0usize);
+        if GetProcessAffinityMask(process, &mut mine, &mut system) == 0 {
+            return Pinning::Failed(std::io::Error::last_os_error().to_string());
+        }
+        let allowed: Vec<usize> = (0..usize::BITS as usize)
+            .filter(|&cpu| mine >> cpu & 1 == 1)
+            .collect();
+        let Some(chosen) = cpus_for(&allowed, wanted) else {
+            return Pinning::NotNeeded;
+        };
+        let mask = chosen.iter().fold(0usize, |mask, &cpu| mask | 1 << cpu);
+        if SetProcessAffinityMask(process, mask) == 0 {
+            return Pinning::Failed(std::io::Error::last_os_error().to_string());
+        }
+        Pinning::Pinned(chosen)
+    }
+}
+
+#[cfg(not(any(target_os = "linux", windows)))]
+fn pin(_wanted: usize) -> Pinning {
+    Pinning::NotNeeded
 }
 
 /// Threads of the machine (see [`Profile::threads`]), at least one.

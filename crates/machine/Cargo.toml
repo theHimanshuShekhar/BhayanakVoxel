@@ -4,7 +4,11 @@ version.workspace = true
 edition.workspace = true
 publish.workspace = true
 
-# Reads how much memory the machine has free (Windows has no way in the standard library; Linux
-# reads /proc). It is in the build already, through winit.
+# Reads how much memory the machine has free and holds the process to the processors of a
+# constrained profile (Windows has no way in the standard library; Linux reads /proc and has
+# `sched_setaffinity`). Both are in the build already, through winit and wgpu.
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_System_SystemInformation"] }
+windows-sys = { version = "0.61", features = ["Win32_System_SystemInformation", "Win32_System_Threading"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
