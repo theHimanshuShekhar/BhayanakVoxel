@@ -1102,9 +1102,16 @@ fn roughness(slope: f64, biome: Biome, drainage: u8) -> u8 {
 /// rounds). The areas are integers, added in any order to the same sum; this is the same result
 /// as taking the texels highest first, which was one thread and 1.4 s (#264).
 fn drainage(heights: &[i16], size: u32, threads: usize) -> Vec<u8> {
+    drainage_with(heights, size, threads, SHARED_FROM)
+}
+
+/// Texels of a round below which the round is not shared among threads.
+const SHARED_FROM: usize = 4 * PIECE;
+
+/// [`drainage`], with the rounds of `shared_from` texels or more shared among the threads (the
+/// tests lower it to reach that branch on a small map).
+fn drainage_with(heights: &[i16], size: u32, threads: usize, shared_from: usize) -> Vec<u8> {
     const NONE: u32 = u32::MAX;
-    /// Texels of a round below which the round is not shared among threads.
-    const SHARED_FROM: usize = 4 * PIECE;
     let count = heights.len();
     let mut receiver = vec![NONE; count];
     par_fill(&mut receiver, PIECE, threads, |index| {
@@ -1157,7 +1164,7 @@ fn drainage(heights: &[i16], size: u32, threads: usize) -> Vec<u8> {
         }
     };
     while !round.is_empty() {
-        round = if round.len() < SHARED_FROM {
+        round = if round.len() < shared_from {
             let mut next = Vec::new();
             for &t in &round {
                 push(t, &mut next);
@@ -1337,7 +1344,9 @@ mod tests {
         let mut eroded = normalise(&raw, size, 3);
         erode(&mut eroded, size, noise, 3);
         let ramp: Vec<i16> = (0..count).map(|k| ((k % 9_000) as i16) / 3 - 100).collect();
-        for heights in [eroded, ramp, vec![5; count]] {
+        let mut pit = vec![5i16; count];
+        pit[count / 2] = -50;
+        for heights in [eroded, ramp, vec![5; count], pit] {
             let expected = drainage_highest_first(&heights, size);
             for threads in [1, 4, 8] {
                 assert_eq!(
@@ -1345,7 +1354,53 @@ mod tests {
                     expected,
                     "{threads} threads"
                 );
+                // With every round shared among the threads, as the big ones are (this map is
+                // under `SHARED_FROM`, so the rounds above are all done on one).
+                for shared_from in [1, 2, 64] {
+                    assert_eq!(
+                        drainage_with(&heights, size, threads, shared_from),
+                        expected,
+                        "{threads} threads, rounds of {shared_from} or more shared"
+                    );
+                }
             }
+        }
+    }
+
+    #[test]
+    fn the_big_rounds_of_a_map_over_the_threshold_are_shared_and_give_the_same_drainage() {
+        // A checkerboard of land at two heights: every high texel drains to a low neighbour and
+        // nothing drains to it, so the first round is all of them, about half of 98 304 texels,
+        // which is over `SHARED_FROM` and takes the parallel branch with no help from the test.
+        let size = 128u32;
+        let count = 6 * (size as usize).pow(2);
+        let board: Vec<i16> = (0..count)
+            .map(|index| {
+                let (_, i, j) = split(size, index);
+                SEA_LEVEL + if (i + j) % 2 == 0 { 100 } else { 0 }
+            })
+            .collect();
+        let leaves = board
+            .iter()
+            .enumerate()
+            .filter(|&(index, &h)| {
+                let (face, i, j) = split(size, index);
+                h > SEA_LEVEL
+                    && (0..4).all(|side| {
+                        let (f, i, j) = step(size, face, i, j, side);
+                        board[join(size, f, i, j)] < h
+                    })
+            })
+            .count();
+        assert!(leaves > SHARED_FROM, "{leaves} texels in the first round");
+        let expected = drainage_highest_first(&board, size);
+        assert!(expected.iter().any(|&d| d > 0));
+        for threads in [1, 4, 8] {
+            assert_eq!(
+                drainage(&board, size, threads),
+                expected,
+                "{threads} threads"
+            );
         }
     }
 

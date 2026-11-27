@@ -7,8 +7,15 @@
 //! (`%LOCALAPPDATA%` on Windows, `$XDG_CACHE_HOME` or `~/.cache` elsewhere) and the second launch
 //! reads it back instead.
 //!
-//! * **The key** is the seed, [`GENERATOR_VERSION`], the map's size and radius, and [`params_hash`]
-//!   (a hash of the numbers the build is made from). A file with any other key is not used.
+//! * **The key** is the seed, [`GENERATOR_VERSION`], the map's size and radius, and [`build_key`]:
+//!   the hash of a tiny map (16 texels along a face) made by the build itself at the radius, with
+//!   [`params_hash`] (its main constants) mixed in. The tiny map is made with the noise's salts, the
+//!   erosion, the normalisation, the biomes and the drainage as they are, so a change to **any
+//!   input of the build** that reaches a texel is another key even if [`GENERATOR_VERSION`] was not
+//!   bumped for it, and nothing stale is loaded. (It is a few milliseconds a launch, and a probe
+//!   of 16 texels cannot show a change that only reaches texels it has not got, such as a rule for
+//!   a feature smaller than 1/16 of a face: bump the version for that, as for any change.) A file
+//!   with any other key is not used.
 //! * **The file** is a header (magic, the key), the texels (8 bytes each, little-endian) and a
 //!   checksum of them, which is made in fixed pieces of [`CHECKSUM_PIECE`] bytes combined in
 //!   order, so it is the same however many threads made it. A file that is missing, is short or
@@ -22,7 +29,10 @@
 //!
 //! Writing is to a temporary file in the same folder and a rename, so a launch that is killed
 //! in the middle leaves the old file or none, not half of one; a write that fails (a read-only
-//! disk, no room) is said and costs nothing, as the map is made.
+//! disk, no room) is said and costs nothing, as the map is made. A temporary file that a killed
+//! launch left (201 MB) is deleted by the next write once it is [`STALE_TEMPORARY`] old, and the
+//! folder keeps the [`MOST_MAPS`] maps used last (a hit counts as a use) and deletes the rest, so it
+//! cannot grow with every seed that was ever played.
 
 use std::fs::{self, File};
 use std::io::{self, BufWriter, Read, Write};
@@ -41,6 +51,12 @@ const TEXEL_BYTES: usize = 8;
 const CHUNK: usize = 8 << 20;
 /// Bytes of a piece of the checksum.
 pub const CHECKSUM_PIECE: usize = 1 << 20;
+/// The maps (a file each, about 201 MB at the real size) that the folder keeps: the ones used last.
+pub const MOST_MAPS: usize = 3;
+/// How old a temporary file of a write must be to be one that a launch that was killed left.
+pub const STALE_TEMPORARY: Duration = Duration::from_secs(5 * 60);
+/// The seed and the size of the tiny map that is in the key ([`build_key`]).
+const PROBE: (u64, u32) = (0x5EED_CAC4_E000, 16);
 
 /// The environment variable that gives the folder to use instead of the operating system's.
 pub const ENV_DIR: &str = "BHAYANAK_CACHE_DIR";
@@ -111,10 +127,9 @@ pub fn path_in(dir: &Path, seed: u64) -> PathBuf {
     dir.join(format!("world-map-{seed:016x}.bin"))
 }
 
-/// A hash of the numbers the build is made from (the noise's cells, the continents' shape, the
-/// share of the ocean, the relief), so that a change to any of them is another key even if
-/// [`GENERATOR_VERSION`] was not bumped for it. The size, the radius and the seed are in the key
-/// themselves.
+/// A hash of the main numbers the build is made from (the noise's cells, the continents' shape,
+/// the share of the ocean, the relief). Part of [`build_key`]; the rest of the build is in the tiny
+/// map that it hashes.
 pub fn params_hash() -> u64 {
     let numbers: [u64; 14] = [
         u64::from(ELEVATION_CELL),
@@ -135,6 +150,31 @@ pub fn params_hash() -> u64 {
     numbers.into_iter().fold(0xcbf2_9ce4_8422_2325u64, mix)
 }
 
+/// The part of the key that is the build: [`params_hash`] and the content hash of a tiny map of
+/// [`PROBE`]'s seed and size that the build makes at `radius` on one thread. Remembered for the
+/// last radius it was asked for (a launch asks twice, to read and to write).
+pub fn build_key(radius: i32) -> u64 {
+    static LAST: std::sync::Mutex<Option<(i32, u64)>> = std::sync::Mutex::new(None);
+    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((r, key)) = *last
+        && r == radius
+    {
+        return key;
+    }
+    let key = build_key_of(
+        |radius| WorldMap::with_threads(PROBE.0, PROBE.1, radius, 1).0,
+        radius,
+    );
+    *last = Some((radius, key));
+    key
+}
+
+/// [`build_key`] of the tiny map that `build` makes at `radius` (the tests give a build that is
+/// another, to show that the key follows it).
+fn build_key_of(build: impl Fn(i32) -> WorldMap, radius: i32) -> u64 {
+    mix(params_hash(), build(radius).content_hash())
+}
+
 fn mix(hash: u64, word: u64) -> u64 {
     (hash ^ word)
         .wrapping_mul(0x9e37_79b9_7f4a_7c15)
@@ -144,12 +184,21 @@ fn mix(hash: u64, word: u64) -> u64 {
 /// The checksum of `bytes`: a hash of each piece of [`CHECKSUM_PIECE`] bytes, on all the threads,
 /// combined in the order of the pieces.
 pub fn checksum(bytes: &[u8]) -> u64 {
-    let pieces = par_pieces(
-        bytes.len().div_ceil(CHECKSUM_PIECE),
-        machine::threads(),
-        |n| piece_hash(&bytes[n * CHECKSUM_PIECE..((n + 1) * CHECKSUM_PIECE).min(bytes.len())]),
-    );
-    pieces.into_iter().fold(0x6a09_e667_f3bc_c908, mix)
+    checksum_on(machine::threads(), bytes)
+}
+
+/// [`checksum`] on `threads` threads (the tests make it on 1, 4 and more than the machine has).
+pub fn checksum_on(threads: usize, bytes: &[u8]) -> u64 {
+    piece_hashes(threads, bytes)
+        .into_iter()
+        .fold(0x6a09_e667_f3bc_c908, mix)
+}
+
+/// The hash of each piece of [`CHECKSUM_PIECE`] bytes of `bytes`, in order, on `threads` threads.
+fn piece_hashes(threads: usize, bytes: &[u8]) -> Vec<u64> {
+    par_pieces(bytes.len().div_ceil(CHECKSUM_PIECE), threads, |p| {
+        piece_hash(&bytes[p * CHECKSUM_PIECE..((p + 1) * CHECKSUM_PIECE).min(bytes.len())])
+    })
 }
 
 fn piece_hash(piece: &[u8]) -> u64 {
@@ -165,10 +214,14 @@ fn piece_hash(piece: &[u8]) -> u64 {
 }
 
 fn header(seed: u64, size: u32, radius: i32) -> [u8; HEADER] {
+    header_of(seed, size, radius, build_key(radius))
+}
+
+fn header_of(seed: u64, size: u32, radius: i32, build: u64) -> [u8; HEADER] {
     let mut h = [0u8; HEADER];
     h[..8].copy_from_slice(&MAGIC);
     h[8..12].copy_from_slice(&GENERATOR_VERSION.to_le_bytes());
-    h[12..20].copy_from_slice(&params_hash().to_le_bytes());
+    h[12..20].copy_from_slice(&build.to_le_bytes());
     h[20..28].copy_from_slice(&seed.to_le_bytes());
     h[28..32].copy_from_slice(&size.to_le_bytes());
     h[32..36].copy_from_slice(&radius.to_le_bytes());
@@ -213,7 +266,30 @@ fn decode(bytes: &[u8]) -> Option<Texel> {
 
 /// The map of `seed`, `size` and `radius` from `dir`, if the file there is for them and is whole.
 pub fn load(dir: &Path, seed: u64, size: u32, radius: i32) -> Result<WorldMap, Miss> {
-    let mut file = match File::open(path_in(dir, seed)) {
+    load_on(machine::threads(), dir, seed, size, radius)
+}
+
+/// [`load`] on `threads` threads.
+pub fn load_on(
+    threads: usize,
+    dir: &Path,
+    seed: u64,
+    size: u32,
+    radius: i32,
+) -> Result<WorldMap, Miss> {
+    let path = path_in(dir, seed);
+    let map = read(threads, &path, seed, size, radius)?;
+    // A hit is a use: the folder keeps the maps used last ([`MOST_MAPS`]). It costs nothing if the
+    // file cannot be touched.
+    let _ = File::options()
+        .write(true)
+        .open(&path)
+        .and_then(|f| f.set_modified(std::time::SystemTime::now()));
+    Ok(map)
+}
+
+fn read(threads: usize, path: &Path, seed: u64, size: u32, radius: i32) -> Result<WorldMap, Miss> {
+    let mut file = match File::open(path) {
         Ok(file) => file,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Err(Miss::Missing),
         Err(e) => return Err(Miss::Corrupt(format!("cannot be opened: {e}"))),
@@ -225,9 +301,9 @@ pub fn load(dir: &Path, seed: u64, size: u32, radius: i32) -> Result<WorldMap, M
     if head[..8] != MAGIC {
         return Err(corrupt("not a world map file"));
     }
-    if head != header(seed, size, radius) {
+    let want = header(seed, size, radius);
+    if head != want {
         let field = |range: std::ops::Range<usize>| &head[range];
-        let want = header(seed, size, radius);
         let other = if field(8..12) != &want[8..12] {
             "another generator version"
         } else if field(12..20) != &want[12..20] {
@@ -265,19 +341,14 @@ pub fn load(dir: &Path, seed: u64, size: u32, radius: i32) -> Result<WorldMap, M
     let mut pieces: Vec<u64> = Vec::with_capacity((expected as usize).div_ceil(CHECKSUM_PIECE));
     let per_chunk = CHUNK / TEXEL_BYTES;
     let mut bad = false;
-    for (n, out) in texels.chunks_mut(per_chunk).enumerate() {
+    for out in texels.chunks_mut(per_chunk) {
         let bytes = &mut buffer[..out.len() * TEXEL_BYTES];
         file.read_exact(bytes)
             .map_err(|_| corrupt("ends before its map does"))?;
         let bytes: &[u8] = bytes;
-        let _ = n;
-        pieces.extend(par_pieces(
-            bytes.len().div_ceil(CHECKSUM_PIECE),
-            machine::threads(),
-            |p| piece_hash(&bytes[p * CHECKSUM_PIECE..((p + 1) * CHECKSUM_PIECE).min(bytes.len())]),
-        ));
+        pieces.extend(piece_hashes(threads, bytes));
         let failed = std::sync::atomic::AtomicBool::new(false);
-        par_chunks(out, 1 << 16, machine::threads(), |from, part| {
+        par_chunks(out, 1 << 16, threads, |from, part| {
             for (k, slot) in part.iter_mut().enumerate() {
                 let at = (from + k) * TEXEL_BYTES;
                 match decode(&bytes[at..at + TEXEL_BYTES]) {
@@ -311,6 +382,12 @@ pub fn load(dir: &Path, seed: u64, size: u32, radius: i32) -> Result<WorldMap, M
 /// Writes `map` to `dir` (made if it is not there), over what was there: to a temporary file in
 /// the folder, and then a rename.
 pub fn store(dir: &Path, map: &WorldMap) -> io::Result<()> {
+    store_on(machine::threads(), dir, map)
+}
+
+/// [`store`] on `threads` threads: the file is the same whatever they are. Once it is written,
+/// the folder is tidied ([`tidy`]).
+pub fn store_on(threads: usize, dir: &Path, map: &WorldMap) -> io::Result<()> {
     fs::create_dir_all(dir)?;
     let path = path_in(dir, map.seed);
     let temporary = path.with_extension(format!("tmp{}", std::process::id()));
@@ -321,21 +398,13 @@ pub fn store(dir: &Path, map: &WorldMap) -> io::Result<()> {
         let mut buffer = vec![0u8; CHUNK];
         for texels in map.texels.chunks(CHUNK / TEXEL_BYTES) {
             let bytes = &mut buffer[..texels.len() * TEXEL_BYTES];
-            par_chunks(bytes, 1 << 19, machine::threads(), |from, part| {
+            par_chunks(bytes, 1 << 19, threads, |from, part| {
                 for (k, slot) in part.as_chunks_mut::<TEXEL_BYTES>().0.iter_mut().enumerate() {
                     *slot = encode(&texels[from / TEXEL_BYTES + k]);
                 }
             });
             let bytes: &[u8] = bytes;
-            pieces.extend(par_pieces(
-                bytes.len().div_ceil(CHECKSUM_PIECE),
-                machine::threads(),
-                |p| {
-                    piece_hash(
-                        &bytes[p * CHECKSUM_PIECE..((p + 1) * CHECKSUM_PIECE).min(bytes.len())],
-                    )
-                },
-            ));
+            pieces.extend(piece_hashes(threads, bytes));
             out.write_all(bytes)?;
         }
         let sum = pieces.into_iter().fold(0x6a09_e667_f3bc_c908, mix);
@@ -345,8 +414,44 @@ pub fn store(dir: &Path, map: &WorldMap) -> io::Result<()> {
     })();
     if written.is_err() {
         let _ = fs::remove_file(&temporary);
+    } else {
+        tidy(dir);
     }
     written
+}
+
+/// Deletes what the folder should not keep, best effort (a file that cannot be deleted is left):
+/// the temporary files of writes that were killed ([`STALE_TEMPORARY`] old; a younger one is
+/// another launch writing now), and all but the [`MOST_MAPS`] maps that were used last.
+pub fn tidy(dir: &Path) {
+    let now = std::time::SystemTime::now();
+    let mut maps = Vec::new();
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.filter_map(Result::ok) {
+        let name = entry.file_name();
+        let Some(name) = name.to_str().filter(|n| n.starts_with("world-map-")) else {
+            continue;
+        };
+        let Ok(modified) = entry.metadata().and_then(|m| m.modified()) else {
+            continue;
+        };
+        if name.ends_with(".bin") {
+            maps.push((modified, entry.path()));
+        } else if name.contains(".tmp")
+            && now
+                .duration_since(modified)
+                .is_ok_and(|age| age >= STALE_TEMPORARY)
+        {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
+    // The most recent first; the ties (a file system with coarse times) in name order.
+    maps.sort_by(|a, b| b.cmp(a));
+    for (_, path) in maps.into_iter().skip(MOST_MAPS) {
+        let _ = fs::remove_file(path);
+    }
 }
 
 /// The map of `seed`, `size` and `radius`: from `dir` if the file there is its own and whole, else
@@ -362,7 +467,7 @@ pub fn load_or_build(
     let started = Instant::now();
     let miss = match dir {
         None => Miss::Off,
-        Some(dir) => match load(dir, seed, size, radius) {
+        Some(dir) => match load_on(threads, dir, seed, size, radius) {
             Ok(map) => {
                 return Loaded {
                     map,
@@ -379,7 +484,7 @@ pub fn load_or_build(
     let took = started.elapsed();
     let wrote = dir.map(|dir| {
         let started = Instant::now();
-        store(dir, &map)
+        store_on(threads, dir, &map)
             .map(|()| started.elapsed())
             .map_err(|e| e.to_string())
     });

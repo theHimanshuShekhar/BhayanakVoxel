@@ -181,15 +181,161 @@ fn a_file_of_another_generator_version_or_build_is_not_used() {
 }
 
 #[test]
-fn the_build_hash_is_stable_and_the_checksum_does_not_depend_on_the_threads() {
-    assert_eq!(params_hash(), params_hash());
-    let bytes: Vec<u8> = (0..(3 * CHECKSUM_PIECE + 77))
+fn the_checksum_is_the_same_on_1_4_and_more_threads_than_the_machine_has_and_follows_the_bytes() {
+    let bytes: Vec<u8> = (0..(5 * CHECKSUM_PIECE + 77))
         .map(|n| (n * 31 % 251) as u8)
         .collect();
-    assert_eq!(checksum(&bytes), checksum(&bytes));
-    let mut other = bytes.clone();
-    other[CHECKSUM_PIECE + 5] ^= 1;
-    assert_ne!(checksum(&bytes), checksum(&other));
+    let alone = checksum_on(1, &bytes);
+    for threads in [2, 4, machine::threads(), 3 * machine::threads()] {
+        assert_eq!(checksum_on(threads, &bytes), alone, "{threads} threads");
+    }
+    assert_eq!(checksum(&bytes), alone);
+    // A byte in any piece, and the order of the pieces, change it.
+    for at in [0, CHECKSUM_PIECE + 5, 5 * CHECKSUM_PIECE + 76] {
+        let mut other = bytes.clone();
+        other[at] ^= 1;
+        assert_ne!(checksum_on(4, &other), alone, "byte {at}");
+    }
+    let mut swapped = bytes.clone();
+    let (a, b) = swapped.split_at_mut(CHECKSUM_PIECE);
+    a.swap_with_slice(&mut b[..CHECKSUM_PIECE]);
+    assert_ne!(checksum_on(4, &swapped), alone, "pieces in another order");
+}
+
+#[test]
+fn the_file_is_the_same_whatever_the_threads_that_wrote_and_read_it() {
+    let dir = Dir::new();
+    let map = fresh();
+    let mut files = Vec::new();
+    for threads in [1, 4, 3 * machine::threads()] {
+        store_on(threads, &dir.0, &map).unwrap();
+        files.push(fs::read(dir.file()).unwrap());
+        same(
+            &map,
+            &load_on(threads, &dir.0, SEED, SIZE, TEST_RADIUS).unwrap(),
+        );
+    }
+    assert!(files.windows(2).all(|w| w[0] == w[1]));
+}
+
+#[test]
+fn the_key_follows_the_build_and_not_only_the_version() {
+    let real = |radius| WorldMap::with_threads(PROBE.0, PROBE.1, radius, 1).0;
+    let key = build_key_of(real, TEST_RADIUS);
+    assert_eq!(
+        key,
+        build_key(TEST_RADIUS),
+        "the same build, the same key, however often asked"
+    );
+    assert_eq!(key, build_key_of(real, TEST_RADIUS));
+    // A build whose rules differ in any way that reaches a texel (a biome's threshold, the
+    // erosion's step, the drainage's coding) makes another tiny map and so another key, with no
+    // change to the version: here each field of a texel in turn.
+    let changed = |change: fn(&mut Texel)| {
+        build_key_of(
+            |radius| {
+                let mut map = real(radius);
+                let middle = map.texels.len() / 2;
+                change(&mut map.texels[middle]);
+                map
+            },
+            TEST_RADIUS,
+        )
+    };
+    for (what, other) in [
+        ("elevation", changed(|t| t.elevation ^= 1)),
+        ("erosion", changed(|t| t.erosion ^= 1)),
+        (
+            "biome",
+            changed(|t| {
+                t.biome = if t.biome == Biome::Snow {
+                    Biome::Desert
+                } else {
+                    Biome::Snow
+                }
+            }),
+        ),
+        (
+            "regions",
+            changed(|t| t.regions = Regions((t.regions.0 + 1) % 16)),
+        ),
+        ("roughness", changed(|t| t.rough ^= 1)),
+        ("drainage", changed(|t| t.drainage ^= 1)),
+    ] {
+        assert_ne!(other, key, "{what}");
+    }
+    // The radius is part of what is built: another radius is another key.
+    assert_ne!(build_key(TEST_RADIUS), build_key(WORLD_RADIUS));
+    // And the key is in the file: a file written with another build's key is not used.
+    let dir = Dir::new();
+    let map = fresh();
+    store(&dir.0, &map).unwrap();
+    let mut bytes = fs::read(dir.file()).unwrap();
+    bytes[12..20].copy_from_slice(&changed(|t| t.biome = Biome::Volcanic).to_le_bytes());
+    fs::write(dir.file(), bytes).unwrap();
+    assert!(matches!(
+        load(&dir.0, SEED, SIZE, TEST_RADIUS),
+        Err(Miss::OtherKey(_))
+    ));
+}
+
+fn set_age(path: &Path, age: Duration) {
+    File::options()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() - age)
+        .unwrap();
+}
+
+#[test]
+fn a_write_deletes_the_temporary_files_of_launches_that_were_killed_and_keeps_a_live_one() {
+    let dir = Dir::new();
+    fs::create_dir_all(&dir.0).unwrap();
+    let stale = dir.0.join("world-map-00000000000000aa.tmp4242");
+    let live = dir.0.join("world-map-00000000000000bb.tmp4243");
+    let other = dir.0.join("notes.tmp1");
+    for file in [&stale, &live, &other] {
+        fs::write(file, b"half a map").unwrap();
+    }
+    set_age(&stale, STALE_TEMPORARY + Duration::from_secs(60));
+    set_age(&other, STALE_TEMPORARY + Duration::from_secs(60));
+    store(&dir.0, &fresh()).unwrap();
+    assert!(
+        !stale.exists(),
+        "a temporary file that is old is a killed launch's"
+    );
+    assert!(live.exists(), "a young one is a write in another process");
+    assert!(other.exists(), "what is not the cache's is not touched");
+    assert!(dir.file().exists());
+}
+
+#[test]
+fn the_folder_keeps_the_maps_used_last_and_a_hit_is_a_use() {
+    let dir = Dir::new();
+    let of = |seed: u64| WorldMap::with_threads(seed, SIZE, TEST_RADIUS, 4).0;
+    let kept = |last: u64| -> Vec<u64> {
+        (1..=last)
+            .filter(|&s| path_in(&dir.0, s).exists())
+            .collect()
+    };
+    // Five seeds' maps, the first the oldest, each a day older than the next.
+    for seed in 1..=5 {
+        store(&dir.0, &of(seed)).unwrap();
+        set_age(
+            &path_in(&dir.0, seed),
+            Duration::from_secs((6 - seed) * 86_400),
+        );
+    }
+    // The write of the sixth tidies: the three used last stay, the new one is one of them.
+    store(&dir.0, &of(6)).unwrap();
+    assert_eq!(kept(6), [4, 5, 6], "{MOST_MAPS} maps");
+    // Reading the oldest of them counts as using it: the next write keeps it, and drops another.
+    assert!(load(&dir.0, 4, SIZE, TEST_RADIUS).is_ok());
+    store(&dir.0, &of(7)).unwrap();
+    let left = kept(7);
+    assert_eq!(left.len(), MOST_MAPS);
+    assert!(left.contains(&4) && left.contains(&7), "{left:?}");
 }
 
 #[test]
