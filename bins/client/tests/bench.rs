@@ -324,7 +324,7 @@ fn check_convergence(convergence: &Value, out: &Path) {
 }
 
 fn check_schema(report: &Value, out: &Path) {
-    assert_eq!(report["schema_version"], 37);
+    assert_eq!(report["schema_version"], 38);
     // The default is the game's own choice (#50, Part 2): hardware ray queries where the adapter
     // has them, and compute, with the reason, where it has not.
     assert_eq!(report["rt"]["requested"], "auto");
@@ -370,6 +370,15 @@ fn check_schema(report: &Value, out: &Path) {
     assert!(!string(&machine["gpu"]).is_empty());
     assert_eq!(string(&machine["backend"]), "Vulkan");
     let timers = machine["timers_supported"].as_bool().expect("a bool");
+    // What the run was held to (#264): the profile, the pinning, and the LOD bias it started at.
+    let profile = &machine["profile"];
+    assert!(profile["threads"].as_u64().is_some_and(|t| t >= 1));
+    assert!(profile["memory_mib"].is_u64() && profile["found_memory_mib"].is_u64());
+    assert!(profile["constrained"].is_boolean() && profile["ray_queries"].is_boolean());
+    assert!(!string(&profile["pinning"]).is_empty());
+    assert!(profile["pinned_cpus"].is_array());
+    assert!(profile["starting_bias"].as_f64().is_some_and(|b| b >= 1.0));
+    assert_eq!(profile["default_bias"], 1.0);
 
     let config = &report["config"];
     assert!(config["width"].is_u64() && config["height"].is_u64());
