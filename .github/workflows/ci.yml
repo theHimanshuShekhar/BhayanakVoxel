@@ -71,7 +71,13 @@ jobs:
         run: |
           set -euo pipefail
           filterset=$(bash .github/scripts/real-thread-filterset.sh)
+          # One streaming test of the client (`flying_away_and_back_...`) is 10 to 15 minutes of CPU in
+          # an unoptimised build, and a shard cannot finish before its longest test does. The client and
+          # the render crate are built at opt-level 2 here, as Cargo.toml does for the crates that tests
+          # run through: that test is 2.5 times faster, and it and every other test runs as written.
+          # Debug assertions and overflow checks stay on.
           cargo nextest run --workspace --no-fail-fast \
+            --config profile.dev.package.client.opt-level=2 --config profile.dev.package.render.opt-level=2 \
             --partition hash:${{ matrix.shard }}/3 -E "not ($filterset)"
         env:
           # Where the golden image test writes actual.png, expected.png and diff.png on a mismatch.
@@ -152,7 +158,9 @@ jobs:
           gpu+=' | test(~bench::edits::tests::the_largest_brush_is_dug_and_placed_in_turn_at_no_more_than_the_metric_rate)'
           gpu+=' | test(~bench::lookdev::run::tests::a_short_run_writes_a_folder_for_each_shot_and_a_sheet_that_names_every_image)'
           gpu+=' | test(~bench::tests::the_flights_updates_are_logged_by_where_in_the_run_they_were_made)'
+          # As in linux-tests: the longest client test is 15 minutes unoptimised, and a shard waits for it.
           cargo nextest run --no-fail-fast --partition hash:${{ matrix.shard }}/2 \
+            --config profile.dev.package.client.opt-level=2 --config profile.dev.package.render.opt-level=2 \
             -p brick-store -p materials -p net -p planet-gen -p sim -p prefetch-sim -p server -p client \
             -E "not ($filterset) and not ($gpu) and not binary_id(client::bench)"
       # nextest does not run doctests.
