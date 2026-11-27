@@ -385,6 +385,10 @@ fn run(args: &Args) -> Result<u8, Box<dyn Error>> {
     let stream_slice = args
         .stream_slice_ms
         .map(|ms| std::time::Duration::from_millis(u64::from(ms)));
+    let hooks = realtime::GenHooks {
+        extra_us: args.gen_extra_us,
+        relief_m: args.relief_m,
+    };
     let streaming_real_time = match real_time_budgets {
         Some(budgets) if args.real_time => Some(realtime::run(
             !plan.patch,
@@ -396,6 +400,7 @@ fn run(args: &Args) -> Result<u8, Box<dyn Error>> {
             realtime::Asked {
                 backend: args.rt.main_backend(),
                 may_fall_back: args.rt.may_fall_back(),
+                hooks,
             },
         )),
         _ => None,
@@ -413,6 +418,7 @@ fn run(args: &Args) -> Result<u8, Box<dyn Error>> {
             realtime::Asked {
                 backend: RtBackend::Hardware,
                 may_fall_back: false,
+                hooks,
             },
         )),
         _ => None,

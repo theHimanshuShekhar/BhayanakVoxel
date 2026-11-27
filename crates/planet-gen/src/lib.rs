@@ -22,6 +22,7 @@ use std::sync::atomic::{AtomicI32, Ordering};
 use brick_store::{BRICK_SIZE, Brick, BrickCoord, BrickStore, Interior, Material, VoxelCoord};
 
 mod caves;
+pub mod cost;
 mod detail;
 pub mod planet;
 pub mod world_map;

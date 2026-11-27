@@ -76,6 +76,40 @@ pub const PEAK: i32 = voxels(2_000.0);
 /// Depth of the deepest trench below sea level, in Voxels (1 km).
 pub const TRENCH: i32 = voxels(1_000.0);
 
+/// The extent of the ground above and below sea level, in Voxels: [`PEAK`] and [`TRENCH`] for the
+/// map the Planet is made with, and what the bench's `--peak-m` and `--trench-m` make of them (#242,
+/// [`WorldMap::with_relief`]). Everything that is derived from the range (the Planet's highest and
+/// lowest radius, the bounds of the shortcuts) reads it from the map, and not from the constants.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Relief {
+    /// The highest the ground is above sea level, in Voxels.
+    pub peak: i32,
+    /// The lowest it is below sea level, in Voxels.
+    pub trench: i32,
+}
+
+impl Relief {
+    /// [`PEAK`] and [`TRENCH`]: what every map has unless it was asked for another.
+    pub const DEFAULT: Relief = Relief {
+        peak: PEAK,
+        trench: TRENCH,
+    };
+
+    /// A relief of a `peak` metres high and a `trench` metres deep.
+    pub fn of_metres(peak: f64, trench: f64) -> Relief {
+        Relief {
+            peak: voxels(peak),
+            trench: voxels(trench),
+        }
+    }
+}
+
+impl Default for Relief {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
 /// [`PEAK`] and [`TRENCH`] in the map's elevation units.
 const PEAK_UNITS: i32 = units(2_000.0);
 const TRENCH_UNITS: i32 = units(1_000.0);
@@ -232,6 +266,14 @@ pub struct WorldMap {
     size: u32,
     /// Distance of sea level from the Planet's centre, in Voxels.
     radius: i32,
+    /// How far above and below sea level the ground goes: [`Relief::DEFAULT`], or what
+    /// [`WorldMap::with_relief`] stretched it to. The texels are those of the default relief
+    /// either way; the stretch is applied where they are read.
+    relief: Relief,
+    /// The factors by which a texel above sea level and one below it are read (the relief's peak
+    /// and trench over [`PEAK`] and [`TRENCH`]): both exactly 1.0 for the default relief, so that
+    /// reading is bit for bit what it was.
+    stretch: (f64, f64),
     /// Face by face, each row by row (`i` fastest).
     texels: Vec<Texel>,
 }
@@ -306,8 +348,43 @@ impl WorldMap {
             seed,
             size,
             radius,
+            relief: Relief::DEFAULT,
+            stretch: (1.0, 1.0),
             texels,
         }
+    }
+
+    /// This map with the ground stretched to `relief` (#242, the bench's cost proxy for a taller
+    /// ground column): every elevation above sea level is read `relief.peak / PEAK` times as high
+    /// and every one below it `relief.trench / TRENCH` times as deep, as the map's texels are
+    /// interpolated, so the highest peak is `relief.peak` and the deepest trench `relief.trench`.
+    /// The texels (and so [`WorldMap::content_hash`], the biomes, the roughness and the drainage)
+    /// are those of the default relief: only the heights of the ground are stretched, linearly
+    /// about sea level, and nothing that is horizontal is. Panics if the Planet is not bigger than
+    /// the relief, or the relief is not at least a Voxel each way.
+    pub fn with_relief(mut self, relief: Relief) -> WorldMap {
+        assert!(
+            relief.peak > 0 && relief.trench > 0,
+            "a relief needs a peak and a trench of at least a Voxel"
+        );
+        assert!(
+            i64::from(self.radius) > i64::from(relief.peak) + i64::from(relief.trench),
+            "a Planet of {} Voxels does not fit a relief of {} and {} Voxels",
+            self.radius,
+            relief.peak,
+            relief.trench
+        );
+        self.relief = relief;
+        self.stretch = (
+            f64::from(relief.peak) / f64::from(PEAK),
+            f64::from(relief.trench) / f64::from(TRENCH),
+        );
+        self
+    }
+
+    /// How far above and below sea level the ground of this map goes.
+    pub fn relief(&self) -> Relief {
+        self.relief
     }
 
     /// The seed the map was made from, which per-brick generation draws its own randomness from
@@ -381,8 +458,14 @@ impl WorldMap {
         let (inner_i, inner_j) = (i.clamp(0, last), j.clamp(0, last));
         let read = |(face, i, j): (usize, u32, u32)| {
             let texel = self.texel(face, i, j);
+            let elevation = texel.elevation_voxels();
             [
-                texel.elevation_voxels(),
+                elevation
+                    * if elevation >= 0.0 {
+                        self.stretch.0
+                    } else {
+                        self.stretch.1
+                    },
                 f64::from(texel.rough) / 255.0,
                 f64::from(texel.drainage) / 255.0,
             ]
@@ -452,7 +535,7 @@ impl WorldMap {
         for (f, x, y) in places {
             if f != face {
                 return FieldRange {
-                    elevation: (-f64::from(TRENCH), f64::from(PEAK)),
+                    elevation: (-f64::from(self.relief.trench), f64::from(self.relief.peak)),
                     rough: (0.0, 1.0),
                     drainage: (0.0, 1.0),
                 };
