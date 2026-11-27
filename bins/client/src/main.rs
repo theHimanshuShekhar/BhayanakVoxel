@@ -428,8 +428,19 @@ struct Ground {
 /// Generates the spawn ring on gentle land of the Planet of `map`: the full crust at level 0
 /// within `reach` Voxels, on all the cores, in a store with a pyramid of `levels` levels that
 /// reads the Planet itself where it holds nothing ([`Planet::crust_around`]).
-fn generate_ground(map: WorldMap, reach: i32, levels: usize) -> Ground {
-    let planet = Planet::new(map);
+///
+/// `extra` is the bench's artificial cost of each brick generated (#242, [`planet_gen::cost`]),
+/// which the game never has.
+fn generate_ground(
+    map: WorldMap,
+    reach: i32,
+    levels: usize,
+    extra: Option<std::sync::Arc<planet_gen::cost::ExtraCost>>,
+) -> Ground {
+    let mut planet = Planet::new(map);
+    if let Some(extra) = extra {
+        planet = planet.with_extra_cost(extra);
+    }
     let ground = planet.spawn(reach);
     let started = Instant::now();
     let store = planet.crust_around(ground, reach, levels - 1);
@@ -516,8 +527,13 @@ fn horizon(planet: &Planet) -> Option<render::lod::Horizon> {
 
 /// Makes the Planet of `map` into what the client starts with: the spawn ring on gentle land,
 /// then the Guard, and the scene of the bands drawn from them, with a loader to make the resident set complete
-/// (#86). The ring and the Guard are timed, and reported, apart.
-fn load(map: WorldMap, reach: i32) -> Result<Loaded, RingsFull> {
+/// (#86). The ring and the Guard are timed, and reported, apart. `extra` is the bench's cost of a
+/// generated brick (see [`generate_ground`]).
+fn load(
+    map: WorldMap,
+    reach: i32,
+    extra: Option<std::sync::Arc<planet_gen::cost::ExtraCost>>,
+) -> Result<Loaded, RingsFull> {
     let started = Instant::now();
     let Ground {
         planet,
@@ -526,7 +542,7 @@ fn load(map: WorldMap, reach: i32) -> Result<Loaded, RingsFull> {
         camera,
         ground,
         took: ring_took,
-    } = generate_ground(map, reach, RING_LEVELS);
+    } = generate_ground(map, reach, RING_LEVELS, extra);
     let bands = Bands::standard(f64::from(DEFAULT_BIAS));
     let room = room_for(bands);
     store.reserve(&room.held);
@@ -629,7 +645,7 @@ fn load_planet() -> Loaded {
     let started = Instant::now();
     let map = WorldMap::generate(SEED, WORLD_MAP_SIZE);
     eprintln!("world map generated in {:.1?}", started.elapsed());
-    load(map, SPAWN_REACH).expect("the ground around the spawn fits the rings' buffers")
+    load(map, SPAWN_REACH, None).expect("the ground around the spawn fits the rings' buffers")
 }
 
 /// The overlay's egui state. The hotbar is always shown, so it runs every frame; F1 only hides
@@ -1676,7 +1692,7 @@ mod tests {
     #[test]
     fn the_client_generates_a_planet_it_stands_on_land_in_with_the_ground_around_it() {
         // Ring packing is the renderer's and is tested there; one level is the ground alone.
-        let loaded = generate_ground(WorldMap::for_tests(SEED), 100, 1);
+        let loaded = generate_ground(WorldMap::for_tests(SEED), 100, 1, None);
         let [x, y, z] = loaded.camera.position;
         let up = loaded.camera.horizon_up;
         let feet = |down: f64| {
@@ -1700,7 +1716,7 @@ mod tests {
 
     #[test]
     fn the_server_holds_the_ground_without_a_pyramid_so_an_edit_there_remakes_no_coarse_brick() {
-        let loaded = generate_ground(WorldMap::for_tests(SEED), 100, 3);
+        let loaded = generate_ground(WorldMap::for_tests(SEED), 100, 3, None);
         assert_eq!(loaded.store.level_count(), 3);
         assert_eq!(loaded.server_store.level_count(), 1);
         assert_eq!(
@@ -1714,7 +1730,7 @@ mod tests {
         // The full-size Planet reaches far beyond the test Planet's radius, so the sphere the
         // client clips rays to must be the full-size Planet's. With the test Planet's, every ray
         // from the spawn misses and there is only sky.
-        let loaded = generate_ground(WorldMap::for_tests(SEED), 100, 1);
+        let loaded = generate_ground(WorldMap::for_tests(SEED), 100, 1, None);
         let (cell, origin) = render::camera::split(loaded.camera.position);
         let ray = render::reference::Ray {
             cell,

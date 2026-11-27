@@ -38,12 +38,14 @@
 use std::any::Any;
 use std::error::Error;
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use brick_store::{Budget, VOXELS_PER_METRE};
 use net::{ServerEnd, loopback};
-use planet_gen::planet::tangents;
-use planet_gen::world_map::{WORLD_MAP_SIZE, WorldMap};
+use planet_gen::cost::{ExtraCost, ExtraCostStats};
+use planet_gen::planet::{interior_radius_for, max_radius_for, tangents};
+use planet_gen::world_map::{Relief, TEST_RADIUS, WORLD_MAP_SIZE, WORLD_RADIUS, WorldMap};
 use render::reference::{Ray, trace};
 use render::{
     Camera, GpuPasses, Mode, Offscreen, Rebuild, Resolution, RtBackend, RtChoice, Scene,
@@ -58,7 +60,7 @@ use super::process;
 use super::rt::{AccelSummary, HwFrame, PathHardware};
 use super::stream::{
     Constants, Series, Sizing, Start, TestPlanet, measure_sizes, over_the_ground, percentile_99,
-    test_planet, within_reach,
+    test_planet_with, within_reach,
 };
 use crate::loader::{Loader, workers_for};
 use crate::scene_worker::{Cause, Done, Longest, Spent, UPLOAD_BUDGET};
@@ -1513,6 +1515,20 @@ pub struct RealTimeReport {
     /// Which way rays found the Planet in the runs (`--rt-backend`, #236), and what their
     /// acceleration structures did; null for a report that was not made by [`run`].
     pub rt: Option<RtRealTime>,
+    /// `--gen-extra-us` (#242): the artificial CPU cost of each generated brick that the runs were
+    /// asked for, in µs; 0 with no hook. The hook charges every brick the generator is asked for,
+    /// at every level, as `planet_gen::cost` says.
+    pub gen_extra_us_asked: u32,
+    /// What a charge really took, in µs, wall clock, over every charge of the runs that finished:
+    /// a little over `gen_extra_us_asked` when the machine is busy (a worker preempted in the
+    /// middle of a charge). 0 when 0 was asked; null with no hook.
+    pub gen_extra_us_measured: Option<f64>,
+    /// How many bricks the hook was asked to charge, over the runs: every brick generated, the spawn
+    /// ring's and the Guard's included (not deterministic: the loader generates what the machine's
+    /// clock lets it). Null with no hook.
+    pub gen_extra_bricks: Option<u64>,
+    /// `--peak-m` and `--trench-m` (#242): the ground the runs were on.
+    pub relief: ReliefReport,
 }
 
 /// The ray backend of the real-time mode's runs (#236): the report's `rt` block, for the mode.
@@ -1556,6 +1572,10 @@ impl RealTimeReport {
             max,
             error: None,
             rt: None,
+            gen_extra_us_asked: 0,
+            gen_extra_us_measured: None,
+            gen_extra_bricks: None,
+            relief: GenHooks::default().report(WORLD_RADIUS),
         }
     }
 
@@ -1652,6 +1672,9 @@ struct Built {
     /// The server's end of the world's link: held so that it stays connected, and never read.
     _server: ServerEnd,
     setup: Setup,
+    /// The generator's artificial cost of a brick, if the run has one (`--gen-extra-us`, #242): the
+    /// run reads what it charged from it at the end.
+    extra: Option<Arc<ExtraCost>>,
 }
 
 /// What a run needs to know of the world it is on.
@@ -1674,14 +1697,15 @@ struct Setup {
 }
 
 /// The Planet of the client, at full size: made as `main.rs` makes it.
-fn build_full() -> Result<Built, Box<dyn Error>> {
+fn build_full(hooks: &GenHooks) -> Result<Built, Box<dyn Error>> {
     eprintln!("real time: generating the world map...");
     let began = Instant::now();
-    let map = WorldMap::generate(crate::SEED, WORLD_MAP_SIZE);
+    let map = hooks.relief(WorldMap::generate(crate::SEED, WORLD_MAP_SIZE));
     let world_map = began.elapsed();
     eprintln!("real time: loading the Planet...");
+    let extra = hooks.extra();
     let began = Instant::now();
-    let loaded = crate::load(map, crate::SPAWN_REACH)
+    let loaded = crate::load(map, crate::SPAWN_REACH, extra.clone())
         .map_err(|_| "the ground around the spawn does not fit the scene's buffers")?;
     let load = began.elapsed();
     let start = Start::of(&loaded.store);
@@ -1697,6 +1721,7 @@ fn build_full() -> Result<Built, Box<dyn Error>> {
     Ok(Built {
         world,
         _server: server,
+        extra,
         setup: Setup {
             spawn: loaded.camera,
             d0,
@@ -1722,8 +1747,9 @@ fn build_full() -> Result<Built, Box<dyn Error>> {
 }
 
 /// The test Planet, with threads: what `--short` runs, as a smoke test of the mode.
-fn build_test() -> Result<Built, Box<dyn Error>> {
+fn build_test(hooks: &GenHooks) -> Result<Built, Box<dyn Error>> {
     let began = Instant::now();
+    let extra = hooks.extra();
     let TestPlanet {
         mut store,
         scene,
@@ -1731,7 +1757,7 @@ fn build_test() -> Result<Built, Box<dyn Error>> {
         bands,
         start,
         sea,
-    } = test_planet();
+    } = test_planet_with(hooks.asked_relief(), extra.clone());
     // The budget of the client's constants, for this `d0`, over the spawn ring that is held as well
     // (it is not scaled with `d0`).
     let budget = Budget {
@@ -1750,6 +1776,7 @@ fn build_test() -> Result<Built, Box<dyn Error>> {
     Ok(Built {
         world,
         _server: server,
+        extra,
         setup: Setup {
             spawn,
             d0: bands.d0(),
@@ -3364,13 +3391,121 @@ pub(super) fn catching<T>(
     }
 }
 
+/// The bench-only hooks of the generator that the real-time mode can be run with (#242): neither
+/// is in the game, and with neither the run is what it always was.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct GenHooks {
+    /// `--gen-extra-us`: the artificial CPU cost of each brick generated, in µs. `Some(0)` has the
+    /// hook count the bricks and charge nothing.
+    pub extra_us: Option<u32>,
+    /// `--peak-m` and `--trench-m`: the ground stretched to peaks and trenches of this many
+    /// metres, if either was said.
+    pub relief_m: Option<(f64, f64)>,
+}
+
+impl GenHooks {
+    /// The cost of each brick, to share between the Planet that is made and the report.
+    pub fn extra(&self) -> Option<Arc<ExtraCost>> {
+        self.extra_us.map(ExtraCost::new)
+    }
+
+    /// The relief the run asked for, if it is not today's.
+    pub fn asked_relief(&self) -> Option<Relief> {
+        self.relief_m
+            .map(|(peak, trench)| Relief::of_metres(peak, trench))
+            .filter(|&relief| relief != Relief::DEFAULT)
+    }
+
+    /// `map` with its ground stretched to the relief asked for; as it was if none was.
+    pub fn relief(&self, map: WorldMap) -> WorldMap {
+        match self.asked_relief() {
+            Some(relief) => map.with_relief(relief),
+            None => map,
+        }
+    }
+
+    /// What the report says of the ground the run was on, for a Planet of `radius` Voxels.
+    fn report(&self, radius: i32) -> ReliefReport {
+        let relief = self.asked_relief().unwrap_or(Relief::DEFAULT);
+        let metres = |voxels: i32| f64::from(voxels) / VOXELS_PER_METRE;
+        ReliefReport {
+            stretched: self.asked_relief().is_some(),
+            peak_m: metres(relief.peak),
+            trench_m: metres(relief.trench),
+            column_m: metres(relief.peak + relief.trench),
+            max_radius_above_sea_m: metres(max_radius_for(radius, relief) - radius),
+            interior_below_sea_m: metres(radius - interior_radius_for(radius, relief)),
+        }
+    }
+}
+
+/// The ground's extent that the real-time mode ran on (#242): the report's `relief`. Everything
+/// derived from the range follows it (the Planet's highest and lowest radius, which set the Guard's
+/// cells, the bands' and the horizon's reach and the bounds of the shortcuts); `peak_m` and
+/// `trench_m` are what `--peak-m` and `--trench-m` made of the heights of the world map, which are
+/// stretched linearly about sea level and nothing else is.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+pub struct ReliefReport {
+    /// Whether `--peak-m` or `--trench-m` stretched the ground; false is today's 2 km and 1 km.
+    pub stretched: bool,
+    /// The highest the ground goes above sea level and the lowest below it, in metres.
+    pub peak_m: f64,
+    pub trench_m: f64,
+    /// `peak_m` and `trench_m` together: the ground column's height.
+    pub column_m: f64,
+    /// The Planet's highest radius over sea level (`Planet::max_radius`: the peak, the detail's
+    /// reach and the crystals' on it), and its interior's (deep rock whatever the map says) under
+    /// it, in metres. The first is what the Guard's box and the bands' and horizon's top are made
+    /// from.
+    pub max_radius_above_sea_m: f64,
+    pub interior_below_sea_m: f64,
+}
+
+/// What the generator's extra cost did over the runs of the mode: the report's `gen_extra_us_*`
+/// fields (#242).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct GenExtraTotals {
+    pub asked_us: u32,
+    pub bricks: u64,
+    pub spent: Duration,
+}
+
+impl GenExtraTotals {
+    fn add(&mut self, stats: &ExtraCostStats) {
+        self.asked_us = stats.asked_us;
+        self.bricks += stats.bricks;
+        self.spent += stats.spent;
+    }
+
+    /// The mean a charge really took, in µs.
+    fn measured_us(&self) -> f64 {
+        if self.asked_us == 0 || self.bricks == 0 {
+            0.0
+        } else {
+            self.spent.as_secs_f64() * 1e6 / self.bricks as f64
+        }
+    }
+}
+
 /// The backend a run asks for, and whether it may go on as compute where the adapter has no ray
-/// queries (the bench's default, which asks for the game's own choice: #50).
+/// queries (the bench's default, which asks for the game's own choice: #50), and the hooks of the
+/// generator (#242).
 #[derive(Clone, Copy, Debug)]
 pub struct Asked {
     pub backend: RtBackend,
     pub may_fall_back: bool,
+    pub hooks: GenHooks,
 }
+
+/// What a run gave: its report, the Planet's `d0`, the ray backend it was on, the hardware
+/// backend's acceleration structures if it had them, and what the generator's extra cost charged.
+type RunDone = (
+    RunReport,
+    f64,
+    RtChoice,
+    Option<AccelSummary>,
+    Option<ExtraCostStats>,
+);
 
 /// The `run`th run: its world, its GPU, and the paths. Also the Planet's `d0`.
 fn whole_run(
@@ -3381,7 +3516,7 @@ fn whole_run(
     script: &Script,
     limit_ms: f64,
     asked: Asked,
-) -> Result<(RunReport, f64, RtChoice, Option<AccelSummary>), Failure> {
+) -> Result<RunDone, Failure> {
     // What the paths do is caught where the step is known; this catches the rest (making the
     // world, the GPU, and ending the run, which drops them).
     catch_unwind(AssertUnwindSafe(|| {
@@ -3428,15 +3563,20 @@ fn run_once(
     script: &Script,
     limit_ms: f64,
     asked: Asked,
-) -> Result<(RunReport, f64, RtChoice, Option<AccelSummary>), Failure> {
+) -> Result<RunDone, Failure> {
     let failed = |step: &str, error: Box<dyn Error>| Failure {
         run,
         step: step.to_string(),
         message: error.to_string(),
     };
-    let built = if full { build_full() } else { build_test() }
-        .map_err(|e| failed("building the world", e))?;
+    let built = if full {
+        build_full(&asked.hooks)
+    } else {
+        build_test(&asked.hooks)
+    }
+    .map_err(|e| failed("building the world", e))?;
     let d0 = built.setup.d0;
+    let extra = built.extra.clone();
     let mut gpu = Offscreen::with_backend(resolution, built.world.scene(), asked.backend)
         .map_err(|e| failed("making the GPU context", e))?;
     let choice = gpu.rt().clone();
@@ -3471,7 +3611,7 @@ fn run_once(
         group_regions: group_regions.clone(),
         ..AccelSummary::of(&gpu.accel)
     });
-    Ok((report, d0, choice, accel))
+    Ok((report, d0, choice, accel, extra.map(|extra| extra.stats())))
 }
 
 /// Runs the real-time mode: `runs` runs of the paths, each on a world of its own and a GPU of its
@@ -3503,6 +3643,7 @@ pub fn run(
     let mut choice = None;
     let mut d0 = 0.0;
     let mut failure = None;
+    let mut extra = GenExtraTotals::default();
     for run in 1..=runs {
         eprintln!("real time: run {run} of {runs}");
         let began = Instant::now();
@@ -3515,8 +3656,11 @@ pub fn run(
             budgets.frame_time_p99_ms,
             asked,
         ) {
-            Ok((report, d, rt, summary)) => {
+            Ok((report, d, rt, summary, charged)) => {
                 d0 = d;
+                if let Some(charged) = charged {
+                    extra.add(&charged);
+                }
                 eprintln!("real time: run {run} took {:.0?}", began.elapsed());
                 reports.push(report);
                 accel.push(summary);
@@ -3542,6 +3686,18 @@ pub fn run(
     if flat_ambient {
         planet.push_str(", flat ambient");
     }
+    if let Some(us) = asked.hooks.extra_us {
+        planet.push_str(&format!(", +{us} µs a brick"));
+    }
+    let relief = asked
+        .hooks
+        .report(if full { WORLD_RADIUS } else { TEST_RADIUS });
+    if relief.stretched {
+        planet.push_str(&format!(
+            ", relief {} m peaks and {} m trenches",
+            relief.peak_m, relief.trench_m
+        ));
+    }
     let rt = RtRealTime {
         requested: backend_name(choice.as_ref().map_or(asked.backend, |c| c.requested)).to_string(),
         active: backend_name(choice.as_ref().map_or(RtBackend::Compute, |c| c.active)).to_string(),
@@ -3550,7 +3706,11 @@ pub fn run(
         hw_group_regions: render::hw::process_grouping().describe(),
     };
     planet.push_str(&format!(", rays by {}", rt.active));
-    let report = RealTimeReport::new(planet, d0, reports, budgets).with_rt(rt);
+    let mut report = RealTimeReport::new(planet, d0, reports, budgets).with_rt(rt);
+    report.gen_extra_us_asked = asked.hooks.extra_us.unwrap_or(0);
+    report.gen_extra_us_measured = asked.hooks.extra_us.map(|_| extra.measured_us());
+    report.gen_extra_bricks = asked.hooks.extra_us.map(|_| extra.bricks);
+    report.relief = relief;
     match failure {
         Some(failure) => report.failed(failure),
         None => report,
@@ -3583,7 +3743,7 @@ fn misses_by_second(miss_seconds: &[u32], last: Option<Instant>, began: Instant)
 
 #[cfg(test)]
 mod tests {
-    use super::super::stream::Measured;
+    use super::super::stream::{Measured, test_planet};
     use super::*;
 
     #[test]
@@ -4262,14 +4422,36 @@ mod tests {
                 "deterministic",
                 "error",
                 "gates",
+                "gen_extra_bricks",
+                "gen_extra_us_asked",
+                "gen_extra_us_measured",
                 "max",
                 "min",
                 "mode",
                 "planet",
+                "relief",
                 "rt",
                 "runs"
             ]
         );
+        // No hook (#242): nothing asked, nothing measured, and today's 2 km and 1 km.
+        assert_eq!(json["gen_extra_us_asked"], 0);
+        assert!(json["gen_extra_us_measured"].is_null() && json["gen_extra_bricks"].is_null());
+        assert_eq!(
+            keys(&json["relief"]),
+            [
+                "column_m",
+                "interior_below_sea_m",
+                "max_radius_above_sea_m",
+                "peak_m",
+                "stretched",
+                "trench_m"
+            ]
+        );
+        assert_eq!(json["relief"]["stretched"], false);
+        assert_eq!(json["relief"]["peak_m"], 2000.0);
+        assert_eq!(json["relief"]["trench_m"], 1000.0);
+        assert_eq!(json["relief"]["column_m"], 3000.0);
         // No ray backend was asked for (#236): `rt` is null until `with_rt` says which ran.
         assert!(json["rt"].is_null());
         assert_eq!(json["mode"], "real-time");
@@ -4950,7 +5132,7 @@ mod tests {
     /// about 300 m up).
     #[test]
     fn the_catch_up_between_paths_ends_with_the_scene_at_the_camera() {
-        let built = build_test().expect("the test Planet builds");
+        let built = build_test(&GenHooks::default()).expect("the test Planet builds");
         let Built { world, setup, .. } = built;
         let mut gpu = NoGpu;
         let mut session = Session::new(world, &mut gpu, BUDGETS.frame_time_p99_ms);
@@ -4980,8 +5162,65 @@ mod tests {
     /// to hold. It is in `.github/real-thread-tests.txt`, and does
     /// not gate.
     #[test]
+    fn the_relief_report_is_the_planets_extent_and_says_whether_it_was_stretched() {
+        let today = GenHooks::default().report(WORLD_RADIUS);
+        assert!(!today.stretched);
+        assert_eq!(
+            (today.peak_m, today.trench_m, today.column_m),
+            (2000.0, 1000.0, 3000.0)
+        );
+        // Asking for today's values is not a stretch.
+        let same = GenHooks {
+            extra_us: None,
+            relief_m: Some((2000.0, 1000.0)),
+        };
+        assert_eq!(same.report(WORLD_RADIUS), today);
+        let tall = GenHooks {
+            extra_us: Some(100),
+            relief_m: Some((8000.0, 4000.0)),
+        }
+        .report(WORLD_RADIUS);
+        assert!(tall.stretched);
+        assert_eq!(
+            (tall.peak_m, tall.trench_m, tall.column_m),
+            (8000.0, 4000.0, 12000.0)
+        );
+        // The highest radius is the peak and what stands on it, the interior's the trench and the
+        // strata and the detail: 6 km higher and 3 km lower than today's, to the Voxel.
+        assert!((tall.max_radius_above_sea_m - today.max_radius_above_sea_m - 6000.0).abs() < 0.1);
+        assert!((tall.interior_below_sea_m - today.interior_below_sea_m - 3000.0).abs() < 0.1);
+    }
+
+    #[test]
+    fn the_real_time_run_with_both_hooks_on_the_test_planet_completes_and_charges_the_bricks() {
+        let hooks = GenHooks {
+            extra_us: Some(25),
+            relief_m: Some((8000.0, 4000.0)),
+        };
+        let built = build_test(&hooks).expect("the stretched test Planet builds");
+        // The spawn is on land, above sea, and the camera over it.
+        let spawn = norm(built.setup.spawn.position);
+        assert!(spawn > built.setup.sea, "{spawn} is not above sea level");
+        let extra = built.extra.clone().expect("the hook made a cost");
+        let run = one_run(
+            built,
+            &mut NoGpu,
+            &Script::short(),
+            BUDGETS.frame_time_p99_ms,
+        )
+        .unwrap_or_else(|stopped| panic!("the run stopped at {}: {}", stopped.step, stopped.error));
+        assert_eq!(run.paths.len(), 8, "every path ran");
+        let stats = extra.stats();
+        assert_eq!(stats.asked_us, 25);
+        assert!(stats.bricks > 1000, "{} bricks charged", stats.bricks);
+        let ratio = stats.measured_us / 25.0;
+        // Only from below: a busy machine preempts a charge and makes it longer, never shorter.
+        assert!(ratio >= 0.5, "{stats:?}");
+    }
+
+    #[test]
     fn the_real_time_run_on_the_test_planet_completes_with_every_path_and_field() {
-        let built = build_test().expect("the test Planet builds");
+        let built = build_test(&GenHooks::default()).expect("the test Planet builds");
         let d0 = built.setup.d0;
         let run = one_run(
             built,
@@ -5169,7 +5408,7 @@ mod tests {
             script.stream_slice = Duration::from_millis(ms);
         }
         for run in 1..=runs {
-            let built = build_full().expect("the full-size Planet builds");
+            let built = build_full(&GenHooks::default()).expect("the full-size Planet builds");
             let report = one_run(built, &mut NoGpu, &script, BUDGETS.frame_time_p99_ms)
                 .unwrap_or_else(|stopped| {
                     panic!("the run stopped at {}: {}", stopped.step, stopped.error)
@@ -5277,7 +5516,7 @@ mod tests {
     #[test]
     #[ignore = "generates the full-size world map and runs every path: about 8 minutes"]
     fn the_sea_level_crossing_round_at_full_size_is_no_longer_than_the_other_paths_worst() {
-        let built = build_full().expect("the full-size Planet loads");
+        let built = build_full(&GenHooks::default()).expect("the full-size Planet loads");
         let run = one_run(
             built,
             &mut NoGpu,
@@ -5394,7 +5633,7 @@ mod tests {
     #[test]
     #[ignore = "generates the full-size world map: about 5 minutes"]
     fn a_camera_held_under_the_sea_at_full_size_keeps_the_scene_within_the_gate() {
-        let built = build_full().expect("the full-size Planet loads");
+        let built = build_full(&GenHooks::default()).expect("the full-size Planet loads");
         let Built { world, setup, .. } = built;
         let script = Script::full();
         world.set_backed_up_slice(script.stream_slice);
@@ -5433,7 +5672,7 @@ mod tests {
     /// fill. It is in `.github/real-thread-tests.txt` with the smoke test (it has threads).
     #[test]
     fn a_run_that_stops_names_the_step_it_was_at() {
-        let built = build_test().expect("the test Planet builds");
+        let built = build_test(&GenHooks::default()).expect("the test Planet builds");
         let script = Script {
             fill_cap: Duration::ZERO,
             ..Script::short()

@@ -226,7 +226,15 @@ use super::stream::StreamReport;
 /// compute with `rt.fallback` saying why), and a report without the flag is `auto` with `active`
 /// `hw`, where it was `compute`; `streaming_real_time.rt.requested` is then `hw`, which the run
 /// asked the GPU context for. Nothing else is changed.
-pub const SCHEMA_VERSION: u32 = 36;
+///
+/// 37 (#242) adds the generator's bench hooks to `streaming_real_time`: `gen_extra_us_asked`,
+/// `gen_extra_us_measured` and `gen_extra_bricks` (`--gen-extra-us`: an artificial CPU cost of each
+/// generated brick, and what each charge really took), and `relief` (`--peak-m` and `--trench-m`:
+/// the ground's extent the runs were on, `stretched` or today's). The planet's label in
+/// `streaming_real_time.planet` says them too. With neither flag the values are 0, null, null and
+/// today's 2 km and 1 km. A report with a hook is the measurement of the gates' headroom, not of
+/// the game's own frame.
+pub const SCHEMA_VERSION: u32 = 37;
 
 /// One timed thing (a pass, or the GPU total of a profiler frame) in one mode, against its
 /// budget. In reference mode a profiler frame is one sample, so the entries of that mode have
@@ -756,7 +764,7 @@ mod tests {
                 "streaming_real_time"
             ]
         );
-        assert_eq!(json["schema_version"], 36);
+        assert_eq!(json["schema_version"], 37);
         assert_eq!(json["rt"]["active"], "compute");
         assert_eq!(json["rt"]["comparison"], serde_json::Value::Null);
         assert_eq!(json["rt"]["real_time_hw"], serde_json::Value::Null);

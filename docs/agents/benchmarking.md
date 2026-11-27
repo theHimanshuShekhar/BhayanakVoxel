@@ -70,6 +70,8 @@ release: a debug build's CPU side is slow enough to distort the frame times.
 | `--hw-group-regions G` | How the hardware backend makes its BLASes (#236): `G` regions along an edge of each, `4` (one cell), `8`, `16` or `32`, or `NEAR:FAR@LEVEL` (levels below LEVEL have BLASes of NEAR regions, the others FAR: `4:16@6`), or `NEAR:MID@LEVEL:FAR@LEVEL` (a third size from the second LEVEL up: `8:16@1:32@3`). **The default is `16:32@2`** (`PRODUCTION_GROUPING`): 16 regions for levels 0 and 1, 32 from level 2. The 4090's sweeps of #236: every real-time gate passes, its update `p95` is the lowest of the sizes tried (worst path 0.55 ms; 16 everywhere 0.91, 32 everywhere 0.57 with a soft-miss gate missed), 43% fewer BLASes than 16 everywhere, and its level 0 is 16's, whose Edit by the ground (`hw_edits_ground`) is 0.97 ms at `p95` (a finer level 0, `4:16@1`, 0.73). A BLAS is built again whole when any cell of it is stale, so bigger ones cost the frame thread less (fewer builds to record, fewer instances for a submit that traces to check) and the GPU more (more boxes a patch). The report's `rt.hw_group_regions` and `streaming_real_time.rt.hw_group_regions` say what the flag said, and `rt.comparison.hw_accel.group_regions` and the `group_regions` of an Edit stress's or a real-time run's `accel` what the context that ran had. |
 | `--hw-build-blas N` | The most BLASes a frame builds of the groups that may wait (#236), default no bound; the groups that may not wait (they gained boxes or have no BLAS, or waited too long) are built at once whatever it is, and a frame that built nothing builds one. It spreads a burst of builds over frames without breaking the hole rule: `accel.*.blas_urgent` and the paths' `hardware.blas_urgent` are what it cannot spread. |
 | `--hw-wait` | A diagnosis, not a measurement of the frame (#236): every update of the hardware backend waits for the GPU, so the paths' `hardware.wait` (and the slowest frames' `wait_ms`) is the GPU's time of the frame's boxes' pass, BLAS builds and TLAS. Use it to see whether a frame's `wait_not_passes` is the builds. The gates mean nothing with it. |
+| `--gen-extra-us N` | With `--real-time` (#242): an artificial CPU cost of `N` µs (0 to 1000) for each brick the generator is asked for, at every level, wherever generation runs (the loader's workers, the load's spawn ring and Guard cells). For the headroom curve of the streaming gates ("Headroom hooks" below). The report's `gen_extra_us_asked` and `gen_extra_us_measured` say what it was and what a charge really took. |
+| `--peak-m M`, `--trench-m M` | With `--real-time` (#242): today's world map with its heights stretched to peaks of `M` m (default 2000) and trenches of `M` m (default 1000); either alone changes only that side. A cost proxy for a taller ground column, not a new terrain ("Headroom hooks" below). The report's `relief` says what ran. |
 | `--no-fail` | Exit with status 0 even if a pass is over budget, a frame of the streaming mode has a hole, or a gate of the real-time mode is over. |
 
 It runs unattended. Without the convergence phase it takes a minute or so (generating the whole Planet is about 22 s of it); the convergence phase, on by default, adds about 45 s on the 4090 at the default `--truth-spp`, and more on a slower GPU or with a larger `--truth-spp`.
@@ -303,6 +305,82 @@ client.exe bench --streaming --real-time --out bench-out
 The rest of `client bench` runs first, as for `--streaming`. `--short --streaming --real-time` runs
 the same paths on the test Planet for a few seconds each, to see that it works: its times, on lavapipe,
 mean nothing.
+
+### Headroom hooks (#242)
+
+Two switches of the real-time mode measure how much the streaming gates can afford before the new
+terrain (#238) is written; they give the headroom curve that the per-brick cost budget (#247) is set
+from. Neither is in the game, both are off by default, and with neither the run, its goldens and
+its determinism are unchanged. Both apply to the real-time mode only (the stepped mode's counts are
+committed), full size or, with `--short`, on the test Planet.
+
+**`--gen-extra-us N`: extra cost per brick.** `planet_gen::cost::ExtraCost`, given to the Planet
+(`Planet::with_extra_cost`), spends `N` µs of CPU as each brick's generation starts (`Planet::generate`:
+the one place every brick, of any level, comes from). It is charged wherever generation runs: the
+loader's workers (children and Guard cells), the spawn ring and the visible Guard cells made in `load`
+(so time to control and Guard completion carry it), and a read of the store's source on the frame
+thread. What it is:
+- **Constant per brick, at every level.** A brick of any level evaluates the same 8 x 8 x 8 Voxels,
+  and today's per-brick cost is about flat across the levels the loader makes (`gen_rate`,
+  `docs/measurements.md`: 50 µs at level 0, 83 to 131 µs at levels 1 to 7), so `N` is the charge of
+  every brick, level 0 and coarse alike, and not scaled by level. A brick is charged whether it turns
+  out to be air, one layer or mixed (today's shortcuts decide the sky and the interior in a few µs;
+  a new terrain's noise would be evaluated before it knows).
+- **CPU work, not a sleep.** A loop of a splitmix64 hash whose each round depends on the last,
+  seeded by the brick's running number, its result passed to `black_box`. The rounds for a µs are
+  calibrated once per process (the median of 15 samples of 0.2 ms).
+- **It changes nothing generated**: not which bricks, not what they hold, not the counts hash
+  (`planet_gen::cost`, and the client's test `the_extra_cost_changes_no_count_of_the_stepped_run`).
+- **The report says what it did**: `streaming_real_time.gen_extra_us_asked` (`N`; 0 with no hook),
+  `gen_extra_us_measured` (the wall-clock mean of a charge over every charge of the finished runs, in
+  µs: a little over `N` on a busy machine, since a worker preempted in a charge counts its wait; 0
+  for `N` = 0; null with no hook) and `gen_extra_bricks` (the bricks charged, not deterministic).
+  Read `measured` against `asked` before reading anything else: a ratio far from 1 means the machine
+  was too busy for the sweep point to mean what it says. The planet's label has `, +N µs a brick`.
+
+**`--peak-m M --trench-m M`: a taller ground column.** `WorldMap::with_relief(Relief)`. The map is
+generated as ever (its texels, `content_hash`, biomes, slope-roughness, drainage and caves are
+today's), and **only the heights are stretched, linearly about sea level, where they are read**: an
+elevation above sea level is read `peak / 2000 m` times as high and one below it `trench / 1000 m`
+times as deep (`--peak-m 8000 --trench-m 4000` is 4 times, an exact power of two, each way; a test
+holds `elevation_at` to exactly 4 times the default's). The stored `i16` in 10 cm units is not
+touched, so the 3.27 km cap of #243 is not hit by this proxy. **What follows the range**, because it
+reads it from the map's `Relief` and not from the constants `PEAK` and `TRENCH`: the Planet's
+`max_radius` and `interior_radius` (so the Guard's cells and its box, the bands' and the horizon's
+top, the scene's `Bound`), the cave table's highest anchor, the bounds on the ground over a brick
+(`field_range`) and so every sky, sea, deep-rock and one-layer shortcut, and what the bricks of the
+stretched ground are (tests: `planet/tests/relief_tests.rs`: the bounds hold at every Voxel, no
+brick is its Voxels wrongly, `air_below` and `solid_below` are never claimed wrongly on the peak, the
+trench and the steepest ground). **What is not scaled**: horizontal distances (so slopes are 4 times
+as steep), the detail's amplitudes (20 m) and its thresholds in metres (the roughness reaches
+its full at 150 m of the stored height, since it reads the stretched height), the erosion, the
+continent shapes, the biome's choice, the strata depths, the sea level and the radius, the spawn's
+rule (it reads the stored height, 20 to 100 m, and a relief of up to 40 m on the stretched ground, so
+it is the same texel as today's if that is gentle enough, 4 times as high above sea), the bands'
+`d0`, the Guard's finest level (`GUARD_FIRST`) and the sizing constants and the store's and scene's
+budgets of `main.rs`. So the run measures what a 12 km column costs in more bricks near the surface
+on steep ground, a taller Guard and the deeper dives of the paths; a gate it fails may be one of
+those fixed capacities (read `memory`, `sizing` and the store's figures with it) and not the cost of
+generation. Today's 2 km and 1 km is the default and a test holds it bit for bit; `report.relief`
+says what ran (`peak_m`, `trench_m`, `column_m`, `max_radius_above_sea_m`,
+`interior_below_sea_m`, `stretched`).
+
+**Together** (`--streaming --real-time --gen-extra-us 100 --peak-m 8000 --trench-m 4000`) the
+charge is on every brick of the taller column.
+
+**A sweep** is one process per point (each is `--runs 3`, as ever; the gates use the worst), with
+`--no-fail` so that a point over its gates still writes its report:
+
+```
+client.exe bench --streaming --real-time --no-fail --out sweep/c000-r2000 --gen-extra-us 0
+client.exe bench --streaming --real-time --no-fail --out sweep/c100-r8000 --gen-extra-us 100 --peak-m 8000 --trench-m 4000
+```
+
+and for each report: `streaming_real_time.gates` (`over` and each gate's `worst` against its limit),
+`max.cold_start.time_to_control_s` against 2 s and `spawn_ring_s`, `max.cold_start.guard_complete_s`
+(reported, not gated) and `guard_s`, `max.cold_start.fill_s`, each path's soft misses (the camera's
+on the flights, gated) and holes (gated), the frame thread's CPU p99, `gen_extra_us_measured` against
+`_asked` and `relief`.
 
 ### What the 4090 script must pass
 
@@ -1572,7 +1650,7 @@ adapter without ray queries runs compute with a warning, `rt.active` `compute` a
 `rt.fallback` (the real-time mode, which refuses a **requested** `hw` on such an adapter because its
 gates would say nothing of it, goes on as compute for the default). **`--rt-backend compute` is the
 old default**: pass it to measure the player's setting for compute, the reference, or to compare
-with a report from before Part 2 (the report's schema is 36; a report with `requested`
+with a report from before Part 2 (the report's schema is 37; a report with `requested`
 `compute` is what every earlier report was). `--rt-backend hw` is the same as `auto` on an adapter
 with ray queries; use it when the run must not be allowed to fall back (in the real-time mode it
 stops with the reason).
@@ -1873,7 +1951,7 @@ rays; those that need ray queries skip themselves, printing why, where there are
 
 ```
 {
-  "schema_version": 36,
+  "schema_version": 37,
   "build":   { "version", "commit" },          // commit: CI builds only, else null; on a PR
                                                // build it is GitHub's merge commit, not the head
   "machine": { "gpu", "device_type", "driver", "driver_info", "backend", "os", "arch",

@@ -49,6 +49,17 @@ Options:
                    for, in a round, while the loader's workers are as far ahead as they may be
                    [default: 32]. For finding what a slice does to the flights' soft misses, the
                    settle and the frame times; the report's config says what it was
+  --gen-extra-us N With --real-time, an artificial cost of N microseconds of CPU for each brick the
+                   generator is asked for, at every level, on the threads that generate (the
+                   loader's workers, and the load's spawn ring and Guard): the headroom of the
+                   streaming gates against a costlier terrain (#242). It changes no brick and no
+                   count; the report's `gen_extra_us_asked` and `gen_extra_us_measured` say what it
+                   was and what each charge really took
+  --peak-m M       With --real-time, the highest the ground goes above sea level, in metres
+                   [default: 2000]; --trench-m M the deepest below it [default: 1000]: today's
+                   map with its heights stretched to them (#242, a cost proxy for a taller ground
+                   column, not a new terrain), the Guard, bands' and bounds' extents following. The
+                   report's `relief` says what ran. Either alone changes only that side
   --no-convergence Leave out the convergence phase (ADR 0005), which otherwise runs last of the
                    timed phases: the Reference view on two still views (the reference golden's,
                    and a pit lit by bounce light) at the output resolution, scored with FLIP and
@@ -165,6 +176,12 @@ pub struct Args {
     /// `--stream-slice-ms`: the scene thread's slice for taking in while the loader is backed up,
     /// if it was said (see [`crate::scene_worker::BACKED_UP_SLICE`]).
     pub stream_slice_ms: Option<u32>,
+    /// `--gen-extra-us`: the artificial CPU cost of each generated brick of the real-time mode, in
+    /// microseconds (#242), if it was said.
+    pub gen_extra_us: Option<u32>,
+    /// `--peak-m` and `--trench-m`: the real-time mode's ground stretched to this height of peaks
+    /// and depth of trenches, in metres (#242), if either was said (the other is today's).
+    pub relief_m: Option<(f64, f64)>,
     pub no_fail: bool,
     /// The convergence phase (#187), which runs unless `--no-convergence`, and its truths' samples
     /// if `--truth-spp` said.
@@ -222,6 +239,8 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Parsed, String> {
         runs: DEFAULT_RUNS,
         flat_ambient: false,
         stream_slice_ms: None,
+        gen_extra_us: None,
+        relief_m: None,
         no_fail: false,
         convergence: true,
         truth_spp: None,
@@ -256,6 +275,17 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Parsed, String> {
             "--flat-ambient" => parsed.flat_ambient = true,
             "--stream-slice-ms" => {
                 parsed.stream_slice_ms = Some(stream_slice_ms(&value("--stream-slice-ms")?)?);
+            }
+            "--gen-extra-us" => {
+                parsed.gen_extra_us = Some(gen_extra_us(&value("--gen-extra-us")?)?);
+            }
+            "--peak-m" => {
+                let peak = relief_metres("--peak-m", &value("--peak-m")?)?;
+                parsed.relief_m = Some((peak, parsed.relief_m.map_or(TODAYS_TRENCH_M, |r| r.1)));
+            }
+            "--trench-m" => {
+                let trench = relief_metres("--trench-m", &value("--trench-m")?)?;
+                parsed.relief_m = Some((parsed.relief_m.map_or(TODAYS_PEAK_M, |r| r.0), trench));
             }
             "--no-fail" => parsed.no_fail = true,
             "--no-convergence" => parsed.convergence = false,
@@ -304,6 +334,12 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Parsed, String> {
     }
     if parsed.stream_slice_ms.is_some() && !parsed.real_time {
         return Err("--stream-slice-ms is for --real-time".into());
+    }
+    if parsed.gen_extra_us.is_some() && !parsed.real_time {
+        return Err("--gen-extra-us is for --real-time".into());
+    }
+    if parsed.relief_m.is_some() && !parsed.real_time {
+        return Err("--peak-m and --trench-m are for --real-time".into());
     }
     if parsed.day_seconds.is_some() && !parsed.day_cycle {
         return Err("--day-seconds is for --day-cycle".into());
@@ -366,6 +402,34 @@ fn stream_slice_ms(text: &str) -> Result<u32, String> {
         .ok()
         .filter(|ms| (1..=1000).contains(ms))
         .ok_or_else(|| format!("`{text}` is not a slice in milliseconds like 32 (1 to 1000)"))
+}
+
+/// The map's peak and trench today, in metres: what `--peak-m` and `--trench-m` leave of the other
+/// when only one is said.
+pub const TODAYS_PEAK_M: f64 = 2_000.0;
+pub const TODAYS_TRENCH_M: f64 = 1_000.0;
+
+/// `--gen-extra-us`: microseconds a brick, from 0 (the hook on, charging nothing) to a millisecond:
+/// a brick costs 50 to 130 µs today, and a millisecond each is several times more than any terrain
+/// of the sweep.
+fn gen_extra_us(text: &str) -> Result<u32, String> {
+    text.parse::<u32>()
+        .ok()
+        .filter(|&us| us <= 1_000)
+        .ok_or_else(|| {
+            format!("`{text}` is not a cost in microseconds a brick like 100 (0 to 1000)")
+        })
+}
+
+/// `--peak-m` and `--trench-m`: metres, from 100 m to 19 km (the test Planet is 40 km in radius,
+/// and a Planet must be bigger than the two together).
+fn relief_metres(option: &str, text: &str) -> Result<f64, String> {
+    text.parse::<f64>()
+        .ok()
+        .filter(|m| m.is_finite() && (100.0..=19_000.0).contains(m))
+        .ok_or_else(|| {
+            format!("`{text}` is not a size for {option} in metres like 8000 (100 to 19000)")
+        })
 }
 
 /// `--truth-spp`: at least the last checkpoint, or the truth would be rougher than what it judges.
@@ -494,6 +558,8 @@ mod tests {
                 runs: 3,
                 flat_ambient: false,
                 stream_slice_ms: None,
+                gen_extra_us: None,
+                relief_m: None,
                 no_fail: false,
                 convergence: true,
                 truth_spp: None,
@@ -513,6 +579,64 @@ mod tests {
                 diag: Diag::default()
             }
         );
+    }
+
+    #[test]
+    fn the_generator_hooks_are_off_unless_asked_and_are_for_the_real_time_mode() {
+        let args = run(&["--streaming", "--real-time"]);
+        assert_eq!((args.gen_extra_us, args.relief_m), (None, None));
+        let args = run(&[
+            "--streaming",
+            "--real-time",
+            "--gen-extra-us",
+            "100",
+            "--peak-m",
+            "8000",
+            "--trench-m",
+            "4000",
+        ]);
+        assert_eq!(args.gen_extra_us, Some(100));
+        assert_eq!(args.relief_m, Some((8000.0, 4000.0)));
+        // Either alone leaves the other as today's, in either order.
+        let args = run(&["--streaming", "--real-time", "--peak-m", "8000"]);
+        assert_eq!(args.relief_m, Some((8000.0, 1000.0)));
+        let args = run(&["--streaming", "--real-time", "--trench-m", "4000"]);
+        assert_eq!(args.relief_m, Some((2000.0, 4000.0)));
+        let args = run(&[
+            "--streaming",
+            "--real-time",
+            "--trench-m",
+            "4000",
+            "--peak-m",
+            "8000",
+        ]);
+        assert_eq!(args.relief_m, Some((8000.0, 4000.0)));
+        assert_eq!(
+            run(&["--streaming", "--real-time", "--gen-extra-us", "0"]).gen_extra_us,
+            Some(0)
+        );
+        for bad in [
+            &["--gen-extra-us", "5"][..],
+            &["--peak-m", "8000"],
+            &["--trench-m", "4000"],
+        ] {
+            assert!(
+                parse_all(bad).unwrap_err().contains("--real-time"),
+                "{bad:?}"
+            );
+        }
+        for bad in [
+            ["--gen-extra-us", "-1"],
+            ["--gen-extra-us", "1001"],
+            ["--gen-extra-us", "x"],
+            ["--peak-m", "0"],
+            ["--peak-m", "20000"],
+            ["--trench-m", "nan"],
+            ["--trench-m", "-5"],
+        ] {
+            let all = ["--streaming", "--real-time", bad[0], bad[1]];
+            assert!(parse_all(&all).is_err(), "{bad:?}");
+        }
     }
 
     #[test]

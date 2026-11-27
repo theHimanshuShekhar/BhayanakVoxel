@@ -324,7 +324,7 @@ fn check_convergence(convergence: &Value, out: &Path) {
 }
 
 fn check_schema(report: &Value, out: &Path) {
-    assert_eq!(report["schema_version"], 36);
+    assert_eq!(report["schema_version"], 37);
     // The default is the game's own choice (#50, Part 2): hardware ray queries where the adapter
     // has them, and compute, with the reason, where it has not.
     assert_eq!(report["rt"]["requested"], "auto");
