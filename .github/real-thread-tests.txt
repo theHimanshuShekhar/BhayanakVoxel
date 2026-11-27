@@ -5,7 +5,8 @@
 # machine clock) and gates.
 #
 # One test-name filter per line. libtest matches a filter anywhere in the full test name. The
-# `linux` and `windows-tests` jobs `--skip` each line; the `real-thread-tests` job runs only these.
+# `linux-tests` and `windows-tests` jobs skip each line (a nextest filterset: real-thread-filterset.sh);
+# the `real-thread-tests` job runs only these, with `cargo test`.
 # Every client test therefore runs in exactly one of the two. A line that matches no test of the
 # client binary, or a test of another crate, fails a check (.github/scripts/check-real-thread-list.sh).
 #
