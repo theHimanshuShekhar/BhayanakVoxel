@@ -39,8 +39,12 @@ The height of the Planet's solid surface at each place, the sea floor included: 
 _Avoid_: Heightfield, ground (the Ground is what is generated around a character), elevation (the world map's coarse share of it)
 
 **Formation**:
-A 3D shape the generator adds to the Relief or carves from it, only where a Landform or a landmark asks for one: a leaning cliff, a spire, an arch, a sky island. A place is solid when it is under the Relief or inside an added Formation, and not inside a carved one; carving wins. Caves are carved Formations. Part of the generated terrain, not an Edit.
+A 3D shape the generator adds to the Relief or carves from it, only where a Biome or a Landmark asks for one: a leaning cliff, a spire, an arch, a sky island. A place is solid when it is under the Relief or inside an added Formation, and not inside a carved one; carving wins. Caves are carved Formations. Part of the generated terrain, not an Edit.
 _Avoid_: Overhang (one kind), stamp, 3D layer
+
+**Landmark**:
+One of the few giant one-off Formations placed across the Planet from the seed, such as a 500 m arch or a sky archipelago, each where its Biome allows its kind. The everyday spires and arches are just Formations.
+_Avoid_: POI, wonder, structure (structures are buildings and villages)
 
 **Material**:
 The kind of matter a Voxel is made of (e.g. rock, sand, water, glass), carrying properties like hardness or emissiveness.
