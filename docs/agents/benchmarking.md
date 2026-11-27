@@ -86,6 +86,27 @@ table, or a run of the real-time mode that stopped on an error: that is 1 even w
 and `report.json` is still written, with everything done before it and the error, see "When a run
 stops").
 
+### The machine profile and the world map cache (#264)
+
+The client and the bench size their threads and memory from the machine (`crates/machine`, and
+`docs/perf/resource-audit.md`). Every run prints `machine: ...` first. To measure the low end on a
+bigger machine, put `--profile low-end` before the subcommand (or set `BHAYANAK_PROFILE=low-end`):
+4 threads, 6 GiB of memory, 4 GB of video memory and no ray queries (the compute tracer), the
+GTX 1650 / RX 570 class that the project's low end is. `--threads N`, `--memory-mib N`,
+`--video-memory-mib N` and `--no-ray-queries` lower one thing at a time. A report from a constrained
+profile is not comparable with the budgets (they are the 4090's); it is for finding out whether the
+low end streams, holds its memory and loads in a reasonable time. The `needs-stream-bench` run of a
+PR that changes the load or the loader runs both, the default and `--profile low-end`.
+
+The 320 km world map takes 11 s to build on 8 threads of the dev box (it was 24 s before #264) and
+is kept in a file after the first build: `%LOCALAPPDATA%\bhayanakvoxel` on Windows,
+`$XDG_CACHE_HOME` or `~/.cache` elsewhere (`BHAYANAK_CACHE_DIR` sets the folder,
+`BHAYANAK_NO_MAP_CACHE=1` turns the cache off). A cached map is read and checked in well under a
+second, and a file that is corrupt, short, or made by another generator version or seed is built
+again and written over. `client map-build [--no-write]` builds cold, writes, reads back, checks that
+the hashes are the same and prints the time of each stage: a report that wants the cold figure
+runs it first, or runs the bench with `BHAYANAK_NO_MAP_CACHE=1`.
+
 ### What it does
 
 1. Generates the test Planet and uploads it to the GPU, each brick at the level of detail its
