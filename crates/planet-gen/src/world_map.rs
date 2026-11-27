@@ -244,6 +244,8 @@ pub struct WorldMap {
     radius: i32,
     /// Face by face, each row by row (`i` fastest).
     texels: Vec<Texel>,
+    /// PROTOTYPE (#206): the rivers and lakes of the chosen method, if the map was made with one.
+    rivers: Option<crate::rivers_proto::RiverData>,
 }
 
 impl WorldMap {
@@ -321,6 +323,7 @@ impl WorldMap {
             size,
             radius,
             texels,
+            rivers: None,
         }
     }
 
@@ -330,21 +333,64 @@ impl WorldMap {
     /// and placeholder Biome table, roughed up with the old volcanic hot spots.
     fn from_landform(seed: u64, size: u32, radius: i32, noise: i32, threads: usize) -> WorldMap {
         let count = 6 * (size as usize).pow(2);
+        // PROTOTYPE (#206): a dev-box cache of the landform part (the texels and the heights in
+        // metres), so that the rivers can be worked on without the 90 s of the model.
+        let cache = std::env::var("PROTO_MAP_CACHE")
+            .ok()
+            .map(|dir| std::path::PathBuf::from(dir).join(format!("map-{size}.bin")));
+        let (texels, metres) = match cache.as_deref().and_then(|p| read_cache(p, count)) {
+            Some(loaded) => {
+                eprintln!("landform: map read from the cache");
+                loaded
+            }
+            None => {
+                let made = Self::landform_texels(seed, size, noise, threads, count);
+                if let Some(path) = &cache {
+                    write_cache(path, &made.0, &made.1);
+                }
+                made
+            }
+        };
+        let mode = crate::rivers_proto::default_mode();
+        let rivers = (mode != crate::rivers_proto::RiverMode::Off).then(|| {
+            let t = std::time::Instant::now();
+            let rivers = crate::rivers_proto::build(mode, &metres, size, threads);
+            eprintln!("rivers ({mode:?}): built in {:.1} s", t.elapsed().as_secs_f64());
+            rivers
+        });
+        WorldMap {
+            seed,
+            size,
+            radius,
+            texels,
+            rivers,
+        }
+    }
+
+    fn landform_texels(
+        seed: u64,
+        size: u32,
+        noise: i32,
+        threads: usize,
+        count: usize,
+    ) -> (Vec<Texel>, Vec<f32>) {
         let lf = crate::landform_proto::generate((size as usize).min(1024));
         // The model's highest peak is a little over what an `i16` of 25 cm holds: above 6.5 km
         // heights are squeezed smoothly (not clipped) so that the highest is 8.15 km.
         let top = lf.h.iter().copied().fold(f32::MIN, f32::max);
         let squeeze = if top > 8_150.0 { (8_150.0 - 6_500.0) / (top - 6_500.0) } else { 1.0 };
         eprintln!("landform: highest {top:.0} m, squeezed above 6.5 km by {squeeze:.3}");
+        let squeezed = |m: f32| if m > 6_500.0 { 6_500.0 + (m - 6_500.0) * squeeze } else { m };
         let to_units = |m: f32| {
-            let m = if m > 6_500.0 { 6_500.0 + (m - 6_500.0) * squeeze } else { m };
-            (m * ELEVATION_UNITS_PER_METRE as f32).round().clamp(-32_000.0, f64::from(units(8_190.0)) as f32)
+            (squeezed(m) * ELEVATION_UNITS_PER_METRE as f32).round().clamp(-32_000.0, f64::from(units(8_190.0)) as f32)
         };
-        let mut eroded = vec![0i16; count];
-        par_fill(&mut eroded, threads, |index| {
+        let mut metres = vec![0f32; count];
+        par_fill(&mut metres, threads, |index| {
             let (face, i, j) = split(size, index);
-            to_units(lf.height_at(centre(size, face, i, j))) as i16
+            squeezed(lf.height_at(centre(size, face, i, j)))
         });
+        let mut eroded = vec![0i16; count];
+        par_fill(&mut eroded, threads, |index| to_units(metres[index]) as i16);
         let mut base = vec![0i16; count];
         par_fill(&mut base, threads, |index| {
             let (face, i, j) = split(size, index);
@@ -374,12 +420,12 @@ impl WorldMap {
                 drainage: drainage[index],
             }
         });
-        WorldMap {
-            seed,
-            size,
-            radius,
-            texels,
-        }
+        (texels, metres)
+    }
+
+    /// PROTOTYPE (#206): the rivers and lakes the map was made with, if any.
+    pub fn rivers(&self) -> Option<&crate::rivers_proto::RiverData> {
+        self.rivers.as_ref()
     }
 
     /// The seed the map was made from, which per-brick generation draws its own randomness from
@@ -640,6 +686,83 @@ impl WorldMap {
         }
         hash
     }
+}
+
+/// PROTOTYPE (#206): the landform cache's file: the texels, 8 bytes each, then the heights.
+fn write_cache(path: &std::path::Path, texels: &[Texel], metres: &[f32]) {
+    let mut out = Vec::with_capacity(texels.len() * 12);
+    for t in texels {
+        out.extend_from_slice(&t.elevation.to_le_bytes());
+        out.extend_from_slice(&t.erosion.to_le_bytes());
+        out.extend_from_slice(&[t.biome as u8, t.regions.0, t.rough, t.drainage]);
+    }
+    for m in metres {
+        out.extend_from_slice(&m.to_le_bytes());
+    }
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(path, out);
+}
+
+fn read_cache(path: &std::path::Path, count: usize) -> Option<(Vec<Texel>, Vec<f32>)> {
+    let bytes = std::fs::read(path).ok()?;
+    if bytes.len() != count * 12 {
+        return None;
+    }
+    let biomes = [Biome::Temperate, Biome::Desert, Biome::Snow, Biome::Volcanic];
+    let texels = bytes[..count * 8]
+        .chunks_exact(8)
+        .map(|c| Texel {
+            elevation: i16::from_le_bytes([c[0], c[1]]),
+            erosion: i16::from_le_bytes([c[2], c[3]]),
+            biome: biomes[c[4] as usize],
+            regions: Regions(c[5]),
+            rough: c[6],
+            drainage: c[7],
+        })
+        .collect();
+    let metres = bytes[count * 8..]
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+    Some((texels, metres))
+}
+
+/// PROTOTYPE (#206): what the river code reads of the map's geometry.
+pub(crate) fn proto_position(size: u32, direction: [f64; 3]) -> (usize, f64, f64) {
+    position(size, direction)
+}
+
+/// PROTOTYPE (#206): the unit direction at fractional texel coordinates `(fi, fj)` of `face`
+/// (texel centres at whole numbers), which may lie beyond the face's edge (the face's plane is
+/// continued).
+pub(crate) fn proto_node(size: u32, face: usize, fi: f64, fj: f64) -> [f64; 3] {
+    let [n, u, v] = FACES[face].map(|axis| axis.map(f64::from));
+    let c = |k: f64| (2.0 * k + 1.0) / f64::from(size) - 1.0;
+    let (a, b) = (warp(c(fi)), warp(c(fj)));
+    let cube: [f64; 3] = std::array::from_fn(|k| n[k] + a * u[k] + b * v[k]);
+    let length = (cube[0] * cube[0] + cube[1] * cube[1] + cube[2] * cube[2]).sqrt();
+    cube.map(|c| c / length)
+}
+
+/// PROTOTYPE (#206): texel `(i, j)` of `face`, where either may be a few beyond the face's edge:
+/// the texel across the edge nearest where the face's plane continued puts it.
+pub(crate) fn proto_resolve(size: u32, face: usize, i: i32, j: i32) -> (usize, i32, i32) {
+    let n = size as i32;
+    if i >= 0 && j >= 0 && i < n && j < n {
+        return (face, i, j);
+    }
+    let (f, a, b) = locate(size, proto_node(size, face, f64::from(i), f64::from(j)));
+    (f, a as i32, b as i32)
+}
+
+pub(crate) fn proto_index(size: u32, face: usize, i: u32, j: u32) -> usize {
+    join(size, face, i, j)
+}
+
+pub(crate) fn proto_split(size: u32, index: usize) -> (usize, u32, u32) {
+    split(size, index)
 }
 
 /// Fills `out` with `f(index)`, split into one contiguous part per thread. `f` sees only its

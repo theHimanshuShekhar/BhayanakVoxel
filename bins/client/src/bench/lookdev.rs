@@ -26,6 +26,7 @@ use super::path::{CameraPath, Keyframe};
 #[cfg(test)]
 mod finder;
 mod landform;
+mod rivers_proto;
 mod run;
 // The record of which generator and Planet the places are for is read by the tests that say when
 // they have moved, and by nothing else.

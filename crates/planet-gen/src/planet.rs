@@ -67,6 +67,21 @@ pub const ICE: Material = Material(15);
 /// The one Material of the terrain that gives off light.
 pub const MOLTEN_CORE: Material = Material(16);
 pub const WATER: Material = Material(27);
+/// PROTOTYPE (#206): the bank Material of wet country.
+pub const MUD: Material = Material(31);
+
+/// PROTOTYPE (#206): how deep the bank Material goes, in Voxels.
+const BANK_VOXELS: f64 = crate::rivers_proto::BANK_THICK * brick_store::VOXELS_PER_METRE;
+
+/// PROTOTYPE (#206): the bank Material of a Biome: sand where hot and dry, gravel where cold,
+/// mud where wet.
+fn bank_material(biome: Biome) -> Material {
+    match biome {
+        Biome::Desert => SAND,
+        Biome::Snow | Biome::Volcanic => GRAVEL,
+        Biome::Temperate => MUD,
+    }
+}
 
 /// The molten core's share of the radius: a fifth (3.2 km of 16 km, 64 km of 320 km). It scales
 /// with the Planet, as the core of a bigger one would.
@@ -330,6 +345,8 @@ struct GroundBounds {
     cell: Option<ElevationCell>,
     /// The strata of the ground, if it is all land or all sea floor.
     strata: Option<&'static Strata>,
+    /// PROTOTYPE (#206): a river or lake is near, so the top of the ground may be bank.
+    river: bool,
 }
 
 impl GroundBounds {
@@ -355,6 +372,7 @@ impl GroundBounds {
             return None;
         }
         if shallow > 0.0
+            && (!self.river || shallow > BANK_VOXELS + 1.0)
             && let Some(strata) = self.strata
             && let Some(material) = one_layer(strata, shallow, deep)
         {
@@ -376,6 +394,8 @@ pub struct Planet {
     caves: Arc<Caves>,
     shape: Shape,
     detail: Detail,
+    /// PROTOTYPE (#206): the river method this Planet draws (the map must have been built with it).
+    rivers: crate::rivers_proto::RiverMode,
 }
 
 impl fmt::Debug for Planet {
@@ -399,8 +419,30 @@ impl Planet {
             shape: Shape::new(map.radius()),
             detail: Detail::new(map.seed(), map.radius()),
             caves: Arc::new(Caves::new(map.clone())),
+            rivers: crate::rivers_proto::default_mode(),
             map,
         }
+    }
+
+    /// PROTOTYPE (#206): this Planet drawing the rivers of `mode` (or none): it draws them only
+    /// if its world map was built with that method.
+    pub fn with_rivers(mut self, mode: crate::rivers_proto::RiverMode) -> Planet {
+        self.rivers = mode;
+        self
+    }
+
+    /// PROTOTYPE (#206): the stored rivers, if this Planet draws them.
+    fn river_data(&self) -> Option<&crate::rivers_proto::RiverData> {
+        self.map.rivers().filter(|rd| rd.mode == self.rivers)
+    }
+
+    /// PROTOTYPE (#206): the height of what is on top at `point`: the ground, or the water over it.
+    pub fn surface_height(&self, point: [f64; 3]) -> f64 {
+        let radius = distance(point);
+        let fields = self.map.fields_at(point);
+        let (detail, wet) =
+            self.detail_wet(point, radius, fields, 1.0, &mut detail::Cache::default());
+        (fields.elevation + detail).max(wet.water)
     }
 
     /// FNV-1a hash of the tubes of the caves of the cubes in the box from `low` to `high`, bit for
@@ -464,17 +506,60 @@ impl Planet {
         size: f64,
         cache: &mut detail::Cache,
     ) -> f64 {
-        self.detail.height(point, radius, fields, size, cache)
+        self.detail_wet(point, radius, fields, size, cache).0
+    }
+
+    /// PROTOTYPE (#206): [`Planet::detail_at`] with the rivers cut through it, and what water and
+    /// bank there is at the point.
+    fn detail_wet(
+        &self,
+        point: [f64; 3],
+        radius: f64,
+        fields: Fields,
+        size: f64,
+        cache: &mut detail::Cache,
+    ) -> (f64, crate::rivers_proto::Wet) {
+        let detail = self.detail.height(point, radius, fields, size, cache);
+        match self.river_data() {
+            Some(rd) => crate::rivers_proto::shape(
+                &self.map,
+                rd,
+                point,
+                radius,
+                fields.elevation,
+                detail,
+                size,
+            ),
+            None => (detail, crate::rivers_proto::Wet::NONE),
+        }
     }
 
     /// Bounds `(lowest, highest)` on [`Planet::ground_height`] over every point in the hull of
     /// `corners`, for a brick sampled `size` Voxels apart: the map's bounds (see
     /// [`WorldMap::elevation_range`]) and the detail's.
     fn ground_range(&self, corners: &[[f64; 3]], size: f64) -> (f64, f64) {
+        let (low, high, _) = self.ground_range_r(corners, size);
+        (low, high)
+    }
+
+    /// PROTOTYPE (#206): [`Planet::ground_range`], and whether a river or lake is near the box.
+    /// Where one is, the detail is damped and the channel is cut through it, so the ground is
+    /// within the map's elevation and the detail's bounds widened to include no detail, the bed
+    /// of the lowest channel near, and the highest water.
+    fn ground_range_r(&self, corners: &[[f64; 3]], size: f64) -> (f64, f64, bool) {
         let fields = self.map.field_range(corners);
         let (low, high) = fields.elevation;
         let (below, above) = self.detail.bounds(corners, size, fields);
-        (low + below, high + above)
+        if let Some(rd) = self.river_data()
+            && let Some((bed, top)) = crate::rivers_proto::bounds(&self.map, rd, corners, size)
+        {
+            return (
+                (low + below.min(0.0)).min(bed),
+                (high + above.max(0.0)).max(top),
+                true,
+            );
+        }
+        (low + below, high + above, false)
     }
 
     /// The Voxel at `coord`: `None` for air.
@@ -563,16 +648,21 @@ impl Planet {
         biome: Option<Biome>,
     ) -> Option<Material> {
         let sea = self.shape.sea;
-        let height = fields.elevation + self.detail_at(point, radius, fields, size, cache);
+        let (detail, wet) = self.detail_wet(point, radius, fields, size, cache);
+        let height = fields.elevation + detail;
         let depth = sea + height - radius;
         let biome = || biome.unwrap_or_else(|| self.map.sample(point).biome);
         if depth <= 0.0 {
             // Above the ground: water below sea level, else air, and ice on a polar sea.
             if radius >= sea {
-                return None;
+                // PROTOTYPE (#206): the water of a river or a lake.
+                return (radius < sea + wet.water).then_some(WATER);
             }
             let frozen = radius >= sea - ICE_THICKNESS && biome() == Biome::Snow;
             return Some(if frozen { ICE } else { WATER });
+        }
+        if wet.bank && depth < BANK_VOXELS {
+            return Some(bank_material(biome()));
         }
         Some(at_depth(strata(biome(), height < 0.0), depth))
     }
@@ -652,7 +742,7 @@ impl Planet {
         let corners: [[f64; 3]; 8] =
             std::array::from_fn(|i| samples.corner([i & 1, i >> 1 & 1, i >> 2]));
         // Every Voxel is in the hull of the corners, so the ground under it is within these.
-        let (low, high) = self.ground_range(&corners, samples.size);
+        let (low, high, river) = self.ground_range_r(&corners, samples.size);
         // The brick's Voxels are between these many Voxels below the ground.
         let shallowest = sea + low - far - SLACK;
         let deepest = sea + high - near + SLACK;
@@ -681,7 +771,10 @@ impl Planet {
             if shallowest >= f64::from(STRATA_DEPTH) {
                 return Brick::solid(DEEP_ROCK);
             }
-            if shallowest > 0.0 && (low >= 0.0 || high < 0.0) {
+            if shallowest > BANK_VOXELS * f64::from(u8::from(river)) + f64::from(u8::from(river))
+                && shallowest > 0.0
+                && (low >= 0.0 || high < 0.0)
+            {
                 // Below the ground, all land or all sea floor, and one stratum if it is all in
                 // one biome, which it is if the corners are in one texel.
                 if let Some(texel) = self.single_texel(&corners) {
@@ -811,13 +904,14 @@ impl Planet {
         let corners: [[f64; 3]; 8] =
             std::array::from_fn(|i| samples.corner([i & 1, i >> 1 & 1, i >> 2]));
         let texel = self.single_texel(&corners)?;
-        let (low, high) = self.ground_range(&corners, samples.size);
+        let (low, high, river) = self.ground_range_r(&corners, samples.size);
         Some(GroundBounds {
             low,
             high,
             biome: texel.biome,
             cell: self.map.elevation_cell(&corners),
             strata: (low >= 0.0 || high < 0.0).then(|| strata(texel.biome, high < 0.0)),
+            river,
         })
     }
 

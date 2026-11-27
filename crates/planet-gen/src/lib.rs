@@ -25,6 +25,7 @@ mod caves;
 mod detail;
 pub mod planet;
 pub mod landform_proto;
+pub mod rivers_proto;
 pub mod world_map;
 
 pub use caves::Tube;

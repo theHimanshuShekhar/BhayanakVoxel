@@ -67,7 +67,7 @@ fn day_times() -> [(&'static str, f64); 5] {
     ]
 }
 
-const USAGE: &str = "usage: client lookdev --out DIR [--size WxH] [--spp N] [--compare DIR] [--atmosphere] [--day] [--untinted] [--landform] [--shot NAME]...\n  \
+const USAGE: &str = "usage: client lookdev --out DIR [--size WxH] [--spp N] [--compare DIR] [--atmosphere] [--day] [--untinted] [--landform] [--proto-rivers d8|mfd] [--shot NAME]...\n  \
 --day (#203): instead of the combinations, the world clock's sky at dawn, the golden hour, noon, dusk and night\n  \
 (Reference and settled Primary) from the meadow, from orbit (the Zoom's far end) and in the cyan crystal cave\n  \
 (on lavapipe: client lookdev --out DIR --day --size 480x270 --spp 16)\n  \
@@ -172,6 +172,8 @@ pub struct Options {
     pub only: Vec<String>,
     /// PROTOTYPE (#246): the landform model's shots, found by searching the world map.
     pub landform: bool,
+    /// PROTOTYPE (#206): the rivers-and-lakes shots of one method, found by searching the map.
+    pub proto_rivers: Option<planet_gen::rivers_proto::RiverMode>,
     /// A smoke test: the test Planet (the shots' places are not there: the images are of nothing
     /// in particular), two shots, tiny.
     pub short: bool,
@@ -190,6 +192,7 @@ fn parse(args: impl IntoIterator<Item = String>) -> Result<Options, String> {
         untinted: false,
         only: Vec::new(),
         landform: false,
+        proto_rivers: None,
         short: false,
     };
     let (mut have_out, mut size, mut spp) = (false, None, None);
@@ -216,6 +219,12 @@ fn parse(args: impl IntoIterator<Item = String>) -> Result<Options, String> {
             "--day" => options.day = true,
             "--gi" => options.gi = true,
             "--landform" => options.landform = true,
+            "--proto-rivers" => {
+                options.proto_rivers = Some(
+                    planet_gen::rivers_proto::RiverMode::parse(&value("d8|mfd")?)
+                        .ok_or("--proto-rivers is d8 or mfd")?,
+                )
+            }
             "--untinted" => options.untinted = true,
             "--shot" => options.only.push(value("a name")?),
             "--help" | "-h" => return Err(USAGE.to_string()),
@@ -470,6 +479,9 @@ fn write_sheet(
 
 /// Renders the shots, writes their images and the sheet, and returns the sheet's path.
 pub fn run(options: &Options) -> Result<PathBuf, Box<dyn Error>> {
+    if let Some(mode) = options.proto_rivers {
+        return super::rivers_proto::run(options, mode);
+    }
     if options.landform {
         return super::landform::run(options);
     }

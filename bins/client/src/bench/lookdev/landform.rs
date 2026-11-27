@@ -33,36 +33,36 @@ const DUSK: f64 = 1.0;
 /// Voxels round a shot's place that the level 0 ring holds: 30 m.
 const RING: i32 = (30.0 * VOXELS_PER_METRE) as i32;
 
-type V3 = [f64; 3];
+pub(super) type V3 = [f64; 3];
 
-fn add(a: V3, b: V3) -> V3 {
+pub(super) fn add(a: V3, b: V3) -> V3 {
     [a[0] + b[0], a[1] + b[1], a[2] + b[2]]
 }
-fn mul(a: V3, s: f64) -> V3 {
+pub(super) fn mul(a: V3, s: f64) -> V3 {
     [a[0] * s, a[1] * s, a[2] * s]
 }
-fn dot(a: V3, b: V3) -> f64 {
+pub(super) fn dot(a: V3, b: V3) -> f64 {
     a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
 }
-fn cross(a: V3, b: V3) -> V3 {
+pub(super) fn cross(a: V3, b: V3) -> V3 {
     [
         a[1] * b[2] - a[2] * b[1],
         a[2] * b[0] - a[0] * b[2],
         a[0] * b[1] - a[1] * b[0],
     ]
 }
-fn norm(a: V3) -> V3 {
+pub(super) fn norm(a: V3) -> V3 {
     mul(a, 1.0 / dot(a, a).sqrt())
 }
 
 /// Metres to Voxels.
-fn vox(m: f64) -> f64 {
+pub(super) fn vox(m: f64) -> f64 {
     m * VOXELS_PER_METRE
 }
 
 /// The planet seen through the world map, in metres.
-struct Ground<'a> {
-    map: &'a WorldMap,
+pub(super) struct Ground<'a> {
+    pub(super) map: &'a WorldMap,
 }
 
 impl Ground<'_> {
@@ -86,7 +86,7 @@ impl Ground<'_> {
 }
 
 /// East and north at a unit direction (the pole axis is y).
-fn frame(d: V3) -> (V3, V3) {
+pub(super) fn frame(d: V3) -> (V3, V3) {
     let reference = if d[1].abs() > 0.99 {
         [1.0, 0.0, 0.0]
     } else {
@@ -97,36 +97,36 @@ fn frame(d: V3) -> (V3, V3) {
 }
 
 /// The direction `km` kilometres from `d` along `bearing` (radians clockwise from north).
-fn walk(d: V3, bearing: f64, km: f64) -> V3 {
+pub(super) fn walk(d: V3, bearing: f64, km: f64) -> V3 {
     let (east, north) = frame(d);
     let t = add(mul(north, bearing.cos()), mul(east, bearing.sin()));
     let a = km * 1000.0 * VOXELS_PER_METRE / f64::from(WORLD_RADIUS);
     norm(add(mul(d, a.cos()), mul(t, a.sin())))
 }
 
-fn lat_lon(d: V3) -> (f64, f64) {
+pub(super) fn lat_lon(d: V3) -> (f64, f64) {
     (d[1].asin().to_degrees(), d[2].atan2(d[0]).to_degrees())
 }
 
 /// A shot's place, found by the search.
-struct Found {
-    name: &'static str,
-    subject: String,
+pub(super) struct Found {
+    pub(super) name: &'static str,
+    pub(super) subject: String,
     /// Where the camera is and where it looks, in Voxels from the Planet's centre.
-    position: V3,
-    target: V3,
+    pub(super) position: V3,
+    pub(super) target: V3,
     /// The place the level 0 ring is built round, on the ground under the camera.
-    site: V3,
-    sun: f64,
+    pub(super) site: V3,
+    pub(super) sun: f64,
     /// The sun's direction where the camera looks straight down (the orbit), where an elevation
     /// from the horizon means nothing.
-    sun_dir: Option<V3>,
+    pub(super) sun_dir: Option<V3>,
     /// How much of the game's haze the look keeps: the game's 1/300 per metre (and the hero tint's
     /// own, of the same order, over the distance in air) makes everything past a kilometre fog,
     /// which is right for a forest floor and wrong for a range 40 km away.
-    haze: f32,
+    pub(super) haze: f32,
     /// What the search found, for the sheet.
-    note: String,
+    pub(super) note: String,
 }
 
 /// Nodes of a Fibonacci lattice on the sphere, 2 km apart, with the height of the ground at each.
@@ -248,7 +248,7 @@ fn biggest_continent(survey: &Survey) -> Option<(V3, usize, V3)> {
 }
 
 /// Every shot the search finds, and a line for each feature it does not.
-fn find(ground: &Ground) -> (Vec<Found>, Vec<String>) {
+pub(super) fn find(ground: &Ground) -> (Vec<Found>, Vec<String>) {
     let t = Instant::now();
     let survey = Survey::new(ground);
     eprintln!(
@@ -608,7 +608,7 @@ fn find(ground: &Ground) -> (Vec<Found>, Vec<String>) {
 }
 
 /// A [`Shot`] of one still camera, for the shared camera and sun code.
-fn shot_of(f: &Found) -> Shot {
+pub(super) fn shot_of(f: &Found) -> Shot {
     let key = Key {
         position: f.position,
         target: f.target,
@@ -624,18 +624,18 @@ fn shot_of(f: &Found) -> Shot {
     }
 }
 
-fn envf(name: &str, default: f64) -> f64 {
+pub(super) fn envf(name: &str, default: f64) -> f64 {
     std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
 }
 
-fn slug(name: &str) -> String {
+pub(super) fn slug(name: &str) -> String {
     name.chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
         .collect()
 }
 
 /// The images side by side in rows of two, each at half size, for one look at all of them.
-fn contact_sheet(images: &[Image]) -> Image {
+pub(super) fn contact_sheet(images: &[Image]) -> Image {
     let (w, h) = (images[0].width as usize / 2, images[0].height as usize / 2);
     let rows = images.len().div_ceil(2);
     let mut sheet = Image {
@@ -688,6 +688,19 @@ pub fn run(options: &Options) -> Result<PathBuf, Box<dyn Error>> {
         report += &format!("MISSING {m}\n");
     }
     std::fs::write(options.out.join("features.txt"), &report)?;
+    render_shots(options, &planet, &found, &missing, map_s, began, "landform look-dev (#246)")
+}
+
+/// Renders `found` (shared with the PROTOTYPE rivers shots, #206).
+pub(super) fn render_shots(
+    options: &Options,
+    planet: &Planet,
+    found: &[Found],
+    missing: &[String],
+    map_s: f64,
+    began: Instant,
+    title: &str,
+) -> Result<PathBuf, Box<dyn Error>> {
 
     let (w, h) = options.size;
     let d0 = f64::from(h) / (2.0 * 35f64.to_radians().tan());
@@ -819,16 +832,16 @@ pub fn run(options: &Options) -> Result<PathBuf, Box<dyn Error>> {
     if !images.is_empty() {
         write_png(&options.out.join("contact-sheet.png"), &contact_sheet(&images))?;
     }
-    let mut page = String::from(
-        "<!doctype html><meta charset=utf-8><title>landform look-dev (#246)</title>\
-         <style>body{font:14px system-ui;margin:1.5em;background:#16171a;color:#ddd}\
+    let mut page = format!("<!doctype html><meta charset=utf-8><title>{title}</title>");
+    page.push_str(
+        "<style>body{font:14px system-ui;margin:1.5em;background:#16171a;color:#ddd}\
          table{border-collapse:collapse}td{vertical-align:top;padding:4px 6px;border-top:1px solid #444}\
          td.name{max-width:260px;font-size:12px;color:#aaa}td.name b{color:#ddd;font-size:15px}\
          img{display:block;width:560px;height:auto}.m{color:#f90}</style>",
     );
     let _ = write!(
         page,
-        "<h1>Landform look-dev (#246): PROTOTYPE</h1><p>World map made in {map_s:.0} s from the landform model; \
+        "<h1>{title}: PROTOTYPE</h1><p>World map made in {map_s:.0} s from the landform model; \
          {}x{}; the Primary image settled over {} frames and the Reference at {} samples a pixel; noon (the sun {NOON} degrees up) \
          unless it says dusk. Took {:.0} s.</p>",
         options.size.0,
@@ -837,7 +850,7 @@ pub fn run(options: &Options) -> Result<PathBuf, Box<dyn Error>> {
         options.spp,
         began.elapsed().as_secs_f64()
     );
-    for m in &missing {
+    for m in missing {
         let _ = write!(page, "<p class=m>MISSING {m}</p>");
     }
     page.push_str("<table><tr><td>shot</td><td>Primary, settled</td><td>Reference</td></tr>");
