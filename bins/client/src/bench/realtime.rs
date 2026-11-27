@@ -1539,7 +1539,7 @@ pub struct RealTimeReport {
 
 /// What the machine had, what the run was held to, and the bias it started at (#264). Without
 /// this a report cannot say whether the gates were passed at the bias they are budgeted for: a
-/// machine with under 8 GiB free starts coarser (`bias_for`), which makes the gates easier.
+/// machine with under 9.7 GiB free starts coarser (`bias_for`), which makes the gates easier.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct ProfileReport {
     /// The profile the run used: threads, free memory (MiB), video memory (MiB, null if not
@@ -3789,7 +3789,7 @@ pub fn run(
 }
 
 /// The gates are budgeted for the default LOD bias. A full-size run of the default profile that
-/// started coarser (a machine with under 8 GiB free) did not pass them at it: it is over, with a
+/// started coarser (a machine with under 9.7 GiB free) did not pass them at it: it is over, with a
 /// name that says why, whatever else it measured. (The test Planet of `--short`, which CI runs,
 /// does not take its bands from the machine's memory, so it is not held to this; nor is a run of a
 /// constrained profile, which is for finding out what the low end does and says so.)

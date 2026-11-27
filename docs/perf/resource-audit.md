@@ -63,10 +63,12 @@ prints the profile it runs with on its first line (`machine: ...`).
 | 5 | `par_bricks` (the spawn ring, `generate_region`, `generate_planet`, `Planet::guard`) and `Planet::guard_in` (the Guard's cells), `planet-gen` | slabs of constant x (about a hundred for the spawn ring, so that a slab that held the surface left the others idle at the end) | columns of constant x and y, the next free thread takes the next; a cell a piece in `guard_in`. Output in the order of x, y, z whatever the threads (it was in no order) | `threads()` = 4 | all `threads()` |
 | 6 | `loader::workers_for`, `GUARD_WORKERS` | `cores − 2`; the Guard's background share 2 workers whatever the workers | `workers_for` is `machine::loader_workers_for`, so a constrained profile gets 2 workers on 4 threads; the Guard's share is `max(2, workers / 3)` (`guard_share`) | 2 workers; the Guard has all but one when the queue is empty, one beside it | 30 workers on a 32-thread machine, 10 on the Guard beside the queue (was 2) |
 | 7 | **Not fixed:** `Selection::arrived` and `Scene::arrive`, the scene thread's tree update (`select.rs:1911`, `rings.rs`) | 43 to 54 s of the shot fill's 92 to 131 s, on one core | the same: 40 s of it is `revisit_whole_as` (about 17 ms per round of 400 parents), 11.7 s the recheck of the neighbours; `show_diff` (region repacking, `rings.rs:1316`) another 10 to 11 s | | follow-up 1 below |
-| 8 | The LOD bias the client starts at, `bias_for` in `bins/client/src/main.rs` | 1.0 whatever the memory | 1.0 where the machine has the room (`MEMORY_AT_DEFAULT_BIAS` 7 GiB with 1 GiB kept free: **8 GiB free**); coarser in the square root of the shortfall, up to 3.0, below that. The tables (`room_for`, `budget_for`, `expected_words`) scale with `d0²`, so a larger bias is a smaller resident set. A multiple of 0.05. **The report says it** (`machine.profile.starting_bias`) and a full-size real-time run of the default profile that did not start at 1.0 has `starting_bias` in `gates.over`: the gates are budgeted for 1.0 | the low-end reference (5 GiB) gets **1.35**; never fails, never below the Guard and the ring | the ceiling is the default 1.0: spending spare memory and GPU on quality is #230's |
+| 8 | The LOD bias the client starts at, `bias_for` in `bins/client/src/main.rs` | 1.0 whatever the memory | 1.0 where the machine has the room (the peak is estimated as `MEMORY_FIXED` 830 MiB + `MEMORY_SCALED` 8030 MiB / bias², fitted to the 4090's measurements, and may be 90% of the memory: **9.7 GiB free**; the 4090's 18.7 GiB has the room); coarser in the square root of the shortfall, up to 3.0, below that. The tables (`room_for`, `budget_for`, `expected_words`) scale with `d0²`, so a larger bias is a smaller resident set. A multiple of 0.05. **The report says it** (`machine.profile.starting_bias`) and a full-size real-time run of the default profile that did not start at 1.0 has `starting_bias` in `gates.over`: the gates are budgeted for 1.0 | the low-end reference (5 GiB) gets **1.5** (estimated peak 4.3 GiB, 86% of it; it was 1.35 and peaked at 5228 MiB, over the 5 GiB, before the 4090 run recalibrated the estimate); never fails, never below the Guard and the ring | the ceiling is the default 1.0: spending spare memory and GPU on quality is #230's |
 | 9 | The constrained profile's ray queries, `request_gpu_for` in `crates/render/src/lib.rs` | the adapter's | `ray_queries = false` removes `EXPERIMENTAL_RAY_QUERY` from the requested features, so the compute tracer runs on any machine | the compute tracer | the adapter's |
 
 Rows 1 to 3 are what the owner saw: the load, and the look-dev's shot build.
+
+The 4090 PC (16 threads) measured this branch (56a26fb) against `main` (89273fd), back to back, default profile, all gates passing, two runs: Guard 16.0 s to 8.4 s; the map at launch 15.5 to 16.0 s to 6.8 s cold and 0.09 to 0.12 s from the cache; time to control 1.10 s to 1.10 and 1.14 s; scene lag d0 max 1.49 to 1.46 to 1.52; frame time p99 9.78 ms to 9.62 to 10.4 ms; fill 119 s to 120 s; `resident_peak_mib` 8508 to 8607 to 8377 to 8850. `map-build`: 6.50 s cold on 16 threads, 23.1 s cold on 4 pinned threads, 81 ms from the cache, the same hash. During the load 15 threads ran at about 40% and one, the scene thread (follow-up 1 below), at 100%. The low-end profile (pinned to CPUs 0 to 3, bias 1.35) completed with no holes, over its soft-miss and time-to-control gates (108 frames, 2.25 s; #230 sets those), and its `resident_peak_mib` of 4941 to 5228 was over the 5 GiB: the memory model of item 8 was recalibrated from it (see the checklist below).
 
 ## Not fixed: what is not cheap, and what it measured
 
@@ -119,11 +121,16 @@ Windows artifact: `client.exe --profile low-end bench --streaming --real-time`):
 - **The CPU utilisation during the load:** per-thread CPU of the client process from the start to
   the first frame (how many threads were at 100%, not Task Manager's total). Before this change the
   map's erosion and drainage ran at about one core for 16 s of the 24 on the dev box.
-- **`resident_peak_mib` on the low-end profile:** it must be under the profile's 5 GiB (it starts at
-  bias 1.35, which the estimate puts at about 3.9 GiB). The 7 GiB of
-  `MEMORY_AT_DEFAULT_BIAS` is derived from the 6.66 GiB measured after the fill (#167) and is the
-  estimate this run checks. The report's `machine.profile` says the profile, the processors the run
-  was pinned to, the memory found and the starting bias; the Windows memory read
+- **`resident_peak_mib` on the low-end profile:** it must be at most 90% of the profile's 5 GiB
+  (4608 MiB). The 4090's first run of this PR (56a26fb) measured the memory model wrong: the
+  estimate was 7 GiB at bias 1.0 (the 6.66 GiB after the fill, #167, which is not the run's peak),
+  but the 4090 peaks at 8377 to 8850 MiB at 1.0 and the low-end run, at the 1.35 that the estimate
+  chose, peaked at 4941 to 5228 MiB, over its 5 GiB (the estimate said 3.9 GiB). The model is now
+  `MEMORY_FIXED` 830 MiB + `MEMORY_SCALED` 8030 MiB / bias², fitted to those two peaks (8850 at 1.0,
+  5228 at 1.35), and the starting bias is the least multiple of 0.05 that puts the estimate under
+  90% of the memory: **1.5 at 5 GiB, an estimated 4399 MiB (86%)**; 1.0 from about 9.7 GiB free (the
+  4090's 18.7 GiB). This run, at 1.5, checks it again. The report's `machine.profile` says the profile, the
+  processors the run was pinned to, the memory found and the starting bias; the Windows memory read
   (`GlobalMemoryStatusEx`) is run by CI's `windows-tests` (the `machine` crate's, since #268's fix
   added `-p machine` to them) and by this run, and `machine: ...` on its first line says what it
   found. The pinning (`SetProcessAffinityMask`) is run by a test of the `machine` crate on the

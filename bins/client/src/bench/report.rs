@@ -240,7 +240,7 @@ use super::stream::StreamReport;
 /// `constrained`), what pinning the process to its processors did (`pinning`, `pinned_cpus`), and
 /// the LOD bias the client started at (`starting_bias`, with the default's in `default_bias`). A
 /// full-size real-time run of the default profile that started at another bias (a machine with under
-/// 8 GiB free starts coarser) has `starting_bias` in `streaming_real_time.gates.over`. Nothing else is
+/// 9.7 GiB free starts coarser) has `starting_bias` in `streaming_real_time.gates.over`. Nothing else is
 /// changed.
 pub const SCHEMA_VERSION: u32 = 38;
 

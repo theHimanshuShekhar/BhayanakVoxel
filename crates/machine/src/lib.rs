@@ -44,6 +44,9 @@ pub struct Profile {
     pub ray_queries: bool,
 }
 
+/// One mebibyte.
+pub const MIB: u64 = 1 << 20;
+
 /// One gibibyte.
 pub const GIB: u64 = 1 << 30;
 

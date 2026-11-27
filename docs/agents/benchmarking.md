@@ -97,7 +97,7 @@ RX 570 class that the project's low end is. The process is **pinned to 4 logical
 that its threads, not only the work's, compete for 4 as on that machine (on Windows every thread; on
 Linux all but Mesa's shader disk-cache thread, which resets its own mask); the report's
 `machine.profile` says which (`pinned_cpus`, or why it was not pinned), the memory found and the
-LOD bias the client started at (1.35 at 5 GiB: the default 1.0 needs 8 GiB free). **A full-size
+LOD bias the client started at (1.5 at 5 GiB: the default 1.0 needs 9.7 GiB free). **A full-size
 real-time run of the default profile that did not start at 1.0 has `starting_bias` in
 `gates.over`**, since the gates are budgeted for 1.0; a run on fewer threads or less memory than the
 machine has (`machine.profile.lowered`) is not held to that. `--no-ray-queries` and

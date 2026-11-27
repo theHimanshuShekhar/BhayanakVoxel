@@ -99,17 +99,22 @@ const PIXELS_PER_LINE: f32 = 20.0;
 /// it. A machine with the memory for it starts with this ([`default_bias`]).
 const DEFAULT_BIAS: f32 = 1.0;
 
-/// What the client's process holds at a bias of 1 once the resident set is complete, in bytes: the
-/// 6.66 GiB that the full-size run measured after the fill at 2 m (#167, the dev box, with the
-/// tables, the scene's host buffers and the store), and a margin of a tenth, which the bench's
-/// peak over it asks for. Everything that grows with the draw distance goes with `d0` squared, and
-/// `d0` with the bias, so the memory of another bias is this over its square (the Guard, the
-/// spawn ring and the code do not scale, and are a few percent: the constrained run on the 4090
-/// reports `resident_peak_mib` to check this).
-const MEMORY_AT_DEFAULT_BIAS: u64 = 7 * machine::GIB;
+/// What the client's process holds, in bytes, as a function of the LOD bias `b`:
+/// `MEMORY_FIXED + MEMORY_SCALED / b²`. Everything that grows with the draw distance (the
+/// tables, the scene's host buffers, the store) goes with `d0` squared, and `d0` with the bias,
+/// so it is `MEMORY_SCALED` over the square of the bias; the Guard, the spawn ring, the code and
+/// the runtime do not scale and are `MEMORY_FIXED`. Fitted to the 4090 PC's full-size runs of
+/// #264 (the largest `resident_peak_mib` sampled, which is what the estimate is for): 8850 MiB at
+/// a bias of 1.0 (the default profile; the runs measured 8377 to 8850) and 5228 MiB at 1.35 (the
+/// low-end profile, 5 GiB, pinned to 4 CPUs, compute tracer; 4941 to 5228), which gives about
+/// 825 MiB and 8025 MiB; these are a few MiB over that. (The 6.66 GiB of #167 was the resident set
+/// after the fill at 2 m, not the peak of the run, and the estimate built on it was 1.8 GiB short.)
+const MEMORY_FIXED: u64 = 830 * machine::MIB;
+const MEMORY_SCALED: u64 = 8_030 * machine::MIB;
 
-/// Memory that is left to the system and the other programs, whatever the machine has.
-const MEMORY_LEFT_FREE: u64 = machine::GIB;
+/// The share of the memory the machine has to use that the process may hold at its peak: a tenth
+/// is left to the system, the other programs and the estimate's error.
+const MEMORY_USED_AT_MOST: f64 = 0.9;
 
 /// The most the bias is raised to for want of memory: three times coarser than the default, a
 /// ninth of the memory. A machine with less than the 1.8 GiB that this needs runs at this and is
@@ -117,7 +122,7 @@ const MEMORY_LEFT_FREE: u64 = machine::GIB;
 const MOST_BIAS: f32 = 3.0;
 
 /// The LOD bias to start with on a machine that has `memory` bytes to use: the default where it
-/// has the memory for the default's resident set, and coarser (a larger bias, so the bands are
+/// has the memory for the default's peak (about 9.7 GiB to use), and coarser (a larger bias, so the bands are
 /// nearer in Voxels and fewer bricks are drawn and held) in the square root of the shortfall, up
 /// to [`MOST_BIAS`], so that a machine with little memory draws less far and less fine instead of
 /// running out of it. The floor of what it draws is the Guard (the whole Planet, coarse) and
@@ -125,8 +130,9 @@ const MOST_BIAS: f32 = 3.0;
 /// up. The ceiling, on a machine with more memory than needed, is the default's bias: spending
 /// spare memory and GPU on quality is #230's.
 fn bias_for(memory: u64) -> f32 {
-    let usable = memory.saturating_sub(MEMORY_LEFT_FREE).max(machine::GIB) as f64;
-    let wanted = (MEMORY_AT_DEFAULT_BIAS as f64 / usable).sqrt();
+    let usable = memory as f64 * MEMORY_USED_AT_MOST;
+    let room = (usable - MEMORY_FIXED as f64).max(machine::MIB as f64);
+    let wanted = (MEMORY_SCALED as f64 / room).sqrt();
     let bias = ((wanted * 20.0).ceil() / 20.0) as f32;
     bias.clamp(DEFAULT_BIAS, MOST_BIAS)
 }
@@ -1719,13 +1725,40 @@ mod tests {
     #[test]
     fn the_bias_has_a_floor_at_the_default_and_a_ceiling_and_grows_as_memory_shrinks() {
         let gib = machine::GIB;
-        // Memory to spare, up to the 4090 PC's: the default, never finer (that is #230's).
-        for memory in [8 * gib, 16 * gib, 64 * gib, u64::MAX] {
+        // Memory to spare, up to the 4090 PC's (18.7 GiB to use): the default, never finer (that
+        // is #230's). 10 GiB is about the least that holds the default's 8.7 GiB peak.
+        for memory in [
+            10 * gib,
+            16 * gib,
+            18 * gib + 700 * machine::MIB,
+            64 * gib,
+            u64::MAX,
+        ] {
             assert_eq!(bias_for(memory), DEFAULT_BIAS, "{memory} bytes");
         }
-        // The low-end reference (8 GB, 5 GiB free): coarser, but not by much.
+        // The low-end reference (8 GB, 5 GiB free): coarser, and its estimated peak is at most 90%
+        // of its memory (the 4090 measured 5228 MiB at 1.35, which was over 5 GiB: the estimate
+        // is fitted to that and to 8850 MiB at 1.0).
         let low = bias_for(machine::Profile::LOW_END.memory);
-        assert!((1.3..=1.4).contains(&low), "{low}");
+        assert_eq!(low, 1.5);
+        // Every bias holds the estimate under the share of the memory it may use, to the least
+        // memory that does not need the ceiling, and starts coarser the less there is.
+        for memory in (4..=10).map(|g| g * gib) {
+            let peak =
+                MEMORY_FIXED as f64 + MEMORY_SCALED as f64 / f64::from(bias_for(memory)).powi(2);
+            assert!(
+                peak <= memory as f64 * MEMORY_USED_AT_MOST,
+                "{memory}: {peak}"
+            );
+        }
+        // The estimate reproduces what the 4090 measured, a little over it.
+        let at = |bias: f64| {
+            (MEMORY_FIXED as f64 + MEMORY_SCALED as f64 / (bias * bias)) / machine::MIB as f64
+        };
+        assert!((8850.0..8950.0).contains(&at(1.0)), "{}", at(1.0));
+        assert!((5228.0..5330.0).contains(&at(1.35)), "{}", at(1.35));
+        // A tenth short of the default's memory is already coarser.
+        assert!(bias_for(9 * gib) > DEFAULT_BIAS);
         // Less and less memory is coarser and coarser, to a ceiling, and nothing makes it fail.
         let mut last = low;
         for memory in [4 * gib, 3 * gib, 2 * gib, gib, 0] {
