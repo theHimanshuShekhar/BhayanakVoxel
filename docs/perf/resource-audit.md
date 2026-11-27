@@ -19,8 +19,11 @@ Add to it when you find another or change one.
 - **Low end:** `--profile low-end` (or `BHAYANAK_PROFILE=low-end`): 4 threads, 5 GiB of free memory (the
   8 GB machine's: Windows at idle leaves 4.5 to 5 GiB), 4 GB of video memory and no ray queries.
   The process is **pinned to 4 logical processors** (`sched_setaffinity` on Linux,
-  `SetProcessAffinityMask` on Windows), so that every thread of it (the frame thread, the scene
-  thread, the simulation, the driver's) competes for them as on a 4-thread machine; the processors
+  `SetProcessAffinityMask` on Windows), so that the threads of it (the frame thread, the scene
+  thread, the simulation, the driver's) compete for them as on a 4-thread machine. On Windows the
+  process's mask binds every thread; **on Linux a thread can set its own mask, and Mesa's shader
+  disk-cache thread (`client:disk$0`) does, so it runs on any processor** (a thread of little
+  work; the game's threads stay pinned). The processors
   are the first 4 the process was allowed (here 2 to 5) and are reported in
   `machine.profile.pinned_cpus`. It is not a slower CPU, so the low-end times are what 4 threads of
   this CPU do. If the system refuses, the run goes on unpinned and says so.
@@ -37,7 +40,7 @@ Everything below that says "from the machine" reads it in `crates/machine` and n
 | `threads()` | the machine's | 4 (or fewer if the machine has fewer) | 1 |
 | `bulk_threads()` (work the frame thread must not wait behind) | threads − 1 | 3 | 1 |
 | `loader_workers()` | threads − 2 | 2 | 1 |
-| memory | the least of `MemAvailable` and the cgroup's room (v2 `memory.max` less `memory.current`, v1 `memory.limit_in_bytes` less `memory.usage_in_bytes`); Windows `GlobalMemoryStatusEx` | 5 GiB | 1 GiB, in `bias_for` |
+| memory | the least of `MemAvailable` and the cgroup's room (v2 `memory.max` less `memory.current` less `inactive_file`; v1 `memory.limit_in_bytes` less `memory.usage_in_bytes` less `total_inactive_file`; the least over the process's own cgroup, from `/proc/self/cgroup`, and each ancestor up to the root); Windows `GlobalMemoryStatusEx` | 5 GiB | 1 GiB, in `bias_for` |
 | processors | all the process may use | pinned to 4 of them | |
 | video memory | not read (see below) | 4 GiB | none read |
 | ray queries | the adapter's | off (the compute tracer) | |
@@ -121,8 +124,10 @@ Windows artifact: `client.exe --profile low-end bench --streaming --real-time`):
   `MEMORY_AT_DEFAULT_BIAS` is derived from the 6.66 GiB measured after the fill (#167) and is the
   estimate this run checks. The report's `machine.profile` says the profile, the processors the run
   was pinned to, the memory found and the starting bias; the Windows memory read
-  (`GlobalMemoryStatusEx`) and the pinning (`SetProcessAffinityMask`) are run by CI's tests and by
-  this run, and `machine: ...` on its first line says what they found.
+  (`GlobalMemoryStatusEx`) is run by CI's `windows-tests` (the `machine` crate's, since #268's fix
+  added `-p machine` to them) and by this run, and `machine: ...` on its first line says what it
+  found. The pinning (`SetProcessAffinityMask`) is run by a test of the `machine` crate on the
+  Windows runners, which pins that test's process to one processor and puts the mask back.
 - **The scene's lag and the scene thread's latency**, against `main`: `gates.scene_lag_d0_max` (and
   every latency of the scene thread the report has: the paths' `scene_lag_d0_max`, the settle times,
   the soft misses of the scene thread). The look at due entries went from at most 4 threads at normal

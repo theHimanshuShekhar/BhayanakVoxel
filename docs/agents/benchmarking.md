@@ -94,11 +94,14 @@ bigger machine, put `--profile low-end` before the subcommand (or set `BHAYANAK_
 4 threads, 5 GiB of free memory (the 8 GB machine's: Windows at idle leaves 4.5 to 5), 4 GB of
 video memory (not read by any budget yet) and no ray queries (the compute tracer), the GTX 1650 /
 RX 570 class that the project's low end is. The process is **pinned to 4 logical processors**, so
-that every thread of it, not only the work's, competes for 4 as on that machine; the report's
+that its threads, not only the work's, compete for 4 as on that machine (on Windows every thread; on
+Linux all but Mesa's shader disk-cache thread, which resets its own mask); the report's
 `machine.profile` says which (`pinned_cpus`, or why it was not pinned), the memory found and the
 LOD bias the client started at (1.35 at 5 GiB: the default 1.0 needs 8 GiB free). **A full-size
 real-time run of the default profile that did not start at 1.0 has `starting_bias` in
-`gates.over`**, since the gates are budgeted for 1.0; a constrained run is not held to that. `--threads N`, `--memory-mib N`,
+`gates.over`**, since the gates are budgeted for 1.0; a run on fewer threads or less memory than the
+machine has (`machine.profile.lowered`) is not held to that. `--no-ray-queries` and
+`--video-memory-mib` alone do not exempt a run. `--threads N`, `--memory-mib N`,
 `--video-memory-mib N` and `--no-ray-queries` lower one thing at a time. A report from a constrained
 profile is not comparable with the budgets (they are the 4090's); it is for finding out whether the
 low end streams, holds its memory and loads in a reasonable time. The `needs-stream-bench` run of a
