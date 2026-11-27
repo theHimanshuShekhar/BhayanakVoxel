@@ -88,7 +88,7 @@ the client binary: the gating jobs skip a line in the whole workspace but the re
 it in the client binary only, so that test would run nowhere. The `linux` job also checks that
 nextest and libtest see the same tests, and that the filterset and the libtest filters select the same
 ones in the client binary. The script prints how many tests gate and how many run in the real-thread
-job (on 2026-11-27: 1554 and 17, the same under libtest and nextest), and how many gate in each crate.
+job (on 2026-11-28: 1593 and 17, the same under libtest and nextest), and how many gate in each crate.
 
 ## Stepped tests and real-thread tests
 
