@@ -13,14 +13,21 @@ shards that run in parallel (#263).
 | Job | What it runs |
 | --- | --- |
 | `linux` | `cargo fmt --check`, clippy with `-D warnings`, `cargo test --doc --workspace` (nextest does not run doctests), the checks of the real-thread list (below), and the check that `server` does not depend on wgpu or winit. It runs no other tests. |
-| `linux-tests (1/3)`, `(2/3)`, `(3/3)` | `cargo nextest run --workspace` on lavapipe (software Vulkan) without the real-thread tests, a third of the tests each (hardware ray queries are the game's default backend since #50 Part 2, and lavapipe has them where its Mesa does: the goldens are matched on both backends, and `hw_agreement` holds the backends to each other; on a runner whose lavapipe has no ray queries those tests skip, and the log says `SKIPPED ...: why`, which is the "CI falls back to compute and says so" of the ticket). All three must be green. |
-| `windows-tests (1/2)`, `(2/2)` | Tests of `brick-store`, `materials`, `net`, `planet-gen`, `sim`, `prefetch-sim` and `server`, and the client's unit tests that need no GPU and are not in the real-thread list, half of them each. The stepped streaming tests are among them. Shard 1 also runs their doctests. |
+| `linux-tests (1/5)` to `(5/5)` | `cargo nextest run --workspace` on lavapipe (software Vulkan) without the real-thread tests, a fifth of the tests each (hardware ray queries are the game's default backend since #50 Part 2, and lavapipe has them where its Mesa does: the goldens are matched on both backends, and `hw_agreement` holds the backends to each other; on a runner whose lavapipe has no ray queries those tests skip, and the log says `SKIPPED ...: why`, which is the "CI falls back to compute and says so" of the ticket). All five must be green. |
+| `windows-tests (1/3)`, `(2/3)`, `(3/3)` | Tests of `brick-store`, `materials`, `net`, `planet-gen`, `sim`, `prefetch-sim` and `server`, and the client's unit tests that need no GPU and are not in the real-thread list, a third of them each. The stepped streaming tests are among them. Shard 1 also runs their doctests. |
 | `windows-client` | Builds the release client and uploads it as the `client-windows` artifact, which the benchmark uses. |
 | `determinism` | The golden hash tests of `planet-gen` and `sim`, in debug and release, on Linux and Windows. (These run with `cargo test`, not nextest.) |
 
 The shards are `cargo nextest run --partition hash:N/M`: a test's shard is a hash of its binary and
 name, so it is the same on every run, and the shards together run every test once. A test that is
 slow is a floor under a shard's wall time, so a new very long test is better split in two than added.
+`.config/nextest.toml` gives the tests that take minutes a `priority`, so that a shard starts them
+first and does not reach one at the end; it changes the order and nothing else. The two longest
+client tests (`flying_away_and_back_...`, about 10 minutes on a Windows runner, and
+`the_day_cycle_reports_...`) are CPU-bound and set the least a shard can take. The shards build the
+`client` and `render` crates at opt-level 2 (`--config profile.dev.package.<crate>.opt-level=2`),
+not the workspace's unoptimised build, for the same reason; the tests run as written, with debug
+assertions and overflow checks on.
 cargo-nextest is pinned in `.github/actions/setup-nextest` (the version and the `taiki-e/install-action`
 commit), and the job installs the release binary, not a build.
 
@@ -30,7 +37,7 @@ commit), and the job installs the release binary, not a build.
 cargo install cargo-nextest --version 0.9.152 --locked      # or a release binary from nexte.st
 filterset=$(bash .github/scripts/real-thread-filterset.sh)
 cargo nextest run --workspace --no-fail-fast -E "not ($filterset)"                       # all of linux-tests
-cargo nextest run --workspace --no-fail-fast --partition hash:1/3 -E "not ($filterset)"  # linux-tests (1/3)
+cargo nextest run --workspace --no-fail-fast --partition hash:1/5 -E "not ($filterset)"  # linux-tests (1/5)
 cargo test --doc --workspace
 bash .github/scripts/check-real-thread-list.sh all     # counts per side; needs cargo-nextest and jq
 ```

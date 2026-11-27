@@ -46,20 +46,21 @@ jobs:
             exit 1
           fi
 
-  # Every test of the workspace but the real-thread ones, with cargo-nextest, in three shards that run
+  # Every test of the workspace but the real-thread ones, with cargo-nextest, in five shards that run
   # in parallel (`--partition hash`: a test's shard is a hash of its name, so it is the same on every
-  # run, and the three together run every test once). This includes the bench smoke test
+  # run, and the five together run every test once). This includes the bench smoke test
   # (bins/client/tests/bench.rs): `client bench --short` on lavapipe, with the report's schema checked.
   # Its timings are not looked at. The client tests that are about real threads or real time are left
   # out here; the real-thread-tests job runs them (.github/real-thread-tests.txt lists them). The
   # streaming tests that are about behaviour run stepped (no threads, no sleeps) and are run here.
   linux-tests:
-    name: linux-tests (${{ matrix.shard }}/3)
+    name: linux-tests (${{ matrix.shard }}/${{ matrix.of }})
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2, 3]
+        shard: [1, 2, 3, 4, 5]
+        of: [5]
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup-rust
@@ -74,11 +75,11 @@ jobs:
           # One streaming test of the client (`flying_away_and_back_...`) is 10 to 15 minutes of CPU in
           # an unoptimised build, and a shard cannot finish before its longest test does. The client and
           # the render crate are built at opt-level 2 here, as Cargo.toml does for the crates that tests
-          # run through: that test is 2.5 times faster, and it and every other test runs as written.
+          # run through: that test is 1.7 times faster (403 s to 240 s, run alone), and it and every other test runs as written.
           # Debug assertions and overflow checks stay on.
           cargo nextest run --workspace --no-fail-fast \
             --config profile.dev.package.client.opt-level=2 --config profile.dev.package.render.opt-level=2 \
-            --partition hash:${{ matrix.shard }}/3 -E "not ($filterset)"
+            --partition hash:${{ matrix.shard }}/${{ matrix.of }} -E "not ($filterset)"
         env:
           # Where the golden image test writes actual.png, expected.png and diff.png on a mismatch.
           GOLDEN_FAILURE_DIR: ${{ github.workspace }}/golden-failures
@@ -135,14 +136,15 @@ jobs:
   # unit tests, minus the real-thread tests and the six that make an Offscreen renderer (a Vulkan
   # device): the cave stills, the landscape golden, the crystals golden, the Edit stress of the bench,
   # the look-dev smoke run and the log of the hardware backend's updates. Run with cargo-nextest in
-  # two shards (`--partition hash`, as `linux-tests` does).
+  # three shards (`--partition hash`, as `linux-tests` does).
   windows-tests:
-    name: windows-tests (${{ matrix.shard }}/2)
+    name: windows-tests (${{ matrix.shard }}/${{ matrix.of }})
     runs-on: windows-2025-vs2026
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2]
+        shard: [1, 2, 3]
+        of: [3]
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup-rust
@@ -159,7 +161,7 @@ jobs:
           gpu+=' | test(~bench::lookdev::run::tests::a_short_run_writes_a_folder_for_each_shot_and_a_sheet_that_names_every_image)'
           gpu+=' | test(~bench::tests::the_flights_updates_are_logged_by_where_in_the_run_they_were_made)'
           # As in linux-tests: the longest client test is 15 minutes unoptimised, and a shard waits for it.
-          cargo nextest run --no-fail-fast --partition hash:${{ matrix.shard }}/2 \
+          cargo nextest run --no-fail-fast --partition hash:${{ matrix.shard }}/${{ matrix.of }} \
             --config profile.dev.package.client.opt-level=2 --config profile.dev.package.render.opt-level=2 \
             -p brick-store -p materials -p net -p planet-gen -p sim -p prefetch-sim -p server -p client \
             -E "not ($filterset) and not ($gpu) and not binary_id(client::bench)"
