@@ -5156,11 +5156,6 @@ mod tests {
         assert!(session.idle());
     }
 
-    /// The real-time mode on the test Planet, with real workers and a real scene thread and no GPU:
-    /// every path runs and the report has its fields. It asserts no time bound, only what was run and
-    /// that the parts of a frame's cycle are inside it: how long anything took is not for a test
-    /// to hold. It is in `.github/real-thread-tests.txt`, and does
-    /// not gate.
     #[test]
     fn the_relief_report_is_the_planets_extent_and_says_whether_it_was_stretched() {
         let today = GenHooks::default().report(WORLD_RADIUS);
@@ -5191,6 +5186,9 @@ mod tests {
         assert!((tall.interior_below_sea_m - today.interior_below_sea_m - 3000.0).abs() < 0.1);
     }
 
+    /// The real-time mode on the test Planet with both hooks on: every path runs on the stretched
+    /// relief and the extra cost is charged. Real workers and a real scene thread, so it is in
+    /// `.github/real-thread-tests.txt`, and does not gate.
     #[test]
     fn the_real_time_run_with_both_hooks_on_the_test_planet_completes_and_charges_the_bricks() {
         let hooks = GenHooks {
@@ -5218,6 +5216,11 @@ mod tests {
         assert!(ratio >= 0.5, "{stats:?}");
     }
 
+    /// The real-time mode on the test Planet, with real workers and a real scene thread and no GPU:
+    /// every path runs and the report has its fields. It asserts no time bound, only what was run and
+    /// that the parts of a frame's cycle are inside it: how long anything took is not for a test
+    /// to hold. It is in `.github/real-thread-tests.txt`, and does
+    /// not gate.
     #[test]
     fn the_real_time_run_on_the_test_planet_completes_with_every_path_and_field() {
         let built = build_test(&GenHooks::default()).expect("the test Planet builds");
