@@ -19,7 +19,7 @@ Said of a solid Voxel with air against one of its faces. The Planet's surface is
 _Avoid_: Visible, surface Voxel
 
 **Cave**:
-Air that the generator carves under the Planet's land, in tunnels and chambers, some of which open to the surface as cave mouths. A part of the Planet's generated terrain, not an Edit.
+Air that the generator carves under the Planet's land, in tunnels, chambers and ravines, some of which open to the surface as cave mouths. Each Cave has its Cave Biome. A part of the Planet's generated terrain, not an Edit.
 _Avoid_: Dungeon, hole (a hole is dug)
 
 **Climate**:
@@ -31,8 +31,12 @@ The kind of shape the land takes at a place, such as a range, plateau, canyon, v
 _Avoid_: Terrain type, relief
 
 **Biome**:
-A named kind of land with its own surface and life, chosen by the Climate from those its Landform allows (a canyon in a hot, dry Climate is badlands).
+A named kind of land with its own surface and life, chosen by the Climate from those its Landform allows (a canyon in a hot, dry Climate is badlands), or, for a Cave Biome, by the land above it and its depth.
 _Avoid_: Zone, region
+
+**Cave Biome**:
+The Biome of a Cave, chosen by the surface Biome's moisture and rock above it and by its depth, such as lush caves under wet land or dripstone in limestone. The surface above keeps its own Biome.
+_Avoid_: Cave type, underground biome
 
 **Relief**:
 The height of the Planet's solid surface at each place, the sea floor included: one height per place, so it has no overhangs. Most of the terrain is the Relief alone.
