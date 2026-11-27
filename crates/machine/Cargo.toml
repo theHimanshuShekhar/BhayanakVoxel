@@ -1,0 +1,10 @@
+[package]
+name = "machine"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+# Reads how much memory the machine has free (Windows has no way in the standard library; Linux
+# reads /proc). It is in the build already, through winit.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_System_SystemInformation"] }
