@@ -375,6 +375,7 @@ fn check_schema(report: &Value, out: &Path) {
     assert!(profile["threads"].as_u64().is_some_and(|t| t >= 1));
     assert!(profile["memory_mib"].is_u64() && profile["found_memory_mib"].is_u64());
     assert!(profile["constrained"].is_boolean() && profile["ray_queries"].is_boolean());
+    assert!(profile["lowered"].is_boolean());
     assert!(!string(&profile["pinning"]).is_empty());
     assert!(profile["pinned_cpus"].is_array());
     assert!(profile["starting_bias"].as_f64().is_some_and(|b| b >= 1.0));

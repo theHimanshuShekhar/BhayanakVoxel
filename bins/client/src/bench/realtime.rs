@@ -1551,8 +1551,11 @@ pub struct ProfileReport {
     /// What the machine had before a flag or the environment held the profile down.
     pub found_threads: usize,
     pub found_memory_mib: u64,
-    /// Whether the profile is lower than the machine (`--profile low-end` and the rest).
+    /// Whether the profile is different from the machine (`--profile low-end` and the rest, and
+    /// `--no-ray-queries` and `--video-memory-mib`), and whether it has fewer threads or less memory
+    /// than the machine has (`lowered`: only that makes the gates not apply).
     pub constrained: bool,
+    pub lowered: bool,
     /// What pinning the process to the profile's processors did, as a sentence; and the processors
     /// (empty when it was not pinned).
     pub pinning: String,
@@ -1577,6 +1580,7 @@ impl ProfileReport {
             found_threads: found.threads,
             found_memory_mib: found.memory >> 20,
             constrained: machine::constrained(),
+            lowered: machine::lowered(),
             pinning: pinning.describe(),
             pinned_cpus: match pinning {
                 machine::Pinning::Pinned(cpus) => cpus,
@@ -1588,10 +1592,12 @@ impl ProfileReport {
     }
 
     /// Whether the gates of a full-size run on this machine are not at the bias they are budgeted
-    /// for: the profile is the machine's own (a constrained run is for finding out what the low end
-    /// does, and says so) and the free memory makes the client start coarser.
+    /// for: the run is not on a smaller machine on purpose (fewer threads or less memory than the
+    /// machine has, which is for finding out what the low end does, and says so) and the free memory
+    /// makes the client start coarser. `--no-ray-queries` or a video memory limit alone leave the
+    /// machine as it is and do not exempt a run.
     pub fn bias_is_not_the_gates(&self) -> bool {
-        !self.constrained && self.starting_bias != self.default_bias
+        !self.lowered && self.starting_bias != self.default_bias
     }
 }
 
@@ -3828,9 +3834,10 @@ mod tests {
     use super::super::stream::{Measured, test_planet};
     use super::*;
 
-    fn report_at(constrained: bool, starting_bias: f64) -> RealTimeReport {
+    fn report_at(lowered: bool, starting_bias: f64) -> RealTimeReport {
         let mut report = RealTimeReport::new("test".into(), 1.0, Vec::new(), &BUDGETS);
-        report.profile.constrained = constrained;
+        report.profile.constrained = lowered;
+        report.profile.lowered = lowered;
         report.profile.starting_bias = starting_bias;
         report.profile.default_bias = 1.0;
         report
@@ -3850,11 +3857,51 @@ mod tests {
         assert_eq!(exit_code(&report, true), 0, "--no-fail still says no");
         // The smoke run on the test Planet (CI's lavapipe) and a run of a constrained profile are
         // not held to it, and the report says what the bias was.
-        for (full, constrained) in [(false, false), (true, true), (false, true)] {
-            let mut report = report_at(constrained, 1.35);
+        for (full, lowered) in [(false, false), (true, true), (false, true)] {
+            let mut report = report_at(lowered, 1.35);
             hold_to_the_default_bias(full, &mut report);
-            assert!(report.gates.over.is_empty(), "{full} {constrained}");
+            assert!(report.gates.over.is_empty(), "{full} {lowered}");
         }
+    }
+
+    #[test]
+    fn only_fewer_threads_or_less_memory_exempt_a_run_from_the_default_bias() {
+        let found = machine::Profile {
+            threads: 8,
+            memory: 6 * machine::GIB,
+            video_memory: None,
+            ray_queries: true,
+        };
+        let lowered = |profile: machine::Profile| {
+            profile.threads < found.threads || profile.memory < found.memory
+        };
+        let over = |profile: machine::Profile| {
+            let mut report = report_at(lowered(profile), 1.15);
+            report.profile.constrained = profile != found;
+            hold_to_the_default_bias(true, &mut report);
+            report.gates.over == ["starting_bias"]
+        };
+        // `--no-ray-queries`, `--video-memory-mib` and `BHAYANAK_RAY_QUERIES=0` change the profile
+        // and not the machine: the run is still over.
+        assert!(over(machine::Profile {
+            ray_queries: false,
+            ..found
+        }));
+        assert!(over(machine::Profile {
+            video_memory: Some(2 * machine::GIB),
+            ..found
+        }));
+        assert!(over(found));
+        // Fewer threads or less memory is a smaller machine on purpose: exempt.
+        assert!(!over(machine::Profile {
+            threads: 4,
+            ..found
+        }));
+        assert!(!over(machine::Profile {
+            memory: 5 * machine::GIB,
+            ..found
+        }));
+        assert!(!over(machine::Profile::LOW_END.limited_to(found)));
     }
 
     #[test]
