@@ -601,7 +601,8 @@ camera, and `holes_after_catch_up` the holes the look after it found, which must
     the generator; decision A's curve, 3 levels at 50 m/s on levels 0 to 4, is in). The two add up to `camera_soft_miss_frames`.
   - `loader_latency`, `loader_ahead_*`, `camera_soft_miss_by_level` and `by_second` (#251, schema 35;
     reported, not gated, of the machine's clock): for telling why a flight has camera misses.
-    `loader_latency` is how long the jobs that the scene thread took in during the path waited,
+    `loader_latency` is how long the jobs that the scene thread took in during the path waited (the
+    jobs that were generated: a job that was dropped is not in it),
     by class (`drawn`: the bands split the brick; `margin`; `prefetch`) and by part: `outbox` (asked
     for, until a sync handed it to the workers: a sync that finds them busy with the queue leaves it
     there), `queued` (in the workers' queue until one took it), `made` (being generated), `waited` (made, in
@@ -668,13 +669,18 @@ camera, and `holes_after_catch_up` the holes the look after it found, which must
     A Still view waits for the absorbing to end (`World::caught_up`).
   - `scene_thread`: milliseconds the scene thread spent in the path on `follow` (selecting again
     for a new camera and packing what changed), `pack` (asking the loader, taking in what it made
-    and packing it), `upload` (publishing: copying what changed out for the frame thread, which
+    and packing it; **`pack_request_ms`, `pack_receive_ms`, `pack_hold_ms` and `pack_arrive_ms`
+    (#251) are parts of it, not more time**: asking the loader, taking in what it made, holding the
+    children in the store, and the scene's taking them in with the packing of what changed, the
+    rest of `pack` being the waits for locks and the loop; they are left out of the busy sum below),
+    `upload` (publishing: copying what changed out for the frame thread, which
     copies it to the GPU), `evict` (eviction), `coarse` (the coarse levels over an Edit) and
     `hole_scan` (the looks for holes), `release` (making the scene again for a depth that was
     given back, and the listing that was not looked at: `Rebuild::Release`), `reband` (looking again at the nodes that a change of the
     bands for the camera's speed listed, and packing what changed: **not in `follow`**; ADR 0009),
     and **`hole_scan_share`**: the looks' share of the scene
-    thread's **busy** time, which is the sum of the parts above and not wall time (a thread that is
+    thread's **busy** time, which is the sum of the parts above (`pack` once, not with its own parts)
+    and not wall time (a thread that is
     idle most of the time can still read high). **A path's figures are those of its frames: the look
     that is forced after the last frame is not in them**, so a path in which no look came due reads
     0 and not 100%; its time is `end_look_ms`. **While a look runs the scene thread publishes

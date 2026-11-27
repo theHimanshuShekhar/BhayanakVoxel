@@ -644,6 +644,7 @@ impl Loader {
         keys: impl IntoIterator<Item = Key>,
         camera: [f64; 3],
     ) {
+        let asked = Instant::now();
         for key in keys {
             if self.requested.contains_key(&key) {
                 continue;
@@ -664,7 +665,6 @@ impl Loader {
                 .reach
                 .class(self.bands, camera, level, coord)
                 .unwrap_or(Class::Drawn);
-            let asked = Instant::now();
             self.outbox.push(Job {
                 class,
                 distance: brick_distance(camera, level, coord),
@@ -784,7 +784,10 @@ impl Loader {
             match self.arrivals.try_recv() {
                 Ok((ticket, arrival, stamps)) => {
                     taken += 1;
-                    if let Some(stamps) = stamps {
+                    // A job that was dropped is not made: its near-zero `made` would pull the
+                    // means down, so only what was generated is in the latency (#251).
+                    if let Some(stamps) = stamps.filter(|_| !matches!(arrival, Arrival::Dropped(_)))
+                    {
                         self.latency.add(&stamps, Instant::now());
                     }
                     match arrival {

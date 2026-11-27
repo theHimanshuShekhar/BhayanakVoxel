@@ -4397,8 +4397,9 @@ mod tests {
     /// Taking children in looks at the bricks beside them to see if they are buried now, and most
     /// have no node (they are not drawn, nor split, nor waiting): the selection looks at the node
     /// first, so the source is not asked whether those are solid all the way down, which cost
-    /// 1.5 s of the scene thread's 10 s in the 2 m flight (#251). The selection it comes to is
-    /// the same as it was.
+    /// 1.5 s of the scene thread's 10 s in the 2 m flight (#251). That the selection is the same
+    /// is the golden counts test's (`streaming-counts.golden`), not this one's: this counts the
+    /// source's answers.
     #[test]
     fn taking_in_bricks_asks_the_source_only_about_the_bricks_beside_them_that_have_nodes() {
         let asked = std::sync::Arc::new(AtomicUsize::new(0));
