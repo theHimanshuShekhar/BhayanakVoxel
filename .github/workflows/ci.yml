@@ -136,15 +136,24 @@ jobs:
   # unit tests, minus the real-thread tests and the six that make an Offscreen renderer (a Vulkan
   # device): the cave stills, the landscape golden, the crystals golden, the Edit stress of the bench,
   # the look-dev smoke run and the log of the hardware backend's updates. Run with cargo-nextest in
-  # three shards (`--partition hash`, as `linux-tests` does).
+  # three jobs: `slow` runs the two client streaming tests that take 8 to 13 minutes of CPU each, and
+  # nothing else, so that they have the runner to themselves (a job cannot end before its longest test
+  # does, and next to other tests they took up to 13 minutes); `1/2` and `2/2` run every other test
+  # between them (`--partition hash`, as `linux-tests` does). The two tests are named in
+  # `.config/nextest.toml` too, which starts the slow tests of the other jobs first.
   windows-tests:
-    name: windows-tests (${{ matrix.shard }}/${{ matrix.of }})
+    name: windows-tests (${{ matrix.label }})
     runs-on: windows-2025-vs2026
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2, 3]
-        of: [3]
+        include:
+          - label: slow
+            partition: ""
+          - label: 1/2
+            partition: hash:1/2
+          - label: 2/2
+            partition: hash:2/2
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup-rust
@@ -160,14 +169,23 @@ jobs:
           gpu+=' | test(~bench::edits::tests::the_largest_brush_is_dug_and_placed_in_turn_at_no_more_than_the_metric_rate)'
           gpu+=' | test(~bench::lookdev::run::tests::a_short_run_writes_a_folder_for_each_shot_and_a_sheet_that_names_every_image)'
           gpu+=' | test(~bench::tests::the_flights_updates_are_logged_by_where_in_the_run_they_were_made)'
-          # As in linux-tests: the longest client test is 15 minutes unoptimised, and a shard waits for it.
-          cargo nextest run --no-fail-fast --partition hash:${{ matrix.shard }}/${{ matrix.of }} \
+          slow='test(~streaming_tests::flying_away_and_back_keeps_the_store_within_its_budget) | test(~streaming_tests::flying_with_margins_evicts_the_trail)'
+          base="not ($filterset) and not ($gpu) and not binary_id(client::bench)"
+          if [ -z "${{ matrix.partition }}" ]; then
+            selection="($slow) and $base"
+            partition=()
+          else
+            selection="not ($slow) and $base"
+            partition=(--partition "${{ matrix.partition }}")
+          fi
+          # As in linux-tests, the client and render crates are built at opt-level 2.
+          cargo nextest run --no-fail-fast "${partition[@]}" \
             --config profile.dev.package.client.opt-level=2 --config profile.dev.package.render.opt-level=2 \
             -p brick-store -p materials -p net -p planet-gen -p sim -p prefetch-sim -p server -p client \
-            -E "not ($filterset) and not ($gpu) and not binary_id(client::bench)"
+            -E "$selection"
       # nextest does not run doctests.
       - run: cargo test --doc -p brick-store -p materials -p net -p planet-gen -p sim -p prefetch-sim -p server
-        if: matrix.shard == 1
+        if: matrix.label == 'slow'
 
   windows-client:
     runs-on: windows-2025-vs2026
