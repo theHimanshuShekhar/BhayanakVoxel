@@ -210,7 +210,17 @@ use super::stream::StreamReport;
 /// have `hw_blas`, `hw_blas_urgent`, `hw_boxes`, `hw_submits`, `hw_created`, `hw_pool_grew` and `hw_tlas_made` (null on compute), and `--hw-wait` makes the hardware's `wait` (and `wait_boxes`) the GPU's, with `gpu_blas` and `gpu_tlas` where the device times inside encoders (`hw_gpu_blas_ms`, `hw_gpu_tlas_ms` of the slowest frames). The `prepare_ms`/`build_ms` of an update are the frame thread's cost
 /// only; the GPU's own time is only in the Edit stress (it waits there); `memory` has `device_blocks`, `device_reserved_mib`, `device_allocated_mib`, `device_empty_blocks` and `device_empty_mib`
 /// (the allocator's blocks at the end of the run, of which it now keeps two that are empty: `third_party/gpu-allocator/PATCH.md`).
-pub const SCHEMA_VERSION: u32 = 34;
+///
+/// 35 (#251) adds to each real-time path `loader_latency` (how long the loader's jobs waited, by
+/// class `drawn`, `margin` and `prefetch` and by part `outbox`, `queued`, `made`, `waited` and
+/// `total`: `mean_ms`, `p99_ms` (the upper bound of its bin) and `over_100_ms`; `jobs` is the
+/// number taken in), `loader_ahead_mean`, `loader_ahead_max` and `loader_frames_at_max_ahead` (the
+/// jobs the workers have taken that the scene thread has not taken in, against `MAX_AHEAD`),
+/// `camera_soft_miss_by_level` (the camera misses by the level of the brick drawn whole) and
+/// `by_second` (a flight's seconds: the camera misses, the loader's queue, the bricks taken in and
+/// the scene thread's work in each), and to each `scene_thread` `pack_request_ms`, `pack_receive_ms`,
+/// `pack_hold_ms` and `pack_arrive_ms` (what `pack_ms` is made of). Nothing else is changed.
+pub const SCHEMA_VERSION: u32 = 35;
 
 /// One timed thing (a pass, or the GPU total of a profiler frame) in one mode, against its
 /// budget. In reference mode a profiler frame is one sample, so the entries of that mode have
@@ -740,7 +750,7 @@ mod tests {
                 "streaming_real_time"
             ]
         );
-        assert_eq!(json["schema_version"], 34);
+        assert_eq!(json["schema_version"], 35);
         assert_eq!(json["rt"]["active"], "compute");
         assert_eq!(json["rt"]["comparison"], serde_json::Value::Null);
         assert_eq!(json["rt"]["real_time_hw"], serde_json::Value::Null);

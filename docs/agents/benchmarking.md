@@ -599,6 +599,22 @@ camera, and `holes_after_catch_up` the holes the look after it found, which must
     side** (the scene thread's following: the long slice's giving way to a camera that moves is
     for it), a miss in any other is **loader side** (a brick that the bands ask for is not there:
     the generator; decision A's curve, 3 levels at 50 m/s on levels 0 to 4, is in). The two add up to `camera_soft_miss_frames`.
+  - `loader_latency`, `loader_ahead_*`, `camera_soft_miss_by_level` and `by_second` (#251, schema 35;
+    reported, not gated, of the machine's clock): for telling why a flight has camera misses.
+    `loader_latency` is how long the jobs that the scene thread took in during the path waited (the
+    jobs that were generated: a job that was dropped is not in it),
+    by class (`drawn`: the bands split the brick; `margin`; `prefetch`) and by part: `outbox` (asked
+    for, until a sync handed it to the workers: a sync that finds them busy with the queue leaves it
+    there), `queued` (in the workers' queue until one took it), `made` (being generated), `waited` (made, in
+    the channel until the scene thread took it in) and `total`; each with `mean_ms`, `p99_ms` (the
+    upper bound of the bin that holds it: 0.5, 1, 2.5, 5, 10, 25, 50, 100, 250 ms, and 500 for over
+    250) and `over_100_ms`. `loader_ahead_mean`/`_max` and `loader_frames_at_max_ahead` are the jobs
+    the workers have taken that the scene thread has not (at `MAX_AHEAD`, 512, they wait).
+    `camera_soft_miss_by_level` is the camera misses by the level of the brick that was drawn whole
+    under the camera. `by_second` is a flight's seconds one by one (`second`, `frames`,
+    `camera_soft_misses`, `loader_queue_mean`/`_max`, `loader_ahead_mean`, `arrived_bricks`, the
+    scene thread's `scene_follow_ms`, `scene_pack_ms` and `scene_reband_ms`, `lag_d0_max`), to see
+    what the second of a miss looked like against the others. The summary prints all of it.
   - `scene_release_rebuilds`, `release_frame_ms_max` and `release_update_ms_max` (#168): how many
     times a finer depth made the scene again (`Rebuild::Release`, `scene_worker.rs` `RELEASE_REBUILD_OVER`,
     500 thousand nodes) instead of looking at its nodes again, and the frame thread's cost of the
@@ -653,13 +669,18 @@ camera, and `holes_after_catch_up` the holes the look after it found, which must
     A Still view waits for the absorbing to end (`World::caught_up`).
   - `scene_thread`: milliseconds the scene thread spent in the path on `follow` (selecting again
     for a new camera and packing what changed), `pack` (asking the loader, taking in what it made
-    and packing it), `upload` (publishing: copying what changed out for the frame thread, which
+    and packing it; **`pack_request_ms`, `pack_receive_ms`, `pack_hold_ms` and `pack_arrive_ms`
+    (#251) are parts of it, not more time**: asking the loader, taking in what it made, holding the
+    children in the store, and the scene's taking them in with the packing of what changed, the
+    rest of `pack` being the waits for locks and the loop; they are left out of the busy sum below),
+    `upload` (publishing: copying what changed out for the frame thread, which
     copies it to the GPU), `evict` (eviction), `coarse` (the coarse levels over an Edit) and
     `hole_scan` (the looks for holes), `release` (making the scene again for a depth that was
     given back, and the listing that was not looked at: `Rebuild::Release`), `reband` (looking again at the nodes that a change of the
     bands for the camera's speed listed, and packing what changed: **not in `follow`**; ADR 0009),
     and **`hole_scan_share`**: the looks' share of the scene
-    thread's **busy** time, which is the sum of the parts above and not wall time (a thread that is
+    thread's **busy** time, which is the sum of the parts above (`pack` once, not with its own parts)
+    and not wall time (a thread that is
     idle most of the time can still read high). **A path's figures are those of its frames: the look
     that is forced after the last frame is not in them**, so a path in which no look came due reads
     0 and not 100%; its time is `end_look_ms`. **While a look runs the scene thread publishes
@@ -1818,7 +1839,7 @@ rays; those that need ray queries skip themselves, printing why, where there are
 
 ```
 {
-  "schema_version": 34,
+  "schema_version": 35,
   "build":   { "version", "commit" },          // commit: CI builds only, else null; on a PR
                                                // build it is GitHub's merge commit, not the head
   "machine": { "gpu", "device_type", "driver", "driver_info", "backend", "os", "arch",

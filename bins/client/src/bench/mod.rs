@@ -1432,6 +1432,7 @@ fn print_real_time(r: &realtime::RealTimeReport) {
                     s.walk_s, s.reband_s, s.fill_s
                 ))
             );
+            eprint_loader_detail(p);
             // Where the time of the slowest frames went, when there were frames over the limit.
             if p.frames_over_limit > 0 {
                 for f in p.slowest.iter().take(3) {
@@ -1600,6 +1601,73 @@ fn print_streaming(s: &stream::StreamReport) {
         eprintln!(
             "  (not deterministic) copy {:?} ms, draw {:?} ms over {} drawn frames; the GPU wrote {} bytes",
             t.upload_ms.mean_ms, t.draw_ms.mean_ms, t.drawn_frames, t.gpu_uploaded_bytes
+        );
+    }
+}
+
+/// What the loader's jobs waited for in a path, by class, the camera misses by level and a flight's
+/// seconds (#251), on stderr: for the summary and for the ignored full-size run with no GPU.
+pub(crate) fn eprint_loader_detail(p: &realtime::PathReport) {
+    if p.scene_thread.pack_ms > 0.0 {
+        eprintln!(
+            "        scene thread pack {:.0} ms = request {:.0} + receive {:.0} + hold {:.0} + arrive {:.0} (the rest is waiting for locks and the loop)",
+            p.scene_thread.pack_ms,
+            p.scene_thread.pack_request_ms,
+            p.scene_thread.pack_receive_ms,
+            p.scene_thread.pack_hold_ms,
+            p.scene_thread.pack_arrive_ms,
+        );
+    }
+    // What the loader's jobs waited for, by class (#251): the mean and the 99th percentile's
+    // bin of the queue, the making, the channel and all of them, and the jobs over 100 ms.
+    let l = &p.loader_latency;
+    if l.drawn.jobs + l.margin.jobs + l.prefetch.jobs > 0 {
+        eprintln!(
+            "        loader jobs ahead of the scene thread: mean {:.0}, max {}, at the most in {} frames",
+            p.loader_ahead_mean, p.loader_ahead_max, p.loader_frames_at_max_ahead
+        );
+        for (name, c) in [
+            ("drawn", &l.drawn),
+            ("margin", &l.margin),
+            ("prefetch", &l.prefetch),
+        ] {
+            eprintln!(
+                "        {name:>8} jobs {:>7}: mean/p99 ms: outbox {:.1}/{:.1}, queued {:.1}/{:.1}, made {:.1}/{:.1}, waited {:.1}/{:.1}, total {:.1}/{:.1}; {} over 100 ms",
+                c.jobs,
+                c.outbox.mean_ms,
+                c.outbox.p99_ms,
+                c.queued.mean_ms,
+                c.queued.p99_ms,
+                c.made.mean_ms,
+                c.made.p99_ms,
+                c.waited.mean_ms,
+                c.waited.p99_ms,
+                c.total.mean_ms,
+                c.total.p99_ms,
+                c.total.over_100_ms,
+            );
+        }
+    }
+    if !p.camera_soft_miss_by_level.is_empty() {
+        eprintln!(
+            "        camera misses by the level drawn whole: {:?}",
+            p.camera_soft_miss_by_level
+        );
+    }
+    for s in &p.by_second {
+        eprintln!(
+            "        second {:>2}: {:>3} frames, camera misses {:>3}, queue mean {:>5.0} max {:>5}, ahead {:>4.0}, arrived {:>6} bricks, scene thread follow {:>5.0} pack {:>5.0} reband {:>5.0} ms, lag max {:.2} d0",
+            s.second,
+            s.frames,
+            s.camera_soft_misses,
+            s.loader_queue_mean,
+            s.loader_queue_max,
+            s.loader_ahead_mean,
+            s.arrived_bricks,
+            s.scene_follow_ms,
+            s.scene_pack_ms,
+            s.scene_reband_ms,
+            s.lag_d0_max,
         );
     }
 }
