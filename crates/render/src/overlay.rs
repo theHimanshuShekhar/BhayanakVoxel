@@ -95,6 +95,10 @@ pub struct Info<'a> {
     /// Why this adapter cannot run ray queries, if it cannot: then the compute backend is the only
     /// one, the setting is greyed out, and the panel says why.
     pub rt_unavailable: Option<&'a str>,
+    /// What the device's ray-query features are against the setting, if they are not what it asks
+    /// for ([`Renderer::rt_note`](crate::Renderer::rt_note), #260): a restart is needed, the next
+    /// launch makes the device without them, or the device could not be made with them.
+    pub rt_note: Option<&'a str>,
 }
 
 /// A time for the panel: milliseconds, or "n/a" where there is none.
@@ -145,7 +149,10 @@ fn cpu_rows(ui: &mut egui::Ui, cpu: &CpuBreakdown, present_mode: wgpu::PresentMo
 /// Which ray backend runs, and the setting that switches it (#50).
 fn rt_rows(ui: &mut egui::Ui, info: &Info, controls: &mut Controls) {
     let (name, why) = match (info.rt_active, info.rt_unavailable) {
-        (RtBackend::Compute, Some(_)) => ("compute", "no ray queries on this adapter"),
+        (RtBackend::Compute, Some(_)) => ("compute", "ray queries are not available"),
+        (RtBackend::Compute, None) if controls.backend.is_hardware() => {
+            ("compute", "the device has no ray queries")
+        }
         (RtBackend::Compute, None) => ("compute", "the setting"),
         (RtBackend::Hardware, _) => ("hardware", "ray queries"),
         (RtBackend::HardwareNearest, _) => ("hardware", "ray queries, nearest-hit shadows"),
@@ -167,6 +174,9 @@ fn rt_rows(ui: &mut egui::Ui, info: &Info, controls: &mut Controls) {
     }
     if let Some(reason) = info.rt_unavailable {
         ui.weak(format!("compute only: {reason}"));
+    }
+    if let Some(note) = info.rt_note {
+        ui.weak(note);
     }
 }
 
@@ -499,7 +509,28 @@ mod tests {
             lod: None,
             rt_active,
             rt_unavailable,
+            rt_note: None,
         }
+    }
+
+    #[test]
+    fn the_panel_says_when_the_devices_ray_query_features_wait_for_a_restart() {
+        let (timings, cpu) = (Timings::default(), CpuBreakdown::default());
+        let mut info = info_with(&timings, &cpu, RtBackend::Compute, None);
+        info.rt_note = Some("restart needed: this device was made without ray queries");
+        let text = draw(&info, &mut controls());
+        assert!(
+            text.contains("ray tracing: compute (the device has no ray queries)"),
+            "{text}"
+        );
+        assert!(text.contains("restart needed"), "{text}");
+        // The setting stays enabled: it is saved for the next launch.
+        info.rt_note = Some("the device keeps its ray-query features until the next launch");
+        let mut setting = controls();
+        setting.backend = RtBackend::Compute;
+        info.rt_active = RtBackend::Hardware;
+        let text = draw(&info, &mut setting);
+        assert!(text.contains("until the next launch"), "{text}");
     }
 
     #[test]
@@ -538,7 +569,7 @@ mod tests {
             &mut controls(),
         );
         assert!(
-            text.contains("ray tracing: compute (no ray queries on this adapter)"),
+            text.contains("ray tracing: compute (ray queries are not available)"),
             "{text}"
         );
         assert!(
@@ -562,6 +593,7 @@ mod tests {
             lod: None,
             rt_active: RtBackend::Hardware,
             rt_unavailable: None,
+            rt_note: None,
         };
         let text = draw(&info, &mut controls());
         assert!(text.contains("N: walk / noclip"), "{text}");
@@ -582,6 +614,7 @@ mod tests {
             lod: None,
             rt_active: RtBackend::Hardware,
             rt_unavailable: None,
+            rt_note: None,
         };
         let text = draw(&info, &mut controls());
         for key in [
@@ -621,6 +654,7 @@ mod tests {
             lod: None,
             rt_active: RtBackend::Hardware,
             rt_unavailable: None,
+            rt_note: None,
         };
         let text = draw(&info, &mut controls());
         for row in Row::ALL {
@@ -671,6 +705,7 @@ mod tests {
             }),
             rt_active: RtBackend::Hardware,
             rt_unavailable: None,
+            rt_note: None,
         };
         let text = draw(&info, &mut controls());
         for expected in [
@@ -712,6 +747,7 @@ mod tests {
             lod: None,
             rt_active: RtBackend::Hardware,
             rt_unavailable: None,
+            rt_note: None,
         };
         let text = draw(&info, &mut controls());
         assert!(text.contains("GPU timers: not supported"), "{text}");
@@ -733,6 +769,7 @@ mod tests {
             lod: None,
             rt_active: RtBackend::Hardware,
             rt_unavailable: None,
+            rt_note: None,
         };
         let mut controls = Controls {
             mode: Mode::Reference,

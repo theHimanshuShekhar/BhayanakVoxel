@@ -16,7 +16,7 @@ use crate::sun::Sun;
 use crate::timing::Timings;
 use crate::tracer::{Target, Tracer, View};
 use crate::upscale::{DEFAULT_SCALE, Resolution};
-use crate::{Result, RtBackend, RtChoice, create_instance, request_gpu_for};
+use crate::{Result, RtBackend, RtChoice, RtDevice, create_instance, request_gpu_for};
 
 /// How the Planet is drawn.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -42,8 +42,9 @@ pub struct Renderer {
     /// What the player asked for and what runs (#50): hardware ray queries, which are the default,
     /// or the compute walk (see [`Renderer::set_backend`]).
     rt: RtChoice,
-    /// Why the adapter cannot run ray queries, if it cannot (the setting is then moot).
-    rt_unavailable: Option<String>,
+    /// What the device has of ray queries and why (#260): its features are fixed when it is made,
+    /// from the setting of that launch.
+    rt_device: RtDevice,
     /// Where the camera was at the last frame: where the hardware backend's frame starts when the
     /// tracer is built again (a new Planet, or a change of backend).
     camera_position: [f64; 3],
@@ -79,10 +80,13 @@ impl Renderer {
     /// `window` is anything wgpu can make a surface from, e.g. an `Arc<winit::window::Window>`.
     ///
     /// `backend` is how rays find the Planet (#50): the player's setting, and the default is
-    /// [`RtBackend::Hardware`]. **The device is made with ray queries whenever the adapter has
-    /// them, whatever `backend` is**, so that the setting can change at run time
-    /// ([`Renderer::set_backend`]); an adapter without them runs the compute backend, with no error
-    /// ([`Renderer::rt`] says why).
+    /// [`RtBackend::Hardware`]. **The device is made with wgpu's experimental ray-query features
+    /// only if `backend` is a hardware one, the adapter has them and the run is not held to none
+    /// (`--profile low-end`)** (#260): the compute setting makes a device that cannot choke on
+    /// them, and a change of the setting at run time ([`Renderer::set_backend`]) is a change of
+    /// the next launch's device ([`Renderer::rt_note`] says so). If the device cannot be made with
+    /// them it is made again without, and compute runs. An adapter without them runs the compute
+    /// backend, with no error ([`Renderer::rt`] says why).
     pub fn new(
         window: impl Into<wgpu::SurfaceTarget<'static>>,
         width: u32,
@@ -92,12 +96,8 @@ impl Renderer {
     ) -> Result<Self> {
         let instance = create_instance();
         let surface = instance.create_surface(window)?;
-        let (adapter, device, queue, _) =
-            request_gpu_for(&instance, Some(&surface), true, RtBackend::Hardware, false)?;
-        let rt = crate::choose_backend(backend, device.features(), &device.limits());
-        let rt_unavailable =
-            crate::choose_backend(RtBackend::Hardware, device.features(), &device.limits())
-                .fallback;
+        let (adapter, device, queue, rt, rt_device) =
+            request_gpu_for(&instance, Some(&surface), true, backend, false)?;
         let mut config = surface
             .get_default_config(&adapter, width.max(1), height.max(1))
             .ok_or("surface is not supported by the adapter")?;
@@ -129,7 +129,7 @@ impl Renderer {
             queue,
             tracer,
             rt,
-            rt_unavailable,
+            rt_device,
             camera_position,
             profiler,
             last_cpu: RenderCpu::default(),
@@ -181,16 +181,34 @@ impl Renderer {
     /// Why this adapter cannot run ray queries, if it cannot: the compute backend is then the only
     /// one, whatever the setting says.
     pub fn rt_unavailable(&self) -> Option<&str> {
-        self.rt_unavailable.as_deref()
+        self.rt_device.unavailable.as_deref()
+    }
+
+    /// What the player should know about the device's ray-query features against the setting, if
+    /// anything (#260): a restart is needed for hardware ray tracing on a device that was made
+    /// without them, the next launch makes a device without them after a switch to compute, or the
+    /// device could not be made with them. The overlay says it.
+    pub fn rt_note(&self) -> Option<String> {
+        self.rt_device.note(self.rt.requested)
+    }
+
+    /// Whether the device was made with the ray-query features.
+    pub fn device_has_ray_queries(&self) -> bool {
+        self.rt_device.on_device
     }
 
     /// Changes how rays find the Planet to `requested`, for `scene`, which is the Planet being drawn
     /// (what the window draws, and what [`Renderer::update_scene`] has kept up to date): the
     /// player's setting, changed at run time (#50). The tracer is made again for the scene, so this
     /// takes a moment, as a rebuild of the scene does; the sun, the look and the rest of its
-    /// settings stay. On an adapter without ray queries the compute backend stays, with no error.
+    /// settings stay. On an adapter without ray queries the compute backend stays, with no error,
+    /// and so it does on a device that was made without them (for the compute setting, #260, or
+    /// because it could not be made with them): a switch to hardware is then kept as the setting
+    /// and takes effect at the next launch ([`Renderer::rt_note`]).
     pub fn set_backend(&mut self, scene: &Scene, requested: RtBackend) -> Result<()> {
-        let rt = crate::choose_backend(requested, self.device.features(), &self.device.limits());
+        let rt = self
+            .rt_device
+            .choose(requested, self.device.features(), &self.device.limits());
         if rt.active != self.tracer.backend() {
             self.tracer.switch_backend(
                 &self.device,
