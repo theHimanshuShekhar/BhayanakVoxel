@@ -27,12 +27,12 @@ The conditions at a point on the Planet: its temperature and its moisture. It ch
 _Avoid_: Weather, environment
 
 **Landform**:
-The kind of shape the land takes at a place, such as a range, plateau, canyon, valley, plains or coast.
+The kind of shape the land takes at a place, such as a range, plateau, canyon, valley, plains, coast, volcanic land or ocean.
 _Avoid_: Terrain type, relief
 
 **Biome**:
 A named kind of land with its own surface and life, chosen by the Climate from those its Landform allows (a canyon in a hot, dry Climate is badlands).
-_Avoid_: Zone, region (Regions are the fantasy masks)
+_Avoid_: Zone, region
 
 **Relief**:
 The height of the Planet's solid surface at each place, the sea floor included: one height per place, so it has no overhangs. Most of the terrain is the Relief alone.
