@@ -11,9 +11,9 @@
 // (f32, in Voxels of the level from the group's corner) and the two words that the shader reads
 // for a candidate (`Prim::words`). A region's boxes come after the boxes of the regions before it
 // in the group, in the order of its mask's bits, a box for each: a brick that is one Material is
-// its whole brick, a mixed one the min and max of the Voxels its occupancy mask sets (a mask that
-// sets none, which no scene lists, is its whole brick as well), and a region that is one Material
-// is one box of 64 Voxels.
+// its whole brick, a mixed one the min and max of the Voxels its occupancy mask sets, as the scene
+// packed it into the brick's header (a mask that sets none, which no scene lists, is its whole
+// brick), and a region that is one Material is one box of 64 Voxels.
 
 struct BoxJob {
     // The first region of the group's cube, in regions of its level.
@@ -128,28 +128,10 @@ fn box_main(@builtin(local_invocation_index) t: u32, @builtin(workgroup_id) wg: 
         var lo = vec3<u32>(0u);
         var hi = vec3<u32>(7u);
         if (entry & SOLID_FLAG) == 0u {
-            // The tight box of the 512-bit mask: Voxel x + 8y + 64z is bit (y & 3) * 8 + x of
-            // word 2z + (y >> 2).
-            var xs = 0u;
-            var ys = 0u;
-            var zs = 0u;
-            for (var w = 0u; w < 16u; w++) {
-                let bits = bricks[entry + w];
-                if bits == 0u {
-                    continue;
-                }
-                zs |= 1u << (w >> 1u);
-                xs |= (bits | (bits >> 8u) | (bits >> 16u) | (bits >> 24u)) & 0xffu;
-                for (var y = 0u; y < 4u; y++) {
-                    if ((bits >> (y * 8u)) & 0xffu) != 0u {
-                        ys |= 1u << ((w & 1u) * 4u + y);
-                    }
-                }
-            }
-            if xs != 0u {
-                lo = vec3<u32>(firstTrailingBit(xs), firstTrailingBit(ys), firstTrailingBit(zs));
-                hi = vec3<u32>(firstLeadingBit(xs), firstLeadingBit(ys), firstLeadingBit(zs));
-            }
+            // The tight box that the scene packed into the brick's header (scene.rs, `pack_header`),
+            // so that this backend and the compute walk enter the brick through the same one.
+            lo = vec3<u32>(header_box_low(bricks[entry + 16u]));
+            hi = vec3<u32>(header_box_high(bricks[entry + 16u]));
         }
         let brick = corner + vec3<u32>(bit & 7u, (bit >> 3u) & 7u, bit >> 6u);
         let at = brick * 8u;

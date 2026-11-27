@@ -16,7 +16,7 @@ use brick_store::{BrickCoord, BrickStore, children_with_solid};
 use planet_gen::planet::{Planet, tangents};
 use planet_gen::world_map::WorldMap;
 use render::lod::{Bands, brick_distance};
-use render::scene::{Bound, REGION_WORDS, SOLID_FLAG};
+use render::scene::{Bound, REGION_WORDS, SOLID_FLAG, header_bits, header_palette_len};
 use render::{RingPatch, Scene, SceneUpdate};
 
 const SEED: u64 = 0xB4A7_A9AC;
@@ -225,7 +225,7 @@ fn closeness(scene: &Scene, levels: std::ops::Range<usize>, block: usize) -> (f6
 /// Words that the mixed brick with `brick_refs` entry `entry` has in `bricks`.
 fn brick_len(bricks: &[u32], entry: usize) -> usize {
     let header = bricks[entry + 16];
-    17 + ((header >> 8) as usize).div_ceil(2) + 512 * (header & 0xff) as usize / 32
+    17 + header_palette_len(header).div_ceil(2) + 512 * header_bits(header) as usize / 32
 }
 
 /// Fails unless `copy` shows what `scene` shows: the same header, regions and table, and the same

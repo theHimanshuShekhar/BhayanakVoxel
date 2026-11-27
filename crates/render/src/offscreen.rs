@@ -244,6 +244,13 @@ impl Offscreen {
         &self.rt
     }
 
+    /// The ray backend that the tracer itself was built for: what [`Offscreen::rt`] says, unless
+    /// something rebuilt the tracer on another (a test that this is still the hardware backend after
+    /// [`Offscreen::set_scene`] holds the window to it, #50).
+    pub fn backend(&self) -> RtBackend {
+        self.tracer.backend()
+    }
+
     /// Every update of the hardware backend's acceleration structures since the last call, the
     /// first build included: what each rebuilt and cost. Empty on the compute backend.
     pub fn take_hardware_updates(&mut self) -> Vec<crate::hw::HwUpdate> {
@@ -386,7 +393,7 @@ impl Offscreen {
             timers,
             table,
             full_reference,
-            RtBackend::Compute,
+            default_backend(),
             false,
         )
     }
@@ -460,12 +467,28 @@ impl Offscreen {
     /// Replaces the Planet being drawn, as the window's `Renderer::set_scene` does when the Planet
     /// it was loading is ready: the same call, so that a test of the window's sky setup (a ground
     /// level and a day sky set on the empty scene the window starts with, then the Planet) is of
-    /// the window's code. Only with the compute backend, which is the window's.
+    /// the window's code. **The ray backend stays what it is** (#50): a context on the hardware
+    /// backend is on it after the new Planet, as the window's is.
     pub fn set_scene(&mut self, scene: &Scene) -> Result<()> {
-        if self.rt.active.is_hardware() {
-            return Err("set_scene is the window's path, which has the compute backend".into());
-        }
-        self.tracer.replace_scene(&self.device, scene)
+        self.tracer
+            .replace_scene(&self.device, &self.queue, scene, scene_centre(scene))
+    }
+
+    /// Changes the ray backend to `requested` for `scene`, which is the Planet being drawn: what the
+    /// window does when the player changes the setting (#50). Hardware needs a device that was made
+    /// with ray queries ([`Offscreen::with_backend`] with a hardware backend, on an adapter that has
+    /// them): without them the compute backend runs, with no error, and [`Offscreen::rt`] says why.
+    pub fn set_backend(&mut self, scene: &Scene, requested: RtBackend) -> Result<()> {
+        let rt = crate::choose_backend(requested, self.device.features(), &self.device.limits());
+        self.tracer.switch_backend(
+            &self.device,
+            &self.queue,
+            scene,
+            scene_centre(scene),
+            rt.active,
+        )?;
+        self.rt = rt;
+        Ok(())
     }
 
     /// Brings the GPU copy of the Planet up to date with `scene`, after `update` (the result of
@@ -1394,6 +1417,22 @@ impl Offscreen {
     /// Casts `rays` through the GPU `trace()` and returns the hits, in order.
     pub fn trace_rays(&mut self, rays: &[Ray]) -> Vec<Option<Hit>> {
         self.tracer.trace_rays(&self.device, &self.queue, rays)
+    }
+}
+
+/// The environment variable that makes every `Offscreen` that was not asked for a backend run on
+/// one (#50): `hw` or `hw-nearest`, for running the golden and lighting tests on the hardware
+/// backend (`BHAYANAK_RT_BACKEND=hw cargo test -p render --release`). An adapter without ray queries
+/// runs compute, as everywhere; whatever is unset or else is compute.
+pub const BACKEND_VARIABLE: &str = "BHAYANAK_RT_BACKEND";
+
+/// What `Offscreen::new` and the constructors like it run: compute, unless [`BACKEND_VARIABLE`]
+/// says another.
+fn default_backend() -> RtBackend {
+    match std::env::var(BACKEND_VARIABLE).as_deref() {
+        Ok("hw") => RtBackend::Hardware,
+        Ok("hw-nearest") => RtBackend::HardwareNearest,
+        _ => RtBackend::Compute,
     }
 }
 

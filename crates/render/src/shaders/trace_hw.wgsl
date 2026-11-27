@@ -1,6 +1,6 @@
-// The hardware backend of trace() (#50, a spike): ray queries over procedural AABBs, one per
-// non-empty brick of each level (hw.rs), with the compute path's in-brick DDA (`hit_brick`)
-// run on each candidate and its hit committed with `rayQueryGenerateIntersection`.
+// The hardware backend of trace() (#50), the default where the adapter has ray queries: ray queries
+// over procedural AABBs, one per non-empty brick of each level (hw.rs), with the compute path's
+// in-brick DDA (`walk_brick`, entered through the brick's tight box) run on each candidate and its hit committed with `rayQueryGenerateIntersection`.
 //
 // `shaders::hardware` joins this to trace.wgsl, with trace.wgsl's `trace_within` renamed
 // `trace_within_compute`; this file defines the `trace_within` that `trace` calls, so the passes
@@ -60,7 +60,7 @@ fn hw_candidate(ray: Ray, w: Walk, c: RayIntersection, limit: f32) -> Hit {
     let local = vec3<i32>(vec3<u32>(w0 & 255u, (w0 >> 8u) & 255u, (w0 >> 16u) & 255u));
     let brick = (group.xyz >> vec3<u32>(level + 3u)) + local;
     let whole_region = (w0 & HW_REGION_BOX) != 0u;
-    // The box in Voxels of the level, then in Voxels of level 0.
+    // The box in Voxels of the level, from `low` up to, and not including, `high`.
     var low = brick * 8;
     var high = low + 64;
     if !whole_region {
@@ -69,18 +69,16 @@ fn hw_candidate(ray: Ray, w: Walk, c: RayIntersection, limit: f32) -> Hit {
         high = low + hi + 1;
         low = low + lo;
     }
-    let t_a = reach(ray, w, low << vec3<u32>(level));
-    let t_b = reach(ray, w, high << vec3<u32>(level));
-    let t_near = min(t_a, t_b);
-    let t_enter = max3(t_near);
-    let t_exit = min3(max(t_a, t_b));
+    let span = box_span(ray, w, level, low, high);
+    let t_enter = span.x;
+    let t_exit = span.y;
     if t_enter > t_exit || t_exit < 0.0 || t_enter >= limit {
         return miss();
     }
     // As hit_level: the face the ray crosses last, or, from inside, against its largest component.
     var normal = select(vec3<f32>(0.0), -vec3<f32>(w.step), largest_axis(abs(w.d)));
     if t_enter > 0.0 {
-        normal = select(vec3<f32>(0.0), -vec3<f32>(w.step), largest_axis(t_near));
+        normal = box_normal(ray, w, level, low, high);
     }
     let t_in = max(t_enter, 0.0);
     if whole_region {
@@ -95,7 +93,11 @@ fn hw_candidate(ray: Ray, w: Walk, c: RayIntersection, limit: f32) -> Hit {
     if entry == 0xffffffffu {
         return miss();
     }
-    return hit_brick(ray, w, level, entry, brick, t_in, normal);
+    if (entry & SOLID_FLAG) != 0u {
+        return hit_brick(ray, w, level, entry, brick, t_in, normal);
+    }
+    // The box is the one that the walk of the compute path enters the brick through (`hit_brick`).
+    return walk_brick(ray, w, level, entry, brick, low, high - 1, t_in, normal);
 }
 
 fn hw_walk(ray: Ray) -> Walk {

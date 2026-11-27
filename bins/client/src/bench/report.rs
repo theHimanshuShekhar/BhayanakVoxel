@@ -220,7 +220,13 @@ use super::stream::StreamReport;
 /// `by_second` (a flight's seconds: the camera misses, the loader's queue, the bricks taken in and
 /// the scene thread's work in each), and to each `scene_thread` `pack_request_ms`, `pack_receive_ms`,
 /// `pack_hold_ms` and `pack_arrive_ms` (what `pack_ms` is made of). Nothing else is changed.
-pub const SCHEMA_VERSION: u32 = 35;
+///
+/// 36 (#50 Part 2) makes hardware ray queries the default: `rt.requested` can be `auto` (what
+/// `client bench` asks for with no `--rt-backend`: ray queries where the adapter has them, else
+/// compute with `rt.fallback` saying why), and a report without the flag is `auto` with `active`
+/// `hw`, where it was `compute`; `streaming_real_time.rt.requested` is then `hw`, which the run
+/// asked the GPU context for. Nothing else is changed.
+pub const SCHEMA_VERSION: u32 = 36;
 
 /// One timed thing (a pass, or the GPU total of a profiler frame) in one mode, against its
 /// budget. In reference mode a profiler frame is one sample, so the entries of that mode have
@@ -750,7 +756,7 @@ mod tests {
                 "streaming_real_time"
             ]
         );
-        assert_eq!(json["schema_version"], 35);
+        assert_eq!(json["schema_version"], 36);
         assert_eq!(json["rt"]["active"], "compute");
         assert_eq!(json["rt"]["comparison"], serde_json::Value::Null);
         assert_eq!(json["rt"]["real_time_hw"], serde_json::Value::Null);

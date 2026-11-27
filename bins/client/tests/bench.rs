@@ -324,12 +324,21 @@ fn check_convergence(convergence: &Value, out: &Path) {
 }
 
 fn check_schema(report: &Value, out: &Path) {
-    assert_eq!(report["schema_version"], 35);
-    // The default is the compute backend, with no acceleration structures (#50).
-    assert_eq!(report["rt"]["requested"], "compute");
-    assert_eq!(report["rt"]["active"], "compute");
-    assert!(report["rt"]["fallback"].is_null());
-    assert!(report["rt"]["accel"].is_null());
+    assert_eq!(report["schema_version"], 36);
+    // The default is the game's own choice (#50, Part 2): hardware ray queries where the adapter
+    // has them, and compute, with the reason, where it has not.
+    assert_eq!(report["rt"]["requested"], "auto");
+    match report["rt"]["active"].as_str().unwrap() {
+        "hw" => {
+            assert!(report["rt"]["fallback"].is_null());
+            assert!(report["rt"]["accel"].is_object(), "{}", report["rt"]);
+        }
+        "compute" => {
+            assert!(report["rt"]["fallback"].is_string());
+            assert!(report["rt"]["accel"].is_null());
+        }
+        other => panic!("rt.active is {other}"),
+    }
     assert!(report["rt"]["comparison"].is_null());
     // The day cycle is asked for (see its own test); the others do not.
     assert!(report["day_cycle"].is_null());
@@ -527,6 +536,8 @@ fn the_convergence_phase_can_be_left_out_and_a_truth_needs_the_phase() {
     let out = scratch("no-convergence");
     let run = bench(&[
         "--short",
+        "--rt-backend",
+        "compute",
         "--no-convergence",
         "--no-fail",
         "--out",
@@ -551,6 +562,8 @@ fn the_day_cycle_reports_a_sped_up_day_with_its_frames_exposure_and_cache() {
     let out = scratch("day-cycle");
     let run = bench(&[
         "--short",
+        "--rt-backend",
+        "compute",
         "--no-fail",
         "--no-convergence",
         "--day-cycle",
@@ -609,7 +622,14 @@ fn a_failing_convergence_phase_warns_and_leaves_the_rest_of_the_report() {
     std::fs::create_dir_all(&run_dir).unwrap();
     // The phase's folder cannot be made where a file of that name is.
     std::fs::write(run_dir.join("convergence"), "in the way").unwrap();
-    let run = bench(&["--short", "--no-fail", "--out", run_dir.to_str().unwrap()]);
+    let run = bench(&[
+        "--short",
+        "--rt-backend",
+        "compute",
+        "--no-fail",
+        "--out",
+        run_dir.to_str().unwrap(),
+    ]);
     let stderr = String::from_utf8_lossy(&run.stderr);
     assert_eq!(run.status.code(), Some(0), "{stderr}");
     assert!(
@@ -632,6 +652,8 @@ fn a_pass_over_budget_fails_the_run_with_status_2() {
     std::fs::write(&budgets, IMPOSSIBLE).unwrap();
     let run = bench(&[
         "--short",
+        "--rt-backend",
+        "compute",
         "--no-convergence",
         "--out",
         out.join("run").to_str().unwrap(),
@@ -673,6 +695,8 @@ fn a_diagnostic_run_is_marked_in_its_report_and_is_not_held_to_the_budgets() {
     std::fs::write(&budgets, IMPOSSIBLE).unwrap();
     let run = bench(&[
         "--short",
+        "--rt-backend",
+        "compute",
         "--no-convergence",
         "--out",
         out.join("run").to_str().unwrap(),
@@ -702,6 +726,8 @@ fn a_diagnostic_run_is_marked_in_its_report_and_is_not_held_to_the_budgets() {
     let plain = scratch("plain");
     bench(&[
         "--short",
+        "--rt-backend",
+        "compute",
         "--no-convergence",
         "--out",
         plain.join("run").to_str().unwrap(),

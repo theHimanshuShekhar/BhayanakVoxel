@@ -36,7 +36,8 @@ use std::collections::BTreeMap;
 use std::ops::Range;
 
 use crate::scene::{
-    REGION_FIRST_REF, REGION_VOXELS, REGION_WORDS, SOLID_FLAG, Scene, SceneUpdate, hash_region,
+    BRICK_HEADER_WORD, BRICK_PALETTE_WORD, REGION_FIRST_REF, REGION_VOXELS, REGION_WORDS,
+    SOLID_FLAG, Scene, SceneUpdate, hash_region, header_bits, header_palette_len,
 };
 
 /// The most boxes in a cell's list. Keep in step with `EMITTER_LIST_MAX` in `emitters.wgsl`.
@@ -523,9 +524,9 @@ fn brick_boxes(
     out: &mut Vec<EmitterBox>,
 ) {
     let bricks = &scene.bricks;
-    let header = bricks[at + 16];
-    let (bits, palette_len) = (header & 0xff, (header >> 8) as usize);
-    let palette = at + 17;
+    let header = bricks[at + BRICK_HEADER_WORD];
+    let (bits, palette_len) = (header_bits(header), header_palette_len(header));
+    let palette = at + BRICK_PALETTE_WORD;
     // Most bricks have no emissive Material in their palette: that is all that is read of them.
     let palette_emits =
         (0..palette_len).any(|i| emits((bricks[palette + i / 2] >> ((i % 2) * 16)) & 0xffff));

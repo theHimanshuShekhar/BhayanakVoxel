@@ -1,10 +1,11 @@
-//! The hardware ray-tracing backend behind `trace(ray) -> Hit` (#50, a spike; #236).
+//! The hardware ray-tracing backend behind `trace(ray) -> Hit` (#50; #236). It is the default backend where the adapter has ray queries (#50, Part 2).
 //!
 //! Ray queries (`wgpu::Features::EXPERIMENTAL_RAY_QUERY`, Vulkan only) over **procedural AABBs,
 //! one per non-empty brick** of each level; a ray query reports each box it enters as a candidate
 //! and the shader (`shaders/trace_hw.wgsl`) runs the same in-brick DDA as the compute path on it
-//! (`hit_brick`), then `rayQueryGenerateIntersection`s the hit. The compute `trace()` stays the
-//! default, the fallback and the CPU-checkable reference (`reference.rs`).
+//! (`walk_brick`, entered through the brick's tight box as `hit_brick` does), then
+//! `rayQueryGenerateIntersection`s the hit. The compute `trace()` is the fallback, for an adapter
+//! with no ray queries or a player who chose it, and the CPU-checkable reference (`reference.rs`).
 //!
 //! Shadow rays (`occluded` in the shaders) end at the first hit with `RtBackend::Hardware`
 //! (`RAY_FLAG_TERMINATE_ON_FIRST_HIT`), as the compute walk does, and look for the nearest like
@@ -66,9 +67,10 @@ use std::ops::Range;
 use std::time::{Duration, Instant};
 
 use crate::Result;
+pub use crate::scene::tight_box;
 use crate::scene::{
-    Level, REGION_BRICKS, REGION_FIRST_REF, REGION_VOXELS, REGION_WORDS, SOLID_FLAG, Scene,
-    SceneUpdate, hash_region,
+    BRICK_HEADER_WORD, Level, REGION_BRICKS, REGION_FIRST_REF, REGION_VOXELS, REGION_WORDS,
+    SOLID_FLAG, Scene, SceneUpdate, hash_region, header_box,
 };
 
 /// Regions along each edge of a **cell**: 4 x 4 x 4 regions, 32 bricks and 256 Voxels of its level
@@ -307,30 +309,6 @@ pub fn process_grouping() -> Grouping {
         .unwrap_or_else(|| Grouping::parse(PRODUCTION_GROUPING).expect("a grouping that there is"))
 }
 
-/// The smallest and largest Voxel (as local coordinates 0..=7) that a brick's 512-bit occupancy
-/// mask has set, as `[x, y, z]` corners, or `None` for an empty mask. `mask` is the 16 words of a
-/// mixed brick (Voxel `x | y << 3 | z << 6` is bit `i % 32` of word `i / 32`).
-pub fn tight_box(mask: &[u32]) -> Option<([u8; 3], [u8; 3])> {
-    let mut lo = [u8::MAX; 3];
-    let mut hi = [0u8; 3];
-    let mut any = false;
-    for (w, &word) in mask.iter().take(16).enumerate() {
-        let mut bits = word;
-        while bits != 0 {
-            let b = bits.trailing_zeros() as usize;
-            bits &= bits - 1;
-            let i = w * 32 + b;
-            let v = [(i & 7) as u8, (i >> 3 & 7) as u8, (i >> 6) as u8];
-            for a in 0..3 {
-                lo[a] = lo[a].min(v[a]);
-                hi[a] = hi[a].max(v[a]);
-            }
-            any = true;
-        }
-    }
-    any.then_some((lo, hi))
-}
-
 /// The index in `scene.regions` of the region at `key` of `level`, if the scene has one: the
 /// lookup of `find_region` in `trace.wgsl`.
 pub fn find_region(scene: &Scene, level: usize, key: [i32; 3]) -> Option<usize> {
@@ -481,12 +459,15 @@ fn region_prims(scene: &Scene, region: usize, local: [i32; 3], out: &mut Vec<Pri
         let (lo, hi) = if entry & SOLID_FLAG != 0 {
             ([0u8; 3], [7u8; 3])
         } else {
-            let at = entry as usize;
-            scene
-                .bricks
-                .get(at..at + 16)
-                .and_then(tight_box)
-                .unwrap_or(([0u8; 3], [7u8; 3]))
+            // The header's box, which the scene made from the mask when it packed the brick
+            // (a word that is not there reads as a zero: a box of the Voxel at the corner).
+            header_box(
+                scene
+                    .bricks
+                    .get(entry as usize + BRICK_HEADER_WORD)
+                    .copied()
+                    .unwrap_or(0),
+            )
         };
         let brick = [
             corner[0] + (bit & 7) as i32,

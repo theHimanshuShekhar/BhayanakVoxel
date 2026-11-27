@@ -131,11 +131,30 @@ fn max3(v: vec3<f32>) -> f32 {
     return max(v.x, max(v.y, v.z));
 }
 
+// What a mixed brick's header word says (scene.rs, `pack_header`): the bits of a palette index, the
+// palette's length, and the tight box: the lowest and highest Voxel its mask sets, as local
+// coordinates 0 to 7.
+fn header_bits(header: u32) -> u32 {
+    return 1u << (header & 7u);
+}
+
+fn header_palette_len(header: u32) -> u32 {
+    return (header >> 3u) & 0x3ffu;
+}
+
+fn header_box_low(header: u32) -> vec3<i32> {
+    return vec3<i32>(vec3<u32>((header >> 13u) & 7u, (header >> 16u) & 7u, (header >> 19u) & 7u));
+}
+
+fn header_box_high(header: u32) -> vec3<i32> {
+    return vec3<i32>(vec3<u32>((header >> 22u) & 7u, (header >> 25u) & 7u, (header >> 28u) & 7u));
+}
+
 // Material of Voxel `bit` in the mixed brick at `at` in `bricks`.
 fn mixed_material(at: u32, bit: u32) -> u32 {
     let header = bricks[at + 16u];
-    let bits = header & 0xffu;
-    let palette_len = header >> 8u;
+    let bits = header_bits(header);
+    let palette_len = header_palette_len(header);
     let palette = at + 17u;
     let indices = palette + (palette_len + 1u) / 2u;
     let position = bit * bits;
@@ -189,22 +208,36 @@ fn voxel_at(ray: Ray, w: Walk, t: f32) -> vec3<i32> {
     return ray.cell + vec3<i32>(floor(ray.origin + w.d * t));
 }
 
-// Walks the Voxels of the brick at absolute brick coordinate `brick` of `level` (entry `entry`
-// in `brick_refs`), entered at `t_in` through the face with normal `normal_in`.
-fn hit_brick(ray: Ray, w: Walk, level: u32, entry: u32, brick: vec3<i32>, t_in: f32, normal_in: vec3<f32>) -> Hit {
-    let first = brick * 8;
-    // The entry point is on the brick's boundary, so rounding can put it a hair outside.
-    var voxel = clamp(voxel_at(ray, w, t_in) >> vec3<u32>(level), first, first + 7);
-    if (entry & SOLID_FLAG) != 0u {
-        return hit_level_voxel(ray, w, level, t_in, normal_in, voxel, entry & 0xffffu);
-    }
+// Where the ray is inside the box of Voxels of `level` from `low` up to, and not including, `high`
+// (absolute coordinates of the level): the distances at which it enters and leaves, or an entry past
+// the exit for a ray that misses. Both backends use this one, for the tight box of a brick.
+fn box_span(ray: Ray, w: Walk, level: u32, low: vec3<i32>, high: vec3<i32>) -> vec2<f32> {
+    let t_a = reach(ray, w, low << vec3<u32>(level));
+    let t_b = reach(ray, w, high << vec3<u32>(level));
+    return vec2<f32>(max3(min(t_a, t_b)), min3(max(t_a, t_b)));
+}
+
+// The normal of the face that the ray enters the same box through (`box_span`), from outside.
+fn box_normal(ray: Ray, w: Walk, level: u32, low: vec3<i32>, high: vec3<i32>) -> vec3<f32> {
+    let t_a = reach(ray, w, low << vec3<u32>(level));
+    let t_b = reach(ray, w, high << vec3<u32>(level));
+    return select(vec3<f32>(0.0), -vec3<f32>(w.step), largest_axis(min(t_a, t_b)));
+}
+
+// Walks the Voxels of the mixed brick at absolute brick coordinate `brick` of `level` (entry `entry`
+// in `brick_refs`) that lie in its tight box, `first` to `last` (absolute Voxels of the level),
+// entered at `t_in` through the face with normal `normal_in`.
+fn walk_brick(ray: Ray, w: Walk, level: u32, entry: u32, brick: vec3<i32>, first: vec3<i32>, last: vec3<i32>, t_in: f32, normal_in: vec3<f32>) -> Hit {
+    let origin = brick * 8;
+    // The entry point is on the box's boundary, so rounding can put it a hair outside.
+    var voxel = clamp(voxel_at(ray, w, t_in) >> vec3<u32>(level), first, last);
     let size = f32(1u << level);
     var next = reach(ray, w, (voxel + w.upper) << vec3<u32>(level));
     let delta = abs(w.inv * size);
     var t = t_in;
     var normal = normal_in;
     for (var i = 0; i < BLOCK_STEPS; i++) {
-        let local = vec3<u32>(voxel - first);
+        let local = vec3<u32>(voxel - origin);
         let bit = local.x | (local.y << 3u) | (local.z << 6u);
         if ((bricks[entry + (bit >> 5u)] >> (bit & 31u)) & 1u) != 0u {
             return hit_level_voxel(ray, w, level, t, normal, voxel, mixed_material(entry, bit));
@@ -214,11 +247,39 @@ fn hit_brick(ray: Ray, w: Walk, level: u32, entry: u32, brick: vec3<i32>, t_in: 
         voxel += select(vec3<i32>(0), w.step, axis);
         next += select(vec3<f32>(0.0), delta, axis);
         normal = select(vec3<f32>(0.0), -vec3<f32>(w.step), axis);
-        if any(voxel < first) || any(voxel > first + 7) {
+        if any(voxel < first) || any(voxel > last) {
             break;
         }
     }
     return miss();
+}
+
+// The hit in the brick at absolute brick coordinate `brick` of `level` (entry `entry` in
+// `brick_refs`), entered at `t_in` through the face with normal `normal_in`. A mixed brick is
+// entered through its tight box: a ray that misses the box misses the brick, and the walk starts
+// where the ray enters the box and ends where it leaves it (#50).
+fn hit_brick(ray: Ray, w: Walk, level: u32, entry: u32, brick: vec3<i32>, t_in: f32, normal_in: vec3<f32>) -> Hit {
+    let first = brick * 8;
+    if (entry & SOLID_FLAG) != 0u {
+        // The entry point is on the brick's boundary, so rounding can put it a hair outside.
+        let voxel = clamp(voxel_at(ray, w, t_in) >> vec3<u32>(level), first, first + 7);
+        return hit_level_voxel(ray, w, level, t_in, normal_in, voxel, entry & 0xffffu);
+    }
+    let header = bricks[entry + 16u];
+    let low = first + header_box_low(header);
+    let high = first + header_box_high(header) + 1;
+    let span = box_span(ray, w, level, low, high);
+    if span.x > span.y || span.y < t_in {
+        return miss();
+    }
+    // The box is inside the brick, so the ray reaches it no sooner than it reached the brick.
+    var t = t_in;
+    var normal = normal_in;
+    if span.x > t_in {
+        t = span.x;
+        normal = box_normal(ray, w, level, low, high);
+    }
+    return walk_brick(ray, w, level, entry, brick, low, high - 1, t, normal);
 }
 
 // Walks the bricks of the region at absolute region coordinate `rc` of `level` (index `region`

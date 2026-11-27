@@ -393,7 +393,10 @@ fn run(args: &Args) -> Result<u8, Box<dyn Error>> {
             args.flat_ambient,
             &budgets,
             stream_slice,
-            args.rt.main_backend(),
+            realtime::Asked {
+                backend: args.rt.main_backend(),
+                may_fall_back: args.rt.may_fall_back(),
+            },
         )),
         _ => None,
     };
@@ -407,7 +410,10 @@ fn run(args: &Args) -> Result<u8, Box<dyn Error>> {
             args.flat_ambient,
             &budgets,
             stream_slice,
-            RtBackend::Hardware,
+            realtime::Asked {
+                backend: RtBackend::Hardware,
+                may_fall_back: false,
+            },
         )),
         _ => None,
     };
