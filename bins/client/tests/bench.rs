@@ -324,12 +324,15 @@ fn check_convergence(convergence: &Value, out: &Path) {
 }
 
 fn check_schema(report: &Value, out: &Path) {
-    assert_eq!(report["schema_version"], 35);
-    // The default is the compute backend, with no acceleration structures (#50).
-    assert_eq!(report["rt"]["requested"], "compute");
-    assert_eq!(report["rt"]["active"], "compute");
-    assert!(report["rt"]["fallback"].is_null());
-    assert!(report["rt"]["accel"].is_null());
+    assert_eq!(report["schema_version"], 36);
+    // The default is the game's own choice (#50, Part 2): hardware ray queries where the adapter
+    // has them, and compute, with the reason, where it has not.
+    assert_eq!(report["rt"]["requested"], "auto");
+    match report["rt"]["active"].as_str().unwrap() {
+        "hw" => assert!(report["rt"]["fallback"].is_null()),
+        "compute" => assert!(report["rt"]["fallback"].is_string()),
+        other => panic!("rt.active is {other}"),
+    }
     assert!(report["rt"]["comparison"].is_null());
     // The day cycle is asked for (see its own test); the others do not.
     assert!(report["day_cycle"].is_null());

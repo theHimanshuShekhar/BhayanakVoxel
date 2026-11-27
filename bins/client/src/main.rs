@@ -9,6 +9,7 @@ mod growth;
 mod loader;
 mod priority;
 mod scene_worker;
+mod settings;
 #[cfg(test)]
 mod streaming_tests;
 mod tool;
@@ -36,7 +37,8 @@ use render::lod::{self, Bands};
 use render::overlay::{self, Controls, DayControls, Hud, HudEvent, LodInfo, SceneMemory};
 use render::scene::Bound;
 use render::tracer::View;
-use render::{Camera, Mode, Renderer, RingsFull, Scene, SceneUpdate};
+use render::{Camera, Mode, Renderer, RingsFull, RtBackend, Scene, SceneUpdate};
+use settings::{RayTracing, Settings};
 use sim::{
     DEFAULT_DAY_LENGTH_SECONDS, FixedTimestep, Predictor, ServerHandle, TICK_RATE_HZ, WorldClock,
 };
@@ -641,6 +643,10 @@ struct Gui {
 struct App {
     window: Option<Arc<Window>>,
     renderer: Option<Renderer>,
+    /// What is kept between launches (how rays find the Planet), and the file it is in, if this
+    /// machine has a place for one. The overlay changes it, and it is saved at once.
+    settings: Settings,
+    settings_path: Option<std::path::PathBuf>,
     gui: Option<Gui>,
     /// The Planet, while it is still being generated.
     loading: Option<Receiver<Loaded>>,
@@ -747,9 +753,21 @@ impl App {
             // The window may be gone before the Planet is ready; that is fine.
             let _ = sender.send(load_planet());
         });
+        let settings_path = settings::path();
+        let settings = settings_path
+            .as_deref()
+            .map_or_else(Settings::default, |path| {
+                let (settings, warning) = Settings::load(path);
+                if let Some(warning) = warning {
+                    eprintln!("warning: {warning}; the defaults are used");
+                }
+                settings
+            });
         Self {
             window: None,
             renderer: None,
+            settings,
+            settings_path,
             gui: None,
             loading: Some(receiver),
             world: None,
@@ -796,7 +814,15 @@ impl App {
             size.width,
             size.height,
             &Scene::default(),
+            self.settings.ray_tracing.backend(),
         )?);
+        if let Some(renderer) = &self.renderer {
+            let rt = renderer.rt();
+            match &rt.fallback {
+                Some(why) => eprintln!("ray tracing: compute ({why})"),
+                None => eprintln!("ray tracing: {}", rt.active.name()),
+            }
+        }
         if let Some(renderer) = &mut self.renderer {
             // The atmosphere measures the camera's height from the Planet's sea level.
             renderer.set_ground_level(f64::from(WORLD_RADIUS));
@@ -1052,6 +1078,24 @@ impl App {
         self.show(update)
     }
 
+    /// Changes how rays find the Planet to `requested` (the overlay's setting, #50) for the Planet
+    /// that is being drawn, and keeps the setting for the next launch.
+    fn set_ray_tracing(&mut self, requested: RtBackend) -> Result<(), Box<dyn Error>> {
+        let empty = Scene::default();
+        let scene = self.world.as_ref().map_or(&empty, World::scene);
+        if let Some(renderer) = &mut self.renderer {
+            renderer.set_backend(scene, requested)?;
+            eprintln!("ray tracing: {}", renderer.rt().active.name());
+        }
+        self.settings.ray_tracing = RayTracing::of(requested);
+        if let Some(path) = &self.settings_path
+            && let Err(e) = self.settings.save(path)
+        {
+            eprintln!("warning: cannot save {}: {e}", path.display());
+        }
+        Ok(())
+    }
+
     /// Copies what changed in the Planet to the GPU.
     fn show(&mut self, update: Option<SceneUpdate>) -> Result<(), Box<dyn Error>> {
         if let (Some(update), Some(world), Some(renderer)) =
@@ -1163,6 +1207,7 @@ impl App {
             },
             stages: renderer.stages(),
             bias: self.bias,
+            backend: renderer.rt().requested,
         };
         let mut controls = before;
         let info = overlay::Info {
@@ -1182,6 +1227,8 @@ impl App {
                 allocated: renderer.scene_bytes(),
             },
             lod: self.world.as_ref().and_then(lod_info),
+            rt_active: renderer.rt().active,
+            rt_unavailable: renderer.rt_unavailable(),
         };
         let input = gui.state.take_egui_input(window);
         let camera = &self.camera;
@@ -1240,6 +1287,11 @@ impl App {
         }
         if controls.bias != before.bias
             && let Err(err) = self.set_bias(controls.bias)
+        {
+            self.error = Some(err);
+        }
+        if controls.backend != before.backend
+            && let Err(err) = self.set_ray_tracing(controls.backend)
         {
             self.error = Some(err);
         }

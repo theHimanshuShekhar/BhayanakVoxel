@@ -1208,8 +1208,67 @@ impl Tracer {
     /// the sky is black and the sun unattenuated, #203), the look, the stages, the night, the debug
     /// view, the seed and the rest of what a caller set on it. The new Planet counts as the sun
     /// jumping ([`Tracer::sun_changed`]), as it starts the views and the caches over.
-    pub fn replace_scene(&mut self, device: &wgpu::Device, scene: &Scene) -> Result<()> {
-        let mut next = Self::new(device, scene)?;
+    ///
+    /// **It keeps the ray backend too** (#50): a tracer on the hardware backend is rebuilt on the
+    /// hardware backend, with the same shadow-ray variant, its acceleration structures made for
+    /// `scene` with the frame starting at `camera` (Voxels of level 0; the camera that was last
+    /// drawn from). The built-in Materials are the new tracer's, as they were.
+    pub fn replace_scene(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        scene: &Scene,
+        camera: [f64; 3],
+    ) -> Result<()> {
+        self.switch_backend(device, queue, scene, camera, self.backend())
+    }
+
+    /// A tracer for `scene` on the ray backend `backend` (#50), with the built-in Materials: the
+    /// hardware ones need a device with ray queries ([`crate::choose_backend`]), and `camera` is
+    /// where their frame starts.
+    pub fn on_backend(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        scene: &Scene,
+        camera: [f64; 3],
+        backend: crate::RtBackend,
+    ) -> Result<Self> {
+        if backend.is_hardware() {
+            Self::hardware(
+                device,
+                queue,
+                scene,
+                None,
+                camera,
+                backend == crate::RtBackend::Hardware,
+            )
+        } else {
+            Self::new(device, scene)
+        }
+    }
+
+    /// Which ray backend this tracer runs (see [`crate::RtBackend`]).
+    pub fn backend(&self) -> crate::RtBackend {
+        match &self.hw {
+            None => crate::RtBackend::Compute,
+            Some(hw) if hw.layout.any_hit_shadows => crate::RtBackend::Hardware,
+            Some(_) => crate::RtBackend::HardwareNearest,
+        }
+    }
+
+    /// Rebuilds the tracer for `scene` on `backend`, keeping every setting that
+    /// [`Tracer::replace_scene`] keeps: what the player's change of the ray backend does (#50). A
+    /// hardware `backend` needs a device with ray queries ([`crate::choose_backend`]). If it fails,
+    /// the tracer is as it was.
+    pub fn switch_backend(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        scene: &Scene,
+        camera: [f64; 3],
+        backend: crate::RtBackend,
+    ) -> Result<()> {
+        let mut next = Self::on_backend(device, queue, scene, camera, backend)?;
         next.debug_view = self.debug_view;
         next.ground_level = self.ground_level;
         next.look = self.look;

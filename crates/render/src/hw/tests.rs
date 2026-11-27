@@ -465,12 +465,13 @@ fn a_regions_box_count_is_the_boxes_the_cpu_makes_of_it_and_a_groups_the_sum() {
 }
 
 #[test]
-fn a_mask_that_sets_no_voxel_is_the_whole_brick_here_as_on_the_gpu() {
-    // No scene lists one, but a word that is not there is read as a zero on the GPU, and the CPU's
-    // twin does the same, so that the boxes can be compared box for box.
+fn a_header_that_says_the_whole_brick_is_the_whole_brick_here_as_on_the_gpu() {
+    // The scene packs the whole brick as the box of a mask that sets no Voxel (which no scene
+    // lists); the box is read from the header on the GPU and here alike.
     let mut scene = Scene::new(&store_with(&[[1, 1, 1]]), None);
     let at = scene.brick_refs[0] as usize;
     scene.bricks[at..at + 16].fill(0);
+    scene.bricks[at + 16] = crate::scene::pack_header(1, 1, ([0; 3], [7; 3]));
     let prims = group_prims(&scene, 0, [0, 0, 0]);
     assert_eq!(prims.len(), 1);
     assert_eq!((prims[0].min, prims[0].max), ([0.0; 3], [8.0; 3]));

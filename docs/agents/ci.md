@@ -9,7 +9,7 @@ These must be green to merge:
 
 | Job | What it runs |
 | --- | --- |
-| `linux` | `cargo fmt --check`, clippy with `-D warnings`, `cargo test --workspace` on lavapipe (software Vulkan) without the real-thread tests, the check that no line of the real-thread list matches a test outside the client binary, and the check that `server` does not depend on wgpu or winit. |
+| `linux` | `cargo fmt --check`, clippy with `-D warnings`, `cargo test --workspace` on lavapipe (software Vulkan) without the real-thread tests (hardware ray queries are the game's default backend since #50 Part 2, and lavapipe has them where its Mesa does: the goldens are matched on both backends, and `hw_agreement` holds the backends to each other; on a runner whose lavapipe has no ray queries those tests skip, and the log says `SKIPPED ...: why`, which is the "CI falls back to compute and says so" of the ticket), the check that no line of the real-thread list matches a test outside the client binary, and the check that `server` does not depend on wgpu or winit. |
 | `windows-tests` | Tests of `brick-store`, `materials`, `net`, `planet-gen`, `sim`, `prefetch-sim` and `server`, and the client's unit tests that need no GPU and are not in the real-thread list. The stepped streaming tests are among them. |
 | `windows-client` | Builds the release client and uploads it as the `client-windows` artifact, which the benchmark uses. |
 | `determinism` | The golden hash tests of `planet-gen` and `sim`, in debug and release, on Linux and Windows. |

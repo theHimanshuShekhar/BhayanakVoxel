@@ -26,7 +26,12 @@ use super::stats::Stats;
 /// What `--rt-backend` asked for.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum RtMode {
+    /// What the player gets (#50, Part 2): hardware ray queries where the adapter has them, and the
+    /// compute walk, with a warning, where it has not. The default, so that the gated runs measure
+    /// the game; `--rt-backend hw` is the same on an adapter with ray queries and an error on one
+    /// without, and `compute` is the player's setting for compute.
     #[default]
+    Auto,
     Compute,
     Hardware,
     /// Ray queries with the shadow rays looking for the nearest hit (`RtBackend::HardwareNearest`).
@@ -35,21 +40,23 @@ pub enum RtMode {
 }
 
 impl RtMode {
-    /// `compute`, `hw`, `hw-nearest` or `both`.
+    /// `auto`, `compute`, `hw`, `hw-nearest` or `both`.
     pub fn parse(text: &str) -> Result<Self, String> {
         match text {
+            "auto" => Ok(Self::Auto),
             "compute" => Ok(Self::Compute),
             "hw" | "hardware" => Ok(Self::Hardware),
             "hw-nearest" => Ok(Self::HardwareNearest),
             "both" => Ok(Self::Both),
             _ => Err(format!(
-                "`{text}` is not a ray backend: compute, hw, hw-nearest or both"
+                "`{text}` is not a ray backend: auto, compute, hw, hw-nearest or both"
             )),
         }
     }
 
     pub fn name(self) -> &'static str {
         match self {
+            Self::Auto => "auto",
             Self::Compute => "compute",
             Self::Hardware => "hw",
             Self::HardwareNearest => "hw-nearest",
@@ -57,10 +64,17 @@ impl RtMode {
         }
     }
 
+    /// Whether a run on an adapter without ray queries goes on, as compute, with a warning (what
+    /// the game does), instead of stopping with the reason: only for the default, which asked for
+    /// no backend in particular.
+    pub fn may_fall_back(self) -> bool {
+        self == Self::Auto
+    }
+
     /// The backend the main run (the flight, the sweep and the Edit stress) is on.
     pub fn main_backend(self) -> RtBackend {
         match self {
-            Self::Hardware => RtBackend::Hardware,
+            Self::Auto | Self::Hardware => RtBackend::Hardware,
             Self::HardwareNearest => RtBackend::HardwareNearest,
             Self::Compute | Self::Both => RtBackend::Compute,
         }
@@ -929,8 +943,13 @@ mod tests {
     }
 
     #[test]
-    fn the_flag_has_four_values_and_compute_is_the_default() {
-        assert_eq!(RtMode::default(), RtMode::Compute);
+    fn the_flag_has_five_values_and_auto_is_the_default() {
+        assert_eq!(RtMode::default(), RtMode::Auto);
+        assert_eq!(RtMode::parse("auto"), Ok(RtMode::Auto));
+        assert_eq!(RtMode::parse("compute"), Ok(RtMode::Compute));
+        assert_eq!(RtMode::Auto.main_backend(), RtBackend::Hardware);
+        assert!(RtMode::Auto.may_fall_back());
+        assert!(!RtMode::Hardware.may_fall_back());
         assert_eq!(RtMode::parse("hw"), Ok(RtMode::Hardware));
         assert_eq!(RtMode::parse("hw-nearest"), Ok(RtMode::HardwareNearest));
         assert_eq!(RtMode::parse("both"), Ok(RtMode::Both));

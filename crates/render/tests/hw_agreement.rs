@@ -132,6 +132,119 @@ fn the_shadows_of_both_hardware_variants_are_the_compute_backends() {
     }
 }
 
+/// Pixels of `a` that differ from `b`'s by more than two levels in any channel.
+fn differing_pixels(a: &render::Image, b: &render::Image) -> usize {
+    a.rgba
+        .chunks(4)
+        .zip(b.rgba.chunks(4))
+        .filter(|(a, b)| a.iter().zip(*b).any(|(&a, &b)| a.abs_diff(b) > 2))
+        .count()
+}
+
+/// The pitfall of #50's Part 2: the window's `set_scene` (`Tracer::replace_scene`) used to build the
+/// tracer through `Tracer::new`, so a window on the hardware backend was on compute after the
+/// Planet arrived, and nothing said so. `Offscreen::set_scene` is the same call; the check is of the
+/// tracer, not of what `rt()` says.
+#[test]
+fn after_set_scene_the_window_path_is_still_on_the_hardware_backend_and_draws_the_new_planet() {
+    let planet = small_scene();
+    let camera = Camera::looking_at([0.0, 1620.0, 100.0], [0.0, 1560.0, 0.0]);
+    for backend in [RtBackend::Hardware, RtBackend::HardwareNearest] {
+        // As the window starts: an empty scene, the Planet's ground level, then the Planet.
+        let mut gpu =
+            Offscreen::with_backend(Resolution::native(48, 27), &Scene::default(), backend)
+                .unwrap();
+        if gpu.rt().active != backend {
+            eprintln!("skipped: {:?}", gpu.rt().fallback);
+            return;
+        }
+        gpu.set_ground_level(1535.0);
+        gpu.set_scene(&planet).unwrap();
+        assert_eq!(gpu.backend(), backend, "the tracer fell back to compute");
+        assert_eq!(gpu.rt().active, backend);
+        assert!(gpu.hardware_update().is_some());
+        assert!(
+            gpu.hardware_instances() > 0,
+            "the new Planet's acceleration structures are made"
+        );
+        // And it draws the new Planet as compute does, with the settings the window made on the
+        // empty scene (the ground level) kept.
+        let mut compute = Offscreen::with_backend(
+            Resolution::native(48, 27),
+            &Scene::default(),
+            RtBackend::Compute,
+        )
+        .unwrap();
+        compute.set_ground_level(1535.0);
+        compute.set_scene(&planet).unwrap();
+        assert_eq!(compute.backend(), RtBackend::Compute);
+        let (got, want) = (gpu.render(&camera), compute.render(&camera));
+        let differing = differing_pixels(&got, &want);
+        assert!(
+            differing <= 48 * 27 / 100,
+            "{backend:?}: {differing} of {} pixels differ from compute's",
+            48 * 27
+        );
+        // A second Planet, as a new world would be: still hardware.
+        gpu.set_scene(&small_scene()).unwrap();
+        assert_eq!(gpu.backend(), backend);
+    }
+}
+
+/// The player's setting (#50, Part 2) changes at run time: the tracer is made again for the
+/// Planet on the other backend, with the settings it had (the image does not change), and
+/// where there are no ray queries asking for hardware leaves compute running with no error.
+#[test]
+fn the_players_setting_switches_the_backend_at_run_time_and_keeps_the_settings() {
+    let planet = small_scene();
+    let camera = Camera::looking_at([0.0, 1620.0, 100.0], [0.0, 1560.0, 0.0]);
+    let mut gpu =
+        Offscreen::with_backend(Resolution::native(48, 27), &planet, RtBackend::Hardware).unwrap();
+    if gpu.rt().active != RtBackend::Hardware {
+        eprintln!("skipped: {:?}", gpu.rt().fallback);
+        return;
+    }
+    gpu.set_ground_level(1535.0);
+    let on_hardware = gpu.render(&camera);
+
+    gpu.set_backend(&planet, RtBackend::Compute).unwrap();
+    assert_eq!(
+        (gpu.backend(), gpu.rt().active),
+        (RtBackend::Compute, RtBackend::Compute)
+    );
+    assert_eq!(
+        gpu.hardware_instances(),
+        0,
+        "no acceleration structures on compute"
+    );
+    let on_compute = gpu.render(&camera);
+    assert!(differing_pixels(&on_compute, &on_hardware) <= 48 * 27 / 100);
+
+    gpu.set_backend(&planet, RtBackend::Hardware).unwrap();
+    assert_eq!(
+        (gpu.backend(), gpu.rt().active),
+        (RtBackend::Hardware, RtBackend::Hardware)
+    );
+    assert!(gpu.hardware_instances() > 0);
+    assert_eq!(
+        gpu.render(&camera).rgba,
+        on_hardware.rgba,
+        "the same Planet on the same backend, with the same settings, is the same image"
+    );
+
+    // An adapter without ray queries: hardware cannot be had, compute runs, with no error.
+    let mut lacking =
+        Offscreen::without_ray_queries(Resolution::native(48, 27), &planet, RtBackend::Hardware)
+            .unwrap();
+    lacking.set_backend(&planet, RtBackend::Hardware).unwrap();
+    assert_eq!(lacking.backend(), RtBackend::Compute);
+    assert_eq!(lacking.rt().requested, RtBackend::Hardware);
+    assert_eq!(lacking.rt().active, RtBackend::Compute);
+    assert!(lacking.rt().fallback.is_some());
+    lacking.set_scene(&planet).unwrap();
+    assert_eq!(lacking.backend(), RtBackend::Compute);
+}
+
 /// A flat stone floor with a tall pillar at its middle, in a world whose up is +y: a long shadow.
 fn pillar_scene() -> Scene {
     let mut store = BrickStore::new();

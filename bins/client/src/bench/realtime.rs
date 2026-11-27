@@ -3364,6 +3364,14 @@ pub(super) fn catching<T>(
     }
 }
 
+/// The backend a run asks for, and whether it may go on as compute where the adapter has no ray
+/// queries (the bench's default, which asks for the game's own choice: #50).
+#[derive(Clone, Copy, Debug)]
+pub struct Asked {
+    pub backend: RtBackend,
+    pub may_fall_back: bool,
+}
+
 /// The `run`th run: its world, its GPU, and the paths. Also the Planet's `d0`.
 fn whole_run(
     full: bool,
@@ -3372,20 +3380,12 @@ fn whole_run(
     flat_ambient: bool,
     script: &Script,
     limit_ms: f64,
-    backend: RtBackend,
+    asked: Asked,
 ) -> Result<(RunReport, f64, RtChoice, Option<AccelSummary>), Failure> {
     // What the paths do is caught where the step is known; this catches the rest (making the
     // world, the GPU, and ending the run, which drops them).
     catch_unwind(AssertUnwindSafe(|| {
-        run_once(
-            full,
-            run,
-            resolution,
-            flat_ambient,
-            script,
-            limit_ms,
-            backend,
-        )
+        run_once(full, run, resolution, flat_ambient, script, limit_ms, asked)
     }))
     .unwrap_or_else(|payload| {
         Err(Failure {
@@ -3398,9 +3398,18 @@ fn whole_run(
 
 /// Whether the GPU context is on the backend that the run asked for. The hardware backend with no
 /// ray queries on the adapter would run on compute, and its gates would pass for the wrong thing:
-/// that is an error, and the reason is the adapter's.
-fn ran_as_asked(asked: RtBackend, choice: &RtChoice) -> Result<(), String> {
+/// that is an error, and the reason is the adapter's. **Unless the run asked for no backend in
+/// particular** (`may_fall_back`, the bench's default: the game's own choice, #50): the run goes on
+/// as compute, with a warning, and the report's `rt.active` and `rt.fallback` say so.
+fn ran_as_asked(asked: RtBackend, choice: &RtChoice, may_fall_back: bool) -> Result<(), String> {
     if asked.is_hardware() && !choice.active.is_hardware() {
+        if may_fall_back {
+            eprintln!(
+                "warning: the adapter cannot do ray queries ({}): this run is on the compute backend",
+                choice.fallback.as_deref().unwrap_or("no reason given")
+            );
+            return Ok(());
+        }
         return Err(format!(
             "--rt-backend {} was asked for, and the adapter cannot do it ({}): this would be a \
              compute run, and its gates would say nothing of the hardware backend",
@@ -3418,7 +3427,7 @@ fn run_once(
     flat_ambient: bool,
     script: &Script,
     limit_ms: f64,
-    backend: RtBackend,
+    asked: Asked,
 ) -> Result<(RunReport, f64, RtChoice, Option<AccelSummary>), Failure> {
     let failed = |step: &str, error: Box<dyn Error>| Failure {
         run,
@@ -3428,12 +3437,13 @@ fn run_once(
     let built = if full { build_full() } else { build_test() }
         .map_err(|e| failed("building the world", e))?;
     let d0 = built.setup.d0;
-    let mut gpu = Offscreen::with_backend(resolution, built.world.scene(), backend)
+    let mut gpu = Offscreen::with_backend(resolution, built.world.scene(), asked.backend)
         .map_err(|e| failed("making the GPU context", e))?;
     let choice = gpu.rt().clone();
     // A run that was asked to be on the hardware backend and is not has gates that say nothing of
     // it: it stops here, with the reason, and the mode exits with an error (status 1).
-    ran_as_asked(backend, &choice).map_err(|why| failed("making the GPU context", why.into()))?;
+    ran_as_asked(asked.backend, &choice, asked.may_fall_back)
+        .map_err(|why| failed("making the GPU context", why.into()))?;
     // The first build is the world's, not the run's: the log is of what the run did.
     gpu.take_hardware_updates();
     gpu.set_flat_ambient(flat_ambient);
@@ -3478,7 +3488,7 @@ pub fn run(
     flat_ambient: bool,
     budgets: &StreamingBudgets,
     stream_slice: Option<Duration>,
-    backend: RtBackend,
+    asked: Asked,
 ) -> RealTimeReport {
     let mut script = if full {
         Script::full()
@@ -3503,7 +3513,7 @@ pub fn run(
             flat_ambient,
             &script,
             budgets.frame_time_p99_ms,
-            backend,
+            asked,
         ) {
             Ok((report, d, rt, summary)) => {
                 d0 = d;
@@ -3533,7 +3543,7 @@ pub fn run(
         planet.push_str(", flat ambient");
     }
     let rt = RtRealTime {
-        requested: backend_name(choice.as_ref().map_or(backend, |c| c.requested)).to_string(),
+        requested: backend_name(choice.as_ref().map_or(asked.backend, |c| c.requested)).to_string(),
         active: backend_name(choice.as_ref().map_or(RtBackend::Compute, |c| c.active)).to_string(),
         fallback: choice.and_then(|c| c.fallback),
         accel,
@@ -4598,15 +4608,24 @@ mod tests {
             active,
             fallback: fallback.map(str::to_string),
         };
-        assert!(ran_as_asked(RtBackend::Hardware, &choice(RtBackend::Hardware, None)).is_ok());
+        assert!(
+            ran_as_asked(
+                RtBackend::Hardware,
+                &choice(RtBackend::Hardware, None),
+                false
+            )
+            .is_ok()
+        );
         let no_queries = choice(RtBackend::Compute, Some("the adapter has no ray queries"));
-        let why = ran_as_asked(RtBackend::Hardware, &no_queries).unwrap_err();
+        let why = ran_as_asked(RtBackend::Hardware, &no_queries, false).unwrap_err();
         assert!(
             why.contains("no ray queries") && why.contains("hw"),
             "{why}"
         );
+        // The bench's default asked for no backend in particular: it goes on, as compute.
+        assert!(ran_as_asked(RtBackend::Hardware, &no_queries, true).is_ok());
         // Compute asked for, compute run: nothing to say.
-        assert!(ran_as_asked(RtBackend::Compute, &choice(RtBackend::Compute, None)).is_ok());
+        assert!(ran_as_asked(RtBackend::Compute, &choice(RtBackend::Compute, None), false).is_ok());
     }
 
     #[test]

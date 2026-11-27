@@ -69,17 +69,21 @@ Options:
                    phase's sun-and-sky view (#52), 1 to 16 [default: the renderer's, 2]. The
                    report's `convergence.shadows.shadow_rays` says which; run it with 1 and with 2
                    to compare them
-  --rt-backend B   How rays find the Planet (#50): compute (the default: the compute-shader DDA),
-                   hw (ray queries over the bricks' tight boxes, with shadow rays that end at the
-                   first hit, for the flight, the sweep and the Edit stress and for the runs of
-                   `--streaming --real-time`, #236; the compute path, with
-                   a warning and the reason in the report's `rt.fallback`, if the adapter has no
-                   ray queries), hw-nearest (hw with shadow rays that look for the nearest hit) or
-                   both (the bench as for compute, then the same flight and Edit stress on hw, and
-                   the flight on hw-nearest, each on a context of its own, and the passes that cast
-                   rays compared: `rt.comparison`; with `--streaming --real-time`, the real-time
-                   runs on compute and then on hw: `rt.real_time_hw`). The report's `rt` says which ran and what the
-                   acceleration structures cost to update
+  --rt-backend B   How rays find the Planet (#50): auto (the default, and what the game does:
+                   ray queries where the adapter has them, else the compute path with a warning
+                   and the reason in the report's `rt.fallback`), compute (the compute-shader DDA:
+                   the game's setting for compute, and the reference), hw (ray queries over the
+                   bricks' tight boxes, with shadow rays that end at the first hit, for the flight,
+                   the sweep and the Edit stress and for the runs of `--streaming --real-time`,
+                   #236; the same as auto on an adapter with ray queries, and on one without them
+                   the compute path with a warning, and an error in the real-time mode, whose gates
+                   would say nothing of hw), hw-nearest (hw with shadow rays that look for the
+                   nearest hit) or both (the bench as for compute, then the same flight and Edit
+                   stress on hw, and the flight on hw-nearest, each on a context of its own, and
+                   the passes that cast rays compared: `rt.comparison`; with `--streaming
+                   --real-time`, the real-time runs on compute and then on hw:
+                   `rt.real_time_hw`). The report's `rt` says which ran and what the acceleration
+                   structures cost to update
   --hw-group-regions G
                    How the hardware backend (--rt-backend hw|both) makes its BLASes (#236): G
                    regions along an edge of each, 4, 8, 16 or 32, or NEAR:FAR@LEVEL (levels below
@@ -495,7 +499,7 @@ mod tests {
                 truth_spp: None,
                 flip_gamma22: false,
                 shadow_rays: None,
-                rt: RtMode::Compute,
+                rt: RtMode::Auto,
                 hw_group: None,
                 hw_blas_budget: None,
                 hw_wait: false,
@@ -513,7 +517,9 @@ mod tests {
 
     #[test]
     fn the_ray_backend_is_compute_unless_asked_and_a_bad_one_is_refused() {
-        assert_eq!(run(&[]).rt, RtMode::Compute);
+        // The default is what the player gets (#50): ray queries where the adapter has them.
+        assert_eq!(run(&[]).rt, RtMode::Auto);
+        assert_eq!(run(&["--rt-backend", "auto"]).rt, RtMode::Auto);
         assert_eq!(run(&["--rt-backend", "compute"]).rt, RtMode::Compute);
         assert_eq!(run(&["--rt-backend", "hw"]).rt, RtMode::Hardware);
         assert_eq!(
