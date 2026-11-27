@@ -86,6 +86,39 @@ table, or a run of the real-time mode that stopped on an error: that is 1 even w
 and `report.json` is still written, with everything done before it and the error, see "When a run
 stops").
 
+### The machine profile and the world map cache (#264)
+
+The client and the bench size their threads and memory from the machine (`crates/machine`, and
+`docs/perf/resource-audit.md`). Every run prints `machine: ...` first. To measure the low end on a
+bigger machine, put `--profile low-end` before the subcommand (or set `BHAYANAK_PROFILE=low-end`):
+4 threads, 5 GiB of free memory (the 8 GB machine's: Windows at idle leaves 4.5 to 5), 4 GB of
+video memory (not read by any budget yet) and no ray queries (the compute tracer), the GTX 1650 /
+RX 570 class that the project's low end is. The process is **pinned to 4 logical processors**, so
+that its threads, not only the work's, compete for 4 as on that machine (on Windows every thread; on
+Linux all but Mesa's shader disk-cache thread, which resets its own mask); the report's
+`machine.profile` says which (`pinned_cpus`, or why it was not pinned), the memory found and the
+LOD bias the client started at (1.5 at 5 GiB: the default 1.0 needs 9.7 GiB free). **A full-size
+real-time run of the default profile that did not start at 1.0 has `starting_bias` in
+`gates.over`**, since the gates are budgeted for 1.0; a run on fewer threads or less memory than the
+machine has (`machine.profile.lowered`) is not held to that. `--no-ray-queries` and
+`--video-memory-mib` alone do not exempt a run. `--threads N`, `--memory-mib N`,
+`--video-memory-mib N` and `--no-ray-queries` lower one thing at a time. A report from a constrained
+profile is not comparable with the budgets (they are the 4090's); it is for finding out whether the
+low end streams, holds its memory and loads in a reasonable time. The `needs-stream-bench` run of a
+PR that changes the load or the loader runs both, the default and `--profile low-end`.
+
+The 320 km world map takes 11 s to build on 8 threads of the dev box (it was 24 s before #264) and
+is kept in a file after the first build: `%LOCALAPPDATA%\bhayanakvoxel` on Windows,
+`$XDG_CACHE_HOME` or `~/.cache` elsewhere (`BHAYANAK_CACHE_DIR` sets the folder,
+`BHAYANAK_NO_MAP_CACHE=1` turns the cache off). A cached map is read and checked in well under a
+second, and a file that is corrupt, short, or made by another generator version or seed is built
+again and written over. The key includes the hash of a tiny map made by the build itself, so a
+change to the build that was not given a version bump is not loaded stale. Temporary files that a
+killed launch left are deleted after 5 minutes, and the folder keeps the 3 maps used last.
+`client map-build [--no-write]` builds cold, writes, reads back, checks that
+the hashes are the same and prints the time of each stage: a report that wants the cold figure
+runs it first, or runs the bench with `BHAYANAK_NO_MAP_CACHE=1`.
+
 ### What it does
 
 1. Generates the test Planet and uploads it to the GPU, each brick at the level of detail its
@@ -1951,11 +1984,14 @@ rays; those that need ray queries skip themselves, printing why, where there are
 
 ```
 {
-  "schema_version": 37,
+  "schema_version": 38,
   "build":   { "version", "commit" },          // commit: CI builds only, else null; on a PR
                                                // build it is GitHub's merge commit, not the head
   "machine": { "gpu", "device_type", "driver", "driver_info", "backend", "os", "arch",
-               "timers_supported" },
+               "timers_supported",
+               "profile": { "threads", "memory_mib", "video_memory_mib", "ray_queries",
+                            "found_threads", "found_memory_mib", "constrained", "pinning",
+                            "pinned_cpus", "starting_bias", "default_bias" } },  // #264
   "config":  { "width", "height", "output_width", "output_height", "scene", "path",
                "keyframes", "bias", "diag" },          // width, height: traced; output_*: upscaled
   "modes": {

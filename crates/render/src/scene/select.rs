@@ -43,7 +43,7 @@
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::hash::{BuildHasherDefault, Hasher};
-use std::sync::OnceLock;
+#[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
 use brick_store::{Brick, BrickCoord, BrickStore, TableSize, VOXELS_PER_METRE};
@@ -152,19 +152,25 @@ enum Due {
     },
 }
 
-/// Entries due at once from which looking at them is shared among threads: below this the threads
-/// cost more than they save (a thread is about 50 microseconds, and an entry about 0.2).
+/// Entries due at once from which looking at them is shared among threads: two pieces, below which
+/// a thread costs more than it saves (a thread is about 50 microseconds, and an entry about 0.2, so
+/// a piece of [`LOOK_PIECE`] is 0.4 ms).
 #[cfg(not(test))]
-const PARALLEL_FROM: usize = 32_768;
+const PARALLEL_FROM: usize = 2 * LOOK_PIECE;
 /// Under test, in the render library's own unit tests (`cargo test -p render --lib`), it is low
 /// enough for them to reach the threads, so that the thread-comparison test shows they change
 /// nothing. `cfg(test)` is not set for the client's stepped runs or for the tests in `render/tests`,
-/// which are built against the library without it and use the 32 768 above.
+/// which are built against the library without it and use the sizes above.
 #[cfg(test)]
 const PARALLEL_FROM: usize = 64;
 
-/// The most threads that look at due entries, and at most half of the machine's.
-const MOST_THREADS: usize = 4;
+/// Entries in a piece of the look at due entries, and of the look for holes: a fixed number, so
+/// that the pieces are the same whatever the number of threads, which take the next piece as they
+/// finish one. It was one share a thread, over at most 4 threads and half the machine's (#264).
+#[cfg(not(test))]
+const LOOK_PIECE: usize = 2048;
+#[cfg(test)]
+const LOOK_PIECE: usize = 16;
 
 /// Looks at each of the `due` entries (a stamp and a node): whether the node changes, or when it
 /// may. Each is looked at alone (the nodes are only read), so a long list is shared among threads,
@@ -178,9 +184,7 @@ fn look_at_due(
     changes: &(impl Fn(Key, f64, bool, bool) -> bool + Sync),
     slack: &(impl Fn(Key, f64, bool, bool) -> f64 + Sync),
 ) -> Vec<Due> {
-    let threads = std::thread::available_parallelism()
-        .map_or(1, |n| n.get() / 2)
-        .clamp(1, MOST_THREADS);
+    let threads = machine::bulk_threads();
     look_at_due_by(
         nodes,
         due,
@@ -230,26 +234,15 @@ fn look_at_due_by(
     map_shared(due, threads, &look)
 }
 
-/// `look` of each of `items`, in their order, shared among `threads` (one: here and now).
+/// `look` of each of `items`, in their order, shared among `threads` (one: here and now) in pieces
+/// of [`LOOK_PIECE`]. The threads run at the lowest priority the client gives them
+/// ([`set_worker_start`]).
 fn map_shared<T: Sync, R: Send>(
     items: &[T],
     threads: usize,
     look: &(impl Fn(&T) -> R + Sync),
 ) -> Vec<R> {
-    if threads <= 1 {
-        return items.iter().map(look).collect();
-    }
-    let share = items.len().div_ceil(threads).max(1);
-    std::thread::scope(|scope| {
-        let parts: Vec<_> = items
-            .chunks(share)
-            .map(|part| scope.spawn(|| part.iter().map(look).collect::<Vec<_>>()))
-            .collect();
-        parts
-            .into_iter()
-            .flat_map(|part| part.join().expect("a thread that looks at due entries"))
-            .collect()
-    })
+    machine::par_map_with(items, LOOK_PIECE, threads, machine::worker_start(), look)
 }
 
 /// A node that is close enough to the edge of its hysteresis to be looked at every frame.
@@ -478,52 +471,27 @@ fn decide(store: &BrickStore, level: usize, coord: BrickCoord, p: impl FnOnce() 
 /// before into the tree.
 const PLAN_CHUNK: usize = 1 << 16;
 
-/// What each thread of [`par_map`] runs before it starts: the client lowers their priority with it
-/// (`priority.rs` there). Making the scene again from nothing on every core at the frame thread's
-/// priority kept the frame thread from waking for 30 ms at a time (#168): on the 4090, 26 to 31
-/// frames over the limit while the scene thread made the scene again.
-static WORKER_START: OnceLock<fn()> = OnceLock::new();
-
-/// Sets what each thread of [`par_map`] runs before it starts. Once: a second call changes nothing.
+/// Sets what each thread of [`par_map`], the look at due entries and the look for holes runs before
+/// it starts: the client lowers their priority with it (`priority.rs` there). Making the scene again
+/// from nothing on every core at the frame thread's priority kept the frame thread from waking for
+/// 30 ms at a time (#168): on the 4090, 26 to 31 frames over the limit while the scene thread made
+/// the scene again. Once: a second call changes nothing.
 pub fn set_worker_start(start: fn()) {
-    let _ = WORKER_START.set(start);
+    machine::set_worker_start(start);
 }
 
-/// `f` of each of `items`, in order, on as many threads as the machine has. Generating the
-/// bricks of a Planet is what takes the time, and it does not depend on the order.
+/// `f` of each of `items`, in order, on the machine's threads but one (the frame thread's, see
+/// [`machine::bulk_threads`]), in pieces of 16 items that the threads take as they finish one.
+/// Generating the bricks of a Planet is what takes the time, and it does not depend on the order.
 pub fn par_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R> {
     const BLOCK: usize = 16;
-    let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
-    if threads == 1 || items.len() <= BLOCK {
-        return items.iter().map(f).collect();
-    }
-    let next = AtomicUsize::new(0);
-    let mut parts: Vec<(usize, Vec<R>)> = std::thread::scope(|scope| {
-        let workers: Vec<_> = (0..threads)
-            .map(|_| {
-                scope.spawn(|| {
-                    if let Some(start) = WORKER_START.get() {
-                        start();
-                    }
-                    let mut mine = Vec::new();
-                    loop {
-                        let from = next.fetch_add(BLOCK, AtomicOrdering::Relaxed);
-                        if from >= items.len() {
-                            break mine;
-                        }
-                        let to = (from + BLOCK).min(items.len());
-                        mine.push((from, items[from..to].iter().map(&f).collect()));
-                    }
-                })
-            })
-            .collect();
-        workers
-            .into_iter()
-            .flat_map(|w| w.join().expect("a worker panicked"))
-            .collect()
-    });
-    parts.sort_unstable_by_key(|&(from, _)| from);
-    parts.into_iter().flat_map(|(_, part)| part).collect()
+    machine::par_map_with(
+        items,
+        BLOCK,
+        machine::bulk_threads(),
+        machine::worker_start(),
+        f,
+    )
 }
 
 /// Whether a node `distance` from the camera changes: what is drawn, or (for a whole node) whether
@@ -1327,43 +1295,35 @@ impl Selection {
         let threads = if self.nodes.len() < PARALLEL_FROM {
             1
         } else {
-            std::thread::available_parallelism()
-                .map_or(1, |n| n.get() / 2)
-                .clamp(1, MOST_THREADS)
+            machine::bulk_threads()
         };
         self.holes_by(store, threads)
     }
 
-    /// [`Selection::holes`] shared among `threads` (one: here and now). Each looks at every
-    /// `threads`th node of the table, whose order is the same for all of them.
+    /// [`Selection::holes`] shared among `threads` (one: here and now): the split nodes are listed
+    /// in one pass of the table, and their children looked for in pieces of [`LOOK_PIECE`] (it was
+    /// every thread walking the whole table to take every `threads`th node of it, so that more
+    /// threads were no faster).
     fn holes_by(&self, store: &BrickStore, threads: usize) -> usize {
-        let hole = |(&(level, coord), node): (&Key, &Node)| {
-            node.state == State::Split && !store.children_resident(level, coord)
-        };
+        let hole = |&(level, coord): &Key| !store.children_resident(level, coord);
+        let mut split = self
+            .nodes
+            .iter()
+            .filter(|(_, node)| node.state == State::Split)
+            .map(|(&key, _)| key);
         if threads <= 1 {
-            return self.nodes.iter().filter(|&entry| hole(entry)).count();
+            return split.filter(|key| hole(key)).count();
         }
-        std::thread::scope(|scope| {
-            let parts: Vec<_> = (0..threads)
-                .map(|first| {
-                    scope.spawn(move || {
-                        if let Some(start) = WORKER_START.get() {
-                            start();
-                        }
-                        self.nodes
-                            .iter()
-                            .skip(first)
-                            .step_by(threads)
-                            .filter(|&entry| hole(entry))
-                            .count()
-                    })
-                })
-                .collect();
-            parts
-                .into_iter()
-                .map(|part| part.join().expect("a thread that looks for holes"))
-                .sum()
-        })
+        let split: Vec<Key> = split.by_ref().collect();
+        machine::par_map_with(
+            &split,
+            LOOK_PIECE,
+            threads,
+            machine::worker_start(),
+            |key| usize::from(hole(key)),
+        )
+        .into_iter()
+        .sum()
     }
 
     /// Takes `key` off the bricks that wait, because its children will not be generated after all (the

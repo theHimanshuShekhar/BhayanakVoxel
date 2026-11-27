@@ -45,7 +45,7 @@ use brick_store::{Budget, VOXELS_PER_METRE};
 use net::{ServerEnd, loopback};
 use planet_gen::cost::{ExtraCost, ExtraCostStats};
 use planet_gen::planet::{interior_radius_for, max_radius_for, tangents};
-use planet_gen::world_map::{Relief, TEST_RADIUS, WORLD_MAP_SIZE, WORLD_RADIUS, WorldMap};
+use planet_gen::world_map::{Relief, TEST_RADIUS, WORLD_RADIUS, WorldMap};
 use render::reference::{Ray, trace};
 use render::{
     Camera, GpuPasses, Mode, Offscreen, Rebuild, Resolution, RtBackend, RtChoice, Scene,
@@ -1129,8 +1129,9 @@ struct SecondSum {
 /// The cold start: the world made, and the frames at the Spawn until the resident set is complete.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize)]
 pub struct ColdStart {
-    /// Generating the world map, which the client does before it loads the Planet: not in the time
-    /// to control. Null for the test Planet's.
+    /// Making the world map, which the client does before it loads the Planet: not in the time
+    /// to control. Built, or read from the cache folder (#264: the stderr line says which, and
+    /// `BHAYANAK_NO_MAP_CACHE=1` makes it built every time). Null for the test Planet's.
     pub world_map_s: Option<f64>,
     /// [`crate::load`]: the spawn ring, the Guard, and the first scene.
     pub load_s: f64,
@@ -1349,7 +1350,8 @@ pub struct Gates {
     /// nothing has not passed (a GPU with no timers has no pass times).
     pub gi_paths_timed: u64,
     /// The gates that are over: `frame_time`, `frame_cpu`, `holes`, `memory`, `soft_misses`,
-    /// `scene_lag`, `spawn_ring`, `time_to_control`, `settle`, `gi`.
+    /// `scene_lag`, `spawn_ring`, `time_to_control`, `settle`, `gi`, and `starting_bias`: a full-size
+    /// run of the default profile that did not start at the default LOD bias ([`ProfileReport`]).
     pub over: Vec<&'static str>,
 }
 
@@ -1529,6 +1531,74 @@ pub struct RealTimeReport {
     pub gen_extra_bricks: Option<u64>,
     /// `--peak-m` and `--trench-m` (#242): the ground the runs were on.
     pub relief: ReliefReport,
+    /// The machine the runs were on and what it was held to (#264). In the report's `machine.profile`
+    /// and not repeated here; it is what holds the full-size runs to the default LOD bias.
+    #[serde(skip)]
+    pub profile: ProfileReport,
+}
+
+/// What the machine had, what the run was held to, and the bias it started at (#264). Without
+/// this a report cannot say whether the gates were passed at the bias they are budgeted for: a
+/// machine with under 9.7 GiB free starts coarser (`bias_for`), which makes the gates easier.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct ProfileReport {
+    /// The profile the run used: threads, free memory (MiB), video memory (MiB, null if not
+    /// known; no budget reads it yet) and whether ray queries were allowed.
+    pub threads: usize,
+    pub memory_mib: u64,
+    pub video_memory_mib: Option<u64>,
+    pub ray_queries: bool,
+    /// What the machine had before a flag or the environment held the profile down.
+    pub found_threads: usize,
+    pub found_memory_mib: u64,
+    /// Whether the profile is different from the machine (`--profile low-end` and the rest, and
+    /// `--no-ray-queries` and `--video-memory-mib`), and whether it has fewer threads or less memory
+    /// than the machine has (`lowered`: only that makes the gates not apply).
+    pub constrained: bool,
+    pub lowered: bool,
+    /// What pinning the process to the profile's processors did, as a sentence; and the processors
+    /// (empty when it was not pinned).
+    pub pinning: String,
+    pub pinned_cpus: Vec<usize>,
+    /// The LOD bias that the client starts at on this machine (`bias_for` the profile's memory) and
+    /// the default's. **The gates are the default's: a default-profile run of the full-size mode
+    /// that starts at any other bias has `starting_bias` in `gates.over`.**
+    pub starting_bias: f64,
+    pub default_bias: f64,
+}
+
+impl ProfileReport {
+    /// This process's machine, profile and starting bias.
+    pub fn now() -> ProfileReport {
+        let (profile, found) = (machine::profile(), machine::found());
+        let pinning = machine::pinning();
+        ProfileReport {
+            threads: profile.threads,
+            memory_mib: profile.memory >> 20,
+            video_memory_mib: profile.video_memory.map(|v| v >> 20),
+            ray_queries: profile.ray_queries,
+            found_threads: found.threads,
+            found_memory_mib: found.memory >> 20,
+            constrained: machine::constrained(),
+            lowered: machine::lowered(),
+            pinning: pinning.describe(),
+            pinned_cpus: match pinning {
+                machine::Pinning::Pinned(cpus) => cpus,
+                _ => Vec::new(),
+            },
+            starting_bias: f64::from(crate::default_bias()),
+            default_bias: f64::from(crate::DEFAULT_BIAS),
+        }
+    }
+
+    /// Whether the gates of a full-size run on this machine are not at the bias they are budgeted
+    /// for: the run is not on a smaller machine on purpose (fewer threads or less memory than the
+    /// machine has, which is for finding out what the low end does, and says so) and the free memory
+    /// makes the client start coarser. `--no-ray-queries` or a video memory limit alone leave the
+    /// machine as it is and do not exempt a run.
+    pub fn bias_is_not_the_gates(&self) -> bool {
+        !self.lowered && self.starting_bias != self.default_bias
+    }
 }
 
 /// The ray backend of the real-time mode's runs (#236): the report's `rt` block, for the mode.
@@ -1576,6 +1646,7 @@ impl RealTimeReport {
             gen_extra_us_measured: None,
             gen_extra_bricks: None,
             relief: GenHooks::default().report(WORLD_RADIUS),
+            profile: ProfileReport::now(),
         }
     }
 
@@ -1698,10 +1769,9 @@ struct Setup {
 
 /// The Planet of the client, at full size: made as `main.rs` makes it.
 fn build_full(hooks: &GenHooks) -> Result<Built, Box<dyn Error>> {
-    eprintln!("real time: generating the world map...");
-    let began = Instant::now();
-    let map = hooks.relief(WorldMap::generate(crate::SEED, WORLD_MAP_SIZE));
-    let world_map = began.elapsed();
+    eprintln!("real time: making the world map (read from the cache if it is there)...");
+    let (map, world_map) = crate::world_map();
+    let map = hooks.relief(map);
     eprintln!("real time: loading the Planet...");
     let extra = hooks.extra();
     let began = Instant::now();
@@ -1769,7 +1839,7 @@ fn build_test(hooks: &GenHooks) -> Result<Built, Box<dyn Error>> {
     let source = store
         .source()
         .ok_or("the test Planet's store has a source")?;
-    let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let cores = machine::threads();
     let loader = Loader::new(source, spawn.position, bands, workers_for(cores));
     let (client, server) = loopback();
     let world = World::new(scene, Predictor::new(store), client).with_loader(loader);
@@ -3711,9 +3781,27 @@ pub fn run(
     report.gen_extra_us_measured = asked.hooks.extra_us.map(|_| extra.measured_us());
     report.gen_extra_bricks = asked.hooks.extra_us.map(|_| extra.bricks);
     report.relief = relief;
+    hold_to_the_default_bias(full, &mut report);
     match failure {
         Some(failure) => report.failed(failure),
         None => report,
+    }
+}
+
+/// The gates are budgeted for the default LOD bias. A full-size run of the default profile that
+/// started coarser (a machine with under 9.7 GiB free) did not pass them at it: it is over, with a
+/// name that says why, whatever else it measured. (The test Planet of `--short`, which CI runs,
+/// does not take its bands from the machine's memory, so it is not held to this; nor is a run of a
+/// constrained profile, which is for finding out what the low end does and says so.)
+fn hold_to_the_default_bias(full: bool, report: &mut RealTimeReport) {
+    if full && report.profile.bias_is_not_the_gates() {
+        eprintln!(
+            "real time: the client started at LOD bias {} on this machine ({} MiB free), not the {} that the gates are budgeted for: `starting_bias` is over. Run with --profile low-end to measure a constrained machine on purpose",
+            report.profile.starting_bias,
+            report.profile.found_memory_mib,
+            report.profile.default_bias
+        );
+        report.gates.over.push("starting_bias");
     }
 }
 
@@ -3745,6 +3833,97 @@ fn misses_by_second(miss_seconds: &[u32], last: Option<Instant>, began: Instant)
 mod tests {
     use super::super::stream::{Measured, test_planet};
     use super::*;
+
+    fn report_at(lowered: bool, starting_bias: f64) -> RealTimeReport {
+        let mut report = RealTimeReport::new("test".into(), 1.0, Vec::new(), &BUDGETS);
+        report.profile.constrained = lowered;
+        report.profile.lowered = lowered;
+        report.profile.starting_bias = starting_bias;
+        report.profile.default_bias = 1.0;
+        report
+    }
+
+    #[test]
+    fn a_full_size_run_of_the_default_profile_that_started_coarser_is_over_by_name() {
+        // A machine with the room: the default bias, nothing over.
+        let mut report = report_at(false, 1.0);
+        hold_to_the_default_bias(true, &mut report);
+        assert!(report.gates.over.is_empty(), "{:?}", report.gates.over);
+        // Under 8 GiB free: coarser, and the gates were not passed at the bias they are for.
+        let mut report = report_at(false, 1.2);
+        hold_to_the_default_bias(true, &mut report);
+        assert_eq!(report.gates.over, ["starting_bias"]);
+        assert_eq!(exit_code(&report, false), EXIT_OVER_BUDGET);
+        assert_eq!(exit_code(&report, true), 0, "--no-fail still says no");
+        // The smoke run on the test Planet (CI's lavapipe) and a run of a constrained profile are
+        // not held to it, and the report says what the bias was.
+        for (full, lowered) in [(false, false), (true, true), (false, true)] {
+            let mut report = report_at(lowered, 1.35);
+            hold_to_the_default_bias(full, &mut report);
+            assert!(report.gates.over.is_empty(), "{full} {lowered}");
+        }
+    }
+
+    #[test]
+    fn only_fewer_threads_or_less_memory_exempt_a_run_from_the_default_bias() {
+        let found = machine::Profile {
+            threads: 8,
+            memory: 6 * machine::GIB,
+            video_memory: None,
+            ray_queries: true,
+        };
+        let lowered = |profile: machine::Profile| {
+            profile.threads < found.threads || profile.memory < found.memory
+        };
+        let over = |profile: machine::Profile| {
+            let mut report = report_at(lowered(profile), 1.15);
+            report.profile.constrained = profile != found;
+            hold_to_the_default_bias(true, &mut report);
+            report.gates.over == ["starting_bias"]
+        };
+        // `--no-ray-queries`, `--video-memory-mib` and `BHAYANAK_RAY_QUERIES=0` change the profile
+        // and not the machine: the run is still over.
+        assert!(over(machine::Profile {
+            ray_queries: false,
+            ..found
+        }));
+        assert!(over(machine::Profile {
+            video_memory: Some(2 * machine::GIB),
+            ..found
+        }));
+        assert!(over(found));
+        // Fewer threads or less memory is a smaller machine on purpose: exempt.
+        assert!(!over(machine::Profile {
+            threads: 4,
+            ..found
+        }));
+        assert!(!over(machine::Profile {
+            memory: 5 * machine::GIB,
+            ..found
+        }));
+        assert!(!over(machine::Profile::LOW_END.limited_to(found)));
+    }
+
+    #[test]
+    fn the_report_of_the_machine_says_the_profile_the_pinning_and_the_starting_bias() {
+        let json = serde_json::to_value(ProfileReport::now()).unwrap();
+        for key in [
+            "threads",
+            "memory_mib",
+            "video_memory_mib",
+            "ray_queries",
+            "found_threads",
+            "found_memory_mib",
+            "constrained",
+            "pinning",
+            "pinned_cpus",
+            "starting_bias",
+            "default_bias",
+        ] {
+            assert!(json.get(key).is_some(), "{key}");
+        }
+        assert_eq!(json["default_bias"], 1.0);
+    }
 
     #[test]
     fn the_misses_by_second_cover_every_second_the_path_had() {

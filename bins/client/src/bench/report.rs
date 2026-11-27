@@ -234,7 +234,15 @@ use super::stream::StreamReport;
 /// `streaming_real_time.planet` says them too. With neither flag the values are 0, null, null and
 /// today's 2 km and 1 km. A report with a hook is the measurement of the gates' headroom, not of
 /// the game's own frame.
-pub const SCHEMA_VERSION: u32 = 37;
+///
+/// 38 (#264) adds `machine.profile`: the machine (`found_threads`, `found_memory_mib`),
+/// the profile the run was held to (`threads`, `memory_mib`, `video_memory_mib`, `ray_queries`,
+/// `constrained`), what pinning the process to its processors did (`pinning`, `pinned_cpus`), and
+/// the LOD bias the client started at (`starting_bias`, with the default's in `default_bias`). A
+/// full-size real-time run of the default profile that started at another bias (a machine with under
+/// 9.7 GiB free starts coarser) has `starting_bias` in `streaming_real_time.gates.over`. Nothing else is
+/// changed.
+pub const SCHEMA_VERSION: u32 = 38;
 
 /// One timed thing (a pass, or the GPU total of a profiler frame) in one mode, against its
 /// budget. In reference mode a profiler frame is one sample, so the entries of that mode have
@@ -467,6 +475,8 @@ pub struct Machine {
     pub arch: String,
     /// Without GPU timestamp queries there are no pass times, only frame times.
     pub timers_supported: bool,
+    /// The CPU side of the machine and what the run was held to (#264).
+    pub profile: super::realtime::ProfileReport,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -692,6 +702,7 @@ mod tests {
                 os: "linux".into(),
                 arch: "x86_64".into(),
                 timers_supported: true,
+                profile: crate::bench::realtime::ProfileReport::now(),
             },
             config: Config {
                 width: 64,
@@ -764,7 +775,7 @@ mod tests {
                 "streaming_real_time"
             ]
         );
-        assert_eq!(json["schema_version"], 37);
+        assert_eq!(json["schema_version"], 38);
         assert_eq!(json["rt"]["active"], "compute");
         assert_eq!(json["rt"]["comparison"], serde_json::Value::Null);
         assert_eq!(json["rt"]["real_time_hw"], serde_json::Value::Null);
@@ -778,6 +789,8 @@ mod tests {
         );
         assert_eq!(json["build"]["commit"], serde_json::Value::Null);
         assert_eq!(json["machine"]["timers_supported"], true);
+        assert!(json["machine"]["profile"]["starting_bias"].is_number());
+        assert!(json["machine"]["profile"]["pinning"].is_string());
         let pass = &json["modes"]["primary"]["passes"][0];
         // Stats are flattened into the entry; a figure that is missing is null, not absent.
         assert_eq!(

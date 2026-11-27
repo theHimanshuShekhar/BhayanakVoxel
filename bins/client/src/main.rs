@@ -7,6 +7,7 @@ mod fly;
 mod ghost;
 mod growth;
 mod loader;
+mod mapbuild;
 mod priority;
 mod scene_worker;
 mod settings;
@@ -94,8 +95,52 @@ const RING_LEVELS: usize = lod::LEVELS;
 /// Pixels of a touchpad's scrolling that make one line of a wheel.
 const PIXELS_PER_LINE: f32 = 20.0;
 
-/// The LOD bias the client starts with: output pixels one Voxel may cover. The overlay changes it.
+/// The least LOD bias the client starts with: output pixels one Voxel may cover. The overlay changes
+/// it. A machine with the memory for it starts with this ([`default_bias`]).
 const DEFAULT_BIAS: f32 = 1.0;
+
+/// What the client's process holds, in bytes, as a function of the LOD bias `b`:
+/// `MEMORY_FIXED + MEMORY_SCALED / b²`. Everything that grows with the draw distance (the
+/// tables, the scene's host buffers, the store) goes with `d0` squared, and `d0` with the bias,
+/// so it is `MEMORY_SCALED` over the square of the bias; the Guard, the spawn ring, the code and
+/// the runtime do not scale and are `MEMORY_FIXED`. Fitted to the 4090 PC's full-size runs of
+/// #264 (the largest `resident_peak_mib` sampled, which is what the estimate is for): 8850 MiB at
+/// a bias of 1.0 (the default profile; the runs measured 8377 to 8850) and 5228 MiB at 1.35 (the
+/// low-end profile, 5 GiB, pinned to 4 CPUs, compute tracer; 4941 to 5228), which gives about
+/// 825 MiB and 8025 MiB; these are a few MiB over that. (The 6.66 GiB of #167 was the resident set
+/// after the fill at 2 m, not the peak of the run, and the estimate built on it was 1.8 GiB short.)
+const MEMORY_FIXED: u64 = 830 * machine::MIB;
+const MEMORY_SCALED: u64 = 8_030 * machine::MIB;
+
+/// The share of the memory the machine has to use that the process may hold at its peak: a tenth
+/// is left to the system, the other programs and the estimate's error.
+const MEMORY_USED_AT_MOST: f64 = 0.9;
+
+/// The most the bias is raised to for want of memory: three times coarser than the default, a
+/// ninth of the memory. A machine with less than the 1.8 GiB that this needs runs at this and is
+/// short of memory at it: the game says so rather than refusing to start.
+const MOST_BIAS: f32 = 3.0;
+
+/// The LOD bias to start with on a machine that has `memory` bytes to use: the default where it
+/// has the memory for the default's peak (about 9.7 GiB to use), and coarser (a larger bias, so the bands are
+/// nearer in Voxels and fewer bricks are drawn and held) in the square root of the shortfall, up
+/// to [`MOST_BIAS`], so that a machine with little memory draws less far and less fine instead of
+/// running out of it. The floor of what it draws is the Guard (the whole Planet, coarse) and
+/// the ring round the player, which are the same on every machine. A multiple of 0.05, rounded
+/// up. The ceiling, on a machine with more memory than needed, is the default's bias: spending
+/// spare memory and GPU on quality is #230's.
+fn bias_for(memory: u64) -> f32 {
+    let usable = memory as f64 * MEMORY_USED_AT_MOST;
+    let room = (usable - MEMORY_FIXED as f64).max(machine::MIB as f64);
+    let wanted = (MEMORY_SCALED as f64 / room).sqrt();
+    let bias = ((wanted * 20.0).ceil() / 20.0) as f32;
+    bias.clamp(DEFAULT_BIAS, MOST_BIAS)
+}
+
+/// The LOD bias the client starts with on this machine ([`bias_for`] its profile's memory).
+fn default_bias() -> f32 {
+    bias_for(machine::profile().memory)
+}
 
 /// A Planet's bricks, packed for the GPU as the bricks the LOD `bands` select from `camera`. The
 /// store must have its pyramid ([`RING_LEVELS`] of it); its source gives the bricks it does not
@@ -543,7 +588,7 @@ fn load(
         ground,
         took: ring_took,
     } = generate_ground(map, reach, RING_LEVELS, extra);
-    let bands = Bands::standard(f64::from(DEFAULT_BIAS));
+    let bands = Bands::standard(f64::from(default_bias()));
     let room = room_for(bands);
     store.reserve(&room.held);
     store.reserve_resident(room.resident);
@@ -571,7 +616,7 @@ fn load(
     let guard_cells = (visible.len(), later.len());
     let selected = Instant::now();
     let mut scene = planet_scene(&store, camera.position, bands, planet.max_radius())?;
-    let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let cores = machine::threads();
     scene.reserve(room.nodes, room.waiting, room.stuck);
     // The horizon cap and the margins of ADR 0004, on from the start: the selection is only the
     // Guard and the spawn ring now, so looking at its bricks again is cheap.
@@ -642,10 +687,40 @@ fn load(
 /// cores in a release build (several times that in debug), so this runs on its own threads while
 /// the window is already up.
 fn load_planet() -> Loaded {
-    let started = Instant::now();
-    let map = WorldMap::generate(SEED, WORLD_MAP_SIZE);
-    eprintln!("world map generated in {:.1?}", started.elapsed());
+    let (map, _) = world_map();
     load(map, SPAWN_REACH, None).expect("the ground around the spawn fits the rings' buffers")
+}
+
+/// The full-size world map of the client's seed: read from the cache folder if it was made there
+/// before, built (on the machine's threads) and written there if not (#264, see
+/// `planet_gen::world_map::cache`). Says which, and how long it took, on stderr. The cache is
+/// the client's: a server builds its own map.
+fn world_map() -> (WorldMap, Duration) {
+    use planet_gen::world_map::cache;
+    let dir = cache::default_dir();
+    let made = cache::load_or_build(
+        dir.as_deref(),
+        SEED,
+        WORLD_MAP_SIZE,
+        WORLD_RADIUS,
+        machine::threads(),
+    );
+    match (&made.outcome, &made.stages) {
+        (cache::Outcome::Hit, _) => eprintln!("world map read from the cache in {:.2?}", made.took),
+        (cache::Outcome::Built(why), stages) => {
+            eprintln!("world map generated in {:.1?} ({why:?})", made.took);
+            if let Some(stages) = stages {
+                eprintln!("  stages {stages:.1?}");
+            }
+            match &made.wrote {
+                Some(Ok(took)) => eprintln!("  cached in {took:.2?}"),
+                Some(Err(why)) => eprintln!("  not cached: {why}"),
+                None => {}
+            }
+        }
+    }
+    let took = made.took;
+    (made.map, took)
 }
 
 /// The overlay's egui state. The hotbar is always shown, so it runs every frame; F1 only hides
@@ -810,7 +885,7 @@ impl App {
                 1.0 - hero_time_of_day(),
                 DEFAULT_DAY_LENGTH_SECONDS,
             )),
-            bias: DEFAULT_BIAS,
+            bias: default_bias(),
             still: Stillness::default(),
             title: String::new(),
             grabbed: false,
@@ -1610,11 +1685,24 @@ impl ApplicationHandler for App {
 
 fn main() -> Result<ExitCode, Box<dyn Error>> {
     // The threads that read and pack bricks for a scene made again run below the frame thread.
-    render::scene::select::set_worker_start(priority::lower_current_thread);
-    let mut args = std::env::args().skip(1);
+    machine::set_worker_start(priority::lower_current_thread);
+    // `--profile low-end`, `--threads N` and the rest of the machine's overrides (#264), before
+    // anything reads the machine.
+    let args = machine::take_flags(std::env::args().skip(1).collect())?;
+    // A constrained profile holds the whole process to its threads' processors, so that the frame
+    // thread, the scene thread, the simulation and the driver's threads share them too.
+    let pinning = machine::pin_to_profile();
+    eprintln!(
+        "machine: {}; {}; starting LOD bias {}",
+        machine::profile().describe(),
+        pinning.describe(),
+        default_bias()
+    );
+    let mut args = args.into_iter();
     match args.next().as_deref() {
         Some("bench") => return Ok(bench::main(args)),
         Some("lookdev") => return Ok(bench::lookdev::main(args)),
+        Some("map-build") => return Ok(mapbuild::main(args)),
         _ => {}
     }
     let event_loop = EventLoop::new()?;
@@ -1632,6 +1720,56 @@ mod tests {
 
     fn dot(a: [f64; 3], b: [f64; 3]) -> f64 {
         (0..3).map(|i| a[i] * b[i]).sum()
+    }
+
+    #[test]
+    fn the_bias_has_a_floor_at_the_default_and_a_ceiling_and_grows_as_memory_shrinks() {
+        let gib = machine::GIB;
+        // Memory to spare, up to the 4090 PC's (18.7 GiB to use): the default, never finer (that
+        // is #230's). 10 GiB is about the least that holds the default's 8.7 GiB peak.
+        for memory in [
+            10 * gib,
+            16 * gib,
+            18 * gib + 700 * machine::MIB,
+            64 * gib,
+            u64::MAX,
+        ] {
+            assert_eq!(bias_for(memory), DEFAULT_BIAS, "{memory} bytes");
+        }
+        // The low-end reference (8 GB, 5 GiB free): coarser, and its estimated peak is at most 90%
+        // of its memory (the 4090 measured 5228 MiB at 1.35, which was over 5 GiB: the estimate
+        // is fitted to that and to 8850 MiB at 1.0).
+        let low = bias_for(machine::Profile::LOW_END.memory);
+        assert_eq!(low, 1.5);
+        // Every bias holds the estimate under the share of the memory it may use, to the least
+        // memory that does not need the ceiling, and starts coarser the less there is.
+        for memory in (4..=10).map(|g| g * gib) {
+            let peak =
+                MEMORY_FIXED as f64 + MEMORY_SCALED as f64 / f64::from(bias_for(memory)).powi(2);
+            assert!(
+                peak <= memory as f64 * MEMORY_USED_AT_MOST,
+                "{memory}: {peak}"
+            );
+        }
+        // The estimate reproduces what the 4090 measured, a little over it.
+        let at = |bias: f64| {
+            (MEMORY_FIXED as f64 + MEMORY_SCALED as f64 / (bias * bias)) / machine::MIB as f64
+        };
+        assert!((8850.0..8950.0).contains(&at(1.0)), "{}", at(1.0));
+        assert!((5228.0..5330.0).contains(&at(1.35)), "{}", at(1.35));
+        // A tenth short of the default's memory is already coarser.
+        assert!(bias_for(9 * gib) > DEFAULT_BIAS);
+        // Less and less memory is coarser and coarser, to a ceiling, and nothing makes it fail.
+        let mut last = low;
+        for memory in [4 * gib, 3 * gib, 2 * gib, gib, 0] {
+            let bias = bias_for(memory);
+            assert!(
+                bias >= last && bias <= MOST_BIAS,
+                "{memory}: {bias} after {last}"
+            );
+            last = bias;
+        }
+        assert_eq!(bias_for(0), bias_for(gib));
     }
 
     #[test]

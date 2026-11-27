@@ -439,6 +439,7 @@ fn run(args: &Args) -> Result<u8, Box<dyn Error>> {
             os: std::env::consts::OS.to_string(),
             arch: std::env::consts::ARCH.to_string(),
             timers_supported,
+            profile: realtime::ProfileReport::now(),
         },
         config: Config {
             width: plan.width,

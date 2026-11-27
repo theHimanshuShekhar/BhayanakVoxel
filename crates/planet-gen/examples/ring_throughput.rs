@@ -23,7 +23,7 @@ fn main() {
     let seed = args
         .next()
         .map_or(0xB4A7_A9AC, |s| s.parse().expect("SEED"));
-    let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let threads = machine::threads();
     let started = Instant::now();
     let map = WorldMap::generate(seed, size);
     println!(

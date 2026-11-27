@@ -198,7 +198,9 @@ fn request_gpu_for(
         ..Default::default()
     }))?;
     let mut features = adapter.features();
-    if hide_ray_queries {
+    // The constrained profile (`--profile low-end`, `--no-ray-queries`, #264) is a machine without
+    // ray queries, so the compute tracer: the low-end run on any adapter.
+    if hide_ray_queries || !machine::profile().ray_queries {
         features.remove(wgpu::Features::EXPERIMENTAL_RAY_QUERY);
     }
     let choice = choose_backend(backend, features, &adapter.limits());
