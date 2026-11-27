@@ -14,7 +14,7 @@ shards that run in parallel (#263).
 | --- | --- |
 | `linux` | `cargo fmt --check`, clippy with `-D warnings`, `cargo test --doc --workspace` (nextest does not run doctests), the checks of the real-thread list (below), and the check that `server` does not depend on wgpu or winit. It runs no other tests. |
 | `linux-tests (1/5)` to `(5/5)` | `cargo nextest run --workspace` on lavapipe (software Vulkan) without the real-thread tests, a fifth of the tests each (hardware ray queries are the game's default backend since #50 Part 2, and lavapipe has them where its Mesa does: the goldens are matched on both backends, and `hw_agreement` holds the backends to each other; on a runner whose lavapipe has no ray queries those tests skip, and the log says `SKIPPED ...: why`, which is the "CI falls back to compute and says so" of the ticket). All five must be green. |
-| `windows-tests (slow)`, `(1/2)`, `(2/2)` | Tests of `brick-store`, `materials`, `net`, `planet-gen`, `sim`, `prefetch-sim` and `server`, and the client's unit tests that need no GPU and are not in the real-thread list, `slow` runs the two client streaming tests that take 8 to 13 minutes each (`flying_away_and_back_...`, `flying_with_margins_...`) and nothing else, `1/2` and `2/2` run the rest between them. The stepped streaming tests are among them. `slow` also runs the doctests. |
+| `windows-tests (slow)`, `(1/2)`, `(2/2)` | Tests of `brick-store`, `materials`, `net`, `planet-gen`, `sim`, `prefetch-sim` and `server`, and the client's unit tests that need no GPU and are not in the real-thread list. `slow` runs the two client streaming tests that take 8 to 13 minutes each (`flying_away_and_back_...`, `flying_with_margins_...`) and nothing else, `1/2` and `2/2` run the rest between them. The stepped streaming tests are among them. `slow` also runs the doctests. |
 | `windows-client` | Builds the release client and uploads it as the `client-windows` artifact, which the benchmark uses. |
 | `determinism` | The golden hash tests of `planet-gen` and `sim`, in debug and release, on Linux and Windows. (These run with `cargo test`, not nextest.) |
 
@@ -88,7 +88,7 @@ the client binary: the gating jobs skip a line in the whole workspace but the re
 it in the client binary only, so that test would run nowhere. The `linux` job also checks that
 nextest and libtest see the same tests, and that the filterset and the libtest filters select the same
 ones in the client binary. The script prints how many tests gate and how many run in the real-thread
-job (on 2026-11-27: 1539 and 16, the same under libtest and nextest), and how many gate in each crate.
+job (on 2026-11-27: 1554 and 17, the same under libtest and nextest), and how many gate in each crate.
 
 ## Stepped tests and real-thread tests
 
