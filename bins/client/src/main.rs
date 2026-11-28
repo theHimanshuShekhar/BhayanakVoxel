@@ -913,6 +913,14 @@ impl App {
                 Some(why) => eprintln!("ray tracing: compute ({why})"),
                 None => eprintln!("ray tracing: {}", rt.active.name()),
             }
+            eprintln!(
+                "gpu device: ray-query features {}",
+                if renderer.device_has_ray_queries() {
+                    "on (experimental opt-in)"
+                } else {
+                    "off"
+                }
+            );
         }
         if let Some(renderer) = &mut self.renderer {
             // The atmosphere measures the camera's height from the Planet's sea level.
@@ -1177,6 +1185,9 @@ impl App {
         if let Some(renderer) = &mut self.renderer {
             renderer.set_backend(scene, requested)?;
             eprintln!("ray tracing: {}", renderer.rt().active.name());
+            if let Some(note) = renderer.rt_note() {
+                eprintln!("ray tracing: {note}");
+            }
         }
         self.settings.ray_tracing = RayTracing::of(requested);
         if let Some(path) = &self.settings_path
@@ -1301,6 +1312,7 @@ impl App {
             backend: renderer.rt().requested,
         };
         let mut controls = before;
+        let rt_note = renderer.rt_note();
         let info = overlay::Info {
             timings: renderer.timings(),
             cpu: &self.cpu,
@@ -1320,6 +1332,7 @@ impl App {
             lod: self.world.as_ref().and_then(lod_info),
             rt_active: renderer.rt().active,
             rt_unavailable: renderer.rt_unavailable(),
+            rt_note: rt_note.as_deref(),
         };
         let input = gui.state.take_egui_input(window);
         let camera = &self.camera;

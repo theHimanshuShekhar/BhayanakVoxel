@@ -407,7 +407,7 @@ impl Offscreen {
         backend: RtBackend,
         hide_ray_queries: bool,
     ) -> Result<Self> {
-        let (adapter, device, queue, rt) =
+        let (adapter, device, queue, rt, _) =
             request_gpu_for(shared_instance(), None, timers, backend, hide_ray_queries)?;
         let info = adapter.get_info();
         let info = GpuInfo {
