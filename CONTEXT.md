@@ -50,6 +50,14 @@ _Avoid_: Overhang (one kind), stamp, 3D layer
 One of the few giant one-off Formations placed across the Planet from the seed, such as a 500 m arch or a sky archipelago, each where its Biome allows its kind. The everyday spires and arches are just Formations.
 _Avoid_: POI, wonder, structure (structures are buildings and villages)
 
+**Ore**:
+A Material dug to be turned into metal, fuel or gems, such as iron ore, coal or Skyrite. Ore lies in the ground as ordinary Voxels.
+_Avoid_: Resource (too broad), mineral
+
+**Vein**:
+One body of an Ore in the ground, whatever its shape: a seam along the strata, a winding streak, a pocket, or flecks in sand. Part of the generated terrain, not an Edit.
+_Avoid_: Deposit, node, lode
+
 **Plant**:
 One generated growth of Voxels that a Biome places: a tree, shrub, grass tuft, flower, fern, vine or fallen log, each grown differently from the seed. Its Voxels are ordinary Voxels, so digging cuts it like anything else, and the Planet does not remember which Voxels belong to which Plant. Part of the generated terrain, not an Edit.
 _Avoid_: Species, foliage, flora, vegetation (the informal name for Plants together)
