@@ -97,7 +97,7 @@ Every Milestone is **done** only when all of the following hold:
 | Edit and BVH updates | 1.0 ms |
 
 - Generation and streaming (restated 2026-11-10, measured by the streaming bench on the full-size Planet on the 4090):
-  - The player has control in ≤ ~2 s, on a 20 m full-detail ring; loading continues nearest first behind it.
+  - The player has control in ≤ ~5 s, on a 20 m full-detail ring, with the ring done in ≤ 4.5 s and control in ≤ 15 s on the low-end profile (relaxed from ~2 s by the owner on 2026-11-28, #247; the gates move with #287); loading continues nearest first behind it.
   - **No holes, ever**, and **zero soft misses at the speed-scaled level** on the 50 m/s flight paths, the vertical take-off and the 180° turn.
   - Full detail returns within a settle time after the camera slows or stops. The time is reported first and becomes a gate once measured.
   - The Guard (the whole Planet, coarse) is ready ≤ ~5 s after start, and the world map takes ≤ ~2 min (relaxed from ~1 min by the owner on 2026-11-26, #246).
