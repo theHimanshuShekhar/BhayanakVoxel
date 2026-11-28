@@ -31,7 +31,7 @@
 //! must bump [`GENERATOR_VERSION`](crate::GENERATOR_VERSION), which also keys the map's cache on
 //! disk (with saves), and update the golden hash in `tests/golden.rs`.
 
-use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use brick_store::VOXELS_PER_METRE;
@@ -47,6 +47,27 @@ pub const ELEVATION_UNITS_PER_METRE: i32 = 10;
 
 /// Voxels in one elevation unit: 2 for 5 cm Voxels, a whole number so that converting is exact.
 const VOXELS_PER_UNIT: f64 = VOXELS_PER_METRE / ELEVATION_UNITS_PER_METRE as f64;
+
+/// PROTOTYPE (#246, #267): the landform model's heights (8.19 km peaks, 4.2 km trenches) do not fit
+/// an `i16` of 10 cm, so the map stores them divided by this and reads them back through
+/// [`WorldMap::with_relief`]'s stretch (the peak over [`PEAK`] is 4.095, the trench over
+/// [`TRENCH`] 4.2; 4.1 is for the slope that the roughness is made from). Used only while
+/// [`use_landform_prototype`] is on, and main's constants and goldens are untouched.
+const LANDFORM_STRETCH: f32 = 4.1;
+
+static LANDFORM: AtomicBool = AtomicBool::new(false);
+
+/// PROTOTYPE (#246, #267): make the real Planet's map from the landform model (`lookdev
+/// --landform`, `gen-cost --landform`) instead of the noise. Off unless asked for, so the goldens
+/// are main's. Call it before the first map is made.
+pub fn use_landform_prototype(on: bool) {
+    LANDFORM.store(on, Ordering::Relaxed);
+}
+
+/// Whether [`use_landform_prototype`] is on.
+pub fn landform_prototype() -> bool {
+    LANDFORM.load(Ordering::Relaxed)
+}
 
 /// Whole Voxels in `metres`, rounded to the nearest: the way the generator turns a size in metres
 /// into the integer it works with.
@@ -236,6 +257,24 @@ impl Texel {
     }
 }
 
+/// PROTOTYPE (#267): what the per-brick layers read of a texel (see [`WorldMap::lie`]).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Lie {
+    /// Height above sea level, in Voxels, as [`WorldMap::elevation_at`] reads it.
+    pub elevation: f64,
+    /// [`Texel::drainage`], in `[0, 1]`.
+    pub drainage: f64,
+    /// The slope vector, along the ground and uphill: its length is the rise over the run.
+    pub grad: [f64; 3],
+    /// How much higher than the texel the mean of its four neighbours is, over the distance
+    /// between them: above 0 where the ground is concave (the foot of a slope).
+    pub curvature: f64,
+    /// The unit vector along the ground to the stored flow receiver; zero where there is none.
+    pub down: [f64; 3],
+    /// The unit vector from the Planet's centre through the middle of the texel.
+    pub up: [f64; 3],
+}
+
 /// The four texels that the elevation is interpolated between, over the square of the map
 /// between their centres: see [`WorldMap::elevation_cell`].
 #[derive(Clone, Copy, Debug)]
@@ -312,6 +351,9 @@ pub struct WorldMap {
     stretch: (f64, f64),
     /// Face by face, each row by row (`i` fastest).
     texels: Vec<Texel>,
+    /// PROTOTYPE (#267): each texel's flow receiver (see [`receivers`]), texel by texel as
+    /// `texels`; empty for a map that is not the landform model's.
+    flow: Vec<u8>,
 }
 
 impl WorldMap {
@@ -367,6 +409,20 @@ impl WorldMap {
         };
         let noise = lattice_radius(radius);
         let count = 6 * (size as usize).pow(2);
+        // PROTOTYPE (#246): the real Planet's map comes from the landform model, when asked.
+        if landform_prototype() && radius == WORLD_RADIUS && size >= 256 {
+            let map = Self::from_landform(seed, size, radius, noise, threads);
+            let times = BuildTimes {
+                raw: Duration::ZERO,
+                normalise: Duration::ZERO,
+                erode: Duration::ZERO,
+                drainage: Duration::ZERO,
+                texels: started.elapsed(),
+                total: started.elapsed(),
+                threads,
+            };
+            return (map, times);
+        }
         let mut raw = vec![0; count];
         par_fill(&mut raw, PIECE, threads, |index| {
             let (face, i, j) = split(size, index);
@@ -420,6 +476,7 @@ impl WorldMap {
             relief: Relief::DEFAULT,
             stretch: (1.0, 1.0),
             texels,
+            flow: Vec::new(),
         };
         (map, times)
     }
@@ -455,6 +512,87 @@ impl WorldMap {
     /// How far above and below sea level the ground of this map goes.
     pub fn relief(&self) -> Relief {
         self.relief
+    }
+
+    /// PROTOTYPE (#246): the map of the landform model. The model runs on its own grid of at most
+    /// 1024 texels a face (490 m, where erosion takes about a minute), and the map's texels
+    /// (245 m at 2048) are read from it bilinearly. Biomes come from the model's wind-band climate
+    /// and placeholder Biome table, roughed up with the old volcanic hot spots.
+    fn from_landform(seed: u64, size: u32, radius: i32, noise: i32, threads: usize) -> WorldMap {
+        let count = 6 * (size as usize).pow(2);
+        let lf = crate::landform_proto::generate((size as usize).min(1024));
+        // The model's highest peak is a little over the 8.15 km that the relief of 8.19 km holds: above
+        // 6.5 km heights are squeezed smoothly (not clipped) so that the highest is 8.15 km.
+        let top = lf.h.iter().copied().fold(f32::MIN, f32::max);
+        let squeeze = if top > 8_150.0 {
+            (8_150.0 - 6_500.0) / (top - 6_500.0)
+        } else {
+            1.0
+        };
+        eprintln!("landform: highest {top:.0} m, squeezed above 6.5 km by {squeeze:.3}");
+        // Stored as 10 cm units over the stretch that `relief` reads them back with.
+        let (up, down) = (
+            ELEVATION_UNITS_PER_METRE as f32 * PEAK as f32 / voxels(8_190.0) as f32,
+            ELEVATION_UNITS_PER_METRE as f32 * TRENCH as f32 / voxels(4_200.0) as f32,
+        );
+        let to_units = |m: f32| {
+            let m = if m > 6_500.0 {
+                6_500.0 + (m - 6_500.0) * squeeze
+            } else {
+                m
+            };
+            let scale = if m >= 0.0 { up } else { down };
+            (m * scale).round().clamp(-32_000.0, 32_000.0)
+        };
+        let mut eroded = vec![0i16; count];
+        par_fill(&mut eroded, PIECE, threads, |index| {
+            let (face, i, j) = split(size, index);
+            to_units(lf.height_at(centre(size, face, i, j))) as i16
+        });
+        let mut base = vec![0i16; count];
+        par_fill(&mut base, PIECE, threads, |index| {
+            let (face, i, j) = split(size, index);
+            to_units(lf.height0_at(centre(size, face, i, j))) as i16
+        });
+        let blank = Texel {
+            elevation: 0,
+            erosion: 0,
+            biome: Biome::Temperate,
+            regions: Regions::default(),
+            rough: 0,
+            drainage: 0,
+        };
+        let drainage = drainage(&eroded, size, threads);
+        let flow = receivers(&eroded, size, threads);
+        let mut texels = vec![blank; count];
+        par_fill(&mut texels, PIECE, threads, |index| {
+            let (face, i, j) = split(size, index);
+            let direction = centre(size, face, i, j);
+            let elevation = eroded[index];
+            let biome = landform_biome(&lf, seed, noise, direction, elevation);
+            Texel {
+                elevation,
+                erosion: (i32::from(base[index]) - i32::from(elevation)) as i16,
+                biome,
+                regions: regions(seed, noise, direction),
+                rough: roughness(
+                    slope(&eroded, size, noise, index) * f64::from(LANDFORM_STRETCH),
+                    biome,
+                    drainage[index],
+                ),
+                drainage: drainage[index],
+            }
+        });
+        WorldMap {
+            seed,
+            size,
+            radius,
+            relief: Relief::DEFAULT,
+            stretch: (1.0, 1.0),
+            texels,
+            flow,
+        }
+        .with_relief(Relief::of_metres(8_190.0, 4_200.0))
     }
 
     /// The seed the map was made from, which per-brick generation draws its own randomness from
@@ -572,6 +710,88 @@ impl WorldMap {
             rough,
             drainage,
         }
+    }
+
+    /// PROTOTYPE (#267): what the per-brick ridge, gully and talus layers read of the map. The
+    /// record of texel `(face, i, j)`, where `i` and `j` may be one beyond the face's edge, as
+    /// [`WorldMap::fields_beyond`] reads them (at a cube corner, the texel across the first edge).
+    pub(crate) fn lie(&self, face: usize, i: i32, j: i32) -> Lie {
+        let last = self.size as i32 - 1;
+        let (ci, cj) = (i.clamp(0, last) as u32, j.clamp(0, last) as u32);
+        let (face, i, j) = match (i != ci as i32, j != cj as i32) {
+            (false, false) => (face, ci, cj),
+            (true, _) => step(self.size, face, ci, cj, usize::from(i > 0)),
+            (false, true) => step(self.size, face, ci, cj, 2 + usize::from(j > 0)),
+        };
+        let radius = f64::from(self.radius);
+        let height = |(f, i, j): (usize, u32, u32)| {
+            let e = self.texel(f, i, j).elevation_voxels();
+            e * if e >= 0.0 {
+                self.stretch.0
+            } else {
+                self.stretch.1
+            }
+        };
+        let here = (face, i, j);
+        let to = |p: (usize, u32, u32)| centre(self.size, p.0, p.1, p.2).map(|c| c * radius);
+        let (p0, h0) = (to(here), height(here));
+        let sides: [(usize, u32, u32); 4] =
+            std::array::from_fn(|side| step(self.size, face, i, j, side));
+        let ps = sides.map(to);
+        let hs = sides.map(height);
+        // The slope vector g, along the ground, with g . (P_east - P_west) = the rise between
+        // them, and the same north to south: solved on the two chords.
+        let sub = |a: [f64; 3], b: [f64; 3]| -> [f64; 3] { std::array::from_fn(|k| a[k] - b[k]) };
+        let dot = |a: [f64; 3], b: [f64; 3]| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+        let (v1, v2) = (sub(ps[1], ps[0]), sub(ps[3], ps[2]));
+        let (d1, d2) = (hs[1] - hs[0], hs[3] - hs[2]);
+        let (a11, a12, a22) = (dot(v1, v1), dot(v1, v2), dot(v2, v2));
+        let det = a11 * a22 - a12 * a12;
+        let (u, w) = if det.abs() > 1e-9 {
+            ((d1 * a22 - d2 * a12) / det, (d2 * a11 - d1 * a12) / det)
+        } else {
+            (0.0, 0.0)
+        };
+        let grad: [f64; 3] = std::array::from_fn(|k| u * v1[k] + w * v2[k]);
+        let spacing = (a11.sqrt() + a22.sqrt()) / 4.0;
+        let mean = hs.iter().sum::<f64>() / 4.0;
+        let up = centre(self.size, face, i, j);
+        let mut down = [0.0; 3];
+        if let Some(&code) = self.flow.get(join(self.size, face, i, j))
+            && let Some(r) = receiver_of(self.size, face, i, j, code)
+        {
+            let d = sub(to(r), p0);
+            let along = dot(d, up);
+            let t: [f64; 3] = std::array::from_fn(|k| d[k] - up[k] * along);
+            let len = dot(t, t).sqrt();
+            if len > 0.0 {
+                down = t.map(|c| c / len);
+            }
+        }
+        Lie {
+            elevation: h0,
+            drainage: f64::from(self.texel(face, i, j).drainage) / 255.0,
+            grad,
+            curvature: (mean - h0) / spacing,
+            down,
+            up,
+        }
+    }
+
+    /// PROTOTYPE (#267): the texel `direction` is in.
+    pub(crate) fn lie_texel(&self, direction: [f64; 3]) -> (usize, u32, u32) {
+        locate(self.size, direction)
+    }
+
+    /// PROTOTYPE (#267): whether the map has the landform model's flow receivers.
+    pub fn has_flow(&self) -> bool {
+        !self.flow.is_empty()
+    }
+
+    /// PROTOTYPE (#267): a number that tells this map from another in the same process, for the
+    /// caches of threads.
+    pub(crate) fn lie_id(&self) -> usize {
+        self.texels.as_ptr() as usize ^ (self.seed as usize).rotate_left(17)
     }
 
     /// The unit vector from the Planet's centre through the middle of texel `(i, j)` of `face`.
@@ -1086,6 +1306,62 @@ fn roughness(slope: f64, biome: Biome, drainage: u8) -> u8 {
     ((0.3 + 0.7 * steep) * biome * valley * 255.0 + 0.5) as u8
 }
 
+/// The eight neighbours a flow receiver can be, as (di, dj): the four across the edges first.
+const NEIGHBOURS: [(i32, i32); 8] = [
+    (-1, 0),
+    (1, 0),
+    (0, -1),
+    (0, 1),
+    (-1, -1),
+    (1, -1),
+    (-1, 1),
+    (1, 1),
+];
+
+/// The texel that flow code `code` of texel `(face, i, j)` runs to (see [`receivers`]), `None` for
+/// no receiver.
+fn receiver_of(size: u32, face: usize, i: u32, j: u32, code: u8) -> Option<(usize, u32, u32)> {
+    if code >= 8 {
+        return None;
+    }
+    if code < 4 {
+        return Some(step(size, face, i, j, usize::from(code)));
+    }
+    let (di, dj) = NEIGHBOURS[usize::from(code)];
+    let (ni, nj) = (i.checked_add_signed(di)?, j.checked_add_signed(dj)?);
+    (ni < size && nj < size).then_some((face, ni, nj))
+}
+
+/// PROTOTYPE (#267): each land texel's flow receiver, as #241 stores it: the neighbour (D8: the
+/// four across the edges and the four diagonals inside the face) with the steepest drop, a code
+/// of 0 to 7 as [`NEIGHBOURS`] has them, and 255 for none (the sea, or a pit). A diagonal's drop is
+/// over its length. Integers and one division of integers, so the same on every machine.
+fn receivers(heights: &[i16], size: u32, threads: usize) -> Vec<u8> {
+    let mut out = vec![255u8; heights.len()];
+    par_fill(&mut out, PIECE, threads, |index| {
+        let here = i32::from(heights[index]);
+        if here < i32::from(SEA_LEVEL) {
+            return 255;
+        }
+        let (face, i, j) = split(size, index);
+        let mut best = (0i64, 255u8);
+        for code in 0..8u8 {
+            let Some((f, ni, nj)) = receiver_of(size, face, i, j, code) else {
+                continue;
+            };
+            let drop = i64::from(here - i32::from(heights[join(size, f, ni, nj)]));
+            // Drop over length, compared by cross-multiplying: 1 for the sides, 1.4142 (as
+            // 14142 / 10000) for the diagonals.
+            let scaled = drop * if code < 4 { 10_000 } else { 7_071 };
+            if scaled > best.0 {
+                best = (scaled, code);
+            }
+        }
+        best.1
+    });
+    out
+}
+
 /// How much water drains through each texel: land flows to its lowest neighbour (of four, the
 /// first on a tie) if that is lower than it, so the texels' areas add up from the high ground
 /// down to the sea or to a pit. The log of the area in texels, 16 to the doubling (the log is
@@ -1212,6 +1488,49 @@ fn biome(seed: u64, noise: i32, direction: [f64; 3], elevation: i16) -> Biome {
     } else if warmth < 0.2 {
         Biome::Snow
     } else if land && warmth > 0.4 && aridity > 0.3 {
+        Biome::Desert
+    } else {
+        Biome::Temperate
+    }
+}
+
+/// The biome of a landform-model texel: the placeholder Biome table's entry says snow, desert or
+/// neither, and the old volcanic hot spots stay. Oceans are ice where the model's sea is frozen.
+fn landform_biome(
+    lf: &crate::landform_proto::Landform,
+    seed: u64,
+    noise: i32,
+    direction: [f64; 3],
+    elevation: i16,
+) -> Biome {
+    let land = elevation >= SEA_LEVEL;
+    let name = lf.biome_at(direction);
+    let temp = lf.temp_at(direction);
+    if land && fractal(seed ^ VOLCANISM, noise, direction, PATCH_CELL, 4) > 0.5 && temp > -3.0 {
+        return Biome::Volcanic;
+    }
+    let snow = [
+        "GLACIAL PEAKS",
+        "ALPINE TUNDRA",
+        "ICE PLATEAU",
+        "FROZEN CANYON",
+        "GLACIAL VALLEY",
+        "ICE SHEET",
+        "TUNDRA",
+        "POLAR COAST",
+        "FROZEN SEA",
+    ];
+    let dry = [
+        "ROCKY BARRENS",
+        "MESA BADLANDS",
+        "BADLANDS CANYON",
+        "DRY VALLEY",
+        "DESERT",
+        "DUNE COAST",
+    ];
+    if snow.contains(&name) {
+        Biome::Snow
+    } else if dry.contains(&name) {
         Biome::Desert
     } else {
         Biome::Temperate

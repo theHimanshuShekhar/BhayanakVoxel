@@ -376,6 +376,7 @@ fn read(threads: usize, path: &Path, seed: u64, size: u32, radius: i32) -> Resul
         relief: Relief::DEFAULT,
         stretch: (1.0, 1.0),
         texels,
+        flow: Vec::new(),
     })
 }
 

@@ -4,6 +4,7 @@ mod day;
 mod dig;
 mod editor;
 mod fly;
+mod gencost;
 mod ghost;
 mod growth;
 mod loader;
@@ -1716,6 +1717,7 @@ fn main() -> Result<ExitCode, Box<dyn Error>> {
         Some("bench") => return Ok(bench::main(args)),
         Some("lookdev") => return Ok(bench::lookdev::main(args)),
         Some("map-build") => return Ok(mapbuild::main(args)),
+        Some("gen-cost") => return Ok(gencost::main(args)),
         _ => {}
     }
     let event_loop = EventLoop::new()?;

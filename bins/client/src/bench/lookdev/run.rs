@@ -67,10 +67,11 @@ fn day_times() -> [(&'static str, f64); 5] {
     ]
 }
 
-const USAGE: &str = "usage: client lookdev --out DIR [--size WxH] [--spp N] [--compare DIR] [--atmosphere] [--day] [--untinted] [--shot NAME]...\n  \
+const USAGE: &str = "usage: client lookdev --out DIR [--size WxH] [--spp N] [--compare DIR] [--atmosphere] [--day] [--untinted] [--landform [--proto-detail none|all|ridged,gullies,talus]] [--shot NAME]...\n  \
 --day (#203): instead of the combinations, the world clock's sky at dawn, the golden hour, noon, dusk and night\n  \
 (Reference and settled Primary) from the meadow, from orbit (the Zoom's far end) and in the cyan crystal cave\n  \
 (on lavapipe: client lookdev --out DIR --day --size 480x270 --spp 16)\n  \
+  --landform (#246, a prototype): the landform model's shots (orbit, 30 km over the continent, the greatest range at noon and dusk, a valley floor, a plateau edge, a river mouth, a canyon rim, and from #267 two on a steep flank), each found by searching the world map; --proto-detail (#267, a prototype) adds per-brick ridge, gully and talus detail\n  \
 the 4090: client.exe lookdev --out DIR [--compare OLD_SHEET_DIR]   (1280x720, 64 spp)\n  \
 --gi (#54): instead of the combinations, each shot (and the emissive room) at the game's settings as the Reference\n  \
 has it, as Primary was before the radiance cache (the flat ambient of 0.25), and as it is with the cache's GI\n  \
@@ -169,6 +170,10 @@ pub struct Options {
     pub untinted: bool,
     /// Only the shots whose names contain one of these (all of them if there are none).
     pub only: Vec<String>,
+    /// PROTOTYPE (#246): the landform model's shots, found by searching the world map.
+    pub landform: bool,
+    /// PROTOTYPE (#267): the per-brick ridge, gully and talus layers of the landform shots.
+    pub proto_detail: planet_gen::proto_detail::Set,
     /// A smoke test: the test Planet (the shots' places are not there: the images are of nothing
     /// in particular), two shots, tiny.
     pub short: bool,
@@ -186,6 +191,8 @@ fn parse(args: impl IntoIterator<Item = String>) -> Result<Options, String> {
         gi: false,
         untinted: false,
         only: Vec::new(),
+        landform: false,
+        proto_detail: planet_gen::proto_detail::Set::NONE,
         short: false,
     };
     let (mut have_out, mut size, mut spp) = (false, None, None);
@@ -211,6 +218,10 @@ fn parse(args: impl IntoIterator<Item = String>) -> Result<Options, String> {
             "--atmosphere" => options.atmosphere = true,
             "--day" => options.day = true,
             "--gi" => options.gi = true,
+            "--landform" => options.landform = true,
+            "--proto-detail" => {
+                options.proto_detail = planet_gen::proto_detail::Set::parse(&value("a set")?)?;
+            }
             "--untinted" => options.untinted = true,
             "--shot" => options.only.push(value("a name")?),
             "--help" | "-h" => return Err(USAGE.to_string()),
@@ -261,7 +272,7 @@ fn sun_for(camera: &Camera) -> Sun {
 }
 
 /// [`sun_for`] at another elevation (degrees), under the same rules.
-fn sun_at(camera: &Camera, elevation: f64) -> Sun {
+pub(super) fn sun_at(camera: &Camera, elevation: f64) -> Sun {
     let up = camera.horizon_up;
     let forward = camera.forward();
     let tilt = dot(forward, up);
@@ -465,6 +476,9 @@ fn write_sheet(
 
 /// Renders the shots, writes their images and the sheet, and returns the sheet's path.
 pub fn run(options: &Options) -> Result<PathBuf, Box<dyn Error>> {
+    if options.landform {
+        return super::landform::run(options);
+    }
     let began = Instant::now();
     std::fs::create_dir_all(&options.out)?;
     let ground_level = if options.short {
@@ -1116,7 +1130,7 @@ fn write_atmosphere_sheet(
 }
 
 /// The camera of a shot's stills: its second keyframe, or its first if it has one frame.
-fn still_camera(shot: &Shot) -> Camera {
+pub(super) fn still_camera(shot: &Shot) -> Camera {
     let path = shot.path();
     let frames = path.keyframe_frames(shot.frames);
     let still = *frames.get(1).unwrap_or(&frames[0]);
@@ -1127,7 +1141,7 @@ fn still_camera(shot: &Shot) -> Camera {
 /// history, so that the history is full of the sun's samples.
 const SETTLE_FRAMES: u32 = 32;
 
-fn settle_frames(options: &Options) -> u32 {
+pub(super) fn settle_frames(options: &Options) -> u32 {
     if options.short { 2 } else { SETTLE_FRAMES }
 }
 
