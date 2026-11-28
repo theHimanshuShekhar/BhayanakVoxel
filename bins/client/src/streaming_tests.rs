@@ -955,7 +955,7 @@ impl Held {
 #[test]
 #[ignore = "generates the full-size world map"]
 fn the_full_size_planet_streams_in_and_walking_over_it_does_not_stall() {
-    let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let cores = machine::threads();
     eprintln!(
         "{cores} cores, {} workers, load average at the start: {}",
         crate::loader::workers_for(cores),

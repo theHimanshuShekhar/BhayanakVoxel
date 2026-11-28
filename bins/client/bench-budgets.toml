@@ -5,6 +5,10 @@
 # This file is compiled into the executable. `client bench --budgets FILE` uses another file
 # instead; a copy of this one is the place to start.
 #
+# The bench runs the backend the game does (#50 Part 2): hardware ray queries where the adapter has
+# them, so these budgets hold the hardware backend on the 4090; `--rt-backend compute` holds the
+# compute fallback to the same numbers. The cave stills and the convergence phase are compute.
+#
 # The numbers come from the rendering decision (#10, "Frame budget"). A stage gets a line here
 # once there is a pass of that name; the rest are listed, commented out, for whoever adds the
 # pass. A budget for a pass that does not run is ignored (the report lists it); a pass that ran
@@ -27,7 +31,10 @@ upscale = 0.5
 # Edits and BVH updates (#10, 1 ms), held at the metric Edit rate (8 m3/s, #147): the mean over
 # every frame of the Edit stress of the whole-Planet bench, in which the largest Brush is dug and
 # placed in turn at the rate the server allows. It is CPU time (the Edit applied, the scene
-# packed, the writes sent), and not a GPU pass.
+# packed, the writes sent), and not a GPU pass. On the hardware backend (#50, the default) it also has
+# the Edit's update of the acceleration structures (the tight boxes made again by the GPU's box pass,
+# the BLASes of the groups the Edit touched, the TLAS), which the Edit stress waits for so that
+# their own time is in it: this is the "1 ms Edit+BVH" of #10 and #50.
 edits = 1.0
 
 # The longest Edit of the same stress on the frame thread (#156): planning it and changing level 0

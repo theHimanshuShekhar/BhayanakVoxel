@@ -196,7 +196,53 @@ use super::stream::StreamReport;
 /// still view, with `frames`, `luminance_ratio`, `bias` (FLIP against truth A), `residual` (the
 /// denoised settled frame against it), `raw_residual`, `denoiser_shift` and `denoised_limit`
 /// (each a FLIP score set, or null with FLIP off). Nothing else is changed.
-pub const SCHEMA_VERSION: u32 = 33;
+///
+/// 34 (#236, after #55's 33 on #203's 32; #55's note is its own paragraph) keeps the hardware backend's acceleration structures in step
+/// off the frame thread: `rt.accel` gains `sweep` (the sweep's own updates, no longer counted as
+/// the flight's or its warm-up's), each update `pending` (groups waiting for their rebuild) and
+/// each summary `pending_max` and `updates_waiting` (the updates that left groups waiting); the streaming real-time run takes `--rt-backend` (`streaming_real_time.rt`:
+/// `requested`, `active`, `fallback`, `accel`; `both` also puts the hardware run in `rt.real_time_hw`);
+/// every `Spread` has `p95_ms`; the real-time `frame_parts.update` counts the hardware
+/// backend's builds wherever they are encoded (also those of the draw), each path has `hardware` (null on
+/// compute: `wait_not_passes` by what the frame built, that cost by part per frame, the draw's submit and the TLAS's instances, `update_rest`, the BLASes and boxes a frame, the cost per BLAS), each
+/// summary `blas_urgent`, `blas_rebuilt_by_level`, `prims_rebuilt_by_level`, `tlas_instances_max`, `prims_total_max` and `phases_ms`, each Edit's update `phases_ms`, `edits_ground` and `rt.comparison.hw_edits_ground` (the Edit stress by the ground, on the run's backend and on hw, three times as long), each Edit stress's `frame_thread_parts`, `frame_thread_each` and `grown_bytes_each` (where an Edit's frame thread went), `group_regions` of `rt.comparison.hw_accel` and of the Edit stress's and real-time runs' `accel` (the context's own), `rt.hw_group_regions` and `streaming_real_time.rt.hw_group_regions` (what `--hw-group-regions` said), and an adapter that cannot
+/// run the hardware backend stops a real-time run that asked for it (an `error`, exit status 1); the slowest frames
+/// have `hw_blas`, `hw_blas_urgent`, `hw_boxes`, `hw_submits`, `hw_created`, `hw_pool_grew` and `hw_tlas_made` (null on compute), and `--hw-wait` makes the hardware's `wait` (and `wait_boxes`) the GPU's, with `gpu_blas` and `gpu_tlas` where the device times inside encoders (`hw_gpu_blas_ms`, `hw_gpu_tlas_ms` of the slowest frames). The `prepare_ms`/`build_ms` of an update are the frame thread's cost
+/// only; the GPU's own time is only in the Edit stress (it waits there); `memory` has `device_blocks`, `device_reserved_mib`, `device_allocated_mib`, `device_empty_blocks` and `device_empty_mib`
+/// (the allocator's blocks at the end of the run, of which it now keeps two that are empty: `third_party/gpu-allocator/PATCH.md`).
+///
+/// 35 (#251) adds to each real-time path `loader_latency` (how long the loader's jobs waited, by
+/// class `drawn`, `margin` and `prefetch` and by part `outbox`, `queued`, `made`, `waited` and
+/// `total`: `mean_ms`, `p99_ms` (the upper bound of its bin) and `over_100_ms`; `jobs` is the
+/// number taken in), `loader_ahead_mean`, `loader_ahead_max` and `loader_frames_at_max_ahead` (the
+/// jobs the workers have taken that the scene thread has not taken in, against `MAX_AHEAD`),
+/// `camera_soft_miss_by_level` (the camera misses by the level of the brick drawn whole) and
+/// `by_second` (a flight's seconds: the camera misses, the loader's queue, the bricks taken in and
+/// the scene thread's work in each), and to each `scene_thread` `pack_request_ms`, `pack_receive_ms`,
+/// `pack_hold_ms` and `pack_arrive_ms` (what `pack_ms` is made of). Nothing else is changed.
+///
+/// 36 (#50 Part 2) makes hardware ray queries the default: `rt.requested` can be `auto` (what
+/// `client bench` asks for with no `--rt-backend`: ray queries where the adapter has them, else
+/// compute with `rt.fallback` saying why), and a report without the flag is `auto` with `active`
+/// `hw`, where it was `compute`; `streaming_real_time.rt.requested` is then `hw`, which the run
+/// asked the GPU context for. Nothing else is changed.
+///
+/// 37 (#242) adds the generator's bench hooks to `streaming_real_time`: `gen_extra_us_asked`,
+/// `gen_extra_us_measured` and `gen_extra_bricks` (`--gen-extra-us`: an artificial CPU cost of each
+/// generated brick, and what each charge really took), and `relief` (`--peak-m` and `--trench-m`:
+/// the ground's extent the runs were on, `stretched` or today's). The planet's label in
+/// `streaming_real_time.planet` says them too. With neither flag the values are 0, null, null and
+/// today's 2 km and 1 km. A report with a hook is the measurement of the gates' headroom, not of
+/// the game's own frame.
+///
+/// 38 (#264) adds `machine.profile`: the machine (`found_threads`, `found_memory_mib`),
+/// the profile the run was held to (`threads`, `memory_mib`, `video_memory_mib`, `ray_queries`,
+/// `constrained`), what pinning the process to its processors did (`pinning`, `pinned_cpus`), and
+/// the LOD bias the client started at (`starting_bias`, with the default's in `default_bias`). A
+/// full-size real-time run of the default profile that started at another bias (a machine with under
+/// 9.7 GiB free starts coarser) has `starting_bias` in `streaming_real_time.gates.over`. Nothing else is
+/// changed.
+pub const SCHEMA_VERSION: u32 = 38;
 
 /// One timed thing (a pass, or the GPU total of a profiler frame) in one mode, against its
 /// budget. In reference mode a profiler frame is one sample, so the entries of that mode have
@@ -429,6 +475,8 @@ pub struct Machine {
     pub arch: String,
     /// Without GPU timestamp queries there are no pass times, only frame times.
     pub timers_supported: bool,
+    /// The CPU side of the machine and what the run was held to (#264).
+    pub profile: super::realtime::ProfileReport,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -485,6 +533,11 @@ pub struct Report {
     /// The Edit stress: the largest Brush, dug and placed in turn at the metric rate, on the
     /// whole Planet; null for `--short`.
     pub edits: Option<EditsReport>,
+    /// The Edit stress again with the camera by the ground (2.4 m up), where the Edits are in
+    /// level 0 (`edits`' camera is a kilometre up, in the coarse levels); on the run's own backend:
+    /// `rt.comparison.hw_edits_ground` is the hardware's, to put by it (#236). Not held to a
+    /// budget. Null for `--short`.
+    pub edits_ground: Option<EditsReport>,
     /// The convergence phase (#187, left out by `--no-convergence`): how fast the Reference view
     /// gets clean, in two still views, scored against a truth. Not held to any budget; null with
     /// `--no-convergence` or when the phase fails (an error or a panic: the rest is still written).
@@ -649,6 +702,7 @@ mod tests {
                 os: "linux".into(),
                 arch: "x86_64".into(),
                 timers_supported: true,
+                profile: crate::bench::realtime::ProfileReport::now(),
             },
             config: Config {
                 width: 64,
@@ -681,6 +735,7 @@ mod tests {
             screenshots: vec!["primary-0.png".into()],
             budgets: summarize("embedded", &budgets(), &modes(0.5), &[], &[]),
             edits: None,
+            edits_ground: None,
             convergence: None,
             streaming: None,
             streaming_real_time: None,
@@ -690,6 +745,8 @@ mod tests {
                 fallback: None,
                 accel: None,
                 comparison: None,
+                real_time_hw: None,
+                hw_group_regions: "4".into(),
             },
             day_cycle: None,
         };
@@ -708,6 +765,7 @@ mod tests {
                 "convergence",
                 "day_cycle",
                 "edits",
+                "edits_ground",
                 "machine",
                 "modes",
                 "rt",
@@ -717,9 +775,10 @@ mod tests {
                 "streaming_real_time"
             ]
         );
-        assert_eq!(json["schema_version"], 33);
+        assert_eq!(json["schema_version"], 38);
         assert_eq!(json["rt"]["active"], "compute");
         assert_eq!(json["rt"]["comparison"], serde_json::Value::Null);
+        assert_eq!(json["rt"]["real_time_hw"], serde_json::Value::Null);
         assert_eq!(json["day_cycle"], serde_json::Value::Null);
         assert_eq!(json["convergence"], serde_json::Value::Null);
         assert_eq!(json["streaming"], serde_json::Value::Null);
@@ -730,6 +789,8 @@ mod tests {
         );
         assert_eq!(json["build"]["commit"], serde_json::Value::Null);
         assert_eq!(json["machine"]["timers_supported"], true);
+        assert!(json["machine"]["profile"]["starting_bias"].is_number());
+        assert!(json["machine"]["profile"]["pinning"].is_string());
         let pass = &json["modes"]["primary"]["passes"][0];
         // Stats are flattened into the entry; a figure that is missing is null, not absent.
         assert_eq!(

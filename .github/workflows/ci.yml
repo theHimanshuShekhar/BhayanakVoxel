@@ -15,43 +15,27 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # fmt, clippy, the doctests, the checks of the real-thread list, and the server's dependencies. The
+  # tests themselves are the `linux-tests` shards below.
   linux:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup-rust
+      - uses: ./.github/actions/setup-nextest
       # lavapipe is a software Vulkan driver, so render tests can create a device without a GPU.
       - name: Install lavapipe
         run: sudo apt-get update && sudo apt-get install -y mesa-vulkan-drivers
       - run: cargo fmt --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
-      # This includes the bench smoke test (bins/client/tests/bench.rs): `client bench --short` on
-      # lavapipe, with the report's schema checked. Its timings are not looked at.
-      # The client tests that are about real threads or real time are skipped here; the
-      # real-thread-tests job runs them (.github/real-thread-tests.txt lists them). The streaming
-      # tests that are about behaviour run stepped (no threads, no sleeps) and are run here.
-      - name: cargo test --workspace, without the real-thread tests
-        shell: bash
-        run: |
-          set -euo pipefail
-          mapfile -t filters < <(tr -d '\r' < .github/real-thread-tests.txt | grep -vE '^\s*(#|$)')
-          skips=()
-          for f in "${filters[@]}"; do skips+=(--skip "$f"); done
-          cargo test --workspace -- "${skips[@]}"
-        env:
-          # Where the golden image test writes actual.png, expected.png and diff.png on a mismatch.
-          GOLDEN_FAILURE_DIR: ${{ github.workspace }}/golden-failures
+      # nextest does not run doctests.
+      - run: cargo test --doc --workspace
       # The gating jobs skip a listed filter in the whole workspace, the real-thread job runs it in
       # the client binary only: a line that matches another crate's test would run it nowhere.
-      - name: Real-thread list matches no test outside the client binary
-        run: bash .github/scripts/check-real-thread-list.sh outside
-      - name: Upload golden image failures
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: golden-image-failures
-          path: golden-failures
-          if-no-files-found: ignore
+      # Also: nextest's filterset (the gating jobs') and libtest's filters (the real-thread job's)
+      # select the same tests, and the counts of each side are in the log.
+      - name: Real-thread list matches no test outside the client binary, and nextest agrees
+        run: bash .github/scripts/check-real-thread-list.sh all
       - name: Server must not depend on wgpu or winit
         shell: bash
         run: |
@@ -61,6 +45,51 @@ jobs:
             echo "::error::server must not depend on wgpu or winit"
             exit 1
           fi
+
+  # Every test of the workspace but the real-thread ones, with cargo-nextest, in five shards that run
+  # in parallel (`--partition hash`: a test's shard is a hash of its binary and name, so it is the same on every
+  # run, and the five together run every test once). This includes the bench smoke test
+  # (bins/client/tests/bench.rs): `client bench --short` on lavapipe, with the report's schema checked.
+  # Its timings are not looked at. The client tests that are about real threads or real time are left
+  # out here; the real-thread-tests job runs them (.github/real-thread-tests.txt lists them). The
+  # streaming tests that are about behaviour run stepped (no threads, no sleeps) and are run here.
+  linux-tests:
+    name: linux-tests (${{ matrix.shard }}/${{ matrix.of }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4, 5]
+        of: [5]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-rust
+      - uses: ./.github/actions/setup-nextest
+      - name: Install lavapipe
+        run: sudo apt-get update && sudo apt-get install -y mesa-vulkan-drivers
+      - name: cargo nextest run, without the real-thread tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          filterset=$(bash .github/scripts/real-thread-filterset.sh)
+          # One streaming test of the client (`flying_away_and_back_...`) is 10 to 15 minutes of CPU in
+          # an unoptimised build, and a shard cannot finish before its longest test does. The client and
+          # the render crate are built at opt-level 2 here, as Cargo.toml does for the crates that tests
+          # run through: that test is 1.7 times faster (403 s to 240 s, run alone), and it and every other test runs as written.
+          # Debug assertions and overflow checks stay on.
+          cargo nextest run --workspace --no-fail-fast \
+            --config profile.dev.package.client.opt-level=2 --config profile.dev.package.render.opt-level=2 \
+            --partition hash:${{ matrix.shard }}/${{ matrix.of }} -E "not ($filterset)"
+        env:
+          # Where the golden image test writes actual.png, expected.png and diff.png on a mismatch.
+          GOLDEN_FAILURE_DIR: ${{ github.workspace }}/golden-failures
+      - name: Upload golden image failures
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: golden-image-failures-${{ matrix.shard }}
+          path: golden-failures
+          if-no-files-found: ignore
 
   # The client tests that are about real threads or real time (the frame thread's milliseconds, a thread that is busy or panics), and the
   # sim's two wall-clock tests (an ignored test each: the kilometre walk's tick time and the server thread's 60 Hz), on both platforms. Some of
@@ -103,32 +132,67 @@ jobs:
           [ "$(grep -c '^test result: .* 1 passed' walk.out)" -eq 2 ] || { echo "::error::a wall-clock test of the sim did not run"; exit 1; }
 
   # Windows is the game's target. The runners have no Vulkan driver, so nothing here may need a GPU:
-  # no `render` tests and no tests/bench.rs.
+  # no `render` tests and no tests/bench.rs. The tests of the crates that need no GPU and the client's
+  # unit tests, minus the real-thread tests and the six that make an Offscreen renderer (a Vulkan
+  # device): the cave stills, the landscape golden, the crystals golden, the Edit stress of the bench,
+  # the look-dev smoke run and the log of the hardware backend's updates. Run with cargo-nextest in
+  # three jobs: `slow` runs the two client streaming tests that take 8 to 13 minutes of CPU each, and
+  # nothing else, so that they have the runner to themselves (a job cannot end before its longest test
+  # does, and next to other tests they took up to 13 minutes); `1/3` to `3/3` run every other test
+  # between them (`--partition hash`, as `linux-tests` does). The two tests are named in
+  # `.config/nextest.toml` too, which starts the slow tests of the other jobs first.
   windows-tests:
+    name: windows-tests (${{ matrix.label }})
     runs-on: windows-2025-vs2026
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: slow
+            partition: ""
+          - label: 1/3
+            partition: hash:1/3
+          - label: 2/3
+            partition: hash:2/3
+          - label: 3/3
+            partition: hash:3/3
     steps:
       - uses: actions/checkout@v4
+      # The one `nextest -p ... -p client` run resolves the crates' features differently from the old two
+      # `cargo test` commands (it builds windows-sys, egui-winit and ctrlc again), so it has a cache of its
+      # own: rust-cache would otherwise match the old `windows-tests` key and never save this build.
       - uses: ./.github/actions/setup-rust
-      - name: Tests of the crates that need no GPU
-        run: cargo test -p brick-store -p materials -p net -p planet-gen -p sim -p prefetch-sim -p server
-      # The client's unit tests, minus the real-thread tests and the five that make an Offscreen
-      # renderer (a Vulkan device): the cave stills, the landscape golden, the Edit stress of the bench,
-      # the look-dev smoke run and the log of the hardware backend's updates.
-      - name: Client tests that need no GPU, without the real-thread tests
+        with:
+          cache-key: nextest
+      - uses: ./.github/actions/setup-nextest
+      - name: Tests that need no GPU, without the real-thread tests
         shell: bash
         run: |
           set -euo pipefail
-          mapfile -t filters < <(tr -d '\r' < .github/real-thread-tests.txt | grep -vE '^\s*(#|$)')
-          skips=(
-            --skip bench::caves::tests::the_stills_are_timed_and_photographed
-            --skip bench::landscape::the_landscape_from_the_ground_500_m_and_20_km_matches_the_approved_images
-            --skip bench::crystals::a_cluster_on_a_sunlit_slope_and_a_crystal_cave_match_the_approved_images
-            --skip bench::edits::tests::the_largest_brush_is_dug_and_placed_in_turn_at_no_more_than_the_metric_rate
-            --skip bench::lookdev::run::tests::a_short_run_writes_a_folder_for_each_shot_and_a_sheet_that_names_every_image
-            --skip bench::tests::the_flights_updates_are_logged_by_where_in_the_run_they_were_made
-          )
-          for f in "${filters[@]}"; do skips+=(--skip "$f"); done
-          cargo test -p client --bin client -- "${skips[@]}"
+          filterset=$(bash .github/scripts/real-thread-filterset.sh)
+          gpu='test(~bench::caves::tests::the_stills_are_timed_and_photographed)'
+          gpu+=' | test(~bench::landscape::the_landscape_from_the_ground_500_m_and_20_km_matches_the_approved_images)'
+          gpu+=' | test(~bench::crystals::a_cluster_on_a_sunlit_slope_and_a_crystal_cave_match_the_approved_images)'
+          gpu+=' | test(~bench::edits::tests::the_largest_brush_is_dug_and_placed_in_turn_at_no_more_than_the_metric_rate)'
+          gpu+=' | test(~bench::lookdev::run::tests::a_short_run_writes_a_folder_for_each_shot_and_a_sheet_that_names_every_image)'
+          gpu+=' | test(~bench::tests::the_flights_updates_are_logged_by_where_in_the_run_they_were_made)'
+          slow='test(~streaming_tests::flying_away_and_back_keeps_the_store_within_its_budget) | test(~streaming_tests::flying_with_margins_evicts_the_trail)'
+          base="not ($filterset) and not ($gpu) and not binary_id(client::bench)"
+          if [ -z "${{ matrix.partition }}" ]; then
+            selection="($slow) and $base"
+            partition=()
+          else
+            selection="not ($slow) and $base"
+            partition=(--partition "${{ matrix.partition }}")
+          fi
+          # As in linux-tests, the client and render crates are built at opt-level 2.
+          cargo nextest run --no-fail-fast "${partition[@]}" \
+            --config profile.dev.package.client.opt-level=2 --config profile.dev.package.render.opt-level=2 \
+            -p brick-store -p machine -p materials -p net -p planet-gen -p sim -p prefetch-sim -p server -p client \
+            -E "$selection"
+      # nextest does not run doctests.
+      - run: cargo test --doc -p brick-store -p machine -p materials -p net -p planet-gen -p sim -p prefetch-sim -p server
+        if: matrix.label == 'slow'
 
   windows-client:
     runs-on: windows-2025-vs2026

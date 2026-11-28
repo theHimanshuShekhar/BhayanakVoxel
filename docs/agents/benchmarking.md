@@ -66,7 +66,12 @@ release: a debug build's CPU side is slow enough to distort the frame times.
 | `--flip-gamma-2-2` | Also score each checkpoint with the old gamma-2.2 curve (#188), from the same samples, to tell the sRGB move from the estimator's effect. Not with `--no-convergence` or `--short`. |
 | `--no-convergence` | Leave out the convergence phase (below), which otherwise runs after the caves. |
 | `--truth-spp N` | Samples of each of the convergence phase's two truths (the emissive room's have at least 8192 with FLIP, `ROOM_TRUTH_SPP`). Default 1024; ADR 0005's is 8192, which takes eight times as long (`client.exe bench --truth-spp 8192` is the 4090 baseline). At least 1024, the last checkpoint. |
-| `--rt-backend B` | How rays find the Planet (#50, a spike): `compute` (the default: the compute-shader DDA, the reference), `hw` (ray queries over the bricks' tight boxes, shadow rays ending at the first hit, for the flight, the sweep and the Edit stress), `hw-nearest` (`hw` with shadow rays that look for the nearest hit) or `both` (the bench as for `compute`, then the same flight and Edit stress on `hw` and the flight on `hw-nearest`, each on a context of its own, and the three compared). An adapter without ray queries runs compute with a warning and the reason in `rt.fallback`, not an error. See "The hardware ray backend" below. |
+| `--rt-backend B` | How rays find the Planet (#50): **`auto`** (the default, since #50 Part 2: what the player gets, ray queries where the adapter has them and else the compute path with a warning and the reason in `rt.fallback`), `compute` (the compute-shader DDA, the reference and the player's setting for compute), `hw` (ray queries over the bricks' tight boxes, shadow rays ending at the first hit, for the flight, the sweep and the Edit stress, and for `--streaming --real-time`'s runs, #236; on an adapter without them the same warning and fallback in the main bench, and an error in the real-time mode), `hw-nearest` (`hw` with shadow rays that look for the nearest hit) or `both` (the bench as for `compute`, then the same flight and Edit stress on `hw` and the flight on `hw-nearest`, each on a context of its own, and the three compared). See "The hardware ray backend" below. |
+| `--hw-group-regions G` | How the hardware backend makes its BLASes (#236): `G` regions along an edge of each, `4` (one cell), `8`, `16` or `32`, or `NEAR:FAR@LEVEL` (levels below LEVEL have BLASes of NEAR regions, the others FAR: `4:16@6`), or `NEAR:MID@LEVEL:FAR@LEVEL` (a third size from the second LEVEL up: `8:16@1:32@3`). **The default is `16:32@2`** (`PRODUCTION_GROUPING`): 16 regions for levels 0 and 1, 32 from level 2. The 4090's sweeps of #236: every real-time gate passes, its update `p95` is the lowest of the sizes tried (worst path 0.55 ms; 16 everywhere 0.91, 32 everywhere 0.57 with a soft-miss gate missed), 43% fewer BLASes than 16 everywhere, and its level 0 is 16's, whose Edit by the ground (`hw_edits_ground`) is 0.97 ms at `p95` (a finer level 0, `4:16@1`, 0.73). A BLAS is built again whole when any cell of it is stale, so bigger ones cost the frame thread less (fewer builds to record, fewer instances for a submit that traces to check) and the GPU more (more boxes a patch). The report's `rt.hw_group_regions` and `streaming_real_time.rt.hw_group_regions` say what the flag said, and `rt.comparison.hw_accel.group_regions` and the `group_regions` of an Edit stress's or a real-time run's `accel` what the context that ran had. |
+| `--hw-build-blas N` | The most BLASes a frame builds of the groups that may wait (#236), default no bound; the groups that may not wait (they gained boxes or have no BLAS, or waited too long) are built at once whatever it is, and a frame that built nothing builds one. It spreads a burst of builds over frames without breaking the hole rule: `accel.*.blas_urgent` and the paths' `hardware.blas_urgent` are what it cannot spread. |
+| `--hw-wait` | A diagnosis, not a measurement of the frame (#236): every update of the hardware backend waits for the GPU, so the paths' `hardware.wait` (and the slowest frames' `wait_ms`) is the GPU's time of the frame's boxes' pass, BLAS builds and TLAS. Use it to see whether a frame's `wait_not_passes` is the builds. The gates mean nothing with it. |
+| `--gen-extra-us N` | With `--real-time` (#242): an artificial CPU cost of `N` µs (0 to 1000) for each brick the generator is asked for, at every level, wherever generation runs (the loader's workers, the load's spawn ring and Guard cells). For the headroom curve of the streaming gates ("Headroom hooks" below). The report's `gen_extra_us_asked` and `gen_extra_us_measured` say what it was and what a charge really took. |
+| `--peak-m M`, `--trench-m M` | With `--real-time` (#242): today's world map with its heights stretched to peaks of `M` m (default 2000) and trenches of `M` m (default 1000); either alone changes only that side. A cost proxy for a taller ground column, not a new terrain ("Headroom hooks" below). The report's `relief` says what ran. |
 | `--no-fail` | Exit with status 0 even if a pass is over budget, a frame of the streaming mode has a hole, or a gate of the real-time mode is over. |
 
 It runs unattended. Without the convergence phase it takes a minute or so (generating the whole Planet is about 22 s of it); the convergence phase, on by default, adds about 45 s on the 4090 at the default `--truth-spp`, and more on a slower GPU or with a larger `--truth-spp`.
@@ -80,6 +85,39 @@ unreadable budgets file, a bad option, `--real-time` with budgets that have no `
 table, or a run of the real-time mode that stopped on an error: that is 1 even with `--no-fail`,
 and `report.json` is still written, with everything done before it and the error, see "When a run
 stops").
+
+### The machine profile and the world map cache (#264)
+
+The client and the bench size their threads and memory from the machine (`crates/machine`, and
+`docs/perf/resource-audit.md`). Every run prints `machine: ...` first. To measure the low end on a
+bigger machine, put `--profile low-end` before the subcommand (or set `BHAYANAK_PROFILE=low-end`):
+4 threads, 5 GiB of free memory (the 8 GB machine's: Windows at idle leaves 4.5 to 5), 4 GB of
+video memory (not read by any budget yet) and no ray queries (the compute tracer), the GTX 1650 /
+RX 570 class that the project's low end is. The process is **pinned to 4 logical processors**, so
+that its threads, not only the work's, compete for 4 as on that machine (on Windows every thread; on
+Linux all but Mesa's shader disk-cache thread, which resets its own mask); the report's
+`machine.profile` says which (`pinned_cpus`, or why it was not pinned), the memory found and the
+LOD bias the client started at (1.5 at 5 GiB: the default 1.0 needs 9.7 GiB free). **A full-size
+real-time run of the default profile that did not start at 1.0 has `starting_bias` in
+`gates.over`**, since the gates are budgeted for 1.0; a run on fewer threads or less memory than the
+machine has (`machine.profile.lowered`) is not held to that. `--no-ray-queries` and
+`--video-memory-mib` alone do not exempt a run. `--threads N`, `--memory-mib N`,
+`--video-memory-mib N` and `--no-ray-queries` lower one thing at a time. A report from a constrained
+profile is not comparable with the budgets (they are the 4090's); it is for finding out whether the
+low end streams, holds its memory and loads in a reasonable time. The `needs-stream-bench` run of a
+PR that changes the load or the loader runs both, the default and `--profile low-end`.
+
+The 320 km world map takes 11 s to build on 8 threads of the dev box (it was 24 s before #264) and
+is kept in a file after the first build: `%LOCALAPPDATA%\bhayanakvoxel` on Windows,
+`$XDG_CACHE_HOME` or `~/.cache` elsewhere (`BHAYANAK_CACHE_DIR` sets the folder,
+`BHAYANAK_NO_MAP_CACHE=1` turns the cache off). A cached map is read and checked in well under a
+second, and a file that is corrupt, short, or made by another generator version or seed is built
+again and written over. The key includes the hash of a tiny map made by the build itself, so a
+change to the build that was not given a version bump is not loaded stale. Temporary files that a
+killed launch left are deleted after 5 minutes, and the folder keeps the 3 maps used last.
+`client map-build [--no-write]` builds cold, writes, reads back, checks that
+the hashes are the same and prints the time of each stage: a report that wants the cold figure
+runs it first, or runs the bench with `BHAYANAK_NO_MAP_CACHE=1`.
 
 ### What it does
 
@@ -300,6 +338,82 @@ client.exe bench --streaming --real-time --out bench-out
 The rest of `client bench` runs first, as for `--streaming`. `--short --streaming --real-time` runs
 the same paths on the test Planet for a few seconds each, to see that it works: its times, on lavapipe,
 mean nothing.
+
+### Headroom hooks (#242)
+
+Two switches of the real-time mode measure how much the streaming gates can afford before the new
+terrain (#238) is written; they give the headroom curve that the per-brick cost budget (#247) is set
+from. Neither is in the game, both are off by default, and with neither the run, its goldens and
+its determinism are unchanged. Both apply to the real-time mode only (the stepped mode's counts are
+committed), full size or, with `--short`, on the test Planet.
+
+**`--gen-extra-us N`: extra cost per brick.** `planet_gen::cost::ExtraCost`, given to the Planet
+(`Planet::with_extra_cost`), spends `N` µs of CPU as each brick's generation starts (`Planet::generate`:
+the one place every brick, of any level, comes from). It is charged wherever generation runs: the
+loader's workers (children and Guard cells), the spawn ring and the visible Guard cells made in `load`
+(so time to control and Guard completion carry it), and a read of the store's source on the frame
+thread. What it is:
+- **Constant per brick, at every level.** A brick of any level evaluates the same 8 x 8 x 8 Voxels,
+  and today's per-brick cost is about flat across the levels the loader makes (`gen_rate`,
+  `docs/measurements.md`: 50 µs at level 0, 83 to 131 µs at levels 1 to 7), so `N` is the charge of
+  every brick, level 0 and coarse alike, and not scaled by level. A brick is charged whether it turns
+  out to be air, one layer or mixed (today's shortcuts decide the sky and the interior in a few µs;
+  a new terrain's noise would be evaluated before it knows).
+- **CPU work, not a sleep.** A loop of a splitmix64 hash whose each round depends on the last,
+  seeded by the brick's running number, its result passed to `black_box`. The rounds for a µs are
+  calibrated once per process (the median of 15 samples of 0.2 ms).
+- **It changes nothing generated**: not which bricks, not what they hold, not the counts hash
+  (`planet_gen::cost`, and the client's test `the_extra_cost_changes_no_count_of_the_stepped_run`).
+- **The report says what it did**: `streaming_real_time.gen_extra_us_asked` (`N`; 0 with no hook),
+  `gen_extra_us_measured` (the wall-clock mean of a charge over every charge of the finished runs, in
+  µs: a little over `N` on a busy machine, since a worker preempted in a charge counts its wait; 0
+  for `N` = 0; null with no hook) and `gen_extra_bricks` (the bricks charged, not deterministic).
+  Read `measured` against `asked` before reading anything else: a ratio far from 1 means the machine
+  was too busy for the sweep point to mean what it says. The planet's label has `, +N µs a brick`.
+
+**`--peak-m M --trench-m M`: a taller ground column.** `WorldMap::with_relief(Relief)`. The map is
+generated as ever (its texels, `content_hash`, biomes, slope-roughness, drainage and caves are
+today's), and **only the heights are stretched, linearly about sea level, where they are read**: an
+elevation above sea level is read `peak / 2000 m` times as high and one below it `trench / 1000 m`
+times as deep (`--peak-m 8000 --trench-m 4000` is 4 times, an exact power of two, each way; a test
+holds `elevation_at` to exactly 4 times the default's). The stored `i16` in 10 cm units is not
+touched, so the 3.27 km cap of #243 is not hit by this proxy. **What follows the range**, because it
+reads it from the map's `Relief` and not from the constants `PEAK` and `TRENCH`: the Planet's
+`max_radius` and `interior_radius` (so the Guard's cells and its box, the bands' and the horizon's
+top, the scene's `Bound`), the cave table's highest anchor, the bounds on the ground over a brick
+(`field_range`) and so every sky, sea, deep-rock and one-layer shortcut, and what the bricks of the
+stretched ground are (tests: `planet/tests/relief_tests.rs`: the bounds hold at every Voxel, no
+brick is its Voxels wrongly, `air_below` and `solid_below` are never claimed wrongly on the peak, the
+trench and the steepest ground). **What is not scaled**: horizontal distances (so slopes are 4 times
+as steep), the detail's amplitudes (20 m) and its thresholds in metres (the roughness reaches
+its full at 150 m of the stored height, since it reads the stretched height), the erosion, the
+continent shapes, the biome's choice, the strata depths, the sea level and the radius, the spawn's
+rule (it reads the stored height, 20 to 100 m, and a relief of up to 40 m on the stretched ground, so
+it is the same texel as today's if that is gentle enough, 4 times as high above sea), the bands'
+`d0`, the Guard's finest level (`GUARD_FIRST`) and the sizing constants and the store's and scene's
+budgets of `main.rs`. So the run measures what a 12 km column costs in more bricks near the surface
+on steep ground, a taller Guard and the deeper dives of the paths; a gate it fails may be one of
+those fixed capacities (read `memory`, `sizing` and the store's figures with it) and not the cost of
+generation. Today's 2 km and 1 km is the default and a test holds it bit for bit; `report.relief`
+says what ran (`peak_m`, `trench_m`, `column_m`, `max_radius_above_sea_m`,
+`interior_below_sea_m`, `stretched`).
+
+**Together** (`--streaming --real-time --gen-extra-us 100 --peak-m 8000 --trench-m 4000`) the
+charge is on every brick of the taller column.
+
+**A sweep** is one process per point (each is `--runs 3`, as ever; the gates use the worst), with
+`--no-fail` so that a point over its gates still writes its report:
+
+```
+client.exe bench --streaming --real-time --no-fail --out sweep/c000-r2000 --gen-extra-us 0
+client.exe bench --streaming --real-time --no-fail --out sweep/c100-r8000 --gen-extra-us 100 --peak-m 8000 --trench-m 4000
+```
+
+and for each report: `streaming_real_time.gates` (`over` and each gate's `worst` against its limit),
+`max.cold_start.time_to_control_s` against 2 s and `spawn_ring_s`, `max.cold_start.guard_complete_s`
+(reported, not gated) and `guard_s`, `max.cold_start.fill_s`, each path's soft misses (the camera's
+on the flights, gated) and holes (gated), the frame thread's CPU p99, `gen_extra_us_measured` against
+`_asked` and `relief`.
 
 ### What the 4090 script must pass
 
@@ -596,6 +710,22 @@ camera, and `holes_after_catch_up` the holes the look after it found, which must
     side** (the scene thread's following: the long slice's giving way to a camera that moves is
     for it), a miss in any other is **loader side** (a brick that the bands ask for is not there:
     the generator; decision A's curve, 3 levels at 50 m/s on levels 0 to 4, is in). The two add up to `camera_soft_miss_frames`.
+  - `loader_latency`, `loader_ahead_*`, `camera_soft_miss_by_level` and `by_second` (#251, schema 35;
+    reported, not gated, of the machine's clock): for telling why a flight has camera misses.
+    `loader_latency` is how long the jobs that the scene thread took in during the path waited (the
+    jobs that were generated: a job that was dropped is not in it),
+    by class (`drawn`: the bands split the brick; `margin`; `prefetch`) and by part: `outbox` (asked
+    for, until a sync handed it to the workers: a sync that finds them busy with the queue leaves it
+    there), `queued` (in the workers' queue until one took it), `made` (being generated), `waited` (made, in
+    the channel until the scene thread took it in) and `total`; each with `mean_ms`, `p99_ms` (the
+    upper bound of the bin that holds it: 0.5, 1, 2.5, 5, 10, 25, 50, 100, 250 ms, and 500 for over
+    250) and `over_100_ms`. `loader_ahead_mean`/`_max` and `loader_frames_at_max_ahead` are the jobs
+    the workers have taken that the scene thread has not (at `MAX_AHEAD`, 512, they wait).
+    `camera_soft_miss_by_level` is the camera misses by the level of the brick that was drawn whole
+    under the camera. `by_second` is a flight's seconds one by one (`second`, `frames`,
+    `camera_soft_misses`, `loader_queue_mean`/`_max`, `loader_ahead_mean`, `arrived_bricks`, the
+    scene thread's `scene_follow_ms`, `scene_pack_ms` and `scene_reband_ms`, `lag_d0_max`), to see
+    what the second of a miss looked like against the others. The summary prints all of it.
   - `scene_release_rebuilds`, `release_frame_ms_max` and `release_update_ms_max` (#168): how many
     times a finer depth made the scene again (`Rebuild::Release`, `scene_worker.rs` `RELEASE_REBUILD_OVER`,
     500 thousand nodes) instead of looking at its nodes again, and the frame thread's cost of the
@@ -650,13 +780,18 @@ camera, and `holes_after_catch_up` the holes the look after it found, which must
     A Still view waits for the absorbing to end (`World::caught_up`).
   - `scene_thread`: milliseconds the scene thread spent in the path on `follow` (selecting again
     for a new camera and packing what changed), `pack` (asking the loader, taking in what it made
-    and packing it), `upload` (publishing: copying what changed out for the frame thread, which
+    and packing it; **`pack_request_ms`, `pack_receive_ms`, `pack_hold_ms` and `pack_arrive_ms`
+    (#251) are parts of it, not more time**: asking the loader, taking in what it made, holding the
+    children in the store, and the scene's taking them in with the packing of what changed, the
+    rest of `pack` being the waits for locks and the loop; they are left out of the busy sum below),
+    `upload` (publishing: copying what changed out for the frame thread, which
     copies it to the GPU), `evict` (eviction), `coarse` (the coarse levels over an Edit) and
     `hole_scan` (the looks for holes), `release` (making the scene again for a depth that was
     given back, and the listing that was not looked at: `Rebuild::Release`), `reband` (looking again at the nodes that a change of the
     bands for the camera's speed listed, and packing what changed: **not in `follow`**; ADR 0009),
     and **`hole_scan_share`**: the looks' share of the scene
-    thread's **busy** time, which is the sum of the parts above and not wall time (a thread that is
+    thread's **busy** time, which is the sum of the parts above (`pack` once, not with its own parts)
+    and not wall time (a thread that is
     idle most of the time can still read high). **A path's figures are those of its frames: the look
     that is forced after the last frame is not in them**, so a path in which no look came due reads
     0 and not 100%; its time is `end_look_ms`. **While a look runs the scene thread publishes
@@ -735,6 +870,21 @@ camera, and `holes_after_catch_up` the holes the look after it found, which must
     word). The buffers are allocated whole and change only when one grows (#145), so this is the
     most over the run, after the growths. This is the VRAM the scene takes (at full size the
     bricks buffer alone is about 587 MB). Reported, not gated.
+  - `device_blocks`, `device_reserved_mib`, `device_allocated_mib`, `device_empty_blocks` and
+    `device_empty_mib` (#236): what the device's allocator keeps at the end of the run, for **all**
+    of the GPU's buffers, not the scene's: the memory blocks it holds, what they reserve, what is
+    allocated in them, and how many of the blocks have nothing in them and what those reserve
+    (`null` where the allocator cannot say). The allocator is the patched `gpu-allocator`
+    (`third_party/gpu-allocator/PATCH.md`), which **keeps up to two empty blocks** of a memory type
+    and destroys the rest, where the published crate destroys every empty block but the last: a
+    block made on a frame stalled the GPU for 6.5 to 7 ms before the builds' first command
+    (`hardware.gap_new_blocks`), on about 1% of the frames of cold start and of a flight. The
+    hardware backend also makes the blocks of `hw::SPARE_BUFFERS` buffers of 60 MiB when its scene
+    is made (two blocks, **384 to 512 MiB of VRAM** on a GPU, where blocks are 128 MiB and then
+    256), so the first builds find them. `device_empty_mib` is what is kept and nothing uses;
+    `device_reserved_mib` less `device_allocated_mib` less that is free space in blocks that are
+    used. A compute run reports them too, which is the compute default's reserve with the patch.
+    Reported, not gated (the gate is `scene_used_peak_mib`).
   - `scene_gpu_peak_growth_mib`, `scene_host_peak_growth_mib` and `scene_gpu_peak_rebuild_mib`:
     **the peak during a growth**, which `scene_reserved_mib` is not (it is the size after). While
     a buffer grows the old one and the new one both exist: the GPU's is the buffers' bytes before
@@ -1517,16 +1667,48 @@ it alone with fewer: `client bench --truth-spp 8192 --converged-frames 256`.
 
 ## The hardware ray backend (#50)
 
-A spike: are wgpu ray queries over procedural AABBs faster than the compute DDA on the rays that
-`trace()` casts (the primary rays, the sun shadows and the GI), at 5 cm on the 4090? The code is
-`crates/render/src/hw.rs` (the acceleration structures), `shaders/trace_hw.wgsl` (the shader) and
-`bins/client/src/bench/rt.rs` (the report). Compute is and stays the default and the reference; the
-hardware backend is chosen only by `--rt-backend hw|hw-nearest|both` (the player's game does not use
-it), and only on an adapter with `EXPERIMENTAL_RAY_QUERY` (`render::choose_backend`: no ray queries,
-or limits of 0, is the compute backend with a reason, never an error). Whether lavapipe has ray
-queries depends on its Mesa (the dev box's, 25.0.7, has them); the tests that compare the backends
-skip themselves, printing why, where it has none, and the fallback is tested through a device made
-without the feature (`Offscreen::without_ray_queries`).
+Wgpu ray queries over procedural AABBs were faster than the compute DDA on the rays that `trace()`
+casts (the primary rays, the sun shadows and the GI) on the 4090 (PR #233), and the owner adopted
+them on 2026-11-21: **hardware is the default wherever the adapter has ray queries, and the player
+can switch to compute** (Part 2). The code is `crates/render/src/hw.rs` (the acceleration
+structures), `shaders/trace_hw.wgsl` (the shader) and `bins/client/src/bench/rt.rs` (the report).
+
+**What changed for the bench in Part 2.** `client bench` with no `--rt-backend` is **`auto`**: the
+backend the game picks, so the gated runs (`client bench`, `client bench --streaming --real-time`)
+measure what players get. On the 4090 that is hardware, and the report's `rt.requested` is `auto`
+and `rt.active` is `hw`. **The budgets and the gates are the same numbers as before; they now
+hold the hardware backend**, and `edits` (the 1 ms Edit+BVH budget) now includes the
+acceleration-structure update of each Edit (the Edit stress waits for the builds, `set_wait`). An
+adapter without ray queries runs compute with a warning, `rt.active` `compute` and the reason in
+`rt.fallback` (the real-time mode, which refuses a **requested** `hw` on such an adapter because its
+gates would say nothing of it, goes on as compute for the default). **`--rt-backend compute` is the
+old default**: pass it to measure the player's setting for compute, the reference, or to compare
+with a report from before Part 2 (the report's schema is 37; a report with `requested`
+`compute` is what every earlier report was). `--rt-backend hw` is the same as `auto` on an adapter
+with ray queries; use it when the run must not be allowed to fall back (in the real-time mode it
+stops with the reason).
+
+Hardware is chosen only on an adapter with `EXPERIMENTAL_RAY_QUERY` (`render::choose_backend`: no
+ray queries, or limits of 0, is the compute backend with a reason, never an error). Whether
+lavapipe has ray queries depends on its Mesa (the dev box's, 25.0.7, has them); the tests that
+compare the backends skip themselves, printing `SKIPPED ...: why`, where it has none, and the
+fallback is tested through a device made without the feature (`Offscreen::without_ray_queries`).
+**CI's `linux-tests` shards** run the goldens on both backends (`golden.rs`'s `..._on_the_hardware_backend_`
+tests) and the whole of `hw_agreement`; it falls back to compute and says so in the log when the
+runner's lavapipe has no ray queries.
+
+**The player's setting.** The game (`bins/client/src/settings.rs`, the overlay's "Hardware ray
+tracing" checkbox) asks for hardware by default and keeps the player's choice in `settings.toml`
+(`ray_tracing = "hardware" | "compute"`) in the per-user config directory, or where
+`BHAYANAK_SETTINGS` says. The overlay shows which backend runs and why not hardware. The setting
+changes at run time (the tracer is made again for the Planet, so it takes a moment) and survives
+`set_scene`.
+
+**Tight boxes are in the brick.** The scene packs each mixed brick's tight box (the lowest and
+highest Voxel its mask sets) into its header word (`scene.rs`, `pack_header`); the box pass reads
+it, and the compute walk enters the brick through the same box (`hit_brick`, `walk_brick`):
+a ray that misses the box misses the brick, and the Voxel walk starts at the box's face and ends at
+its far side. An Edit packs the brick again, so the box is as new as the mask.
 
 **What is built.** One AABB for each non-empty brick of each ring level, as tight as the Voxels that
 the brick's occupancy mask has set (a solid or uniform region is one box of its whole 64-Voxel
@@ -1549,7 +1731,11 @@ primary rays, the GI's bounces and the path tracer's rays are the nearest-hit qu
 
 ```
 client.exe bench --rt-backend both --no-convergence --no-fail --out bench-out-rt
-client.exe bench --rt-backend hw --no-convergence --no-fail --out bench-out-hw   # the sweep too
+client.exe bench --no-convergence --no-fail --out bench-out-hw   # the default (auto: hw), the sweep too
+client.exe bench --rt-backend compute --no-convergence --no-fail --out bench-out-compute   # the old default
+# #236: the frame thread's update on the real-time streaming mode, hardware against compute
+client.exe bench --streaming --real-time --rt-backend both --out bench-out-rt-stream
+client.exe bench --streaming --real-time --out bench-out-rt-stream-hw   # the default (auto: hw), gated
 ```
 
 `both` is one process: the compute run is the ordinary bench; the hardware run is a second context
@@ -1560,40 +1746,88 @@ Edits). All are on the same GPU, driver and clocks. Read `rt.comparison`:
   and `compute_over_hw` (above 1, hardware is faster; null if a pass was not timed), and the same
   with `hw-nearest` (`hw_nearest_mean_ms`, `compute_over_hw_nearest`).
 - **`speedup.gpu_total` is the GPU time of the frame's passes and leaves out the hardware's
-  acceleration structure updates**, which happen between frames and wait for the GPU. For the frame
-  with them in, `hw_gpu_total_plus_accel_ms` is the hardware's mean `gpu_total` plus the flight's
-  updates' total cost (`hw_accel.flight.total_sum_ms`) spread over the measured frames, and
-  `compute_over_hw_with_accel` is compute's `gpu_total` over it. (The updates' time is mostly CPU
-  time with the GPU idle, so adding it to the GPU time is the frame's length if the update is on
-  the frame thread, as here, and not the GPU's work.)
+  acceleration structure updates**, which are submitted between frames (#236: they are not waited
+  for, so their GPU time is in no pass timer of the flight and in none of `frame_time`). For the
+  frame with them in, `hw_gpu_total_plus_accel_ms` is the hardware's mean `gpu_total` plus the
+  flight's updates' total cost (`hw_accel.flight.total_sum_ms`) spread over `flight_frames` (the
+  steady flight's frames, not every measured frame), and `compute_over_hw_with_accel` is compute's
+  `gpu_total` over it. Since #236 that total is the frame thread's cost (recording and
+  submitting); the GPU's own time for a build is only measured in the Edit stress (`hw_edits`),
+  which waits.
 - `compute`, `hw` and `hw_nearest`: the flight's primary mode on each backend: every pass's STATS,
-  `gpu_total`, `frame_time` and `scene_update_ms`. **`scene_update_ms` (its `max_ms`) is the stutter
-  that following the camera makes**, the hardware's acceleration structure updates included: it is
-  timed in the flight apart from the passes, and there is no p99 (`p95_ms` and `max_ms` are what
-  `STATS` has).
+  `gpu_total`, `frame_time` and `scene_update_ms`. **`scene_update_ms` is what following the camera
+  costs the frame thread**, the hardware's acceleration structure updates included (their
+  recording and submitting: since #236 not the GPU's time): it is timed in the flight apart from
+  the passes, and there is no p99 (`p95_ms` and `max_ms` are what `STATS` has).
 - `hw_accel`: the cost of the acceleration structures. `initial` is the first build. `flight` is a
-  summary of the updates of the **steady flight**: the measured frames of the mode, less the first
-  (`flight_frames` of them). The jumps are apart, since a jump rebuilds everything and is not
-  what following the camera costs: **`warmup`** (the move to the end of the path where the mode
-  warms up, and the warm-up frames), **`first_frame`** (the first measured frame, which follows
-  the camera back from there to the start of the path; `scene_update_ms` has it in its `max_ms`,
-  which is a jump and not a stutter of the flight) and **`settle`** (the move to where the Edit
-  stress starts). `edits` is the Edit stress's. A summary has `updates`, `noop_updates` (scene
+  summary of the updates of the **steady flight**: the measured frames of the mode, less the first,
+  spread over `flight_frames` of them. The jumps are apart, since a jump builds everything at once
+  and is not what following the camera costs: **`warmup`** (the move to the end of the path where
+  the mode warms up, the warm-up frames, and whatever was still logged when the Edit stress was
+  set up: `settle_for_edits` drains it here and never throws an update away),
+  **`first_frame`** (the first measured frame, which follows the camera back from there to the
+  start of the path; `scene_update_ms` has it in its `max_ms`, which is a jump and not the
+  flight's worst frame), **`sweep`** (#236: the sweep's own updates, its still frames and its jumps
+  to each height and back; with `--rt-backend hw` alone the sweep runs on the hardware backend
+  before the Edit stress, and until then its still frames were counted in `flight` and its jumps
+  in `warmup`) and **`settle`** (the move to where the Edit stress starts). `edits` is the Edit
+  stress's. A summary has `updates`, `noop_updates` (scene
   updates after which no box was stale), `blas_rebuilt`, `prims_rebuilt`, `tlas_rebuilds`, the
   BLASes rebuilt per update `_mean`/`_max`, `prepare_ms`, `build_ms` and `total_ms` as STATS of the
-  updates that rebuilt something, `total_sum_ms` (their total and the search of the no-op updates)
-  and `noop_search_ms` (the no-op updates' part of it). Each update has a `kind`: `build` (all),
+  updates that rebuilt something, `pending_max` (the most groups that waited for a later frame's
+  build budget; a jump has 0 as it builds all), `total_sum_ms` (their total and the search of the
+  no-op updates) and `noop_search_ms` (the no-op updates' part of it). Each update has a `kind`: `build` (all),
   `patch` (the groups a move or an Edit touched, and the TLAS again) or `anchor` (the camera left
   the TLAS's frame: instances only).
-  - **`prepare_ms`** is CPU time: the search for the groups the patch made stale (the scene's
-    patch mapped to groups; it sorts every region's first entry when entries of `brick_refs` were
-    written, so it is not free, and a no-op update has it alone), then the boxes worked out and a buffer and a BLAS made for each group.
-  - **`build_ms`** is everything from the first build command to the GPU being idle: it records the
-    BLAS and TLAS builds, writes the boxes' words, the instance table and the bind group, submits,
-    and **waits for the GPU to finish everything queued** (`device.poll(wait)`), the scene's own
-    uploads (`update_scene`'s writes) included, which compute does not wait for. So it is the time
-    the frame thread stands still for an update, and is an upper bound on what the builds alone
-    cost.
+  - **`prepare_ms`** is the frame thread's CPU time to take an update's dirty groups from the
+    patch (they come with it: the scene thread lists them, #236), work out which to build this
+    frame within the budget and make a BLAS for each new group. It has no scan of the scene and
+    makes no boxes (the GPU does).
+  - **`build_ms`** is the frame thread's time to record the box pass, the BLAS builds and the TLAS
+    build and submit them, **with no wait for the GPU** (#236; it used to wait for everything
+    queued, the scene's uploads included). Only in the Edit stress, which sets `set_wait(true)`,
+    does it include the GPU's own time to finish them, so that the Edit+BVH cost there is the
+    builds' own.
+- `edits_ground` (the report's top level, on the run's own backend: **compute's** in `both`) and
+  `hw_edits_ground`: the same stress again with the camera **by the ground** (48 Voxels, 2.4 m,
+  over the pole; null on `--short`), where its Edits are in level 0 and in the finest BLASes, and
+  three times as long (`GROUND_FRAMES`: about a dozen Edits, not four, since it is the one the
+  BLAS sizes are judged by). **`hw_edits`' camera is a kilometre up, so its Edits are in the coarse
+  levels, whose few cells are in the same BLASes at every `--hw-group-regions`: it does not measure
+  what a BLAS of 16 x 16 x 16 regions costs an Edit to build again; `hw_edits_ground` does** (its
+  `accel` has the builds, its `frame_thread` the Edit+BVH). It goes on from where the altitude
+  stress left the Planet (it starts with the mode that undoes the last Edit). Not gated: put
+  `edits_ground.frame_thread` by `hw_edits_ground.frame_thread` for what the hardware adds to an
+  Edit by the ground. Every Edit stress (`edits`, `hw_edits`, both grounds) has
+  **`frame_thread_parts`**, the frame thread by part, each a `Stats` over the Edits: `edit` (the
+  Edit planned and level 0 written: the same on both backends), `scene_write` (the scene's
+  buffers, what is left once the parts below are out; the same too), `scene_grow` (buffers that
+  grew: a new buffer, a copy, a new bind group), `scene_submit` (the host's time in the `Queue::submit`
+  of the scene's copies, where a driver that holds the submit up behind earlier GPU work shows;
+  `scene_queue_submit` is the `Queue::submit` call alone, the rest being the belt's finish and recall, and is
+  not in the sum of the parts),
+  `scene_emitters` (the emitter index), `flush` (the submit that sends them), `accel` (the hardware's update, less
+  its wait: what a frame of the game pays), `accel_wait` (the stress waits for the GPU's builds, the
+  game does not: **it is in `frame_thread` and in `accel.total_ms`, so the Edit+BVH figure is an
+  upper bound**) and `edit_made`; and **`frame_thread_each`**, each Edit's frame-thread ms in order
+  (the first is the cold one), and **`grown_bytes_each`**, the bytes copied into buffers that grew.
+  The stress does **not** wait for the GPU before its first Edit: the first hardware Edit by the
+  ground on the 4090 was 5.7 ms (the others 1.4 to 2.0), 3.2 of them in `scene_write`, and compute's
+  1.9 with 0.4, and a wait would have hidden what a player pays the first time they dig. The cause
+  found (on lavapipe, with the device's allocator report) is the scene upload's staging belt: it
+  made a 4 MiB chunk, a device allocation, when it had none free, and a context whose belt was cold,
+  or whose chunks the GPU still held, did that in its first Edit's frame (compute's first write does
+  it too on a fresh context: 2.9 ms there). The belt now has three chunks before the first update
+  (`BELT_WARM_CHUNKS`), and `edits_by_the_ground_fit_in_the_scenes_buffers_on_either_backend` asserts
+  that no Edit makes a device allocation of a MiB or more (the small ones an Edit makes are wgpu's
+  own staging and build scratch, sub-allocated, which a first Edit and a later one both make). If the first hardware Edit is still over on the 4090, its
+  `scene_write`, `scene_submit` and `scene_grow` say which part it is.
+  **The first Edit's submit** (on the 4090 at fbc133e: 5.8 ms on compute and 7.0 on hardware by the
+  ground, against 0.06 on the Edits after it and on the altitude stress's) follows the jump to the
+  ground, whose upload, freed buffers and builds the GPU and driver are still on: `settle_for_edits`
+  now draws six frames after the jump, as the game does before a dig (each waits for the GPU), and
+  prints their times (`settle:` on stderr). `scene_queue_submit` says whether the time is in
+  `Queue::submit` itself.
 - `hw_edits`: the Edit stress on the hardware backend, in the report's `edits` shape, to put by
   `edits` (compute). **Both stress runs start from the same camera and rings**: the sweep's last
   height (20 000 Voxels over the pole), where the compute run ends the sweep, and the hardware run
@@ -1606,43 +1840,158 @@ Edits). All are on the same GPU, driver and clocks. Read `rt.comparison`:
   are not gated. The acceleration structures' update is inside the frame thread's time
   (`update_scene` waits for the build), so it is in `frame_thread`.
 
-**Where the updates run, if the player's client used this.** All on the **frame thread**, and the
-frame waits: `Renderer::update_scene` calls `Tracer::update_scene`
-(`crates/render/src/tracer.rs`, `update_scene`), which calls `HwScene::update` right after writing
-the scene's buffers, from the client's `upload` (`bins/client/src/main.rs`, `upload`, called by
-`stream` and `show` on the frame thread). `HwScene::update` makes the groups' boxes and BLASes
-(`prepare`, CPU) and builds them with a `device.poll(wait_indefinitely)` (`build`), so a frame that
-makes a patch is that long late. The move of the TLAS's frame when the camera leaves its snap
-(`HwScene::follow`) is in `Tracer`'s draw, also on the frame thread, with its own wait. The scene thread
-(ADR 0006) packs the bricks and does none of this. The bench measures that: the flight's updates are
-in `scene_update_ms` and `hw_accel.flight`, and the worst of them is a stutter of that size. Moving
-them to another thread is not done here.
+**Where the updates run (#236).** The frame thread's part is small and never waits for the GPU:
 
-`--rt-backend hw` alone runs the whole bench (the flight, the sweep and the Edit stress) on the
-hardware backend: `rt.active` is `hw`, `rt.accel` has the same `initial`/`flight`/`edits` as
-`hw_accel`, and `modes`, `altitudes` and `edits` are the hardware ones, to compare with a
-`compute` report's by hand (`hw-nearest` is the same with nearest-hit shadows). The budgets are
-the compute backend's: a `hw` report is held to them like any other, so use `--no-fail` to read
-it. The cave stills, the convergence phase and the streaming modes always use compute: they are
+- **The dirty groups are found on the scene thread** (ADR 0006), which already knows which
+  regions it wrote: `Scene::write_region` notes each region it changes (`Patch::touched`), and
+  `take_patch` maps them to groups with each group's box count (`RingPatch::groups`: a count of 0
+  means the group is gone), and flags the groups that **may have gained** (`RingPatch::grown`: a
+  brick that is new, a brick with a Voxel where it had none, a region that is new: any box not
+  inside a box the group had; a dig that exposes interior bricks the scene did not list is one).
+  A patch of a move of the rings lists every group whose boxes moved. Patches merge in the outbox
+  like the rest (the later count wins, `grown` is the union). A rebuild of the whole scene
+  (`Patched`/`Rebuilt` updates) restarts the backend: every group is made again.
+- **The boxes are made on the GPU** (`shaders/hw_boxes.wgsl`, `BoxPass`) from the occupancy masks
+  that the scene's buffers already hold, into one pool buffer (`Pool`, a first-fit allocator that
+  grows by a GPU copy), one workgroup for each region of a group. `group_prims`/`region_prims` in
+  `hw.rs` are the CPU twin, and `cargo test -p render --test hw_agreement` holds the GPU's boxes
+  to the CPU's, box for box, so that compute and hardware keep the same boxes.
+- **Nothing waits**: the box pass, the BLAS builds and the TLAS build are submitted in queue order
+  (wgpu-hal places the barriers between them). Each group has a stable TLAS instance slot.
+- **What waits, and what cannot.** A group waiting for its build keeps its old BLAS in the TLAS
+  and the shader reads the scene's current bricks through the old boxes. That is exact for a group
+  that **only lost** (every box it has now lies inside a box it had: a ray enters a box with
+  nothing in it any more and finds nothing, as the rebuilt group would, a few frames later), and
+  wrong for one that **gained**, since a ray cannot hit what no box covers: it would pass through
+  the new brick, or hit something farther. So a group that is in `RingPatch::grown`, or has no
+  BLAS yet, is built **in the frame it is listed in whatever the budget**. Only groups that only
+  lost wait; "never a hole" is true of those and of nothing else, and `pending` counts them.
+- **The budget** (`BUILD_BUDGET`, 2^18 boxes, like #145's upload budget) is **a frame's**, counted
+  over every build of the frame: the updates before the draw, and the first draw (`follow`, with
+  the profiler's frame count): a second view of a frame builds none of what may wait, and a
+  frame that has built nothing builds at least the nearest group. The groups that may wait are
+  built nearest the camera first; one that has waited `MAX_WAIT_FRAMES` (30, about half a
+  second) frames is built whatever the budget, so that a far group is not left behind for ever.
+  The groups that may not wait come first and are in the count, so a frame that gained more than
+  the budget has the cost of it: it is the number to look for in `scene_update_ms` on the 4090
+  (the ring move's leading face). A jump or a rebuild builds every group in one update: the GPU
+  is busy ~100 ms then, and the frame thread's part is one scan of the groups. Those updates
+  are in `warmup`, `first_frame`, `sweep` or `settle`, not in `flight`. The box pass dispatches
+  32768 jobs at a time, so a jump of any size cannot exceed a dimension of a dispatch.
+- **The frame's update counts every build**: `frame_parts.update` is the update's call and the
+  builds of the draw (those of `follow`, which are encoded in it; `DrawTimes::hardware`, taken
+  out of `encode`), so the "within 1.0 ms of compute" check is of all the hardware backend's work
+  on the frame thread. The log of the updates (`HwScene::take_log`) keeps the latest 4096 if
+  nobody takes it; the benches take it every frame.
+- The TLAS's frame moves with the camera (hysteresis of 1.5 snaps) in `HwScene::follow`, on the
+  frame thread, as an update of the instances only, also with no wait.
+
+**In the real-time streaming mode** (`--streaming --real-time --rt-backend hw|both`; #236): the
+runs fly on the hardware backend. The report's `streaming_real_time.rt` has `requested`, `active`,
+`fallback` and each run's `accel` summary (null on compute). `both` runs the whole mode twice, on
+compute (`streaming_real_time`) and then on hardware (`rt.real_time_hw`, the same shape), one after
+the other on contexts of their own. The acceptance of #236 reads each path's `frame_parts.update`
+(`mean_ms` and `p95_ms`: **`Spread` has `p95_ms` since schema 34**) and `frame_time`: the hardware's
+update is to be within 1.0 ms of compute's at the mean and at p95, and every gate holds with
+`--rt-backend hw`. The summary prints "frame thread's scene update" under each path's mean frame.
+Each run's `accel` has `pending_max` and `updates_waiting` (the updates that left groups waiting)
+to say how much the budget held back. **A run asked for the hardware backend (`hw`, or the hardware
+half of `both`) on an adapter with no ray queries is an error** (`error` of that report, with the
+adapter's reason, exit status 1): its gates would be compute's, and say nothing of the backend.
+
+**BLAS size** (`--hw-group-regions`, #236): the scene thread lists and counts **cells** of 4 x 4 x 4
+regions (`RingPatch::groups`), whatever the BLASes are; `HwScene` keeps each cell's count and a BLAS
+is 1, 2, 4 or 8 cells along an edge (4, 8, 16 or 32 regions) of them, set by level (`16:32@2` in the program unless `--hw-group-regions` says otherwise). The cells of a BLAS are kept as a map per BLAS (`HwScene::members`), updated as the patches come, so that a BLAS's count and its box pass's jobs do not look up every cell it could have. A BLAS with a stale cell
+is built again whole, from all its cells (the box pass has a job a cell, which writes its boxes after
+the cells before it, from the BLAS's corner); it may not wait if a cell of it gained boxes, as ever.
+`accel.*.blas_rebuilt_by_level` and `prims_rebuilt_by_level` say where the builds are (index 0 is
+level 0), `tlas_instances_max` and `prims_total_max` how big the TLAS got, and each path's
+`hardware.tlas_instances` and `hardware.draw_submit` (the draw's own submit in ms, a `Spread`) are
+there to read what a submit that traces costs by the TLAS's instances: wgpu-core checks every
+instance of a TLAS in each submit that uses it.
+
+**Where the hardware's frame-thread time goes** (each path's `hardware`, null on compute; each
+run's `accel.*.phases_ms`; each Edit's `phases_ms`). Every update is timed in parts that add up to
+its `prepare_ms + build_ms` (one clock, read between the parts), and a path's `hardware` has them
+per frame, summed over the frame's updates (the update's call and the draw's follow), over every
+frame of the path like `frame_parts.update` (zero where nothing was built): `total`, then
+`before` (the patch merged into the queue, or the TLAS's frame moved: every instance written),
+`plan` (the queue sorted, the pool's room, the new BLASes made, the jobs), `instances` (the
+instance table written and the bind group made again), `boxes_pass` (recording the box pass),
+`builds` (the entries and the BLAS and TLAS build commands recorded), `finish`, `submit`
+(`Queue::submit` of the hardware's command buffer alone) and `wait` (zero but in the Edit stress),
+each a `Spread` with `mean_ms`, `p95_ms`, `p99_ms`, `worst_ms`. `update_rest` is
+`frame_parts.update - total` per frame: what the compute backend pays as well (the scene's write
+and flush), so it is to match compute's `frame_parts.update`, and the rest of the gap is what the
+parts do not cover. `blas`, `boxes` and `submits` are per frame `{mean, p95, max}`;
+`frames_with_builds` the frames with a BLAS built; `wait_not_passes` is `frame_parts.wait_not_passes` (the
+GPU's wait that is not the passes: the boxes' pass, the builds and the TLAS of the frame land in it) as a
+`Spread` over the frames of each kind: `idle` (no BLAS built), `waiting_only` (only groups that could wait),
+`urgent` (at least one that could not), `big` (boxes at or over the build budget), `several_submits`, and the
+allocations: `created` (a BLAS was made, not only built), `pool_grew` (the box pool grew and was copied) and
+`tlas_made` (the TLAS was made again for more instances), so that
+a p99 of it says which frames carry it; the slowest frames list `hw_blas`, `hw_blas_urgent`, `hw_boxes` and
+`hw_submits`, `hw_created`, `hw_pool_grew` and `hw_tlas_made` (null on compute); with `--hw-wait` the box pass
+(and a pool's copy) is submitted and waited for before the builds are recorded: `hardware.wait_boxes` is the GPU's
+time of it and `hardware.wait` the builds' and the TLAS's alone; on a device with timestamps in encoders
+(`TIMESTAMP_QUERY_INSIDE_ENCODERS`, asked for with `--hw-wait`) `hardware.gpu_blas` and `hardware.gpu_tlas` are what
+the GPU's clock says the BLAS builds and the TLAS build took (the slowest frames: `hw_gpu_blas_ms`, `hw_gpu_tlas_ms`),
+the builds then recorded in calls of their own, the TLAS in the last; `hardware.gpu_gap` (slowest frames:
+`hw_gpu_gap_ms`) is the GPU clock's time from the end of the box pass's commands to the start of the builds'
+(the CPU's wake-up from its wait and its recording of the builds are in it, a few tenths of a millisecond; more is
+what the GPU did before the builds' first command; the look at the allocator below is left out of it); zero where the
+device has none. With `--hw-wait` the frame also looks at wgpu's allocator before the update and after its command
+buffer is finished (where wgpu makes the scratch buffers of the builds): `hardware.gap_new_blocks` and
+`hardware.gap_no_new_blocks` are `gpu_gap` of the frames in which it made a memory block and of those in which it
+did not, `hardware.scratch_bytes` the biggest allocation made while recording (the scratch buffer, as a rule), and the
+slowest frames list `hw_blocks_made`, `hw_reserved_grew` (bytes), `hw_scratch_bytes`, and the CPU's
+`hw_finish_ms` and `hw_submit_ms`;
+`per_blas_us` the parts over the BLASes built,
+in microseconds, over the frames that built (so the cost can be read per BLAS). **The `submit` of
+the hardware's command buffer also sends the `write_buffer`s of the frame's update that were
+queued before it** (the scene's upload), which on compute go in the draw's submit: read
+`frame_parts.submit` of the two backends with it (the hardware's is lower by that much).
+
+`--rt-backend hw` (and the default, `auto`, on an adapter with ray queries) runs the whole bench
+(the flight, the sweep and the Edit stress) on the hardware backend: `rt.active` is `hw`,
+`rt.accel` has the same `initial`/`flight`/`sweep`/`edits` as `hw_accel`, and `modes`, `altitudes`
+and `edits` are the hardware ones, to compare with a `compute` report's by hand (`hw-nearest` is
+the same with nearest-hit shadows). The budgets are the same for both backends, so a report is
+held to them whichever ran. The cave stills and the convergence phase always use compute: they are
 not what is compared.
 
-**Tests.** `cargo test -p render --lib hw::` (CPU only: the tight boxes, the regular grouping, and
-the groups an Edit makes stale, in level 0 and in a coarse level where a brick is written in place
-and nothing but `RingPatch::rewritten_coarse` says where); `cargo test -p render --test
-hw_agreement -- --nocapture` (on a device: the choice of backend, the fallback through a device made
-without ray queries, an Edit's patch and agreement with compute at level 0 and at a coarse level,
-the shadows of both variants against compute's, and the hits of both backends on 6000 rays; those
-that compare skip themselves, printing why, on an adapter without ray queries).
+**Not verified on a real GPU by the author of #236**: the dev box's lavapipe has ray queries, so
+every test runs for real, but it cannot show a GPU race or a time. The order of the box pass, the
+builds and the TLAS build rests on queue order and wgpu-hal's barriers, and what the 4090 does
+with it is for the orchestrator's runs to show (`needs-benchmark`, `needs-stream-bench`).
+
+**Tests.** `cargo test -p render --lib hw::` (CPU only: the tight boxes, the regular grouping, the
+groups a patch lists with their counts (an Edit, a coarse brick written in place, a move of the
+rings, merged patches), which of them may wait (a dig of the surface only loses, a block placed or
+a dig into the interior gains, and every group that is not flagged has its new boxes inside the
+old), the box counts and the pool's allocator); `cargo test -p render --test
+hw_agreement -- --nocapture` (on a device: the choice of backend, the fallback through a device
+made without ray queries, the GPU's boxes against the CPU's box for box, an Edit's patch and
+agreement with compute at level 0 and at a coarse level, the rings moving with no group stale and
+no hole with the budget full and at 1 (**at 1, hits are compared with compute's on every step
+while groups wait, ahead of the camera and behind it: no hit lost, none farther**), the budget
+being a frame's whatever its views, a group that waited too long, the box pass in many dispatches,
+the log's bound, the draw's builds counted as the hardware's, a waiting group, a jump, the TLAS's frame following the
+camera, the shadows of both variants against compute's, and the hits of both backends on 6000
+rays; those that need ray queries skip themselves, printing why, where there are none).
 
 ## Reading the report
 
 ```
 {
-  "schema_version": 31,
+  "schema_version": 38,
   "build":   { "version", "commit" },          // commit: CI builds only, else null; on a PR
                                                // build it is GitHub's merge commit, not the head
   "machine": { "gpu", "device_type", "driver", "driver_info", "backend", "os", "arch",
-               "timers_supported" },
+               "timers_supported",
+               "profile": { "threads", "memory_mib", "video_memory_mib", "ray_queries",
+                            "found_threads", "found_memory_mib", "constrained", "pinning",
+                            "pinned_cpus", "starting_bias", "default_bias" } },  // #264
   "config":  { "width", "height", "output_width", "output_height", "scene", "path",
                "keyframes", "bias", "diag" },          // width, height: traced; output_*: upscaled
   "modes": {
@@ -1658,6 +2007,7 @@ that compare skip themselves, printing why, on an adapter without ray queries).
   "screenshots": [ "primary-frame0000.png", ..., "primary-cave-mouth.png", ... ],
   "budgets": { "source", "ok", "failed": ["primary/primary"], "unmatched": [] },
   "edits":   { ... } | null,                       // the Edit stress; null for --short
+  "edits_ground": { ... } | null,                  // the same by the ground (level 0), on the run's backend; null for --short
   "convergence": { "width", "height", "scene", "checkpoints", "truth_spp", "seeds", "flip",
                    "flip_gamma22",
                    "lines", "min_line_over_floor", "folder", "csv", "wall_s",
@@ -1678,17 +2028,27 @@ that compare skip themselves, printing why, on an adapter without ray queries).
                  "timing": { "deterministic": false, ... } } | null,  // --streaming only
   "streaming_real_time": { "mode": "real-time", "deterministic": false, "planet", "d0",
                            "runs": [RUN...], "min": RUN, "max": RUN, "gates",
+                           "rt": { "requested", "active", "fallback", "accel": [SUMMARY | null...] },
                            "error": { "run", "step", "message" } | null } | null,  // --real-time only
-  "rt": { "requested": "compute" | "hw" | "both", "active": "compute" | "hw", "fallback": STRING | null,
-          "accel": { "initial", "flight", "edits" } | null,     // active hw only
+  "rt": { "requested": "auto" | "compute" | "hw" | "hw-nearest" | "both", "active": "compute" | "hw", "fallback": STRING | null,
+          "accel": { "initial", "flight", "flight_frames", "warmup", "first_frame", "sweep",
+                     "settle", "edits" } | null,   // active hw only; each part is a SUMMARY
+                                        // (with its own "noop_search_ms"), "flight_frames" a count
           "comparison": { "compute", "hw", "hw_nearest", "speedup", "hw_gpu_total_plus_accel_ms",
-                         "compute_over_hw_with_accel", "hw_accel", "hw_edits" } | null }  // both only
+                         "compute_over_hw_with_accel", "hw_accel", "hw_edits", "hw_edits_ground" } | null,  // both only
+          "real_time_hw": { ...the shape of streaming_real_time... } | null }  // both and --real-time only
 }
 ```
 
 - `STATS` is `{ "samples", "mean_ms", "p95_ms", "max_ms" }`. The figures are `null` when there are
   no samples. `p95_ms` is the nearest rank. Times come from every sample the GPU timers recorded
   over the measured frames (`Timings::history()`), not from the overlay's rolling window.
+- `SUMMARY` (the hardware backend's updates of a stretch of a run; the parts of `rt.accel` and each
+  entry of `streaming_real_time.rt.accel`) is `{ "updates", "noop_updates", "blas_rebuilt",
+  "prims_rebuilt", "tlas_rebuilds", "blas_rebuilt_per_update_mean", "blas_rebuilt_per_update_max",
+  "pending_max", "updates_waiting", "prepare_ms": STATS, "build_ms": STATS, "total_ms": STATS,
+  "phases_ms": { "before", "plan", "instances", "boxes_pass", "builds", "finish", "submit", "wait": STATS },
+  "total_sum_ms", "noop_search_ms" }`; see "The hardware ray backend".
 - `ENTRY` is `STATS` plus `name`, `budget_ms` (null if the pass has none) and `status`:
   - `within`: the **mean** is at most the budget.
   - `over`: the mean is above it. This blocks the merge.

@@ -11,7 +11,7 @@
 use brick_store::VOXELS_PER_METRE as VPM;
 use planet_gen::Tube;
 use planet_gen::planet::{Planet, tangents};
-use planet_gen::world_map::{Biome, Fields, Regions, Texel, WORLD_MAP_SIZE, WorldMap};
+use planet_gen::world_map::{Biome, Fields, Regions, Texel};
 
 use super::{CavePalette, Hue, Key, Place, SHOTS, Shot, Stamp};
 
@@ -1012,7 +1012,7 @@ pub fn source(planet: &Planet, found: &[Found]) -> String {
 }
 
 pub fn full_planet() -> Planet {
-    Planet::new(WorldMap::generate(crate::SEED, WORLD_MAP_SIZE))
+    Planet::new(crate::world_map().0)
 }
 
 #[test]

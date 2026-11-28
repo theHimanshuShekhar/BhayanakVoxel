@@ -17,11 +17,10 @@
 //! a change that only reaches coarser levels (never persisted) just updates the golden hashes in
 //! `tests/golden.rs`.
 
-use std::sync::atomic::{AtomicI32, Ordering};
-
 use brick_store::{BRICK_SIZE, Brick, BrickCoord, BrickStore, Interior, Material, VoxelCoord};
 
 mod caves;
+pub mod cost;
 mod detail;
 pub mod planet;
 pub mod landform_proto;
@@ -238,42 +237,40 @@ fn generate_box(seed: u64, min: BrickCoord, max: BrickCoord, skip_core: bool) ->
 }
 
 /// The bricks that `keep` returns for each coordinate in the box from `min` to `max` inclusive,
-/// in no particular order. Slabs of constant x are done on all available cores.
+/// in the order of `x`, then `y`, then `z` whatever the threads. Columns of constant x and y are
+/// the pieces, taken by the next free thread among the machine's (this is the load, and the ring
+/// the player waits for: all of them, [`machine::threads`]); they were slabs of constant x (about
+/// a hundred of them for the spawn ring, so that a slab that held the surface left the others
+/// idle at the end).
 fn par_bricks<T: Send>(
     min: BrickCoord,
     max: BrickCoord,
     keep: impl Fn(BrickCoord) -> Option<T> + Sync,
 ) -> Vec<(BrickCoord, T)> {
-    let next_x = AtomicI32::new(min.0[0]);
-    let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
-    let slabs: Vec<Vec<(BrickCoord, T)>> = std::thread::scope(|scope| {
-        let workers: Vec<_> = (0..threads)
-            .map(|_| {
-                scope.spawn(|| {
-                    let mut found = Vec::new();
-                    loop {
-                        let x = next_x.fetch_add(1, Ordering::Relaxed);
-                        if x > max.0[0] {
-                            return found;
-                        }
-                        for y in min.0[1]..=max.0[1] {
-                            for z in min.0[2]..=max.0[2] {
-                                let coord = BrickCoord([x, y, z]);
-                                if let Some(brick) = keep(coord) {
-                                    found.push((coord, brick));
-                                }
-                            }
-                        }
-                    }
-                })
+    par_bricks_on(machine::threads(), min, max, keep)
+}
+
+/// [`par_bricks`] on `threads` threads (the tests make the same bricks on one, four and all).
+fn par_bricks_on<T: Send>(
+    threads: usize,
+    min: BrickCoord,
+    max: BrickCoord,
+    keep: impl Fn(BrickCoord) -> Option<T> + Sync,
+) -> Vec<(BrickCoord, T)> {
+    let rows = (max.0[1] - min.0[1] + 1).max(0) as usize;
+    let columns = (max.0[0] - min.0[0] + 1).max(0) as usize * rows;
+    machine::par_pieces(columns, threads, |n| {
+        let (x, y) = (min.0[0] + (n / rows) as i32, min.0[1] + (n % rows) as i32);
+        (min.0[2]..=max.0[2])
+            .filter_map(|z| {
+                let coord = BrickCoord([x, y, z]);
+                keep(coord).map(|brick| (coord, brick))
             })
-            .collect();
-        workers
-            .into_iter()
-            .map(|worker| worker.join().expect("generator thread panicked"))
-            .collect()
-    });
-    slabs.into_iter().flatten().collect()
+            .collect::<Vec<_>>()
+    })
+    .into_iter()
+    .flatten()
+    .collect()
 }
 
 #[cfg(test)]
@@ -458,6 +455,31 @@ mod tests {
                 coord.within_ball(CORE_RADIUS),
                 "{coord:?}"
             );
+        }
+    }
+
+    /// The bricks of a box that holds the surface and caves, as (coordinate, content hash) in the
+    /// order they come out in, on `threads` threads.
+    fn box_hashes(threads: usize) -> Vec<(BrickCoord, u64)> {
+        let (min, max) = (BrickCoord([176, -5, -5]), BrickCoord([184, 5, 5]));
+        par_bricks_on(threads, min, max, |coord| {
+            Some(generate_brick(SEED, coord)).filter(|brick| !brick.is_air())
+        })
+        .into_iter()
+        .map(|(coord, brick)| (coord, brick.content_hash()))
+        .collect()
+    }
+
+    #[test]
+    fn the_bricks_of_a_box_are_the_same_at_1_4_and_all_threads_in_the_same_order() {
+        let alone = box_hashes(1);
+        assert!(alone.len() > 100, "the box holds ground ({})", alone.len());
+        assert!(
+            alone.windows(2).all(|w| w[0].0 < w[1].0),
+            "in the order of x, then y, then z"
+        );
+        for threads in [4, machine::threads(), 3 * machine::threads()] {
+            assert_eq!(box_hashes(threads), alone, "{threads} threads");
         }
     }
 }

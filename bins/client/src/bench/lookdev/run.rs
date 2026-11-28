@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 
 use brick_store::{BrickStore, VOXELS_PER_METRE};
 use planet_gen::planet::Planet;
-use planet_gen::world_map::{TEST_MAP_SIZE, TEST_RADIUS, WORLD_MAP_SIZE, WorldMap};
+use planet_gen::world_map::{TEST_MAP_SIZE, TEST_RADIUS, WorldMap};
 use render::LocalFrame;
 use render::daylight::hero_time_of_day;
 use render::lod::Bands;
@@ -495,7 +495,7 @@ pub fn run(options: &Options) -> Result<PathBuf, Box<dyn Error>> {
         )
     } else {
         eprintln!("making the 320 km world map (about 25 s)...");
-        let planet = Planet::new(WorldMap::generate(crate::SEED, WORLD_MAP_SIZE));
+        let planet = Planet::new(crate::world_map().0);
         let first = crate::loader::GUARD_FIRST;
         (planet, first, (0..SHOTS.len()).collect())
     };

@@ -7,8 +7,10 @@ mod fly;
 mod ghost;
 mod growth;
 mod loader;
+mod mapbuild;
 mod priority;
 mod scene_worker;
+mod settings;
 #[cfg(test)]
 mod streaming_tests;
 mod tool;
@@ -36,7 +38,8 @@ use render::lod::{self, Bands};
 use render::overlay::{self, Controls, DayControls, Hud, HudEvent, LodInfo, SceneMemory};
 use render::scene::Bound;
 use render::tracer::View;
-use render::{Camera, Mode, Renderer, RingsFull, Scene, SceneUpdate};
+use render::{Camera, Mode, Renderer, RingsFull, RtBackend, Scene, SceneUpdate};
+use settings::{RayTracing, Settings};
 use sim::{
     DEFAULT_DAY_LENGTH_SECONDS, FixedTimestep, Predictor, ServerHandle, TICK_RATE_HZ, WorldClock,
 };
@@ -92,8 +95,52 @@ const RING_LEVELS: usize = lod::LEVELS;
 /// Pixels of a touchpad's scrolling that make one line of a wheel.
 const PIXELS_PER_LINE: f32 = 20.0;
 
-/// The LOD bias the client starts with: output pixels one Voxel may cover. The overlay changes it.
+/// The least LOD bias the client starts with: output pixels one Voxel may cover. The overlay changes
+/// it. A machine with the memory for it starts with this ([`default_bias`]).
 const DEFAULT_BIAS: f32 = 1.0;
+
+/// What the client's process holds, in bytes, as a function of the LOD bias `b`:
+/// `MEMORY_FIXED + MEMORY_SCALED / b²`. Everything that grows with the draw distance (the
+/// tables, the scene's host buffers, the store) goes with `d0` squared, and `d0` with the bias,
+/// so it is `MEMORY_SCALED` over the square of the bias; the Guard, the spawn ring, the code and
+/// the runtime do not scale and are `MEMORY_FIXED`. Fitted to the 4090 PC's full-size runs of
+/// #264 (the largest `resident_peak_mib` sampled, which is what the estimate is for): 8850 MiB at
+/// a bias of 1.0 (the default profile; the runs measured 8377 to 8850) and 5228 MiB at 1.35 (the
+/// low-end profile, 5 GiB, pinned to 4 CPUs, compute tracer; 4941 to 5228), which gives about
+/// 825 MiB and 8025 MiB; these are a few MiB over that. (The 6.66 GiB of #167 was the resident set
+/// after the fill at 2 m, not the peak of the run, and the estimate built on it was 1.8 GiB short.)
+const MEMORY_FIXED: u64 = 830 * machine::MIB;
+const MEMORY_SCALED: u64 = 8_030 * machine::MIB;
+
+/// The share of the memory the machine has to use that the process may hold at its peak: a tenth
+/// is left to the system, the other programs and the estimate's error.
+const MEMORY_USED_AT_MOST: f64 = 0.9;
+
+/// The most the bias is raised to for want of memory: three times coarser than the default, a
+/// ninth of the memory. A machine with less than the 1.8 GiB that this needs runs at this and is
+/// short of memory at it: the game says so rather than refusing to start.
+const MOST_BIAS: f32 = 3.0;
+
+/// The LOD bias to start with on a machine that has `memory` bytes to use: the default where it
+/// has the memory for the default's peak (about 9.7 GiB to use), and coarser (a larger bias, so the bands are
+/// nearer in Voxels and fewer bricks are drawn and held) in the square root of the shortfall, up
+/// to [`MOST_BIAS`], so that a machine with little memory draws less far and less fine instead of
+/// running out of it. The floor of what it draws is the Guard (the whole Planet, coarse) and
+/// the ring round the player, which are the same on every machine. A multiple of 0.05, rounded
+/// up. The ceiling, on a machine with more memory than needed, is the default's bias: spending
+/// spare memory and GPU on quality is #230's.
+fn bias_for(memory: u64) -> f32 {
+    let usable = memory as f64 * MEMORY_USED_AT_MOST;
+    let room = (usable - MEMORY_FIXED as f64).max(machine::MIB as f64);
+    let wanted = (MEMORY_SCALED as f64 / room).sqrt();
+    let bias = ((wanted * 20.0).ceil() / 20.0) as f32;
+    bias.clamp(DEFAULT_BIAS, MOST_BIAS)
+}
+
+/// The LOD bias the client starts with on this machine ([`bias_for`] its profile's memory).
+fn default_bias() -> f32 {
+    bias_for(machine::profile().memory)
+}
 
 /// A Planet's bricks, packed for the GPU as the bricks the LOD `bands` select from `camera`. The
 /// store must have its pyramid ([`RING_LEVELS`] of it); its source gives the bricks it does not
@@ -426,8 +473,19 @@ struct Ground {
 /// Generates the spawn ring on gentle land of the Planet of `map`: the full crust at level 0
 /// within `reach` Voxels, on all the cores, in a store with a pyramid of `levels` levels that
 /// reads the Planet itself where it holds nothing ([`Planet::crust_around`]).
-fn generate_ground(map: WorldMap, reach: i32, levels: usize) -> Ground {
-    let planet = Planet::new(map);
+///
+/// `extra` is the bench's artificial cost of each brick generated (#242, [`planet_gen::cost`]),
+/// which the game never has.
+fn generate_ground(
+    map: WorldMap,
+    reach: i32,
+    levels: usize,
+    extra: Option<std::sync::Arc<planet_gen::cost::ExtraCost>>,
+) -> Ground {
+    let mut planet = Planet::new(map);
+    if let Some(extra) = extra {
+        planet = planet.with_extra_cost(extra);
+    }
     let ground = planet.spawn(reach);
     let started = Instant::now();
     let store = planet.crust_around(ground, reach, levels - 1);
@@ -514,8 +572,13 @@ fn horizon(planet: &Planet) -> Option<render::lod::Horizon> {
 
 /// Makes the Planet of `map` into what the client starts with: the spawn ring on gentle land,
 /// then the Guard, and the scene of the bands drawn from them, with a loader to make the resident set complete
-/// (#86). The ring and the Guard are timed, and reported, apart.
-fn load(map: WorldMap, reach: i32) -> Result<Loaded, RingsFull> {
+/// (#86). The ring and the Guard are timed, and reported, apart. `extra` is the bench's cost of a
+/// generated brick (see [`generate_ground`]).
+fn load(
+    map: WorldMap,
+    reach: i32,
+    extra: Option<std::sync::Arc<planet_gen::cost::ExtraCost>>,
+) -> Result<Loaded, RingsFull> {
     let started = Instant::now();
     let Ground {
         planet,
@@ -524,8 +587,8 @@ fn load(map: WorldMap, reach: i32) -> Result<Loaded, RingsFull> {
         camera,
         ground,
         took: ring_took,
-    } = generate_ground(map, reach, RING_LEVELS);
-    let bands = Bands::standard(f64::from(DEFAULT_BIAS));
+    } = generate_ground(map, reach, RING_LEVELS, extra);
+    let bands = Bands::standard(f64::from(default_bias()));
     let room = room_for(bands);
     store.reserve(&room.held);
     store.reserve_resident(room.resident);
@@ -553,7 +616,7 @@ fn load(map: WorldMap, reach: i32) -> Result<Loaded, RingsFull> {
     let guard_cells = (visible.len(), later.len());
     let selected = Instant::now();
     let mut scene = planet_scene(&store, camera.position, bands, planet.max_radius())?;
-    let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let cores = machine::threads();
     scene.reserve(room.nodes, room.waiting, room.stuck);
     // The horizon cap and the margins of ADR 0004, on from the start: the selection is only the
     // Guard and the spawn ring now, so looking at its bricks again is cheap.
@@ -624,10 +687,40 @@ fn load(map: WorldMap, reach: i32) -> Result<Loaded, RingsFull> {
 /// cores in a release build (several times that in debug), so this runs on its own threads while
 /// the window is already up.
 fn load_planet() -> Loaded {
-    let started = Instant::now();
-    let map = WorldMap::generate(SEED, WORLD_MAP_SIZE);
-    eprintln!("world map generated in {:.1?}", started.elapsed());
-    load(map, SPAWN_REACH).expect("the ground around the spawn fits the rings' buffers")
+    let (map, _) = world_map();
+    load(map, SPAWN_REACH, None).expect("the ground around the spawn fits the rings' buffers")
+}
+
+/// The full-size world map of the client's seed: read from the cache folder if it was made there
+/// before, built (on the machine's threads) and written there if not (#264, see
+/// `planet_gen::world_map::cache`). Says which, and how long it took, on stderr. The cache is
+/// the client's: a server builds its own map.
+fn world_map() -> (WorldMap, Duration) {
+    use planet_gen::world_map::cache;
+    let dir = cache::default_dir();
+    let made = cache::load_or_build(
+        dir.as_deref(),
+        SEED,
+        WORLD_MAP_SIZE,
+        WORLD_RADIUS,
+        machine::threads(),
+    );
+    match (&made.outcome, &made.stages) {
+        (cache::Outcome::Hit, _) => eprintln!("world map read from the cache in {:.2?}", made.took),
+        (cache::Outcome::Built(why), stages) => {
+            eprintln!("world map generated in {:.1?} ({why:?})", made.took);
+            if let Some(stages) = stages {
+                eprintln!("  stages {stages:.1?}");
+            }
+            match &made.wrote {
+                Some(Ok(took)) => eprintln!("  cached in {took:.2?}"),
+                Some(Err(why)) => eprintln!("  not cached: {why}"),
+                None => {}
+            }
+        }
+    }
+    let took = made.took;
+    (made.map, took)
 }
 
 /// The overlay's egui state. The hotbar is always shown, so it runs every frame; F1 only hides
@@ -641,6 +734,10 @@ struct Gui {
 struct App {
     window: Option<Arc<Window>>,
     renderer: Option<Renderer>,
+    /// What is kept between launches (how rays find the Planet), and the file it is in, if this
+    /// machine has a place for one. The overlay changes it, and it is saved at once.
+    settings: Settings,
+    settings_path: Option<std::path::PathBuf>,
     gui: Option<Gui>,
     /// The Planet, while it is still being generated.
     loading: Option<Receiver<Loaded>>,
@@ -747,9 +844,21 @@ impl App {
             // The window may be gone before the Planet is ready; that is fine.
             let _ = sender.send(load_planet());
         });
+        let settings_path = settings::path();
+        let settings = settings_path
+            .as_deref()
+            .map_or_else(Settings::default, |path| {
+                let (settings, warning) = Settings::load(path);
+                if let Some(warning) = warning {
+                    eprintln!("warning: {warning}; the defaults are used");
+                }
+                settings
+            });
         Self {
             window: None,
             renderer: None,
+            settings,
+            settings_path,
             gui: None,
             loading: Some(receiver),
             world: None,
@@ -776,7 +885,7 @@ impl App {
                 1.0 - hero_time_of_day(),
                 DEFAULT_DAY_LENGTH_SECONDS,
             )),
-            bias: DEFAULT_BIAS,
+            bias: default_bias(),
             still: Stillness::default(),
             title: String::new(),
             grabbed: false,
@@ -796,7 +905,23 @@ impl App {
             size.width,
             size.height,
             &Scene::default(),
+            self.settings.ray_tracing.backend(),
         )?);
+        if let Some(renderer) = &self.renderer {
+            let rt = renderer.rt();
+            match &rt.fallback {
+                Some(why) => eprintln!("ray tracing: compute ({why})"),
+                None => eprintln!("ray tracing: {}", rt.active.name()),
+            }
+            eprintln!(
+                "gpu device: ray-query features {}",
+                if renderer.device_has_ray_queries() {
+                    "on (experimental opt-in)"
+                } else {
+                    "off"
+                }
+            );
+        }
         if let Some(renderer) = &mut self.renderer {
             // The atmosphere measures the camera's height from the Planet's sea level.
             renderer.set_ground_level(f64::from(WORLD_RADIUS));
@@ -1052,6 +1177,27 @@ impl App {
         self.show(update)
     }
 
+    /// Changes how rays find the Planet to `requested` (the overlay's setting, #50) for the Planet
+    /// that is being drawn, and keeps the setting for the next launch.
+    fn set_ray_tracing(&mut self, requested: RtBackend) -> Result<(), Box<dyn Error>> {
+        let empty = Scene::default();
+        let scene = self.world.as_ref().map_or(&empty, World::scene);
+        if let Some(renderer) = &mut self.renderer {
+            renderer.set_backend(scene, requested)?;
+            eprintln!("ray tracing: {}", renderer.rt().active.name());
+            if let Some(note) = renderer.rt_note() {
+                eprintln!("ray tracing: {note}");
+            }
+        }
+        self.settings.ray_tracing = RayTracing::of(requested);
+        if let Some(path) = &self.settings_path
+            && let Err(e) = self.settings.save(path)
+        {
+            eprintln!("warning: cannot save {}: {e}", path.display());
+        }
+        Ok(())
+    }
+
     /// Copies what changed in the Planet to the GPU.
     fn show(&mut self, update: Option<SceneUpdate>) -> Result<(), Box<dyn Error>> {
         if let (Some(update), Some(world), Some(renderer)) =
@@ -1163,8 +1309,10 @@ impl App {
             },
             stages: renderer.stages(),
             bias: self.bias,
+            backend: renderer.rt().requested,
         };
         let mut controls = before;
+        let rt_note = renderer.rt_note();
         let info = overlay::Info {
             timings: renderer.timings(),
             cpu: &self.cpu,
@@ -1182,6 +1330,9 @@ impl App {
                 allocated: renderer.scene_bytes(),
             },
             lod: self.world.as_ref().and_then(lod_info),
+            rt_active: renderer.rt().active,
+            rt_unavailable: renderer.rt_unavailable(),
+            rt_note: rt_note.as_deref(),
         };
         let input = gui.state.take_egui_input(window);
         let camera = &self.camera;
@@ -1240,6 +1391,11 @@ impl App {
         }
         if controls.bias != before.bias
             && let Err(err) = self.set_bias(controls.bias)
+        {
+            self.error = Some(err);
+        }
+        if controls.backend != before.backend
+            && let Err(err) = self.set_ray_tracing(controls.backend)
         {
             self.error = Some(err);
         }
@@ -1542,11 +1698,24 @@ impl ApplicationHandler for App {
 
 fn main() -> Result<ExitCode, Box<dyn Error>> {
     // The threads that read and pack bricks for a scene made again run below the frame thread.
-    render::scene::select::set_worker_start(priority::lower_current_thread);
-    let mut args = std::env::args().skip(1);
+    machine::set_worker_start(priority::lower_current_thread);
+    // `--profile low-end`, `--threads N` and the rest of the machine's overrides (#264), before
+    // anything reads the machine.
+    let args = machine::take_flags(std::env::args().skip(1).collect())?;
+    // A constrained profile holds the whole process to its threads' processors, so that the frame
+    // thread, the scene thread, the simulation and the driver's threads share them too.
+    let pinning = machine::pin_to_profile();
+    eprintln!(
+        "machine: {}; {}; starting LOD bias {}",
+        machine::profile().describe(),
+        pinning.describe(),
+        default_bias()
+    );
+    let mut args = args.into_iter();
     match args.next().as_deref() {
         Some("bench") => return Ok(bench::main(args)),
         Some("lookdev") => return Ok(bench::lookdev::main(args)),
+        Some("map-build") => return Ok(mapbuild::main(args)),
         _ => {}
     }
     let event_loop = EventLoop::new()?;
@@ -1564,6 +1733,56 @@ mod tests {
 
     fn dot(a: [f64; 3], b: [f64; 3]) -> f64 {
         (0..3).map(|i| a[i] * b[i]).sum()
+    }
+
+    #[test]
+    fn the_bias_has_a_floor_at_the_default_and_a_ceiling_and_grows_as_memory_shrinks() {
+        let gib = machine::GIB;
+        // Memory to spare, up to the 4090 PC's (18.7 GiB to use): the default, never finer (that
+        // is #230's). 10 GiB is about the least that holds the default's 8.7 GiB peak.
+        for memory in [
+            10 * gib,
+            16 * gib,
+            18 * gib + 700 * machine::MIB,
+            64 * gib,
+            u64::MAX,
+        ] {
+            assert_eq!(bias_for(memory), DEFAULT_BIAS, "{memory} bytes");
+        }
+        // The low-end reference (8 GB, 5 GiB free): coarser, and its estimated peak is at most 90%
+        // of its memory (the 4090 measured 5228 MiB at 1.35, which was over 5 GiB: the estimate
+        // is fitted to that and to 8850 MiB at 1.0).
+        let low = bias_for(machine::Profile::LOW_END.memory);
+        assert_eq!(low, 1.5);
+        // Every bias holds the estimate under the share of the memory it may use, to the least
+        // memory that does not need the ceiling, and starts coarser the less there is.
+        for memory in (4..=10).map(|g| g * gib) {
+            let peak =
+                MEMORY_FIXED as f64 + MEMORY_SCALED as f64 / f64::from(bias_for(memory)).powi(2);
+            assert!(
+                peak <= memory as f64 * MEMORY_USED_AT_MOST,
+                "{memory}: {peak}"
+            );
+        }
+        // The estimate reproduces what the 4090 measured, a little over it.
+        let at = |bias: f64| {
+            (MEMORY_FIXED as f64 + MEMORY_SCALED as f64 / (bias * bias)) / machine::MIB as f64
+        };
+        assert!((8850.0..8950.0).contains(&at(1.0)), "{}", at(1.0));
+        assert!((5228.0..5330.0).contains(&at(1.35)), "{}", at(1.35));
+        // A tenth short of the default's memory is already coarser.
+        assert!(bias_for(9 * gib) > DEFAULT_BIAS);
+        // Less and less memory is coarser and coarser, to a ceiling, and nothing makes it fail.
+        let mut last = low;
+        for memory in [4 * gib, 3 * gib, 2 * gib, gib, 0] {
+            let bias = bias_for(memory);
+            assert!(
+                bias >= last && bias <= MOST_BIAS,
+                "{memory}: {bias} after {last}"
+            );
+            last = bias;
+        }
+        assert_eq!(bias_for(0), bias_for(gib));
     }
 
     #[test]
@@ -1624,7 +1843,7 @@ mod tests {
     #[test]
     fn the_client_generates_a_planet_it_stands_on_land_in_with_the_ground_around_it() {
         // Ring packing is the renderer's and is tested there; one level is the ground alone.
-        let loaded = generate_ground(WorldMap::for_tests(SEED), 100, 1);
+        let loaded = generate_ground(WorldMap::for_tests(SEED), 100, 1, None);
         let [x, y, z] = loaded.camera.position;
         let up = loaded.camera.horizon_up;
         let feet = |down: f64| {
@@ -1648,7 +1867,7 @@ mod tests {
 
     #[test]
     fn the_server_holds_the_ground_without_a_pyramid_so_an_edit_there_remakes_no_coarse_brick() {
-        let loaded = generate_ground(WorldMap::for_tests(SEED), 100, 3);
+        let loaded = generate_ground(WorldMap::for_tests(SEED), 100, 3, None);
         assert_eq!(loaded.store.level_count(), 3);
         assert_eq!(loaded.server_store.level_count(), 1);
         assert_eq!(
@@ -1662,7 +1881,7 @@ mod tests {
         // The full-size Planet reaches far beyond the test Planet's radius, so the sphere the
         // client clips rays to must be the full-size Planet's. With the test Planet's, every ray
         // from the spawn misses and there is only sky.
-        let loaded = generate_ground(WorldMap::for_tests(SEED), 100, 1);
+        let loaded = generate_ground(WorldMap::for_tests(SEED), 100, 1, None);
         let (cell, origin) = render::camera::split(loaded.camera.position);
         let ray = render::reference::Ray {
             cell,

@@ -5,7 +5,8 @@
 # machine clock) and gates.
 #
 # One test-name filter per line. libtest matches a filter anywhere in the full test name. The
-# `linux` and `windows-tests` jobs `--skip` each line; the `real-thread-tests` job runs only these.
+# `linux-tests` and `windows-tests` jobs skip each line (a nextest filterset: real-thread-filterset.sh);
+# the `real-thread-tests` job runs only these, with `cargo test`.
 # Every client test therefore runs in exactly one of the two. A line that matches no test of the
 # client binary, or a test of another crate, fails a check (.github/scripts/check-real-thread-list.sh).
 #
@@ -41,6 +42,7 @@ streaming_tests::a_throttled_scene_thread_goes_on_when_the_frame_thread_takes_wh
 # thread and the machine's clock, with no GPU. It runs every path and checks that the report has its
 # fields, and no time. The tests of the gates and of the report are not here: they gate.
 bench::realtime::tests::the_real_time_run_on_the_test_planet_completes_with_every_path_and_field
+bench::realtime::tests::the_real_time_run_with_both_hooks_on_the_test_planet_completes_and_charges_the_bricks
 bench::realtime::tests::the_catch_up_between_paths_ends_with_the_scene_at_the_camera
 # A run that cannot finish (a cold start with no time) says at which step: on the same threads.
 bench::realtime::tests::a_run_that_stops_names_the_step_it_was_at

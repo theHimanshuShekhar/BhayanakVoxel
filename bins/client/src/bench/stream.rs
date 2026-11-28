@@ -757,7 +757,25 @@ pub(super) struct TestPlanet {
 
 /// The test Planet (see [`TestPlanet`]), which the stepped and the real-time modes both start from.
 pub(super) fn test_planet() -> TestPlanet {
-    let planet = Planet::new(WorldMap::with_radius(crate::SEED, MAP_SIZE, TEST_RADIUS));
+    test_planet_with(None, None)
+}
+
+/// [`test_planet`] with the generator's bench hooks (#242): the ground stretched to `relief` if it
+/// is given, and `extra`, the artificial cost of each brick, on the Planet. Neither is given by the
+/// stepped mode, whose counts are the committed ones; the real-time mode's `--short` run on the
+/// test Planet takes them.
+pub(super) fn test_planet_with(
+    relief: Option<planet_gen::world_map::Relief>,
+    extra: Option<std::sync::Arc<planet_gen::cost::ExtraCost>>,
+) -> TestPlanet {
+    let mut map = WorldMap::with_radius(crate::SEED, MAP_SIZE, TEST_RADIUS);
+    if let Some(relief) = relief {
+        map = map.with_relief(relief);
+    }
+    let mut planet = Planet::new(map);
+    if let Some(extra) = extra {
+        planet = planet.with_extra_cost(extra);
+    }
     let ground = planet.spawn(100);
     let mut store = planet.crust_around(ground, RING, LEVELS - 1);
     hold_guard(&mut store, &planet, TEST_GUARD_FIRST);
@@ -791,6 +809,16 @@ pub(super) fn test_planet() -> TestPlanet {
 impl Streamer {
     /// The world right after the spawn, with the Guard held and the rest waiting for the loader.
     pub fn new() -> Self {
+        Self::with_hooks(None, None)
+    }
+
+    /// [`Streamer::new`] with the generator's bench hooks (see [`test_planet_with`]). The stepped
+    /// mode of `client bench` has none; a test runs it with the extra cost to show that it moves
+    /// no count.
+    pub(super) fn with_hooks(
+        relief: Option<planet_gen::world_map::Relief>,
+        extra: Option<std::sync::Arc<planet_gen::cost::ExtraCost>>,
+    ) -> Self {
         let TestPlanet {
             store,
             scene,
@@ -798,7 +826,7 @@ impl Streamer {
             bands,
             start,
             ..
-        } = test_planet();
+        } = test_planet_with(relief, extra);
         let (ahead, _) = tangents(spawn.horizon_up);
         let point = |metres: f64| -> [f64; 3] {
             over_the_ground(
@@ -1179,6 +1207,24 @@ mod tests {
             BEFORE_SPEED_SCALING,
             "the speed scale off changed what the stepped run counts"
         );
+    }
+
+    #[test]
+    fn the_extra_cost_changes_no_count_of_the_stepped_run() {
+        // The hook only spends time (#242): a charge of a few µs a brick, which the whole run
+        // makes hundreds of thousands of, and the counts hash and every count are as without it.
+        // With 0 it is the same too, and counts the bricks.
+        for micros in [0, 3] {
+            let extra = planet_gen::cost::ExtraCost::new(micros);
+            let report = Streamer::with_hooks(None, Some(extra.clone()))
+                .run(&mut NoGpu)
+                .expect("the stepped run completes");
+            assert_eq!(&report, self::report(), "{micros} µs a brick");
+            assert_eq!(report.counts_hash, GOLDEN.trim());
+            let stats = extra.stats();
+            assert!(stats.bricks > 1000, "{} bricks charged", stats.bricks);
+            assert_eq!(stats.measured_us > 0.0, micros > 0, "{stats:?}");
+        }
     }
 
     #[test]

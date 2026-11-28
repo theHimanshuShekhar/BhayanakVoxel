@@ -22,11 +22,22 @@
 //! It follows the crate's rules. Randomness is `value_noise` of an integer point on the sphere,
 //! so the six faces meet without a seam, and the floats used are only `+ - * /`, `sqrt` and
 //! conversions. Every texel is computed from read-only inputs, and the sums and the median are
-//! over integers, so the map does not depend on the thread count. A change to the map's output
+//! over integers, so the map does not depend on the thread count. **Every stage is parallel**
+//! (#264) and none of them splits its work by thread: the work is cut into pieces of a fixed
+//! size ([`PIECE`] texels, a fixed number of rows), the threads take the next piece as they
+//! finish one, and what a piece makes does not depend on which thread made it. Where pieces are
+//! combined (the histogram of the heights, the area that drains through a texel) the combination
+//! is an integer sum, which is the same in any order. A change to the map's output
 //! must bump [`GENERATOR_VERSION`](crate::GENERATOR_VERSION), which also keys the map's cache on
 //! disk (with saves), and update the golden hash in `tests/golden.rs`.
 
+use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
+use std::time::{Duration, Instant};
+
 use brick_store::VOXELS_PER_METRE;
+use machine::{par_chunks, par_fill, par_pieces};
+
+pub mod cache;
 
 use super::{corner_value, value_noise};
 
@@ -84,6 +95,40 @@ pub const PEAK: i32 = voxels(8_190.0);
 /// Bound on the depth of the deepest trench below sea level, in Voxels (4.2 km; the landform
 /// model's trenches reach 3.8 km). PROTOTYPE (#246): was 1 km.
 pub const TRENCH: i32 = voxels(4_200.0);
+
+/// The extent of the ground above and below sea level, in Voxels: [`PEAK`] and [`TRENCH`] for the
+/// map the Planet is made with, and what the bench's `--peak-m` and `--trench-m` make of them (#242,
+/// [`WorldMap::with_relief`]). Everything that is derived from the range (the Planet's highest and
+/// lowest radius, the bounds of the shortcuts) reads it from the map, and not from the constants.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Relief {
+    /// The highest the ground is above sea level, in Voxels.
+    pub peak: i32,
+    /// The lowest it is below sea level, in Voxels.
+    pub trench: i32,
+}
+
+impl Relief {
+    /// [`PEAK`] and [`TRENCH`]: what every map has unless it was asked for another.
+    pub const DEFAULT: Relief = Relief {
+        peak: PEAK,
+        trench: TRENCH,
+    };
+
+    /// A relief of a `peak` metres high and a `trench` metres deep.
+    pub fn of_metres(peak: f64, trench: f64) -> Relief {
+        Relief {
+            peak: voxels(peak),
+            trench: voxels(trench),
+        }
+    }
+}
+
+impl Default for Relief {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
 
 /// The relief of the noise-only map (the test Planets and the small maps): 2 km and 1 km, in the
 /// map's elevation units.
@@ -236,12 +281,45 @@ impl ElevationCell {
     }
 }
 
+/// Texels in a piece of a stage that fills the map: a fixed number, never a share of the threads,
+/// so that any number of threads cuts the work the same way. A piece takes about a millisecond
+/// at the dearest stage.
+pub const PIECE: usize = 1 << 13;
+
+/// How long each stage of a build took, and on how many threads (the audit of #264, and what
+/// `client map-build` prints).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct BuildTimes {
+    /// The noise at every texel's centre.
+    pub raw: Duration,
+    /// Scaling the noise to elevation: the weighted histogram, the median, the extremes.
+    pub normalise: Duration,
+    /// Thermal erosion.
+    pub erode: Duration,
+    /// The area that drains through each texel.
+    pub drainage: Duration,
+    /// Biome, regions and roughness of every texel.
+    pub texels: Duration,
+    /// The whole build.
+    pub total: Duration,
+    /// The threads it was run on at the most.
+    pub threads: usize,
+}
+
 /// The world map of one seed. See the module documentation.
 pub struct WorldMap {
     seed: u64,
     size: u32,
     /// Distance of sea level from the Planet's centre, in Voxels.
     radius: i32,
+    /// How far above and below sea level the ground goes: [`Relief::DEFAULT`], or what
+    /// [`WorldMap::with_relief`] stretched it to. The texels are those of the default relief
+    /// either way; the stretch is applied where they are read.
+    relief: Relief,
+    /// The factors by which a texel above sea level and one below it are read (the relief's peak
+    /// and trench over [`PEAK`] and [`TRENCH`]): both exactly 1.0 for the default relief, so that
+    /// reading is bit for bit what it was.
+    stretch: (f64, f64),
     /// Face by face, each row by row (`i` fastest).
     texels: Vec<Texel>,
 }
@@ -267,31 +345,65 @@ impl WorldMap {
     /// scale with it. Panics if `size` is 0 or `radius` is too small to hold the 2 km peak or too
     /// big for the coordinates (`i32` Voxels, and 10 cm lattice points).
     pub fn with_radius(seed: u64, size: u32, radius: i32) -> WorldMap {
-        let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+        Self::with_threads(seed, size, radius, machine::threads()).0
+    }
+
+    /// [`WorldMap::with_radius`] on at most `threads` threads, with the time each stage took. The
+    /// map is the same whatever the number of threads (the tests hold it to 1, 4 and all).
+    pub fn with_threads(
+        seed: u64,
+        size: u32,
+        radius: i32,
+        threads: usize,
+    ) -> (WorldMap, BuildTimes) {
         Self::generate_on(seed, size, radius, threads)
     }
 
-    fn generate_on(seed: u64, size: u32, radius: i32, threads: usize) -> WorldMap {
+    fn generate_on(seed: u64, size: u32, radius: i32, threads: usize) -> (WorldMap, BuildTimes) {
         assert!(size > 0, "a world map needs at least one texel");
         assert!(
             radius > PEAK + TRENCH && i64::from(radius) < i64::from(i32::MAX) / 2,
             "a Planet of {radius} Voxels does not fit its relief or the coordinates"
         );
+        let started = Instant::now();
+        let mut lap = {
+            let mut last = started;
+            move || {
+                let now = Instant::now();
+                let took = now - last;
+                last = now;
+                took
+            }
+        };
         let noise = lattice_radius(radius);
         let count = 6 * (size as usize).pow(2);
         // PROTOTYPE (#246): the real Planet's map comes from the landform model.
         if radius == WORLD_RADIUS && size >= 256 {
-            return Self::from_landform(seed, size, radius, noise, threads);
+            let started_lf = Instant::now();
+            let map = Self::from_landform(seed, size, radius, noise, threads);
+            let times = BuildTimes {
+                raw: Duration::ZERO,
+                normalise: Duration::ZERO,
+                erode: Duration::ZERO,
+                drainage: Duration::ZERO,
+                texels: started_lf.elapsed(),
+                total: started.elapsed(),
+                threads,
+            };
+            return (map, times);
         }
         let mut raw = vec![0; count];
-        par_fill(&mut raw, threads, |index| {
+        par_fill(&mut raw, PIECE, threads, |index| {
             let (face, i, j) = split(size, index);
             raw_elevation(seed, noise, centre(size, face, i, j))
         });
-        let base = normalise(&raw, size);
+        let raw_took = lap();
+        let base = normalise(&raw, size, threads);
         drop(raw);
+        let normalise_took = lap();
         let mut eroded = base.clone();
         erode(&mut eroded, size, noise, threads);
+        let erode_took = lap();
         let blank = Texel {
             elevation: 0,
             erosion: 0,
@@ -300,9 +412,10 @@ impl WorldMap {
             rough: 0,
             drainage: 0,
         };
-        let drainage = drainage(&eroded, size);
+        let drainage = drainage(&eroded, size, threads);
+        let drainage_took = lap();
         let mut texels = vec![blank; count];
-        par_fill(&mut texels, threads, |index| {
+        par_fill(&mut texels, PIECE, threads, |index| {
             let (face, i, j) = split(size, index);
             let direction = centre(size, face, i, j);
             let elevation = eroded[index];
@@ -316,12 +429,57 @@ impl WorldMap {
                 drainage: drainage[index],
             }
         });
-        WorldMap {
+        let times = BuildTimes {
+            raw: raw_took,
+            normalise: normalise_took,
+            erode: erode_took,
+            drainage: drainage_took,
+            texels: lap(),
+            total: started.elapsed(),
+            threads,
+        };
+        let map = WorldMap {
             seed,
             size,
             radius,
+            relief: Relief::DEFAULT,
+            stretch: (1.0, 1.0),
             texels,
-        }
+        };
+        (map, times)
+    }
+
+    /// This map with the ground stretched to `relief` (#242, the bench's cost proxy for a taller
+    /// ground column): every elevation above sea level is read `relief.peak / PEAK` times as high
+    /// and every one below it `relief.trench / TRENCH` times as deep, as the map's texels are
+    /// interpolated, so the highest peak is `relief.peak` and the deepest trench `relief.trench`.
+    /// The texels (and so [`WorldMap::content_hash`], the biomes, the roughness and the drainage)
+    /// are those of the default relief: only the heights of the ground are stretched, linearly
+    /// about sea level, and nothing that is horizontal is. Panics if the Planet is not bigger than
+    /// the relief, or the relief is not at least a Voxel each way.
+    pub fn with_relief(mut self, relief: Relief) -> WorldMap {
+        assert!(
+            relief.peak > 0 && relief.trench > 0,
+            "a relief needs a peak and a trench of at least a Voxel"
+        );
+        assert!(
+            i64::from(self.radius) > i64::from(relief.peak) + i64::from(relief.trench),
+            "a Planet of {} Voxels does not fit a relief of {} and {} Voxels",
+            self.radius,
+            relief.peak,
+            relief.trench
+        );
+        self.relief = relief;
+        self.stretch = (
+            f64::from(relief.peak) / f64::from(PEAK),
+            f64::from(relief.trench) / f64::from(TRENCH),
+        );
+        self
+    }
+
+    /// How far above and below sea level the ground of this map goes.
+    pub fn relief(&self) -> Relief {
+        self.relief
     }
 
     /// PROTOTYPE (#246): the map of the landform model. The model runs on its own grid of at most
@@ -341,12 +499,12 @@ impl WorldMap {
             (m * ELEVATION_UNITS_PER_METRE as f32).round().clamp(-32_000.0, f64::from(units(8_190.0)) as f32)
         };
         let mut eroded = vec![0i16; count];
-        par_fill(&mut eroded, threads, |index| {
+        par_fill(&mut eroded, PIECE, threads, |index| {
             let (face, i, j) = split(size, index);
             to_units(lf.height_at(centre(size, face, i, j))) as i16
         });
         let mut base = vec![0i16; count];
-        par_fill(&mut base, threads, |index| {
+        par_fill(&mut base, PIECE, threads, |index| {
             let (face, i, j) = split(size, index);
             to_units(lf.height0_at(centre(size, face, i, j))) as i16
         });
@@ -358,9 +516,9 @@ impl WorldMap {
             rough: 0,
             drainage: 0,
         };
-        let drainage = drainage(&eroded, size);
+        let drainage = drainage(&eroded, size, threads);
         let mut texels = vec![blank; count];
-        par_fill(&mut texels, threads, |index| {
+        par_fill(&mut texels, PIECE, threads, |index| {
             let (face, i, j) = split(size, index);
             let direction = centre(size, face, i, j);
             let elevation = eroded[index];
@@ -378,6 +536,8 @@ impl WorldMap {
             seed,
             size,
             radius,
+            relief: Relief::DEFAULT,
+            stretch: (1.0, 1.0),
             texels,
         }
     }
@@ -453,8 +613,14 @@ impl WorldMap {
         let (inner_i, inner_j) = (i.clamp(0, last), j.clamp(0, last));
         let read = |(face, i, j): (usize, u32, u32)| {
             let texel = self.texel(face, i, j);
+            let elevation = texel.elevation_voxels();
             [
-                texel.elevation_voxels(),
+                elevation
+                    * if elevation >= 0.0 {
+                        self.stretch.0
+                    } else {
+                        self.stretch.1
+                    },
                 f64::from(texel.rough) / 255.0,
                 f64::from(texel.drainage) / 255.0,
             ]
@@ -524,7 +690,7 @@ impl WorldMap {
         for (f, x, y) in places {
             if f != face {
                 return FieldRange {
-                    elevation: (-f64::from(TRENCH), f64::from(PEAK)),
+                    elevation: (-f64::from(self.relief.trench), f64::from(self.relief.peak)),
                     rough: (0.0, 1.0),
                     drainage: (0.0, 1.0),
                 };
@@ -640,22 +806,6 @@ impl WorldMap {
         }
         hash
     }
-}
-
-/// Fills `out` with `f(index)`, split into one contiguous part per thread. `f` sees only its
-/// index, so the result does not depend on the thread count.
-fn par_fill<T: Send>(out: &mut [T], threads: usize, f: impl Fn(usize) -> T + Sync) {
-    let part = out.len().div_ceil(threads.max(1)).max(1);
-    std::thread::scope(|scope| {
-        for (n, chunk) in out.chunks_mut(part).enumerate() {
-            let f = &f;
-            scope.spawn(move || {
-                for (k, slot) in chunk.iter_mut().enumerate() {
-                    *slot = f(n * part + k);
-                }
-            });
-        }
-    });
 }
 
 /// Splits a texel's index into (face, i, j).
@@ -854,27 +1004,53 @@ fn raw_elevation(seed: u64, noise: i32, direction: [f64; 3]) -> i32 {
 }
 
 /// The weight of each texel of a face, proportional to the area of sphere it covers.
-fn area_weights(size: u32) -> Vec<u32> {
+fn area_weights(size: u32, threads: usize) -> Vec<u32> {
     let slope = |t: f64| (2.0 + 2.0 * t.abs()) / 3.0;
-    (0..size * size)
-        .map(|k| {
-            let (ti, tj) = (coordinate(size, k % size), coordinate(size, k / size));
-            let (a, b) = (warp(ti), warp(tj));
-            let r = 1.0 + a * a + b * b;
-            (slope(ti) * slope(tj) / (r * r.sqrt()) * 1_048_576.0) as u32
-        })
-        .collect()
+    let mut weights = vec![0u32; (size as usize).pow(2)];
+    par_fill(&mut weights, PIECE, threads, |k| {
+        let k = k as u32;
+        let (ti, tj) = (coordinate(size, k % size), coordinate(size, k / size));
+        let (a, b) = (warp(ti), warp(tj));
+        let r = 1.0 + a * a + b * b;
+        (slope(ti) * slope(tj) / (r * r.sqrt()) * 1_048_576.0) as u32
+    });
+    weights
 }
 
 /// Scales the noise to elevation units so that sea level sits where [`OCEAN_SHARE`] of the area is
 /// below it, which makes that share of the Planet ocean, the highest point [`PEAK`] above it and the lowest [`TRENCH`] below.
-fn normalise(raw: &[i32], size: u32) -> Vec<i16> {
+///
+/// The histogram and the extremes are folded on all the threads (a sum of integers and a least
+/// and a greatest do not depend on the order), and the median is found in the one histogram.
+fn normalise(raw: &[i32], size: u32, threads: usize) -> Vec<i16> {
     const SHIFT: u32 = 5;
     const OFFSET: i32 = 1 << 20;
-    let weights = area_weights(size);
-    let mut area = vec![0u64; 1 << (21 - SHIFT)];
-    for (index, &value) in raw.iter().enumerate() {
-        area[((value + OFFSET) >> SHIFT) as usize] += u64::from(weights[index % weights.len()]);
+    const BINS: usize = 1 << (21 - SHIFT);
+    let weights = area_weights(size, threads);
+    let pieces = raw.len().div_ceil(PIECE * 16);
+    let folded = machine::par_fold(
+        pieces,
+        threads,
+        || (vec![0u64; BINS], i32::MAX, i32::MIN),
+        |(area, lo, hi), piece| {
+            let from = piece * PIECE * 16;
+            let to = (from + PIECE * 16).min(raw.len());
+            for index in from..to {
+                let value = raw[index];
+                area[((value + OFFSET) >> SHIFT) as usize] +=
+                    u64::from(weights[index % weights.len()]);
+                *lo = (*lo).min(value);
+                *hi = (*hi).max(value);
+            }
+        },
+    );
+    let mut area = vec![0u64; BINS];
+    let (mut min, mut max) = (i32::MAX, i32::MIN);
+    for (part, lo, hi) in folded {
+        for (total, n) in area.iter_mut().zip(part) {
+            *total += n;
+        }
+        (min, max) = (min.min(lo), max.max(hi));
     }
     let half = (area.iter().sum::<u64>() as f64 * OCEAN_SHARE) as u64;
     let mut below = 0;
@@ -886,21 +1062,18 @@ fn normalise(raw: &[i32], size: u32) -> Vec<i16> {
         })
         .unwrap();
     let median = ((median_bin as i32) << SHIFT) - OFFSET;
-    let (min, max) = raw
-        .iter()
-        .fold((i32::MAX, i32::MIN), |(lo, hi), &v| (lo.min(v), hi.max(v)));
     let rise = i64::from(max - median).max(1);
     let fall = i64::from(median - min).max(1);
-    raw.iter()
-        .map(|&v| {
-            let above = i64::from(v - median);
-            (if above >= 0 {
-                above * i64::from(PEAK_UNITS) / rise
-            } else {
-                above * i64::from(TRENCH_UNITS) / fall
-            }) as i16
-        })
-        .collect()
+    let mut scaled = vec![0i16; raw.len()];
+    par_fill(&mut scaled, PIECE, threads, |index| {
+        let above = i64::from(raw[index] - median);
+        (if above >= 0 {
+            above * i64::from(PEAK_UNITS) / rise
+        } else {
+            above * i64::from(TRENCH_UNITS) / fall
+        }) as i16
+    });
+    scaled
 }
 
 /// Thermal erosion: each texel sheds an eighth of its height over the talus to each lower
@@ -909,29 +1082,64 @@ fn normalise(raw: &[i32], size: u32) -> Vec<i16> {
 /// number of steps and the talus scale with the texel size, so the slope limit is the same at
 /// every size, but a coarse map is not a small copy of a fine one: material spreads about
 /// `sqrt(size / 16)` texels, and the amounts moved differ.
+///
+/// A step is `size / 16` of them over the whole map, 128 at the real size, so it is most of the
+/// build: the texels away from a face's edge, which are nearly all, read their neighbours by
+/// index (#264: 14.6 s of the 23.7 s of the build at eight threads, in a kernel of 28 ns a texel
+/// that split the index and walked the cube's edges for each of four neighbours).
 fn erode(heights: &mut Vec<i16>, size: u32, noise: i32, threads: usize) {
     // A slope of 0.2 (11 degrees) across one texel, which is a quarter of the circumference of
     // sea level (pi / 2 of the radius, 251,327 units at 16 km), divided by `size`, wide.
     let quarter = i64::from(noise) * 1_570_796 / 1_000_000;
     // In elevation units (25 cm), not lattice points (10 cm).
     let talus = ((quarter / i64::from(size)) as i32 / 5 * LATTICE_POINTS_PER_METRE / ELEVATION_UNITS_PER_METRE / 2).max(1);
+    let moved = |from: i32, to: i32| (from - to - talus).max(0) / 8;
+    let width = size as usize;
     let mut next = vec![0i16; heights.len()];
     for _ in 0..size / 16 {
-        par_fill(&mut next, threads, |index| {
-            let (face, i, j) = split(size, index);
-            let here = i32::from(heights[index]);
-            let around = [0, 1, 2, 3].map(|side| {
-                let (f, i, j) = step(size, face, i, j, side);
-                i32::from(heights[join(size, f, i, j)])
-            });
-            let moved = |from: i32, to: i32| (from - to - talus).max(0) / 8;
-            let shed: i32 = around.iter().map(|&n| moved(here, n)).sum();
-            let gained: i32 = around.iter().map(|&n| moved(n, here)).sum();
-            (here - shed + gained) as i16
+        let last: &[i16] = heights;
+        // Pieces are runs of rows, so that a piece is a fixed number of whole rows of a face
+        // (a face is `size` rows, and a piece never starts in the middle of one).
+        par_chunks(&mut next, width * ERODE_ROWS, threads, |from, chunk| {
+            let (mut face, mut i, mut j) = split(size, from);
+            for (k, slot) in chunk.iter_mut().enumerate() {
+                let index = from + k;
+                let here = i32::from(last[index]);
+                let around = if i > 0 && j > 0 && i + 1 < size && j + 1 < size {
+                    [
+                        last[index - 1],
+                        last[index + 1],
+                        last[index - width],
+                        last[index + width],
+                    ]
+                } else {
+                    [0, 1, 2, 3].map(|side| {
+                        let (f, i, j) = step(size, face, i, j, side);
+                        last[join(size, f, i, j)]
+                    })
+                };
+                let (mut shed, mut gained) = (0, 0);
+                for n in around {
+                    let n = i32::from(n);
+                    shed += moved(here, n);
+                    gained += moved(n, here);
+                }
+                *slot = (here - shed + gained) as i16;
+                i += 1;
+                if i == size {
+                    (i, j) = (0, j + 1);
+                    if j == size {
+                        (j, face) = (0, face + 1);
+                    }
+                }
+            }
         });
         std::mem::swap(heights, &mut next);
     }
 }
+
+/// Rows of texels in a piece of the erosion's step.
+const ERODE_ROWS: usize = 8;
 
 /// The steepest slope from texel `index` to one of its four neighbours: the rise over the run,
 /// where a texel is `noise * pi / 2 / size` lattice points wide (10 cm, as the elevation's units).
@@ -971,57 +1179,108 @@ fn roughness(slope: f64, biome: Biome, drainage: u8) -> u8 {
 /// from the integer's bits, not a function that machines differ on): 0 for a texel that nothing
 /// drains into, and on the sea. A proxy for the large drainage, at the map's texel: the map has
 /// no rivers (M1b-1).
-fn drainage(heights: &[i16], size: u32) -> Vec<u8> {
+///
+/// The flow makes a forest: each texel has at most one receiver, which is strictly lower, so a
+/// texel's area is the sum of its donors' and the order of the sums is free. It is worked out in
+/// rounds from the leaves (texels nothing flows into): a round adds the area of each texel that
+/// is ready (all its donors have added theirs) to its receiver's, and the receivers that have then
+/// had every donor are the next round. A round is shared among the threads when it is long, and
+/// done here when it is short (a river's last stretch is a round of one texel for thousands of
+/// rounds). The areas are integers, added in any order to the same sum; this is the same result
+/// as taking the texels highest first, which was one thread and 1.4 s (#264).
+fn drainage(heights: &[i16], size: u32, threads: usize) -> Vec<u8> {
+    drainage_with(heights, size, threads, SHARED_FROM)
+}
+
+/// Texels of a round below which the round is not shared among threads.
+const SHARED_FROM: usize = 4 * PIECE;
+
+/// [`drainage`], with the rounds of `shared_from` texels or more shared among the threads (the
+/// tests lower it to reach that branch on a small map).
+fn drainage_with(heights: &[i16], size: u32, threads: usize, shared_from: usize) -> Vec<u8> {
+    const NONE: u32 = u32::MAX;
     let count = heights.len();
-    // Highest first, by counting sort over the height (a texel's order among equals is its index).
-    let mut counts = vec![0u32; 1 << 16];
-    for &h in heights {
-        counts[(i32::from(h) + 32_768) as usize] += 1;
-    }
-    let mut start = 0u32;
-    for c in counts.iter_mut().rev() {
-        let n = *c;
-        *c = start;
-        start += n;
-    }
-    let mut order = vec![0u32; count];
-    for (index, &h) in heights.iter().enumerate() {
-        let slot = &mut counts[(i32::from(h) + 32_768) as usize];
-        order[*slot as usize] = index as u32;
-        *slot += 1;
-    }
-    let mut area = vec![1u32; count];
-    for &index in &order {
-        let index = index as usize;
+    let mut receiver = vec![NONE; count];
+    par_fill(&mut receiver, PIECE, threads, |index| {
         let here = heights[index];
         if here < SEA_LEVEL {
-            continue;
+            return NONE;
         }
         let (face, i, j) = split(size, index);
-        let mut lowest = (here, usize::MAX);
+        let mut lowest = (here, NONE);
         for side in 0..4 {
             let (f, i, j) = step(size, face, i, j, side);
             let at = join(size, f, i, j);
             if heights[at] < lowest.0 {
-                lowest = (heights[at], at);
+                lowest = (heights[at], at as u32);
             }
         }
-        if lowest.1 != usize::MAX {
-            area[lowest.1] = area[lowest.1].saturating_add(area[index]);
+        lowest.1
+    });
+    // Donors still to add their area, per texel: the neighbours whose receiver it is.
+    let mut waiting = vec![0u8; count];
+    par_fill(&mut waiting, PIECE, threads, |index| {
+        let (face, i, j) = split(size, index);
+        (0..4)
+            .filter(|&side| {
+                let (f, i, j) = step(size, face, i, j, side);
+                receiver[join(size, f, i, j)] == index as u32
+            })
+            .count() as u8
+    });
+    let waiting: Vec<AtomicU8> = waiting.into_iter().map(AtomicU8::new).collect();
+    let area: Vec<AtomicU32> = (0..count).map(|_| AtomicU32::new(1)).collect();
+    // A texel is ready when nothing is waited for. Those that flow nowhere add to nothing.
+    let ready = |range: std::ops::Range<usize>| -> Vec<u32> {
+        range
+            .filter(|&t| waiting[t].load(Ordering::Relaxed) == 0 && receiver[t] != NONE)
+            .map(|t| t as u32)
+            .collect()
+    };
+    let first = par_pieces(count.div_ceil(PIECE), threads, |n| {
+        ready(n * PIECE..((n + 1) * PIECE).min(count))
+    });
+    let mut round: Vec<u32> = first.into_iter().flatten().collect();
+    // Adds the area of `t` to its receiver's and says whether that was the receiver's last donor
+    // and it flows on. The area read is final: every donor of `t` has added its own.
+    let push = |t: u32, out: &mut Vec<u32>| {
+        let r = receiver[t as usize];
+        area[r as usize].fetch_add(area[t as usize].load(Ordering::Relaxed), Ordering::Relaxed);
+        if waiting[r as usize].fetch_sub(1, Ordering::AcqRel) == 1 && receiver[r as usize] != NONE {
+            out.push(r);
         }
+    };
+    while !round.is_empty() {
+        round = if round.len() < shared_from {
+            let mut next = Vec::new();
+            for &t in &round {
+                push(t, &mut next);
+            }
+            next
+        } else {
+            let pieces = round.len().div_ceil(PIECE);
+            let parts = par_pieces(pieces, threads, |n| {
+                let mut next = Vec::new();
+                for &t in &round[n * PIECE..((n + 1) * PIECE).min(round.len())] {
+                    push(t, &mut next);
+                }
+                next
+            });
+            parts.into_iter().flatten().collect()
+        };
     }
-    area.iter()
-        .zip(heights)
-        .map(|(&a, &h)| {
-            if h < SEA_LEVEL || a < 2 {
-                return 0;
-            }
-            let shift = a.leading_zeros();
-            let whole = 31 - shift;
-            let part = ((a << shift) >> 27) & 15;
-            (whole * 16 + part).min(255) as u8
-        })
-        .collect()
+    let mut out = vec![0u8; count];
+    par_fill(&mut out, PIECE, threads, |index| {
+        let (a, h) = (area[index].load(Ordering::Relaxed), heights[index]);
+        if h < SEA_LEVEL || a < 2 {
+            return 0;
+        }
+        let shift = a.leading_zeros();
+        let whole = 31 - shift;
+        let part = ((a << shift) >> 27) & 15;
+        (whole * 16 + part).min(255) as u8
+    });
+    out
 }
 
 /// The biome at a texel: cold at the poles and on high ground, dry in a band of subtropical
@@ -1133,19 +1392,152 @@ mod tests {
         assert_ne!(again.content_hash(), other.content_hash());
     }
 
+    /// The hashes of the maps of the build before its stages were parallel (#264), which was one
+    /// thread for the histogram and the drainage and a kernel that walked the cube's edges for
+    /// every neighbour: the parallel build is bit for bit the same.
+    const BEFORE_264: [(u64, u32, u64); 4] = [
+        (SEED, 64, 0x8222_ab37_26df_da0d),
+        (SEED, 128, 0x4fce_04bc_dcd3_8b06),
+        (SEED, 256, 0xb40f_552e_b256_1b1a),
+        // A size that is not a multiple of a piece's rows, so that pieces start inside a face.
+        (7, 100, 0x5e7e_830c_b341_63c0),
+    ];
+
     #[test]
-    fn the_map_does_not_depend_on_the_thread_count() {
-        let one = WorldMap::generate_on(SEED, 64, TEST_RADIUS, 1).content_hash();
-        for threads in [2, 3, 8] {
-            let many = WorldMap::generate_on(SEED, 64, TEST_RADIUS, threads);
-            assert_eq!(one, many.content_hash());
+    fn the_map_is_the_same_at_1_4_and_all_threads_and_as_before_the_build_was_parallel() {
+        let all = machine::threads().max(8);
+        for (seed, size, expected) in BEFORE_264 {
+            for threads in [1, 4, all] {
+                let (map, times) = WorldMap::with_threads(seed, size, TEST_RADIUS, threads);
+                assert_eq!(
+                    map.content_hash(),
+                    expected,
+                    "seed {seed:#x}, {size} texels, {threads} threads"
+                );
+                assert_eq!(times.threads, threads);
+            }
+        }
+    }
+
+    /// The drainage as it was before it was parallel: the texels highest first (a counting sort of
+    /// the heights, a texel's order among equals its index), each adding its area to its lowest
+    /// lower neighbour's.
+    fn drainage_highest_first(heights: &[i16], size: u32) -> Vec<u8> {
+        let count = heights.len();
+        let mut order: Vec<usize> = (0..count).collect();
+        order.sort_by_key(|&i| std::cmp::Reverse(heights[i]));
+        let mut area = vec![1u32; count];
+        for index in order {
+            let here = heights[index];
+            if here < SEA_LEVEL {
+                continue;
+            }
+            let (face, i, j) = split(size, index);
+            let mut lowest = (here, usize::MAX);
+            for side in 0..4 {
+                let (f, i, j) = step(size, face, i, j, side);
+                let at = join(size, f, i, j);
+                if heights[at] < lowest.0 {
+                    lowest = (heights[at], at);
+                }
+            }
+            if lowest.1 != usize::MAX {
+                area[lowest.1] = area[lowest.1].saturating_add(area[index]);
+            }
+        }
+        area.iter()
+            .zip(heights)
+            .map(|(&a, &h)| {
+                if h < SEA_LEVEL || a < 2 {
+                    return 0;
+                }
+                let shift = a.leading_zeros();
+                let whole = 31 - shift;
+                let part = ((a << shift) >> 27) & 15;
+                (whole * 16 + part).min(255) as u8
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_drainage_of_rounds_is_that_of_the_texels_highest_first() {
+        // The eroded heights of a real map, and a flat plain with a pit and a ramp, which makes
+        // long rounds of one texel and a round of thousands.
+        let size = 64u32;
+        let noise = lattice_radius(TEST_RADIUS);
+        let count = 6 * (size as usize).pow(2);
+        let mut raw = vec![0; count];
+        for (index, slot) in raw.iter_mut().enumerate() {
+            let (face, i, j) = split(size, index);
+            *slot = raw_elevation(SEED, noise, centre(size, face, i, j));
+        }
+        let mut eroded = normalise(&raw, size, 3);
+        erode(&mut eroded, size, noise, 3);
+        let ramp: Vec<i16> = (0..count).map(|k| ((k % 9_000) as i16) / 3 - 100).collect();
+        let mut pit = vec![5i16; count];
+        pit[count / 2] = -50;
+        for heights in [eroded, ramp, vec![5; count], pit] {
+            let expected = drainage_highest_first(&heights, size);
+            for threads in [1, 4, 8] {
+                assert_eq!(
+                    drainage(&heights, size, threads),
+                    expected,
+                    "{threads} threads"
+                );
+                // With every round shared among the threads, as the big ones are (this map is
+                // under `SHARED_FROM`, so the rounds above are all done on one).
+                for shared_from in [1, 2, 64] {
+                    assert_eq!(
+                        drainage_with(&heights, size, threads, shared_from),
+                        expected,
+                        "{threads} threads, rounds of {shared_from} or more shared"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_big_rounds_of_a_map_over_the_threshold_are_shared_and_give_the_same_drainage() {
+        // A checkerboard of land at two heights: every high texel drains to a low neighbour and
+        // nothing drains to it, so the first round is all of them, about half of 98 304 texels,
+        // which is over `SHARED_FROM` and takes the parallel branch with no help from the test.
+        let size = 128u32;
+        let count = 6 * (size as usize).pow(2);
+        let board: Vec<i16> = (0..count)
+            .map(|index| {
+                let (_, i, j) = split(size, index);
+                SEA_LEVEL + if (i + j) % 2 == 0 { 100 } else { 0 }
+            })
+            .collect();
+        let leaves = board
+            .iter()
+            .enumerate()
+            .filter(|&(index, &h)| {
+                let (face, i, j) = split(size, index);
+                h > SEA_LEVEL
+                    && (0..4).all(|side| {
+                        let (f, i, j) = step(size, face, i, j, side);
+                        board[join(size, f, i, j)] < h
+                    })
+            })
+            .count();
+        assert!(leaves > SHARED_FROM, "{leaves} texels in the first round");
+        let expected = drainage_highest_first(&board, size);
+        assert!(expected.iter().any(|&d| d > 0));
+        for threads in [1, 4, 8] {
+            assert_eq!(
+                drainage(&board, size, threads),
+                expected,
+                "{threads} threads"
+            );
         }
     }
 
     #[test]
     fn about_half_the_planets_area_is_ocean() {
         let map = map();
-        let weights = area_weights(SIZE);
+        let weights = area_weights(SIZE, 4);
         let (mut ocean, mut all) = (0u64, 0u64);
         for (_, i, j, texel) in all_texels(map) {
             let weight = u64::from(weights[(j * SIZE + i) as usize]);
@@ -1398,7 +1790,7 @@ mod tests {
 
     #[test]
     fn texels_are_within_a_factor_of_two_of_each_other_in_area() {
-        let weights = area_weights(SIZE);
+        let weights = area_weights(SIZE, 4);
         let (min, max) = (weights.iter().min().unwrap(), weights.iter().max().unwrap());
         assert!(f64::from(*max) / f64::from(*min) < 2.2, "{min} {max}");
     }

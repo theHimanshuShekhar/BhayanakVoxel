@@ -44,10 +44,10 @@ use brick_store::{BRICK_SIZE, Brick, BrickCoord, BrickSource, BrickStore, Materi
 
 pub use crate::SOIL;
 use crate::caves::{self, Caves, Tube};
+use crate::cost::ExtraCost;
 use crate::detail::{self, Detail};
 use crate::world_map::{
-    Biome, ElevationCell, Fields, PEAK, SEA_LEVEL, TRENCH, Texel, WORLD_RADIUS, WorldMap, units,
-    voxels,
+    Biome, ElevationCell, Fields, Relief, SEA_LEVEL, Texel, WORLD_RADIUS, WorldMap, units, voxels,
 };
 use crate::{Corners, distance, par_bricks};
 
@@ -85,14 +85,24 @@ pub const fn molten_radius(radius: i32) -> i32 {
 /// Radius inside which a Voxel of a Planet of `radius` Voxels is core or deep rock whatever the
 /// world map says: below even the lowest ground's strata.
 pub const fn interior_radius(radius: i32) -> i32 {
-    radius - TRENCH - DETAIL_REACH - STRATA_DEPTH
+    interior_radius_for(radius, Relief::DEFAULT)
+}
+
+/// [`interior_radius`] for a ground that goes as low as `relief` says (#242).
+pub const fn interior_radius_for(radius: i32, relief: Relief) -> i32 {
+    radius - relief.trench - DETAIL_REACH - STRATA_DEPTH
 }
 
 /// Every Voxel of a Planet of `radius` Voxels is within this many Voxels of its centre: sea
 /// level's radius plus the highest its ground goes, and the crystals that can stand on it (#204).
 /// Nothing is generated beyond it, so a ray need not be walked further.
 pub const fn max_radius(radius: i32) -> i32 {
-    radius + PEAK + DETAIL_REACH + crystals::REACH as i32 + 1
+    max_radius_for(radius, Relief::DEFAULT)
+}
+
+/// [`max_radius`] for a ground that goes as high as `relief` says (#242).
+pub const fn max_radius_for(radius: i32, relief: Relief) -> i32 {
+    radius + relief.peak + DETAIL_REACH + crystals::REACH as i32 + 1
 }
 
 /// The default Planet's [`max_radius`].
@@ -109,12 +119,12 @@ struct Shape {
 }
 
 impl Shape {
-    fn new(radius: i32) -> Shape {
+    fn new(radius: i32, relief: Relief) -> Shape {
         Shape {
             sea: f64::from(radius) + f64::from(SEA_LEVEL),
             molten: molten_radius(radius),
-            interior: interior_radius(radius),
-            max: max_radius(radius),
+            interior: interior_radius_for(radius, relief),
+            max: max_radius_for(radius, relief),
         }
     }
 
@@ -376,6 +386,8 @@ pub struct Planet {
     caves: Arc<Caves>,
     shape: Shape,
     detail: Detail,
+    /// The bench's artificial cost of each brick generated (#242); none for the game's Planet.
+    extra_cost: Option<Arc<ExtraCost>>,
 }
 
 impl fmt::Debug for Planet {
@@ -396,13 +408,21 @@ impl Planet {
     pub fn new(map: WorldMap) -> Planet {
         let map = Arc::new(map);
         Planet {
-            shape: Shape::new(map.radius()),
+            shape: Shape::new(map.radius(), map.relief()),
             detail: Detail::new(map.seed(), map.radius()),
             caves: Arc::new(Caves::new(map.clone())),
+            extra_cost: None,
             map,
         }
     }
 
+    /// This Planet with an artificial cost for each brick it generates, a hook for the bench
+    /// (#242, see [`crate::cost`]). It spends CPU time as a brick's generation starts and changes
+    /// nothing that is generated. Clones of the Planet share it.
+    pub fn with_extra_cost(mut self, cost: Arc<ExtraCost>) -> Planet {
+        self.extra_cost = Some(cost);
+        self
+    }
     /// FNV-1a hash of the tubes of the caves of the cubes in the box from `low` to `high`, bit for
     /// bit, in the order of the cubes: what the golden test holds the walk that grows them to,
     /// on every platform.
@@ -622,6 +642,9 @@ impl Planet {
     fn generate(&self, level: usize, coord: BrickCoord) -> Brick {
         #[cfg(test)]
         BRICKS_MADE.with(|made| made.set(made.get() + 1));
+        if let Some(cost) = &self.extra_cost {
+            cost.burn();
+        }
         let mut brick = self.terrain(level, coord);
         if level <= CRYSTAL_MAX_LEVEL && (brick.is_air() || !brick.is_uniform()) {
             self.plant_crystals(level, coord, &mut brick);
@@ -1358,31 +1381,27 @@ impl Planet {
         top: usize,
         cells: &[BrickCoord],
     ) -> Vec<(usize, BrickCoord, Brick, bool)> {
-        let next = std::sync::atomic::AtomicUsize::new(0);
-        let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
-        let parts: Vec<Vec<(usize, Vec<_>)>> = std::thread::scope(|scope| {
-            let workers: Vec<_> = (0..threads.min(cells.len().max(1)))
-                .map(|_| {
-                    scope.spawn(|| {
-                        let mut made = Vec::new();
-                        loop {
-                            let at = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            let Some(&cell) = cells.get(at) else {
-                                return made;
-                            };
-                            made.push((at, self.guard_cell(levels.clone(), top, cell)));
-                        }
-                    })
-                })
-                .collect();
-            workers
-                .into_iter()
-                .map(|worker| worker.join().expect("generator thread panicked"))
-                .collect()
-        });
-        let mut by_cell: Vec<_> = parts.into_iter().flatten().collect();
-        by_cell.sort_by_key(|&(at, _)| at);
-        by_cell.into_iter().flat_map(|(_, made)| made).collect()
+        self.guard_in_on(machine::threads(), levels, top, cells)
+    }
+
+    /// [`Planet::guard_in`] on `threads` threads (the tests make the same Guard on one, four and
+    /// all).
+    fn guard_in_on(
+        &self,
+        threads: usize,
+        levels: std::ops::RangeInclusive<usize>,
+        top: usize,
+        cells: &[BrickCoord],
+    ) -> Vec<(usize, BrickCoord, Brick, bool)> {
+        // A cell a piece, taken by the next free thread (a cell is thousands of bricks and costs
+        // what its ground costs, so a share a thread would leave all but one waiting at the end),
+        // and the cells come back in order.
+        machine::par_pieces(cells.len(), threads, |at| {
+            self.guard_cell(levels.clone(), top, cells[at])
+        })
+        .into_iter()
+        .flatten()
+        .collect()
     }
 }
 
@@ -1513,7 +1532,7 @@ impl BrickSource for RegionSource {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::world_map::{Biome, SEA_LEVEL, TEST_MAP_SIZE, TEST_RADIUS, Texel};
+    use crate::world_map::{Biome, PEAK, SEA_LEVEL, TEST_MAP_SIZE, TEST_RADIUS, Texel};
     use brick_store::VOXELS_PER_METRE;
     use std::sync::OnceLock;
 
@@ -3015,6 +3034,14 @@ mod tests {
             .flat_map(|&cell| planet().guard_cell(12..=top, top, cell))
             .collect();
         assert_eq!(shared, alone);
+        // And the same on one, four and three times all the threads.
+        for threads in [1, 4, 3 * machine::threads()] {
+            assert_eq!(
+                planet().guard_in_on(threads, 12..=top, top, &cells),
+                alone,
+                "{threads} threads"
+            );
+        }
         // A cell that is the ball's: every brick of the top level that the ball touches is one,
         // and the others are not.
         let size = f64::from(BRICK_SIZE << top);
@@ -3118,6 +3145,7 @@ mod tests {
     }
 
     mod cave_tests;
+    mod relief_tests;
 
     /// The bounds on the ground over a brick (what the shortcuts of `generate` rest on) hold at
     /// every Voxel of it, and are not far from what the Voxels have: the detail's bounds are the

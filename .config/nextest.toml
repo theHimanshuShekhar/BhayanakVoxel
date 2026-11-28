@@ -1,0 +1,31 @@
+# cargo-nextest settings (docs/agents/ci.md). Nothing here changes what a test checks or whether it
+# runs: only the order in which a shard starts them.
+
+# A shard cannot finish before its longest test does, and nextest starts tests in the order of
+# their binaries, so a test of several minutes that is reached late sets the shard's end. These
+# start first. The times are what the CI shards measured on 2026-11-27 (four vCPUs, lavapipe);
+# when a test that takes this long is added, or one here gets fast, change the list.
+[[profile.default.overrides]]
+# Over five minutes.
+filter = '''
+test(~streaming_tests::flying_away_and_back_keeps_the_store_within_its_budget)
+| test(~the_day_cycle_reports_a_sped_up_day_with_its_frames_exposure_and_cache)
+| test(~the_hardware_follows_the_rings_as_they_move_with_no_group_stale_and_no_hole)
+'''
+priority = 100
+
+[[profile.default.overrides]]
+# Two to five minutes: the long streaming runs, the bench's runs, the rings and the largest primes.
+filter = '''
+test(~streaming_tests::flying_with_margins_evicts_the_trail)
+| binary_id(render::rings)
+| test(~the_short_bench_writes_a_report_and_screenshots)
+| test(~the_streaming_mode_reports_the_counts_of_a_stepped_run)
+| test(~bench::crystals::a_cluster_on_a_sunlit_slope)
+| test(~bench::landscape::the_landscape_from_the_ground_500_m)
+| test(~bench::lookdev::run::tests::a_short_run_writes_a_folder)
+| test(~bench::stream::tests::the_extra_cost_changes_no_count)
+| binary_id(prefetch-sim::suite)
+| test(~the_cache_keeps_up_with_a_drifting_sun)
+'''
+priority = 50

@@ -34,7 +34,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::planet::tangents;
-use crate::world_map::{PEAK, SEA_LEVEL, WorldMap, voxels};
+use crate::world_map::{SEA_LEVEL, WorldMap, voxels};
 use crate::{Corners, distance, hash, value_noise};
 
 /// The size of `metres`, in Voxels, as a float.
@@ -441,7 +441,7 @@ impl Caves {
         let map = &*self.map;
         let sea = f64::from(map.radius()) + f64::from(SEA_LEVEL);
         let lowest = sea - ANCHOR_DEPTH.end();
-        let highest = sea + f64::from(PEAK) - ANCHOR_DEPTH.start();
+        let highest = sea + f64::from(map.relief().peak) - ANCHOR_DEPTH.start();
         let centre = cube.map(|c| f64::from(c) * f64::from(CELL) + f64::from(CELL / 2));
         let none = Cube {
             tubes: Vec::new(),
