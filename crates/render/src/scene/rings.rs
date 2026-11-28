@@ -632,7 +632,7 @@ const EXTEND_PIECE: usize = 1 << 18;
 /// pages, which the changes that land in them later would find by faults, milliseconds on the
 /// thread that pastes them), on the machine's threads but one in pieces of [`EXTEND_PIECE`]. A
 /// scene's buffers are 813 MiB at full size, and writing them on one thread was 0.3 s of the load
-/// that the player waits for, and again of the start of the scene thread (#269).
+/// that the player waits for (#269).
 fn extended(old: &[u32], len: usize) -> Vec<u32> {
     debug_assert!(old.len() <= len);
     let mut words = vec![0u32; len];
@@ -960,7 +960,10 @@ impl Scene {
         // changes land in later would otherwise be found by faults, which is milliseconds on the
         // thread that pastes them.
         let held = |words: &[u32], pool: &Pool| {
-            extended(&words[..pool.used_end(words.len())], words.len())
+            let mut copy = Vec::with_capacity(words.len());
+            copy.extend_from_slice(&words[..pool.used_end(words.len())]);
+            copy.resize(words.len(), 0);
+            copy
         };
         Scene {
             levels: self.levels.clone(),

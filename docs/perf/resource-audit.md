@@ -62,8 +62,8 @@ prints the profile it runs with on its first line (`machine: ...`).
 | 4 | `look_at_due`, `holes`, `par_map` and `map_shared`, `crates/render/src/scene/select.rs` | `MOST_THREADS = 4` (and half the machine's) for the look at due entries; `PARALLEL_FROM` 32 768; the holes: every thread walked the whole table to take every n-th node (more threads were no faster); a share a thread, so a share with a slow node left the rest idle | all `bulk_threads()`; pieces of a fixed 2 048 entries (`LOOK_PIECE`), the next free thread takes the next, results in piece order; `PARALLEL_FROM` is two pieces; the holes list the split keys in one pass and share them in pieces | 3 threads | 31 on a 32-thread machine, not 4. **Not measured on the 4090** |
 | 5 | `par_bricks` (the spawn ring, `generate_region`, `generate_planet`, `Planet::guard`) and `Planet::guard_in` (the Guard's cells), `planet-gen` | slabs of constant x (about a hundred for the spawn ring, so that a slab that held the surface left the others idle at the end) | columns of constant x and y, the next free thread takes the next; a cell a piece in `guard_in`. Output in the order of x, y, z whatever the threads (it was in no order) | `threads()` = 4 | all `threads()` |
 | 6 | `loader::workers_for`, `GUARD_WORKERS` | `cores − 2`; the Guard's background share 2 workers whatever the workers | `workers_for` is `machine::loader_workers_for`, so a constrained profile gets 2 workers on 4 threads; the Guard's share is `max(2, workers / 3)` (`guard_share`) | 2 workers; the Guard has all but one when the queue is empty, one beside it | 30 workers on a 32-thread machine, 10 on the Guard beside the queue (was 2) |
-| 7 | `Selection::arrived` (`select.rs`, ADR 0006), the scene thread's tree update | 43 to 54 s of the shot fill's 92 to 131 s, on one core: `decide` for each brick that arrived and its children was 43 s of the 131 s of the full-size fill (2.8 million decisions, 15 µs) | the decisions are planned on `bulk_threads()` in pieces of 8 bricks and the tree is changed on the scene thread in the order of the batch, the same at 1, 4 and all threads (test); the look at the neighbours stays serial (a threaded version of it, for 2 048 bricks or more, was taken by 7 599 of the 146 171 calls of a full-size fill, 300 bricks a call on average: it was not shown to save anything and no test could tell it from a look that skipped bricks, so it was dropped). **On the dev box (8 threads, busy, no GPU) the fill did not measurably improve** (below): a batch is about 70 bricks, a call 1.2 to 1.8 ms, and starting threads for it and their cold `remembered` caches take what the plan gains. **Not measured on the 4090** | 3 threads | a thread for every two pieces of 8 bricks at the most (5 at 70 bricks), none for a batch of 16 or fewer (most of the 146 171 calls of a fill: about 15 000 are planned on threads), so a 32-thread machine uses 5 of them; **follow-up 1** |
-| 10 | The start of the load (`load`, `crust_around`, `Scene::pack_rings`' buffers, `BrickStore::build_lod`) | 1.77 to 1.88 s to control on the dev box (the spawn ring 0.85 to 0.93 s and 0.92 to 1.00 s of setup, on one thread): the ring's table grew a dozen times over its 1.1 million bricks, `build_lod(0)` collected 1.1 million keys to remake no level, and the scene's two buffers (813 MiB at full size) were written on one thread | **1.41 to 1.53 s** (the ring 0.81 to 0.90 s, the setup 0.60 to 0.63 s): the ring's store reserves room for what it found before inserting (about 0.1 s), `build_lod(0)` returns at once (80 ms), and the buffers are made in pieces of 1 MiB on `bulk_threads()` (`rings::extended`, 0.3 s; the threads run `worker_start`, so they stay under the frame thread; the same function makes the frame thread's copy and a buffer that grows; **a buffer that grows now keeps the old one beside the new until it is copied, where `resize` could move it in place on Linux: about 400 MiB more at the peak of the load at full size**). The same words | the same pieces on 3 threads | the load's remaining serial setup is listed in follow-up 8 |
+| 7 | **Not fixed:** `Selection::arrived` and `Scene::arrive`, the scene thread's tree update (`select.rs`, `rings.rs`) | 43 to 54 s of the shot fill's 92 to 131 s, on one core: `decide` for each brick that arrived and its children was 43 s of the 131 s of the full-size fill (2.8 million decisions, 15 µs) | **A parallel plan was tried (#269) and reverted: it did not help on the 4090 and cost the frame thread** (follow-up 1) | | follow-up 1 below |
+| 10 | The start of the load (`load`, `crust_around`, `Scene::pack_rings`' buffers, `BrickStore::build_lod`) | 1.77 to 1.88 s to control on the dev box (the spawn ring 0.85 to 0.93 s and 0.92 to 1.00 s of setup, on one thread): the ring's table grew a dozen times over its 1.1 million bricks, `build_lod(0)` collected 1.1 million keys to remake no level, and the scene's two buffers (813 MiB at full size) were written on one thread | **1.41 to 1.53 s** (the ring 0.81 to 0.90 s, the setup 0.60 to 0.63 s): the ring's store reserves room for what it found before inserting (about 0.1 s), `build_lod(0)` returns at once (80 ms), and the buffers are made in pieces of 1 MiB on `bulk_threads()` (`rings::extended`, 0.3 s; the threads run `worker_start`, so they stay under the frame thread; `make_room` uses it, and the frame thread's copy, `mirror`, is the code it was; **a buffer that grows now keeps the old one beside the new until it is copied, where `resize` could move it in place on Linux: about 400 MiB more at the peak of the load at full size**). The same words | the same pieces on 3 threads | the load's remaining serial setup is listed in follow-up 8 |
 | 8 | The LOD bias the client starts at, `bias_for` in `bins/client/src/main.rs` | 1.0 whatever the memory | 1.0 where the machine has the room (the peak is estimated as `MEMORY_FIXED` 830 MiB + `MEMORY_SCALED` 8030 MiB / bias², fitted to the 4090's measurements, and may be 90% of the memory: **9.7 GiB free**; the 4090's 18.7 GiB has the room); coarser in the square root of the shortfall, up to 3.0, below that. The tables (`room_for`, `budget_for`, `expected_words`) scale with `d0²`, so a larger bias is a smaller resident set. A multiple of 0.05. **The report says it** (`machine.profile.starting_bias`) and a full-size real-time run of the default profile that did not start at 1.0 has `starting_bias` in `gates.over`: the gates are budgeted for 1.0 | the low-end reference (5 GiB) gets **1.5** (estimated peak 4.3 GiB, 86% of it; it was 1.35 and peaked at 5228 MiB, over the 5 GiB, before the 4090 run recalibrated the estimate); never fails, never below the Guard and the ring | the ceiling is the default 1.0: spending spare memory and GPU on quality is #230's |
 | 9 | The constrained profile's ray queries, `request_gpu_for` in `crates/render/src/lib.rs` | the adapter's | `ray_queries = false` removes `EXPERIMENTAL_RAY_QUERY` from the requested features and the experimental opt-in from the device, as the compute setting does (#260), so the compute tracer runs on any machine | the compute tracer | the adapter's |
 
@@ -87,15 +87,11 @@ On the dev box (Ryzen 7 5700G, 8 threads, shared with other agents, load average
 | of it the spawn ring (1.1 million bricks) | 0.85, 0.88, 0.93 s | 0.81, 0.85, 0.90 s |
 | of it the rest | 0.92 to 1.00 s, serial | 0.60 to 0.63 s |
 | Cores used in the second after the ring | 1.8 (one thread at 0.86) | 3.1 then 5.2 |
-| Fill (the Guard complete at 15 s) | 166, 179, 180 s | 173, 201 s (the box was busier in the second) |
-| Scene thread's CPU over the fill | 162, 176, 176 s | 136, 147, 157 s |
-| `Selection::arrived` over the fill (timed inside) | about 80 s | 75, 82, 92 s |
 
 The two runs side by side, one after the other on the same quieter box (the last of each): before
-(`main`, 9b349e8) load 1.86 s (ring 0.91 + 0.95), fill 147.3 s, scene thread's CPU 142.7 s,
-`pack_arrive` 101.0 s, 1.7 cores in the second after the ring; after, load **1.32 s** (ring 0.72
-+ 0.60), fill **138.8 s**, scene thread's CPU **106.2 s**, `pack_arrive` **94.6 s**, 3.6 then 5.9
-cores. The fill's 6% is inside what the earlier runs differ by.
+(`main`, 9b349e8) load 1.86 s (ring 0.91 + 0.95), 1.7 cores in the second after the ring; after,
+load **1.32 s** (ring 0.72 + 0.60), 3.6 then 5.9 cores. (The "after" runs of the first table and
+this one had the parallel plan below in them, which does not run before the load ends.)
 
 **What bounds the time to control is not the scene thread (it is not running) and not the ring's
 parallelism (`par_bricks` already uses every thread: 8 threads over 0.5 s, 6.3 cores): it is about 0.9 s of
@@ -105,34 +101,54 @@ itself is 0.7 s of generation (`region_bricks`) and 0.1 s of inserts. The 4090's
 ring's part smaller and the serial part more of the whole, so this is where the remaining time is.
 
 **What bounds the fill is the scene thread on its one core while the loader's workers wait for it**
-(one thread at 0.99 of a core from 12 s to 120 s with the others under half a core, in the
-before windows), and on the dev box the cut of its work is small: the plan is made on 3 to 5
-threads for each batch of 70 bricks, 1.2 to 1.8 ms a call where one thread takes about 1 ms
-(a call ends when its slowest piece does, the threads cost 70 to 350 µs to start), and a thread
-that starts has no `remembered` answers, so the source is asked twice as often (2 312 asks for 244
-parents on one thread, 4 604 on all: the loader's workers lose that CPU). The #242 slope stays
-generation work, about 1.1 million bricks divided by the threads.
+(one thread at 0.99 of a core from 12 s to 120 s with the others under half a core). The #242
+slope stays generation work, about 1.1 million bricks divided by the threads.
 
+**The parallel plan of `Selection::arrived` that was tried here did not help and was reverted.**
+The decisions (`decide`, 43 s of the fill) were made on `bulk_threads()` in pieces of 8 bricks and the
+tree changed on the scene thread in order (the same tree at 1, 4 and all threads). On the dev box the
+fill did not measurably improve (a batch is about 70 bricks, a call 1.2 to 1.8 ms where one thread
+takes about 1 ms; the threads cost 70 to 350 µs to start and start with no `remembered` answers, so
+the source was asked about twice as often, 4 604 against 2 312 asks for 244 parents). **On the 4090**
+(`client bench --streaming --real-time`, median of 3, `main` 9b349e8 against the PR at e77e2a1):
+
+| | `main` | the plan |
+| --- | --- | --- |
+| time to control | 1.14 s | 1.00 s (this is the load's setup above, not the plan) |
+| Guard complete | 8.66 s | 8.68 s |
+| fill | 120.0 s | 114.5 s |
+| `pack_arrive` total | 103.9 s | 101.9 s |
+| frame_cpu p99, worst path | 6.25 ms | 7.56 ms (the gate is 8.0) |
+| frame_cpu p99, sea-level crossing | 3.27 to 3.58 ms | 6.94 to 7.56 ms, in all 3 runs |
+| frame_cpu p99, flights at 2 m and 50 m, vertical take-off | | each +0.5 to 1.5 ms |
+| time to control with `--gen-extra-us` 25 and 50, `--peak-m 8000 --trench-m 4000` | 3.58 s and 5.83 s (b08d5ca) | 3.39 s and 5.85 s |
+
+No gain in the fill or in the sweep's slope, and a frame thread that is slower in every path
+that was measured: the threads that plan compete with the frame thread for cores. **If arrival
+planning is made parallel again, it has to run on `bulk_threads()` (the one tried did, with
+`worker_start`) and must not raise the frame thread's p99** (the worst path 6.25 ms on `main`, the gate 8.0). The sea-level
+crossing's p99 doubling is also the thing to look at in `make_room`'s threaded `extended` (a rebuild
+calls it), which stayed.
 
 ## Not fixed: what is not cheap, and what it measured
 
 For the owner. None is filed (the ticket said to list them).
 
-1. **`Selection::arrived` and `Scene::arrive` are still one core of work on the scene thread** (row 7).
-   The decisions are planned on threads now, and the tree is changed, and `show_diff` repacks the
-   regions, on one: of the scene thread's 130 to 160 s in the fill, about 35 s is the plan (on
-   threads, so it costs the batch its slowest piece), 12 s `revisit_whole_as`, 18 s the recheck of
-   the neighbours, **48 to 54 s `show_diff`** (`sync_header` about 15 s, `write_region` 14.5 s,
-   the rest read and encode), 30 s `publish`. What would take it off the core: a pool of threads
-   that lives between batches (`unsafe` for the borrow, which the workspace has only in
+1. **`Selection::arrived` and `Scene::arrive` are serial on the scene thread** (row 7). Of the
+   scene thread's 130 to 160 s in a full-size fill on the dev box: about 43 s the decisions
+   (`decide`), 12 s `revisit_whole_as`, 18 s the recheck of the neighbours, **48 to 54 s `show_diff`**
+   (`sync_header` about 15 s, `write_region` 14.5 s, the rest read and encode), 30 s `publish`.
+   **The parallel plan was tried and reverted** (the table above: no gain on the 4090, the frame
+   thread's p99 up 0.5 to 3.9 ms). What would take the work off the core without that cost: a pool
+   of threads that lives between batches (`unsafe` for the borrow, which the workspace has only in
    `priority.rs`, or the store and tree behind `Arc`), planning the next batch while the tree takes
    the last (the tree split from the plan, a larger change to ADR 0006), a per-process cache of
-   the source's answers instead of the per-thread `remembered` (a plan asks twice as often as one
-   thread: 4 604 against 2 312 asks for 244 parents), and `show_diff` per region on threads (it
-   writes into the shared buffers, so it is a plan and an apply too). A round of 4 000 instead of
-   400 took the fill from 110 s to 92.65 s (the part of `arrive` that grows with the number of
-   rounds falls) but it changes the order the bricks are loaded in, which the look-dev's stills
-   depend on, so it is not done.
+   the source's answers instead of the per-thread `remembered` (a plan on fresh threads asked twice
+   as often), and `show_diff` per region on threads (it writes into the shared buffers, so it is a
+   plan and an apply too). A look at the neighbours on threads was also tried and dropped: 5% of
+   the calls reached 2 048 bricks. A round of 4 000 instead of 400 took the fill from 110 s to
+   92.65 s (the part of `arrive` that grows with the number of rounds falls) but it changes the
+   order the bricks are loaded in, which the look-dev's stills depend on, so it is not done.
 2. **Video memory is not read.** `wgpu` does not expose it. `Profile::video_memory` is only what
    `--video-memory-mib` or the low-end profile's 4 GiB says, and **no budget reads it**: the scene's buffers and the
    resident set are sized from the system memory and `d0²`. A read through the adapter's raw handle
