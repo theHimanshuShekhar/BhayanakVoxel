@@ -135,7 +135,7 @@ cargo run --release -p client -- bench --out bench-out
 
 It exits with status 2 if a pass is over its budget. Budgets live in
 `bins/client/bench-budgets.toml`; the full workflow — including the `needs-benchmark` label and
-the Windows artifact — is described in [`docs/agents/benchmarking.md`](docs/agents/benchmarking.md).
+the Windows artifact — is described in [`docs/agents/benchmarking.md`](docs/agents/benchmarking.md); the report's fields are in [`docs/perf/bench-report-reference.md`](docs/perf/bench-report-reference.md).
 
 ## Development
 

@@ -14,4 +14,4 @@ When a skill mentions a role (e.g. "apply the AFK-ready triage label"), use the 
 
 Edit the right-hand column to match whatever vocabulary you actually use.
 
-PR labels (not triage roles): `needs-benchmark` marks a PR that touches rendering or performance, for the dev to run `client bench` on its artifact. See `docs/agents/benchmarking.md`.
+PR labels (not triage roles): `needs-benchmark` marks a PR that can change GPU timings, for the orchestrator to run `client bench` on its artifact; `needs-stream-bench` marks one that touches the loader, prefetch or eviction, for `client bench --streaming --real-time`. See `docs/agents/benchmarking.md`.

@@ -54,7 +54,7 @@ it fails, so look at it on a PR, but do not make it a required check.
 
 It runs the client tests that are about real threads or real time (see the next section), among them
 the smoke test of the bench's real-time mode on the test Planet and its error case (#162): CI never runs the
-full-size mode, which is for the 4090 (`docs/agents/benchmarking.md`), and the tests of its gates
+full-size mode, which is for the 4090 (`docs/agents/benchmarking.md`; its fields are in `docs/perf/bench-report-reference.md`), and the tests of its gates
 need no threads and gate. Some of
 them wait on wall-clock time, and they fail now and then on a busy runner. Run them locally when
 you change the loader, the scene thread or streaming:
@@ -124,7 +124,7 @@ How the stepped mode shares code with the real one: the loader's worker loop is 
 thread's loop is a wait (`Engine::await_work`) and a round (`Engine::round`); a stepped scene
 thread calls the round. What a stepped mode does not have is the waiting itself, so a test of how a
 parked thread wakes is a real-thread test. A step takes no time on the clock, and a pause moves the
-clock on by the pause. The stepped parts are in the shipped binary, since `client bench --streaming` (#181) steps the same code and is that binary: the game starts threads and never steps. Its clock (`bins/client/src/clock.rs`) is the machine's, `Instant::now` and `thread::sleep`, behind a test of whether the clock is stepped that is never true there. The streaming bench's counts are checked by stepped tests (`bench::stream`) that gate on Linux and on Windows; see `docs/agents/benchmarking.md`.
+clock on by the pause. The stepped parts are in the shipped binary, since `client bench --streaming` (#181) steps the same code and is that binary: the game starts threads and never steps. Its clock (`bins/client/src/clock.rs`) is the machine's, `Instant::now` and `thread::sleep`, behind a test of whether the clock is stepped that is never true there. The streaming bench's counts are checked by stepped tests (`bench::stream`) that gate on Linux and on Windows; see "The streaming mode" in `docs/perf/bench-report-reference.md`.
 
 ## No GPU on Windows
 
