@@ -737,6 +737,17 @@ pub fn par_chunks<T: Send>(
     threads: usize,
     f: impl Fn(usize, &mut [T]) + Sync,
 ) {
+    par_chunks_with(out, piece, threads, None, f);
+}
+
+/// [`par_chunks`] in which each thread runs `start` first, if there is one.
+pub fn par_chunks_with<T: Send>(
+    out: &mut [T],
+    piece: usize,
+    threads: usize,
+    start: Option<fn()>,
+    f: impl Fn(usize, &mut [T]) + Sync,
+) {
     let piece = piece.max(1);
     let threads = threads.clamp(1, out.len().div_ceil(piece).max(1));
     if threads == 1 {
@@ -750,6 +761,9 @@ pub fn par_chunks<T: Send>(
     std::thread::scope(|scope| {
         for _ in 0..threads {
             scope.spawn(|| {
+                if let Some(start) = start {
+                    start();
+                }
                 loop {
                     let next = chunks.lock().unwrap_or_else(|e| e.into_inner()).next();
                     let Some((n, chunk)) = next else { break };

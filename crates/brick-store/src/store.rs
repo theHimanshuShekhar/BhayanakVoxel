@@ -1049,6 +1049,11 @@ impl BrickStore {
     /// 20 or 21 to reach from 5 cm Voxels to its disc.
     pub fn build_lod(&mut self, coarse_levels: usize) {
         self.coarse = vec![BrickStore::new(); coarse_levels];
+        // With no level above this one there is nothing to make, and collecting every key to say
+        // so was 80 ms over the spawn ring's million bricks (#269).
+        if coarse_levels == 0 {
+            return;
+        }
         self.remake_above(self.bricks.keys().copied().collect(), false);
     }
 
