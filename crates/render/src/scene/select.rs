@@ -616,8 +616,9 @@ const ARRIVE_PIECE: usize = 8;
 const ARRIVE_PIECE: usize = 2;
 
 /// The fewest bricks that arrive at once ([`Selection::arrived`]) that are planned on more than one
-/// thread: the plan of fewer is made here, which is less than starting the threads costs.
-const ARRIVE_PARALLEL_FROM: usize = 2 * ARRIVE_PIECE;
+/// thread: more than two pieces, since [`Selection::plan_arrivals`] starts a thread for every two
+/// pieces and a plan on one thread is made as the tree reaches each brick, which costs nothing more.
+const ARRIVE_PARALLEL_FROM: usize = 2 * ARRIVE_PIECE + 1;
 
 /// The coarsest level that is looked at in `store`.
 pub fn top_level(store: &BrickStore) -> usize {
@@ -792,9 +793,6 @@ pub struct Selection {
     /// once as the tree reaches each: empty between calls. A decision depends on the probe it is
     /// given only by whether the brick is air, which is the same however the probe was made.
     memo: HashMap<Key, Plan>,
-    /// How many nodes have been made since the selection began, so that two reads say whether the
-    /// set of nodes grew between them.
-    inserted: u64,
     /// Those of `waiting` that nobody has been told of yet.
     fresh: Vec<Key>,
     /// Bricks that stopped waiting without their children arriving (they were removed, merged or
@@ -902,7 +900,6 @@ impl Selection {
             many: MANY_STUCK,
             waiting: HashSet::default(),
             memo: HashMap::default(),
-            inserted: 0,
             fresh: Vec::new(),
             cancelled: Vec::new(),
         };
@@ -1951,8 +1948,8 @@ impl Selection {
     /// then changed on this thread, in the order of `parents`, by the code that always changed it,
     /// which takes each decision from what was planned and makes the same one where there is none.
     /// So the tree and the diff are what one thread makes of it, whatever the number of threads:
-    /// the same at 1, 4 and all of them. The look at the bricks beside the children is shared the
-    /// same way ([`Selection::beside_arrived`]).
+    /// the same at 1, 4 and all of them. The look at the bricks beside the children stays on this
+    /// thread ([`Selection::beside_arrived`]).
     pub fn arrived(&mut self, store: &BrickStore, parents: impl IntoIterator<Item = Key>) -> Diff {
         let parents: Vec<Key> = parents.into_iter().collect();
         let threads = if parents.len() < ARRIVE_PARALLEL_FROM {
@@ -1985,7 +1982,7 @@ impl Selection {
             }
         }
         self.memo.clear();
-        self.beside_arrived(store, parents, threads, &mut diff);
+        self.beside_arrived(store, parents, &mut diff);
         diff
     }
 
@@ -2003,6 +2000,10 @@ impl Selection {
         // A thread costs 70 to 350 µs to start (the dev box) and a piece is a few hundred µs of
         // work, so a call with few pieces does not start one for each.
         let threads = threads.min(pieces.div_ceil(2));
+        if threads <= 1 {
+            // Two pieces or fewer: the plan is made as the tree reaches each brick.
+            return;
+        }
         let made = machine::par_pieces_with(pieces, threads, machine::worker_start(), |piece| {
             let range = piece * ARRIVE_PIECE..((piece + 1) * ARRIVE_PIECE).min(parents.len());
             let mut decided = Vec::new();
@@ -2076,17 +2077,12 @@ impl Selection {
 
     /// The bricks that touch the children just made resident were told, when they were looked at,
     /// that these were not known to be full (see [`BrickStore::is_full_known`]), so they may be
-    /// buried after all: looks at each of them that is a node and full, in order. Which are nodes
-    /// and full is worked out on `threads` first, for all of them, for the tree as it is; once a
-    /// look at an earlier one has made a node, the rest are asked as they would be with no plan
-    /// (`inserted` says whether one was made).
-    fn beside_arrived(
-        &mut self,
-        store: &BrickStore,
-        parents: &[Key],
-        threads: usize,
-        diff: &mut Diff,
-    ) {
+    /// buried after all: looks at each of them that is a node and full, in order. (A version that
+    /// worked out which are nodes and full on threads, for 2 048 bricks or more, was taken by 7 599
+    /// of the 146 171 calls of a full-size fill, 300 bricks a call on average; it was not shown to
+    /// save anything, no test could tell it from a look that skipped bricks, and it was dropped,
+    /// #269.)
+    fn beside_arrived(&mut self, store: &BrickStore, parents: &[Key], diff: &mut Diff) {
         let mut beside = Vec::new();
         for &(level, coord) in parents {
             for child in coord.children() {
@@ -2104,22 +2100,8 @@ impl Selection {
         // and asking the store about a brick it does not hold asks the source whether it is solid
         // all the way down, which cost 1.1 µs a brick (1.5 s of the scene thread's 10 s in the 2 m
         // flight, 60% of taking the children in, #251).
-        let candidate = |nodes: &HashMap<Key, Node>, key: &Key| {
-            nodes.contains_key(key) && store.is_full_known(key.0, key.1)
-        };
-        let known: Option<Vec<bool>> = (threads > 1 && beside.len() >= LOOK_PIECE).then(|| {
-            let nodes = &self.nodes;
-            map_shared(&beside, threads, &|key| candidate(nodes, key))
-        });
-        let before = self.inserted;
-        for (n, key) in beside.into_iter().enumerate() {
-            let is = match &known {
-                // A brick that was not a node is not one unless a look made it, and one that was
-                // may have gone.
-                Some(known) if self.inserted == before => known[n] && self.nodes.contains_key(&key),
-                _ => candidate(&self.nodes, &key),
-            };
-            if is {
+        for key in beside {
+            if self.nodes.contains_key(&key) && store.is_full_known(key.0, key.1) {
                 self.recheck(store, key, diff);
             }
         }
@@ -2135,7 +2117,6 @@ impl Selection {
     /// Makes `key` a node that is split.
     fn mark_split(&mut self, key: Key, distance: f64) {
         self.waiting.remove(&key);
-        self.inserted += 1;
         self.nodes.insert(
             key,
             Node {
@@ -2172,7 +2153,6 @@ impl Selection {
         p: Probe,
         diff: &mut Diff,
     ) {
-        self.inserted += 1;
         self.nodes.insert(
             key,
             Node {
@@ -4473,8 +4453,8 @@ mod tests {
 
     /// Taking in what arrived is planned on the machine's threads and put in the tree on one
     /// (#269), so the tree, the diff and what is asked for next are what one thread makes of them,
-    /// at 1, 4 and all threads: round by round, with the camera moving and the margins on, which
-    /// have bricks under the ones that arrive arrive too (a brick and what is under it in one batch).
+    /// at 1, 4 and all threads: round by round, with the margins on, and bricks under the ones that
+    /// arrive arriving with them (a brick and what is under it in one batch).
     #[test]
     fn taking_in_arrivals_makes_the_same_tree_and_diff_at_1_4_and_all_threads() {
         let all = machine::bulk_threads().max(8);
@@ -4643,6 +4623,30 @@ mod tests {
     /// source's answers.
     #[test]
     fn taking_in_bricks_asks_the_source_only_about_the_bricks_beside_them_that_have_nodes() {
+        let (during, parents) = source_asks_taking_in(Some(1));
+        // Measured on this world: 9.5 asks a parent with the node looked at first, 13.4 with the
+        // source asked first (the other asks are the split's own: what its children are). The
+        // 2 m flight's world has more bricks beside each that the scene knows nothing of.
+        assert!(parents > 100, "{parents}");
+        assert!(
+            during * 100 < parents * 1100,
+            "{during} asks for {parents} parents"
+        );
+        // What the scene thread runs, `arrived`, plans a batch of 17 bricks or more on threads that
+        // start with no answers remembered (the cache is per thread, #269), so it asks the source
+        // again, about 1.7 to 2 times as often here: 2.5 times is the bound, so that a plan that
+        // asks of every brick beside the children, or twice of each, fails.
+        let (planned, _) = source_asks_taking_in(None);
+        assert!(
+            planned * 2 < during * 5,
+            "{planned} asks for {parents} parents on threads, {during} on one"
+        );
+    }
+
+    /// The source's answers asked for while a flat world's selection takes in all that it asks
+    /// for, and how many bricks arrived: by [`Selection::arrived_by`] with `threads` if there is a
+    /// number, by [`Selection::arrived`] if not.
+    fn source_asks_taking_in(threads: Option<usize>) -> (usize, usize) {
         let asked = std::sync::Arc::new(AtomicUsize::new(0));
         let mut store = flat(4, 4);
         store.set_source(AsksSolid(asked.clone()));
@@ -4676,19 +4680,17 @@ mod tests {
             }
             parents += wanted.len();
             let before = asked.load(AtomicOrdering::Relaxed);
-            // On one thread: the answers a thread is told lately are remembered per thread, so a
-            // plan made on others, which start with none, asks again (twice as often here, #269).
-            selection.arrived_by(&store, &wanted, 1);
+            match threads {
+                Some(threads) => {
+                    selection.arrived_by(&store, &wanted, threads);
+                }
+                None => {
+                    selection.arrived(&store, wanted);
+                }
+            }
             during += asked.load(AtomicOrdering::Relaxed) - before;
         }
-        // Measured on this world: 9.5 asks a parent with the node looked at first, 13.4 with the
-        // source asked first (the other asks are the split's own: what its children are). The
-        // 2 m flight's world has more bricks beside each that the scene knows nothing of.
-        assert!(parents > 100, "{parents}");
-        assert!(
-            during * 100 < parents * 1100,
-            "{during} asks for {parents} parents"
-        );
+        (during, parents)
     }
 
     /// Rock under y = -8 (the top of the level 0 bricks at y = -2), at every level: a brick wholly
