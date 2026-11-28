@@ -5,151 +5,174 @@
 <h1 align="center">BhayanakVoxel</h1>
 
 <p align="center">
-  A detailed voxel game set on a single spherical planet, where players reshape a finely
-  voxelized world and can zoom continuously from their character out to orbit.
+  A voxel sandbox on one spherical Planet, 320 km in radius, where every 5 cm Voxel is editable
+  and the camera can zoom continuously from the character out to orbit.
 </p>
 
-BhayanakVoxel is built as a custom engine in Rust on [wgpu](https://wgpu.rs), with Vulkan as the
-only supported backend. It does not use a heightfield, a mesh renderer or a third-party engine:
-the Planet is Voxels all the way through, down to 5 cm, and every one of them is editable.
+BhayanakVoxel is a hobby and tech-demo game on a custom engine in Rust and [wgpu](https://wgpu.rs),
+with Vulkan as the only backend. It has no heightfield, no mesh renderer and no third-party engine:
+the Planet is Voxels all the way through, and lighting is path-traced.
 
-> **Status:** early development. The skeleton (M0) is done; M1a — "Walk the Planet" — is in
-> progress. Digging, walking, deterministic Planet generation and the rendering tracer work today.
-> Flight and Zoom, real-time lighting, saves, Debris and Fluids are still being built. The plan is
-> in [`docs/spec.md`](docs/spec.md).
+The Vertical slice is a shared creative sandbox: shape the Planet with Brushes, with free Materials
+and no rules. After the slice it grows into moving Pieces, survival with Tools, a solar system of
+Planets, Debris and Fluids. What is planned, Milestone by Milestone, is in
+[`docs/spec.md`](docs/spec.md).
 
-## What makes it different
+## What works today
 
-- **One planet, no map borders.** A single sphere of Voxels, 5 cm across each, with an editable
-  surface. Edits propagate through the LOD pyramid, so a crater dug up close stays visible from
-  orbit.
-- **Continuous Zoom.** The camera pulls back from first/third person to a full view of the Planet
-  without a separate map view or a load screen.
-- **Sparse 8³ Bricks, not an octree.** Each brick stores a 512-bit occupancy mask plus
-  palette-compressed 16-bit Material IDs; uniform bricks cost nothing. Bricks and their coarser
-  mip levels are the one representation used everywhere — near terrain, far terrain and orbit.
-- **Deterministic generation.** Clients generate the Planet themselves from
-  `(seed, GENERATOR_VERSION)` using the same crate as the server, bit-for-bit on every platform.
-  The server only replicates Edit operations, which keeps multiplayer bandwidth tiny and far
-  terrain accurate.
-- **A path tracer as ground truth.** A progressive reference path tracer runs in the same
-  renderer as the real-time compute-shader tracer, so lighting work is measured against a correct
-  image rather than tuned by eye.
+The game is in early development. M0 (the skeleton) is done and M1a, "Walk the Planet", is in
+progress; [#41](https://github.com/theHimanshuShekhar/bhayanakvoxel/issues/41) tracks it.
 
-## How it works
+- **The Planet.** Generated from `(seed, GENERATOR_VERSION)`, bit-for-bit the same on every
+  platform: a coarse world map (continents, climate, biomes, drainage), Caves, emissive Crystal
+  clusters, and a brick at any level of detail made on demand. The world map is built on the first
+  launch and kept in a cache file.
+- **Streaming and levels of detail.** Sparse 8³ Bricks and an all-voxel LOD pyramid out to orbit,
+  with a ring of full detail around the camera, a coarse Guard for the whole Planet, and a level of
+  detail that coarsens as the camera speeds up.
+- **Walking and flying.** A character (walk, run, crouch, jump) with a capsule that sweeps against
+  Voxels, and a noclip debug camera.
+- **Editing.** Dig, place, smooth and flatten with sphere, cube and cylinder Brushes up to 4 m,
+  about 60 Materials from one data file, a hotbar and a Material palette, hardness-timed digging,
+  and a Ghost that shows the Voxels an Edit would change. The in-process server checks every Edit.
+- **Lighting.** Primary visibility, sun shadows, radiance-cache global illumination, emissive
+  Voxels, an atmosphere, a day and night cycle, a denoiser and upscaler, and a progressive
+  **Reference** path tracer (`R`) that is the ground truth the Primary view is measured against.
+  Rays find the Planet with hardware ray queries where the GPU has them, and with a compute-shader
+  walk of the Bricks where it does not.
 
-| Piece | What it does |
-| --- | --- |
-| `brick-store` | Sparse 8³ brick storage, coordinates and the LOD pyramid. CPU-only. |
-| `planet-gen` | Deterministic terrain generation on top of the brick store, plus the world map. |
-| `materials` | Every Material of the game, defined in one `materials.toml` data file. |
-| `sim` | The authoritative simulation: Edit validation, prediction, fixed-timestep server. |
-| `net` | The client/server message protocol, carried over an in-memory loopback today. |
-| `render` | The wgpu renderer: compute-shader DDA through the bricks, the reference path tracer, GPU pass timers and the debug overlay. |
-| `client` | The game window, free-fly camera, digging, and the `bench` harness. |
-| `server` | The dedicated server. It never links wgpu or winit, and CI enforces that. |
+Not built yet: swimming, climbing and the full Zoom, the avatar, saves and the start menu,
+multiplayer over a network, vegetation, rivers, Debris and Fluids. The dedicated `server` binary
+only ticks at 60 Hz today; single-player runs the simulation in the client's process.
 
-The design decisions behind these choices are recorded as ADRs in
-[`docs/adr/`](docs/adr/), and the project's vocabulary is defined in [`CONTEXT.md`](CONTEXT.md).
+## Requirements
 
-## Getting started
+- A Rust toolchain. `rust-toolchain.toml` pins the exact version, and `rustup` installs it when you
+  build. The workspace uses edition 2024.
+- A Vulkan GPU and driver. Metal, Direct3D 12 and OpenGL are not compiled in. On Linux, install the
+  Vulkan loader and driver (for example `mesa-vulkan-drivers`) and the usual X11 or Wayland
+  development packages.
+- **Ray tracing:** hardware ray queries are the default where the adapter and its driver offer
+  Vulkan ray queries. Where they do not, or where you choose compute in the debug panel (`F1`, "Hardware ray tracing (setting)", kept in `settings.toml` in the
+  per-user config folder), the compute tracer runs instead.
+- **Machine:** the reference is an RTX 4090 at 1440p, 60 fps. The low-end reference, which the game
+  runs on without failing, is **4 threads, 8 GB of RAM (about 5 GiB free), 4 GB of video memory and
+  no ray queries** (a GTX 1650 or RX 570 class card). The game sizes its threads, memory and
+  level-of-detail bias from the machine it finds.
 
-You need:
+## Build and run
 
-- A stable Rust toolchain (the workspace uses edition 2024).
-- A Vulkan-capable GPU and driver. Metal, Direct3D 12 and OpenGL are not compiled in.
-- On Linux, the Vulkan loader and windowing libraries — e.g. `mesa-vulkan-drivers` plus
-  `libxkbcommon` and the usual X11/Wayland development packages.
-
-Build in release mode: a debug build is slow enough to distort frame times, and generating the
-test Planet takes noticeably longer.
+Build in release mode: a debug build is slow enough to distort frame times.
 
 ```sh
-# The game window
-cargo run --release -p client
-
-# The dedicated server
-cargo run --release -p server
+cargo run --release -p client                        # the game window
+cargo run --release -p client -- --profile low-end   # the same, held to the low-end reference
+cargo run --release -p server                        # the dedicated server (a 60 Hz tick loop so far)
 ```
 
-The client generates the Planet on startup, which takes about half a minute in a release build; the
-window title says when it is done.
+The first launch builds the world map (about 7 s on 16 threads, 23 s on 4) and writes it to
+`$XDG_CACHE_HOME/bhayanakvoxel` (`~/.cache/bhayanakvoxel` if that is unset, `%LOCALAPPDATA%\bhayanakvoxel` on Windows); later launches read it
+back in a fraction of a second. `BHAYANAK_CACHE_DIR` names another folder and
+`BHAYANAK_NO_MAP_CACHE=1` turns the cache off. The window title says while the Planet is still being
+generated.
 
-### Controls
+### Machine flags
+
+The `client` takes the flags, anywhere on the line, and the `server` reads only the environment
+variables. They only lower what the machine has.
+
+| Flag | Environment variable | Meaning |
+| --- | --- | --- |
+| `--profile low-end` (or `auto`) | `BHAYANAK_PROFILE` | Run as the low-end reference machine does, on any machine, with the process pinned to 4 logical processors |
+| `--threads N` | `BHAYANAK_THREADS` | Use at most N threads |
+| `--memory-mib N` | `BHAYANAK_MEMORY_MIB` | Use at most N MiB of memory |
+| `--video-memory-mib N` | `BHAYANAK_VIDEO_MEMORY_MIB` | Use at most N MiB of video memory |
+| `--no-ray-queries` | `BHAYANAK_RAY_QUERIES=0` | Act as if the adapter had no ray queries (the compute tracer) |
+
+The client prints the profile it runs with on its first line.
+
+### Subcommands of `client`
+
+| Command | What it does |
+| --- | --- |
+| `client bench [--out DIR] [--short] [--streaming [--real-time]] ...` | A scripted flight over the Planet, offscreen, that times every GPU pass and writes `report.json` and screenshots. Exits with status 2 if a pass or a gate is over its budget. `--help` lists every option. |
+| `client lookdev --out DIR [--size WxH] [--spp N] [--shot NAME] ...` | Renders the look-dev shot list (a forest floor, a canyon, crystal caves, a pull-out to the Planet) with the real pipeline and writes a contact sheet. `--short` is a smoke test on any device. |
+| `client map-build [--no-write]` | Builds the full-size world map cold, writes the cache, reads it back, checks the two are the same map and says how long each took. |
+
+The benchmark workflow, its budgets (`bins/client/bench-budgets.toml`) and the 4090 runs are in
+[`docs/agents/benchmarking.md`](docs/agents/benchmarking.md). `cargo run --release -p prefetch-sim`
+prints the CPU prefetch simulator's report.
+
+## Controls
 
 | Input | Action |
 | --- | --- |
 | Click | Capture the mouse; click again to apply the tool. A Dig is made by holding the button |
-| `1`-`9` | Pick a hotbar tool (mode and shape): dig sphere / cube / cylinder, place sphere / cube / cylinder, smooth sphere, flatten cube / cylinder |
-| Wheel | Step along the hotbar (mouse captured) |
-| `Alt` + wheel | Smaller or bigger Brush, from 1 Voxel up to 4 m across |
-| `[` `]` | The same, from the keyboard |
-| `Tab` | Open or close the Material palette: type to search by name, click a Material or press `Enter` for the first match. Opening it releases the mouse, closing it captures it again if it was captured before; every key goes to the search box while it is open |
-| `-` `=` | Previous or next Material (placed by place and flatten) |
-| `G` | Brush axes on the local up (snapped to 45 degrees) or on the world grid |
+| `Esc` | Release the mouse |
 | `W` `A` `S` `D` | Walk |
 | `Shift` | Run |
 | `Space` | Jump |
 | `Ctrl` or `C` | Crouch |
 | `N` | Switch between walking and the debug noclip camera |
-| `Q` `E` | Roll the noclip camera left or right; `X` levels it |
-| Arrow keys | Turn the sun |
-| `R` | Switch between primary visibility and the reference path tracer |
-| `V` | Cycle debug views |
+| `1`-`9` | Pick a hotbar tool: dig sphere, cube or cylinder; place sphere, cube or cylinder; smooth sphere; flatten cube or cylinder |
+| Wheel | Step along the hotbar (mouse captured) |
+| `Alt` + wheel, or `[` `]` | Smaller or bigger Brush, from 1 Voxel up to 4 m across |
+| `Tab` | Open or close the Material palette: type to search, click a Material or press `Enter` for the first match |
+| `-` `=` | Previous or next Material (placed by place and flatten) |
+| `G` | Brush axes on the local up (snapped to 45 degrees) or on the world grid |
+| `R` | Switch between the Primary view and the Reference path tracer |
+| `V` | Cycle the debug views |
+| Arrow keys | Set the time of day, half an hour a press |
+| `P` | Stop or start the world clock |
 | `F1` | Show or hide the debug panel (the hotbar stays) |
-| `Esc` | Release the mouse |
 
-The client walks the Planet as a character (1.8 m tall, walks 4.5 m/s, runs 7, crouches 2, jumps
-about 1.2 m, steps up to 0.5 m; numbers in `crates/sim/movement.toml`). In noclip, `W` `A` `S` `D`
-fly along the view, `Space` and `Ctrl`/`C` go up and down, and `Shift` flies faster; `Q` and `E`
-roll the camera about where it looks (45 degrees a second) and `X` levels it; nothing
-collides. Coming out of noclip sets the character down where the camera is.
+In noclip, `W` `A` `S` `D` fly along the view, `Space` and `Ctrl` or `C` go up and down, `Shift` flies
+faster, `Q` and `E` roll the camera and `X` levels it; nothing collides. Edits are made as the
+walking character, not from noclip.
 
-The hotbar is along the bottom of the window and is clickable while the mouse is released (`Esc`, or
-the palette); the palette has the Brush size buttons too. The Materials are all there for the
-taking: no inventory. Placing, smoothing and flattening are instant. A Dig takes as long as the
-hardness of the Material at the Voxel aimed at says, 0.15 s per unit of hardness in
-`crates/materials/materials.toml` (sand 0.15 s, soil 0.3 s, rock 0.9 s, obsidian 1.2 s, at least
-0.05 s), and a bar by the middle of the window shows the hold; looking at another Voxel starts it
-over. The client times it and then sends the one ordinary Edit; the server does not check the time.
+The character is 1.8 m tall, walks at 4.5 m/s, runs at 7, crouches at 2, jumps about 1.2 m and steps
+up 0.5 m (`crates/sim/movement.toml`). A Dig takes 0.15 s for each unit of the Material's hardness
+(at least 0.05 s), shown by a bar by the middle of the window. The server holds each player to 20
+Edits a second, a Brush of at most 2 m radius (1 m for a smooth or a flatten), a reach of 8 m and
+8 m³ of Voxels changed a second; the limits and their reasons are in `crates/sim/src/edit.rs`.
 
-The Brush is shown as a ghost where the click would apply it: exactly the Voxels it would change
-(grey when the server will turn it down). A placed Brush sits on the face that was aimed at, is
-aligned to the Planet's local up (exactly radial) and turned to face the way the camera looks, in
-steps of 45 degrees. The server holds each player to 20 Edits a second, a Brush of at most 2 m
-radius for a Dig or a Place (4 m across) and 1 m for a Smooth or a Flatten, a reach of 8 m from the
-eyes (the client aims at 7.5 m), and 8 m^3 (64,000 Voxels) a second of Voxels changed, in bursts of
-up to 576,000. Separately, a CPU budget of 4.8 million units a second (2.88 million at once) counts the
-Voxels in the box that holds the Brush, whether or not it changes anything (a Smooth's count six
-times), which is what stops Edits that change nothing from being free. Edits are made as the
-walking character and not from noclip; an Edit over a limit is taken back.
+## Repository
 
-## Benchmarks
-
-`client bench` flies a fixed camera path over the test Planet, times every GPU pass and writes a
-JSON report plus screenshots. It is how "is this PR within the frame budget?" gets a number.
-
-```sh
-cargo run --release -p client -- bench --out bench-out
-```
-
-It exits with status 2 if a pass is over its budget. Budgets live in
-`bins/client/bench-budgets.toml`; the full workflow — including the `needs-benchmark` label and
-the Windows artifact — is described in [`docs/agents/benchmarking.md`](docs/agents/benchmarking.md).
+| Path | What it is |
+| --- | --- |
+| `crates/brick-store` | Sparse 8³ Brick storage, coordinates and the LOD pyramid. CPU only. |
+| `crates/planet-gen` | Deterministic Planet generation: the world map and its cache, terrain, Caves and Crystal clusters. |
+| `crates/materials` | Every Material of the game, defined in `materials.toml`. |
+| `crates/sim` | The simulation shared by client and server: Edit validation and budgets, the character controller, prediction, the world clock and the fixed-timestep server. |
+| `crates/net` | The client and server message protocol, carried over an in-memory loopback today. |
+| `crates/render` | The wgpu renderer: the compute and hardware tracers, the Reference path tracer, GI, denoiser, atmosphere, GPU pass timers and the debug overlay. |
+| `crates/machine` | Reads the machine's threads, memory and ray queries in one place, the low-end profile, and the deterministic parallel helpers. |
+| `crates/prefetch-sim` | A CPU simulator that replays camera paths to size the streaming shell, margins and Guard. |
+| `bins/client` | The game window, streaming, editing, and the `bench`, `lookdev` and `map-build` commands. |
+| `bins/server` | The dedicated server. It never links wgpu or winit, and CI enforces that. |
+| `third_party/gpu-allocator` | A patched copy of `gpu-allocator` ([`PATCH.md`](third_party/gpu-allocator/PATCH.md)). |
 
 ## Development
 
 ```sh
 cargo fmt --check
 cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
+cargo nextest run --workspace    # needs cargo-nextest; cargo test --workspace also works, more slowly
 ```
 
-CI runs those on Linux, builds the Windows client, runs the non-GPU tests on Windows, and runs the
-golden-hash determinism tests across debug and release builds on both Linux and Windows. Render
-tests run on lavapipe, the software Vulkan driver, so they need no GPU. The client tests that
-start real threads run in a separate job that does not gate merges. Rust and the runner images are
-pinned. Details are in [`docs/agents/ci.md`](docs/agents/ci.md).
+CI runs these on Linux and Windows, with render tests on lavapipe (a software Vulkan driver, so no
+GPU is needed), the golden-hash determinism tests in debug and release on both, and builds the
+Windows client. The jobs that gate merges, and how Rust and the runner images are pinned, are in
+[`docs/agents/ci.md`](docs/agents/ci.md).
 
-Contributor and agent guidance lives in [`AGENTS.md`](AGENTS.md), with the issue tracker,
-triage labels and domain-doc conventions in [`docs/agents/`](docs/agents/).
+## Where the docs are
+
+| Doc | What is in it |
+| --- | --- |
+| [`docs/spec.md`](docs/spec.md) | The Vertical-slice spec: the design, the Milestones and the playtest checklists |
+| [`CONTEXT.md`](CONTEXT.md) | The project's vocabulary |
+| [`docs/adr/`](docs/adr/) | The architecture decisions |
+| [`docs/measurements.md`](docs/measurements.md) | The measured numbers behind the decisions |
+| [`docs/perf/resource-audit.md`](docs/perf/resource-audit.md) | The audit of how the game uses the whole machine |
+| [`docs/research/`](docs/research/) | Research notes; [`INSPIRATION.md`](INSPIRATION.md) links the talks that inspired the game |
+| [`AGENTS.md`](AGENTS.md) and [`docs/agents/`](docs/agents/) | Guidance for contributors and agents: the issue tracker, triage labels, CI and benchmarking |
