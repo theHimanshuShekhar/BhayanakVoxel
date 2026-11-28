@@ -415,3 +415,171 @@ fn golden_crystal_brick_hashes() {
     }
     assert!(!failed, "golden mismatch:\n{report}");
 }
+
+/// The noise toolkit (`planet_gen::noise`, #289): one digest of every primitive over a fixed set
+/// of points, so the `determinism` job holds them to the same bits in debug and release, on Linux
+/// and Windows. Nothing in the generator calls it yet, so no brick above depends on it.
+mod noise_golden {
+    use planet_gen::noise::{
+        Child, Fbm, GradientCache, Knot, LatticeFbm, Ridges, Spline, Warp, gradient, gradient_d,
+        lattice_gradient, lattice_gradient_d,
+    };
+
+    const NOISE_HASH: u64 = 0x5ec2e5260ed9aac0;
+
+    /// A hash of `i`, as 64 well-mixed bits.
+    fn mix(i: u64) -> u64 {
+        let mut z = i.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        z ^ (z >> 31)
+    }
+
+    /// FNV-1a over the bits of every value pushed.
+    struct Digest(u64);
+
+    impl Digest {
+        fn push(&mut self, v: f64) {
+            for byte in v.to_bits().to_le_bytes() {
+                self.0 = (self.0 ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3);
+            }
+        }
+        fn push_all(&mut self, vs: impl IntoIterator<Item = f64>) {
+            vs.into_iter().for_each(|v| self.push(v));
+        }
+    }
+
+    /// A point in `[-extent, extent)³`: a multiple of 2⁻²⁰ times `extent`, so it is exact.
+    fn point(i: u64, extent: f64) -> [f64; 3] {
+        [0, 1, 2].map(|a| ((mix(i * 3 + a) >> 43) as f64 / 1_048_576.0 * 2.0 - 1.0) * extent)
+    }
+
+    fn unit_normal(i: u64) -> [f64; 3] {
+        let p = point(i + 7000, 1.0);
+        let n = (p[0] * p[0] + p[1] * p[1] + p[2] * p[2]).sqrt();
+        p.map(|c| c / n)
+    }
+
+    fn knot(at: f64, y: f64, slope: f64) -> Knot {
+        Knot {
+            at,
+            child: Child::Value(y),
+            slope,
+        }
+    }
+
+    #[test]
+    fn golden_noise_hash() {
+        let mut d = Digest(0xcbf2_9ce4_8422_2325);
+        // Gradient noise at float points and on the lattice, with derivatives and the cache.
+        for i in 0..400u64 {
+            let p = point(i, 300.0);
+            d.push(gradient(0xB4A7, p));
+            let (v, g) = gradient_d(0xB4A7, p);
+            d.push(v);
+            d.push_all(g);
+        }
+        let mut cache = GradientCache::default();
+        for i in 0..400u64 {
+            let q = [0, 1, 2].map(|a| (mix(i * 3 + a + 5) >> 44) as i32 - (1 << 19));
+            for cell in [16, 64, 256] {
+                d.push(lattice_gradient(0xB4A7, q, cell, &mut cache));
+                let (v, g) = lattice_gradient_d(0xB4A7, q, cell, &mut cache);
+                d.push(v);
+                d.push_all(g);
+            }
+        }
+        // fBm with and without rotation, and the lattice one with its bounds.
+        for (k, rotated) in [false, true].into_iter().enumerate() {
+            let fbm = Fbm::new(0x5EED + k as u64, 0.05, 6, 0.5, rotated);
+            d.push_all([fbm.max_value(), fbm.max_gradient()]);
+            for i in 0..200u64 {
+                let p = point(i + 1000, 400.0);
+                let (v, g) = fbm.value_gradient(p);
+                d.push(fbm.value(p));
+                d.push(v);
+                d.push_all(g);
+                let (lo, hi) = fbm.bounds(p, p.map(|c| c + 3.0));
+                d.push_all([lo, hi]);
+            }
+        }
+        let lattice = LatticeFbm::new(0x5EED, &[(256, 24.0), (64, 8.0), (16, 2.0)]);
+        let mut cache = lattice.cache();
+        for i in 0..200u64 {
+            let q = [0, 1, 2].map(|a| (mix(i * 3 + a + 9) >> 44) as i32 - (1 << 19));
+            let (v, g) = lattice.value_gradient(q, &mut cache);
+            d.push(v);
+            d.push_all(g);
+            let (lo, hi) = lattice.bounds(q, q.map(|c| c + 8));
+            d.push_all([lo, hi]);
+        }
+        // The world map's warp and ridges, on the sphere.
+        let warp = Warp::new(0xBEEF, 0.4, [4, 6], [2.0, 3.0]);
+        let ridges = Ridges::new(
+            Fbm::new(0xA1, 0.3, 2, 0.2, true),
+            Fbm::new(0xA2, 0.6, 2, 5.0, true),
+            0.3,
+            0.6,
+        );
+        d.push(warp.max_displacement());
+        for i in 0..150u64 {
+            let n = unit_normal(i);
+            let p = n.map(|c| c * 5.0);
+            d.push_all(warp.apply(p, n));
+            d.push(ridges.value(p, n));
+        }
+        // Splines: authored, PCHIP and nested, with their bounds.
+        let authored = Spline::new(
+            0,
+            vec![
+                knot(0.0, 0.0, 0.5),
+                knot(1.0, 1.0, 1.0),
+                knot(3.0, 2.0, 0.0),
+            ],
+        )
+        .expect("slopes inside the box");
+        let pchip = Spline::pchip(
+            0,
+            &[
+                (-1.1, -1.0),
+                (-0.5, -0.6),
+                (-0.2, -0.1),
+                (0.0, 0.0),
+                (0.1, 0.05),
+                (0.3, 0.4),
+                (0.6, 0.5),
+                (1.0, 1.0),
+            ],
+        )
+        .expect("increasing knots");
+        let nested = Spline::new(
+            0,
+            vec![
+                Knot {
+                    at: -1.0,
+                    child: Child::Spline(pchip.clone()),
+                    slope: 0.25,
+                },
+                Knot {
+                    at: 1.0,
+                    child: Child::Value(0.5),
+                    slope: -0.5,
+                },
+            ],
+        )
+        .expect("finite knots");
+        for i in 0..300u64 {
+            let x = point(i + 3000, 1.5);
+            d.push_all([
+                authored.eval(&[x[0] * 2.0]),
+                pchip.eval(&[x[0]]),
+                nested.eval(&x),
+            ]);
+            let (lo, hi) = nested.bounds(&x, &x.map(|c| c + 0.25));
+            d.push_all([lo, hi]);
+            let (lo, hi) = pchip.bounds(&[x[0]], &[x[0] + 0.5]);
+            d.push_all([lo, hi]);
+        }
+        assert_eq!(d.0, NOISE_HASH, "actual {:#018x}", d.0);
+    }
+}
