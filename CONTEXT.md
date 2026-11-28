@@ -50,8 +50,16 @@ _Avoid_: Overhang (one kind), stamp, 3D layer
 One of the few giant one-off Formations placed across the Planet from the seed, such as a 500 m arch or a sky archipelago, each where its Biome allows its kind. The everyday spires and arches are just Formations.
 _Avoid_: POI, wonder, structure (structures are buildings and villages)
 
+**Plant**:
+One generated growth of Voxels that a Biome places: a tree, shrub, grass tuft, flower, fern, vine or fallen log, each grown differently from the seed. Its Voxels are ordinary Voxels, so digging cuts it like anything else, and the Planet does not remember which Voxels belong to which Plant. Part of the generated terrain, not an Edit.
+_Avoid_: Species, foliage, flora, vegetation (the informal name for Plants together)
+
+**Plant kind**:
+A template that grows Plants, such as a conifer, a broadleaf tree or a fern, with its shape and Materials. Each Biome lists the Plant kinds it grows and how densely.
+_Avoid_: Species, tree type
+
 **Material**:
-The kind of matter a Voxel is made of (e.g. rock, sand, water, glass), carrying properties like hardness or emissiveness.
+The kind of matter a Voxel is made of (e.g. rock, sand, water, glass), carrying properties like hardness, emissiveness, or whether a character can walk through it (leaves and grass can).
 _Avoid_: Block type, voxel type
 
 **Edit**:
