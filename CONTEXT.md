@@ -90,6 +90,14 @@ _Avoid_: Item, weapon
 What a dig gives a player in Survival: the volume of each Material it removed, shown in litres.
 _Avoid_: Drop, loot, resources
 
+**Ledger**:
+The litres of each Material that a player or a Container holds in Survival. Yield fills it and placing spends from it.
+_Avoid_: Pack (the thing that sets its size), inventory (informal: a player's Ledger plus Tool slots)
+
+**Container**:
+A placed chest or crate that holds a Ledger: the one kind of placed thing the Planet remembers. Digging into it breaks it and spills what it held.
+_Avoid_: Storage block, inventory
+
 **Creative**:
 The way to play with every Brush and Material free and no Tools, as in the Vertical slice.
 _Avoid_: Sandbox mode, build mode
