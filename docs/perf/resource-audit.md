@@ -40,7 +40,7 @@ Everything below that says "from the machine" reads it in `crates/machine` and n
 | `threads()` | the machine's | 4 (or fewer if the machine has fewer) | 1 |
 | `bulk_threads()` (work the frame thread must not wait behind) | threads − 1 | 3 | 1 |
 | `loader_workers()` | threads − 2 | 2 | 1 |
-| memory | the least of `MemAvailable` and the cgroup's room (v2 `memory.max` less `memory.current` less `inactive_file`; v1 `memory.limit_in_bytes` less `memory.usage_in_bytes` less `total_inactive_file`; the least over the process's own cgroup, from `/proc/self/cgroup`, and each ancestor up to the root); Windows `GlobalMemoryStatusEx` | 5 GiB | 1 GiB, in `bias_for` |
+| memory | the least of `MemAvailable` and the cgroup's room (v2 `memory.max` less `memory.current` less `inactive_file`; v1 `memory.limit_in_bytes` less `memory.usage_in_bytes` less `total_inactive_file`; the least over the process's own cgroup, from `/proc/self/cgroup`, and each ancestor up to the root); Windows `GlobalMemoryStatusEx` | 5 GiB | no floor on what is read; `bias_for` starts at most 3.0 (`MOST_BIAS`) coarser, a machine with under 1.8 GiB runs at that and says it is short |
 | processors | all the process may use | pinned to 4 of them | |
 | video memory | not read (see below) | 4 GiB | none read |
 | ray queries | the adapter's | off (the compute tracer) | |
