@@ -625,6 +625,33 @@ fn group(keys: impl IntoIterator<Item = (usize, BrickCoord)>) -> ByRegion {
     by_region
 }
 
+/// Words in a piece of [`extended`]: 1 MiB, a fixed size, whatever the threads.
+const EXTEND_PIECE: usize = 1 << 18;
+
+/// `old` and then zeros, `len` words long, with every page of it written (not left as untouched zero
+/// pages, which the changes that land in them later would find by faults, milliseconds on the
+/// thread that pastes them), on the machine's threads but one in pieces of [`EXTEND_PIECE`]. A
+/// scene's buffers are 813 MiB at full size, and writing them on one thread was 0.3 s of the load
+/// that the player waits for (#269).
+fn extended(old: &[u32], len: usize) -> Vec<u32> {
+    debug_assert!(old.len() <= len);
+    let mut words = vec![0u32; len];
+    machine::par_chunks_with(
+        &mut words,
+        EXTEND_PIECE,
+        machine::bulk_threads(),
+        machine::worker_start(),
+        |from, chunk| {
+            let used = old.len().saturating_sub(from).min(chunk.len());
+            if used > 0 {
+                chunk[..used].copy_from_slice(&old[from..from + used]);
+            }
+            chunk[used..].fill(0);
+        },
+    );
+    words
+}
+
 /// How far the camera can go in one move, in `d0`, before the scene is made again instead of
 /// patched. Patching costs about in proportion to the distance (8 ms for 100 Voxels, 90 ms for
 /// 1000, 170 ms for 2000 on the test Planet), a new scene about 200 ms wherever it is, and less
@@ -884,8 +911,8 @@ impl Scene {
         rings.refs.take(self.brick_refs.len());
         rings.data = Pool::new(words);
         rings.data.take(self.bricks.len());
-        self.brick_refs.resize(refs, 0);
-        self.bricks.resize(words, 0);
+        self.brick_refs = extended(&self.brick_refs, refs);
+        self.bricks = extended(&self.bricks, words);
     }
 
     /// The scene packed again from scratch: what `selection` is, with the words in order. The
@@ -2369,6 +2396,30 @@ mod tests {
     use planet_gen::generate_region;
 
     use super::*;
+
+    /// The buffers of a scene are made on the machine's threads, in pieces of a fixed size: what is
+    /// in them is the words that were there, then zeros, for any length and either side of a piece.
+    #[test]
+    fn extending_a_buffer_keeps_its_words_and_zeros_the_rest_whatever_the_pieces() {
+        for (old, len) in [
+            (0, 0),
+            (0, 5),
+            (7, 7),
+            (7, 9),
+            (EXTEND_PIECE, EXTEND_PIECE),
+            (EXTEND_PIECE - 1, EXTEND_PIECE + 1),
+            (EXTEND_PIECE + 3, 3 * EXTEND_PIECE + 5),
+            (0, 3 * EXTEND_PIECE),
+        ] {
+            let words: Vec<u32> = (0..old as u32)
+                .map(|n| n.wrapping_mul(2654435761) | 1)
+                .collect();
+            let grown = extended(&words, len);
+            assert_eq!(grown.len(), len, "{old} to {len}");
+            assert_eq!(grown[..old], words[..], "{old} to {len}");
+            assert!(grown[old..].iter().all(|&w| w == 0), "{old} to {len}");
+        }
+    }
 
     const LEVELS: usize = 5;
     /// Above the test Planet's +y pole.

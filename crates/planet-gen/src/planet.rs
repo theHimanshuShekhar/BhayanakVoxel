@@ -1183,6 +1183,9 @@ impl Planet {
         store.set_source(PlanetSource::new(self.clone()));
         // The pyramid is made of nothing: its bricks are generated and held as they are wanted.
         store.build_lod(levels);
+        // Room for all of them first: the table doubled and moved its entries a dozen times over
+        // a million bricks, on one thread, in the time the player waits (#269).
+        store.reserve(&[found.len()]);
         for (coord, brick) in found {
             store.insert(coord, brick);
         }
