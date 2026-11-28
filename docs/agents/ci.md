@@ -82,13 +82,13 @@ A line is a string of letters, digits, `_`, `:` and `.` only, since nextest cann
 name here.
 
 Three checks keep the list honest (`.github/scripts/check-real-thread-list.sh`). The
-`real-thread-tests` job fails when a line matches no test of the client binary: a test was
+`real-thread-tests` job (its Linux leg) fails when a line matches no test of the client binary: a test was
 renamed or removed, and its line is stale. The `linux` job fails when a line matches a test outside
 the client binary: the gating jobs skip a line in the whole workspace but the real-thread job runs
 it in the client binary only, so that test would run nowhere. The `linux` job also checks that
 nextest and libtest see the same tests, and that the filterset and the libtest filters select the same
 ones in the client binary. The script prints how many tests gate and how many run in the real-thread
-job (on 2026-11-28: 1593 and 17, the same under libtest and nextest), and how many gate in each crate.
+job (on 2026-11-28, at #260: 1600 and 17 under libtest, counted by `cargo test --workspace -- --list`), and how many gate in each crate.
 
 ## Stepped tests and real-thread tests
 
@@ -132,8 +132,8 @@ The Windows runners have no Vulkan driver. So `windows-tests` does not run the `
 `bins/client/tests/bench.rs`. It also skips six client unit tests by name, because they make an
 `Offscreen` renderer: `bench::caves::tests::the_stills_are_timed_and_photographed`,
 `bench::landscape::the_landscape_from_the_ground_500_m_and_20_km_matches_the_approved_images` (#166),
-`bench::crystals::a_cluster_on_a_sunlit_slope_and_a_crystal_cave_match_the_approved_images` (#204) and
-`bench::edits::tests::the_largest_brush_is_dug_and_placed_in_turn_at_no_more_than_the_metric_rate`
+`bench::crystals::a_cluster_on_a_sunlit_slope_and_a_crystal_cave_match_the_approved_images` (#204),
+`bench::edits::tests::the_largest_brush_is_dug_and_placed_in_turn_at_no_more_than_the_metric_rate`,
 `bench::lookdev::run::tests::a_short_run_writes_a_folder_for_each_shot_and_a_sheet_that_names_every_image`
 (#202) and `bench::tests::the_flights_updates_are_logged_by_where_in_the_run_they_were_made` (#50).
 A new client test that needs a GPU must be skipped there too. The `linux-tests` shards run all of them.
