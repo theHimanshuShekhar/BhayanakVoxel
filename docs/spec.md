@@ -21,7 +21,7 @@ BhayanakVoxel is a hobby / tech-demo voxel game. It has one fully voxel, editabl
 
 | Area | Decision | Detail |
 |---|---|---|
-| Engine | Custom **Rust + wgpu** engine, wgpu version pinned, **Vulkan only**, WGSL shaders. A Cargo workspace with the crates `brick-store`, `machine`, `materials`, `planet-gen`, `prefetch-sim`, `sim`, `net` and `render`, plus `client` and `server` binaries (the server never links wgpu). Plain structs, no ECS. | [ADR 0001](https://github.com/theHimanshuShekhar/bhayanakvoxel/blob/main/docs/adr/0001-custom-engine-rust-wgpu.md), [Choose engine foundation & language](https://github.com/theHimanshuShekhar/bhayanakvoxel/issues/7) |
+| Engine | Custom **Rust + wgpu** engine, wgpu version pinned, **Vulkan only**, WGSL shaders. A Cargo workspace with the crates `brick-store`, `machine`, `materials`, `planet-gen`, `prefetch-sim`, `sim`, `net` and `render`, plus `client` and `server` binaries (the server never links wgpu). Plain structs, no ECS. The game uses the whole machine, scaled both ways: budgets come from the machine with a floor and a ceiling, the low-end floor being 4 threads, 8 GB RAM, 4 GB VRAM and no ray queries (`--profile low-end`); see `AGENTS.md` and #264. | [ADR 0001](https://github.com/theHimanshuShekhar/bhayanakvoxel/blob/main/docs/adr/0001-custom-engine-rust-wgpu.md), [Choose engine foundation & language](https://github.com/theHimanshuShekhar/bhayanakvoxel/issues/7) |
 | Planet | 5 cm Voxels (ADR 0007, #147; was 10 cm), a **320 km radius** (ADR 0008; was ~16 km), diggable to the core, fixed 9.8 m/s² gravity toward the centre. The Zoom reaches ~20 R (6,400 km). One seeded world spawn where every character starts; no travel aid beyond walking and flying. Integer Voxel coordinates, f64 simulation positions, camera-relative f32 on the GPU. | [Choose Voxel size & Planet radius](https://github.com/theHimanshuShekhar/bhayanakvoxel/issues/8), [Research: spherical voxel Planets](https://github.com/theHimanshuShekhar/bhayanakvoxel/issues/4) |
 | Storage and LOD | Sparse **8³ bricks**: an occupancy mask plus palette-compressed 16-bit Materials. Unedited bricks are a regenerable cache; edited bricks persist. **All-voxel LOD rings to orbit** using majority downsampling, with Edits propagated to every level. The LOD band distance shrinks with camera speed, so a fast camera draws coarser levels (ADR 0009). | [ADR 0002](adr/0002-brick-store-all-voxel-lod.md), [ADR 0009](adr/0009-speed-scaled-lod.md), [Choose voxel data structure & LOD scheme](https://github.com/theHimanshuShekhar/bhayanakvoxel/issues/9) |
 | Rendering | One `trace()` function with two backends; every lighting pass is built on it. **Hardware RT** (wgpu ray queries over brick AABBs) is the default where the adapter has them, since 2026-11-27 (#50, #236; ADR 0001's amendments); the **compute DDA** is the player's setting and the fallback. 1-bounce GI plus a world-space radiance cache. Emissives, glossy reflections, glass, volumetrics, and a Hillaire atmosphere. Tracing at half resolution per axis, followed by our own WGSL denoiser (temporal accumulation, then A-SVGF, #55) and TAAU. A reference path-tracer mode. **≈ 8.6 ms of GPU work on the 4090.** | [Choose lighting & rendering pipeline](https://github.com/theHimanshuShekhar/bhayanakvoxel/issues/10), [Research: voxel path tracing](https://github.com/theHimanshuShekhar/bhayanakvoxel/issues/5) |
@@ -100,7 +100,7 @@ Every Milestone is **done** only when all of the following hold:
   - The player has control in ≤ ~5 s, on a 20 m full-detail ring, with the ring done in ≤ 4.5 s and control in ≤ 15 s on the low-end profile (relaxed from ~2 s by the owner on 2026-11-28, #247; the gates move with #287); loading continues nearest first behind it.
   - **No holes, ever**, and **zero soft misses at the speed-scaled level** on the 50 m/s flight paths, the vertical take-off and the 180° turn.
   - Full detail returns within a settle time after the camera slows or stops. The time is reported first and becomes a gate once measured.
-  - The Guard (the whole Planet, coarse) is ready ≤ ~5 s after start, and the world map takes ≤ ~2 min (relaxed from ~1 min by the owner on 2026-11-26, #246).
+  - The Guard (the whole Planet, coarse) is ready ≤ ~10 s after start, behind control (relaxed from ~5 s by the owner on 2026-11-28; the 4090 measured 8.4 s after #264), and the world map takes ≤ ~2 min (relaxed from ~1 min by the owner on 2026-11-26, #246).
   - Frame time p99 ≤ 16.7 ms and frame-thread CPU p99 ≤ 8 ms; memory within budget.
 - Edits are visible from orbit (majority propagation).
 - Edits persist across a restart.
@@ -248,7 +248,7 @@ A headless bot soak against the in-process server runs from M1a on (tick time an
 **Acceptance**
 - **60 fps at 1080p output** (~960×540 internal) on an **RTX 3060 / RX 6700** with all features at a "medium" preset.
 - The 4090 targets still hold at "high".
-- Compute DDA and hardware RT are each benchmarked on AMD and NVIDIA, and the faster one is chosen per vendor.
+- Compute DDA and hardware RT are each benchmarked on AMD and NVIDIA. Hardware RT stays the default (since 2026-11-27, #254), and the default changes only for a vendor where compute wins.
 
 **Playtest checklist:** the full M1a/M1b checklist on a 3060-class GPU at 1080p.
 
