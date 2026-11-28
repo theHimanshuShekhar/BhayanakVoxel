@@ -1,5 +1,7 @@
 # Custom engine in Rust + wgpu, Vulkan only
 
+Status: accepted, 2026-10-28 (#7). Amended 2026-11-27 and 2026-11-28, below.
+
 BhayanakVoxel is built as a custom engine in Rust on wgpu, with a pinned wgpu version, WGSL shaders and Vulkan as the only supported backend. We chose it over Bevy, Godot, Unreal, raw Vulkan and C++. No engine provides the hard parts (micro-Voxel storage, the voxel path tracer, Zoom-to-orbit LOD), so an engine would mostly have saved glue code that agents write easily anyway. Rust also gives bit-identical Planet generation on every machine by default, while C++ needs strict float flags on each compiler. The dedicated server is a separate binary that never links wgpu.
 
 ## Considered Options

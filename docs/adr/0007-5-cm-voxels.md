@@ -1,5 +1,7 @@
 # 5 cm Voxels
 
+Status: accepted, 2026-11-07 (#135, #147). The 16 km radius it kept was superseded by ADR 0008 (2026-11-10).
+
 The Voxel is 5 cm, not 10 cm. This supersedes the Voxel size in [Choose Voxel size & Planet radius](https://github.com/theHimanshuShekhar/bhayanakvoxel/issues/8); the rest of that decision (the depth, gravity) stands. The 16 km radius and the Zoom range stood until ADR 0008 (2026-11-10), which makes the Planet 320 km and the Zoom about 20 R. It was decided with the art direction ([#135](https://github.com/theHimanshuShekhar/bhayanakvoxel/issues/135), item 2) and built in [#147](https://github.com/theHimanshuShekhar/bhayanakvoxel/issues/147). #8 chose 10 cm for headroom on the 4090 and said that 5 cm would be tried later; the art direction wants vegetation and rock detail closer to its reference (Teardown is the evidence for how small Voxels read), and that is worth a Voxel an eighth of the volume.
 
 The size is written down once, as `brick_store::VOXELS_PER_METRE` (20), the lowest crate everything depends on. A test reads every source file and fails on a second definition. Everything else is derived from it:

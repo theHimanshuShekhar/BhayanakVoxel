@@ -1,5 +1,7 @@
 # A 320 km Planet with a coarse world map
 
+Status: accepted, 2026-11-10 (the plan review, #165). Amended 2026-11-14 and 2026-11-26, below.
+
 The Planet's radius is 320 km, twenty times the 16 km of [Choose Voxel size & Planet radius](https://github.com/theHimanshuShekhar/bhayanakvoxel/issues/8). This supersedes that radius, and the sentence in ADR 0007 that let it stand; the Voxel stays 5 cm. It was decided in the plan review of 2026-11-10. A 16 km Planet is crossed in half an hour of flying and shows a horizon 250 m away from the ground; at 320 km the horizon is about 1.1 km away, the surface is 1.3 million km², and the view from orbit is of a world and not of a hill.
 
 The switch is made early in M1a-2, right after the streaming bench exists and before the rest of the streaming work (#143–#146), so that every later budget is measured at the real size.
@@ -33,3 +35,5 @@ What makes a Planet this size affordable is that nothing the player pays for sca
 - `prefetch-sim` keys a brick in 20 bits an axis, which a 320 km Planet overflows; it is widened with the re-run.
 - The shell reaches a horizon four and a half times as far, so it has more rings. The bands are in Voxels, so each ring holds about as many bricks as before; the scene and store sizes are measured again and the 512 MiB limit re-decided on the numbers.
 - Everything measured at 16 km is stale: the Guard's levels and bytes, the shell sizes of ADR 0004, the world map's time, and the constants ADR 0007 lists.
+- **Amended 2026-11-14 (#166): the radius is a value.** `NOISE_RADIUS` is gone. `planet-gen` takes the Planet's radius and seed as values; `world_map::WORLD_RADIUS` (320 km) is the default of the one Planet, and a test Planet is an eighth of it. The world map is 2048² texels a face (`WORLD_MAP_SIZE`), about 240 m a texel at this radius, and the ground has its detail added at generation.
+- **Amended 2026-11-26 (#246): the world map takes about 2 minutes, not under one.** The owner relaxed the build budget for the Landform model (plates, splines and ridge noise, warped coasts, and stream-power erosion on the map). The Guard stays at about 5 s. Since #264 the map is built on all the machine's threads and kept in a cache file, so a launch reads it in about 0.1 s (the cold build was 6.8 s on the 4090 PC in #264, with the generator as it was then; `docs/perf/resource-audit.md`).

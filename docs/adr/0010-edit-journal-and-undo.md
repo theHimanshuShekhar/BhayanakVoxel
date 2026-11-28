@@ -1,5 +1,7 @@
 # An Edit journal for durability, and undo by restored bricks
 
+Status: accepted, 2026-11-10 (the plan review, #165).
+
 Decided in the plan review of 2026-11-10. Both parts amend ADR 0003, which stands otherwise: clients generate terrain and the server replicates Edit operations.
 
 **The journal.** The server appends every accepted Edit, with its sequence number, to a journal in the world's `world.db` as it applies it, and flushes about once a second. The autosave of about every minute becomes a checkpoint: it writes the diverged bricks and then truncates the journal up to the sequence number it covers. Loading a world reads the last checkpoint and replays the journal after it. A crash loses about a second of Edits at the most, not a minute.

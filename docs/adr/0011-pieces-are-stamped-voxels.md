@@ -1,5 +1,7 @@
 # Pieces are stamped Voxels, not objects
 
+Status: accepted, 2026-11-11 (#170). Amended 2026-11-28, below.
+
 Building is done with **Pieces** (`CONTEXT.md`): ready-made Voxel models one metre across, such as a brick wall, a log or a stair, placed whole in one Edit. It was decided in the game-direction review of 2026-11-11. A placed Piece is ordinary Voxels. The Planet does not remember that it was a Piece: it can be carved by any Brush, it shows at every LOD, and it will fall as Debris, with no storage, replication or rendering of its own.
 
 We chose it because 5 cm Voxels make free-hand architecture impractical (a small house is thousands of careful Edits), while a remembered object would be a second representation of matter, which ADR 0002 rejects.
@@ -32,3 +34,4 @@ We chose it because 5 cm Voxels make free-hand architecture impractical (a small
 - A long build drifts from the ground's curve: its grid is flat and the Planet is not. At 320 km that is about 1.5 cm in 100 m.
 - Snapping must find the neighbouring build's frame from Voxels that do not remember it: the client keeps the frame of the build it is working on, and a build picked up again later is matched from its faces. How well that works is the main risk, and the Piece ticket must show it.
 - Pieces need glass and emissive Materials to look right (panes, lamps): they are opaque or plain until M1b.
+- **Amended 2026-11-28 (#205): Plants are forgotten Voxels too.** A Plant (`CONTEXT.md`: a tree, shrub, grass tuft, flower, fern, vine or fallen log) is generated from the seed as ordinary Voxels, and the Planet does not remember which Voxels belong to which Plant, so digging cuts it like anything else and it needs no record, as a Piece does not (the spec's M7 says the Planet keeps forgetting Pieces and Plants).

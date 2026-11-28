@@ -1,5 +1,7 @@
 # Terrain is a Relief plus Formations
 
+Status: accepted, 2026-11-25 (#244).
+
 The Planet's shape is a **Relief** (`CONTEXT.md`): one height per place, made of the world map's elevation and per-brick detail. **Formations** add to the Relief or carve from it where a Landform or a landmark asks for one: leaning cliffs, spires, arches, sky islands, and the Caves. It was decided on 2026-11-25 in "Terrain shape model" (#244), on the terrain map (#238), so that the Planet can have Tectonic- and Terralith-like shapes while most bricks are still decided without sampling a Voxel.
 
 We chose it because nearly all of a 320 km Planet's surface is one height per place. A height bound decides a brick as sky, sea, deep rock or one stratum in a few lookups. A full 3D density everywhere would have to sample every brick near the surface and rebuild that bound in three dimensions, for overhangs that only a few Landforms need.

@@ -10,6 +10,10 @@ A detailed voxel game set on a spherical planet, where players reshape a finely 
 A spherical world the game takes place on; voxel all the way through and editable at every point. The Vertical slice has one.
 _Avoid_: World, map, level
 
+**World map**:
+The Planet's coarse description, made once from the seed: its continents, Climate, Biomes and large rivers, one texel to about 240 m. Everything finer is made when a brick is generated.
+_Avoid_: Map (alone)
+
 **Voxel**:
 The smallest unit of matter on the Planet, 5 cm across (ADR 0007), much smaller than a Minecraft block. Sizes in the game are in metres; the Voxel is the unit of the Planet's coordinates.
 _Avoid_: Block, cube
@@ -17,6 +21,24 @@ _Avoid_: Block, cube
 **Exposed**:
 Said of a solid Voxel with air against one of its faces. The Planet's surface is made of its exposed Voxels.
 _Avoid_: Visible, surface Voxel
+
+**Material**:
+The kind of matter a Voxel is made of (e.g. rock, sand, water, glass), carrying properties like hardness, emissiveness, or whether a character can walk through it (leaves and grass can).
+_Avoid_: Block type, voxel type
+
+**Spawn**:
+The one place on a Planet where every character starts, chosen from the seed.
+_Avoid_: Spawn point, start position
+
+**Debris**:
+A group of Voxels detached from the Planet by Edits that moves as a physical rigid body.
+_Avoid_: Fragment, chunk (reserved for storage, if used at all)
+
+**Fluid**:
+A Material whose Voxels flow and settle over time (water, sand, lava).
+_Avoid_: Liquid (sand is a Fluid too)
+
+### Terrain
 
 **Cave**:
 Air that the generator carves under the Planet's land, in tunnels, chambers and ravines, some of which open to the surface as cave mouths. Each Cave has its Cave Biome. A part of the Planet's generated terrain, not an Edit.
@@ -67,15 +89,13 @@ A template that grows Plants, such as a conifer, a broadleaf tree or a fern, wit
 _Avoid_: Species, tree type
 
 **Crystal cluster**:
-A few radiating hexagonal prisms with pointed tips, of one of eight emissive crystal Materials, that the generator grows from a sunlit slope or the wall of a Cave in the world map's crystal-caves region, along the surface's normal. Part of the generated terrain (it fills air only, and is in the levels of detail up to 3), not an Edit. Each Cave has a dominant hue.
+A few radiating hexagonal prisms with pointed tips, of one of eight emissive crystal Materials, that the generator grows from a sunlit slope or the wall of a Cave, along the surface's normal. Part of the generated terrain (it fills air only), not an Edit. Each Cave has a dominant hue.
 _Avoid_: Crystal (the Material of one prism), geode
 
 **Placement rule**:
 A test of a place that depends on the seed alone (the world map and the Caves' density, never the order bricks are made in), so that every brick, at any level, and the server agree on what is there: sunlit (slope, aspect, open sky), Cave wall (the density's gradient) and room (the local density). Content is placed by them.
 
-**Material**:
-The kind of matter a Voxel is made of (e.g. rock, sand, water, glass), carrying properties like hardness, emissiveness, or whether a character can walk through it (leaves and grass can).
-_Avoid_: Block type, voxel type
+### Building and playing
 
 **Edit**:
 A player-caused change to the Planet's Voxels: digging (removing) or placing.
@@ -83,7 +103,7 @@ _Avoid_: Modification, build
 
 **Brush**:
 The shape and size an Edit applies to the Planet (e.g. a 1 m sphere).
-_Avoid_: Tool size, cursor
+_Avoid_: Tool size (a Tool is what a character holds), cursor
 
 **Piece**:
 A ready-made Voxel model, such as a brick Piece or a log, about a metre across, that a player places whole in a single Edit. Once placed it is ordinary Voxels and the Planet does not remember it. A Piece snaps to any face of the Piece it is placed against, in line or staggered, and turned square to it; with nothing to snap to it starts a new build.
@@ -126,24 +146,12 @@ The way to play where a character gathers, carries an inventory, has health, and
 _Avoid_: Adventure mode
 
 **Ghost**:
-The preview of a Brush where the next click would apply it, showing exactly the Voxels the Edit would change.
+The preview of a Brush where the next click would apply it, showing exactly the Voxels the Edit would change. In Survival a Blueprint also shows as a Ghost, marking the Voxels still missing.
 _Avoid_: Cursor, outline
-
-**Debris**:
-A group of Voxels detached from the Planet by Edits that moves as a physical rigid body.
-_Avoid_: Fragment, chunk (reserved for storage, if used at all)
-
-**Fluid**:
-A Material whose Voxels flow and settle over time (water, sand, lava).
-_Avoid_: Liquid (sand is a Fluid too)
 
 **Journal**:
 The durable, ordered record of the Edits the server has accepted since the last checkpoint of the diverged bricks. Replaying it on top of that checkpoint gives the Planet as it was (ADR 0010).
 _Avoid_: Edit log, write-ahead log, history (the undo history is another thing)
-
-**Spawn**:
-The one place on a Planet where every character starts, chosen from the seed.
-_Avoid_: Spawn point, start position
 
 ### Experience
 
@@ -152,19 +160,19 @@ The continuous camera transition from a player's first/third-person view out to 
 _Avoid_: Map view, space view
 
 **Primary view**:
-The real-time view of the world that a player plays in.
+The view of the Planet, drawn every frame, that a player plays in.
 _Avoid_: Real-time view, game view
 
 **Reference view**:
-The unbiased view of the same world that the Primary view is measured against. It is shown when the view is Still and the scene has caught up with the camera (or the catch-up cap has passed, ADR 0005), and gets cleaner the longer it stays so.
+The unbiased view of the same Planet that the Primary view is measured against. It is shown when the view is Still and the scene has caught up with the camera (or the catch-up cap has passed, ADR 0005), and gets cleaner the longer it stays so.
 _Avoid_: Ground truth, path-traced mode, reference mode
 
 **World clock**:
-The time of day of the Planet: a fraction of the day (0 midnight, 0.25 sunrise, 0.5 noon, 0.75 sunset), the day's length in seconds (30 minutes by default), whether it is paused, and how many times it has been set. A plain value, so that in M2 the server holds it and sends it. It moves the sun and the moon (#203). **Setting** it (or a step that takes the sun far) is a *jump*: the light caches forget at once. **Running** it is a *drift*: they follow by their normal updates. It always runs, whatever the camera does; what is *shown* is held only while the Reference view is accumulating a Still view (the gate of the scene's hold), and catches up with the clock when the view moves again (a jump if far).
+The time of day of the Planet: a fraction of the day, how long the day is (30 minutes by default) and whether it is paused. It moves the sun and the Moon, and in M2 the server holds it and sends it. It always runs, whatever the camera does; what is shown is held only while the Reference view is accumulating a Still view, and catches up with the clock when the view moves again.
 _Avoid_: Game time, sun position
 
 **Moon**:
-A dim, cool directional light and a soft disc in the sky at night, opposite the sun and a little behind it in phase. It is the one shadowed **key light** when it is stronger than the sun at the camera (not simply when the sun is down: at dusk it takes over while the sun is still about a degree up). The one going out fades to nothing before the other takes over, so the shadows turn while there is no key light; the fade dims a low moon (under about 4.7 degrees) too, so there is effectively no key light for the last part of the night before dawn (about t = 0.20 to 0.25), and the sky and the cache light the ground then. It costs no second shadow ray. Not physical: the hero look over physical blue (#203).
+A dim, cool directional light and a soft disc in the sky at night, opposite the sun. It is the one shadowed **key light** when it is stronger than the sun at the camera, and each light fades to nothing before the other takes over, so the shadows turn while there is no key light. Not physical: the hero look over physical blue (#203).
 
 **Still**:
 The camera, the sun and the window have not changed for 2 frames and no Edit has happened. The Reference view is shown only while the view is Still, and after a flight only once the scene has caught up with the camera; any change cuts to the Primary view at once and the Reference view starts again from sample 0.
@@ -199,7 +207,7 @@ One level's part of the shell.
 _Avoid_: LOD level (the level is the data; the ring is the residency)
 
 **Guard**:
-The always-resident coarse copy of the whole Planet, kept so a late fine brick is a coarser frame rather than a hole. Never the target LOD. At the start the part of it that a camera within 2 km of the Spawn could see is made before the window opens, and the rest in the background, a **cell** (a brick of its top level and what is under it) at a time; until it is whole a flying camera is held to that ball.
+The always-resident coarse copy of the whole Planet, kept so a late fine brick is a coarser frame rather than a hole. Never the target LOD. At the start only the part that a camera near the Spawn could see is made before play begins, and the rest follows in the background; until it is whole a flying camera is held near the Spawn.
 _Avoid_: Fallback LOD, backup
 
 **Soft miss**:
@@ -211,7 +219,7 @@ A brick whose content differs from what the generator would produce for its coor
 _Avoid_: Dirty brick, edited brick
 
 **Unit**:
-A brick together with its eight children: the store keeps the children of a brick resident, or evicts them, together. Eviction takes units, furthest out of their band first and then least recently wanted, and never one that is the Guard's, wanted this frame, has a job in flight, or is over or beside a diverged brick.
+A brick together with its eight children: the store keeps the children of a brick resident, or evicts them, together. Eviction takes whole Units, and never one that is the Guard's, wanted this frame, or is over or beside a diverged brick.
 _Avoid_: Chunk, node (the selection's nodes are the bricks drawn and split)
 
 **Prefetch**:
@@ -233,5 +241,5 @@ The first playable build that proves the engine's hardest claims; specified as o
 _Avoid_: MVP, demo
 
 **Milestone**:
-One ordered stage of the Vertical slice: M1 Planet + Edits + path-traced lighting + Zoom; then multiplayer; then Debris and Fluids.
+One ordered stage of the plan in `docs/spec.md`: M0 to M5 make the Vertical slice (the skeleton; Planet + Edits + path-traced lighting + Zoom; multiplayer; Debris; Fluids; mid-range GPUs), and M6 to M8 follow it.
 _Avoid_: Phase, sprint
