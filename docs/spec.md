@@ -272,6 +272,14 @@ Decided 2026-11-11. These are ordered but not designed; each is grilled when it 
     - **Shovel:** wide and shallow, plus smooth and flatten.
     - **Axe:** a thin planar slab, the felling cut.
     - Placing needs no Tool.
+  - **Building** (owner, 2026-11-28, #283):
+    - **Every Piece is crafted** from bare Materials at a station, the plain brick Piece included (stone makes stone stairs, planks make a door), and stacks in an item slot. A Piece costs exactly the litres it stamps. Fired brick, planks and glass are Materials made by conversion recipes.
+    - **Digging a placed Piece** is an ordinary dig at full Yield: it returns its Material's litres, not the Piece. The Planet keeps no record of it.
+    - **Loose ground:** the shovel pours soil, sand, gravel and snow straight from the Ledger; nothing else goes down except as a crafted Piece.
+    - **Containers** hold litres and stacks of crafted Pieces; a broken one spills its Pieces as their Material (ADR 0011).
+    - **A Blueprint in Survival** is never pasted: it shows as the player's own Ghost, kept in their player data, which they fill with crafted Pieces at the usual cost. The Ghost marks the Voxels still missing; any Piece that fills them counts.
+    - **Creative's building helpers** are one ticket after saves (#62) and uploads (#163): a box or plane of Pieces, fill, hollow and outline with one Material, masked replace, mirror (the plane in the build's own frame), copy and Paste, and Blueprints. A Paste uploads its Clipboard or Blueprint once as a blob named by its hash; the Paste Edit names the blob, a position and a 90° turn, and the server applies it at the Edit rate and replicates it like a snapshot. Helpers queue Edits at the Edit rate with the Ghost showing progress; a server setting can raise it for Creative players up to the tick budget. Blueprints are kept per player on the server under a quota sized from its free disk, with a floor, and export and import as files.
+    - **Structural integrity** is not specified yet: only Debris connectivity (M3).
   - **Breaking behaviour** (felling, walls coming down, placed items breaking) is decided later. It works from the Voxels alone: Materials and connectivity, with unsupported parts falling as Debris (M3). The Planet keeps forgetting Pieces and Plants (ADR 0011).
 - **M8: Solar system.** More than one Planet, and travel between them.
 - **Deferred from the inspirations** (#136, #137, #138):
@@ -294,7 +302,7 @@ Of the Vertical slice; the first two items are M7 and M8's.
 - MMO scale and sharding.
 - Web, console and mobile.
 - Commercial concerns.
-- Paint, line/box and copy-paste tools, and landscape-scale area sculpting.
+- Paint and landscape-scale area sculpting. (Line/box and copy-paste are no longer deferred: they are Creative's building helpers, after saves and uploads; see M7's *Building*, #283.)
 - Travel aids: teleport and fast travel. The Planet is crossed by walking and flying, and seen whole from orbit.
 - Ambient creatures, vehicles, fire and explosives, mechanisms (moving Pieces are M6's), and recreating real places (#138).
 - Public servers, claims and per-player rollback.

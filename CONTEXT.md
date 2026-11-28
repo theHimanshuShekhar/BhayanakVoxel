@@ -91,12 +91,24 @@ What a dig gives a player in Survival: the volume of each Material it removed, s
 _Avoid_: Drop, loot, resources
 
 **Ledger**:
-The litres of each Material that a player or a Container holds in Survival. Yield fills it and placing spends from it.
-_Avoid_: Pack (the thing that sets its size), inventory (informal: a player's Ledger plus Tool slots)
+The litres of each Material that a player or a Container holds in Survival. Yield fills it; crafting spends from it, and so does pouring loose ground with a shovel.
+_Avoid_: Pack (the thing that sets its size), inventory (informal: a player's Ledger plus slots of Tools and crafted Pieces)
 
 **Container**:
-A placed chest or crate that holds a Ledger: the one kind of placed thing the Planet remembers. Digging into it breaks it and spills what it held.
+A placed chest or crate that holds a Ledger and stacks of crafted Pieces: the one kind of placed thing the Planet remembers. Digging into it breaks it and spills what it held as Materials.
 _Avoid_: Storage block, inventory
+
+**Clipboard**:
+The region of Voxels a player has copied in Creative and not saved, ready to Paste.
+_Avoid_: Selection (what is outlined before it is copied), buffer
+
+**Blueprint**:
+A saved region of Voxels in a player's library, kept by the server and exportable as a file. In Creative it is Pasted; in Survival it shows as a Ghost that the player builds into with Pieces.
+_Avoid_: Prefab, schematic, design
+
+**Paste**:
+The Edit that stamps a Clipboard or Blueprint onto the Planet at a position, turned in 90° steps. Afterwards it is ordinary Voxels.
+_Avoid_: Clone, place (placing is one Piece)
 
 **Creative**:
 The way to play with every Brush and Material free and no Tools, as in the Vertical slice.
