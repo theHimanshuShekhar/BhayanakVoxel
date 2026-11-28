@@ -1,7 +1,7 @@
 # gpu-allocator 0.28.0, patched
 
-This is the published `gpu-allocator` 0.28.0 (MIT OR Apache-2.0) with its examples, dev-dependencies
-and README left out, and one change, in `src/vulkan/mod.rs` (`MemoryType::free`, and the constant
+This is the published `gpu-allocator` 0.28.0 (MIT OR Apache-2.0) with its examples, dev-dependencies,
+README and the manifest's `include`, `readme` and `[[example]]` entries left out, and one change, in `src/vulkan/mod.rs` (`MemoryType::free`, and the constant
 `KEPT_EMPTY_BLOCKS`): of the **empty blocks that support sub-allocations, a memory type keeps up to
 two** (`KEPT_EMPTY_BLOCKS = 2`), and destroys the rest as they empty. Upstream destroys an empty
 block whenever it is not the last one. A block that is dedicated or personal to one allocation is
