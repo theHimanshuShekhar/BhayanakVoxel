@@ -644,6 +644,25 @@ mod tests {
         assert_eq!((choice.active, choice.fallback), (RtBackend::Compute, None));
     }
 
+    /// A run held off ray queries (`--profile low-end`, `--no-ray-queries`, or an adapter without
+    /// them, which `hide_ray_queries` stands in for) makes a device without the features and the
+    /// experimental opt-in, though the setting is hardware: through the real request, so a change
+    /// to how `request_gpu_for` decides whether to ask for them fails here.
+    #[test]
+    fn a_hardware_setting_held_off_makes_a_device_without_ray_queries() {
+        let (_, device, _, choice, rt_device) =
+            request_gpu_for(shared_instance(), None, false, RtBackend::Hardware, true).unwrap();
+        assert!(
+            !device
+                .features()
+                .contains(wgpu::Features::EXPERIMENTAL_RAY_QUERY)
+        );
+        assert!(!rt_device.on_device && rt_device.failed.is_none());
+        assert!(rt_device.unavailable.is_some());
+        assert_eq!(choice.active, RtBackend::Compute);
+        assert!(choice.fallback.is_some());
+    }
+
     /// The hardware setting on an adapter that has ray queries (lavapipe's Mesa, where it does)
     /// makes the device with them; where it has none the test says so and passes, as `hw_agreement`
     /// does.
