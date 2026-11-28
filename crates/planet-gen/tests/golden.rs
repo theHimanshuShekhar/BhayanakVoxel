@@ -56,7 +56,7 @@ const GOLDEN: &[([i32; 3], Kind, u64)] = &[
 #[test]
 fn golden_generator_version() {
     // Changing this means the hashes below were regenerated on purpose.
-    assert_eq!(GENERATOR_VERSION, 6);
+    assert_eq!(GENERATOR_VERSION, 7);
 }
 
 #[test]
@@ -307,6 +307,110 @@ fn golden_coarse_brick_hashes() {
         failed |= got_kind != *want_kind || got_hash != *want_hash;
         report += &format!(
             "({level}, {under:?}) {got_kind:?} actual {got_hash:#018x} want {want_hash:#018x}\n"
+        );
+    }
+    assert!(!failed, "golden mismatch:\n{report}");
+}
+
+/// Boxes of Voxels from the centre, (low, high), whose crystal clusters (#204) [`CRYSTALS_GOLDEN`]
+/// hashes bit for bit, anchors, normals, Materials and every prism: two of ground clusters on
+/// sunlit slopes of the crystal country, two of cave clusters on the walls of its caves.
+const CRYSTAL_BOXES: [([f64; 3], [f64; 3]); 4] = [
+    (
+        [4053047.0, -3127893.0, -3846507.0],
+        [4055607.0, -3125333.0, -3843947.0],
+    ),
+    (
+        [4465126.0, 2479178.0, 3875657.0],
+        [4467686.0, 2481738.0, 3878217.0],
+    ),
+    (
+        [4048918.0, -3126975.0, -3845084.0],
+        [4054038.0, -3121855.0, -3839964.0],
+    ),
+    (
+        [6027223.0, -34088.0, 2186107.0],
+        [6032343.0, -28968.0, 2191227.0],
+    ),
+];
+
+/// The hash of the clusters in each of the boxes above, and how many there are: the rules that
+/// place them (sunlit slope, cave wall, room), the dice that shape them and the floats under all
+/// of it, before they are in any brick.
+const CRYSTALS_GOLDEN: [(usize, u64); 4] = [
+    (13, 0xadeeccbc49f92239),
+    (30, 0xc35f95872a6da761),
+    (94, 0x1d5d6102a39d1400),
+    (199, 0xa0d5dd4ee121e488),
+];
+
+#[test]
+fn golden_crystal_clusters_hash() {
+    let actual: Vec<(usize, u64)> = CRYSTAL_BOXES
+        .iter()
+        .map(|(low, high)| {
+            (
+                planet().crystal_sites(*low, *high).len(),
+                planet().crystals_hash(*low, *high),
+            )
+        })
+        .collect();
+    let hex: Vec<String> = actual
+        .iter()
+        .map(|(n, h)| format!("({n}, {h:#018x})"))
+        .collect();
+    assert_eq!(actual, CRYSTALS_GOLDEN, "actual {hex:?}");
+}
+
+/// Bricks with crystal in them, at levels 0 to 3 (the levels that have clusters) over the longest
+/// cluster of each box above: (mip level, brick, how many of its Voxels are crystal Materials,
+/// hash). There are fewer crystal Voxels at each level, as a coarse Voxel is wider than a prism.
+#[rustfmt::skip]
+const CRYSTAL_BRICKS: &[(usize, [i32; 3], usize, u64)] = &[
+    // Ground clusters.
+    (0, [506859, -390762, -480607], 281, 0xbdf4f6f5b90d66a5),
+    (1, [253429, -195381, -240304], 70, 0x3e39d75a8eb4ba1d),
+    (2, [126714, -97691, -120152], 10, 0x28cd5d6de31d9d23),
+    (3, [63357, -48846, -60076], 1, 0x46d1d6578c5721fd),
+    (0, [558183, 310020, 484772], 208, 0xb889c231dcecf84f),
+    (1, [279091, 155010, 242386], 81, 0x9ceed0592982c3a2),
+    (2, [139545, 77505, 121193], 10, 0xaf483873d23927cd),
+    (3, [69772, 38752, 60596], 4, 0x39aa46a41f585eec),
+    // Cave clusters.
+    (0, [506360, -390856, -480242], 198, 0xc48a8ec6d55c68e1),
+    (1, [253180, -195428, -240121], 126, 0x3fe0914bcd790015),
+    (2, [126590, -97714, -120061], 21, 0x6bd081cf11a0ec39),
+    (3, [63295, -48857, -60031], 1, 0x7c1d04334ad00073),
+    (0, [753501, -4257, 273558], 231, 0xb8ea16c0d103c099),
+    (1, [376750, -2129, 136779], 100, 0xe2dc2ce996ea2933),
+    (2, [188375, -1065, 68389], 19, 0x7b7f579c6fefecab),
+    (3, [94187, -533, 34194], 3, 0x7c6dec85075e4f65),
+];
+
+#[test]
+fn golden_crystal_brick_hashes() {
+    let crystal = |brick: &Brick| {
+        (0..512usize)
+            .filter(|&i| {
+                brick
+                    .get([(i % 8) as u8, (i / 8 % 8) as u8, (i / 64) as u8])
+                    .is_some_and(|m| (56..64).contains(&m.0))
+            })
+            .count()
+    };
+    let mut report = String::new();
+    let mut failed = false;
+    for (level, coord, want_crystal, want_hash) in CRYSTAL_BRICKS {
+        let coord = BrickCoord(*coord);
+        let brick = match level {
+            0 => planet().brick(coord),
+            n => planet().coarse_brick(*n, coord),
+        };
+        let (got_crystal, got_hash) = (crystal(&brick), brick.content_hash());
+        failed |= got_crystal != *want_crystal || got_hash != *want_hash;
+        report += &format!(
+            "({level}, {:?}) {got_crystal} crystal Voxels, actual {got_hash:#018x} want {want_hash:#018x}\n",
+            coord.0
         );
     }
     assert!(!failed, "golden mismatch:\n{report}");

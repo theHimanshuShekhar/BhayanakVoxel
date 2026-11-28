@@ -17,9 +17,12 @@
 mod common;
 
 use brick_store::BrickCoord;
-use common::{Difference, PRIMARY, REFERENCE, check_golden, compare, diff_image, within_tolerance};
+use common::{
+    Difference, PRIMARY, REFERENCE, check_golden, check_hardware_golden, compare, diff_image,
+    hardware_runs, within_tolerance,
+};
 use planet_gen::generate_region;
-use render::{Camera, Image, Offscreen, Resolution, Scene, Sun};
+use render::{Camera, Image, Offscreen, Resolution, RtBackend, Scene, Sun};
 
 const WIDTH: u32 = 256;
 const HEIGHT: u32 = 144;
@@ -36,25 +39,61 @@ fn planet_patch() -> Scene {
 }
 
 /// The view: low over the surface near the +y pole, looking along it towards the horizon.
-fn render_view() -> Image {
+fn render_view(backend: RtBackend) -> Image {
     let camera = Camera::looking_at([0.0, 1548.0, 250.0], [0.0, 1535.0, -300.0]);
-    let mut offscreen = Offscreen::new(WIDTH, HEIGHT, &planet_patch()).unwrap();
+    let mut offscreen = on(backend, Resolution::native(WIDTH, HEIGHT), &planet_patch());
     offscreen.set_ground_level(GROUND_LEVEL);
     offscreen.render(&camera)
 }
 
+/// A context on `backend`, which must run it: the hardware tests skip themselves first
+/// ([`hardware_runs`]).
+fn on(backend: RtBackend, resolution: Resolution, scene: &Scene) -> Offscreen {
+    let offscreen = Offscreen::with_backend(resolution, scene, backend).unwrap();
+    assert_eq!(
+        offscreen.rt().active,
+        backend,
+        "{:?}",
+        offscreen.rt().fallback
+    );
+    offscreen
+}
+
 #[test]
 fn the_test_planet_matches_the_approved_golden_image() {
-    check_golden("planet_256x144.png", &render_view(), &PRIMARY);
+    check_golden(
+        "planet_256x144.png",
+        &render_view(RtBackend::Compute),
+        &PRIMARY,
+    );
+}
+
+// The hardware backend is held to the same approved images with the same tolerances (#50, Part 2):
+// ray queries and the compute walk run the same walk in each brick, through the same tight box, and
+// differ only where a ray grazes the edge of a box, which moves a few edge pixels to the
+// neighbouring Voxel, as a different driver does. Measured on lavapipe (the mse against the
+// approved image, compute then hardware): 1.4192 and 1.4192 for the planet, 1.4475 and 1.4474 for
+// the TAAU pan, 1.3184 and 1.3184 for the GI view, 0.0001 and 0.0001 for the path tracer; no
+// far-off pixel in any. Each sits far inside the limit of its golden (mse 4 and 0.5% far-off pixels;
+// 1 and 0.2% for the path tracer).
+#[test]
+fn the_test_planet_on_the_hardware_backend_matches_the_approved_golden_image() {
+    if hardware_runs("planet") {
+        check_hardware_golden(
+            "planet_256x144.png",
+            &render_view(RtBackend::Hardware),
+            &PRIMARY,
+        );
+    }
 }
 
 /// The same view as the game draws it since #54: with the radiance cache's GI instead of the flat
 /// ambient that an `Offscreen` starts with (so the golden above shows a light the game no longer
 /// draws), after 40 frames, for the cache to have settled. GI is deterministic: the same frames
 /// give the same image.
-fn render_view_with_gi() -> Image {
+fn render_view_with_gi(backend: RtBackend) -> Image {
     let camera = Camera::looking_at([0.0, 1548.0, 250.0], [0.0, 1535.0, -300.0]);
-    let mut offscreen = Offscreen::new(WIDTH, HEIGHT, &planet_patch()).unwrap();
+    let mut offscreen = on(backend, Resolution::native(WIDTH, HEIGHT), &planet_patch());
     offscreen.set_ground_level(GROUND_LEVEL);
     offscreen.set_flat_ambient(false);
     let mut image = offscreen.render(&camera);
@@ -66,17 +105,32 @@ fn render_view_with_gi() -> Image {
 
 #[test]
 fn the_test_planet_with_the_radiance_caches_gi_matches_the_approved_golden_image() {
-    check_golden("planet_gi_256x144.png", &render_view_with_gi(), &PRIMARY);
+    check_golden(
+        "planet_gi_256x144.png",
+        &render_view_with_gi(RtBackend::Compute),
+        &PRIMARY,
+    );
+}
+
+#[test]
+fn the_test_planet_with_gi_on_the_hardware_backend_matches_the_approved_golden_image() {
+    if hardware_runs("planet with GI") {
+        check_hardware_golden(
+            "planet_gi_256x144.png",
+            &render_view_with_gi(RtBackend::Hardware),
+            &PRIMARY,
+        );
+    }
 }
 
 /// The upscaler's view: the same as the primary visibility golden's, traced at 128x72 and
 /// upscaled to the golden's 256x144.
-fn upscaling() -> Offscreen {
+fn upscaling(backend: RtBackend) -> Offscreen {
     let resolution = Resolution {
         internal: (WIDTH / 2, HEIGHT / 2),
         output: (WIDTH, HEIGHT),
     };
-    let mut offscreen = Offscreen::with_resolution(resolution, &planet_patch()).unwrap();
+    let mut offscreen = on(backend, resolution, &planet_patch());
     offscreen.set_ground_level(GROUND_LEVEL);
     offscreen
 }
@@ -89,9 +143,9 @@ fn upscaled_view() -> Camera {
 
 /// A camera that stays still for [`UPSCALED_FRAMES`] frames: the upscaler has gathered the
 /// samples of a whole period of its jitter, and the image is as sharp as it gets.
-fn render_still() -> Image {
+fn render_still(backend: RtBackend) -> Image {
     let camera = upscaled_view();
-    let mut offscreen = upscaling();
+    let mut offscreen = upscaling(backend);
     let mut image = offscreen.render_upscaled(&camera);
     for _ in 1..UPSCALED_FRAMES {
         image = offscreen.render_upscaled(&camera);
@@ -101,15 +155,30 @@ fn render_still() -> Image {
 
 #[test]
 fn a_still_camera_matches_the_approved_upscaled_golden_image() {
-    check_golden("planet_taau_still_256x144.png", &render_still(), &PRIMARY);
+    check_golden(
+        "planet_taau_still_256x144.png",
+        &render_still(RtBackend::Compute),
+        &PRIMARY,
+    );
+}
+
+#[test]
+fn a_still_camera_on_the_hardware_backend_matches_the_approved_upscaled_golden_image() {
+    if hardware_runs("still camera") {
+        check_hardware_golden(
+            "planet_taau_still_256x144.png",
+            &render_still(RtBackend::Hardware),
+            &PRIMARY,
+        );
+    }
 }
 
 /// A camera that turns about a third of a degree a frame (about one output pixel) to the left for
 /// [`UPSCALED_FRAMES`] frames: the last frame, where the history has been moved along with the
 /// camera 23 times and clamped to what the new samples allow.
-fn render_pan() -> Image {
+fn render_pan(backend: RtBackend) -> Image {
     let mut camera = upscaled_view();
-    let mut offscreen = upscaling();
+    let mut offscreen = upscaling(backend);
     let mut image = offscreen.render_upscaled(&camera);
     for _ in 1..UPSCALED_FRAMES {
         camera.turn(0.006, 0.0);
@@ -120,16 +189,31 @@ fn render_pan() -> Image {
 
 #[test]
 fn a_panning_camera_matches_the_approved_upscaled_golden_image() {
-    check_golden("planet_taau_pan_256x144.png", &render_pan(), &PRIMARY);
+    check_golden(
+        "planet_taau_pan_256x144.png",
+        &render_pan(RtBackend::Compute),
+        &PRIMARY,
+    );
+}
+
+#[test]
+fn a_panning_camera_on_the_hardware_backend_matches_the_approved_upscaled_golden_image() {
+    if hardware_runs("panning camera") {
+        check_hardware_golden(
+            "planet_taau_pan_256x144.png",
+            &render_pan(RtBackend::Hardware),
+            &PRIMARY,
+        );
+    }
 }
 
 const SAMPLES: u32 = 64;
 
 /// The reference path tracer's view: close to the terraced hillside, with a low sun to the side,
 /// so that steps are lit on one face and shade the ground below them on the other.
-fn render_reference() -> Image {
+fn render_reference(backend: RtBackend) -> Image {
     let camera = Camera::looking_at([0.0, 1535.0, 120.0], [0.0, 1508.0, 20.0]);
-    let mut offscreen = Offscreen::new(WIDTH, HEIGHT, &planet_patch()).unwrap();
+    let mut offscreen = on(backend, Resolution::native(WIDTH, HEIGHT), &planet_patch());
     offscreen.set_ground_level(GROUND_LEVEL);
     offscreen.set_sun(Sun::from_angles(0.9, 0.25, 0.04));
     offscreen.render_reference(&camera, SAMPLES)
@@ -149,9 +233,20 @@ fn render_reference() -> Image {
 fn the_reference_path_tracer_matches_the_approved_golden_image() {
     check_golden(
         "planet_reference_256x144_64spp.png",
-        &render_reference(),
+        &render_reference(RtBackend::Compute),
         &REFERENCE,
     );
+}
+
+#[test]
+fn the_reference_path_tracer_on_the_hardware_backend_matches_the_approved_golden_image() {
+    if hardware_runs("reference path tracer") {
+        check_hardware_golden(
+            "planet_reference_256x144_64spp.png",
+            &render_reference(RtBackend::Hardware),
+            &REFERENCE,
+        );
+    }
 }
 
 fn flat(rgb: [u8; 3]) -> Image {

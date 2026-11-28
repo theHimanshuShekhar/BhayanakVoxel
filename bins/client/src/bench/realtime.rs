@@ -38,23 +38,29 @@
 use std::any::Any;
 use std::error::Error;
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use brick_store::{Budget, VOXELS_PER_METRE};
 use net::{ServerEnd, loopback};
-use planet_gen::planet::tangents;
-use planet_gen::world_map::{WORLD_MAP_SIZE, WorldMap};
+use planet_gen::cost::{ExtraCost, ExtraCostStats};
+use planet_gen::planet::{interior_radius_for, max_radius_for, tangents};
+use planet_gen::world_map::{Relief, TEST_RADIUS, WORLD_RADIUS, WorldMap};
 use render::reference::{Ray, trace};
-use render::{Camera, GpuPasses, Mode, Offscreen, Rebuild, Resolution, Scene, SceneUpdate, camera};
+use render::{
+    Camera, GpuPasses, Mode, Offscreen, Rebuild, Resolution, RtBackend, RtChoice, Scene,
+    SceneUpdate, camera,
+};
 use serde::Serialize;
 use serde_json::Value;
 use sim::Predictor;
 
 use super::budget::{EXIT_OVER_BUDGET, StreamingBudgets};
 use super::process;
+use super::rt::{AccelSummary, HwFrame, PathHardware};
 use super::stream::{
     Constants, Series, Sizing, Start, TestPlanet, measure_sizes, over_the_ground, percentile_99,
-    test_planet, within_reach,
+    test_planet_with, within_reach,
 };
 use crate::loader::{Loader, workers_for};
 use crate::scene_worker::{Cause, Done, Longest, Spent, UPLOAD_BUDGET};
@@ -152,6 +158,12 @@ pub trait Gpu {
         0
     }
 
+    /// What the device's allocator keeps (`Offscreen::device_memory`): `None` with no GPU or where
+    /// it cannot say.
+    fn device_memory(&self) -> Option<render::hw::DeviceMemory> {
+        None
+    }
+
     /// The GPU's own time of each pass of the frame just drawn, by the pass's name, in
     /// milliseconds: empty with no GPU, no timers, or where this frame's times did not come in.
     fn pass_times(&self) -> Vec<(String, f64)> {
@@ -183,17 +195,37 @@ pub struct GpuFrame {
     /// that were copied. Zero if no buffer grew.
     pub grow: Duration,
     pub grown_bytes: u64,
+    /// What the hardware backend's acceleration structures took in the frame outside the update's
+    /// call: the groups built as the draw followed the camera (#236). It is not in `encode`, and
+    /// the frame's update is `write + flush + hardware`, wherever the builds were encoded.
+    pub hardware: Duration,
+    /// The same by part, from every update of the frame (the call's and the draw's), for a frame
+    /// on the hardware backend; None on the compute one (see [`PathReport::hardware`]).
+    pub accel: Option<HwFrame>,
 }
 
 impl GpuFrame {
     /// The CPU's part: all but the wait.
     fn cpu(&self) -> Duration {
-        self.write + self.flush + self.encode + self.submit
+        self.write + self.flush + self.hardware + self.encode + self.submit
     }
 }
 
-/// The offscreen GPU of the bench.
-pub struct OffscreenGpu<'a>(pub &'a mut Offscreen);
+/// The offscreen GPU of the bench, and the updates of the hardware backend's acceleration
+/// structures that it has taken from the GPU (every frame: the GPU keeps a few thousand).
+pub struct OffscreenGpu<'a> {
+    pub gpu: &'a mut Offscreen,
+    pub accel: Vec<render::HwUpdate>,
+}
+
+impl<'a> OffscreenGpu<'a> {
+    pub fn new(gpu: &'a mut Offscreen) -> Self {
+        Self {
+            gpu,
+            accel: Vec::new(),
+        }
+    }
+}
 
 impl Gpu for OffscreenGpu<'_> {
     fn frame(
@@ -204,33 +236,49 @@ impl Gpu for OffscreenGpu<'_> {
     ) -> Result<GpuFrame, Box<dyn Error>> {
         let mut frame = GpuFrame::default();
         if let Some(update) = update {
-            self.0.update_scene(scene, update)?;
-            let times = self.0.last_update_times();
+            self.gpu.update_scene(scene, update)?;
+            let times = self.gpu.last_update_times();
             frame.write = times.write;
             frame.flush = times.flush;
             frame.writes = times.writes;
-            frame.grow = self.0.last_grow_time();
-            frame.grown_bytes = self.0.last_grown_bytes();
+            frame.grow = self.gpu.last_grow_time();
+            frame.grown_bytes = self.gpu.last_grown_bytes();
         }
-        self.0.draw_upscaled_timed(camera);
-        let drawn = self.0.last_draw_times();
-        frame.encode = drawn.encode;
+        self.gpu.draw_upscaled_timed(camera);
+        let drawn = self.gpu.last_draw_times();
+        // The groups the draw built as it followed the camera are the frame's update, as the
+        // ones of the update's own call are (#236): out of the encode, into `hardware`.
+        frame.hardware = drawn.hardware;
+        frame.encode = drawn.encode.saturating_sub(drawn.hardware);
         frame.submit = drawn.submit;
         frame.wait = drawn.wait;
         frame.passes = drawn.gpu;
+        let updates = self.gpu.take_hardware_updates();
+        if self.gpu.rt().active.is_hardware() {
+            frame.accel = Some(HwFrame {
+                tlas_instances: self.gpu.hardware_instances(),
+                draw_submit: drawn.submit.as_secs_f64() * 1e3,
+                ..HwFrame::of(&updates)
+            });
+        }
+        self.accel.extend(updates);
         Ok(frame)
     }
 
     fn peak_growth_bytes(&self) -> u64 {
-        self.0.peak_growth_bytes()
+        self.gpu.peak_growth_bytes()
     }
 
     fn pass_times(&self) -> Vec<(String, f64)> {
-        self.0.last_draw_pass_times().to_vec()
+        self.gpu.last_draw_pass_times().to_vec()
     }
 
     fn peak_rebuild_bytes(&self) -> u64 {
-        self.0.peak_rebuild_bytes()
+        self.gpu.peak_rebuild_bytes()
+    }
+
+    fn device_memory(&self) -> Option<render::hw::DeviceMemory> {
+        self.gpu.device_memory()
     }
 }
 
@@ -250,12 +298,14 @@ impl Gpu for NoGpu {
     }
 }
 
-/// Times in milliseconds of the frames of a path: the 99th percentile (nearest rank), the worst
-/// and the mean.
+/// Times in milliseconds of the frames of a path: the 95th and 99th percentiles (nearest rank),
+/// the worst and the mean.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize)]
 pub struct Spread {
     pub samples: usize,
     pub mean_ms: f64,
+    /// The 95th percentile (#236 holds the frame thread's update to compute's at it).
+    pub p95_ms: f64,
     pub p99_ms: f64,
     pub worst_ms: f64,
 }
@@ -268,9 +318,11 @@ impl Spread {
         let mut sorted = times.to_vec();
         sorted.sort_by(f64::total_cmp);
         let rank = (sorted.len() * 99).div_ceil(100);
+        let rank95 = (sorted.len() * 95).div_ceil(100);
         Self {
             samples: sorted.len(),
             mean_ms: sorted.iter().sum::<f64>() / sorted.len() as f64,
+            p95_ms: sorted[rank95 - 1],
             p99_ms: sorted[rank - 1],
             worst_ms: sorted[sorted.len() - 1],
         }
@@ -414,6 +466,14 @@ pub struct SceneThread {
     /// scene thread's time in the rebuild, which the frame thread does not wait for, against
     /// #217's cap on the catch-up (12 s). The copy for the frame thread is in `upload_ms`.
     pub release_ms: f64,
+    /// What `pack_ms` is made of (#251), parts of it and not added to it: asking the loader for
+    /// what the scene wants and handing the workers their jobs, taking arrivals from the channel,
+    /// holding their bricks in the store (the write lock included), and the scene splitting the
+    /// bricks under which they are and packing the change.
+    pub pack_request_ms: f64,
+    pub pack_receive_ms: f64,
+    pub pack_hold_ms: f64,
+    pub pack_arrive_ms: f64,
     /// The looks for holes' share of the scene thread's **busy** time above (0 to 1): the sum of
     /// the parts, not wall time, so a thread that is idle most of the time can still read high. A
     /// path's figure is of its frames only: the look that is forced after them is not in it (see
@@ -434,6 +494,10 @@ impl SceneThread {
             hole_scan_ms: ms(now.hole_scan, then.hole_scan),
             reband_ms: ms(now.reband, then.reband),
             release_ms: ms(now.release, then.release),
+            pack_request_ms: ms(now.pack_request, then.pack_request),
+            pack_receive_ms: ms(now.pack_receive, then.pack_receive),
+            pack_hold_ms: ms(now.pack_hold, then.pack_hold),
+            pack_arrive_ms: ms(now.pack_arrive, then.pack_arrive),
             hole_scan_share: 0.0,
         };
         let all = parts.follow_ms
@@ -576,6 +640,32 @@ pub struct SlowFrame {
     /// is not that it blocked the frame, and a look that began after the frame's start and was done
     /// before its end is missed.
     pub hole_look: bool,
+    /// On the hardware backend, what the frame built (#236): BLASes, of them the ones that could
+    /// not wait, their boxes, and the submits of acceleration structures. Null on the compute
+    /// backend. A frame whose `wait_not_passes_ms` is long says here whether it built much.
+    pub hw_blas: Option<u32>,
+    pub hw_blas_urgent: Option<u32>,
+    pub hw_boxes: Option<u64>,
+    pub hw_submits: Option<u32>,
+    /// Of `hw_blas`, the BLASes **made** (allocated), and the updates that grew the box pool or
+    /// made the TLAS again (#236).
+    pub hw_created: Option<u32>,
+    pub hw_pool_grew: Option<u32>,
+    pub hw_tlas_made: Option<u32>,
+    /// With `--hw-wait`: the GPU's time of the frame's BLAS builds and TLAS build (see
+    /// `hardware.gpu_blas`), ms.
+    pub hw_gpu_blas_ms: Option<f64>,
+    pub hw_gpu_tlas_ms: Option<f64>,
+    /// The GPU's time from the box pass's end to the builds' start (`hardware.gpu_gap`), ms.
+    pub hw_gpu_gap_ms: Option<f64>,
+    /// With `--hw-wait`: the memory blocks the allocator made for the frame's recording, the
+    /// bytes they reserve and the biggest scratch buffer (`hardware.scratch_bytes`), and the CPU's
+    /// finishing of the command buffer and its submit (where wgpu makes the scratch buffers).
+    pub hw_blocks_made: Option<u32>,
+    pub hw_reserved_grew: Option<u64>,
+    pub hw_scratch_bytes: Option<u64>,
+    pub hw_finish_ms: Option<f64>,
+    pub hw_submit_ms: Option<f64>,
 }
 
 /// How many frames of a path were of each kind of update.
@@ -765,6 +855,10 @@ pub struct PathReport {
     /// to the GPU, the encoding, the submit, the wait for the GPU, or what the GPU says its passes
     /// took. The slowest frames have the same parts one by one; this is all of them.
     pub frame_parts: FrameParts,
+    /// Where the hardware backend's part of `frame_parts.update` went, by what the frame thread
+    /// did (host prep, recording, finish, submit), and how much it built a frame (#236); null on
+    /// the compute backend.
+    pub hardware: Option<PathHardware>,
     /// The GPU's own time of each pass, by the pass's name, over the frames whose times came in
     /// (#54: GI is passes `gi` and `shade`, and the frame's cost is read against main's here).
     pub gpu_passes: std::collections::BTreeMap<String, Spread>,
@@ -840,6 +934,9 @@ pub struct PathReport {
     /// is not there, which is decision A's). They add up to `camera_soft_miss_frames`.
     pub camera_soft_miss_lag_side: usize,
     pub camera_soft_miss_loader_side: usize,
+    /// The camera misses by the level of the brick that was drawn whole under the camera (#251):
+    /// entry `l` is the frames in which it was of level `l`. Empty for a path with none scored.
+    pub camera_soft_miss_by_level: Vec<u32>,
     pub lag_over_floor_frames: usize,
     /// The scene's buffers in use and the bricks drawn at each level when the path ended (to be
     /// read against `scene_used_peak_mib`: a peak over it is a transient).
@@ -875,6 +972,22 @@ pub struct PathReport {
     pub loader_held_back_s: f64,
     pub stream_calls: u64,
     pub stream_slices_used: u64,
+    /// How long the jobs that the scene thread took in during the path waited, by class (the
+    /// bands split the brick, the margin, prefetch) and by part (#251): in the scene thread's own
+    /// outbox, in the workers' queue, being made, in the channel until it was taken in, and all
+    /// of those. For reading a flight's camera misses as the generator's, the queue's order or the
+    /// scene thread's taking in. Of the machine's clock: not deterministic, not gated.
+    pub loader_latency: LoaderLatency,
+    /// The jobs that the workers had taken and the scene thread had not taken in, as of each frame
+    /// (at `MAX_AHEAD` the workers wait for it, #251): the mean, the most, and the frames that
+    /// were at the most.
+    pub loader_ahead_mean: f64,
+    pub loader_ahead_max: usize,
+    pub loader_frames_at_max_ahead: usize,
+    /// A flight's seconds one by one (#251; empty for the other paths): the camera misses, the
+    /// loader's queue and the scene thread's work in each, to see what the second of a miss
+    /// looked like.
+    pub by_second: Vec<SecondReport>,
     /// Looks of the scene thread at every split brick (every few seconds, and one forced at the end
     /// of the path), the holes they found in all, and those per frame of the path. Never 0 looks.
     pub hole_looks: u64,
@@ -917,11 +1030,108 @@ pub struct PathReport {
     pub still_cuts: Option<StillCutsReport>,
 }
 
+/// The time of a part of the jobs' waiting (#251, [`LoaderLatency`]): the mean, the upper bound of
+/// the bin of the 99th percentile (the last bin has none: 500 says "over 250"), and the jobs
+/// that took over 100 ms (the last two bins).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize)]
+pub struct LatencyFigures {
+    pub mean_ms: f64,
+    pub p99_ms: f64,
+    pub over_100_ms: u64,
+}
+
+/// What the jobs of one class waited for (#251): how many were taken in, and each part's time.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize)]
+pub struct ClassLatency {
+    pub jobs: u64,
+    /// From the scene thread asking for the brick's children to the workers' queue having the job
+    /// (a sync that found the workers busy with the queue leaves it in the outbox).
+    pub outbox: LatencyFigures,
+    /// In the workers' queue, until a worker took it: the order and the `MAX_AHEAD` bound.
+    pub queued: LatencyFigures,
+    /// Being generated.
+    pub made: LatencyFigures,
+    /// Made, and in the channel until the scene thread took it in.
+    pub waited: LatencyFigures,
+    /// All four.
+    pub total: LatencyFigures,
+}
+
+/// [`crate::loader::Latency`] as the report has it, by class (#251).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize)]
+pub struct LoaderLatency {
+    pub drawn: ClassLatency,
+    pub margin: ClassLatency,
+    pub prefetch: ClassLatency,
+}
+
+impl LoaderLatency {
+    fn of(latency: &crate::loader::Latency) -> Self {
+        let class = |class: usize| {
+            let figures = |phase: usize| LatencyFigures {
+                mean_ms: latency.mean_ms(class, phase),
+                p99_ms: latency.p99_ms(class, phase),
+                over_100_ms: latency.over_100_ms(class, phase),
+            };
+            ClassLatency {
+                jobs: latency.jobs(class),
+                outbox: figures(0),
+                queued: figures(1),
+                made: figures(2),
+                waited: figures(3),
+                total: figures(4),
+            }
+        };
+        Self {
+            drawn: class(2),
+            margin: class(1),
+            prefetch: class(0),
+        }
+    }
+}
+
+/// One second of a flight (#251): what the loader and the scene thread were doing in the frames
+/// that began in it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize)]
+pub struct SecondReport {
+    pub second: usize,
+    pub frames: u32,
+    /// Frames with a camera soft miss.
+    pub camera_soft_misses: u32,
+    /// The loader's queue (bricks asked for and not taken in), and the jobs ahead of the scene
+    /// thread, as of the frames.
+    pub loader_queue_mean: f64,
+    pub loader_queue_max: usize,
+    pub loader_ahead_mean: f64,
+    /// Bricks taken in during the second, and the scene thread's time in it, in milliseconds.
+    pub arrived_bricks: u64,
+    pub scene_follow_ms: f64,
+    pub scene_pack_ms: f64,
+    pub scene_reband_ms: f64,
+    /// The most the drawn scene was behind the camera, in `d0`.
+    pub lag_d0_max: f64,
+}
+
+/// A second's frames, summed (the arrays of [`Capture`]'s seconds).
+#[derive(Clone, Copy, Default)]
+struct SecondSum {
+    frames: u32,
+    misses: u32,
+    queue_sum: u64,
+    queue_max: usize,
+    ahead_sum: u64,
+    lag_max: f64,
+    /// What the world had counted when the second's last frame had been taken.
+    arrived: u64,
+    spent: Spent,
+}
+
 /// The cold start: the world made, and the frames at the Spawn until the resident set is complete.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize)]
 pub struct ColdStart {
-    /// Generating the world map, which the client does before it loads the Planet: not in the time
-    /// to control. Null for the test Planet's.
+    /// Making the world map, which the client does before it loads the Planet: not in the time
+    /// to control. Built, or read from the cache folder (#264: the stderr line says which, and
+    /// `BHAYANAK_NO_MAP_CACHE=1` makes it built every time). Null for the test Planet's.
     pub world_map_s: Option<f64>,
     /// [`crate::load`]: the spawn ring, the Guard, and the first scene.
     pub load_s: f64,
@@ -993,6 +1203,22 @@ pub struct Memory {
     /// is the VRAM the scene takes, after its growths (a buffer that fills grows, #145: the most
     /// of the frames' is given). Reported; not gated.
     pub scene_reserved_mib: f64,
+    /// What the device's allocator keeps at the end of the run, all of the GPU's buffers and not
+    /// the scene's alone (#236): the memory blocks it holds, what they reserve, and what is
+    /// allocated in them. The allocator **keeps up to two empty blocks** of a memory type (the
+    /// patched `gpu-allocator`, `third_party/gpu-allocator/PATCH.md`), and the hardware backend makes
+    /// the blocks of `hw::SPARE_BUFFERS` buffers of 60 MiB before its first build (two blocks, 384
+    /// to 512 MiB), so this is the memory that the fix for the stall of a block made on a frame
+    /// costs. `None` where the allocator cannot say. Reported; not gated (`scene_used_peak_mib` is).
+    pub device_blocks: Option<u64>,
+    pub device_reserved_mib: Option<f64>,
+    pub device_allocated_mib: Option<f64>,
+    /// How many of `device_blocks` have nothing allocated in them, and what they reserve: the
+    /// part of the reserve that is kept and not used (the allocator keeps at most two of a memory
+    /// type, `third_party/gpu-allocator/PATCH.md`); the rest of `device_reserved_mib` less
+    /// `device_allocated_mib` is free space inside blocks that are used.
+    pub device_empty_blocks: Option<u64>,
+    pub device_empty_mib: Option<f64>,
     /// The peak **during a growth** (ADR 0004's accounting is of the buffers after it): the GPU's
     /// buffers at the most while a buffer grew, the old buffer and the new one both counted
     /// (`Tracer::peak_growth_bytes`: what the buffers held before, plus the new ones; 0 if none
@@ -1124,7 +1350,8 @@ pub struct Gates {
     /// nothing has not passed (a GPU with no timers has no pass times).
     pub gi_paths_timed: u64,
     /// The gates that are over: `frame_time`, `frame_cpu`, `holes`, `memory`, `soft_misses`,
-    /// `scene_lag`, `spawn_ring`, `time_to_control`, `settle`, `gi`.
+    /// `scene_lag`, `spawn_ring`, `time_to_control`, `settle`, `gi`, and `starting_bias`: a full-size
+    /// run of the default profile that did not start at the default LOD bias ([`ProfileReport`]).
     pub over: Vec<&'static str>,
 }
 
@@ -1287,6 +1514,110 @@ pub struct RealTimeReport {
     /// Set when a run did not finish: the runs above are those that did (and the gates are held to
     /// those only), and the exit status is 1.
     pub error: Option<Failure>,
+    /// Which way rays found the Planet in the runs (`--rt-backend`, #236), and what their
+    /// acceleration structures did; null for a report that was not made by [`run`].
+    pub rt: Option<RtRealTime>,
+    /// `--gen-extra-us` (#242): the artificial CPU cost of each generated brick that the runs were
+    /// asked for, in µs; 0 with no hook. The hook charges every brick the generator is asked for,
+    /// at every level, as `planet_gen::cost` says.
+    pub gen_extra_us_asked: u32,
+    /// What a charge really took, in µs, wall clock, over every charge of the runs that finished:
+    /// a little over `gen_extra_us_asked` when the machine is busy (a worker preempted in the
+    /// middle of a charge). 0 when 0 was asked; null with no hook.
+    pub gen_extra_us_measured: Option<f64>,
+    /// How many bricks the hook was asked to charge, over the runs: every brick generated, the spawn
+    /// ring's and the Guard's included (not deterministic: the loader generates what the machine's
+    /// clock lets it). Null with no hook.
+    pub gen_extra_bricks: Option<u64>,
+    /// `--peak-m` and `--trench-m` (#242): the ground the runs were on.
+    pub relief: ReliefReport,
+    /// The machine the runs were on and what it was held to (#264). In the report's `machine.profile`
+    /// and not repeated here; it is what holds the full-size runs to the default LOD bias.
+    #[serde(skip)]
+    pub profile: ProfileReport,
+}
+
+/// What the machine had, what the run was held to, and the bias it started at (#264). Without
+/// this a report cannot say whether the gates were passed at the bias they are budgeted for: a
+/// machine with under 9.7 GiB free starts coarser (`bias_for`), which makes the gates easier.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct ProfileReport {
+    /// The profile the run used: threads, free memory (MiB), video memory (MiB, null if not
+    /// known; no budget reads it yet) and whether ray queries were allowed.
+    pub threads: usize,
+    pub memory_mib: u64,
+    pub video_memory_mib: Option<u64>,
+    pub ray_queries: bool,
+    /// What the machine had before a flag or the environment held the profile down.
+    pub found_threads: usize,
+    pub found_memory_mib: u64,
+    /// Whether the profile is different from the machine (`--profile low-end` and the rest, and
+    /// `--no-ray-queries` and `--video-memory-mib`), and whether it has fewer threads or less memory
+    /// than the machine has (`lowered`: only that makes the gates not apply).
+    pub constrained: bool,
+    pub lowered: bool,
+    /// What pinning the process to the profile's processors did, as a sentence; and the processors
+    /// (empty when it was not pinned).
+    pub pinning: String,
+    pub pinned_cpus: Vec<usize>,
+    /// The LOD bias that the client starts at on this machine (`bias_for` the profile's memory) and
+    /// the default's. **The gates are the default's: a default-profile run of the full-size mode
+    /// that starts at any other bias has `starting_bias` in `gates.over`.**
+    pub starting_bias: f64,
+    pub default_bias: f64,
+}
+
+impl ProfileReport {
+    /// This process's machine, profile and starting bias.
+    pub fn now() -> ProfileReport {
+        let (profile, found) = (machine::profile(), machine::found());
+        let pinning = machine::pinning();
+        ProfileReport {
+            threads: profile.threads,
+            memory_mib: profile.memory >> 20,
+            video_memory_mib: profile.video_memory.map(|v| v >> 20),
+            ray_queries: profile.ray_queries,
+            found_threads: found.threads,
+            found_memory_mib: found.memory >> 20,
+            constrained: machine::constrained(),
+            lowered: machine::lowered(),
+            pinning: pinning.describe(),
+            pinned_cpus: match pinning {
+                machine::Pinning::Pinned(cpus) => cpus,
+                _ => Vec::new(),
+            },
+            starting_bias: f64::from(crate::default_bias()),
+            default_bias: f64::from(crate::DEFAULT_BIAS),
+        }
+    }
+
+    /// Whether the gates of a full-size run on this machine are not at the bias they are budgeted
+    /// for: the run is not on a smaller machine on purpose (fewer threads or less memory than the
+    /// machine has, which is for finding out what the low end does, and says so) and the free memory
+    /// makes the client start coarser. `--no-ray-queries` or a video memory limit alone leave the
+    /// machine as it is and do not exempt a run.
+    pub fn bias_is_not_the_gates(&self) -> bool {
+        !self.lowered && self.starting_bias != self.default_bias
+    }
+}
+
+/// The ray backend of the real-time mode's runs (#236): the report's `rt` block, for the mode.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct RtRealTime {
+    /// What `--rt-backend` asked for the runs: `compute`, `hw`, `hw-nearest`.
+    pub requested: String,
+    /// What ran: `hw` only if asked for and the adapter has ray queries; else `compute`.
+    pub active: String,
+    /// Why not what was asked for, if it did not run.
+    pub fallback: Option<String>,
+    /// Each run's updates of the hardware backend's acceleration structures, over the whole run
+    /// (the cold start, the paths, the catching up between them and the Edit): `updates` the ones
+    /// that built something, `pending_max` the most groups that waited for a later frame's budget,
+    /// `prepare_ms` and `build_ms` what the frame thread spent (`build_ms` is recording and
+    /// submitting: nothing waits for the GPU). Null for a run on `compute`.
+    pub accel: Vec<Option<AccelSummary>>,
+    /// What `--hw-group-regions` said (`4` if nothing did): see [`super::rt::RtReport`].
+    pub hw_group_regions: String,
 }
 
 impl RealTimeReport {
@@ -1310,7 +1641,19 @@ impl RealTimeReport {
             min,
             max,
             error: None,
+            rt: None,
+            gen_extra_us_asked: 0,
+            gen_extra_us_measured: None,
+            gen_extra_bricks: None,
+            relief: GenHooks::default().report(WORLD_RADIUS),
+            profile: ProfileReport::now(),
         }
+    }
+
+    /// This report, with the ray backend the runs were on.
+    pub fn with_rt(mut self, rt: RtRealTime) -> Self {
+        self.rt = Some(rt);
+        self
     }
 
     /// The report of a mode that stopped on `failure`.
@@ -1400,6 +1743,9 @@ struct Built {
     /// The server's end of the world's link: held so that it stays connected, and never read.
     _server: ServerEnd,
     setup: Setup,
+    /// The generator's artificial cost of a brick, if the run has one (`--gen-extra-us`, #242): the
+    /// run reads what it charged from it at the end.
+    extra: Option<Arc<ExtraCost>>,
 }
 
 /// What a run needs to know of the world it is on.
@@ -1422,14 +1768,14 @@ struct Setup {
 }
 
 /// The Planet of the client, at full size: made as `main.rs` makes it.
-fn build_full() -> Result<Built, Box<dyn Error>> {
-    eprintln!("real time: generating the world map...");
-    let began = Instant::now();
-    let map = WorldMap::generate(crate::SEED, WORLD_MAP_SIZE);
-    let world_map = began.elapsed();
+fn build_full(hooks: &GenHooks) -> Result<Built, Box<dyn Error>> {
+    eprintln!("real time: making the world map (read from the cache if it is there)...");
+    let (map, world_map) = crate::world_map();
+    let map = hooks.relief(map);
     eprintln!("real time: loading the Planet...");
+    let extra = hooks.extra();
     let began = Instant::now();
-    let loaded = crate::load(map, crate::SPAWN_REACH)
+    let loaded = crate::load(map, crate::SPAWN_REACH, extra.clone())
         .map_err(|_| "the ground around the spawn does not fit the scene's buffers")?;
     let load = began.elapsed();
     let start = Start::of(&loaded.store);
@@ -1445,6 +1791,7 @@ fn build_full() -> Result<Built, Box<dyn Error>> {
     Ok(Built {
         world,
         _server: server,
+        extra,
         setup: Setup {
             spawn: loaded.camera,
             d0,
@@ -1470,8 +1817,9 @@ fn build_full() -> Result<Built, Box<dyn Error>> {
 }
 
 /// The test Planet, with threads: what `--short` runs, as a smoke test of the mode.
-fn build_test() -> Result<Built, Box<dyn Error>> {
+fn build_test(hooks: &GenHooks) -> Result<Built, Box<dyn Error>> {
     let began = Instant::now();
+    let extra = hooks.extra();
     let TestPlanet {
         mut store,
         scene,
@@ -1479,7 +1827,7 @@ fn build_test() -> Result<Built, Box<dyn Error>> {
         bands,
         start,
         sea,
-    } = test_planet();
+    } = test_planet_with(hooks.asked_relief(), extra.clone());
     // The budget of the client's constants, for this `d0`, over the spawn ring that is held as well
     // (it is not scaled with `d0`).
     let budget = Budget {
@@ -1491,13 +1839,14 @@ fn build_test() -> Result<Built, Box<dyn Error>> {
     let source = store
         .source()
         .ok_or("the test Planet's store has a source")?;
-    let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let cores = machine::threads();
     let loader = Loader::new(source, spawn.position, bands, workers_for(cores));
     let (client, server) = loopback();
     let world = World::new(scene, Predictor::new(store), client).with_loader(loader);
     Ok(Built {
         world,
         _server: server,
+        extra,
         setup: Setup {
             spawn,
             d0: bands.d0(),
@@ -1547,12 +1896,14 @@ struct Frame {
     /// The GPU's time of each of the frame's passes, by name.
     pass_ms: Vec<(String, f64)>,
     soft_misses: usize,
-    /// Whether the ground below the frame's camera is drawn coarser than the bands ask
-    /// ([`PathReport::camera_soft_miss_frames`]).
-    camera_soft_miss: bool,
+    /// The level of the ground below the frame's camera if it is drawn coarser than the bands ask
+    /// ([`PathReport::camera_soft_miss_frames`]), the level that is drawn whole.
+    camera_miss_level: Option<usize>,
     /// Whether the drawn scene's lag was over what level 0 reaches (see
     /// [`PathReport::lag_over_floor_frames`]); false when nothing is scored.
     lag_over_floor: bool,
+    /// The hardware backend's cost in the frame, by part (None on the compute backend).
+    hw: Option<HwFrame>,
     /// Whether the frame's update was the scene made again for a depth that was given back
     /// ([`Rebuild::Release`]).
     release_rebuild: bool,
@@ -1565,6 +1916,13 @@ struct Frame {
     /// The bricks the loader had been asked for and not yet taken in, as of the frame's look at the
     /// scene (the loader's queue and what its workers have, see [`PathReport::loader_queue_max`]).
     loader_queue: usize,
+    /// The jobs that the loader's workers had taken and the scene thread had not taken in, as of
+    /// the frame's look at the scene ([`PathReport::loader_ahead_max`]).
+    loader_ahead: usize,
+    /// The bricks the scene thread had taken in, and its time by part, as of the look (for a
+    /// flight's [`SecondReport`]s).
+    arrived: u64,
+    spent: Spent,
     /// The drawn scene's lag behind the camera in Voxels (see [`PathReport::scene_lag_voxels_max`]).
     lag: f64,
     /// Whether the look at the scene in this frame has the newest Edit in it (from this frame or an
@@ -1594,6 +1952,15 @@ struct Capture {
     /// The loader's queue at each frame: the most and the sum, for the mean.
     queue_max: usize,
     queue_sum: u64,
+    /// The jobs ahead of the scene thread at each frame: the most, the sum, and the frames at
+    /// `MAX_AHEAD`.
+    ahead_max: usize,
+    ahead_sum: u64,
+    ahead_full_frames: usize,
+    /// What the loader's jobs had waited when the path began ([`PathReport::loader_latency`]).
+    latency: crate::loader::Latency,
+    /// A flight's seconds, summed ([`PathReport::by_second`]).
+    seconds_sum: Vec<SecondSum>,
     /// The most the scene's buffers in use were, in bytes.
     /// The scene thread's follow rounds and budget cuts when the path began.
     follow: (u64, u64, u64),
@@ -1610,6 +1977,8 @@ struct Capture {
     /// The parts of every frame, and the GPU's time of every pass.
     recentre_ms: Vec<f64>,
     update_all_ms: Vec<f64>,
+    /// Each frame's update and its hardware parts, for a path on the hardware backend.
+    hardware: Vec<(f64, HwFrame)>,
     encode_ms: Vec<f64>,
     submit_ms: Vec<f64>,
     wait_ms: Vec<f64>,
@@ -1625,6 +1994,8 @@ struct Capture {
     soft_misses: Series,
     camera_soft_miss_frames: usize,
     camera_soft_miss_lag_side: usize,
+    /// Frames with a camera miss by the level drawn whole (see [`PathReport::camera_soft_miss_by_level`]).
+    miss_levels: Vec<u32>,
     lag_over_floor_frames: usize,
     release_frame_ms: f64,
     release_update_ms: f64,
@@ -1694,11 +2065,17 @@ impl Capture {
             streams: (work.stream_calls, work.stream_slices_used),
             queue_max: 0,
             queue_sum: 0,
+            ahead_max: 0,
+            ahead_sum: 0,
+            ahead_full_frames: 0,
+            latency: world.stats().loader.latency,
+            seconds_sum: Vec::new(),
             follow: (work.follow_steps, work.budget_cuts, work.release_rebuilds),
             miss_seconds: Vec::new(),
             frame_ms: Vec::new(),
             recentre_ms: Vec::new(),
             update_all_ms: Vec::new(),
+            hardware: Vec::new(),
             encode_ms: Vec::new(),
             submit_ms: Vec::new(),
             wait_ms: Vec::new(),
@@ -1712,6 +2089,7 @@ impl Capture {
             soft_misses: Series::default(),
             camera_soft_miss_frames: 0,
             camera_soft_miss_lag_side: 0,
+            miss_levels: Vec::new(),
             lag_over_floor_frames: 0,
             release_frame_ms: 0.0,
             release_update_ms: 0.0,
@@ -1736,6 +2114,12 @@ impl Capture {
         self.lags.push(frame.lag);
         self.queue_max = self.queue_max.max(frame.loader_queue);
         self.queue_sum += frame.loader_queue as u64;
+        self.ahead_max = self.ahead_max.max(frame.loader_ahead);
+        self.ahead_sum += frame.loader_ahead as u64;
+        self.ahead_full_frames += usize::from(frame.loader_ahead >= crate::loader::MAX_AHEAD);
+        if FLIGHTS.contains(&self.name) {
+            self.add_to_second(frame);
+        }
         self.over_budget.add(frame.parts.over_budget);
         if frame.parts.grown_bytes > 0 {
             self.growth_frames += 1;
@@ -1761,6 +2145,13 @@ impl Capture {
         self.cpu_ms.push(frame.cpu_ms);
         self.recentre_ms.push(frame.parts.recentre_ms);
         self.update_all_ms.push(frame.parts.update_ms);
+        if let Some(hw) = frame.hw {
+            let hw = HwFrame {
+                wait_not_passes: frame.parts.wait_not_passes_ms.unwrap_or(0.0),
+                ..hw
+            };
+            self.hardware.push((frame.parts.update_ms, hw));
+        }
         self.encode_ms.push(frame.parts.encode_ms);
         self.submit_ms.push(frame.parts.submit_ms);
         self.wait_ms.push(frame.parts.wait_ms);
@@ -1780,15 +2171,21 @@ impl Capture {
             self.sleep_over_ms.push(frame.parts.sleep_over_ms);
         }
         self.soft_misses.add(frame.soft_misses as u64);
-        self.camera_soft_miss_frames += usize::from(frame.camera_soft_miss);
+        self.camera_soft_miss_frames += usize::from(frame.camera_miss_level.is_some());
         self.camera_soft_miss_lag_side +=
-            usize::from(frame.camera_soft_miss && frame.lag_over_floor);
+            usize::from(frame.camera_miss_level.is_some() && frame.lag_over_floor);
         self.lag_over_floor_frames += usize::from(frame.lag_over_floor);
+        if let Some(level) = frame.camera_miss_level {
+            if self.miss_levels.len() <= level {
+                self.miss_levels.resize(level + 1, 0);
+            }
+            self.miss_levels[level] += 1;
+        }
         if frame.release_rebuild {
             self.release_frame_ms = self.release_frame_ms.max(frame.time_ms);
             self.release_update_ms = self.release_update_ms.max(frame.parts.update_ms);
         }
-        if frame.camera_soft_miss {
+        if frame.camera_miss_level.is_some() {
             let second = frame.began.saturating_duration_since(self.began).as_secs() as usize;
             if self.miss_seconds.len() <= second {
                 self.miss_seconds.resize(second + 1, 0);
@@ -1813,6 +2210,62 @@ impl Capture {
         }
     }
 
+    /// Sums `frame` into the second it began in ([`PathReport::by_second`]).
+    fn add_to_second(&mut self, frame: &Frame) {
+        let second = frame.began.saturating_duration_since(self.began).as_secs() as usize;
+        if self.seconds_sum.len() <= second {
+            // A second that no frame began in carries what the one before it had counted.
+            let carried = self.seconds_sum.last().map(|s| (s.arrived, s.spent));
+            let (arrived, spent) = carried.unwrap_or((self.arrived, self.spent));
+            self.seconds_sum.resize(
+                second + 1,
+                SecondSum {
+                    arrived,
+                    spent,
+                    ..SecondSum::default()
+                },
+            );
+        }
+        let sum = &mut self.seconds_sum[second];
+        sum.frames += 1;
+        sum.misses += u32::from(frame.camera_miss_level.is_some());
+        sum.queue_sum += frame.loader_queue as u64;
+        sum.queue_max = sum.queue_max.max(frame.loader_queue);
+        sum.ahead_sum += frame.loader_ahead as u64;
+        sum.lag_max = sum.lag_max.max(frame.lag);
+        sum.arrived = frame.arrived;
+        sum.spent = frame.spent;
+    }
+
+    /// [`PathReport::by_second`]: each second's sums as a report, the work of a second being what
+    /// was counted by its last frame less what was by the one before's.
+    fn by_second(&self, d0: Option<f64>) -> Vec<SecondReport> {
+        let ms = |now: Duration, then: Duration| now.saturating_sub(then).as_secs_f64() * 1e3;
+        let mut before = (self.arrived, self.spent);
+        self.seconds_sum
+            .iter()
+            .enumerate()
+            .map(|(second, sum)| {
+                let frames = f64::from(sum.frames.max(1));
+                let report = SecondReport {
+                    second,
+                    frames: sum.frames,
+                    camera_soft_misses: sum.misses,
+                    loader_queue_mean: sum.queue_sum as f64 / frames,
+                    loader_queue_max: sum.queue_max,
+                    loader_ahead_mean: sum.ahead_sum as f64 / frames,
+                    arrived_bricks: sum.arrived.saturating_sub(before.0),
+                    scene_follow_ms: ms(sum.spent.follow, before.1.follow),
+                    scene_pack_ms: ms(sum.spent.pack, before.1.pack),
+                    scene_reband_ms: ms(sum.spent.reband, before.1.reband),
+                    lag_d0_max: d0.map_or(0.0, |d0| sum.lag_max / d0),
+                };
+                before = (sum.arrived, sum.spent);
+                report
+            })
+            .collect()
+    }
+
     /// The path's frames are done: what the scene thread has spent so far is the frames', and the
     /// forced look that follows is not.
     fn frames_done(&mut self, world: &World) {
@@ -1835,6 +2288,7 @@ impl Capture {
         let holes = work.holes_found - self.holes;
         let d0 = world.stats().bands.map(|bands| bands.d0());
         let (lag_max, lag_p99) = lag_spread(&self.lags);
+        let by_second = self.by_second(d0);
         PathReport {
             name: self.name,
             frames,
@@ -1852,6 +2306,7 @@ impl Capture {
                 gpu_total: Spread::of(&self.gpu_total_ms),
                 wait_not_passes: Spread::of(&self.wait_not_passes_ms),
             },
+            hardware: (!self.hardware.is_empty()).then(|| PathHardware::of(&self.hardware)),
             gpu_passes: self
                 .pass_series
                 .iter()
@@ -1885,6 +2340,7 @@ impl Capture {
             camera_soft_miss_lag_side: self.camera_soft_miss_lag_side,
             camera_soft_miss_loader_side: self.camera_soft_miss_frames
                 - self.camera_soft_miss_lag_side,
+            camera_soft_miss_by_level: self.miss_levels,
             lag_over_floor_frames: self.lag_over_floor_frames,
             scene_used_end_mib: world.used_bytes() as f64 / MIB,
             scene_level_bricks_end: (0..render::lod::LEVELS)
@@ -1917,6 +2373,11 @@ impl Capture {
             arrived_bricks: work.arrived_bricks - self.arrived,
             loader_queue_max: self.queue_max,
             loader_queue_mean: self.queue_sum as f64 / frames.max(1) as f64,
+            loader_latency: LoaderLatency::of(&world.stats().loader.latency.since(&self.latency)),
+            loader_ahead_mean: self.ahead_sum as f64 / frames.max(1) as f64,
+            loader_ahead_max: self.ahead_max,
+            loader_frames_at_max_ahead: self.ahead_full_frames,
+            by_second,
             loader_generating_s: world
                 .stats()
                 .loader
@@ -2016,19 +2477,18 @@ pub const FLIGHTS: [&str; 4] = [
 ///
 /// The alternative, re-scoring every brick at the frame's camera, is the same count for what is
 /// under the player and a pass over every node a frame; a ray is the player's view of what they
-/// stand on, which is what the ticket's "no soft miss" is for.
-fn soft_miss_under(scene: &Scene, camera: &Camera, bands: Option<render::lod::Bands>) -> bool {
-    let Some(bands) = bands else {
-        return false;
-    };
+/// stand on, which is what the ticket's "no soft miss" is for. The level of the brick that is
+/// drawn whole, if it is a miss (#251: which levels the misses are of).
+fn soft_miss_under(
+    scene: &Scene,
+    camera: &Camera,
+    bands: Option<render::lod::Bands>,
+) -> Option<usize> {
+    let bands = bands?;
     let (cell, origin) = camera::split(camera.position);
     let dir = camera.horizon_up.map(|c| -(c as f32));
-    let Some(hit) = trace(scene, &Ray { cell, origin, dir }) else {
-        return false;
-    };
-    let Some(level) = scene.level_at(hit.voxel) else {
-        return false;
-    };
+    let hit = trace(scene, &Ray { cell, origin, dir })?;
+    let level = scene.level_at(hit.voxel)?;
     let size = 8i64 << level;
     let distance = (0..3)
         .map(|a| {
@@ -2038,7 +2498,7 @@ fn soft_miss_under(scene: &Scene, camera: &Camera, bands: Option<render::lod::Ba
         })
         .sum::<f64>()
         .sqrt();
-    level > 0 && distance < bands.floor(level) * (1.0 - render::lod::HYSTERESIS)
+    (level > 0 && distance < bands.floor(level) * (1.0 - render::lod::HYSTERESIS)).then_some(level)
 }
 
 /// What the frame thread has on the world and the GPU, and the peaks over the frames.
@@ -2174,7 +2634,7 @@ impl<'a> Session<'a> {
             cpu_ms: ms(followed + gpu.cpu()),
             camera_ms: ms(camera_wait),
             recentre_ms: ms(followed),
-            update_ms: ms(gpu.write + gpu.flush),
+            update_ms: ms(gpu.write + gpu.flush + gpu.hardware),
             update_write_ms: ms(gpu.write),
             update_flush_ms: ms(gpu.flush),
             writes: gpu.writes,
@@ -2205,6 +2665,21 @@ impl<'a> Session<'a> {
             grown_bytes: gpu.grown_bytes,
             over_budget,
             hole_look: looking,
+            hw_blas: gpu.accel.map(|h| h.blas),
+            hw_blas_urgent: gpu.accel.map(|h| h.blas_urgent),
+            hw_boxes: gpu.accel.map(|h| h.boxes),
+            hw_submits: gpu.accel.map(|h| h.submits),
+            hw_created: gpu.accel.map(|h| h.blas_created),
+            hw_pool_grew: gpu.accel.map(|h| h.pool_grew),
+            hw_tlas_made: gpu.accel.map(|h| h.tlas_made),
+            hw_gpu_blas_ms: gpu.accel.map(|h| h.gpu_blas),
+            hw_gpu_tlas_ms: gpu.accel.map(|h| h.gpu_tlas),
+            hw_gpu_gap_ms: gpu.accel.map(|h| h.gpu_gap),
+            hw_blocks_made: gpu.accel.map(|h| h.blocks_made),
+            hw_reserved_grew: gpu.accel.map(|h| h.reserved_grew),
+            hw_scratch_bytes: gpu.accel.map(|h| h.scratch_bytes),
+            hw_finish_ms: gpu.accel.map(|h| h.finish),
+            hw_submit_ms: gpu.accel.map(|h| h.submit),
         };
         let slept = Instant::now();
         let asked = FRAME.saturating_sub(slept - began);
@@ -2227,8 +2702,11 @@ impl<'a> Session<'a> {
             parts,
             pass_ms: self.gpu.pass_times(),
             soft_misses: self.world.stats().soft_misses,
-            camera_soft_miss: self.score_camera
-                && soft_miss_under(self.world.scene(), camera, self.world.bands()),
+            camera_miss_level: self
+                .score_camera
+                .then(|| soft_miss_under(self.world.scene(), camera, self.world.bands()))
+                .flatten(),
+            hw: gpu.accel,
             release_rebuild: kind == "rebuild"
                 && self.world.scene().rebuild_reason() == Some(Rebuild::Release),
             lag_over_floor: self.score_camera
@@ -2243,6 +2721,9 @@ impl<'a> Session<'a> {
                 let loader = self.world.stats().loader;
                 loader.pending - loader.guard_pending
             },
+            loader_ahead: self.world.stats().loader.ahead,
+            arrived: self.world.stats().work.arrived_bricks,
+            spent: self.world.scene_thread_time(),
             lag: self.world.lag(camera.position),
             edit_taken,
             taken_at,
@@ -2881,6 +3362,7 @@ impl<'a> Session<'a> {
 
         let work = self.world.stats().work;
         let mib = |bytes: u64| bytes as f64 / MIB;
+        let device = self.gpu.device_memory();
         let memory = Memory {
             resident_peak_mib: self.resident_peak.map(mib),
             whole_process_peak_mib: self.whole_process_peak.map(mib),
@@ -2888,6 +3370,11 @@ impl<'a> Session<'a> {
             scene_used_peak_in: self.scene_used_peak_in.clone(),
             scene_used_peak_level_bricks: self.scene_used_peak_levels.clone(),
             scene_reserved_mib: mib(self.scene_reserved_bytes),
+            device_blocks: device.map(|d| d.blocks as u64),
+            device_reserved_mib: device.map(|d| mib(d.reserved_bytes)),
+            device_allocated_mib: device.map(|d| mib(d.allocated_bytes)),
+            device_empty_blocks: device.map(|d| d.empty_blocks as u64),
+            device_empty_mib: device.map(|d| mib(d.empty_bytes)),
             scene_gpu_peak_growth_mib: mib(self.gpu.peak_growth_bytes()),
             scene_gpu_peak_rebuild_mib: mib(self.gpu.peak_rebuild_bytes()),
             scene_host_peak_growth_mib: mib(self.scene_host_peak_bytes),
@@ -2974,6 +3461,122 @@ pub(super) fn catching<T>(
     }
 }
 
+/// The bench-only hooks of the generator that the real-time mode can be run with (#242): neither
+/// is in the game, and with neither the run is what it always was.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct GenHooks {
+    /// `--gen-extra-us`: the artificial CPU cost of each brick generated, in µs. `Some(0)` has the
+    /// hook count the bricks and charge nothing.
+    pub extra_us: Option<u32>,
+    /// `--peak-m` and `--trench-m`: the ground stretched to peaks and trenches of this many
+    /// metres, if either was said.
+    pub relief_m: Option<(f64, f64)>,
+}
+
+impl GenHooks {
+    /// The cost of each brick, to share between the Planet that is made and the report.
+    pub fn extra(&self) -> Option<Arc<ExtraCost>> {
+        self.extra_us.map(ExtraCost::new)
+    }
+
+    /// The relief the run asked for, if it is not today's.
+    pub fn asked_relief(&self) -> Option<Relief> {
+        self.relief_m
+            .map(|(peak, trench)| Relief::of_metres(peak, trench))
+            .filter(|&relief| relief != Relief::DEFAULT)
+    }
+
+    /// `map` with its ground stretched to the relief asked for; as it was if none was.
+    pub fn relief(&self, map: WorldMap) -> WorldMap {
+        match self.asked_relief() {
+            Some(relief) => map.with_relief(relief),
+            None => map,
+        }
+    }
+
+    /// What the report says of the ground the run was on, for a Planet of `radius` Voxels.
+    fn report(&self, radius: i32) -> ReliefReport {
+        let relief = self.asked_relief().unwrap_or(Relief::DEFAULT);
+        let metres = |voxels: i32| f64::from(voxels) / VOXELS_PER_METRE;
+        ReliefReport {
+            stretched: self.asked_relief().is_some(),
+            peak_m: metres(relief.peak),
+            trench_m: metres(relief.trench),
+            column_m: metres(relief.peak + relief.trench),
+            max_radius_above_sea_m: metres(max_radius_for(radius, relief) - radius),
+            interior_below_sea_m: metres(radius - interior_radius_for(radius, relief)),
+        }
+    }
+}
+
+/// The ground's extent that the real-time mode ran on (#242): the report's `relief`. Everything
+/// derived from the range follows it (the Planet's highest and lowest radius, which set the Guard's
+/// cells, the bands' and the horizon's reach and the bounds of the shortcuts); `peak_m` and
+/// `trench_m` are what `--peak-m` and `--trench-m` made of the heights of the world map, which are
+/// stretched linearly about sea level and nothing else is.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+pub struct ReliefReport {
+    /// Whether `--peak-m` or `--trench-m` stretched the ground; false is today's 2 km and 1 km.
+    pub stretched: bool,
+    /// The highest the ground goes above sea level and the lowest below it, in metres.
+    pub peak_m: f64,
+    pub trench_m: f64,
+    /// `peak_m` and `trench_m` together: the ground column's height.
+    pub column_m: f64,
+    /// The Planet's highest radius over sea level (`Planet::max_radius`: the peak, the detail's
+    /// reach and the crystals' on it), and its interior's (deep rock whatever the map says) under
+    /// it, in metres. The first is what the Guard's box and the bands' and horizon's top are made
+    /// from.
+    pub max_radius_above_sea_m: f64,
+    pub interior_below_sea_m: f64,
+}
+
+/// What the generator's extra cost did over the runs of the mode: the report's `gen_extra_us_*`
+/// fields (#242).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct GenExtraTotals {
+    pub asked_us: u32,
+    pub bricks: u64,
+    pub spent: Duration,
+}
+
+impl GenExtraTotals {
+    fn add(&mut self, stats: &ExtraCostStats) {
+        self.asked_us = stats.asked_us;
+        self.bricks += stats.bricks;
+        self.spent += stats.spent;
+    }
+
+    /// The mean a charge really took, in µs.
+    fn measured_us(&self) -> f64 {
+        if self.asked_us == 0 || self.bricks == 0 {
+            0.0
+        } else {
+            self.spent.as_secs_f64() * 1e6 / self.bricks as f64
+        }
+    }
+}
+
+/// The backend a run asks for, and whether it may go on as compute where the adapter has no ray
+/// queries (the bench's default, which asks for the game's own choice: #50), and the hooks of the
+/// generator (#242).
+#[derive(Clone, Copy, Debug)]
+pub struct Asked {
+    pub backend: RtBackend,
+    pub may_fall_back: bool,
+    pub hooks: GenHooks,
+}
+
+/// What a run gave: its report, the Planet's `d0`, the ray backend it was on, the hardware
+/// backend's acceleration structures if it had them, and what the generator's extra cost charged.
+type RunDone = (
+    RunReport,
+    f64,
+    RtChoice,
+    Option<AccelSummary>,
+    Option<ExtraCostStats>,
+);
+
 /// The `run`th run: its world, its GPU, and the paths. Also the Planet's `d0`.
 fn whole_run(
     full: bool,
@@ -2982,11 +3585,12 @@ fn whole_run(
     flat_ambient: bool,
     script: &Script,
     limit_ms: f64,
-) -> Result<(RunReport, f64), Failure> {
+    asked: Asked,
+) -> Result<RunDone, Failure> {
     // What the paths do is caught where the step is known; this catches the rest (making the
     // world, the GPU, and ending the run, which drops them).
     catch_unwind(AssertUnwindSafe(|| {
-        run_once(full, run, resolution, flat_ambient, script, limit_ms)
+        run_once(full, run, resolution, flat_ambient, script, limit_ms, asked)
     }))
     .unwrap_or_else(|payload| {
         Err(Failure {
@@ -2997,6 +3601,30 @@ fn whole_run(
     })
 }
 
+/// Whether the GPU context is on the backend that the run asked for. The hardware backend with no
+/// ray queries on the adapter would run on compute, and its gates would pass for the wrong thing:
+/// that is an error, and the reason is the adapter's. **Unless the run asked for no backend in
+/// particular** (`may_fall_back`, the bench's default: the game's own choice, #50): the run goes on
+/// as compute, with a warning, and the report's `rt.active` and `rt.fallback` say so.
+fn ran_as_asked(asked: RtBackend, choice: &RtChoice, may_fall_back: bool) -> Result<(), String> {
+    if asked.is_hardware() && !choice.active.is_hardware() {
+        if may_fall_back {
+            eprintln!(
+                "warning: the adapter cannot do ray queries ({}): this run is on the compute backend",
+                choice.fallback.as_deref().unwrap_or("no reason given")
+            );
+            return Ok(());
+        }
+        return Err(format!(
+            "--rt-backend {} was asked for, and the adapter cannot do it ({}): this would be a \
+             compute run, and its gates would say nothing of the hardware backend",
+            backend_name(asked),
+            choice.fallback.as_deref().unwrap_or("no reason given")
+        ));
+    }
+    Ok(())
+}
+
 fn run_once(
     full: bool,
     run: u32,
@@ -3004,18 +3632,38 @@ fn run_once(
     flat_ambient: bool,
     script: &Script,
     limit_ms: f64,
-) -> Result<(RunReport, f64), Failure> {
+    asked: Asked,
+) -> Result<RunDone, Failure> {
     let failed = |step: &str, error: Box<dyn Error>| Failure {
         run,
         step: step.to_string(),
         message: error.to_string(),
     };
-    let built = if full { build_full() } else { build_test() }
-        .map_err(|e| failed("building the world", e))?;
+    let built = if full {
+        build_full(&asked.hooks)
+    } else {
+        build_test(&asked.hooks)
+    }
+    .map_err(|e| failed("building the world", e))?;
     let d0 = built.setup.d0;
-    let mut gpu = Offscreen::with_resolution(resolution, built.world.scene())
+    let extra = built.extra.clone();
+    let mut gpu = Offscreen::with_backend(resolution, built.world.scene(), asked.backend)
         .map_err(|e| failed("making the GPU context", e))?;
+    let choice = gpu.rt().clone();
+    // A run that was asked to be on the hardware backend and is not has gates that say nothing of
+    // it: it stops here, with the reason, and the mode exits with an error (status 1).
+    ran_as_asked(asked.backend, &choice, asked.may_fall_back)
+        .map_err(|why| failed("making the GPU context", why.into()))?;
+    // The first build is the world's, not the run's: the log is of what the run did.
+    gpu.take_hardware_updates();
     gpu.set_flat_ambient(flat_ambient);
+    // The flight times the player's frame, which has the denoiser (#55; the flat ambient of
+    // before #54 had none).
+    gpu.set_denoise(if flat_ambient {
+        render::Denoise::Off
+    } else {
+        render::Denoise::Full
+    });
     // The atmosphere measures the camera's height from the Planet's sea level.
     gpu.set_ground_level(f64::from(if full {
         planet_gen::world_map::WORLD_RADIUS
@@ -3024,9 +3672,16 @@ fn run_once(
     }));
     // A growth is cut to what a buffer of this GPU may hold (see `Scene::set_buffer_limit`).
     built.world.set_buffer_limit(gpu.buffer_limit_words());
-    let report = one_run(built, &mut OffscreenGpu(&mut gpu), script, limit_ms)
+    // What the context has, not what the flag said (#236).
+    let group_regions = gpu.hardware_grouping().describe();
+    let mut gpu = OffscreenGpu::new(&mut gpu);
+    let report = one_run(built, &mut gpu, script, limit_ms)
         .map_err(|stopped| failed(&stopped.step, stopped.error))?;
-    Ok((report, d0))
+    let accel = choice.active.is_hardware().then(|| AccelSummary {
+        group_regions: group_regions.clone(),
+        ..AccelSummary::of(&gpu.accel)
+    });
+    Ok((report, d0, choice, accel, extra.map(|extra| extra.stats())))
 }
 
 /// Runs the real-time mode: `runs` runs of the paths, each on a world of its own and a GPU of its
@@ -3043,6 +3698,7 @@ pub fn run(
     flat_ambient: bool,
     budgets: &StreamingBudgets,
     stream_slice: Option<Duration>,
+    asked: Asked,
 ) -> RealTimeReport {
     let mut script = if full {
         Script::full()
@@ -3053,8 +3709,11 @@ pub fn run(
         script.stream_slice = slice;
     }
     let mut reports = Vec::new();
+    let mut accel = Vec::new();
+    let mut choice = None;
     let mut d0 = 0.0;
     let mut failure = None;
+    let mut extra = GenExtraTotals::default();
     for run in 1..=runs {
         eprintln!("real time: run {run} of {runs}");
         let began = Instant::now();
@@ -3065,11 +3724,17 @@ pub fn run(
             flat_ambient,
             &script,
             budgets.frame_time_p99_ms,
+            asked,
         ) {
-            Ok((report, d)) => {
+            Ok((report, d, rt, summary, charged)) => {
                 d0 = d;
+                if let Some(charged) = charged {
+                    extra.add(&charged);
+                }
                 eprintln!("real time: run {run} took {:.0?}", began.elapsed());
                 reports.push(report);
+                accel.push(summary);
+                choice = Some(rt);
             }
             Err(f) => {
                 eprintln!(
@@ -3091,10 +3756,61 @@ pub fn run(
     if flat_ambient {
         planet.push_str(", flat ambient");
     }
-    let report = RealTimeReport::new(planet, d0, reports, budgets);
+    if let Some(us) = asked.hooks.extra_us {
+        planet.push_str(&format!(", +{us} µs a brick"));
+    }
+    let relief = asked
+        .hooks
+        .report(if full { WORLD_RADIUS } else { TEST_RADIUS });
+    if relief.stretched {
+        planet.push_str(&format!(
+            ", relief {} m peaks and {} m trenches",
+            relief.peak_m, relief.trench_m
+        ));
+    }
+    let rt = RtRealTime {
+        requested: backend_name(choice.as_ref().map_or(asked.backend, |c| c.requested)).to_string(),
+        active: backend_name(choice.as_ref().map_or(RtBackend::Compute, |c| c.active)).to_string(),
+        fallback: choice.and_then(|c| c.fallback),
+        accel,
+        hw_group_regions: render::hw::process_grouping().describe(),
+    };
+    planet.push_str(&format!(", rays by {}", rt.active));
+    let mut report = RealTimeReport::new(planet, d0, reports, budgets).with_rt(rt);
+    report.gen_extra_us_asked = asked.hooks.extra_us.unwrap_or(0);
+    report.gen_extra_us_measured = asked.hooks.extra_us.map(|_| extra.measured_us());
+    report.gen_extra_bricks = asked.hooks.extra_us.map(|_| extra.bricks);
+    report.relief = relief;
+    hold_to_the_default_bias(full, &mut report);
     match failure {
         Some(failure) => report.failed(failure),
         None => report,
+    }
+}
+
+/// The gates are budgeted for the default LOD bias. A full-size run of the default profile that
+/// started coarser (a machine with under 9.7 GiB free) did not pass them at it: it is over, with a
+/// name that says why, whatever else it measured. (The test Planet of `--short`, which CI runs,
+/// does not take its bands from the machine's memory, so it is not held to this; nor is a run of a
+/// constrained profile, which is for finding out what the low end does and says so.)
+fn hold_to_the_default_bias(full: bool, report: &mut RealTimeReport) {
+    if full && report.profile.bias_is_not_the_gates() {
+        eprintln!(
+            "real time: the client started at LOD bias {} on this machine ({} MiB free), not the {} that the gates are budgeted for: `starting_bias` is over. Run with --profile low-end to measure a constrained machine on purpose",
+            report.profile.starting_bias,
+            report.profile.found_memory_mib,
+            report.profile.default_bias
+        );
+        report.gates.over.push("starting_bias");
+    }
+}
+
+/// The name `--rt-backend` gives `backend`.
+fn backend_name(backend: RtBackend) -> &'static str {
+    match backend {
+        RtBackend::Compute => "compute",
+        RtBackend::Hardware => "hw",
+        RtBackend::HardwareNearest => "hw-nearest",
     }
 }
 
@@ -3115,8 +3831,99 @@ fn misses_by_second(miss_seconds: &[u32], last: Option<Instant>, began: Instant)
 
 #[cfg(test)]
 mod tests {
-    use super::super::stream::Measured;
+    use super::super::stream::{Measured, test_planet};
     use super::*;
+
+    fn report_at(lowered: bool, starting_bias: f64) -> RealTimeReport {
+        let mut report = RealTimeReport::new("test".into(), 1.0, Vec::new(), &BUDGETS);
+        report.profile.constrained = lowered;
+        report.profile.lowered = lowered;
+        report.profile.starting_bias = starting_bias;
+        report.profile.default_bias = 1.0;
+        report
+    }
+
+    #[test]
+    fn a_full_size_run_of_the_default_profile_that_started_coarser_is_over_by_name() {
+        // A machine with the room: the default bias, nothing over.
+        let mut report = report_at(false, 1.0);
+        hold_to_the_default_bias(true, &mut report);
+        assert!(report.gates.over.is_empty(), "{:?}", report.gates.over);
+        // Under 8 GiB free: coarser, and the gates were not passed at the bias they are for.
+        let mut report = report_at(false, 1.2);
+        hold_to_the_default_bias(true, &mut report);
+        assert_eq!(report.gates.over, ["starting_bias"]);
+        assert_eq!(exit_code(&report, false), EXIT_OVER_BUDGET);
+        assert_eq!(exit_code(&report, true), 0, "--no-fail still says no");
+        // The smoke run on the test Planet (CI's lavapipe) and a run of a constrained profile are
+        // not held to it, and the report says what the bias was.
+        for (full, lowered) in [(false, false), (true, true), (false, true)] {
+            let mut report = report_at(lowered, 1.35);
+            hold_to_the_default_bias(full, &mut report);
+            assert!(report.gates.over.is_empty(), "{full} {lowered}");
+        }
+    }
+
+    #[test]
+    fn only_fewer_threads_or_less_memory_exempt_a_run_from_the_default_bias() {
+        let found = machine::Profile {
+            threads: 8,
+            memory: 6 * machine::GIB,
+            video_memory: None,
+            ray_queries: true,
+        };
+        let lowered = |profile: machine::Profile| {
+            profile.threads < found.threads || profile.memory < found.memory
+        };
+        let over = |profile: machine::Profile| {
+            let mut report = report_at(lowered(profile), 1.15);
+            report.profile.constrained = profile != found;
+            hold_to_the_default_bias(true, &mut report);
+            report.gates.over == ["starting_bias"]
+        };
+        // `--no-ray-queries`, `--video-memory-mib` and `BHAYANAK_RAY_QUERIES=0` change the profile
+        // and not the machine: the run is still over.
+        assert!(over(machine::Profile {
+            ray_queries: false,
+            ..found
+        }));
+        assert!(over(machine::Profile {
+            video_memory: Some(2 * machine::GIB),
+            ..found
+        }));
+        assert!(over(found));
+        // Fewer threads or less memory is a smaller machine on purpose: exempt.
+        assert!(!over(machine::Profile {
+            threads: 4,
+            ..found
+        }));
+        assert!(!over(machine::Profile {
+            memory: 5 * machine::GIB,
+            ..found
+        }));
+        assert!(!over(machine::Profile::LOW_END.limited_to(found)));
+    }
+
+    #[test]
+    fn the_report_of_the_machine_says_the_profile_the_pinning_and_the_starting_bias() {
+        let json = serde_json::to_value(ProfileReport::now()).unwrap();
+        for key in [
+            "threads",
+            "memory_mib",
+            "video_memory_mib",
+            "ray_queries",
+            "found_threads",
+            "found_memory_mib",
+            "constrained",
+            "pinning",
+            "pinned_cpus",
+            "starting_bias",
+            "default_bias",
+        ] {
+            assert!(json.get(key).is_some(), "{key}");
+        }
+        assert_eq!(json["default_bias"], 1.0);
+    }
 
     #[test]
     fn the_misses_by_second_cover_every_second_the_path_had() {
@@ -3155,22 +3962,26 @@ mod tests {
             frame_time: Spread {
                 samples: 600,
                 mean_ms: frame_p99 / 2.0,
+                p95_ms: frame_p99 * 0.9,
                 p99_ms: frame_p99,
                 worst_ms: frame_p99 * 2.0,
             },
             frame_cpu: Spread {
                 samples: 600,
                 mean_ms: cpu_p99 / 2.0,
+                p95_ms: cpu_p99 * 0.9,
                 p99_ms: cpu_p99,
                 worst_ms: cpu_p99 * 2.0,
             },
             frame_parts: FrameParts::default(),
+            hardware: None,
             // A `gi` pass well inside its gate.
             gpu_passes: [(
                 "gi".to_string(),
                 Spread {
                     samples: 600,
                     mean_ms: 1.0,
+                    p95_ms: 1.5,
                     p99_ms: 2.0,
                     worst_ms: 3.0,
                 },
@@ -3198,6 +4009,7 @@ mod tests {
             camera_soft_miss_per_second: Vec::new(),
             camera_soft_miss_lag_side: 0,
             camera_soft_miss_loader_side: 0,
+            camera_soft_miss_by_level: Vec::new(),
             lag_over_floor_frames: 0,
             scene_used_end_mib: 0.0,
             scene_level_bricks_end: Vec::new(),
@@ -3209,6 +4021,11 @@ mod tests {
             arrived_bricks: 0,
             loader_queue_max: 0,
             loader_queue_mean: 0.0,
+            loader_latency: LoaderLatency::default(),
+            loader_ahead_mean: 0.0,
+            loader_ahead_max: 0,
+            loader_frames_at_max_ahead: 0,
+            by_second: Vec::new(),
             loader_generating_s: 0.0,
             loader_held_back_s: 0.0,
             stream_calls: 0,
@@ -3268,6 +4085,21 @@ mod tests {
             grown_bytes: 0,
             over_budget: None,
             hole_look: false,
+            hw_blas: None,
+            hw_blas_urgent: None,
+            hw_boxes: None,
+            hw_submits: None,
+            hw_created: None,
+            hw_pool_grew: None,
+            hw_tlas_made: None,
+            hw_gpu_blas_ms: None,
+            hw_gpu_tlas_ms: None,
+            hw_gpu_gap_ms: None,
+            hw_blocks_made: None,
+            hw_reserved_grew: None,
+            hw_scratch_bytes: None,
+            hw_finish_ms: None,
+            hw_submit_ms: None,
         }
     }
 
@@ -3328,6 +4160,11 @@ mod tests {
                 scene_used_peak_in: String::new(),
                 scene_used_peak_level_bricks: Vec::new(),
                 scene_reserved_mib: 560.0,
+                device_blocks: None,
+                device_reserved_mib: None,
+                device_allocated_mib: None,
+                device_empty_blocks: None,
+                device_empty_mib: None,
                 scene_gpu_peak_growth_mib: 600.0,
                 scene_gpu_peak_rebuild_mib: 0.0,
                 scene_host_peak_growth_mib: 600.0,
@@ -3578,6 +4415,7 @@ mod tests {
                         Spread {
                             samples: 600,
                             mean_ms,
+                            p95_ms: p99_ms * 0.9,
                             p99_ms,
                             worst_ms: p99_ms * 2.0,
                         },
@@ -3763,13 +4601,38 @@ mod tests {
                 "deterministic",
                 "error",
                 "gates",
+                "gen_extra_bricks",
+                "gen_extra_us_asked",
+                "gen_extra_us_measured",
                 "max",
                 "min",
                 "mode",
                 "planet",
+                "relief",
+                "rt",
                 "runs"
             ]
         );
+        // No hook (#242): nothing asked, nothing measured, and today's 2 km and 1 km.
+        assert_eq!(json["gen_extra_us_asked"], 0);
+        assert!(json["gen_extra_us_measured"].is_null() && json["gen_extra_bricks"].is_null());
+        assert_eq!(
+            keys(&json["relief"]),
+            [
+                "column_m",
+                "interior_below_sea_m",
+                "max_radius_above_sea_m",
+                "peak_m",
+                "stretched",
+                "trench_m"
+            ]
+        );
+        assert_eq!(json["relief"]["stretched"], false);
+        assert_eq!(json["relief"]["peak_m"], 2000.0);
+        assert_eq!(json["relief"]["trench_m"], 1000.0);
+        assert_eq!(json["relief"]["column_m"], 3000.0);
+        // No ray backend was asked for (#236): `rt` is null until `with_rt` says which ran.
+        assert!(json["rt"].is_null());
         assert_eq!(json["mode"], "real-time");
         assert_eq!(json["deterministic"], false);
         assert!(json["error"].is_null());
@@ -3796,6 +4659,11 @@ mod tests {
         assert_eq!(
             keys(&json["runs"][0]["memory"]),
             [
+                "device_allocated_mib",
+                "device_blocks",
+                "device_empty_blocks",
+                "device_empty_mib",
+                "device_reserved_mib",
                 "resident_peak_mib",
                 "scene_gpu_peak_growth_mib",
                 "scene_gpu_peak_rebuild_mib",
@@ -3816,6 +4684,8 @@ mod tests {
                 "absorb_updates",
                 "arrived_bricks",
                 "backlog_peak",
+                "by_second",
+                "camera_soft_miss_by_level",
                 "camera_soft_miss_frames",
                 "camera_soft_miss_lag_side",
                 "camera_soft_miss_loader_side",
@@ -3832,13 +4702,18 @@ mod tests {
                 "frames_over_limit_by_update",
                 "generated_bricks",
                 "gpu_passes",
+                "hardware",
                 "hole_looks",
                 "holes",
                 "holes_per_frame",
                 "lag_over_floor_frames",
                 "largest_updates",
+                "loader_ahead_max",
+                "loader_ahead_mean",
+                "loader_frames_at_max_ahead",
                 "loader_generating_s",
                 "loader_held_back_s",
+                "loader_latency",
                 "loader_queue_max",
                 "loader_queue_mean",
                 "name",
@@ -3922,6 +4797,21 @@ mod tests {
                 "grown_bytes",
                 "harness_ms",
                 "hole_look",
+                "hw_blas",
+                "hw_blas_urgent",
+                "hw_blocks_made",
+                "hw_boxes",
+                "hw_created",
+                "hw_finish_ms",
+                "hw_gpu_blas_ms",
+                "hw_gpu_gap_ms",
+                "hw_gpu_tlas_ms",
+                "hw_pool_grew",
+                "hw_reserved_grew",
+                "hw_scratch_bytes",
+                "hw_submit_ms",
+                "hw_submits",
+                "hw_tlas_made",
                 "index",
                 "lengthen_ms",
                 "other_ms",
@@ -3958,7 +4848,11 @@ mod tests {
                 "follow_ms",
                 "hole_scan_ms",
                 "hole_scan_share",
+                "pack_arrive_ms",
+                "pack_hold_ms",
                 "pack_ms",
+                "pack_receive_ms",
+                "pack_request_ms",
                 "reband_ms",
                 "release_ms",
                 "upload_ms"
@@ -4069,6 +4963,33 @@ mod tests {
     }
 
     #[test]
+    fn a_run_asked_for_the_hardware_backend_on_an_adapter_without_it_is_an_error() {
+        let choice = |active, fallback: Option<&str>| RtChoice {
+            requested: RtBackend::Hardware,
+            active,
+            fallback: fallback.map(str::to_string),
+        };
+        assert!(
+            ran_as_asked(
+                RtBackend::Hardware,
+                &choice(RtBackend::Hardware, None),
+                false
+            )
+            .is_ok()
+        );
+        let no_queries = choice(RtBackend::Compute, Some("the adapter has no ray queries"));
+        let why = ran_as_asked(RtBackend::Hardware, &no_queries, false).unwrap_err();
+        assert!(
+            why.contains("no ray queries") && why.contains("hw"),
+            "{why}"
+        );
+        // The bench's default asked for no backend in particular: it goes on, as compute.
+        assert!(ran_as_asked(RtBackend::Hardware, &no_queries, true).is_ok());
+        // Compute asked for, compute run: nothing to say.
+        assert!(ran_as_asked(RtBackend::Compute, &choice(RtBackend::Compute, None), false).is_ok());
+    }
+
+    #[test]
     fn a_gpu_frames_cpu_part_is_all_but_the_wait() {
         let ms = Duration::from_millis;
         let frame = GpuFrame {
@@ -4081,9 +5002,12 @@ mod tests {
             passes: None,
             grow: ms(50),
             grown_bytes: 1 << 20,
+            hardware: ms(16),
+            accel: None,
         };
-        // The growth is inside the write: it is not another part of the CPU's time.
-        assert_eq!(frame.cpu(), ms(15));
+        // The growth is inside the write: it is not another part of the CPU's time. The hardware
+        // backend's builds are (outside the encode they were measured in).
+        assert_eq!(frame.cpu(), ms(31));
         assert_eq!(GpuFrame::default().cpu(), Duration::ZERO);
     }
 
@@ -4387,7 +5311,7 @@ mod tests {
     /// about 300 m up).
     #[test]
     fn the_catch_up_between_paths_ends_with_the_scene_at_the_camera() {
-        let built = build_test().expect("the test Planet builds");
+        let built = build_test(&GenHooks::default()).expect("the test Planet builds");
         let Built { world, setup, .. } = built;
         let mut gpu = NoGpu;
         let mut session = Session::new(world, &mut gpu, BUDGETS.frame_time_p99_ms);
@@ -4411,6 +5335,66 @@ mod tests {
         assert!(session.idle());
     }
 
+    #[test]
+    fn the_relief_report_is_the_planets_extent_and_says_whether_it_was_stretched() {
+        let today = GenHooks::default().report(WORLD_RADIUS);
+        assert!(!today.stretched);
+        assert_eq!(
+            (today.peak_m, today.trench_m, today.column_m),
+            (2000.0, 1000.0, 3000.0)
+        );
+        // Asking for today's values is not a stretch.
+        let same = GenHooks {
+            extra_us: None,
+            relief_m: Some((2000.0, 1000.0)),
+        };
+        assert_eq!(same.report(WORLD_RADIUS), today);
+        let tall = GenHooks {
+            extra_us: Some(100),
+            relief_m: Some((8000.0, 4000.0)),
+        }
+        .report(WORLD_RADIUS);
+        assert!(tall.stretched);
+        assert_eq!(
+            (tall.peak_m, tall.trench_m, tall.column_m),
+            (8000.0, 4000.0, 12000.0)
+        );
+        // The highest radius is the peak and what stands on it, the interior's the trench and the
+        // strata and the detail: 6 km higher and 3 km lower than today's, to the Voxel.
+        assert!((tall.max_radius_above_sea_m - today.max_radius_above_sea_m - 6000.0).abs() < 0.1);
+        assert!((tall.interior_below_sea_m - today.interior_below_sea_m - 3000.0).abs() < 0.1);
+    }
+
+    /// The real-time mode on the test Planet with both hooks on: every path runs on the stretched
+    /// relief and the extra cost is charged. Real workers and a real scene thread, so it is in
+    /// `.github/real-thread-tests.txt`, and does not gate.
+    #[test]
+    fn the_real_time_run_with_both_hooks_on_the_test_planet_completes_and_charges_the_bricks() {
+        let hooks = GenHooks {
+            extra_us: Some(25),
+            relief_m: Some((8000.0, 4000.0)),
+        };
+        let built = build_test(&hooks).expect("the stretched test Planet builds");
+        // The spawn is on land, above sea, and the camera over it.
+        let spawn = norm(built.setup.spawn.position);
+        assert!(spawn > built.setup.sea, "{spawn} is not above sea level");
+        let extra = built.extra.clone().expect("the hook made a cost");
+        let run = one_run(
+            built,
+            &mut NoGpu,
+            &Script::short(),
+            BUDGETS.frame_time_p99_ms,
+        )
+        .unwrap_or_else(|stopped| panic!("the run stopped at {}: {}", stopped.step, stopped.error));
+        assert_eq!(run.paths.len(), 8, "every path ran");
+        let stats = extra.stats();
+        assert_eq!(stats.asked_us, 25);
+        assert!(stats.bricks > 1000, "{} bricks charged", stats.bricks);
+        let ratio = stats.measured_us / 25.0;
+        // Only from below: a busy machine preempts a charge and makes it longer, never shorter.
+        assert!(ratio >= 0.5, "{stats:?}");
+    }
+
     /// The real-time mode on the test Planet, with real workers and a real scene thread and no GPU:
     /// every path runs and the report has its fields. It asserts no time bound, only what was run and
     /// that the parts of a frame's cycle are inside it: how long anything took is not for a test
@@ -4418,7 +5402,7 @@ mod tests {
     /// not gate.
     #[test]
     fn the_real_time_run_on_the_test_planet_completes_with_every_path_and_field() {
-        let built = build_test().expect("the test Planet builds");
+        let built = build_test(&GenHooks::default()).expect("the test Planet builds");
         let d0 = built.setup.d0;
         let run = one_run(
             built,
@@ -4606,7 +5590,7 @@ mod tests {
             script.stream_slice = Duration::from_millis(ms);
         }
         for run in 1..=runs {
-            let built = build_full().expect("the full-size Planet builds");
+            let built = build_full(&GenHooks::default()).expect("the full-size Planet builds");
             let report = one_run(built, &mut NoGpu, &script, BUDGETS.frame_time_p99_ms)
                 .unwrap_or_else(|stopped| {
                     panic!("the run stopped at {}: {}", stopped.step, stopped.error)
@@ -4665,7 +5649,8 @@ mod tests {
                     path.scene_used_end_mib,
                     path.scene_level_bricks_end,
                 );
-                if path.camera_soft_miss_frames > 0 {
+                crate::bench::eprint_loader_detail(path);
+                if path.camera_soft_miss_frames > 0 || path.scene_budget_cuts > 0 {
                     eprintln!(
                         "  {:>20}: camera misses by second {:?}, follow rounds {}, budget cuts {}",
                         path.name,
@@ -4713,7 +5698,7 @@ mod tests {
     #[test]
     #[ignore = "generates the full-size world map and runs every path: about 8 minutes"]
     fn the_sea_level_crossing_round_at_full_size_is_no_longer_than_the_other_paths_worst() {
-        let built = build_full().expect("the full-size Planet loads");
+        let built = build_full(&GenHooks::default()).expect("the full-size Planet loads");
         let run = one_run(
             built,
             &mut NoGpu,
@@ -4830,7 +5815,7 @@ mod tests {
     #[test]
     #[ignore = "generates the full-size world map: about 5 minutes"]
     fn a_camera_held_under_the_sea_at_full_size_keeps_the_scene_within_the_gate() {
-        let built = build_full().expect("the full-size Planet loads");
+        let built = build_full(&GenHooks::default()).expect("the full-size Planet loads");
         let Built { world, setup, .. } = built;
         let script = Script::full();
         world.set_backed_up_slice(script.stream_slice);
@@ -4869,7 +5854,7 @@ mod tests {
     /// fill. It is in `.github/real-thread-tests.txt` with the smoke test (it has threads).
     #[test]
     fn a_run_that_stops_names_the_step_it_was_at() {
-        let built = build_test().expect("the test Planet builds");
+        let built = build_test(&GenHooks::default()).expect("the test Planet builds");
         let script = Script {
             fill_cap: Duration::ZERO,
             ..Script::short()

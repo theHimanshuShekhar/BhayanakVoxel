@@ -8,6 +8,9 @@ use sim::{FixedTimestep, TICK_RATE_HZ};
 const MAX_TICKS_PER_ADVANCE: u32 = 5;
 
 fn main() {
+    // `BHAYANAK_PROFILE=low-end` (and the other overrides, #264) lower the server's threads too:
+    // hold the process to them, as the client does.
+    machine::pin_to_profile();
     let running = Arc::new(AtomicBool::new(true));
     let handler_flag = Arc::clone(&running);
     ctrlc::set_handler(move || handler_flag.store(false, Ordering::SeqCst))

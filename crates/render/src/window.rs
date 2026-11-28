@@ -16,7 +16,7 @@ use crate::sun::Sun;
 use crate::timing::Timings;
 use crate::tracer::{Target, Tracer, View};
 use crate::upscale::{DEFAULT_SCALE, Resolution};
-use crate::{Result, create_instance, request_gpu};
+use crate::{Result, RtBackend, RtChoice, RtDevice, create_instance, request_gpu_for};
 
 /// How the Planet is drawn.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -39,6 +39,15 @@ pub struct Renderer {
     device: wgpu::Device,
     queue: wgpu::Queue,
     tracer: Tracer,
+    /// What the player asked for and what runs (#50): hardware ray queries, which are the default,
+    /// or the compute walk (see [`Renderer::set_backend`]).
+    rt: RtChoice,
+    /// What the device has of ray queries and why (#260): its features are fixed when it is made,
+    /// from the setting of that launch.
+    rt_device: RtDevice,
+    /// Where the camera was at the last frame: where the hardware backend's frame starts when the
+    /// tracer is built again (a new Planet, or a change of backend).
+    camera_position: [f64; 3],
     profiler: Profiler,
     /// What the CPU spent drawing the last frame.
     last_cpu: RenderCpu,
@@ -69,15 +78,26 @@ pub struct Renderer {
 
 impl Renderer {
     /// `window` is anything wgpu can make a surface from, e.g. an `Arc<winit::window::Window>`.
+    ///
+    /// `backend` is how rays find the Planet (#50): the player's setting, and the default is
+    /// [`RtBackend::Hardware`]. **The device is made with wgpu's experimental ray-query features
+    /// only if `backend` is a hardware one, the adapter has them and the run is not held to none
+    /// (`--profile low-end`)** (#260): the compute setting makes a device that cannot choke on
+    /// them, and a change of the setting at run time ([`Renderer::set_backend`]) is a change of
+    /// the next launch's device ([`Renderer::rt_note`] says so). If the device cannot be made with
+    /// them it is made again without, and compute runs. An adapter without them runs the compute
+    /// backend, with no error ([`Renderer::rt`] says why).
     pub fn new(
         window: impl Into<wgpu::SurfaceTarget<'static>>,
         width: u32,
         height: u32,
         scene: &Scene,
+        backend: RtBackend,
     ) -> Result<Self> {
         let instance = create_instance();
         let surface = instance.create_surface(window)?;
-        let (adapter, device, queue) = request_gpu(&instance, Some(&surface), true)?;
+        let (adapter, device, queue, rt, rt_device) =
+            request_gpu_for(&instance, Some(&surface), true, backend, false)?;
         let mut config = surface
             .get_default_config(&adapter, width.max(1), height.max(1))
             .ok_or("surface is not supported by the adapter")?;
@@ -90,7 +110,10 @@ impl Renderer {
         }
         surface.configure(&device, &config);
 
-        let tracer = Tracer::new(&device, scene)?;
+        // Until a frame is drawn the camera is at the Planet's middle, which the hardware backend's
+        // frame starts from.
+        let camera_position = [0.0; 3];
+        let tracer = Tracer::on_backend(&device, &queue, scene, camera_position, rt.active)?;
         let profiler = Profiler::new(&device, &queue);
         let gui = egui_wgpu::Renderer::new(&device, config.format, Default::default());
         let composite = Composite::new(&device, config.format);
@@ -105,6 +128,9 @@ impl Renderer {
             device,
             queue,
             tracer,
+            rt,
+            rt_device,
+            camera_position,
             profiler,
             last_cpu: RenderCpu::default(),
             gui,
@@ -138,9 +164,62 @@ impl Renderer {
         (target, group)
     }
 
-    /// Replaces the Planet being drawn. A new Planet starts the reference image over.
+    /// Replaces the Planet being drawn. A new Planet starts the reference image over. **The ray
+    /// backend stays what it is** (#50): the tracer that replaces the old one is on the backend that
+    /// [`Renderer::rt`] says, its acceleration structures made for the new Planet.
     pub fn set_scene(&mut self, scene: &Scene) -> Result<()> {
-        self.tracer.replace_scene(&self.device, scene)
+        self.tracer
+            .replace_scene(&self.device, &self.queue, scene, self.camera_position)
+    }
+
+    /// Which way rays find the Planet: what the player asked for and what runs, and why not the
+    /// one asked for if it is not (the adapter has no ray queries).
+    pub fn rt(&self) -> &RtChoice {
+        &self.rt
+    }
+
+    /// Why this adapter cannot run ray queries, if it cannot: the compute backend is then the only
+    /// one, whatever the setting says.
+    pub fn rt_unavailable(&self) -> Option<&str> {
+        self.rt_device.unavailable.as_deref()
+    }
+
+    /// What the player should know about the device's ray-query features against the setting, if
+    /// anything (#260): a restart is needed for hardware ray tracing on a device that was made
+    /// without them, the next launch makes a device without them after a switch to compute, or the
+    /// device could not be made with them. The overlay says it.
+    pub fn rt_note(&self) -> Option<String> {
+        self.rt_device.note(self.rt.requested)
+    }
+
+    /// Whether the device was made with the ray-query features.
+    pub fn device_has_ray_queries(&self) -> bool {
+        self.rt_device.on_device
+    }
+
+    /// Changes how rays find the Planet to `requested`, for `scene`, which is the Planet being drawn
+    /// (what the window draws, and what [`Renderer::update_scene`] has kept up to date): the
+    /// player's setting, changed at run time (#50). The tracer is made again for the scene, so this
+    /// takes a moment, as a rebuild of the scene does; the sun, the look and the rest of its
+    /// settings stay. On an adapter without ray queries the compute backend stays, with no error,
+    /// and so it does on a device that was made without them (for the compute setting, #260, or
+    /// because it could not be made with them): a switch to hardware is then kept as the setting
+    /// and takes effect at the next launch ([`Renderer::rt_note`]).
+    pub fn set_backend(&mut self, scene: &Scene, requested: RtBackend) -> Result<()> {
+        let rt = self
+            .rt_device
+            .choose(requested, self.device.features(), &self.device.limits());
+        if rt.active != self.tracer.backend() {
+            self.tracer.switch_backend(
+                &self.device,
+                &self.queue,
+                scene,
+                self.camera_position,
+                rt.active,
+            )?;
+        }
+        self.rt = rt;
+        Ok(())
     }
 
     /// Brings the GPU copy of the Planet up to date with `scene`, after `update` (the result of
@@ -393,6 +472,7 @@ impl Renderer {
     }
 
     fn draw(&mut self, camera: &Camera, gui: Option<(&egui::Context, egui::FullOutput)>) {
+        self.camera_position = camera.position;
         let acquiring = Instant::now();
         let texture = self.surface.get_current_texture();
         self.last_cpu = RenderCpu {

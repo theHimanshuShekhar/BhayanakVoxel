@@ -159,7 +159,12 @@ fn check_convergence(convergence: &Value, out: &Path) {
         // Primary against truth (#54): the flat ambient and the cache's GI, each in its first frame
         // and its settled one, with no FLIP in a short run but the images' brightness.
         let gi = &view["gi"];
-        for variant in ["flat", "gi"] {
+        // And with the denoiser (#55): `raw` has none, `gi` has it with the sun's shadow rays
+        // weighed as `shadow_weight` says, and `other_weight` with the other weight.
+        assert_eq!(string(&gi["shadow_weight"]), "per-sample");
+        assert_eq!(string(&gi["other_shadow_weight"]), "centre-cosine");
+        assert!(gi["reference_64"].is_null(), "no FLIP: {name}");
+        for variant in ["flat", "raw", "gi", "other_weight"] {
             for when in ["first_frame", "settled"] {
                 let score = &gi[variant][when];
                 assert!(score["flip"].is_null(), "no FLIP: {name} {variant} {when}");
@@ -170,11 +175,29 @@ fn check_convergence(convergence: &Value, out: &Path) {
             }
         }
         assert!(gi["gi_not_further"].is_null(), "no FLIP: {name}");
+        // Primary converged (#55) is measured where `--converged-frames` asks (the short bench does
+        // not): its brightness is, its FLIP is not.
+        let converged = &gi["converged"];
+        if !converged.is_null() {
+            assert!(number(&converged["luminance_ratio"]) > 0.0, "{name}");
+            assert!(converged["bias"].is_null() && converged["residual"].is_null());
+            assert!(
+                out.join(string(&convergence["folder"]))
+                    .join(name)
+                    .join("primary-converged.png")
+                    .is_file(),
+                "{name}/primary-converged.png"
+            );
+        }
         for file in [
             "primary-flat-first-frame.png",
             "primary-flat-settled.png",
+            "primary-raw-first-frame.png",
+            "primary-raw-settled.png",
             "primary-gi-first-frame.png",
             "primary-gi-settled.png",
+            "primary-gi-centre-cosine-first-frame.png",
+            "primary-gi-centre-cosine-settled.png",
         ] {
             assert!(
                 out.join(string(&convergence["folder"]))
@@ -227,7 +250,7 @@ fn check_convergence(convergence: &Value, out: &Path) {
     let gates = &convergence["gi"]["gates"];
     assert_eq!(gates["held"], false);
     assert_eq!(gates["over"], serde_json::json!([]));
-    assert_eq!(number(&gates["room_target_flip"]), 0.10);
+    assert_eq!(number(&gates["primary_target_flip"]), 0.05);
     assert_eq!(number(&gates["settle_within_ms"]), 500.0);
     assert!(
         out.join(string(&convergence["folder"]))
@@ -256,6 +279,17 @@ fn check_convergence(convergence: &Value, out: &Path) {
     assert!(sun["flip"].is_null(), "--short runs no FLIP");
     assert!(sun["floor"].is_null() && sun["meets_target"].is_null());
     assert_eq!(sun["seeds"]["truth_a"], 1);
+    // Primary is denoised (#55) with the weight of the sun's rays that `--shadow-weight` chose, and
+    // the other weight and the denoiser off are reported beside it, with the Reference at 64 samples.
+    assert_eq!(string(&sun["shadow_weight"]), "per-sample");
+    assert_eq!(string(&sun["other_shadow_weight"]), "centre-cosine");
+    assert!(sun["reference_64"].is_null(), "no FLIP");
+    for variant in ["other_weight", "raw"] {
+        for when in ["first_frame", "settled"] {
+            assert!(sun[variant][when]["flip"].is_null(), "{variant} {when}");
+            assert!(sun[variant][when]["edge"]["edge_pixels"].is_u64());
+        }
+    }
     for score in ["first_frame", "settled"] {
         assert!(sun[score]["flip"].is_null(), "{score}");
         // The shadow-edge error is made without FLIP.
@@ -264,12 +298,21 @@ fn check_convergence(convergence: &Value, out: &Path) {
         assert!(edge["other_mean"].is_null() || number(&edge["other_mean"]) >= 0.0);
     }
     assert!((0.0..=1.0).contains(&number(&sun["edge_share"])));
+    if !sun["converged"].is_null() {
+        assert!(number(&sun["converged"]["luminance_ratio"]) > 0.0);
+        assert!(sun["converged"]["bias"].is_null());
+    }
     let folder = out.join(string(&convergence["folder"])).join("sun");
     for file in [
         "truth-a.png",
         "unshadowed.png",
         "primary-first.png",
         "primary-settled.png",
+        "primary-first-other-weight.png",
+        "primary-settled-other-weight.png",
+        "primary-first-no-denoiser.png",
+        "primary-settled-no-denoiser.png",
+        "reference-64.png",
         "edges.png",
     ] {
         assert!(folder.join(file).is_file(), "sun/{file}");
@@ -281,18 +324,28 @@ fn check_convergence(convergence: &Value, out: &Path) {
 }
 
 fn check_schema(report: &Value, out: &Path) {
-    assert_eq!(report["schema_version"], 32);
-    // The default is the compute backend, with no acceleration structures (#50).
-    assert_eq!(report["rt"]["requested"], "compute");
-    assert_eq!(report["rt"]["active"], "compute");
-    assert!(report["rt"]["fallback"].is_null());
-    assert!(report["rt"]["accel"].is_null());
+    assert_eq!(report["schema_version"], 38);
+    // The default is the game's own choice (#50, Part 2): hardware ray queries where the adapter
+    // has them, and compute, with the reason, where it has not.
+    assert_eq!(report["rt"]["requested"], "auto");
+    match report["rt"]["active"].as_str().unwrap() {
+        "hw" => {
+            assert!(report["rt"]["fallback"].is_null());
+            assert!(report["rt"]["accel"].is_object(), "{}", report["rt"]);
+        }
+        "compute" => {
+            assert!(report["rt"]["fallback"].is_string());
+            assert!(report["rt"]["accel"].is_null());
+        }
+        other => panic!("rt.active is {other}"),
+    }
     assert!(report["rt"]["comparison"].is_null());
     // The day cycle is asked for (see its own test); the others do not.
     assert!(report["day_cycle"].is_null());
     assert!(report["config"]["time_of_day"].is_null());
     // The Edit stress is of the whole Planet, which the patch is not.
     assert!(report["edits"].is_null());
+    assert!(report["edits_ground"].is_null());
     // The streaming mode is asked for (see its own test); the other tests do not. The real-time
     // mode takes minutes even on the test Planet, with real threads: it is not run here (a unit
     // test of the client runs it, outside the gating jobs), so its section is null, and a report of
@@ -317,6 +370,16 @@ fn check_schema(report: &Value, out: &Path) {
     assert!(!string(&machine["gpu"]).is_empty());
     assert_eq!(string(&machine["backend"]), "Vulkan");
     let timers = machine["timers_supported"].as_bool().expect("a bool");
+    // What the run was held to (#264): the profile, the pinning, and the LOD bias it started at.
+    let profile = &machine["profile"];
+    assert!(profile["threads"].as_u64().is_some_and(|t| t >= 1));
+    assert!(profile["memory_mib"].is_u64() && profile["found_memory_mib"].is_u64());
+    assert!(profile["constrained"].is_boolean() && profile["ray_queries"].is_boolean());
+    assert!(profile["lowered"].is_boolean());
+    assert!(!string(&profile["pinning"]).is_empty());
+    assert!(profile["pinned_cpus"].is_array());
+    assert!(profile["starting_bias"].as_f64().is_some_and(|b| b >= 1.0));
+    assert_eq!(profile["default_bias"], 1.0);
 
     let config = &report["config"];
     assert!(config["width"].is_u64() && config["height"].is_u64());
@@ -372,12 +435,15 @@ fn check_schema(report: &Value, out: &Path) {
             passes.iter().any(|p| string(&p["name"]) == mode),
             "{mode}: {passes:?}"
         );
-        // Primary mode also upscales.
+        // Primary mode also denoises (#55: the `denoise` pass, which the budgets file holds to
+        // 1.0 ms) and upscales.
         if mode == "primary" {
-            assert!(
-                passes.iter().any(|p| string(&p["name"]) == "upscale"),
-                "{passes:?}"
-            );
+            for pass in ["denoise", "upscale"] {
+                assert!(
+                    passes.iter().any(|p| string(&p["name"]) == pass),
+                    "{pass}: {passes:?}"
+                );
+            }
         }
         for pass in passes {
             check_entry(pass);
@@ -429,6 +495,8 @@ fn the_short_bench_writes_a_report_and_screenshots_and_no_fail_ignores_the_budge
     let run = bench(&[
         "--short",
         "--no-fail",
+        "--converged-frames",
+        "2",
         "--out",
         out.join("run").to_str().unwrap(),
         "--budgets",
@@ -443,6 +511,11 @@ fn the_short_bench_writes_a_report_and_screenshots_and_no_fail_ignores_the_budge
 
     let report = read_report(&out.join("run"));
     check_schema(&report, &out.join("run"));
+    // `--converged-frames` reaches the views and the sun view.
+    for view in report["convergence"]["views"].as_array().unwrap() {
+        assert_eq!(view["gi"]["converged"]["frames"], 2, "{}", view["name"]);
+    }
+    assert_eq!(report["convergence"]["shadows"]["converged"]["frames"], 2);
     // The report is also on stdout.
     assert_eq!(
         serde_json::from_slice::<Value>(&run.stdout).unwrap(),
@@ -473,6 +546,8 @@ fn the_convergence_phase_can_be_left_out_and_a_truth_needs_the_phase() {
     let out = scratch("no-convergence");
     let run = bench(&[
         "--short",
+        "--rt-backend",
+        "compute",
         "--no-convergence",
         "--no-fail",
         "--out",
@@ -497,6 +572,8 @@ fn the_day_cycle_reports_a_sped_up_day_with_its_frames_exposure_and_cache() {
     let out = scratch("day-cycle");
     let run = bench(&[
         "--short",
+        "--rt-backend",
+        "compute",
         "--no-fail",
         "--no-convergence",
         "--day-cycle",
@@ -555,7 +632,14 @@ fn a_failing_convergence_phase_warns_and_leaves_the_rest_of_the_report() {
     std::fs::create_dir_all(&run_dir).unwrap();
     // The phase's folder cannot be made where a file of that name is.
     std::fs::write(run_dir.join("convergence"), "in the way").unwrap();
-    let run = bench(&["--short", "--no-fail", "--out", run_dir.to_str().unwrap()]);
+    let run = bench(&[
+        "--short",
+        "--rt-backend",
+        "compute",
+        "--no-fail",
+        "--out",
+        run_dir.to_str().unwrap(),
+    ]);
     let stderr = String::from_utf8_lossy(&run.stderr);
     assert_eq!(run.status.code(), Some(0), "{stderr}");
     assert!(
@@ -578,6 +662,8 @@ fn a_pass_over_budget_fails_the_run_with_status_2() {
     std::fs::write(&budgets, IMPOSSIBLE).unwrap();
     let run = bench(&[
         "--short",
+        "--rt-backend",
+        "compute",
         "--no-convergence",
         "--out",
         out.join("run").to_str().unwrap(),
@@ -619,6 +705,8 @@ fn a_diagnostic_run_is_marked_in_its_report_and_is_not_held_to_the_budgets() {
     std::fs::write(&budgets, IMPOSSIBLE).unwrap();
     let run = bench(&[
         "--short",
+        "--rt-backend",
+        "compute",
         "--no-convergence",
         "--out",
         out.join("run").to_str().unwrap(),
@@ -648,6 +736,8 @@ fn a_diagnostic_run_is_marked_in_its_report_and_is_not_held_to_the_budgets() {
     let plain = scratch("plain");
     bench(&[
         "--short",
+        "--rt-backend",
+        "compute",
         "--no-convergence",
         "--out",
         plain.join("run").to_str().unwrap(),

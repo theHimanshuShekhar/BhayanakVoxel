@@ -150,8 +150,39 @@ pub fn diff_image(actual: &Image, expected: &Image) -> Image {
 
 /// Checks `actual` against the approved image `name`, or approves it under `UPDATE_GOLDEN`.
 pub fn check_golden(name: &str, actual: &Image, tolerance: &Tolerance) {
+    check_golden_as(
+        name,
+        actual,
+        tolerance,
+        std::env::var_os("UPDATE_GOLDEN").is_some(),
+    );
+}
+
+/// [`check_golden`] for an image of the hardware backend (#50), which is held to the image that the
+/// compute backend approved: it never approves anything (`UPDATE_GOLDEN` is for compute's).
+pub fn check_hardware_golden(name: &str, actual: &Image, tolerance: &Tolerance) {
+    check_golden_as(name, actual, tolerance, false);
+}
+
+/// Whether this adapter can run the hardware backend, which the tests that hold it to the goldens
+/// need; if it cannot they skip, and this says so (CI's log shows the line).
+pub fn hardware_runs(test: &str) -> bool {
+    let tiny = Offscreen::with_backend(
+        render::Resolution::native(8, 8),
+        &Scene::default(),
+        render::RtBackend::Hardware,
+    )
+    .unwrap();
+    let rt = tiny.rt();
+    if let Some(why) = &rt.fallback {
+        eprintln!("SKIPPED {test}: {why}; the hardware backend was not compared with the goldens");
+    }
+    rt.fallback.is_none()
+}
+
+fn check_golden_as(name: &str, actual: &Image, tolerance: &Tolerance, update: bool) {
     let path = golden_path(name);
-    if std::env::var_os("UPDATE_GOLDEN").is_some() {
+    if update {
         write_png(&path, actual);
         eprintln!("wrote {}", path.display());
         return;
@@ -159,6 +190,16 @@ pub fn check_golden(name: &str, actual: &Image, tolerance: &Tolerance) {
     let expected = read_png(&path);
     let difference = compare(actual, &expected);
     let pixels = (actual.width * actual.height) as usize;
+    // For whoever runs with `--nocapture` (and `BHAYANAK_RT_BACKEND=hw`, #50): how close each image
+    // is to its approved one, measured.
+    eprintln!(
+        "golden {name} on {}: mse {:.4}, far off {} of {pixels} pixels (limits: mse {}, {})",
+        std::env::var(render::BACKEND_VARIABLE).unwrap_or_else(|_| "compute".into()),
+        difference.mse,
+        difference.far_off,
+        tolerance.max_mse,
+        (tolerance.max_far_off_fraction * pixels as f64) as usize,
+    );
     if !within_tolerance(&difference, pixels, tolerance) {
         let dir = failure_dir().join(name.trim_end_matches(".png"));
         write_png(&dir.join("actual.png"), actual);

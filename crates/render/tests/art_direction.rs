@@ -8,7 +8,9 @@
 use brick_store::{BrickStore, Material, VoxelCoord};
 use materials::MaterialTable;
 use render::reference::{Ray, trace};
-use render::{Camera, DebugView, Image, Look, Offscreen, Resolution, Scene, Stages, Sun, camera};
+use render::{
+    Camera, DebugView, Image, Look, Offscreen, Resolution, Scene, ShadowWeight, Stages, Sun, camera,
+};
 
 const STONE: Material = Material(1);
 const SIZE: u32 = 32;
@@ -34,6 +36,10 @@ fn overhead() -> Camera {
 fn lit_floor(stages: Stages) -> Image {
     let mut gpu = Offscreen::new(SIZE, SIZE, &floor_of(material("clear glass"))).unwrap();
     gpu.set_look(Look::LEGACY);
+    // The floor must be the same light everywhere for these checks to be about the display
+    // transform, and the per-sample weight (the default since #55) is noise on a floor at 1
+    // sample a pixel that the denoiser, not these stages, is for.
+    gpu.set_shadow_weight(ShadowWeight::CentreCosine);
     gpu.set_stages(stages);
     gpu.render(&overhead())
 }

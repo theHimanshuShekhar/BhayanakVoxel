@@ -12,7 +12,10 @@
 
 use std::cell::Cell;
 
-use crate::scene::{REGION_WORDS, SOLID_FLAG, Scene};
+use crate::scene::{
+    BRICK_HEADER_WORD, BRICK_PALETTE_WORD, REGION_WORDS, SOLID_FLAG, Scene, header_bits,
+    header_box, header_palette_len,
+};
 
 /// What one [`trace_counting`] did, to compare ways of walking a scene: each is a step of one
 /// level of the walk, so the shader's cost is about their weighted sum.
@@ -196,31 +199,41 @@ struct Entry {
     normal: [i32; 3],
 }
 
-/// Walks the Voxels of the brick at absolute brick coordinate `brick` of mip `level` (entry
-/// `entry` in `brick_refs`).
-fn hit_brick(
+/// Where the ray enters and leaves the box of Voxels of mip `level` from `low` up to, and not
+/// including, `high`: `trace.wgsl`'s `box_span`. The entry is past the exit for a ray that misses.
+fn box_span(ray: &Ray, w: &Walk, level: u32, low: [i32; 3], high: [i32; 3]) -> (f32, f32) {
+    let t_a = reach(ray, w, low.map(|l| l << level));
+    let t_b = reach(ray, w, high.map(|h| h << level));
+    let near: [f32; 3] = std::array::from_fn(|a| t_a[a].min(t_b[a]));
+    let far: [f32; 3] = std::array::from_fn(|a| t_a[a].max(t_b[a]));
+    (max3(near), min3(far))
+}
+
+/// The normal of the face the ray enters that box through: `box_normal` in `trace.wgsl`.
+fn box_normal(ray: &Ray, w: &Walk, level: u32, low: [i32; 3], high: [i32; 3]) -> [i32; 3] {
+    let t_a = reach(ray, w, low.map(|l| l << level));
+    let t_b = reach(ray, w, high.map(|h| h << level));
+    let near: [f32; 3] = std::array::from_fn(|a| t_a[a].min(t_b[a]));
+    face(w, largest_axis(near))
+}
+
+/// Walks the Voxels of the mixed brick at absolute brick coordinate `brick` of mip `level` (entry
+/// `entry` in `brick_refs`) that lie in its tight box, `first` to `last` (absolute Voxels of the
+/// level): `walk_brick` in `trace.wgsl`.
+#[allow(clippy::too_many_arguments)]
+fn walk_brick(
     scene: &Scene,
     ray: &Ray,
     w: &Walk,
     level: u32,
     entry: u32,
     brick: [i32; 3],
+    first: [i32; 3],
+    last: [i32; 3],
     enter: Entry,
 ) -> Option<Hit> {
-    let first = brick.map(|b| b * 8);
-    let last = first.map(|f| f + 7);
+    let origin = brick.map(|b| b * 8);
     let mut voxel = clamp3(voxel_at(ray, w, enter.t).map(|v| v >> level), first, last);
-    if entry & SOLID_FLAG != 0 {
-        return Some(hit_level_voxel(
-            ray,
-            w,
-            level,
-            enter.t,
-            enter.normal,
-            voxel,
-            entry & 0xffff,
-        ));
-    }
     let entry = entry as usize;
     let size = (1u32 << level) as f32;
     let mut next = reach(
@@ -232,7 +245,7 @@ fn hit_brick(
     let (mut t, mut normal) = (enter.t, enter.normal);
     for _ in 0..BLOCK_STEPS {
         count(|s| s.voxels += 1);
-        let local: [u32; 3] = std::array::from_fn(|a| (voxel[a] - first[a]) as u32);
+        let local: [u32; 3] = std::array::from_fn(|a| (voxel[a] - origin[a]) as u32);
         let bit = local[0] | local[1] << 3 | local[2] << 6;
         if scene.bricks[entry + (bit >> 5) as usize] >> (bit & 31) & 1 != 0 {
             let material = mixed_material(scene, entry, bit);
@@ -250,13 +263,68 @@ fn hit_brick(
     None
 }
 
+/// The hit in the brick at absolute brick coordinate `brick` of mip `level` (entry `entry` in
+/// `brick_refs`): a mixed brick is entered through its tight box (#50), as `hit_brick` in
+/// `trace.wgsl` does.
+fn hit_brick(
+    scene: &Scene,
+    ray: &Ray,
+    w: &Walk,
+    level: u32,
+    entry: u32,
+    brick: [i32; 3],
+    enter: Entry,
+) -> Option<Hit> {
+    let first = brick.map(|b| b * 8);
+    if entry & SOLID_FLAG != 0 {
+        let last = first.map(|f| f + 7);
+        let voxel = clamp3(voxel_at(ray, w, enter.t).map(|v| v >> level), first, last);
+        return Some(hit_level_voxel(
+            ray,
+            w,
+            level,
+            enter.t,
+            enter.normal,
+            voxel,
+            entry & 0xffff,
+        ));
+    }
+    let (lo, hi) = header_box(scene.bricks[entry as usize + BRICK_HEADER_WORD]);
+    let low: [i32; 3] = std::array::from_fn(|a| first[a] + i32::from(lo[a]));
+    let high: [i32; 3] = std::array::from_fn(|a| first[a] + i32::from(hi[a]) + 1);
+    let (t_enter, t_exit) = box_span(ray, w, level, low, high);
+    if t_enter > t_exit || t_exit < enter.t {
+        return None;
+    }
+    // The box is inside the brick, so the ray reaches it no sooner than it reached the brick.
+    let enter = if t_enter > enter.t {
+        Entry {
+            t: t_enter,
+            normal: box_normal(ray, w, level, low, high),
+        }
+    } else {
+        enter
+    };
+    walk_brick(
+        scene,
+        ray,
+        w,
+        level,
+        entry,
+        brick,
+        low,
+        high.map(|h| h - 1),
+        enter,
+    )
+}
+
 /// Material of Voxel `bit` in the mixed brick at `at` in `bricks`.
 fn mixed_material(scene: &Scene, at: usize, bit: u32) -> u32 {
     let bricks = &scene.bricks;
-    let header = bricks[at + 16];
-    let bits = header & 0xff;
-    let palette_len = (header >> 8) as usize;
-    let palette = at + 17;
+    let header = bricks[at + BRICK_HEADER_WORD];
+    let bits = header_bits(header);
+    let palette_len = header_palette_len(header);
+    let palette = at + BRICK_PALETTE_WORD;
     let indices = palette + palette_len.div_ceil(2);
     let position = bit * bits;
     let index = (bricks[indices + (position / 32) as usize] >> (position % 32)) & ((1 << bits) - 1);
@@ -510,6 +578,34 @@ mod tests {
 
     fn near(a: f32, b: f32) -> bool {
         (a - b).abs() < 1e-3
+    }
+
+    /// A mixed brick is entered through the tight box of its Voxels (#50): a ray that crosses the
+    /// brick and misses the box takes no Voxel step, one that hits the box starts the walk where it
+    /// enters it, and what is hit is what the whole-brick walk found.
+    #[test]
+    fn a_mixed_brick_is_entered_through_its_tight_box() {
+        // Two Voxels in one corner of the brick (0..8)^3: the box is (6..=7, 6..=7, 7..=7).
+        let scene = Scene::new(&store_with(&[[6, 6, 7], [7, 7, 7]]), None);
+        // Along x through the brick at y = z = 1: inside the brick, far from the box.
+        let (hit, steps) = trace_counting(&scene, &ray([-3, 1, 1], [1.0, 0.0, 0.0]));
+        assert!(hit.is_none());
+        assert_eq!(
+            steps.voxels, 0,
+            "a miss of the box walks no Voxel: {steps:?}"
+        );
+        // Along x through the Voxel (6, 6, 7): the walk starts at the box's own face (x = 6), not the
+        // brick's (x = 0), so it takes one Voxel step where the whole brick would take seven.
+        let (hit, steps) = trace_counting(&scene, &ray([-3, 6, 7], [1.0, 0.0, 0.0]));
+        let hit = hit.expect("the Voxel is hit");
+        assert_eq!((hit.voxel, hit.normal), ([6, 6, 7], [-1, 0, 0]));
+        assert!(near(hit.t, 3.0 + 6.0 - 0.5), "{}", hit.t);
+        assert_eq!(steps.voxels, 1, "{steps:?}");
+        // From above, down the column of (7, 7, *): the face of the box that the ray enters through
+        // is the top (+z), and the walk goes on to the Voxel.
+        let (hit, _) = trace_counting(&scene, &ray([7, 7, 12], [0.0, 0.0, -1.0]));
+        let hit = hit.unwrap();
+        assert_eq!((hit.voxel, hit.normal), ([7, 7, 7], [0, 0, 1]));
     }
 
     #[test]

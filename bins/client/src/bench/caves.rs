@@ -165,7 +165,13 @@ pub fn find_site(planet: &Planet) -> Site {
 }
 
 /// Loads what `scene` asks for, nearest `position` first, until it asks for nothing: what the
-/// client's loader does, with this thread.
+/// client's loader does, with the machine's threads. A round takes the 400 nearest, makes their
+/// children on all the threads (each brick is a pure function of the seed and its place, so the
+/// bricks are the same whatever the threads) and holds them in the order the 400 were taken in.
+///
+/// It was one thread making every child of every brick, in turn: on the 4090 and on the dev box
+/// the look-dev's shot build sat on one core for minutes after its tree was made (#264: 363 s
+/// of one core at the first shot, where the ring and the Guard before it took 6 s on all of them).
 pub(super) fn fill(
     scene: &mut Scene,
     store: &mut BrickStore,
@@ -182,17 +188,27 @@ pub(super) fn fill(
         });
         let source = store.source().expect("the ring's store has a source");
         let mut done = Vec::new();
-        for _ in 0..400 {
+        for _ in 0..ROUND {
             let Some((level, coord)) = pending.pop() else {
                 break;
             };
-            let bricks = children_from(&*source, level, coord, |c| store.holds(level - 1, c));
-            store.hold_children(level, coord, bricks);
             done.push((level, coord));
+        }
+        let made = {
+            let store: &BrickStore = store;
+            machine::par_map(&done, 1, machine::bulk_threads(), |&(level, coord)| {
+                children_from(&*source, level, coord, |c| store.holds(level - 1, c))
+            })
+        };
+        for (&(level, coord), bricks) in done.iter().zip(made) {
+            store.hold_children(level, coord, bricks);
         }
         scene.arrive(store, &done)?;
     }
 }
+
+/// How many of the nearest bricks [`fill`] makes the children of in a round.
+const ROUND: usize = 400;
 
 /// What the stills time: frames of each mode.
 pub struct Shares {
@@ -231,6 +247,7 @@ pub fn run(
         fill(&mut current, &mut store, still.key.position)?;
         let mut gpu = Offscreen::with_resolution(resolution, &current)?;
         gpu.set_flat_ambient(false);
+        gpu.set_denoise(render::Denoise::Full);
         gpu.set_ground_level(f64::from(TEST_RADIUS));
         gpu.set_keep_history(true);
         let mut flight = Flight {

@@ -5,6 +5,7 @@
 use egui::{Align2, Button, Color32, Context, Grid, Key, RichText, Sense, Slider, Window, vec2};
 use materials::MaterialTable;
 
+use crate::RtBackend;
 use crate::cpu::{CpuBreakdown, Row};
 use crate::debug_view::DebugView;
 use crate::post::Stages;
@@ -25,6 +26,11 @@ pub struct Controls {
     /// changes when the slider is let go, not while it is dragged, since selecting the bricks
     /// again takes a moment.
     pub bias: f32,
+    /// How rays find the Planet, as the player's setting has it (#50): [`RtBackend::Hardware`] is
+    /// the default, [`RtBackend::Compute`] the fallback for a GPU that ray queries do not suit. The
+    /// panel's checkbox edits it; on an adapter without ray queries it is greyed out, and compute
+    /// runs whatever this says ([`Info::rt_active`]).
+    pub backend: RtBackend,
 }
 
 /// The world clock as the panel edits it: the time of day in hours (0 is midnight, 6 sunrise, 12
@@ -84,6 +90,15 @@ pub struct Info<'a> {
     pub scene_memory: SceneMemory,
     /// What the LOD bands selected, once there is a Planet.
     pub lod: Option<LodInfo>,
+    /// The ray backend that runs (see [`Renderer::rt`](crate::Renderer::rt)).
+    pub rt_active: RtBackend,
+    /// Why this adapter cannot run ray queries, if it cannot: then the compute backend is the only
+    /// one, the setting is greyed out, and the panel says why.
+    pub rt_unavailable: Option<&'a str>,
+    /// What the device's ray-query features are against the setting, if they are not what it asks
+    /// for ([`Renderer::rt_note`](crate::Renderer::rt_note), #260): a restart is needed, the next
+    /// launch makes the device without them, or the device could not be made with them.
+    pub rt_note: Option<&'a str>,
 }
 
 /// A time for the panel: milliseconds, or "n/a" where there is none.
@@ -129,6 +144,40 @@ fn cpu_rows(ui: &mut egui::Ui, cpu: &CpuBreakdown, present_mode: wgpu::PresentMo
             ui.end_row();
         }
     });
+}
+
+/// Which ray backend runs, and the setting that switches it (#50).
+fn rt_rows(ui: &mut egui::Ui, info: &Info, controls: &mut Controls) {
+    let (name, why) = match (info.rt_active, info.rt_unavailable) {
+        (RtBackend::Compute, Some(_)) => ("compute", "ray queries are not available"),
+        (RtBackend::Compute, None) if controls.backend.is_hardware() => {
+            ("compute", "the device has no ray queries")
+        }
+        (RtBackend::Compute, None) => ("compute", "the setting"),
+        (RtBackend::Hardware, _) => ("hardware", "ray queries"),
+        (RtBackend::HardwareNearest, _) => ("hardware", "ray queries, nearest-hit shadows"),
+    };
+    ui.label(format!("ray tracing: {name} ({why})"));
+    let mut hardware = controls.backend.is_hardware();
+    let changed = ui
+        .add_enabled(
+            info.rt_unavailable.is_none(),
+            egui::Checkbox::new(&mut hardware, "Hardware ray tracing (setting)"),
+        )
+        .changed();
+    if changed {
+        controls.backend = if hardware {
+            RtBackend::Hardware
+        } else {
+            RtBackend::Compute
+        };
+    }
+    if let Some(reason) = info.rt_unavailable {
+        ui.weak(format!("compute only: {reason}"));
+    }
+    if let Some(note) = info.rt_note {
+        ui.weak(note);
+    }
 }
 
 /// The bias slider and what the bands made of it. The slider keeps its own value while it is
@@ -328,6 +377,8 @@ pub fn show(ctx: &Context, info: &Info, controls: &mut Controls) {
                 mib(info.scene_memory.allocated)
             ));
             ui.separator();
+            rt_rows(ui, info, controls);
+            ui.separator();
             lod_rows(ui, info.lod.as_ref(), controls);
             ui.separator();
 
@@ -417,6 +468,7 @@ mod tests {
             },
             stages: Stages::default(),
             bias: 1.0,
+            backend: RtBackend::Hardware,
         }
     }
 
@@ -439,6 +491,93 @@ mod tests {
         assert!(!egui::FontDefinitions::default().font_data.is_empty());
     }
 
+    fn info_with<'a>(
+        timings: &'a Timings,
+        cpu: &'a CpuBreakdown,
+        rt_active: RtBackend,
+        rt_unavailable: Option<&'a str>,
+    ) -> Info<'a> {
+        Info {
+            timings,
+            cpu,
+            present_mode: wgpu::PresentMode::Fifo,
+            timers_supported: true,
+            samples: 0,
+            samples_per_frame: 0,
+            loading_paused: false,
+            scene_memory: SceneMemory::default(),
+            lod: None,
+            rt_active,
+            rt_unavailable,
+            rt_note: None,
+        }
+    }
+
+    #[test]
+    fn the_panel_says_when_the_devices_ray_query_features_wait_for_a_restart() {
+        let (timings, cpu) = (Timings::default(), CpuBreakdown::default());
+        let mut info = info_with(&timings, &cpu, RtBackend::Compute, None);
+        info.rt_note = Some("restart needed: this device was made without ray queries");
+        let text = draw(&info, &mut controls());
+        assert!(
+            text.contains("ray tracing: compute (the device has no ray queries)"),
+            "{text}"
+        );
+        assert!(text.contains("restart needed"), "{text}");
+        // The setting stays enabled: it is saved for the next launch.
+        info.rt_note = Some("the device keeps its ray-query features until the next launch");
+        let mut setting = controls();
+        setting.backend = RtBackend::Compute;
+        info.rt_active = RtBackend::Hardware;
+        let text = draw(&info, &mut setting);
+        assert!(text.contains("until the next launch"), "{text}");
+    }
+
+    #[test]
+    fn the_panel_says_which_ray_backend_is_active_and_why() {
+        let (timings, cpu) = (Timings::default(), CpuBreakdown::default());
+        let text = draw(
+            &info_with(&timings, &cpu, RtBackend::Hardware, None),
+            &mut controls(),
+        );
+        assert!(
+            text.contains("ray tracing: hardware (ray queries)"),
+            "{text}"
+        );
+        assert!(text.contains("Hardware ray tracing (setting)"), "{text}");
+
+        // The player's setting for compute.
+        let mut setting = controls();
+        setting.backend = RtBackend::Compute;
+        let text = draw(
+            &info_with(&timings, &cpu, RtBackend::Compute, None),
+            &mut setting,
+        );
+        assert!(
+            text.contains("ray tracing: compute (the setting)"),
+            "{text}"
+        );
+
+        // An adapter without ray queries: compute, whatever the setting says, and the reason.
+        let text = draw(
+            &info_with(
+                &timings,
+                &cpu,
+                RtBackend::Compute,
+                Some("the adapter has no ray queries (EXPERIMENTAL_RAY_QUERY)"),
+            ),
+            &mut controls(),
+        );
+        assert!(
+            text.contains("ray tracing: compute (ray queries are not available)"),
+            "{text}"
+        );
+        assert!(
+            text.contains("compute only: the adapter has no ray queries"),
+            "{text}"
+        );
+    }
+
     #[test]
     fn the_help_line_names_the_noclip_key() {
         let timings = Timings::default();
@@ -452,6 +591,9 @@ mod tests {
             loading_paused: false,
             scene_memory: SceneMemory::default(),
             lod: None,
+            rt_active: RtBackend::Hardware,
+            rt_unavailable: None,
+            rt_note: None,
         };
         let text = draw(&info, &mut controls());
         assert!(text.contains("N: walk / noclip"), "{text}");
@@ -470,6 +612,9 @@ mod tests {
             loading_paused: false,
             scene_memory: SceneMemory::default(),
             lod: None,
+            rt_active: RtBackend::Hardware,
+            rt_unavailable: None,
+            rt_note: None,
         };
         let text = draw(&info, &mut controls());
         for key in [
@@ -507,6 +652,9 @@ mod tests {
             loading_paused: false,
             scene_memory: SceneMemory::default(),
             lod: None,
+            rt_active: RtBackend::Hardware,
+            rt_unavailable: None,
+            rt_note: None,
         };
         let text = draw(&info, &mut controls());
         for row in Row::ALL {
@@ -555,6 +703,9 @@ mod tests {
                 switch_m: 205.6,
                 bricks: vec![1200, 0, 340],
             }),
+            rt_active: RtBackend::Hardware,
+            rt_unavailable: None,
+            rt_note: None,
         };
         let text = draw(&info, &mut controls());
         for expected in [
@@ -594,6 +745,9 @@ mod tests {
             loading_paused: false,
             scene_memory: SceneMemory::default(),
             lod: None,
+            rt_active: RtBackend::Hardware,
+            rt_unavailable: None,
+            rt_note: None,
         };
         let text = draw(&info, &mut controls());
         assert!(text.contains("GPU timers: not supported"), "{text}");
@@ -613,6 +767,9 @@ mod tests {
             loading_paused: true,
             scene_memory: SceneMemory::default(),
             lod: None,
+            rt_active: RtBackend::Hardware,
+            rt_unavailable: None,
+            rt_note: None,
         };
         let mut controls = Controls {
             mode: Mode::Reference,
@@ -624,6 +781,7 @@ mod tests {
             },
             stages: Stages::default(),
             bias: 1.0,
+            backend: RtBackend::Hardware,
         };
         let before = controls;
         let text = draw(&info, &mut controls);

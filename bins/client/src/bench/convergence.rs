@@ -377,7 +377,12 @@ pub fn run(settings: &Settings, out: &Path) -> Result<ConvergenceReport, Box<dyn
             })
             .collect();
         gi::GiReport {
-            gates: gi::gates(&settings.gi, &scored, &edit),
+            gates: gi::gates(
+                &settings.gi,
+                &scored,
+                shadows.settled.flip.map(|f| f.flip_mean),
+                &edit,
+            ),
             edit,
         }
     };
@@ -596,7 +601,12 @@ fn run_view(view: View, settings: &Settings, out: &Path) -> Result<ViewReport, B
         )?);
         still_mse.push(score::mse(&capture.linear, &truth_a.linear));
     }
-    let gi = gi::score_view(&view, &settings.gi, &truth_a.image, &truth_a_rgb, &folder)?;
+    let mut gi = gi::score_view(&view, &settings.gi, &truth_a.image, &truth_a_rgb, &folder)?;
+    // The Reference at 64 samples, the curve's point, beside Primary's score (reported, not gated).
+    gi.reference_64 = curve
+        .iter()
+        .find(|p| p.samples == 64)
+        .and_then(|p| p.flip_mean);
     let still = still::report(
         batching_exact,
         max_batch_samples,
@@ -1027,7 +1037,7 @@ mod tests {
                     game_path: flip,
                 },
                 gates: gi::Gates {
-                    room_target_flip: gi::ROOM_TARGET_FLIP,
+                    primary_target_flip: gi::PRIMARY_TARGET_FLIP,
                     settle_within_ms: gi::SETTLE_WITHIN_MS,
                     reference_flip: still::FLIP_TARGET,
                     reference_within_s: still::WITHIN_S,
@@ -1054,7 +1064,13 @@ mod tests {
         };
         gi::ViewGi {
             flat: variant(0.2, 0.2),
-            gi: variant(0.2, 0.1),
+            raw: variant(0.2, 0.1),
+            gi: variant(0.1, 0.04),
+            other_weight: variant(0.1, 0.03),
+            shadow_weight: "per-sample",
+            other_shadow_weight: "centre-cosine",
+            reference_64: flip.then_some(0.15),
+            converged: None,
             settle_frames: 4,
             gi_not_further: flip.then_some(true),
             files: vec!["primary-gi-settled.png".into()],
@@ -1101,6 +1117,21 @@ mod tests {
             first_frame: score(0.04),
             settled: score(0.02),
             settle_frames: 4,
+            shadow_weight: "per-sample",
+            other_shadow_weight: "centre-cosine",
+            other_weight: shadows::PrimaryFrames {
+                first_frame: score(0.03),
+                settled: score(0.015),
+            },
+            raw: shadows::PrimaryFrames {
+                first_frame: score(0.06),
+                settled: score(0.05),
+            },
+            converged: None,
+            reference_64: flip.then_some(shadows::Scores {
+                flip_mean: 0.1,
+                flip_p99: 0.4,
+            }),
             meets_target: flip.then_some(true),
             edge_share: 0.05,
             files: vec!["truth-a.png".into()],
@@ -1204,6 +1235,21 @@ mod tests {
         };
         let mut sun = shadows::Settings::full(size, env("CONVERGENCE_TEST_SUN_TRUTH_SPP", 64));
         sun.shadow_rays = env("CONVERGENCE_TEST_SHADOW_RAYS", sun.shadow_rays);
+        // `CONVERGENCE_TEST_SHADOW_WEIGHT=centre-cosine` makes it the weight of the gates (#55).
+        let weight = std::env::var("CONVERGENCE_TEST_SHADOW_WEIGHT")
+            .ok()
+            .and_then(|name| {
+                render::ShadowWeight::ALL
+                    .into_iter()
+                    .find(|w| w.name() == name)
+            })
+            .unwrap_or_default();
+        sun.shadow_weight = weight;
+        // `CONVERGENCE_TEST_CONVERGED_FRAMES` (default 128, which is quick) is `Primary converged`'s.
+        sun.converged_frames = env("CONVERGENCE_TEST_CONVERGED_FRAMES", 128);
+        let mut gi_settings = gi::Settings::full(size);
+        gi_settings.shadow_weight = weight;
+        gi_settings.converged_frames = sun.converged_frames;
         let settings = Settings {
             size,
             checkpoints: vec![1, 4, 16, 64],
@@ -1215,7 +1261,7 @@ mod tests {
                 seconds: 0.3,
             },
             shadows: sun,
-            gi: gi::Settings::full(size),
+            gi: gi_settings,
         };
         let out = std::env::temp_dir().join(format!("bhayanak-convergence-{}", std::process::id()));
         let _ = fs::remove_dir_all(&out);

@@ -13,6 +13,7 @@ use crate::batch::max_samples;
 use crate::camera::{Camera, CameraUniform};
 use crate::daylight::{MOON_DISC, Night};
 use crate::debug_view::DebugView;
+use crate::denoise::{self, Denoise, SAMPLES_FORMAT};
 use crate::emitters::{Applied, EmitterIndex, Emitters, emissive_materials};
 use crate::gpu_materials;
 use crate::look::{Look, LookUniform};
@@ -79,6 +80,41 @@ const EVERYWHERE: ([i32; 3], [i32; 3]) = ([i32::MIN / 2; 3], [i32::MAX / 2; 3]);
 
 /// Format of the upscaler's history: encoded colour, and in alpha the frames it has been through.
 pub const HISTORY_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
+
+/// Where `shade_pass` reads the light that it lights the image with (the denoiser's result, or the
+/// frame's samples as they are when it is off): a texture of [`SAMPLES_FORMAT`], the incident light
+/// in xyz and the sun's weight in w (`denoised_light` in `shade.wgsl`).
+const DENOISED_BINDING: u32 = 23;
+
+/// How `shadows` weighs the light of each of a pixel's shadow rays (ADR 0005, "Sun and shadows").
+/// The two agree in expectation where the surface faces the sun squarely, and differ by the change of
+/// the cosine over the sun's disc at a penumbra and where the surface is nearly edge-on to the sun,
+/// which is where #52's miss was. `PerSample` is the default (the 4090 of #55 measured the sun view's
+/// settled FLIP at 0.021 with it and the denoiser, against 0.055 with the centre cosine); the
+/// bench's `--shadow-weight` chooses, and reports both.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(u32)]
+pub enum ShadowWeight {
+    /// The cosine at the disc's centre, however many of the rays see the sun: no noise on a lit
+    /// surface, and a bias in the penumbra (#52's, shipped on 2026-11-17, and the default until #55).
+    CentreCosine = 0,
+    /// Each ray weighed by its own cosine over the disc's mean cosine, as the Reference weighs its
+    /// samples: unbiased, and noisier where a surface is edge-on to the sun, which the denoiser
+    /// takes (#55). The default.
+    #[default]
+    PerSample = 1,
+}
+
+impl ShadowWeight {
+    pub const ALL: [ShadowWeight; 2] = [Self::CentreCosine, Self::PerSample];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::CentreCosine => "centre-cosine",
+            Self::PerSample => "per-sample",
+        }
+    }
+}
 
 /// `Level` in `trace.wgsl`.
 #[repr(C)]
@@ -290,7 +326,8 @@ struct FrameUniform {
     /// rays a pixel casts.
     light: [u32; 4],
     /// Primary's radiance cache: the frame's number, 1 if an Edit or the sun changed lately (in the
-    /// cells of the box below), and two unused.
+    /// cells of the box below), then how `shadows` weighs each ray (0: the cosine at the disc's
+    /// centre, 1: the ray's own cosine, [`ShadowWeight`]), and one unused.
     gi: [u32; 4],
     /// The first Voxel of the box that the cache forgets faster in, and one past its last (the
     /// fourth word of each is unused).
@@ -336,7 +373,8 @@ impl Plane {
             format,
             usage: wgpu::TextureUsages::STORAGE_BINDING
                 | wgpu::TextureUsages::TEXTURE_BINDING
-                | wgpu::TextureUsages::COPY_SRC,
+                | wgpu::TextureUsages::COPY_SRC
+                | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
@@ -400,6 +438,8 @@ pub struct Target {
     /// The light from the bounce, the sky and the emitters at each hit (`gi_trace`), read by the lit
     /// image's pass.
     gi_light: Plane,
+    /// The denoiser's samples, history and results (`denoise.rs`).
+    denoise: denoise::Buffers,
     reference_size: (u32, u32),
     /// The reference path tracer's mean as linear light, and the display transform's images for it.
     reference_hdr: Plane,
@@ -440,6 +480,7 @@ impl Target {
             normals: Plane::new(device, "smooth normals", internal, NORMALS_FORMAT),
             sun_weights: Plane::new(device, "sun weights", internal, SUN_FORMAT),
             gi_light: Plane::new(device, "gi light", internal, GI_FORMAT),
+            denoise: denoise::Buffers::new(device, internal),
             reference_size,
             reference_hdr: Plane::new(
                 device,
@@ -618,6 +659,15 @@ pub struct Tracer {
     /// Whether Primary's light has the flat ambient of before #54 in place of its GI (see
     /// [`Tracer::set_flat_ambient`]).
     flat_ambient: bool,
+    /// The frame's samples of the two noisy signals at every pixel (`gi_samples`), and the denoiser
+    /// that works on them (`denoise.rs`).
+    samples_layout: wgpu::BindGroupLayout,
+    samples: wgpu::ComputePipeline,
+    denoise_pass: denoise::Pass,
+    denoise: Denoise,
+    /// The history image the denoiser wrote in the last frame of Primary that had one (the last
+    /// frame's result is in it, see `Buffers::result`), none for a frame that had no history.
+    denoise_written: Option<usize>,
     shade_layout: wgpu::BindGroupLayout,
     shade: wgpu::ComputePipeline,
     /// The display transform and the exposure it keeps from frame to frame.
@@ -638,6 +688,8 @@ pub struct Tracer {
     sun_and_sky_only: bool,
     /// The shadow rays a pixel casts (see [`Tracer::set_shadow_rays`]).
     shadow_rays: u32,
+    /// How each ray's light is weighed (see [`Tracer::set_shadow_weight`]).
+    shadow_weight: ShadowWeight,
     /// The atmosphere's tables, and the height of the Planet's ground along the up: 0 in a world
     /// that is not a Planet (the camera's height is then its height above y = 0 along its
     /// up), the Planet's radius over the Planet ([`Tracer::set_ground_level`]).
@@ -675,6 +727,12 @@ pub struct Tracer {
     /// How long the last [`Tracer::update_scene`] spent making the buffers that grew (making them
     /// and recording the copies), on the host.
     last_grow_time: std::time::Duration,
+    /// The host's time in the last scene update's submit of its copies (and the belt's recall).
+    last_upload_submit: std::time::Duration,
+    /// Of that, the `Queue::submit` alone (not the belt's finish and recall).
+    last_queue_submit: std::time::Duration,
+    /// The host's time in the last scene update's emitter index (`update_emitters`).
+    last_emitters: std::time::Duration,
     /// The most bytes of GPU memory the scene's buffers have taken while a buffer grew: what they
     /// held before, and the new buffers made, with the old buffer and the new one both there while
     /// the copy into the bigger one is made. 0 if none has grown.
@@ -706,6 +764,29 @@ struct HwLayout {
 
 /// The size of a chunk of the staging belt, in bytes: a patch is written to a few of them.
 const BELT_CHUNK: u64 = 4 << 20;
+
+/// The chunks the staging belt has before the first scene update: a chunk is a device allocation
+/// of [`BELT_CHUNK`] bytes (2 to 3 ms on the 4090's driver and on lavapipe), and the belt makes
+/// one when it has none that the GPU is done with. The first Edit of a context that had not
+/// uploaded much, or whose earlier uploads the GPU still held, paid for that in its frame (#236: the
+/// first hardware Edit by the ground was 5.7 ms, 3.2 of them in the write, and compute's 1.9 with
+/// 0.4). Three are one in use, one the GPU has, and one to spare; a belt that needs more keeps them.
+const BELT_WARM_CHUNKS: usize = 3;
+
+/// Gives `belt` [`BELT_WARM_CHUNKS`] chunks that are free to be written to.
+fn warm_belt(device: &wgpu::Device, belt: &mut wgpu::util::StagingBelt) {
+    let size = wgpu::BufferSize::new(BELT_CHUNK).expect("a chunk is not empty");
+    let align = wgpu::BufferSize::new(4).expect("a word");
+    // A request of a whole chunk fills the one it is given, so that the next makes another.
+    for _ in 0..BELT_WARM_CHUNKS {
+        belt.allocate(size, align);
+    }
+    belt.finish();
+    belt.recall();
+    // A chunk is free for the belt once the device has told it so, which it does when it is
+    // polled: without this the first write would find none, and make one.
+    let _ = device.poll(wgpu::PollType::wait_indefinitely());
+}
 
 /// Where the emitters' buffer is bound, in group 1 of the kernels that sample them (`emitters` in
 /// `emitters.wgsl`).
@@ -1127,8 +1208,67 @@ impl Tracer {
     /// the sky is black and the sun unattenuated, #203), the look, the stages, the night, the debug
     /// view, the seed and the rest of what a caller set on it. The new Planet counts as the sun
     /// jumping ([`Tracer::sun_changed`]), as it starts the views and the caches over.
-    pub fn replace_scene(&mut self, device: &wgpu::Device, scene: &Scene) -> Result<()> {
-        let mut next = Self::new(device, scene)?;
+    ///
+    /// **It keeps the ray backend too** (#50): a tracer on the hardware backend is rebuilt on the
+    /// hardware backend, with the same shadow-ray variant, its acceleration structures made for
+    /// `scene` with the frame starting at `camera` (Voxels of level 0; the camera that was last
+    /// drawn from). The built-in Materials are the new tracer's, as they were.
+    pub fn replace_scene(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        scene: &Scene,
+        camera: [f64; 3],
+    ) -> Result<()> {
+        self.switch_backend(device, queue, scene, camera, self.backend())
+    }
+
+    /// A tracer for `scene` on the ray backend `backend` (#50), with the built-in Materials: the
+    /// hardware ones need a device with ray queries ([`crate::choose_backend`]), and `camera` is
+    /// where their frame starts.
+    pub fn on_backend(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        scene: &Scene,
+        camera: [f64; 3],
+        backend: crate::RtBackend,
+    ) -> Result<Self> {
+        if backend.is_hardware() {
+            Self::hardware(
+                device,
+                queue,
+                scene,
+                None,
+                camera,
+                backend == crate::RtBackend::Hardware,
+            )
+        } else {
+            Self::new(device, scene)
+        }
+    }
+
+    /// Which ray backend this tracer runs (see [`crate::RtBackend`]).
+    pub fn backend(&self) -> crate::RtBackend {
+        match &self.hw {
+            None => crate::RtBackend::Compute,
+            Some(hw) if hw.layout.any_hit_shadows => crate::RtBackend::Hardware,
+            Some(_) => crate::RtBackend::HardwareNearest,
+        }
+    }
+
+    /// Rebuilds the tracer for `scene` on `backend`, keeping every setting that
+    /// [`Tracer::replace_scene`] keeps: what the player's change of the ray backend does (#50). A
+    /// hardware `backend` needs a device with ray queries ([`crate::choose_backend`]). If it fails,
+    /// the tracer is as it was.
+    pub fn switch_backend(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        scene: &Scene,
+        camera: [f64; 3],
+        backend: crate::RtBackend,
+    ) -> Result<()> {
+        let mut next = Self::on_backend(device, queue, scene, camera, backend)?;
         next.debug_view = self.debug_view;
         next.ground_level = self.ground_level;
         next.look = self.look;
@@ -1188,13 +1328,6 @@ impl Tracer {
             layout: crate::hw::bind_group_layout(device),
             any_hit_shadows,
         });
-        let hw = match (hardware, &hw_layout) {
-            (Some((queue, camera, _)), Some(hw)) => Some(Hardware {
-                scene: crate::hw::HwScene::new(device, queue, hw.layout.clone(), scene, camera)?,
-                layout: hw.clone(),
-            }),
-            _ => None,
-        };
         let scene_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("scene"),
             entries: &[
@@ -1206,8 +1339,25 @@ impl Tracer {
             ],
         });
         let scene_buffers = SceneBuffers::new(device, None, &scene_layout, scene)?;
+        // The hardware backend makes its boxes on the GPU, from the scene's buffers.
+        let hw = match (hardware, &hw_layout) {
+            (Some((queue, camera, _)), Some(hw)) => Some(Hardware {
+                scene: crate::hw::HwScene::new(
+                    device,
+                    queue,
+                    hw.layout.clone(),
+                    &scene_layout,
+                    &scene_buffers.group,
+                    scene,
+                    camera,
+                )?,
+                layout: hw.clone(),
+            }),
+            _ => None,
+        };
         let scene_bytes = scene_buffers.bytes;
-        let belt = wgpu::util::StagingBelt::new(device.clone(), BELT_CHUNK);
+        let mut belt = wgpu::util::StagingBelt::new(device.clone(), BELT_CHUNK);
+        warm_belt(device, &mut belt);
 
         let camera_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("camera, image, accumulation, materials and G-buffer"),
@@ -1296,13 +1446,25 @@ impl Tracer {
                 texture(5, uint),
                 texture(6, uint),
                 texture(8, loaded),
-                texture(10, loaded),
                 layout_entry(GI_CACHE_BINDING, buffer_binding(STORAGE_WRITE)),
-                texture(21, loaded),
+                texture(DENOISED_BINDING, loaded),
             ]
             .into_iter()
             .chain(AtmosphereTables::layout_entries())
             .collect::<Vec<_>>(),
+        });
+        let samples_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("denoise samples"),
+            entries: &[
+                layout_entry(0, buffer_binding(wgpu::BufferBindingType::Uniform)),
+                layout_entry(2, buffer_binding(wgpu::BufferBindingType::Uniform)),
+                texture(5, uint),
+                texture(6, uint),
+                texture(8, loaded),
+                texture(10, loaded),
+                texture(21, loaded),
+                layout_entry(22, storage_texture(SAMPLES_FORMAT)),
+            ],
         });
         let materials = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("materials"),
@@ -1389,6 +1551,16 @@ impl Tracer {
                 | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
+        let samples = compute_pipeline(
+            device,
+            "denoise samples",
+            shaders::SHADE,
+            "gi_samples",
+            &samples_layout,
+            &scene_layout,
+            hw_layout.as_ref(),
+            &[],
+        );
         let shade = compute_pipeline(
             device,
             "shade",
@@ -1431,6 +1603,11 @@ impl Tracer {
             camera_position: [0.0; 3],
             emitter_index,
             flat_ambient: false,
+            samples_layout,
+            samples,
+            denoise_pass: denoise::Pass::new(device),
+            denoise: Denoise::default(),
+            denoise_written: None,
             shade_layout,
             shade,
             post: Post::new(device),
@@ -1440,6 +1617,7 @@ impl Tracer {
             key_is_moon: false,
             sun_and_sky_only: false,
             shadow_rays: DEFAULT_SHADOW_RAYS,
+            shadow_weight: ShadowWeight::default(),
             atmosphere: AtmosphereTables::new(device),
             ground_level: 0.0,
             look: Look::default(),
@@ -1459,6 +1637,9 @@ impl Tracer {
             last_writes: 0,
             last_grown: 0,
             last_grow_time: std::time::Duration::ZERO,
+            last_upload_submit: std::time::Duration::ZERO,
+            last_queue_submit: std::time::Duration::ZERO,
+            last_emitters: std::time::Duration::ZERO,
             peak_growth_bytes: 0,
             peak_rebuild_bytes: 0,
             belt,
@@ -1511,7 +1692,12 @@ impl Tracer {
     ) {
         self.gi_frame += 1;
         self.camera_position = camera.position;
-        self.follow_hw(device, queue, camera.position);
+        self.follow_hw(
+            device,
+            queue,
+            Some(profiler.frames_begun()),
+            camera.position,
+        );
         let key = self.settle_key(camera, sun);
         self.write_uniforms(queue, camera, &key, (0, CENTRE, 0), 0);
         self.encode_atmosphere(
@@ -1525,7 +1711,8 @@ impl Tracer {
         );
         // Nothing carries over from one call to the next, the exposure included: it settles at
         // once, on this image. (The radiance cache does: it is the world's, not the image's.)
-        self.dispatch_primary(device, queue, profiler, encoder, target, 1.0);
+        self.denoise_written = None;
+        self.dispatch_primary(device, queue, profiler, encoder, target, 1.0, None);
         self.gi_boost = self.gi_boost.saturating_sub(1);
     }
 
@@ -1583,7 +1770,12 @@ impl Tracer {
         frame.light_settling(self.edit_settling > 0);
         self.gi_frame += 1;
         self.camera_position = camera.position;
-        self.follow_hw(device, queue, camera.position);
+        self.follow_hw(
+            device,
+            queue,
+            Some(profiler.frames_begun()),
+            camera.position,
+        );
         self.write_uniforms(
             queue,
             camera,
@@ -1600,7 +1792,22 @@ impl Tracer {
             sun,
             target.resolution.internal,
         );
-        self.dispatch_primary(device, queue, profiler, encoder, target, rate);
+        // The denoiser's history is the upscaler's: the same cameras, and it starts over with it.
+        let denoise = denoise::Frame::new(
+            &frame,
+            self.stages.smooth_normals,
+            (self.gi_boost > 0).then_some(self.gi_boost_box),
+        );
+        self.denoise_written = Some(denoise.written());
+        self.dispatch_primary(
+            device,
+            queue,
+            profiler,
+            encoder,
+            target,
+            rate,
+            Some(&denoise),
+        );
         self.gi_boost = self.gi_boost.saturating_sub(1);
         self.edit_settling = self.edit_settling.saturating_sub(1);
         self.upscale
@@ -1649,7 +1856,12 @@ impl Tracer {
         let samples = batch_of(samples, target.reference_size);
         let view = View::new(camera, sun, &self.night, target);
         let first = self.accumulator.begin_batch(&view, samples);
-        self.follow_hw(device, queue, camera.position);
+        self.follow_hw(
+            device,
+            queue,
+            Some(profiler.frames_begun()),
+            camera.position,
+        );
         let key = self.settle_key(camera, sun);
         self.write_uniforms(queue, camera, &key, (first, CENTRE, samples), 0);
         self.encode_atmosphere(
@@ -1802,7 +2014,8 @@ impl Tracer {
     ) -> Result<()> {
         self.update_scene_buffers(device, queue, scene, update)?;
         if let Some(hw) = &mut self.hw {
-            hw.scene.update(device, queue, scene, update);
+            hw.scene
+                .update(device, queue, &self.scene.group, scene, update);
         }
         Ok(())
     }
@@ -1821,6 +2034,149 @@ impl Tracer {
             .map_or_else(Vec::new, |h| h.scene.take_log())
     }
 
+    /// What the updates of the hardware backend's acceleration structures since the last call cost
+    /// the frame thread, whichever call made them (zero on the compute backend).
+    pub fn take_hardware_cost(&mut self) -> std::time::Duration {
+        self.hw
+            .as_mut()
+            .map_or(std::time::Duration::ZERO, |h| h.scene.take_cost())
+    }
+
+    /// How many groups of the hardware backend's acceleration structures are stale and wait for
+    /// the budget of a later update (0 on the compute backend).
+    pub fn hardware_pending(&self) -> usize {
+        self.hw.as_ref().map_or(0, |h| h.scene.pending())
+    }
+
+    /// Whether the hardware backend times its builds apart when it waits (see
+    /// [`crate::hw::HwScene::times_builds`]); false on the compute backend.
+    pub fn hardware_times_builds(&self) -> bool {
+        self.hw.as_ref().is_some_and(|h| h.scene.times_builds())
+    }
+
+    /// Builds every group of the hardware backend's acceleration structures that is stale, at
+    /// once, whatever the budget (a no-op on the compute backend): for tests and for the
+    /// benchmark's settle.
+    pub fn settle_hardware(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
+        if let Some(hw) = &mut self.hw {
+            hw.scene.flush(device, queue, &self.scene.group);
+        }
+    }
+
+    /// Changes how the hardware backend's BLASes are made of the scene's cells and builds them all
+    /// again at once ([`crate::hw::Grouping`]; a no-op on the compute backend).
+    pub fn set_hardware_grouping(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        scene: &crate::Scene,
+        grouping: crate::hw::Grouping,
+    ) {
+        if let Some(hw) = &mut self.hw {
+            hw.scene.set_grouping(grouping, scene);
+            hw.scene.flush(device, queue, &self.scene.group);
+        }
+    }
+
+    /// How the hardware backend's cells go into BLASes (the default on the compute backend).
+    pub fn hardware_grouping(&self) -> crate::hw::Grouping {
+        self.hw
+            .as_ref()
+            .map_or_else(Default::default, |h| h.scene.grouping())
+    }
+
+    /// The instances of the hardware backend's TLAS (0 on the compute backend).
+    pub fn hardware_instances(&self) -> u32 {
+        self.hw.as_ref().map_or(0, |h| h.scene.instances())
+    }
+
+    /// Sets the most BLASes a frame of the hardware backend builds of the groups that may wait.
+    pub fn set_hardware_blas_budget(&mut self, blas: u32) {
+        if let Some(hw) = &mut self.hw {
+            hw.scene.set_blas_budget(blas);
+        }
+    }
+
+    /// Sets the most boxes an update of the hardware backend builds (see [`crate::hw::BUILD_BUDGET`]).
+    pub fn set_hardware_budget(&mut self, boxes: u64) {
+        if let Some(hw) = &mut self.hw {
+            hw.scene.set_budget(boxes);
+        }
+    }
+
+    /// Whether the hardware backend's updates wait for the GPU, so that their time is the
+    /// builds' own (see [`crate::hw::HwScene::set_wait`]).
+    pub fn set_hardware_wait(&mut self, wait: bool) {
+        if let Some(hw) = &mut self.hw {
+            hw.scene.set_wait(wait);
+        }
+    }
+
+    /// The groups of the hardware backend that are built, and the boxes each was built from.
+    pub fn hardware_groups(&self) -> std::collections::BTreeMap<crate::hw::GroupKey, u32> {
+        self.hw
+            .as_ref()
+            .map_or_else(Default::default, |h| h.scene.built())
+    }
+
+    /// The boxes of every built group of the hardware backend as the GPU has them (waits).
+    pub fn hardware_boxes(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+    ) -> std::collections::BTreeMap<crate::hw::GroupKey, Vec<[u32; 8]>> {
+        self.hw
+            .as_ref()
+            .map_or_else(Default::default, |h| h.scene.read_boxes(device, queue))
+    }
+
+    /// The boxes that the GPU's box pass makes for `jobs` (level, group, box count) from the
+    /// scene as the GPU has it, read back: needs no ray queries (waits). For the test that holds
+    /// the pass to `hw::group_prims`.
+    pub fn box_pass_boxes(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        jobs: &[(u8, [i32; 3], u32)],
+    ) -> Vec<Vec<[u32; 8]>> {
+        self.box_pass_boxes_chunked(device, queue, jobs, usize::MAX)
+    }
+
+    /// [`Tracer::box_pass_boxes`] with `chunk` jobs to a dispatch.
+    pub fn box_pass_boxes_chunked(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        jobs: &[(u8, [i32; 3], u32)],
+        chunk: usize,
+    ) -> Vec<Vec<[u32; 8]>> {
+        let mut pass = crate::hw::BoxPass::new(device, &self.scene_layout);
+        if chunk != usize::MAX {
+            pass.set_chunk(chunk);
+        }
+        pass.make(device, queue, &self.scene.group, jobs)
+    }
+
+    /// Follows the camera as a draw of frame `frame` would (see [`crate::hw::HwScene::follow`]),
+    /// for tests that stand for the draws of a frame: a view after the first of a frame has no
+    /// budget of its own.
+    pub fn follow_hardware(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        frame: Option<u64>,
+        position: [f64; 3],
+    ) {
+        self.follow_hw(device, queue, frame, position);
+    }
+
+    /// The frames a group of the hardware backend that only lost may wait for its build.
+    pub fn set_hardware_max_wait(&mut self, frames: u32) {
+        if let Some(hw) = &mut self.hw {
+            hw.scene.set_max_wait(frames);
+        }
+    }
+
     /// Binds the hardware backend's group (2) in `pass`, if there is one.
     fn bind_hw(&self, pass: &mut wgpu::ComputePass<'_>) {
         if let Some(hw) = &self.hw {
@@ -1828,10 +2184,19 @@ impl Tracer {
         }
     }
 
-    /// Moves the hardware backend's frame to the camera, if it has one.
-    fn follow_hw(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, position: [f64; 3]) {
+    /// Moves the hardware backend's frame to the camera, if it has one, and builds the next groups
+    /// that wait. `frame`: which frame of the profiler this draw is of, or `None` for one that is not (see
+    /// [`crate::hw::HwScene::follow`]).
+    fn follow_hw(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        frame: Option<u64>,
+        position: [f64; 3],
+    ) {
         if let Some(hw) = &mut self.hw {
-            hw.scene.follow(device, queue, position);
+            hw.scene
+                .follow(device, queue, &self.scene.group, frame, position);
         }
     }
 
@@ -1844,7 +2209,9 @@ impl Tracer {
     ) -> Result<()> {
         self.restart_reference();
         self.smooth_end = smooth_end(scene);
+        let emitting = std::time::Instant::now();
         self.update_emitters(device, scene, update);
+        self.last_emitters = emitting.elapsed();
         // Counted where each write is made, not summed from the patch's cost: [`upload_cost`] is
         // the other count, and the two are compared. Both go over `RingPatch::copies()`, so the
         // comparison does not check that list (the stepped tests' `GpuCopy::assert_is` does).
@@ -1853,6 +2220,8 @@ impl Tracer {
         self.last_writes = 0;
         self.last_grown = 0;
         self.last_grow_time = std::time::Duration::ZERO;
+        self.last_upload_submit = std::time::Duration::ZERO;
+        self.last_queue_submit = std::time::Duration::ZERO;
         match update {
             SceneUpdate::Rebuilt => {
                 let before = self.scene.bytes;
@@ -1909,9 +2278,13 @@ impl Tracer {
                     written += bytes.len() as u64;
                     writes += 1;
                 }
+                let submitting = std::time::Instant::now();
                 self.belt.finish();
+                let queued = std::time::Instant::now();
                 queue.submit(std::iter::once(encoder.finish()));
+                self.last_queue_submit = queued.elapsed();
                 self.belt.recall();
+                self.last_upload_submit = submitting.elapsed();
             }
             SceneUpdate::Patched {
                 regions,
@@ -1973,6 +2346,21 @@ impl Tracer {
     /// the copies into them, on the host (the GPU's copy is not in it). Zero if nothing grew.
     pub fn last_grow_time(&self) -> std::time::Duration {
         self.last_grow_time
+    }
+
+    /// The host's time in the emitter index of the last [`Tracer::update_scene`].
+    pub fn last_emitters(&self) -> std::time::Duration {
+        self.last_emitters
+    }
+
+    /// The host's time in the `Queue::submit` of the last [`Tracer::update_scene`]'s copies.
+    pub fn last_upload_submit(&self) -> std::time::Duration {
+        self.last_upload_submit
+    }
+
+    /// Of [`Tracer::last_upload_submit`], the `Queue::submit` alone.
+    pub fn last_queue_submit(&self) -> std::time::Duration {
+        self.last_queue_submit
     }
 
     /// How many times each of the scene's table, regions, brick refs and bricks buffers has been
@@ -2282,6 +2670,48 @@ impl Tracer {
         }
     }
 
+    /// Chooses how `shadows` weighs the light of each of its rays ([`ShadowWeight`]). The
+    /// upscaler's history and the denoiser's start over: they hold the other weight's light.
+    pub fn set_shadow_weight(&mut self, weight: ShadowWeight) {
+        if weight != self.shadow_weight {
+            self.shadow_weight = weight;
+            self.history.reset();
+        }
+    }
+
+    pub fn shadow_weight(&self) -> ShadowWeight {
+        self.shadow_weight
+    }
+
+    /// Chooses how much of the denoiser (#55) runs ([`Denoise`]): all of it for the game's A-SVGF
+    /// (what a `Tracer` has), the temporal accumulation alone, or none, which lights the image with
+    /// the frame's samples as they are, as before the denoiser. The upscaler's history and the
+    /// denoiser's start over.
+    pub fn set_denoise(&mut self, mode: Denoise) {
+        if mode != self.denoise {
+            self.denoise = mode;
+            self.history.reset();
+        }
+    }
+
+    pub fn denoise(&self) -> Denoise {
+        self.denoise
+    }
+
+    /// The texture that the last frame of Primary was lit with (the denoiser's result, or the frame's
+    /// samples as they are where it is off): the incident light in xyz and the sun's weight in w,
+    /// and whether it is `f32` (else half floats). For tests and the bench.
+    pub(crate) fn light_signals<'a>(&self, target: &'a Target) -> (&'a Plane, bool) {
+        let plane = target.denoise.result(self.denoise, self.denoise_written);
+        let wide = plane.texture.format() == wgpu::TextureFormat::Rgba32Float;
+        (plane, wide)
+    }
+
+    /// The frame's samples of the last frame of Primary, before the denoiser (half floats).
+    pub(crate) fn frame_samples<'a>(&self, target: &'a Target) -> &'a Plane {
+        target.denoise.samples()
+    }
+
     /// Sets the seed of the reference's random numbers (the default is [`RNG_SEED`]) and starts
     /// its image over: the same view, sample count and seed give the same image, and another seed
     /// gives an independent one of the same expected value.
@@ -2376,7 +2806,12 @@ impl Tracer {
                 u32::from(!self.sun_and_sky_only),
                 self.shadow_rays,
             ],
-            gi: [self.gi_frame, u32::from(self.gi_boost > 0), 0, 0],
+            gi: [
+                self.gi_frame,
+                u32::from(self.gi_boost > 0),
+                self.shadow_weight as u32,
+                0,
+            ],
             boost_min: [
                 self.gi_boost_box.0[0],
                 self.gi_boost_box.0[1],
@@ -2416,6 +2851,7 @@ impl Tracer {
     /// the display transform, which makes the encoded lit image. A debug view is drawn by primary
     /// visibility itself (the upscaler draws the history length one), and passes through the
     /// display transform as it is.
+    #[allow(clippy::too_many_arguments)]
     fn dispatch_primary(
         &self,
         device: &wgpu::Device,
@@ -2424,6 +2860,7 @@ impl Tracer {
         encoder: &mut wgpu::CommandEncoder,
         target: &Target,
         rate: f32,
+        denoise: Option<&denoise::Frame>,
     ) {
         self.dispatch(
             device,
@@ -2449,7 +2886,8 @@ impl Tracer {
             }
             self.dispatch_shadows(device, profiler, encoder, target);
             self.dispatch_gi(device, profiler, encoder, target);
-            self.dispatch_shade(device, profiler, encoder, target);
+            let written = self.dispatch_denoise(device, queue, profiler, encoder, target, denoise);
+            self.dispatch_shade(device, profiler, encoder, target, written);
         }
         self.post.encode(
             device,
@@ -2589,14 +3027,69 @@ impl Tracer {
         pass.dispatch_workgroups(GI_CACHE_SLOTS.div_ceil(64) as u32, 1, 1);
     }
 
-    /// The lit image as linear light, from the G-buffer and the sun's light at each hit
-    /// (`shade_pass` in `shade.wgsl`).
+    /// The denoiser (`denoise.rs`, #55), in one timed pass called `denoise`: the frame's samples of
+    /// the sun's weight and the incident light at every pixel (`gi_samples`), then, with a `frame`
+    /// to carry on from (not for a frame with no history to keep, as `encode_primary`'s) and unless
+    /// the denoiser is off, the temporal accumulation and the filter. Returns the history image the
+    /// frame wrote, which says where the result is (`Buffers::result`); `None` for a frame with no
+    /// history to keep, which `shade_pass` lights with the samples.
+    fn dispatch_denoise(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        profiler: &mut Profiler,
+        encoder: &mut wgpu::CommandEncoder,
+        target: &Target,
+        frame: Option<&denoise::Frame>,
+    ) -> Option<usize> {
+        let view = plane_entry;
+        let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("denoise samples"),
+            layout: &self.samples_layout,
+            entries: &[
+                buffer_entry(0, &self.camera_buffer),
+                buffer_entry(2, &self.frame_buffer),
+                view(5, &target.gbuffer),
+                view(6, &target.surface),
+                view(8, &target.normals),
+                view(10, &target.sun_weights),
+                view(21, &target.gi_light),
+                view(22, target.denoise.samples()),
+            ],
+        });
+        let size = target.resolution.internal;
+        let mut pass = profiler.compute_pass(encoder, "denoise");
+        pass.set_pipeline(&self.samples);
+        pass.set_bind_group(0, &self.scene.group, &[]);
+        self.bind_hw(&mut pass);
+        pass.set_bind_group(1, &group, &[]);
+        pass.dispatch_workgroups(size.0.div_ceil(8), size.1.div_ceil(8), 1);
+        let frame = frame?;
+        self.denoise_pass.encode(
+            device,
+            queue,
+            &mut pass,
+            frame,
+            self.denoise,
+            size,
+            &target.denoise,
+            &target.gbuffer,
+            &target.surface,
+            &target.normals,
+        );
+        Some(frame.written())
+    }
+
+    /// The lit image as linear light, from the G-buffer and the light at each hit: the sun's weight
+    /// and the incident light, denoised or not (`shade_pass` in `shade.wgsl`). `written` is the
+    /// history image the denoiser's frame wrote, if it ran.
     fn dispatch_shade(
         &self,
         device: &wgpu::Device,
         profiler: &mut Profiler,
         encoder: &mut wgpu::CommandEncoder,
         target: &Target,
+        written: Option<usize>,
     ) {
         let view = plane_entry;
         let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -2619,9 +3112,11 @@ impl Tracer {
                 view(5, &target.gbuffer),
                 view(6, &target.surface),
                 view(8, &target.normals),
-                view(10, &target.sun_weights),
                 buffer_entry(GI_CACHE_BINDING, &self.gi_cache),
-                view(21, &target.gi_light),
+                view(
+                    DENOISED_BINDING,
+                    target.denoise.result(self.denoise, written),
+                ),
             ]
             .into_iter()
             .chain(self.atmosphere.entries())
@@ -2706,7 +3201,7 @@ impl Tracer {
             return Vec::new();
         }
         // The hardware backend's frame is round the first ray's cell.
-        self.follow_hw(device, queue, rays[0].cell.map(f64::from));
+        self.follow_hw(device, queue, None, rays[0].cell.map(f64::from));
         // Three vec4s per ray: cell, origin, direction.
         let input: Vec<[u32; 4]> = rays
             .iter()

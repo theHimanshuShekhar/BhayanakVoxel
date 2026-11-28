@@ -46,6 +46,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering as Atomic};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, TryLockError};
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use brick_store::{Brick, BrickCoord, BrickSource, BrickStore, TableSize, children_generated};
 use render::lod::{Bands, Class, Reach, brick_distance};
@@ -84,8 +85,18 @@ pub fn hold_guard(
 /// (#220): the rest of the Guard is made in the background, 2 of the 6 workers at eight cores, and
 /// the ring's children are not made later for it. Never more than all but one of the workers
 /// ([`guard_may_start`]), so that the streaming queue always has one: with 4 or 5 cores that is 1
-/// of 2 or 3 workers.
+/// of 2 or 3 workers. This is the least of it, which is a stepped loader's, so that the stepped
+/// counts do not depend on the machine; with more than six workers it is a third of them
+/// ([`guard_share`]), so that the Guard on a 16-thread machine is made in the background by four
+/// workers and not by two (#264).
 pub const GUARD_WORKERS: usize = 2;
+
+/// How many of `workers` make cells of the Guard beside the queue's jobs: [`GUARD_WORKERS`], and a
+/// third of the workers when that is more. The floor is the two that were always given, the
+/// ceiling is the third that leaves the ring's children their share.
+pub fn guard_share(workers: usize) -> usize {
+    GUARD_WORKERS.max(workers / 3)
+}
 
 /// With a single worker (three cores or fewer) the Guard has no share while there is other work, so
 /// it is given a cell after this many of the queue's jobs, not to wait for a fill that takes
@@ -103,7 +114,7 @@ fn guard_may_start(workers: usize, guarding: usize, queue_empty: bool, since: us
     if queue_empty {
         guarding < all_but_one.max(1)
     } else {
-        let share = GUARD_WORKERS.min(all_but_one);
+        let share = guard_share(workers).min(all_but_one);
         guarding < share || (share == 0 && since >= GUARD_EVERY)
     }
 }
@@ -181,6 +192,10 @@ struct Job {
     /// The children that are held already, which are not generated: bit `i` for the `i`th of
     /// [`BrickCoord::children`].
     held: u8,
+    /// When the scene thread asked for it, and when [`Loader::sync`] put it in the workers' queue
+    /// (#251: [`Latency`]).
+    asked: Instant,
+    synced: Instant,
 }
 
 impl PartialEq for Job {
@@ -269,6 +284,127 @@ impl Shared {
     }
 }
 
+/// Where a job's time went, from the scene thread asking for it to the scene thread taking in what
+/// the workers made of it (#251): the instants a job passed, which [`Latency`] sorts into bins.
+#[derive(Clone, Copy)]
+struct Stamps {
+    class: Class,
+    asked: Instant,
+    synced: Instant,
+    started: Instant,
+    finished: Instant,
+}
+
+/// The classes of a job, in the order of [`Class`] (the least urgent first).
+pub const LATENCY_CLASSES: [&str; 3] = ["prefetch", "margin", "drawn"];
+/// The parts of a job's time: in the scene thread's outbox until a sync handed it over, in the
+/// workers' queue until one took it, being generated, in the channel until the scene thread took
+/// it in, and all of them.
+pub const LATENCY_PHASES: [&str; 5] = ["outbox", "queued", "made", "waited", "total"];
+/// Upper bounds, in milliseconds, of the bins of [`Latency`]; a last bin takes what is over.
+pub const LATENCY_BINS_MS: [f64; 9] = [0.5, 1.0, 2.5, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0];
+/// The bins of [`Latency`], the last one open.
+pub const LATENCY_BINS: usize = LATENCY_BINS_MS.len() + 1;
+
+/// How long the loader's jobs waited, by class and by part (#251), as of the jobs the scene thread
+/// has taken in since the start: counts in bins, and the sum of the times (in microseconds, for
+/// the mean). Counters only, so that the report of a path is the difference of two of these
+/// ([`Latency::since`]). Not deterministic: it is of the machine's clock, and no test of counts
+/// reads it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Latency {
+    /// By class, part and bin.
+    pub bins: [[[u64; LATENCY_BINS]; LATENCY_PHASES.len()]; LATENCY_CLASSES.len()],
+    pub sum_us: [[u64; LATENCY_PHASES.len()]; LATENCY_CLASSES.len()],
+}
+
+impl Default for Latency {
+    fn default() -> Self {
+        Self {
+            bins: [[[0; LATENCY_BINS]; LATENCY_PHASES.len()]; LATENCY_CLASSES.len()],
+            sum_us: [[0; LATENCY_PHASES.len()]; LATENCY_CLASSES.len()],
+        }
+    }
+}
+
+impl Latency {
+    /// Counts a job that was taken in at `taken`.
+    fn add(&mut self, stamps: &Stamps, taken: Instant) {
+        let phase = |from: Instant, to: Instant| to.saturating_duration_since(from);
+        let parts: [Duration; LATENCY_PHASES.len()] = [
+            phase(stamps.asked, stamps.synced),
+            phase(stamps.synced, stamps.started),
+            phase(stamps.started, stamps.finished),
+            phase(stamps.finished, taken),
+            phase(stamps.asked, taken),
+        ];
+        let class = stamps.class as usize;
+        for (at, time) in parts.into_iter().enumerate() {
+            let ms = time.as_secs_f64() * 1e3;
+            let bin = LATENCY_BINS_MS
+                .iter()
+                .position(|&upper| ms <= upper)
+                .unwrap_or(LATENCY_BINS - 1);
+            self.bins[class][at][bin] += 1;
+            self.sum_us[class][at] += time.as_micros() as u64;
+        }
+    }
+
+    /// What was counted after `earlier` was.
+    pub fn since(&self, earlier: &Latency) -> Latency {
+        let mut out = *self;
+        for class in 0..LATENCY_CLASSES.len() {
+            for phase in 0..LATENCY_PHASES.len() {
+                out.sum_us[class][phase] =
+                    self.sum_us[class][phase].saturating_sub(earlier.sum_us[class][phase]);
+                for bin in 0..LATENCY_BINS {
+                    out.bins[class][phase][bin] = self.bins[class][phase][bin]
+                        .saturating_sub(earlier.bins[class][phase][bin]);
+                }
+            }
+        }
+        out
+    }
+
+    /// The jobs of `class` counted.
+    pub fn jobs(&self, class: usize) -> u64 {
+        self.bins[class][0].iter().sum()
+    }
+
+    /// The mean time of `phase` of the jobs of `class`, in milliseconds (0 for none).
+    pub fn mean_ms(&self, class: usize, phase: usize) -> f64 {
+        self.sum_us[class][phase] as f64 / 1e3 / self.jobs(class).max(1) as f64
+    }
+
+    /// The upper bound of the bin that holds the 99th percentile of `phase` of the jobs of
+    /// `class`, in milliseconds: the last bin has no bound, and says twice the last one's. 0 for
+    /// none.
+    pub fn p99_ms(&self, class: usize, phase: usize) -> f64 {
+        let jobs = self.jobs(class);
+        if jobs == 0 {
+            return 0.0;
+        }
+        let need = (jobs * 99).div_ceil(100);
+        let mut seen = 0;
+        for (bin, &count) in self.bins[class][phase].iter().enumerate() {
+            seen += count;
+            if seen >= need {
+                return LATENCY_BINS_MS
+                    .get(bin)
+                    .copied()
+                    .unwrap_or(LATENCY_BINS_MS[LATENCY_BINS_MS.len() - 1] * 2.0);
+            }
+        }
+        0.0
+    }
+
+    /// How many jobs of `class` took more than the last bin's bound but one, 100 ms, in `phase`
+    /// (the jobs that were late for a camera at 50 m/s: 5 m, a few bricks).
+    pub fn over_100_ms(&self, class: usize, phase: usize) -> u64 {
+        self.bins[class][phase][LATENCY_BINS - 2..].iter().sum()
+    }
+}
+
 /// What a worker sends back.
 pub enum Arrival {
     /// The children of `key` that are not air, were not held and can be drawn (see
@@ -291,20 +427,20 @@ pub enum Arrival {
 
 /// What a loader is made of before it has workers: the state they share and the two ends of the
 /// channel their arrivals go through.
-type Parts = (
-    Arc<Shared>,
-    Sender<(u64, Arrival)>,
-    Receiver<(u64, Arrival)>,
-);
+type Parts = (Arc<Shared>, Sender<Sent>, Receiver<Sent>);
+
+/// What a worker sends: the job's ticket, what it made, and when the job was asked for, taken
+/// from the queue and done, if it was one of the queue's (a cell of the Guard is not timed).
+type Sent = (u64, Arrival, Option<Stamps>);
 
 /// The workers, and the work they have been asked for. Lives on the frame thread, which is the
 /// only one that talks to it.
 pub struct Loader {
     shared: Arc<Shared>,
-    arrivals: Receiver<(u64, Arrival)>,
+    arrivals: Receiver<Sent>,
     workers: Vec<JoinHandle<()>>,
     /// Where a stepped loader's jobs send what they make (see [`Loader::stepped`]); it has no workers.
-    stepper: Option<Sender<(u64, Arrival)>>,
+    stepper: Option<Sender<Sent>>,
     /// Jobs not yet handed to the workers, for when they are busy with the lock.
     outbox: Vec<Job>,
     /// Tickets given up on that the workers have not been told of yet.
@@ -319,15 +455,18 @@ pub struct Loader {
     /// The bands and reach that jobs are classed by (the workers' are in their state).
     bands: Bands,
     reach: Reach,
+    /// How long the jobs taken in waited, by class and where (#251).
+    latency: Latency,
     /// A test says the loader is backed up whatever its workers are doing (a stepped one has none).
     #[cfg(test)]
     pretend_backed_up: bool,
 }
 
 /// Workers for `cores` cores: two fewer, so that the simulation and the frame thread always have
-/// one each, and at least one.
+/// one each, and at least one. `cores` is [`machine::threads`], which is the machine's, held to the
+/// constrained profile if there is one (#264).
 pub fn workers_for(cores: usize) -> usize {
-    cores.saturating_sub(2).max(1)
+    machine::loader_workers_for(cores)
 }
 
 impl Loader {
@@ -386,15 +525,23 @@ impl Loader {
         while done < most {
             match poll(&self.shared, self.shared.lock()) {
                 Next::Job(job, camera, bands, reach) => {
+                    let started = Instant::now();
                     let arrival = generate(&self.shared, &job, camera, bands, reach);
-                    complete(&self.shared, arrivals, job.ticket, arrival);
+                    let stamps = Stamps {
+                        class: job.class,
+                        asked: job.asked,
+                        synced: job.synced,
+                        started,
+                        finished: Instant::now(),
+                    };
+                    complete(&self.shared, arrivals, job.ticket, arrival, Some(stamps));
                 }
                 // Nothing is made beside it here: the Guard's cells come before the queue's jobs,
                 // which a loader with threads does only while less than [`GUARD_WORKERS`] are on
                 // them.
                 Next::Guard(job) => {
                     let arrival = guard_cell(&self.shared, job);
-                    complete(&self.shared, arrivals, job.ticket, arrival);
+                    complete(&self.shared, arrivals, job.ticket, arrival, None);
                 }
                 Next::Idle(_) | Next::Shutdown => break,
             }
@@ -439,7 +586,7 @@ impl Loader {
 
     fn with(
         shared: Arc<Shared>,
-        arrivals: Receiver<(u64, Arrival)>,
+        arrivals: Receiver<Sent>,
         workers: Vec<JoinHandle<()>>,
         bands: Bands,
     ) -> Self {
@@ -456,6 +603,7 @@ impl Loader {
             next_ticket: 0,
             bands,
             reach: Reach::NONE,
+            latency: Latency::default(),
             #[cfg(test)]
             pretend_backed_up: false,
         }
@@ -507,6 +655,7 @@ impl Loader {
         keys: impl IntoIterator<Item = Key>,
         camera: [f64; 3],
     ) {
+        let asked = Instant::now();
         for key in keys {
             if self.requested.contains_key(&key) {
                 continue;
@@ -533,6 +682,8 @@ impl Loader {
                 key,
                 ticket,
                 held,
+                asked,
+                synced: asked,
             });
         }
     }
@@ -621,7 +772,10 @@ impl Loader {
             cancelled.clear();
         }
         let pushed = !self.outbox.is_empty() || !self.guard_outbox.is_empty();
-        state.queue.extend(self.outbox.drain(..));
+        let synced = Instant::now();
+        state
+            .queue
+            .extend(self.outbox.drain(..).map(|job| Job { synced, ..job }));
         state.guard.extend(self.guard_outbox.drain(..));
         drop(state);
         if pushed {
@@ -639,8 +793,14 @@ impl Loader {
         let mut taken = 0;
         while counted < most {
             match self.arrivals.try_recv() {
-                Ok((ticket, arrival)) => {
+                Ok((ticket, arrival, stamps)) => {
                     taken += 1;
+                    // A job that was dropped is not made: its near-zero `made` would pull the
+                    // means down, so only what was generated is in the latency (#251).
+                    if let Some(stamps) = stamps.filter(|_| !matches!(arrival, Arrival::Dropped(_)))
+                    {
+                        self.latency.add(&stamps, Instant::now());
+                    }
                     match arrival {
                         Arrival::Children { key, bricks } => {
                             counted += 1;
@@ -676,6 +836,11 @@ impl Loader {
             self.shared.wake.notify_all();
         }
         out
+    }
+
+    /// How long the jobs that were taken in waited, by class and part, since the start (#251).
+    pub fn latency(&self) -> Latency {
+        self.latency
     }
 
     /// Bricks asked for whose children have not been received, and cells of the Guard asked for
@@ -729,7 +894,6 @@ impl Loader {
     }
 
     /// Jobs that the workers have taken and the frame thread has not taken in.
-    #[cfg(test)]
     pub fn ahead(&self) -> usize {
         self.shared.ahead.load(Atomic::Acquire)
     }
@@ -779,6 +943,9 @@ fn reordered(mut jobs: Vec<Job>, camera: [f64; 3], bands: Bands, reach: Reach) -
 }
 
 /// What a worker finds when it looks at the queue.
+// A value that is made and matched once for each job, never kept: the job's stamps (#251) make
+// the variant larger than the others, and boxing it would allocate for every job.
+#[allow(clippy::large_enum_variant)]
 enum Next<'a> {
     /// A job it has taken (it is counted in flight and ahead), and the camera, bands and reach to
     /// do it for.
@@ -888,12 +1055,13 @@ fn generate(shared: &Shared, job: &Job, camera: [f64; 3], bands: Bands, reach: R
 /// to take it.
 fn complete(
     shared: &Shared,
-    arrivals: &Sender<(u64, Arrival)>,
+    arrivals: &Sender<Sent>,
     ticket: u64,
     arrival: Arrival,
+    stamps: Option<Stamps>,
 ) -> bool {
     let guard = matches!(arrival, Arrival::Guard { .. });
-    let sent = arrivals.send((ticket, arrival));
+    let sent = arrivals.send((ticket, arrival, stamps));
     if guard {
         shared.guarding.fetch_sub(1, Atomic::Release);
     }
@@ -910,13 +1078,13 @@ fn guard_cell(shared: &Shared, job: GuardJob) -> Arrival {
 }
 
 /// Nanoseconds since `began`.
-fn nanos(began: std::time::Instant) -> u64 {
+fn nanos(began: Instant) -> u64 {
     u64::try_from(began.elapsed().as_nanos()).unwrap_or(u64::MAX)
 }
 
 /// A worker: takes the nearest job when the frame thread is not too far behind, drops it if the
 /// camera has gone from it, and generates it.
-fn work(shared: &Shared, arrivals: &Sender<(u64, Arrival)>) {
+fn work(shared: &Shared, arrivals: &Sender<Sent>) {
     crate::priority::lower_current_thread();
     loop {
         let (job, camera, bands, reach) = {
@@ -925,12 +1093,12 @@ fn work(shared: &Shared, arrivals: &Sender<(u64, Arrival)>) {
                 match poll(shared, state) {
                     Next::Job(job, camera, bands, reach) => break (job, camera, bands, reach),
                     Next::Guard(job) => {
-                        let began = std::time::Instant::now();
+                        let began = Instant::now();
                         let arrival = guard_cell(shared, job);
                         shared
                             .generating_ns
                             .fetch_add(nanos(began), Atomic::Relaxed);
-                        if !complete(shared, arrivals, job.ticket, arrival) {
+                        if !complete(shared, arrivals, job.ticket, arrival, None) {
                             return;
                         }
                         state = shared.lock();
@@ -940,7 +1108,7 @@ fn work(shared: &Shared, arrivals: &Sender<(u64, Arrival)>) {
                     Next::Idle(idle) => {
                         // Waiting with jobs queued is waiting for the frame thread to take in.
                         let held_back = !idle.queue.is_empty();
-                        let began = std::time::Instant::now();
+                        let began = Instant::now();
                         state = shared
                             .wake
                             .wait(idle)
@@ -952,12 +1120,19 @@ fn work(shared: &Shared, arrivals: &Sender<(u64, Arrival)>) {
                 }
             }
         };
-        let began = std::time::Instant::now();
+        let began = Instant::now();
         let arrival = generate(shared, &job, camera, bands, reach);
         shared
             .generating_ns
             .fetch_add(nanos(began), Atomic::Relaxed);
-        if !complete(shared, arrivals, job.ticket, arrival) {
+        let stamps = Stamps {
+            class: job.class,
+            asked: job.asked,
+            synced: job.synced,
+            started: began,
+            finished: Instant::now(),
+        };
+        if !complete(shared, arrivals, job.ticket, arrival, Some(stamps)) {
             return;
         }
     }
@@ -974,6 +1149,8 @@ mod tests {
             key: (3, BrickCoord([x, 0, 0])),
             ticket: 0,
             held: 0,
+            asked: Instant::now(),
+            synced: Instant::now(),
         }
     }
 
@@ -1249,6 +1426,17 @@ mod tests {
         assert_eq!(workers_for(3), 1);
         assert_eq!(workers_for(2), 1);
         assert_eq!(workers_for(1), 1);
+        assert_eq!(workers_for(32), 30);
+    }
+
+    #[test]
+    fn the_guard_has_two_workers_up_to_six_and_a_third_of_more() {
+        for (workers, share) in [(1, 2), (2, 2), (6, 2), (8, 2), (9, 3), (14, 4), (30, 10)] {
+            assert_eq!(guard_share(workers), share, "{workers} workers");
+        }
+        // Beside the queue on 14 workers, four are on cells and the fifth waits.
+        assert!(guard_may_start(14, 3, false, 0));
+        assert!(!guard_may_start(14, 4, false, 0));
     }
 
     /// Solid bricks from any level, counting what it was asked for.
@@ -1411,6 +1599,66 @@ mod tests {
             "{}",
             source.made.load(Atomic::Relaxed)
         );
+    }
+
+    #[test]
+    fn a_jobs_time_is_sorted_into_its_parts_and_bins_by_class_and_a_path_is_the_difference() {
+        let began = Instant::now();
+        let at = |ms: u64| began + Duration::from_millis(ms);
+        let stamps = |class| Stamps {
+            class,
+            asked: at(0),
+            synced: at(3),
+            started: at(13),
+            finished: at(14),
+        };
+        let mut before = Latency::default();
+        before.add(&stamps(Class::Prefetch), at(20));
+        let mut latency = before;
+        // A drawn job: 3 ms in the outbox, 10 queued, 1 made, 120 in the channel: 134 in all.
+        latency.add(&stamps(Class::Drawn), at(134));
+        latency.add(&stamps(Class::Drawn), at(15));
+        let drawn = 2;
+        assert_eq!(latency.jobs(drawn), 2);
+        assert_eq!(latency.jobs(0), 1, "the prefetch job is another class");
+        // Of the two, outbox 3 ms is in the 5 ms bin both times; queued 10 ms in the 10 ms bin.
+        assert_eq!(latency.bins[drawn][0][3], 2);
+        assert_eq!(latency.bins[drawn][1][4], 2);
+        // The channel: 120 ms is in the bin of 250, and 1 ms in the bin of 1.
+        assert_eq!(latency.bins[drawn][3][8], 1);
+        assert_eq!(latency.bins[drawn][3][1], 1);
+        assert_eq!(latency.over_100_ms(drawn, 3), 1);
+        assert_eq!(latency.over_100_ms(drawn, 2), 0);
+        assert!((latency.mean_ms(drawn, 4) - 74.5).abs() < 1e-9);
+        // The 99th percentile of two is the larger: the upper bound of its bin.
+        assert_eq!(latency.p99_ms(drawn, 3), 250.0);
+        assert_eq!(latency.p99_ms(drawn, 2), 1.0);
+        // A path is what was counted in it.
+        let path = latency.since(&before);
+        assert_eq!(path.jobs(drawn), 2);
+        assert_eq!(path.jobs(0), 0);
+        assert_eq!(Latency::default().p99_ms(drawn, 0), 0.0);
+    }
+
+    #[test]
+    fn the_loader_times_the_jobs_it_takes_in_by_their_class() {
+        let source = Arc::new(Counting::default());
+        let mut loader = new_loader(source);
+        let keys = near_the_origin();
+        loader.request(&BrickStore::new(), keys.iter().take(40).copied(), [0.0; 3]);
+        loader.sync([0.0; 3], bands());
+        loader.step(usize::MAX);
+        let mut taken = 0;
+        while taken < 40 {
+            let arrivals = loader.receive(16);
+            assert!(!arrivals.is_empty(), "{taken} of 40");
+            taken += arrivals.len();
+        }
+        let latency = loader.latency();
+        // Asked for with the bands splitting them: the class of what is drawn.
+        assert_eq!(latency.jobs(2), 40);
+        assert_eq!(latency.jobs(1) + latency.jobs(0), 0);
+        assert!(latency.mean_ms(2, 4) >= latency.mean_ms(2, 2));
     }
 
     /// Rock under y = 0 that it proves solid there, counting what it was asked for.

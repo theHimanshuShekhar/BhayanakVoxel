@@ -1,0 +1,20 @@
+name: Set up cargo-nextest
+description: >
+  Installs cargo-nextest at the pinned version, from the release binary (it does not compile it).
+  Run it after setup-rust. To bump it, change `nextest@...` below and the two places in docs/agents/ci.md that name
+  the version (the Pins section and the local-run command).
+
+runs:
+  using: composite
+  steps:
+    # taiki-e/install-action@v2.90.11, by commit. `fallback: none` makes it fail rather than build
+    # from source if the release binary cannot be fetched.
+    - uses: taiki-e/install-action@073e1fd0bc889c9aee68dbaaa927cde1b5653a83
+      with:
+        tool: nextest@0.9.152
+        fallback: none
+      env:
+        GITHUB_TOKEN: ${{ github.token }}
+    - name: Show cargo-nextest
+      shell: bash
+      run: cargo nextest --version

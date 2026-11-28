@@ -49,6 +49,17 @@ Options:
                    for, in a round, while the loader's workers are as far ahead as they may be
                    [default: 32]. For finding what a slice does to the flights' soft misses, the
                    settle and the frame times; the report's config says what it was
+  --gen-extra-us N With --real-time, an artificial cost of N microseconds of CPU for each brick the
+                   generator is asked for, at every level, on the threads that generate (the
+                   loader's workers, and the load's spawn ring and Guard): the headroom of the
+                   streaming gates against a costlier terrain (#242). It changes no brick and no
+                   count; the report's `gen_extra_us_asked` and `gen_extra_us_measured` say what it
+                   was and what each charge really took
+  --peak-m M       With --real-time, the highest the ground goes above sea level, in metres
+                   [default: 2000]; --trench-m M the deepest below it [default: 1000]: today's
+                   map with its heights stretched to them (#242, a cost proxy for a taller ground
+                   column, not a new terrain), the Guard, bands' and bounds' extents following. The
+                   report's `relief` says what ran. Either alone changes only that side
   --no-convergence Leave out the convergence phase (ADR 0005), which otherwise runs last of the
                    timed phases: the Reference view on two still views (the reference golden's,
                    and a pit lit by bounce light) at the output resolution, scored with FLIP and
@@ -69,15 +80,38 @@ Options:
                    phase's sun-and-sky view (#52), 1 to 16 [default: the renderer's, 2]. The
                    report's `convergence.shadows.shadow_rays` says which; run it with 1 and with 2
                    to compare them
-  --rt-backend B   How rays find the Planet (#50): compute (the default: the compute-shader DDA),
-                   hw (ray queries over the bricks' tight boxes, with shadow rays that end at the
-                   first hit, for the flight, the sweep and the Edit stress; the compute path, with
-                   a warning and the reason in the report's `rt.fallback`, if the adapter has no
-                   ray queries), hw-nearest (hw with shadow rays that look for the nearest hit) or
-                   both (the bench as for compute, then the same flight and Edit stress on hw, and
-                   the flight on hw-nearest, each on a context of its own, and the passes that cast
-                   rays compared: `rt.comparison`). The report's `rt` says which ran and what the
-                   acceleration structures cost to update
+  --rt-backend B   How rays find the Planet (#50): auto (the default, and what the game does:
+                   ray queries where the adapter has them, else the compute path with a warning
+                   and the reason in the report's `rt.fallback`), compute (the compute-shader DDA:
+                   the game's setting for compute, and the reference), hw (ray queries over the
+                   bricks' tight boxes, with shadow rays that end at the first hit, for the flight,
+                   the sweep and the Edit stress and for the runs of `--streaming --real-time`,
+                   #236; the same as auto on an adapter with ray queries, and on one without them
+                   the compute path with a warning, and an error in the real-time mode, whose gates
+                   would say nothing of hw), hw-nearest (hw with shadow rays that look for the
+                   nearest hit) or both (the bench as for compute, then the same flight and Edit
+                   stress on hw, and the flight on hw-nearest, each on a context of its own, and
+                   the passes that cast rays compared: `rt.comparison`; with `--streaming
+                   --real-time`, the real-time runs on compute and then on hw:
+                   `rt.real_time_hw`). The report's `rt` says which ran and what the acceleration
+                   structures cost to update
+  --hw-group-regions G
+                   How the hardware backend (--rt-backend hw|both) makes its BLASes (#236): G
+                   regions along an edge of each, 4, 8, 16 or 32, or NEAR:FAR@LEVEL (levels below
+                   LEVEL have BLASes of NEAR regions an edge, the others FAR, e.g. 4:16@6), or
+                   NEAR:MID@LEVEL:FAR@LEVEL (a third size from the second LEVEL up). The default
+                   is 16:32@2. Fewer, larger BLASes cost the frame thread less and the GPU more; the
+                   report's `rt.hw_group_regions` says what ran
+  --hw-build-blas N
+                   The most BLASes a frame builds of the groups that may wait (#236), default no
+                   bound; the groups that may not wait (they gained boxes, or have no BLAS) are built
+                   at once whatever it is. The report counts them as `blas_urgent`
+  --hw-wait        A diagnosis (#236): every update of the hardware backend waits for the GPU, so that
+                   the paths' `hardware.wait` (and the slowest frames' `wait_ms`) is the GPU's time of
+                   the boxes' pass, the BLAS builds and the TLAS of the frame. It is not a player's
+                   frame: the gates mean nothing with it. On a device with timestamps in encoders it
+                   also times the BLAS builds and the TLAS build apart (`hardware.gpu_blas`,
+                   `hardware.gpu_tlas`)
   --time-of-day H  Light the flight (primary and reference, the sweep and the edits) by the sky of the
                    world clock at H hours (0 to 24: 0 midnight, 6 sunrise, 12 noon, 18 sunset) in
                    place of the fixed hero sun, with the clock stopped there (#203)
@@ -89,6 +123,16 @@ Options:
                    and the sped-up one, against a jump. It adds a `day_cycle` block
   --day-seconds N  With --day-cycle, how long the sped-up day is, in seconds of the clock
                    [default: 60; 6 with --short]. At least 4: a faster sun would jump
+  --shadow-weight W How Primary weighs the shadow rays of the sun in the convergence phase (#55):
+                   `per-sample` (each ray's own cosine, the Reference's) [default] or
+                   `centre-cosine` (the cosine to the centre of the disc, what shipped with
+                   #52). It is the one the gates are held on and the one the report's `gi` and
+                   `settled` are of; the other is reported beside it (`other_shadow_weight`), so
+                   one run compares both
+  --converged-frames N  Frames of a still view that Primary with no denoiser is averaged over in the
+                   convergence phase, for `Primary converged` (#55): the error of each view is split
+                   into its bias (FLIP of that against truth) and the denoiser's residual (FLIP of
+                   the denoised image against it) [default: 1024; 0 leaves it out]
   --no-fail        Exit with status 0 even if a pass is over its budget, there is a hole or a
                    real-time gate is over
   -h, --help       Print this";
@@ -132,6 +176,12 @@ pub struct Args {
     /// `--stream-slice-ms`: the scene thread's slice for taking in while the loader is backed up,
     /// if it was said (see [`crate::scene_worker::BACKED_UP_SLICE`]).
     pub stream_slice_ms: Option<u32>,
+    /// `--gen-extra-us`: the artificial CPU cost of each generated brick of the real-time mode, in
+    /// microseconds (#242), if it was said.
+    pub gen_extra_us: Option<u32>,
+    /// `--peak-m` and `--trench-m`: the real-time mode's ground stretched to this height of peaks
+    /// and depth of trenches, in metres (#242), if either was said (the other is today's).
+    pub relief_m: Option<(f64, f64)>,
     pub no_fail: bool,
     /// The convergence phase (#187), which runs unless `--no-convergence`, and its truths' samples
     /// if `--truth-spp` said.
@@ -144,11 +194,25 @@ pub struct Args {
     pub shadow_rays: Option<u32>,
     /// `--rt-backend` (#50): how rays find the Planet.
     pub rt: RtMode,
+    /// `--hw-group-regions` (#236): how the hardware backend's BLASes are made of the cells; None
+    /// is the default, `PRODUCTION_GROUPING`.
+    pub hw_group: Option<render::hw::Grouping>,
+    /// `--hw-build-blas` (#236): the most BLASes a frame builds of the groups that may wait.
+    pub hw_blas_budget: Option<u32>,
+    /// `--hw-wait` (#236): every update of the hardware backend waits for the GPU, a diagnosis of
+    /// what the GPU's time of the boxes, builds and TLAS is (not a player's frame).
+    pub hw_wait: bool,
     /// `--time-of-day`: the hours at which the flight's sky is put (#203).
     pub time_of_day: Option<f64>,
     /// `--day-cycle` and `--day-seconds`: the day cycle phase, and the length of its day if said.
     pub day_cycle: bool,
     pub day_seconds: Option<f64>,
+    /// `--shadow-weight W`: which weight of the sun's shadow rays the convergence phase's gates are
+    /// held on (#55); the other is reported beside it.
+    pub shadow_weight: Option<render::ShadowWeight>,
+    /// `--converged-frames N`: the frames `Primary converged` is averaged over (the phase's default
+    /// if not given).
+    pub converged_frames: Option<u32>,
     pub size: Option<(u32, u32)>,
     pub bias: f64,
     pub diag: Diag,
@@ -161,7 +225,7 @@ pub const DEFAULT_RUNS: u32 = 3;
 #[derive(Debug, PartialEq)]
 pub enum Parsed {
     Help,
-    Run(Args),
+    Run(Box<Args>),
 }
 
 /// Parses what follows `bench` on the command line.
@@ -175,15 +239,22 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Parsed, String> {
         runs: DEFAULT_RUNS,
         flat_ambient: false,
         stream_slice_ms: None,
+        gen_extra_us: None,
+        relief_m: None,
         no_fail: false,
         convergence: true,
         truth_spp: None,
         flip_gamma22: false,
         shadow_rays: None,
         rt: RtMode::default(),
+        hw_group: None,
+        hw_blas_budget: None,
+        hw_wait: false,
         time_of_day: None,
         day_cycle: false,
         day_seconds: None,
+        shadow_weight: None,
+        converged_frames: None,
         size: None,
         bias: 1.0,
         diag: Diag::default(),
@@ -205,15 +276,45 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Parsed, String> {
             "--stream-slice-ms" => {
                 parsed.stream_slice_ms = Some(stream_slice_ms(&value("--stream-slice-ms")?)?);
             }
+            "--gen-extra-us" => {
+                parsed.gen_extra_us = Some(gen_extra_us(&value("--gen-extra-us")?)?);
+            }
+            "--peak-m" => {
+                let peak = relief_metres("--peak-m", &value("--peak-m")?)?;
+                parsed.relief_m = Some((peak, parsed.relief_m.map_or(TODAYS_TRENCH_M, |r| r.1)));
+            }
+            "--trench-m" => {
+                let trench = relief_metres("--trench-m", &value("--trench-m")?)?;
+                parsed.relief_m = Some((parsed.relief_m.map_or(TODAYS_PEAK_M, |r| r.0), trench));
+            }
             "--no-fail" => parsed.no_fail = true,
             "--no-convergence" => parsed.convergence = false,
             "--flip-gamma-2-2" => parsed.flip_gamma22 = true,
             "--truth-spp" => parsed.truth_spp = Some(truth_spp(&value("--truth-spp")?)?),
             "--shadow-rays" => parsed.shadow_rays = Some(shadow_rays(&value("--shadow-rays")?)?),
             "--rt-backend" => parsed.rt = RtMode::parse(&value("--rt-backend")?)?,
+            "--hw-group-regions" => {
+                parsed.hw_group = Some(render::hw::Grouping::parse(&value("--hw-group-regions")?)?);
+            }
+            "--hw-build-blas" => {
+                parsed.hw_blas_budget = Some(
+                    value("--hw-build-blas")?
+                        .parse::<u32>()
+                        .ok()
+                        .filter(|&n| n >= 1)
+                        .ok_or("--hw-build-blas takes a whole number of at least 1")?,
+                );
+            }
+            "--hw-wait" => parsed.hw_wait = true,
             "--time-of-day" => parsed.time_of_day = Some(time_of_day(&value("--time-of-day")?)?),
             "--day-cycle" => parsed.day_cycle = true,
             "--day-seconds" => parsed.day_seconds = Some(day_seconds(&value("--day-seconds")?)?),
+            "--converged-frames" => {
+                parsed.converged_frames = Some(converged_frames(&value("--converged-frames")?)?);
+            }
+            "--shadow-weight" => {
+                parsed.shadow_weight = Some(shadow_weight(&value("--shadow-weight")?)?);
+            }
             "--out" => parsed.out = value("--out")?.into(),
             "--budgets" => parsed.budgets = Some(value("--budgets")?.into()),
             "--size" => parsed.size = Some(size(&value("--size")?)?),
@@ -234,6 +335,12 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Parsed, String> {
     if parsed.stream_slice_ms.is_some() && !parsed.real_time {
         return Err("--stream-slice-ms is for --real-time".into());
     }
+    if parsed.gen_extra_us.is_some() && !parsed.real_time {
+        return Err("--gen-extra-us is for --real-time".into());
+    }
+    if parsed.relief_m.is_some() && !parsed.real_time {
+        return Err("--peak-m and --trench-m are for --real-time".into());
+    }
     if parsed.day_seconds.is_some() && !parsed.day_cycle {
         return Err("--day-seconds is for --day-cycle".into());
     }
@@ -246,6 +353,18 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Parsed, String> {
         return Err(
             "--shadow-rays is for the convergence phase's sun-and-sky view, which \
              --no-convergence leaves out"
+                .into(),
+        );
+    }
+    if parsed.converged_frames.is_some() && !parsed.convergence {
+        return Err(
+            "--converged-frames is for the convergence phase, which --no-convergence leaves out"
+                .into(),
+        );
+    }
+    if parsed.shadow_weight.is_some() && !parsed.convergence {
+        return Err(
+            "--shadow-weight is for the convergence phase, which --no-convergence leaves out"
                 .into(),
         );
     }
@@ -265,7 +384,7 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Parsed, String> {
                 .into(),
         );
     }
-    Ok(Parsed::Run(parsed))
+    Ok(Parsed::Run(Box::new(parsed)))
 }
 
 /// `--runs`: at least 1.
@@ -283,6 +402,34 @@ fn stream_slice_ms(text: &str) -> Result<u32, String> {
         .ok()
         .filter(|ms| (1..=1000).contains(ms))
         .ok_or_else(|| format!("`{text}` is not a slice in milliseconds like 32 (1 to 1000)"))
+}
+
+/// The map's peak and trench today, in metres: what `--peak-m` and `--trench-m` leave of the other
+/// when only one is said.
+pub const TODAYS_PEAK_M: f64 = 2_000.0;
+pub const TODAYS_TRENCH_M: f64 = 1_000.0;
+
+/// `--gen-extra-us`: microseconds a brick, from 0 (the hook on, charging nothing) to a millisecond:
+/// a brick costs 50 to 130 µs today, and a millisecond each is several times more than any terrain
+/// of the sweep.
+fn gen_extra_us(text: &str) -> Result<u32, String> {
+    text.parse::<u32>()
+        .ok()
+        .filter(|&us| us <= 1_000)
+        .ok_or_else(|| {
+            format!("`{text}` is not a cost in microseconds a brick like 100 (0 to 1000)")
+        })
+}
+
+/// `--peak-m` and `--trench-m`: metres, from 100 m to 19 km (the test Planet is 40 km in radius,
+/// and a Planet must be bigger than the two together).
+fn relief_metres(option: &str, text: &str) -> Result<f64, String> {
+    text.parse::<f64>()
+        .ok()
+        .filter(|m| m.is_finite() && (100.0..=19_000.0).contains(m))
+        .ok_or_else(|| {
+            format!("`{text}` is not a size for {option} in metres like 8000 (100 to 19000)")
+        })
 }
 
 /// `--truth-spp`: at least the last checkpoint, or the truth would be rougher than what it judges.
@@ -323,6 +470,25 @@ fn day_seconds(text: &str) -> Result<f64, String> {
         .filter(|s| s.is_finite() && *s >= SHORTEST_DAY_SECONDS)
         .ok_or_else(|| {
             format!("`{text}` is not a day of at least {SHORTEST_DAY_SECONDS} seconds like 60")
+        })
+}
+
+/// `--converged-frames`: a count of frames, 0 for none.
+fn converged_frames(text: &str) -> Result<u32, String> {
+    text.parse::<u32>()
+        .ok()
+        .filter(|&n| n <= 1 << 16)
+        .ok_or_else(|| format!("`{text}` is not a count of frames, 0 to 65536"))
+}
+
+/// `--shadow-weight`: the name of one of `render::ShadowWeight::ALL`.
+fn shadow_weight(text: &str) -> Result<render::ShadowWeight, String> {
+    render::ShadowWeight::ALL
+        .into_iter()
+        .find(|w| w.name() == text)
+        .ok_or_else(|| {
+            let names: Vec<_> = render::ShadowWeight::ALL.iter().map(|w| w.name()).collect();
+            format!("`{text}` is not a shadow weight: {}", names.join(" or "))
         })
 }
 
@@ -374,7 +540,7 @@ mod tests {
 
     fn run(args: &[&str]) -> Args {
         match parse_all(args) {
-            Ok(Parsed::Run(args)) => args,
+            Ok(Parsed::Run(args)) => *args,
             other => panic!("{other:?}"),
         }
     }
@@ -392,15 +558,22 @@ mod tests {
                 runs: 3,
                 flat_ambient: false,
                 stream_slice_ms: None,
+                gen_extra_us: None,
+                relief_m: None,
                 no_fail: false,
                 convergence: true,
                 truth_spp: None,
                 flip_gamma22: false,
                 shadow_rays: None,
-                rt: RtMode::Compute,
+                rt: RtMode::Auto,
+                hw_group: None,
+                hw_blas_budget: None,
+                hw_wait: false,
                 time_of_day: None,
                 day_cycle: false,
                 day_seconds: None,
+                shadow_weight: None,
+                converged_frames: None,
                 size: None,
                 bias: 1.0,
                 diag: Diag::default()
@@ -409,8 +582,68 @@ mod tests {
     }
 
     #[test]
-    fn the_ray_backend_is_compute_unless_asked_and_a_bad_one_is_refused() {
-        assert_eq!(run(&[]).rt, RtMode::Compute);
+    fn the_generator_hooks_are_off_unless_asked_and_are_for_the_real_time_mode() {
+        let args = run(&["--streaming", "--real-time"]);
+        assert_eq!((args.gen_extra_us, args.relief_m), (None, None));
+        let args = run(&[
+            "--streaming",
+            "--real-time",
+            "--gen-extra-us",
+            "100",
+            "--peak-m",
+            "8000",
+            "--trench-m",
+            "4000",
+        ]);
+        assert_eq!(args.gen_extra_us, Some(100));
+        assert_eq!(args.relief_m, Some((8000.0, 4000.0)));
+        // Either alone leaves the other as today's, in either order.
+        let args = run(&["--streaming", "--real-time", "--peak-m", "8000"]);
+        assert_eq!(args.relief_m, Some((8000.0, 1000.0)));
+        let args = run(&["--streaming", "--real-time", "--trench-m", "4000"]);
+        assert_eq!(args.relief_m, Some((2000.0, 4000.0)));
+        let args = run(&[
+            "--streaming",
+            "--real-time",
+            "--trench-m",
+            "4000",
+            "--peak-m",
+            "8000",
+        ]);
+        assert_eq!(args.relief_m, Some((8000.0, 4000.0)));
+        assert_eq!(
+            run(&["--streaming", "--real-time", "--gen-extra-us", "0"]).gen_extra_us,
+            Some(0)
+        );
+        for bad in [
+            &["--gen-extra-us", "5"][..],
+            &["--peak-m", "8000"],
+            &["--trench-m", "4000"],
+        ] {
+            assert!(
+                parse_all(bad).unwrap_err().contains("--real-time"),
+                "{bad:?}"
+            );
+        }
+        for bad in [
+            ["--gen-extra-us", "-1"],
+            ["--gen-extra-us", "1001"],
+            ["--gen-extra-us", "x"],
+            ["--peak-m", "0"],
+            ["--peak-m", "20000"],
+            ["--trench-m", "nan"],
+            ["--trench-m", "-5"],
+        ] {
+            let all = ["--streaming", "--real-time", bad[0], bad[1]];
+            assert!(parse_all(&all).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn the_ray_backend_is_auto_unless_asked_and_a_bad_one_is_refused() {
+        // The default is what the player gets (#50): ray queries where the adapter has them.
+        assert_eq!(run(&[]).rt, RtMode::Auto);
+        assert_eq!(run(&["--rt-backend", "auto"]).rt, RtMode::Auto);
         assert_eq!(run(&["--rt-backend", "compute"]).rt, RtMode::Compute);
         assert_eq!(run(&["--rt-backend", "hw"]).rt, RtMode::Hardware);
         assert_eq!(
@@ -440,6 +673,39 @@ mod tests {
             &["--streaming", "--flat-ambient"],
             // The diagnostic switches say the budgets are not checked, which the gates always are.
             &["--streaming", "--real-time", "--diag", "no-flush"],
+        ] {
+            assert!(parse_all(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn the_hardware_grouping_is_read_as_a_size_or_a_split_and_bad_ones_are_refused() {
+        use render::hw::Grouping;
+        assert_eq!(run(&[]).hw_group, None);
+        assert_eq!(
+            run(&["--hw-group-regions", "8"]).hw_group,
+            Some(Grouping::uniform(8).unwrap())
+        );
+        assert_eq!(
+            run(&["--hw-group-regions", "4:16@6"]).hw_group,
+            Some(Grouping::split(4, 16, 6).unwrap())
+        );
+        assert_eq!(
+            run(&["--hw-group-regions", "16:32@2"]).hw_group,
+            Some(Grouping::split(16, 32, 2).unwrap())
+        );
+        assert_eq!(run(&[]).hw_blas_budget, None);
+        assert_eq!(run(&["--hw-build-blas", "12"]).hw_blas_budget, Some(12));
+        assert!(!run(&[]).hw_wait);
+        assert!(run(&["--hw-wait"]).hw_wait);
+        for bad in [
+            &["--hw-group-regions"][..],
+            &["--hw-group-regions", "5"],
+            &["--hw-group-regions", "64"],
+            &["--hw-group-regions", "4:16"],
+            &["--hw-build-blas"],
+            &["--hw-build-blas", "0"],
+            &["--hw-build-blas", "x"],
         ] {
             assert!(parse_all(bad).is_err(), "{bad:?}");
         }
@@ -522,6 +788,45 @@ mod tests {
             &["--shadow-rays", "two"],
             // The view is of the convergence phase, which this leaves out.
             &["--no-convergence", "--shadow-rays", "2"],
+        ] {
+            assert!(parse_all(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn the_converged_frames_are_a_count_for_the_convergence_phase() {
+        assert_eq!(run(&[]).converged_frames, None);
+        assert_eq!(run(&["--converged-frames", "0"]).converged_frames, Some(0));
+        assert_eq!(
+            run(&["--converged-frames", "256"]).converged_frames,
+            Some(256)
+        );
+        for bad in [
+            &["--converged-frames", "many"][..],
+            &["--converged-frames", "-1"],
+            &["--converged-frames", "1000000"],
+            &["--converged-frames"],
+            &["--no-convergence", "--converged-frames", "8"],
+        ] {
+            assert!(parse_all(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn the_shadow_weight_is_one_of_the_two_the_renderer_has() {
+        assert_eq!(run(&[]).shadow_weight, None);
+        assert_eq!(
+            run(&["--shadow-weight", "per-sample"]).shadow_weight,
+            Some(render::ShadowWeight::PerSample)
+        );
+        assert_eq!(
+            run(&["--shadow-weight", "centre-cosine"]).shadow_weight,
+            Some(render::ShadowWeight::CentreCosine)
+        );
+        for bad in [
+            &["--shadow-weight", "cosine"][..],
+            &["--shadow-weight"],
+            &["--no-convergence", "--shadow-weight", "per-sample"],
         ] {
             assert!(parse_all(bad).is_err(), "{bad:?}");
         }

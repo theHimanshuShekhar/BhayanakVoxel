@@ -329,7 +329,7 @@ fluid = "none"
 
     /// Every id and name of the shipped table. Saved Planets and Edits store ids, so an id keeps
     /// its meaning for good: this list only ever grows. Materials added to the file need no entry.
-    const IDS: [(u16, &str); 55] = [
+    const IDS: [(u16, &str); 63] = [
         (1, "rock"),
         (2, "soil"),
         (3, "grassy soil"),
@@ -385,6 +385,14 @@ fluid = "none"
         (53, "green light"),
         (54, "blue light"),
         (55, "purple light"),
+        (56, "crystal blue"),
+        (57, "crystal cyan"),
+        (58, "crystal green"),
+        (59, "crystal magenta"),
+        (60, "crystal red"),
+        (61, "crystal amber"),
+        (62, "crystal white"),
+        (63, "crystal violet"),
     ];
 
     #[test]
@@ -410,7 +418,8 @@ fluid = "none"
                 .filter(|d| d.category == category)
                 .count()
         };
-        assert!((28..=34).contains(&count(Category::Natural)));
+        // 32 of the decided mix and the eight crystal hues of #204.
+        assert!((28..=40).contains(&count(Category::Natural)));
         assert!((14..=18).contains(&count(Category::Building)));
         assert!((5..=7).contains(&count(Category::Light)));
     }
@@ -438,6 +447,30 @@ fluid = "none"
             assert!(!should || emits, "{} should emit", def.name);
         }
         assert_eq!(table.by_name("rock").unwrap().emissive_intensity, 0.0);
+    }
+
+    #[test]
+    fn the_eight_crystal_hues_are_opaque_emissive_natural_and_follow_the_decided_materials() {
+        let table = MaterialTable::built_in();
+        let hues = [
+            "crystal blue",
+            "crystal cyan",
+            "crystal green",
+            "crystal magenta",
+            "crystal red",
+            "crystal amber",
+            "crystal white",
+            "crystal violet",
+        ];
+        for (n, name) in hues.into_iter().enumerate() {
+            let def = table.by_name(name).unwrap_or_else(|| panic!("no {name}"));
+            // Ids are stored in saved Planets: these are the ones the generator places.
+            assert_eq!(usize::from(def.id), 56 + n, "{name}");
+            assert_eq!(def.category, Category::Natural, "{name}");
+            assert!(def.emissive_intensity > 0.0, "{name} gives off light");
+            // One-layer glass is M1b-2: until then a crystal is opaque.
+            assert_eq!(def.transparency, 0.0, "{name}");
+        }
     }
 
     #[test]
