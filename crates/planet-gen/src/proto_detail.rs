@@ -511,8 +511,13 @@ impl Layers {
                     continue;
                 }
                 let idx = at.map(|v| v >> o.cell.trailing_zeros());
-                let corners = *Layers::cell(cache, base + k, idx, o.cell, source);
-                total += stripes(o, kind, x, idx, &corners);
+                total += stripes(
+                    o,
+                    kind,
+                    x,
+                    idx,
+                    Layers::cell(cache, base + k, idx, o.cell, source),
+                );
             }
         }
         if self.set.contains(Set::TALUS) {
@@ -790,6 +795,31 @@ thread_local! {
 
 const CORNER_SLOTS: usize = 4096;
 
+type BoundsKey = (usize, Set, [i32; 3], [i32; 3], u64);
+type Remembered = Option<(BoundsKey, (f64, f64))>;
+
+thread_local! {
+    /// The bounds this thread asked for last, direct-mapped.
+    static BOUNDS: RefCell<[Remembered; 16]> =
+        const { RefCell::new([None; 16]) };
+}
+
+thread_local! {
+    /// This thread's calls of [`Proto::bounds`] and the nanoseconds they took (a measurement).
+    static SPENT: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+/// `(calls, nanoseconds)` of this thread's bounds since it last asked.
+pub fn take_bounds_spent() -> (u64, u64) {
+    SPENT.with(|spent| spent.replace((0, 0)))
+}
+
+/// Forgets the corners this thread has read, so that a measurement starts cold.
+pub fn reset_corner_cache() {
+    CORNERS.with(|table| table.borrow_mut().clear());
+    BOUNDS.with(|memo| *memo.borrow_mut() = [None; 16]);
+}
+
 /// The layers of a Planet, with the map they read their corners from.
 #[derive(Clone)]
 pub(crate) struct Proto {
@@ -815,10 +845,11 @@ impl Proto {
 
     fn corner(&self, c: [i32; 3]) -> Corner {
         let id = self.map.lie_id() | 1;
-        let slot = (c[0].wrapping_mul(73_856_093)
+        // The corners are multiples of their cell, so the low bits say nothing: the high ones do.
+        let mixed = (c[0].wrapping_mul(73_856_093)
             ^ c[1].wrapping_mul(19_349_663)
-            ^ c[2].wrapping_mul(83_492_791)) as u32 as usize
-            % CORNER_SLOTS;
+            ^ c[2].wrapping_mul(83_492_791)) as u32;
+        let slot = (mixed.wrapping_mul(0x9e37_79b1) >> 20) as usize % CORNER_SLOTS;
         CORNERS.with(|table| {
             let mut table = table.borrow_mut();
             if table.is_empty() {
@@ -867,6 +898,44 @@ impl Proto {
 
     /// Bounds on [`Proto::height`] over every point in the hull of `corners`.
     pub fn bounds(&self, corners: &[[f64; 3]], size: f64) -> (f64, f64) {
+        let started = std::time::Instant::now();
+        let bounds = self.bounds_memo(corners, size);
+        SPENT.with(|spent| {
+            let (calls, nanos) = spent.get();
+            spent.set((calls + 1, nanos + started.elapsed().as_nanos() as u64));
+        });
+        bounds
+    }
+
+    /// [`Proto::bounds_of`], remembering the last few: the generator asks for the same brick's
+    /// bounds more than once (to shortcut it, then to bound its Voxels). A function of the box
+    /// and the map only, so it saves work and nothing else.
+    fn bounds_memo(&self, corners: &[[f64; 3]], size: f64) -> (f64, f64) {
+        let Some((low, high)) = self.layers.detail.lattice_box(corners) else {
+            return self.bounds_of(corners, size);
+        };
+        let id = self.map.lie_id() | 1;
+        let mixed = (low[0].wrapping_mul(73_856_093)
+            ^ low[1].wrapping_mul(19_349_663)
+            ^ low[2].wrapping_mul(83_492_791)
+            ^ high[0].wrapping_mul(1_000_003)
+            ^ (size as i32).wrapping_mul(7_919)) as u32;
+        let slot = (mixed.wrapping_mul(0x9e37_79b1) >> 28) as usize;
+        let key = (id, self.layers.set, low, high, size.to_bits());
+        BOUNDS.with(|memo| {
+            let mut memo = memo.borrow_mut();
+            if let Some((kept, bounds)) = memo[slot]
+                && kept == key
+            {
+                return bounds;
+            }
+            let bounds = self.bounds_of(corners, size);
+            memo[slot] = Some((key, bounds));
+            bounds
+        })
+    }
+
+    fn bounds_of(&self, corners: &[[f64; 3]], size: f64) -> (f64, f64) {
         match self.layers.detail.lattice_box(corners) {
             Some((low, high)) => self.layers.bounds(low, high, size, &|c| self.corner(c)),
             None => (-self.reach.1 - SLACK, self.reach.0 + SLACK),

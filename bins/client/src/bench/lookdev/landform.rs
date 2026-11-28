@@ -616,6 +616,73 @@ fn find(ground: &Ground) -> (Vec<Found>, Vec<String>) {
             "canyon rim: no channel 300 m to 3.8 km up with walls 500 m above it within 2.5 km on both sides".into(),
         ),
     }
+
+    // 9 and 10 (#267). A steep flank of the greatest range, from the ground: the node within 60 km
+    // of the peak, 1.5 to 5.5 km up, with the steepest ground over 0.5 km on its uphill side.
+    let eight: Vec<f64> = (0..8)
+        .map(|b| f64::from(b) * std::f64::consts::TAU / 8.0)
+        .collect();
+    let mut flank: Option<(V3, f64, f64, f64)> = None; // node, uphill bearing, slope, height
+    for &k in survey.near(peak_dir, 60.0).iter().step_by(3) {
+        let h = f64::from(survey.height[k]);
+        if !(1500.0..5500.0).contains(&h) {
+            continue;
+        }
+        let d = survey.dirs[k];
+        let up_bearing = eight
+            .iter()
+            .copied()
+            .max_by(|&a, &b| {
+                ground
+                    .height(walk(d, a, 0.5))
+                    .total_cmp(&ground.height(walk(d, b, 0.5)))
+            })
+            .unwrap();
+        let slope = (ground.height(walk(d, up_bearing, 0.5))
+            - ground.height(walk(d, up_bearing + std::f64::consts::PI, 0.5)))
+            / 1000.0;
+        if flank.is_none_or(|f| slope > f.2) {
+            flank = Some((d, up_bearing, slope, h));
+        }
+    }
+    match flank {
+        Some((d, uphill, slope, h)) => {
+            let (la, lo) = lat_lon(d);
+            let note = format!(
+                "a flank at {h:.0} m, {la:.1} N {lo:.1} E, the ground rises {:.0} degrees to the uphill side over 1 km",
+                slope.atan().to_degrees()
+            );
+            let top = ground.above_ground(walk(d, uphill, 2.0), 0.0);
+            found.push(Found {
+                haze: 0.015,
+                name: "flank, ground",
+                subject:
+                    "standing on a steep flank of the greatest range, 2 m up, looking up the slope"
+                        .into(),
+                position: ground.above_ground(d, 2.0),
+                target: top,
+                site: ground.above_ground(d, 0.0),
+                sun: NOON,
+                sun_dir: None,
+                note: note.clone(),
+            });
+            let back = walk(d, uphill + std::f64::consts::PI, 0.4);
+            found.push(Found {
+                haze: 0.015,
+                name: "flank, 150 m",
+                subject: "the same flank from 0.4 km down the slope and 150 m up, looking at it"
+                    .into(),
+                position: ground.above_ground(back, 150.0),
+                target: ground.above_ground(walk(d, uphill, 0.5), 0.0),
+                site: ground.above_ground(d, 0.0),
+                sun: NOON,
+                sun_dir: None,
+                note,
+            });
+        }
+        None => missing
+            .push("flank: no ground 1.5 to 5.5 km up within 60 km of the greatest peak".into()),
+    }
     (found, missing)
 }
 
@@ -681,6 +748,8 @@ pub fn run(options: &Options) -> Result<PathBuf, Box<dyn Error>> {
     let began = Instant::now();
     std::fs::create_dir_all(&options.out)?;
     planet_gen::world_map::use_landform_prototype(true);
+    planet_gen::proto_detail::use_proto_detail(options.proto_detail);
+    eprintln!("per-brick detail layers: {}", options.proto_detail.name());
     eprintln!("making the 320 km world map from the landform model...");
     let t = Instant::now();
     // LOOKDEV_MAP_SIZE: a smaller map, for trying the shots out quickly.
