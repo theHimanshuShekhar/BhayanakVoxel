@@ -46,6 +46,7 @@ pub use crate::SOIL;
 use crate::caves::{self, Caves, Tube};
 use crate::cost::ExtraCost;
 use crate::detail::{self, Detail};
+use crate::proto_detail::{self, Proto, SCREE_DEPTH};
 use crate::world_map::{
     Biome, ElevationCell, Fields, Relief, SEA_LEVEL, Texel, WORLD_RADIUS, WorldMap, units, voxels,
 };
@@ -340,6 +341,8 @@ struct GroundBounds {
     cell: Option<ElevationCell>,
     /// The strata of the ground, if it is all land or all sea floor.
     strata: Option<&'static Strata>,
+    /// PROTOTYPE (#267): whether loose rock may be among the Voxels near the ground.
+    scree: bool,
 }
 
 impl GroundBounds {
@@ -365,6 +368,7 @@ impl GroundBounds {
             return None;
         }
         if shallow > 0.0
+            && (shallow >= SCREE_DEPTH || !self.scree)
             && let Some(strata) = self.strata
             && let Some(material) = one_layer(strata, shallow, deep)
         {
@@ -388,6 +392,8 @@ pub struct Planet {
     detail: Detail,
     /// The bench's artificial cost of each brick generated (#242); none for the game's Planet.
     extra_cost: Option<Arc<ExtraCost>>,
+    /// PROTOTYPE (#267): the per-brick ridge, gully and talus layers; none unless asked for.
+    proto: Option<Proto>,
 }
 
 impl fmt::Debug for Planet {
@@ -412,8 +418,23 @@ impl Planet {
             detail: Detail::new(map.seed(), map.radius()),
             caves: Arc::new(Caves::new(map.clone())),
             extra_cost: None,
+            proto: None,
             map,
         }
+        .with_proto_detail(proto_detail::proto_detail())
+    }
+
+    /// PROTOTYPE (#267): this Planet with the per-brick detail layers of `set` (none for none),
+    /// and the sky and the interior moved out by the most they can move the ground.
+    pub fn with_proto_detail(mut self, set: proto_detail::Set) -> Planet {
+        self.shape = Shape::new(self.map.radius(), self.map.relief());
+        self.proto = Proto::new(set, self.map.clone());
+        if let Some(proto) = &self.proto {
+            let (up, down) = proto.reach();
+            self.shape.max += up.ceil() as i32;
+            self.shape.interior -= down.ceil() as i32;
+        }
+        self
     }
 
     /// This Planet with an artificial cost for each brick it generates, a hook for the bench
@@ -484,7 +505,11 @@ impl Planet {
         size: f64,
         cache: &mut detail::Cache,
     ) -> f64 {
-        self.detail.height(point, radius, fields, size, cache)
+        let base = self.detail.height(point, radius, fields, size, cache);
+        match &self.proto {
+            Some(proto) => base + proto.height(point, radius, size, cache),
+            None => base,
+        }
     }
 
     /// Bounds `(lowest, highest)` on [`Planet::ground_height`] over every point in the hull of
@@ -494,7 +519,11 @@ impl Planet {
         let fields = self.map.field_range(corners);
         let (low, high) = fields.elevation;
         let (below, above) = self.detail.bounds(corners, size, fields);
-        (low + below, high + above)
+        let (below_proto, above_proto) = match &self.proto {
+            Some(proto) => proto.bounds(corners, size),
+            None => (0.0, 0.0),
+        };
+        (low + below + below_proto, high + above + above_proto)
     }
 
     /// The Voxel at `coord`: `None` for air.
@@ -593,6 +622,13 @@ impl Planet {
             }
             let frozen = radius >= sea - ICE_THICKNESS && biome() == Biome::Snow;
             return Some(if frozen { ICE } else { WATER });
+        }
+        if depth < SCREE_DEPTH
+            && height >= 0.0
+            && let Some(proto) = &self.proto
+            && proto.scree(point, radius, cache)
+        {
+            return Some(GRAVEL);
         }
         Some(at_depth(strata(biome(), height < 0.0), depth))
     }
@@ -704,7 +740,12 @@ impl Planet {
             if shallowest >= f64::from(STRATA_DEPTH) {
                 return Brick::solid(DEEP_ROCK);
             }
-            if shallowest > 0.0 && (low >= 0.0 || high < 0.0) {
+            let scree = shallowest < SCREE_DEPTH
+                && self
+                    .proto
+                    .as_ref()
+                    .is_some_and(|p| p.scree_possible(&corners));
+            if shallowest > 0.0 && !scree && (low >= 0.0 || high < 0.0) {
                 // Below the ground, all land or all sea floor, and one stratum if it is all in
                 // one biome, which it is if the corners are in one texel.
                 if let Some(texel) = self.single_texel(&corners) {
@@ -841,6 +882,10 @@ impl Planet {
             biome: texel.biome,
             cell: self.map.elevation_cell(&corners),
             strata: (low >= 0.0 || high < 0.0).then(|| strata(texel.biome, high < 0.0)),
+            scree: self
+                .proto
+                .as_ref()
+                .is_some_and(|p| p.scree_possible(&corners)),
         })
     }
 

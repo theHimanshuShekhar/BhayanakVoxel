@@ -43,7 +43,17 @@ pub fn generate(res: usize) -> Landform {
         eprintln!("landform: land model {:.1} s", t.elapsed().as_secs_f64());
     }
     let h0 = shape.h.clone();
-    let eroded = erosion::erode(&g, &h0, &shape.uplift, &erosion::Params { steps: 36, k: 0.02, u: 10.0, smax: 650.0 });
+    let eroded = erosion::erode(
+        &g,
+        &h0,
+        &shape.uplift,
+        &erosion::Params {
+            steps: 36,
+            k: 0.02,
+            u: 10.0,
+            smax: 650.0,
+        },
+    );
     if log {
         eprintln!("landform: eroded {:.1} s", t.elapsed().as_secs_f64());
     }
@@ -52,9 +62,20 @@ pub fn generate(res: usize) -> Landform {
     let fam = landform::classify(&g, &shape, &h);
     let biome = landform::biomes(&g, &fam, &clim, &h);
     if log {
-        eprintln!("landform: climate and biomes {:.1} s", t.elapsed().as_secs_f64());
+        eprintln!(
+            "landform: climate and biomes {:.1} s",
+            t.elapsed().as_secs_f64()
+        );
     }
-    Landform { grid: g, h0, h, temp: clim.temp, moist: clim.moist, biome, drainage_km2: eroded.area }
+    Landform {
+        grid: g,
+        h0,
+        h,
+        temp: clim.temp,
+        moist: clim.moist,
+        biome,
+        drainage_km2: eroded.area,
+    }
 }
 
 impl Landform {

@@ -27,17 +27,17 @@
 
 use brick_store::VOXELS_PER_METRE;
 
-use crate::world_map::{FieldRange, Fields, LATTICE_POINTS_PER_METRE};
+use crate::world_map::{ELEVATION_UNITS_PER_METRE, FieldRange, Fields};
 use crate::{Corners, value_noise};
 
 /// An octave: its cell in lattice points (10 cm, a power of two) and whether it is ridged.
 #[derive(Clone, Copy)]
-struct Octave {
-    cell: i32,
-    ridged: bool,
+pub(crate) struct Octave {
+    pub(crate) cell: i32,
+    pub(crate) ridged: bool,
 }
 
-const fn octave(cell: i32, ridged: bool) -> Octave {
+pub(crate) const fn octave(cell: i32, ridged: bool) -> Octave {
     Octave { cell, ridged }
 }
 
@@ -55,7 +55,7 @@ const OCTAVES: [Octave; 7] = [
 const AMPLITUDE: f64 = 0.05;
 
 /// Voxels in one lattice point: 2 for 5 cm Voxels.
-const VOXELS_PER_POINT: f64 = VOXELS_PER_METRE / LATTICE_POINTS_PER_METRE as f64;
+pub(crate) const VOXELS_PER_POINT: f64 = VOXELS_PER_METRE / ELEVATION_UNITS_PER_METRE as f64;
 
 /// An octave's amplitude in Voxels.
 const fn amplitude(o: Octave) -> f64 {
@@ -112,7 +112,7 @@ fn valley(elevation: f64, drainage: f64) -> f64 {
 }
 
 /// Whether a brick sampled `size` Voxels apart has the octave.
-fn has(o: Octave, size: f64) -> bool {
+pub(crate) fn has(o: Octave, size: f64) -> bool {
     f64::from(o.cell) * VOXELS_PER_POINT >= MIN_CELL * size
 }
 
@@ -127,6 +127,8 @@ fn has(o: Octave, size: f64) -> bool {
 pub(crate) struct Cache {
     corners: [Option<Corners>; OCTAVES.len()],
     sums: Vec<Option<([i32; 3], f64)>>,
+    /// PROTOTYPE (#267): the per-brick ridge, gully and talus layers' own.
+    pub(crate) proto: crate::proto_detail::Cache,
 }
 
 /// Lattice points whose sums a [`Cache`] keeps.
@@ -142,6 +144,7 @@ impl Cache {
             } else {
                 Vec::new()
             },
+            proto: crate::proto_detail::Cache::for_brick(size),
             ..Cache::default()
         }
     }
@@ -156,17 +159,17 @@ pub(crate) struct Detail {
 }
 
 /// The salt of octave `k`'s noise.
-fn salt(seed: u64, k: usize) -> u64 {
+pub(crate) fn salt(seed: u64, k: usize) -> u64 {
     seed ^ (k as u64 + 1).wrapping_mul(0x9e37_79b9_7f4a_7c15)
 }
 
 /// An octave's value from the noise `n` in `[-1, 1)`: ridged, or as it is.
-fn shape(o: Octave, n: f64) -> f64 {
+pub(crate) fn shape(o: Octave, n: f64) -> f64 {
     if o.ridged { 2.0 * n.abs() - 1.0 } else { n }
 }
 
 /// The bounds on [`shape`] over noise within `[lo, hi]`.
-fn shape_bounds(o: Octave, lo: f64, hi: f64) -> (f64, f64) {
+pub(crate) fn shape_bounds(o: Octave, lo: f64, hi: f64) -> (f64, f64) {
     if !o.ridged {
         return (lo, hi);
     }
@@ -190,7 +193,7 @@ impl Detail {
 
     /// The lattice point of the sphere of sea level under `point`, which is `radius` from the
     /// centre.
-    fn lattice(&self, point: [f64; 3], radius: f64) -> [i32; 3] {
+    pub(crate) fn lattice(&self, point: [f64; 3], radius: f64) -> [i32; 3] {
         let scale = self.sea / radius;
         point.map(|c| (c * scale).round() as i32)
     }
@@ -254,7 +257,7 @@ impl Detail {
 
     /// The box of lattice points that holds the sphere of sea level's points under the box that
     /// has `corners` among its corners; `None` near the centre, where there is none to give.
-    fn lattice_box(&self, corners: &[[f64; 3]]) -> Option<([i32; 3], [i32; 3])> {
+    pub(crate) fn lattice_box(&self, corners: &[[f64; 3]]) -> Option<([i32; 3], [i32; 3])> {
         // Where the box's points are on the sphere of sea level, in lattice points: the box that
         // holds the corners', and room for the sphere's curve between them and the rounding.
         let mut low = [i32::MAX; 3];
@@ -317,7 +320,13 @@ impl Detail {
 /// box's corners; across the face between two cells it is so on each side, and the face is where
 /// the box is cut. So the extremes are at the corners of the box and where it is cut. A box
 /// across more than two cells along an axis is bounded by the whole range.
-fn noise_range(seed: u64, k: usize, low: [i32; 3], high: [i32; 3], cell: i32) -> (f64, f64) {
+pub(crate) fn noise_range(
+    seed: u64,
+    k: usize,
+    low: [i32; 3],
+    high: [i32; 3],
+    cell: i32,
+) -> (f64, f64) {
     let shift = cell.trailing_zeros();
     // The places along each axis: the ends, and the face between two cells if it is between them.
     let mut places = [[0; 3]; 3];
@@ -364,8 +373,8 @@ fn noise_range(seed: u64, k: usize, low: [i32; 3], high: [i32; 3], cell: i32) ->
 /// are mostly in one cell of the wider octaves, and hashing its corners is what costs.
 fn middle_noise(seed: u64, k: usize, point: [i32; 3], cell: i32) -> f64 {
     thread_local! {
-        static KEPT: std::cell::RefCell<[(u64, Option<Corners>); OCTAVES.len()]> =
-            const { std::cell::RefCell::new([(0, None); OCTAVES.len()]) };
+        static KEPT: std::cell::RefCell<[(u64, Option<Corners>); OCTAVES.len() + 8]> =
+            const { std::cell::RefCell::new([(0, None); OCTAVES.len() + 8]) };
     }
     KEPT.with(|kept| {
         let slot = &mut kept.borrow_mut()[k];

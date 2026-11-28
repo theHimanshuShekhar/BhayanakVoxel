@@ -57,7 +57,10 @@ fn flow(g: &Grid, h: &[f32], ocean: &[bool]) -> Flow {
             let nb = nb as usize;
             if fill[nb] < fill[k] {
                 // Jittered lengths break up the grid's preferred directions.
-                let jit = 1.0 + 0.5 * (f32::from((hash3(k as i32, m as i32, 3, 77) & 0xFFFF) as u16) / 65535.0 - 0.5);
+                let jit = 1.0
+                    + 0.5
+                        * (f32::from((hash3(k as i32, m as i32, 3, 77) & 0xFFFF) as u16) / 65535.0
+                            - 0.5);
                 let s = (fill[k] - fill[nb]) / (g.nbr_d[k][m] * jit);
                 if s > best.1 {
                     best = (nb as u32, s);
@@ -76,14 +79,19 @@ fn flow(g: &Grid, h: &[f32], ocean: &[bool]) -> Flow {
             area[r as usize] += area[k as usize];
         }
     }
-    Flow { order, rec, fill, area }
+    Flow {
+        order,
+        rec,
+        fill,
+        area,
+    }
 }
 
 pub struct Params {
     pub steps: usize,
-    pub k: f32,      // erodibility per step (per sqrt(km^2) per km)
-    pub u: f32,      // uplift per step at uplift = 1, metres
-    pub smax: f32,   // slope limit, m per km
+    pub k: f32,    // erodibility per step (per sqrt(km^2) per km)
+    pub u: f32,    // uplift per step at uplift = 1, metres
+    pub smax: f32, // slope limit, m per km
 }
 
 pub fn erode(g: &Grid, h0: &[f32], uplift: &[f32], p: &Params) -> Eroded {
@@ -117,6 +125,13 @@ pub fn erode(g: &Grid, h0: &[f32], uplift: &[f32], p: &Params) -> Eroded {
     }
     // Final routing on the eroded surface, for the rivers.
     let f = flow(g, &h, &ocean);
-    let lake: Vec<bool> = (0..n).map(|k| !ocean[k] && f.fill[k] > h[k] + 2.0).collect();
-    Eroded { h, area: f.area, lake, rec: f.rec }
+    let lake: Vec<bool> = (0..n)
+        .map(|k| !ocean[k] && f.fill[k] > h[k] + 2.0)
+        .collect();
+    Eroded {
+        h,
+        area: f.area,
+        lake,
+        rec: f.rec,
+    }
 }

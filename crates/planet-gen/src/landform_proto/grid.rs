@@ -27,10 +27,10 @@ pub const OFFS: [(i32, i32); 8] = [
 pub struct Grid {
     pub n: usize,
     pub dir: Vec<V3>,
-    pub area: Vec<f32>,  // km^2
+    pub area: Vec<f32>, // km^2
     pub nbr: Vec<[u32; 8]>,
     pub nbr_d: Vec<[f32; 8]>, // km
-    pub lat: Vec<f32>,   // radians
+    pub lat: Vec<f32>,        // radians
 }
 
 pub fn threads() -> usize {
@@ -47,15 +47,17 @@ pub fn par_map<T: Send + Default + Clone>(n: usize, f: impl Fn(usize) -> T + Syn
     let (f, next_ref, out_ref) = (&f, &next, &out_ptr);
     std::thread::scope(|s| {
         for _ in 0..nt {
-            s.spawn(move || loop {
-                let c = next_ref.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let lo = c * chunk;
-                if lo >= n {
-                    break;
-                }
-                for i in lo..(lo + chunk).min(n) {
-                    // SAFETY: each index is written by exactly one thread.
-                    unsafe { *out_ref.0.add(i) = f(i) };
+            s.spawn(move || {
+                loop {
+                    let c = next_ref.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let lo = c * chunk;
+                    if lo >= n {
+                        break;
+                    }
+                    for i in lo..(lo + chunk).min(n) {
+                        // SAFETY: each index is written by exactly one thread.
+                        unsafe { *out_ref.0.add(i) = f(i) };
+                    }
                 }
             });
         }
@@ -77,11 +79,19 @@ impl Grid {
                 let a = ((i as f64 + 0.5) / n as f64 * 2.0 - 1.0) * std::f64::consts::FRAC_PI_4;
                 let b = ((j as f64 + 0.5) / n as f64 * 2.0 - 1.0) * std::f64::consts::FRAC_PI_4;
                 let (s, t) = (a.tan(), b.tan());
-                (R * R * da * da * (1.0 + s * s) * (1.0 + t * t) / (1.0 + s * s + t * t).powf(1.5)) as f32
+                (R * R * da * da * (1.0 + s * s) * (1.0 + t * t) / (1.0 + s * s + t * t).powf(1.5))
+                    as f32
             })
             .collect();
         let lat: Vec<f32> = dir.iter().map(|d| d[1].asin() as f32).collect();
-        let mut g = Grid { n, dir, area, nbr: Vec::new(), nbr_d: Vec::new(), lat };
+        let mut g = Grid {
+            n,
+            dir,
+            area,
+            nbr: Vec::new(),
+            nbr_d: Vec::new(),
+            lat,
+        };
         let nb: Vec<([u32; 8], [f32; 8])> = par_map(total, |k| {
             let (f, i, j) = g.unpack(k);
             let mut ids = [0u32; 8];
@@ -125,7 +135,13 @@ impl Grid {
     /// Continuous texel coordinates (texel centres at integers) for a direction.
     pub fn locate(&self, d: V3) -> (usize, f64, f64) {
         let ax = [d[0].abs(), d[1].abs(), d[2].abs()];
-        let m = if ax[0] >= ax[1] && ax[0] >= ax[2] { 0 } else if ax[1] >= ax[2] { 1 } else { 2 };
+        let m = if ax[0] >= ax[1] && ax[0] >= ax[2] {
+            0
+        } else if ax[1] >= ax[2] {
+            1
+        } else {
+            2
+        };
         let f = 2 * m + usize::from(d[m] < 0.0);
         let (nn, r, u) = FACES[f];
         let dn = dot(d, nn);

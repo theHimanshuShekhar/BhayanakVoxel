@@ -104,7 +104,12 @@ pub fn gnoise(p: V3, seed: u32) -> (f64, V3) {
     let k5 = va - vc - ve + vg;
     let k6 = va - vb - ve + vf;
     let k7 = -va + vb + vc - vd + ve - vf - vg + vh;
-    let v = va + u[0] * k1 + u[1] * k2 + u[2] * k3 + u[0] * u[1] * k4 + u[1] * u[2] * k5
+    let v = va
+        + u[0] * k1
+        + u[1] * k2
+        + u[2] * k3
+        + u[0] * u[1] * k4
+        + u[1] * u[2] * k5
         + u[2] * u[0] * k6
         + u[0] * u[1] * u[2] * k7;
     let mut d = [0.0; 3];
@@ -194,7 +199,9 @@ impl Spline {
         let n = knots.len();
         let x: Vec<f64> = knots.iter().map(|k| k.0).collect();
         let y: Vec<f64> = knots.iter().map(|k| k.1).collect();
-        let d: Vec<f64> = (0..n - 1).map(|i| (y[i + 1] - y[i]) / (x[i + 1] - x[i])).collect();
+        let d: Vec<f64> = (0..n - 1)
+            .map(|i| (y[i + 1] - y[i]) / (x[i + 1] - x[i]))
+            .collect();
         let mut m = vec![0.0; n];
         m[0] = d[0];
         m[n - 1] = d[n - 2];

@@ -2,9 +2,9 @@
 //! model, each **searched for on the world map** and framed from where it is found, so that they
 //! follow the terrain whatever the model makes:
 //!
-//! 1. the whole Planet from orbit, 2. 30 km up over the biggest continent, 3. the greatest range
-//! from 5 km, 4. the same at dusk, 5. a valley floor looking up at the peaks, 6. a plateau's edge,
-//! 7. a river's mouth, 8. a canyon's rim.
+//! The whole Planet from orbit; 30 km up over the biggest continent; the greatest range from 5 km;
+//! the same at dusk; a valley floor looking up at the peaks; a plateau's edge; a river's mouth; a
+//! canyon's rim.
 //!
 //! A feature the search cannot find (or finds only a weak one) is reported, on stderr and on the
 //! sheet. All at 1280x720 and noon (the sun 60 degrees up) unless noted.
@@ -17,8 +17,8 @@ use std::time::Instant;
 use brick_store::{BrickStore, VOXELS_PER_METRE};
 use planet_gen::planet::Planet;
 use planet_gen::world_map::{WORLD_MAP_SIZE, WORLD_RADIUS, WorldMap};
-use render::lod::Bands;
 use render::atmosphere::Atmosphere;
+use render::lod::Bands;
 use render::sun::DEFAULT_ANGULAR_RADIUS;
 use render::{Camera, Image, Look, Offscreen, Resolution, Stages, Sun};
 
@@ -201,7 +201,11 @@ impl Survey {
 
 fn cell_of(d: V3) -> (i32, i32, i32) {
     let s = f64::from(WORLD_RADIUS) / VOXELS_PER_METRE / 1000.0 / CELL_KM;
-    ((d[0] * s).floor() as i32, (d[1] * s).floor() as i32, (d[2] * s).floor() as i32)
+    (
+        (d[0] * s).floor() as i32,
+        (d[1] * s).floor() as i32,
+        (d[2] * s).floor() as i32,
+    )
 }
 
 /// The biggest land mass: its nodes' centre, and its share of the nodes.
@@ -234,8 +238,8 @@ fn biggest_continent(survey: &Survey) -> Option<(V3, usize, V3)> {
     }
     let (size, id) = best?;
     let mut sum = [0.0; 3];
-    for k in 0..n {
-        if comp[k] == id {
+    for (k, &c) in comp.iter().enumerate().take(n) {
+        if c == id {
             sum = add(sum, survey.dirs[k]);
         }
     }
@@ -315,7 +319,11 @@ fn find(ground: &Ground) -> (Vec<Found>, Vec<String>) {
     for i in -48..=48 {
         for j in -48..=48 {
             let d = walk(
-                walk(survey.dirs[top], std::f64::consts::FRAC_PI_2, f64::from(i) * 0.25),
+                walk(
+                    survey.dirs[top],
+                    std::f64::consts::FRAC_PI_2,
+                    f64::from(i) * 0.25,
+                ),
                 0.0,
                 f64::from(j) * 0.25,
             );
@@ -457,7 +465,10 @@ fn find(ground: &Ground) -> (Vec<Found>, Vec<String>) {
             let far = h - ground.height(walk(d, bearing, 12.0));
             // The drop ends in lowland, not in the sea.
             let foot = ground.height(walk(d, bearing, 12.0));
-            if drop > 500.0 && far > 800.0 && foot > 30.0 && ground.height(walk(d, bearing, 6.0)) > 30.0
+            if drop > 500.0
+                && far > 800.0
+                && foot > 30.0
+                && ground.height(walk(d, bearing, 6.0)) > 30.0
                 && plateau.is_none_or(|p| far > p.3)
             {
                 plateau = Some((d, bearing, h, far));
@@ -506,13 +517,14 @@ fn find(ground: &Ground) -> (Vec<Found>, Vec<String>) {
         // The best drainage within the node's own cell of the survey, on the map's texels.
         for i in -4..=4 {
             for j in -4..=4 {
-                let p = walk(walk(d, std::f64::consts::FRAC_PI_2, f64::from(i) * 0.25), 0.0, f64::from(j) * 0.25);
+                let p = walk(
+                    walk(d, std::f64::consts::FRAC_PI_2, f64::from(i) * 0.25),
+                    0.0,
+                    f64::from(j) * 0.25,
+                );
                 let t = ground.map.sample(p);
                 let at = f64::from(t.drainage);
-                if t.elevation >= 0
-                    && ground.height(p) < 80.0
-                    && mouth.is_none_or(|m| at > m.1)
-                {
+                if t.elevation >= 0 && ground.height(p) < 80.0 && mouth.is_none_or(|m| at > m.1) {
                     mouth = Some((p, at));
                 }
             }
@@ -625,7 +637,10 @@ fn shot_of(f: &Found) -> Shot {
 }
 
 fn envf(name: &str, default: f64) -> f64 {
-    std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
 }
 
 fn slug(name: &str) -> String {
@@ -665,6 +680,7 @@ fn contact_sheet(images: &[Image]) -> Image {
 pub fn run(options: &Options) -> Result<PathBuf, Box<dyn Error>> {
     let began = Instant::now();
     std::fs::create_dir_all(&options.out)?;
+    planet_gen::world_map::use_landform_prototype(true);
     eprintln!("making the 320 km world map from the landform model...");
     let t = Instant::now();
     // LOOKDEV_MAP_SIZE: a smaller map, for trying the shots out quickly.
@@ -708,21 +724,28 @@ pub fn run(options: &Options) -> Result<PathBuf, Box<dyn Error>> {
         crate::bench::caves::fill(&mut scene, &mut store, f.site)?;
         eprintln!(
             "    bricks by level: {:?}",
-            (0..crate::RING_LEVELS).map(|l| scene.level_bricks(l)).collect::<Vec<_>>()
+            (0..crate::RING_LEVELS)
+                .map(|l| scene.level_bricks(l))
+                .collect::<Vec<_>>()
         );
-        let mut gpu = Offscreen::with_materials(
-            Resolution::native(w, h),
-            &scene,
-            super::stamps::table(),
-        )?;
+        let mut gpu =
+            Offscreen::with_materials(Resolution::native(w, h), &scene, super::stamps::table())?;
         gpu.set_flat_ambient(false);
         gpu.set_ground_level(f64::from(WORLD_RADIUS));
-        let mut air = if options.untinted { Atmosphere::PHYSICAL } else { Atmosphere::HERO };
+        let mut air = if options.untinted {
+            Atmosphere::PHYSICAL
+        } else {
+            Atmosphere::HERO
+        };
         for key in &mut air.tint.keys {
             key.haze_per_metre *= f.haze * envf("LOOKDEV_HAZE", 0.3) as f32;
         }
         // The fixed exposure of the orbit shot wants a dimmer sun than the metered ones.
-        let light = if f.sun_dir.is_some() { envf("LOOKDEV_ORBIT_LIGHT", 0.2) } else { 1.0 };
+        let light = if f.sun_dir.is_some() {
+            envf("LOOKDEV_ORBIT_LIGHT", 0.2)
+        } else {
+            1.0
+        };
         air.sun_light = air.sun_light.map(|c| c * light as f32);
         // The game's air is a 35 m layer of heavy Mie haze, which is opaque to a ground-level ray
         // within about 400 m: thinned for the vistas.
@@ -750,7 +773,10 @@ pub fn run(options: &Options) -> Result<PathBuf, Box<dyn Error>> {
             let profile: Vec<String> = (0..=12)
                 .map(|i| {
                     let t = f64::from(i) / 12.0;
-                    format!("{:.0}", ground.height(norm(add(mul(a, 1.0 - t), mul(b, t)))))
+                    format!(
+                        "{:.0}",
+                        ground.height(norm(add(mul(a, 1.0 - t), mul(b, t))))
+                    )
                 })
                 .collect();
             eprintln!("    ground along the view (m): {}", profile.join(" "));
@@ -764,7 +790,11 @@ pub fn run(options: &Options) -> Result<PathBuf, Box<dyn Error>> {
                 (len(camera.position) - planet.sea_radius()) / VOXELS_PER_METRE
                     - planet.ground_height(camera.position) / VOXELS_PER_METRE,
                 dot(camera.forward(), up).asin().to_degrees().abs(),
-                if dot(camera.forward(), up) < 0.0 { "below" } else { "above" },
+                if dot(camera.forward(), up) < 0.0 {
+                    "below"
+                } else {
+                    "above"
+                },
                 len([0, 1, 2].map(|a| f.target[a] - f.position[a])) / VOXELS_PER_METRE / 1000.0
             );
         }
@@ -786,7 +816,10 @@ pub fn run(options: &Options) -> Result<PathBuf, Box<dyn Error>> {
             Some(d) => Sun::new(d.map(|c| c as f32), DEFAULT_ANGULAR_RADIUS).expect("a direction"),
             None => sun_at(
                 &camera,
-                std::env::var("LOOKDEV_SUN").ok().and_then(|v| v.parse().ok()).unwrap_or(f.sun),
+                std::env::var("LOOKDEV_SUN")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(f.sun),
             ),
         });
         let dir = format!("{n:02}-{}", slug(f.name));
@@ -814,10 +847,17 @@ pub fn run(options: &Options) -> Result<PathBuf, Box<dyn Error>> {
         );
         shown.push(f.name);
         images.push(settled);
-        eprintln!("[{n}] {}: done in {:.0} s", f.name, t.elapsed().as_secs_f64());
+        eprintln!(
+            "[{n}] {}: done in {:.0} s",
+            f.name,
+            t.elapsed().as_secs_f64()
+        );
     }
     if !images.is_empty() {
-        write_png(&options.out.join("contact-sheet.png"), &contact_sheet(&images))?;
+        write_png(
+            &options.out.join("contact-sheet.png"),
+            &contact_sheet(&images),
+        )?;
     }
     let mut page = String::from(
         "<!doctype html><meta charset=utf-8><title>landform look-dev (#246)</title>\
@@ -845,6 +885,10 @@ pub fn run(options: &Options) -> Result<PathBuf, Box<dyn Error>> {
     page.push_str("</table>");
     std::fs::write(options.out.join("index.html"), page)?;
     let sheet = options.out.join("index.html");
-    eprintln!("wrote {} ({:.0} s)", sheet.display(), began.elapsed().as_secs_f64());
+    eprintln!(
+        "wrote {} ({:.0} s)",
+        sheet.display(),
+        began.elapsed().as_secs_f64()
+    );
     Ok(sheet)
 }

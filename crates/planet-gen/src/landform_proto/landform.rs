@@ -1,7 +1,7 @@
 //! Climate (temperature, wind-band moisture), Landform family, Biome, Formation allowance.
 
 use super::grid::*;
-use super::model::{Shape, SEED};
+use super::model::{SEED, Shape};
 use super::noise::*;
 
 pub const RANGE: u8 = 0;
@@ -11,7 +11,9 @@ pub const VALLEY: u8 = 3;
 pub const PLAINS: u8 = 4;
 pub const COAST: u8 = 5;
 pub const OCEAN: u8 = 6;
-pub const FAMILY_NAMES: [&str; 7] = ["RANGE", "PLATEAU", "CANYON", "VALLEY", "PLAINS", "COAST", "OCEAN"];
+pub const FAMILY_NAMES: [&str; 7] = [
+    "RANGE", "PLATEAU", "CANYON", "VALLEY", "PLAINS", "COAST", "OCEAN",
+];
 pub const FAMILY_COLOURS: [[u8; 3]; 7] = [
     [150, 80, 60],   // range: rust brown
     [230, 190, 80],  // plateau: ochre
@@ -25,8 +27,8 @@ pub const FAMILY_COLOURS: [[u8; 3]; 7] = [
 // ------------------------------------------------------------------ climate
 
 pub struct Climate {
-    pub temp: Vec<f32>,  // deg C
-    pub moist: Vec<f32>, // 0..1 effective moisture
+    pub temp: Vec<f32>,   // deg C
+    pub moist: Vec<f32>,  // 0..1 effective moisture
     pub precip: Vec<f32>, // raw rain index
 }
 
@@ -62,17 +64,29 @@ pub fn climate(g: &Grid, h: &[f32]) -> Climate {
         let (e, nn) = Grid::frame(d);
         let lat = f64::from(gc.lat[k]);
         let al = lat.abs();
-        let u = if al < 60f64.to_radians() { -(3.0 * al).cos() } else { (6.0 * (al - 60f64.to_radians())).cos() };
+        let u = if al < 60f64.to_radians() {
+            -(3.0 * al).cos()
+        } else {
+            (6.0 * (al - 60f64.to_radians())).cos()
+        };
         let v = -0.35 * (6.0 * al).sin() * lat.signum();
         let w = add(mul(e, u), mul(nn, v));
         let speed = len(w);
-        let wh = if speed > 0.02 { mul(w, 1.0 / speed) } else { [0.0; 3] };
+        let wh = if speed > 0.02 {
+            mul(w, 1.0 / speed)
+        } else {
+            [0.0; 3]
+        };
         let mut ws = [0f32; 8];
         let mut sum = 0.0;
         for m in 0..8 {
             let nb = gc.dir[gc.nbr[k][m] as usize];
             let t = norm(sub(nb, mul(d, dot(nb, d))));
-            let wgt = if speed > 0.02 { (-dot(t, wh)).max(0.0).powi(2) } else { 1.0 };
+            let wgt = if speed > 0.02 {
+                (-dot(t, wh)).max(0.0).powi(2)
+            } else {
+                1.0
+            };
             ws[m] = wgt as f32;
             sum += wgt;
         }
@@ -90,7 +104,9 @@ pub fn climate(g: &Grid, h: &[f32]) -> Climate {
     let zon: Vec<f32> = (0..gc.total())
         .map(|k| {
             let deg = f64::from(gc.lat[k]).to_degrees().abs();
-            (1.0 + 2.5 * gauss(deg, 0.0, 9.0) - 0.65 * gauss(deg, 28.0, 9.0) + 0.8 * gauss(deg, 60.0, 8.0)).max(0.2) as f32
+            (1.0 + 2.5 * gauss(deg, 0.0, 9.0) - 0.65 * gauss(deg, 28.0, 9.0)
+                + 0.8 * gauss(deg, 60.0, 8.0))
+            .max(0.2) as f32
         })
         .collect();
     let mut q = vec![0.3f32; gc.total()];
@@ -108,7 +124,11 @@ pub fn climate(g: &Grid, h: &[f32]) -> Climate {
             let qa = (1.0 - a) * q[k] + a * qin;
             let qs = qsat(f64::from(tc[k])) as f32;
             if hc[k] <= 0.0 {
-                let nq = if qa < qs { qa + 0.09 * s * (qs - qa) } else { qs };
+                let nq = if qa < qs {
+                    qa + 0.09 * s * (qs - qa)
+                } else {
+                    qs
+                };
                 (nq.max(0.0), 0.0)
             } else {
                 let lift = (hc[k] - hup).max(0.0);
@@ -185,45 +205,231 @@ pub struct Biome {
 }
 
 const fn b(name: &'static str, family: u8, t: (f32, f32), m: (f32, f32), colour: [u8; 3]) -> Biome {
-    Biome { name, family, t, m, colour }
+    Biome {
+        name,
+        family,
+        t,
+        m,
+        colour,
+    }
 }
 
 pub const BIOMES: &[Biome] = &[
-    b("GLACIAL PEAKS", RANGE, (-60.0, -4.0), (0.0, 1.0), [235, 240, 250]),
-    b("ALPINE TUNDRA", RANGE, (-4.0, 6.0), (0.0, 1.0), [150, 160, 150]),
-    b("HIGHLAND FOREST", RANGE, (6.0, 20.0), (0.4, 1.0), [50, 110, 70]),
-    b("ROCKY BARRENS", RANGE, (6.0, 40.0), (0.0, 0.4), [140, 115, 95]),
-    b("CLOUD MOUNTAINS", RANGE, (20.0, 45.0), (0.55, 1.0), [30, 140, 110]),
-    b("ICE PLATEAU", PLATEAU, (-60.0, -8.0), (0.0, 1.0), [215, 230, 240]),
-    b("COLD STEPPE PLATEAU", PLATEAU, (-8.0, 8.0), (0.0, 1.0), [170, 170, 120]),
-    b("MESA BADLANDS", PLATEAU, (8.0, 45.0), (0.0, 0.3), [205, 120, 70]),
-    b("HIGHLAND SAVANNA", PLATEAU, (8.0, 45.0), (0.3, 0.6), [200, 175, 90]),
-    b("CLOUD FOREST PLATEAU", PLATEAU, (8.0, 45.0), (0.6, 1.0), [70, 150, 100]),
-    b("FROZEN CANYON", CANYON, (-60.0, -5.0), (0.0, 1.0), [180, 200, 225]),
-    b("TEMPERATE CANYON", CANYON, (-5.0, 14.0), (0.0, 1.0), [170, 120, 95]),
-    b("BADLANDS CANYON", CANYON, (14.0, 45.0), (0.0, 0.35), [200, 85, 55]),
-    b("JUNGLE GORGE", CANYON, (14.0, 45.0), (0.5, 1.0), [30, 120, 60]),
-    b("GLACIAL VALLEY", VALLEY, (-60.0, -3.0), (0.0, 1.0), [190, 215, 235]),
-    b("MEADOW VALLEY", VALLEY, (-3.0, 18.0), (0.2, 1.0), [110, 175, 95]),
-    b("DRY VALLEY", VALLEY, (6.0, 45.0), (0.0, 0.3), [185, 160, 105]),
-    b("WET RIVER VALLEY", VALLEY, (18.0, 45.0), (0.45, 1.0), [40, 150, 90]),
-    b("ICE SHEET", PLAINS, (-60.0, -14.0), (0.0, 1.0), [245, 248, 255]),
+    b(
+        "GLACIAL PEAKS",
+        RANGE,
+        (-60.0, -4.0),
+        (0.0, 1.0),
+        [235, 240, 250],
+    ),
+    b(
+        "ALPINE TUNDRA",
+        RANGE,
+        (-4.0, 6.0),
+        (0.0, 1.0),
+        [150, 160, 150],
+    ),
+    b(
+        "HIGHLAND FOREST",
+        RANGE,
+        (6.0, 20.0),
+        (0.4, 1.0),
+        [50, 110, 70],
+    ),
+    b(
+        "ROCKY BARRENS",
+        RANGE,
+        (6.0, 40.0),
+        (0.0, 0.4),
+        [140, 115, 95],
+    ),
+    b(
+        "CLOUD MOUNTAINS",
+        RANGE,
+        (20.0, 45.0),
+        (0.55, 1.0),
+        [30, 140, 110],
+    ),
+    b(
+        "ICE PLATEAU",
+        PLATEAU,
+        (-60.0, -8.0),
+        (0.0, 1.0),
+        [215, 230, 240],
+    ),
+    b(
+        "COLD STEPPE PLATEAU",
+        PLATEAU,
+        (-8.0, 8.0),
+        (0.0, 1.0),
+        [170, 170, 120],
+    ),
+    b(
+        "MESA BADLANDS",
+        PLATEAU,
+        (8.0, 45.0),
+        (0.0, 0.3),
+        [205, 120, 70],
+    ),
+    b(
+        "HIGHLAND SAVANNA",
+        PLATEAU,
+        (8.0, 45.0),
+        (0.3, 0.6),
+        [200, 175, 90],
+    ),
+    b(
+        "CLOUD FOREST PLATEAU",
+        PLATEAU,
+        (8.0, 45.0),
+        (0.6, 1.0),
+        [70, 150, 100],
+    ),
+    b(
+        "FROZEN CANYON",
+        CANYON,
+        (-60.0, -5.0),
+        (0.0, 1.0),
+        [180, 200, 225],
+    ),
+    b(
+        "TEMPERATE CANYON",
+        CANYON,
+        (-5.0, 14.0),
+        (0.0, 1.0),
+        [170, 120, 95],
+    ),
+    b(
+        "BADLANDS CANYON",
+        CANYON,
+        (14.0, 45.0),
+        (0.0, 0.35),
+        [200, 85, 55],
+    ),
+    b(
+        "JUNGLE GORGE",
+        CANYON,
+        (14.0, 45.0),
+        (0.5, 1.0),
+        [30, 120, 60],
+    ),
+    b(
+        "GLACIAL VALLEY",
+        VALLEY,
+        (-60.0, -3.0),
+        (0.0, 1.0),
+        [190, 215, 235],
+    ),
+    b(
+        "MEADOW VALLEY",
+        VALLEY,
+        (-3.0, 18.0),
+        (0.2, 1.0),
+        [110, 175, 95],
+    ),
+    b(
+        "DRY VALLEY",
+        VALLEY,
+        (6.0, 45.0),
+        (0.0, 0.3),
+        [185, 160, 105],
+    ),
+    b(
+        "WET RIVER VALLEY",
+        VALLEY,
+        (18.0, 45.0),
+        (0.45, 1.0),
+        [40, 150, 90],
+    ),
+    b(
+        "ICE SHEET",
+        PLAINS,
+        (-60.0, -14.0),
+        (0.0, 1.0),
+        [245, 248, 255],
+    ),
     b("TUNDRA", PLAINS, (-14.0, -2.0), (0.0, 1.0), [165, 175, 150]),
     b("TAIGA", PLAINS, (-2.0, 8.0), (0.35, 1.0), [55, 100, 85]),
-    b("COLD STEPPE", PLAINS, (-2.0, 8.0), (0.0, 0.35), [175, 170, 115]),
-    b("GRASSLAND", PLAINS, (8.0, 22.0), (0.25, 0.55), [150, 190, 90]),
-    b("TEMPERATE FOREST", PLAINS, (8.0, 22.0), (0.55, 1.0), [60, 140, 60]),
+    b(
+        "COLD STEPPE",
+        PLAINS,
+        (-2.0, 8.0),
+        (0.0, 0.35),
+        [175, 170, 115],
+    ),
+    b(
+        "GRASSLAND",
+        PLAINS,
+        (8.0, 22.0),
+        (0.25, 0.55),
+        [150, 190, 90],
+    ),
+    b(
+        "TEMPERATE FOREST",
+        PLAINS,
+        (8.0, 22.0),
+        (0.55, 1.0),
+        [60, 140, 60],
+    ),
     b("DESERT", PLAINS, (10.0, 45.0), (0.0, 0.2), [225, 200, 130]),
     b("SAVANNA", PLAINS, (22.0, 45.0), (0.2, 0.55), [195, 180, 80]),
-    b("RAINFOREST", PLAINS, (22.0, 45.0), (0.55, 1.0), [20, 110, 50]),
-    b("POLAR COAST", COAST, (-60.0, -4.0), (0.0, 1.0), [210, 225, 235]),
-    b("COLD SHORE", COAST, (-4.0, 6.0), (0.0, 1.0), [150, 160, 140]),
-    b("TEMPERATE MARSH", COAST, (6.0, 20.0), (0.3, 1.0), [100, 150, 110]),
-    b("DUNE COAST", COAST, (6.0, 45.0), (0.0, 0.3), [230, 210, 150]),
-    b("MANGROVE COAST", COAST, (20.0, 45.0), (0.3, 1.0), [60, 140, 95]),
-    b("FROZEN SEA", OCEAN, (-60.0, -8.0), (0.0, 1.2), [190, 215, 235]),
+    b(
+        "RAINFOREST",
+        PLAINS,
+        (22.0, 45.0),
+        (0.55, 1.0),
+        [20, 110, 50],
+    ),
+    b(
+        "POLAR COAST",
+        COAST,
+        (-60.0, -4.0),
+        (0.0, 1.0),
+        [210, 225, 235],
+    ),
+    b(
+        "COLD SHORE",
+        COAST,
+        (-4.0, 6.0),
+        (0.0, 1.0),
+        [150, 160, 140],
+    ),
+    b(
+        "TEMPERATE MARSH",
+        COAST,
+        (6.0, 20.0),
+        (0.3, 1.0),
+        [100, 150, 110],
+    ),
+    b(
+        "DUNE COAST",
+        COAST,
+        (6.0, 45.0),
+        (0.0, 0.3),
+        [230, 210, 150],
+    ),
+    b(
+        "MANGROVE COAST",
+        COAST,
+        (20.0, 45.0),
+        (0.3, 1.0),
+        [60, 140, 95],
+    ),
+    b(
+        "FROZEN SEA",
+        OCEAN,
+        (-60.0, -8.0),
+        (0.0, 1.2),
+        [190, 215, 235],
+    ),
     b("COLD SEA", OCEAN, (-8.0, 8.0), (0.0, 1.2), [60, 100, 150]),
-    b("TEMPERATE SEA", OCEAN, (8.0, 20.0), (0.0, 1.2), [40, 100, 170]),
+    b(
+        "TEMPERATE SEA",
+        OCEAN,
+        (8.0, 20.0),
+        (0.0, 1.2),
+        [40, 100, 170],
+    ),
     b("WARM SEA", OCEAN, (20.0, 45.0), (0.0, 1.2), [30, 150, 190]),
     b("DEEP OCEAN", OCEAN, (-60.0, 45.0), (1.2, 9.0), [15, 35, 85]),
 ];
@@ -284,7 +490,11 @@ pub fn slope(g: &Grid, h: &[f32]) -> Vec<f32> {
 pub fn formations(g: &Grid, s: &Shape, fam: &[u8], c: &Climate, h: &[f32]) -> Formations {
     let sl = slope(g, h);
     let n = g.total();
-    let mut f = Formations { cliff: vec![0.0; n], spire: vec![0.0; n], arch: vec![0.0; n] };
+    let mut f = Formations {
+        cliff: vec![0.0; n],
+        spire: vec![0.0; n],
+        arch: vec![0.0; n],
+    };
     for k in 0..n {
         if fam[k] == OCEAN {
             continue;
