@@ -22,6 +22,7 @@ use brick_store::{BRICK_SIZE, Brick, BrickCoord, BrickStore, Interior, Material,
 mod caves;
 pub mod cost;
 mod detail;
+pub mod noise;
 pub mod planet;
 pub mod world_map;
 
