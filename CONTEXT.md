@@ -86,6 +86,10 @@ _Avoid_: Block, prefab, tile, brick (a brick is the 8×8×8 Voxel storage unit; 
 What a character holds to dig in Survival: an axe, a shovel or a pickaxe, each of a tier. Every Material names the Tool that digs it. A wrong Tool or bare hands dig it far more slowly but never not at all, and a better tier digs faster. A Tool decides which Brushes its holder can dig with. Placing needs no Tool. Not in Creative.
 _Avoid_: Item, weapon
 
+**Yield**:
+What a dig gives a player in Survival: the volume of each Material it removed, shown in litres.
+_Avoid_: Drop, loot, resources
+
 **Creative**:
 The way to play with every Brush and Material free and no Tools, as in the Vertical slice.
 _Avoid_: Sandbox mode, build mode
