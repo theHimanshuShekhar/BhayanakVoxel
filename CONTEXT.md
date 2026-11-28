@@ -71,8 +71,8 @@ The shape and size an Edit applies to the Planet (e.g. a 1 m sphere).
 _Avoid_: Tool size, cursor
 
 **Piece**:
-A ready-made Voxel model, such as a brick or a log, one metre across, that a player places whole in a single Edit. Once placed it is ordinary Voxels and the Planet does not remember it. A Piece lines up with the Piece it is placed against.
-_Avoid_: Block, prefab, tile
+A ready-made Voxel model, such as a brick Piece or a log, about a metre across, that a player places whole in a single Edit. Once placed it is ordinary Voxels and the Planet does not remember it. A Piece snaps to any face of the Piece it is placed against, in line or staggered, and turned square to it; with nothing to snap to it starts a new build.
+_Avoid_: Block, prefab, tile, brick (a brick is the 8×8×8 Voxel storage unit; say "brick Piece")
 
 **Tool**:
 What a character holds to dig in Survival: an axe, a shovel or a pickaxe, each of a tier. Every Material names the Tool that digs it. A wrong Tool or bare hands dig it far more slowly but never not at all, and a better tier digs faster. A Tool decides which Brushes its holder can dig with. Placing needs no Tool. Not in Creative.
