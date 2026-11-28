@@ -1,0 +1,2067 @@
+# Bench report reference
+
+What each option, field and section of `client bench`'s report means, for reading a `report.json` in depth. The short, current how-to (which PRs get a label, what to run, the gates and what to post) is [`docs/agents/benchmarking.md`](../agents/benchmarking.md); read it first. The log of runs and decisions is [`bench-history.md`](bench-history.md).
+
+This is the descriptive part of the old `docs/agents/benchmarking.md`, moved on 2026-11-28 by the docs review. The figures inside it are the ones measured when each field was added, with the date or the commit where it matters. The source of truth for a field is its doc comment in `bins/client/src/bench/report.rs`, `realtime.rs`, `stream.rs` and `convergence.rs`; for an option, `client bench --help`; for a gate's limit, `bins/client/bench-budgets.toml`.
+
+Contents: [Running it](#running-it) · [The machine profile and the world map cache](#the-machine-profile-and-the-world-map-cache-264) · [What it does](#what-it-does) · [The streaming mode](#the-streaming-mode) · [The real-time mode](#the-real-time-mode) · [The paths](#the-paths) · [The fields](#the-fields) · [What the upload budget bounds](#what-the-upload-budget-bounds) · [The gates](#the-gates) · [The convergence phase](#the-convergence-phase) · [The hardware ray backend](#the-hardware-ray-backend-50) · [Reading the report](#reading-the-report) · [Budgets](#budgets) · [The art direction's passes](#the-art-directions-passes-202) · [The look-dev shot list](#the-look-dev-shot-list) · [The day](#the-day-203-the-cycle-bench-and-the-day-sheet) · [Tests](#tests)
+
+## Running it
+
+From the Windows artifact, which needs no Rust toolchain and no other files:
+
+```
+client.exe bench --out bench-out
+```
+
+With a checkout, `cargo run --release -p client -- bench --out bench-out` does the same. Build in
+release: a debug build's CPU side is slow enough to distort the frame times.
+
+| Option | Meaning |
+| --- | --- |
+| `--out DIR` | Where `report.json` and the screenshots go. Default `bench-out`. |
+| `--budgets FILE` | Use this budgets file instead of the one built into the executable. |
+| `--size WxH` | Resolution of the traced (internal) image. Default `1280x720`, the internal resolution behind 1440p output that the budgets are for; primary mode upscales it to twice that in each direction (2560x1440). Do not change it for a report you paste. |
+| `--bias F` | LOD bias: output pixels one Voxel may cover, default 1. Every switch distance between levels of detail scales with it (see `CONTEXT.md`, LOD band); 2 does about a quarter of the work for up to a pixel more of error. The report records it. A report with another bias is not comparable with the budgets. |
+| `--diag LIST` | Switches for finding out where time goes, separated by commas: `no-follow` (the Planet does not follow the camera), `no-upload` (it does, on the CPU, but the GPU is not told), `no-flush` (writes to the GPU go with the next frame's commands, not at once) and `gap-ms=F` (sleep F ms before each frame, as the CPU work of following would). The report lists them in `config.diag`, the summary warns, and the budgets are not checked (`budgets.skipped` says why; the exit status is 0). See "Reading a regression" below. **`--diag` is an error with `--real-time`**: the real-time gates are always checked, so a diagnostic run of it would contradict the first sentence. |
+| `--short` | A tiny run (160x90, a handful of frames, a patch of the Planet): the CI smoke test. |
+| `--streaming` | Also runs the streaming mode (below): the test Planet streamed in, stepped, on a fixed frame schedule, with counts that are the same on every run. The report's `streaming` is null without it. |
+| `--real-time` | With `--streaming`, also runs the real-time mode (below): the full-size Planet with the real loader workers and scene thread, on the machine's clock, along paths of 50 m/s flights, a take-off, a turn, a stop and a cold start. It takes tens of minutes and is not deterministic. With `--short` it runs on the test Planet, as a smoke test. The report's `streaming_real_time` is null without it. |
+| `--stream-slice-ms N` | With `--real-time`, how long the scene thread takes in what the loader made for in a round while the loader's workers are as far ahead as they may be (`scene_worker::BACKED_UP_SLICE`, default 32). For measuring what another slice does to the flights' camera soft misses, the settle and the frame times (#168); the report's `config.stream_slice_ms` says what it was. |
+| `--runs N` | With `--real-time`, how many times to run the paths in this process. Default 3. The report keeps each run and the least and the most of every number over them; the gates use the worst. |
+| `--flat-ambient` | With `--real-time`, runs it with the flat ambient light (the goldens' and tests' lighting, no radiance-cache GI) instead of the game's GI, to tell what the GI costs in the real-time frame: the same run, the same paths. The planet's label in the report says ", flat ambient". An error without `--real-time`. |
+| `--flip-gamma-2-2` | Also score each checkpoint with the old gamma-2.2 curve (#188), from the same samples, to tell the sRGB move from the estimator's effect. Not with `--no-convergence` or `--short`. |
+| `--no-convergence` | Leave out the convergence phase (below), which otherwise runs after the caves. |
+| `--truth-spp N` | Samples of each of the convergence phase's two truths (the emissive room's have at least 8192 with FLIP, `ROOM_TRUTH_SPP`). Default 1024; ADR 0005's is 8192, which takes eight times as long (`client.exe bench --truth-spp 8192` is the 4090 baseline). At least 1024, the last checkpoint. |
+| `--rt-backend B` | How rays find the Planet (#50): **`auto`** (the default, since #50 Part 2: what the player gets, ray queries where the adapter has them and else the compute path with a warning and the reason in `rt.fallback`), `compute` (the compute-shader DDA, the reference and the player's setting for compute), `hw` (ray queries over the bricks' tight boxes, shadow rays ending at the first hit, for the flight, the sweep and the Edit stress, and for `--streaming --real-time`'s runs, #236; on an adapter without them the same warning and fallback in the main bench, and an error in the real-time mode), `hw-nearest` (`hw` with shadow rays that look for the nearest hit) or `both` (the bench as for `compute`, then the same flight and Edit stress on `hw` and the flight on `hw-nearest`, each on a context of its own, and the three compared). See "The hardware ray backend" below. |
+| `--hw-group-regions G` | How the hardware backend makes its BLASes (#236): `G` regions along an edge of each, `4` (one cell), `8`, `16` or `32`, or `NEAR:FAR@LEVEL` (levels below LEVEL have BLASes of NEAR regions, the others FAR: `4:16@6`), or `NEAR:MID@LEVEL:FAR@LEVEL` (a third size from the second LEVEL up: `8:16@1:32@3`). **The default is `16:32@2`** (`PRODUCTION_GROUPING`): 16 regions for levels 0 and 1, 32 from level 2. The 4090's sweeps of #236: every real-time gate passes, its update `p95` is the lowest of the sizes tried (worst path 0.55 ms; 16 everywhere 0.91, 32 everywhere 0.57 with a soft-miss gate missed), 43% fewer BLASes than 16 everywhere, and its level 0 is 16's, whose Edit by the ground (`hw_edits_ground`) is 0.97 ms at `p95` (a finer level 0, `4:16@1`, 0.73). A BLAS is built again whole when any cell of it is stale, so bigger ones cost the frame thread less (fewer builds to record, fewer instances for a submit that traces to check) and the GPU more (more boxes a patch). The report's `rt.hw_group_regions` and `streaming_real_time.rt.hw_group_regions` say what the flag said, and `rt.comparison.hw_accel.group_regions` and the `group_regions` of an Edit stress's or a real-time run's `accel` what the context that ran had. |
+| `--hw-build-blas N` | The most BLASes a frame builds of the groups that may wait (#236), default no bound; the groups that may not wait (they gained boxes or have no BLAS, or waited too long) are built at once whatever it is, and a frame that built nothing builds one. It spreads a burst of builds over frames without breaking the hole rule: `accel.*.blas_urgent` and the paths' `hardware.blas_urgent` are what it cannot spread. |
+| `--hw-wait` | A diagnosis, not a measurement of the frame (#236): every update of the hardware backend waits for the GPU, so the paths' `hardware.wait` (and the slowest frames' `wait_ms`) is the GPU's time of the frame's boxes' pass, BLAS builds and TLAS. Use it to see whether a frame's `wait_not_passes` is the builds. The gates mean nothing with it. |
+| `--gen-extra-us N` | With `--real-time` (#242): an artificial CPU cost of `N` µs (0 to 1000) for each brick the generator is asked for, at every level, wherever generation runs (the loader's workers, the load's spawn ring and Guard cells). For the headroom curve of the streaming gates ("Headroom hooks" below). The report's `gen_extra_us_asked` and `gen_extra_us_measured` say what it was and what a charge really took. |
+| `--peak-m M`, `--trench-m M` | With `--real-time` (#242): today's world map with its heights stretched to peaks of `M` m (default 2000) and trenches of `M` m (default 1000); either alone changes only that side. A cost proxy for a taller ground column, not a new terrain ("Headroom hooks" below). The report's `relief` says what ran. |
+| `--profile low-end` | Before the subcommand (`client --profile low-end bench ...`), or `BHAYANAK_PROFILE=low-end`: size threads and memory as the low-end machine and pin the process to 4 logical processors ("The machine profile", below). `--threads N`, `--memory-mib N`, `--video-memory-mib N` and `--no-ray-queries` lower one thing at a time. |
+| `--shadow-rays N` | Shadow rays a pixel of Primary casts towards the sun's disc in the convergence phase's sun-and-sky view (#52), 1 to 16, default the renderer's (2). The report's `convergence.shadows.shadow_rays` says which. |
+| `--shadow-weight W` | How Primary weighs the sun's shadow rays in the convergence phase (#55): `per-sample` (the default, each ray's own cosine, the Reference's) or `centre-cosine` (what shipped with #52). The gates are held on the chosen weight; the other is reported beside it (`other_shadow_weight`). |
+| `--converged-frames N` | Frames of a still view that Primary with no denoiser is averaged over in the convergence phase, for `Primary converged` (#55). Default 1024; 0 leaves it out. |
+| `--time-of-day H` | Light the flight, sweep and Edits by the world clock's sky at H hours (0 to 24), stopped there, in place of the fixed hero sun (#203). |
+| `--day-cycle` | Also run the day cycle after the flight (#203): a day of the world clock sped up. Adds a `day_cycle` block. |
+| `--day-seconds N` | With `--day-cycle`, how long the sped-up day is, in seconds of the clock. Default 60 (6 with `--short`), at least 4. |
+| `--no-fail` | Exit with status 0 even if a pass is over budget, a frame of the streaming mode has a hole, or a gate of the real-time mode is over. |
+
+It runs unattended. Without the convergence phase it takes a minute or so (generating the whole Planet was about 22 s of it, measured before the world map's cache and parallel build of #264, and not measured again); the convergence phase, on by default, adds about 45 s on the 4090 at the default `--truth-spp`, and more on a slower GPU or with a larger `--truth-spp`.
+The report is written to `DIR/report.json` and also printed on stdout; progress and a table go
+to stderr.
+
+**Exit status:** 0 if every budget is met, 2 if a pass is over its budget (or has a budget but
+could not be timed) or, with `--streaming`, if any frame had a hole, or, with `--real-time`, if a
+gate of the real-time mode is over (below), or if a gate of the convergence phase's Primary-against-truth
+checks is over (`convergence.gi.gates.over`, #54, #55), or, with `--day-cycle`, if a frame or the
+p99 of the day cycle is over 16.7 ms (`day_cycle.gates.over`, #203); 1 if the bench could not run (no Vulkan device, an
+unreadable budgets file, a bad option, `--real-time` with budgets that have no `[streaming]`
+table, or a run of the real-time mode that stopped on an error: that is 1 even with `--no-fail`,
+and `report.json` is still written, with everything done before it and the error, see "When a run
+stops").
+
+### The machine profile and the world map cache (#264)
+
+The client and the bench size their threads and memory from the machine (`crates/machine`, and
+`docs/perf/resource-audit.md`). Every run prints `machine: ...` first. To measure the low end on a
+bigger machine, put `--profile low-end` before the subcommand (or set `BHAYANAK_PROFILE=low-end`):
+4 threads, 5 GiB of free memory (the 8 GB machine's: Windows at idle leaves 4.5 to 5), 4 GB of
+video memory (not read by any budget yet) and no ray queries (the compute tracer), the GTX 1650 /
+RX 570 class that the project's low end is. The process is **pinned to 4 logical processors**, so
+that its threads, not only the work's, compete for 4 as on that machine (on Windows every thread; on
+Linux all but Mesa's shader disk-cache thread, which resets its own mask); the report's
+`machine.profile` says which (`pinned_cpus`, or why it was not pinned), the memory found and the
+LOD bias the client started at (1.5 at 5 GiB: the default 1.0 needs 9.7 GiB free). **A full-size
+real-time run of the default profile that did not start at 1.0 has `starting_bias` in
+`gates.over`**, since the gates are budgeted for 1.0; a run on fewer threads or less memory than the
+machine has (`machine.profile.lowered`) is not held to that. `--no-ray-queries` and
+`--video-memory-mib` alone do not exempt a run. `--threads N`, `--memory-mib N`,
+`--video-memory-mib N` and `--no-ray-queries` lower one thing at a time. A report from a constrained
+profile is not comparable with the budgets (they are the 4090's); it is for finding out whether the
+low end streams, holds its memory and loads in a reasonable time. The `needs-stream-bench` run of a
+PR that changes the load or the loader runs both, the default and `--profile low-end`.
+
+The 320 km world map takes 11 s to build on 8 threads of the dev box (it was 24 s before #264) and
+is kept in a file after the first build: `%LOCALAPPDATA%\bhayanakvoxel` on Windows,
+`$XDG_CACHE_HOME` or `~/.cache` elsewhere (`BHAYANAK_CACHE_DIR` sets the folder,
+`BHAYANAK_NO_MAP_CACHE=1` turns the cache off). A cached map is read and checked in well under a
+second, and a file that is corrupt, short, or made by another generator version or seed is built
+again and written over. The key includes the hash of a tiny map made by the build itself, so a
+change to the build that was not given a version bump is not loaded stale. Temporary files that a
+killed launch left are deleted after 5 minutes, and the folder keeps the 3 maps used last.
+`client map-build [--no-write]` builds cold, writes, reads back, checks that
+the hashes are the same and prints the time of each stage: a report that wants the cold figure
+runs it first, or runs the bench with `BHAYANAK_NO_MAP_CACHE=1`.
+
+### What it does
+
+1. Generates the test Planet and uploads it to the GPU, each brick at the level of detail its
+   distance from the camera says (the LOD bands, ADR 0002), and prints how much GPU memory they
+   take and how many bricks each level has. The bands follow the camera along the path: selecting
+   again and packing the bricks that change level, and writing them to the GPU, is done before a
+   frame is timed, so it is in no pass and not in the frame's CPU time either.
+2. Flies the camera path in **primary mode**, then in **reference mode** (the progressive path
+   tracer, 4 samples per frame of the path). Each mode first draws a few warm-up frames, which are
+   not measured: the first frames after a mode switch carry the other mode's state (see the notes
+   on #28).
+   Primary mode traces at `config.width` x `config.height` and upscales to `output_*` (passes
+   `primary` and `upscale`); reference mode traces at the traced size, with no upscaling. Primary
+   mode reads an image back only for a screenshot (a 1440p image is 15 MB), so that the frame is
+   not mostly readback with the GPU idle in between; `frame_time` is then the CPU time of the
+   frame as drawn, and a screenshot frame is slower.
+3. Writes a screenshot at each keyframe of the path, per mode.
+4. Then, after the flight, holds the camera still at four heights above the Planet's pole, over its mean radius
+   (4.8 m, which is the ground, 100 m, 500 m and 2 km), looking at the ground that slopes away
+   towards the horizon, and times both modes there for a few dozen frames each (24 primary frames
+   and 6 reference frames of 2 samples). That is the report's `altitudes`. It takes a few seconds
+   and leaves the flight alone, so the flight stays comparable with the reports of main. `--short`
+   has no sweep.
+5. Then, for the caves (#46), holds the camera still at a **cave mouth on a slope** and **inside a
+   tunnel**, times both modes there like the sweep (24 primary frames, 6 reference frames of 2
+   samples), and takes a screenshot of each mode (`primary-cave-mouth.png`,
+   `reference-cave-tunnel.png`, ...). That is the report's `caves`. The caves are the real
+   Planet's, and the flight is over the small test sphere, which has none: so the stills are of
+   the real Planet on a coarse world map (512 texels a face, about a second to make), round the
+   steepest mouth with a good deal of cave by it (`Planet::cave_mouths`), with a ring of level 0,
+   the Guard from level 10 and the bands for a `d0` of 10 m, a tenth of the flight's. That keeps
+   the view to seconds to make, and the numbers say what the cave costs, not the far ground. The
+   flight and the sweep are left alone. `--short` has no stills.
+
+6. Then the convergence phase (#187), unless `--no-convergence`: how fast the Reference view gets
+   clean, on two still views, scored against a truth. It has GPU contexts of its own and runs after
+   everything that is timed against the budgets, so it cannot move them. See "The convergence
+   phase" below.
+
+7. With `--rt-backend both` (#50), after the cave stills: the same flight and Edit stress again on the
+   hardware ray backend, and the flight on its nearest-hit variant, each on a context of its own. See "The hardware ray backend" below.
+
+8. With `--streaming`, after everything else (the cave stills and the convergence phase included, so that the flag cannot
+   move their timings), the streaming mode (#181), on a GPU of its own. See "The streaming mode"
+   below. With `--real-time` as well, the real-time mode (#162) after it, on a world and a GPU of
+   its own for each run. See "The real-time mode".
+
+The flight above does not stream: it draws a Planet that is generated whole, so the ring loader
+(#86) and its uploads are not in these numbers. The loader's own costs (the spawn ring, the Guard, how
+long the bands take to fill, and the frame thread's scene work per frame while walking, worst and
+p99) are read from the ignored full-size test:
+`cargo test --release -p client -- --ignored --nocapture full_size`. The scene's selection and
+packing run on a thread of their own there (ADR 0006), so those numbers are what the frame thread
+pays for it: copying what the scene thread made. The bench's `scene_update_ms` is still the whole
+of following the camera, done inline.
+
+### The streaming mode
+
+`--streaming` runs the loader, the rings' recentring, the scene thread's packing and the copy to
+the GPU on the test Planet (the world map of 512 texels a face, the one the stepped tests use),
+which the flight above leaves out, **with the horizon cap** (ADR 0004, #146: the test Planet's scene has the Planet's
+horizon, as the game's does). It runs **stepped** (#180, `docs/agents/ci.md`): no threads, no
+sleeps, and a clock that only the bench moves, a frame (16.667 ms) at a time, so the work of each
+frame does not depend on how long anything took. The code is the game's (`World`, `Loader`,
+`SceneWorker`); the game starts threads and never steps, and its clock is the machine's (see
+`bins/client/src/clock.rs`). The flight above does not use the world or the clock at all.
+
+The schedule is fixed by frame index (`bins/client/src/bench/stream.rs`): the camera at the spawn
+until the resident set is complete (**fill**); then 60 frames standing (**steady**) and 180 frames
+walking at 24 m/s along three segments (**moving**), with an Edit at frame 150 of them and the
+store held to 102% of the complete set so that the walk evicts. The bands have a `d0` of 64
+Voxels, so that the fill is a few seconds, and the Guard is the game's three levels lower (levels 10 to 17: the test Planet is an eighth of the radius, so level 10 holds about what level 13 does at 320 km, #167).
+Everything in `streaming` is made by that mode and is the same on every run and every machine,
+except `timing`.
+
+`streaming` has `deterministic: true`, the `schedule`, and:
+
+- `counts_hash`: FNV-1a of the counts of every frame and of every integer, boolean and name in
+  the rest of `streaming` (all but `timing`, and itself): the report and each frame's counts are
+  hashed as they are serialized (`hash_json` in `bench/stream.rs`), so a field added to either is
+  in the hash without anyone listing it, and a test (`every_integer_of_the_report_and_of_a_frame_is_in_the_hash`)
+  changes each integer in turn and fails if the hash does not move. **Floats are left out** (a
+  platform's maths library may differ in the last bit); each is worked out from integers that are
+  hashed (the sizing values from the `sizing.measured` counts, `band_start` and `d0` from the
+  constants). It is the one number to compare: `bins/client/src/bench/streaming-counts.golden` has the committed value, a unit
+  test (`the_counts_are_the_committed_ones`, which runs on Linux and on Windows, since it needs no
+  GPU) and `tests/bench.rs` check it. When a change to the streaming code moves the counts on
+- `counts_hash`: FNV-1a of the counts of every frame and of every integer, boolean and name in
+  the rest of `streaming` (all but `timing`, and itself): the report and each frame's counts are
+  hashed as they are serialized (`hash_json` in `bench/stream.rs`), so a field added to either is
+  in the hash without anyone listing it, and a test (`every_integer_of_the_report_and_of_a_frame_is_in_the_hash`)
+  changes each integer in turn and fails if the hash does not move. **Floats are left out** (a
+  platform's maths library may differ in the last bit); each is worked out from integers that are
+  hashed (the sizing values from the `sizing.measured` counts, `band_start` and `d0` from the
+  constants). It is the one number to compare: `bins/client/src/bench/streaming-counts.golden` has the committed value, a unit
+  test (`the_counts_are_the_committed_ones`, which runs on Linux and on Windows, since it needs no
+  GPU) and `tests/bench.rs` check it. When a change to the streaming code moves the counts on
+  purpose, the test prints the new hash; put it in the file and say why in the PR. **The committed hash is the stepped run with the speed scale on** (#168); the run with the scale **off** is what the stepped mode counted before #168 and has its own test (`with_the_speed_scale_off_the_counts_are_those_the_run_had_before_it`). The values the committed hash has had, with the commit and the reason, are in [`bench-history.md`](bench-history.md), "2026-11-12, #181 and #162" and the notes at its end.
+- `upload`: bytes written to the GPU per frame (`bytes`: `total`, `max`, frames and frames with
+  any) and the belt copies per frame (`writes`, the same, each a copy with a barrier of
+  its own: neighbouring ranges of a patch are joined into one when they are within `COPY_GAP`
+  words), `bytes_p99` and `writes_p99` (99th percentile, nearest rank, of the frames that had an
+  update), `patch_bytes` (what patches wrote, a rebuild's all-buffers write excluded), `rebuilds`
+  and `updates`. **Two counts are compared, and they are not independent of
+  everything.** One is worked out from the patch before anything is written
+  (`render::tracer::upload_cost`, which these fields are made of: `RingPatch::cost` sums the
+  bytes and the copies of `RingPatch::copies()`, the ranges after joining, and the header). The
+  other is counted by the tracer **where it writes to the staging belt**: the header's bytes and
+  one copy, then the bytes and one copy of each range, the words between joined ranges included
+  (`timing.gpu_uploaded_bytes` and `timing.gpu_uploaded_writes`, summed over the updates). **Both
+  loop over the same `RingPatch::copies()` and use the same header size.** So the equality (the
+  smoke test checks bytes and copies) shows that the tracer writes every range that `copies()`
+  lists and the header, once each, and that `cost()`'s arithmetic matches the writes; if
+  `copies()` missed or mangled a range, both counts would agree and be wrong. That the ranges
+  cover the change, word for word, is checked by `GpuCopy::assert_is` in the stepped tests
+  (`streaming_tests.rs`): a copy of the buffers written from `copies()` as the tracer writes them,
+  compared with the frame thread's scene after every frame. None of it is a count of what a GPU
+  executed (the belt and the driver are below it). A buffer that grew (#145) copies the old one on the GPU
+  (`copy_buffer_to_buffer`): that is not an upload, is in neither count, and is counted apart
+  (`timing.gpu_grown_bytes`). The upload budget (`scene_worker::UPLOAD_BUDGET`) adds `cut_frames`, the frames in
+  which the scene thread held work back for it, and `longest_backlog_frames`, the most such frames
+  in a row. Both are counts and are in the hash. **The budget does not engage on the test Planet**
+  (the biggest frame is a fraction of it): the stepped tests run it with a small one. What a
+  frame may take beyond the budget is in [What the upload budget bounds](#what-the-upload-budget-bounds).
+- `soft_misses`: bricks drawn whole although the bands split them, per frame, for `fill`, `steady`
+  and `moving` (frames, total, max, frames with any), and the total by the level of the brick
+  drawn whole. Counted for every frame, not a few times a second. The fill has them; with the
+  camera steady or moving on the margins and the lead, there are none today.
+- `rings`: for each level (a Ring), where its LOD band starts, and the bricks drawn at the first
+  frame, when the resident set was complete, and at the end.
+- `work`: what the scene thread did, in steps and bricks, not milliseconds: `follow` (selecting
+  again for a new camera), `pack` (taking in what the loader made), `upload` (frames with an
+  update, and bytes: patches are words, not bricks) and eviction.
+- `residency`: the Diverged bricks (those an Edit changed), the store's size as its budget counts
+  it (at the start, when complete, the most, at the end) and the budget, and two latencies, which
+  are not the same thing:
+  - `edit_latency_frames` (**Edit latency**): frames from the frame in which the Edit was made to
+    the frame that took it in from the scene thread (the first in which `World::edit_taken`
+    holds, which is not when the wait for it ended: a timeout ends that too). The Edit is made
+    before the frame's look at the scene, where the game makes it (its input is handled before
+    `recentre`). **A stepped scene thread finishes its round inside that look**, so the frame that
+    made the Edit takes it: the field is **0**, and it cannot show ADR 0006's bound (an Edit made
+    in frame N shows in frame N+1 if the real thread has packed it by then, which a thread that
+    takes time can fail to do). The bound is held by the stepped test
+    `an_edit_a_busy_scene_thread_has_not_packed_is_waited_for_edit_wait_and_shows_in_the_first_look_after_it_has`
+    and the real-thread tests, and measured in real time by #162's run on the 4090. The field is
+    there to show a change that makes an Edit later than the look that made it.
+  - `outbox_latency_frames` (**Outbox latency**): frames that a result the scene thread published
+    waited in its outbox (ADR 0006) before the frame thread took it, for each frame that took one
+    (frames, total, max, frames with any). 0 in a stepped run, in which a frame takes what was
+    published in it. The upload budget (#145) does not change that: it holds work back in the
+    scene thread, before it is published, so every patch the frame takes is whole and the field
+    stays 0; it is there to show when a change makes the outbox hold results.
+- `holes`: Split bricks whose children are not resident in the store, per frame. **The gate:** any
+  hole fails the run with status 2 (unless `--no-fail`).
+- `sizing`: see below.
+- `timing`: the one part that is not deterministic: CPU time of each copy to the GPU and of each
+  draw (every frame in a measurement, every tenth with `--short`), and the bytes the GPU counted.
+
+#### Sizing constants
+
+`bins/client/src/main.rs` sizes its tables from `BRICKS_PER_D0_SQUARED`, `REFS_PER_BRICK`,
+`WORDS_PER_BRICK` and `STREAMED_PER_D0_SQUARED`, each measured once at full size by hand (see
+`docs/measurements.md`). `streaming.sizing` has the same four measured on the test Planet with the
+resident set complete, and each beside its constant and `limit` (the constant times `HEADROOM`). A
+unit test (`the_sizes_measured_on_the_test_planet_are_within_the_constants_with_headroom`) fails
+when one is over, which means the constant in `main.rs` is too small for the Planet: raise it with
+a measurement, not to get green. Each constant's doc comment names the field it is checked
+against.
+
+The four constants' like-for-like check on the test Planet (limit against what each is a limit of, with the figures) is in [`bench-history.md`](bench-history.md), entry "2026-11-12, #181 and #162".
+
+
+The camera is a function of the frame index only (keyframes, interpolated in a straight line at
+constant speed), never of the clock, so every run on every machine shows the GPU the same views.
+The path has a version in its name (`planet-flyover-v1`); if the path ever changes, the version
+changes, and reports of different versions are not comparable.
+
+It draws **offscreen** (`render::Offscreen`), not in a window. The tracer and the pass timers are
+the same as the window's; what is left out is the window's `blit` and `overlay` passes, and
+what is gained is that nothing waits for the display and that a frame's GPU times are in when it
+returns, so there is no lag to correct for. It asks Vulkan for the high-performance adapter, as
+the window does, and the report says which GPU it got: check `machine.device_type` is not `Cpu`
+before reading anything into the times.
+
+## The real-time mode
+
+`--streaming --real-time` (#162) runs what the stepped mode cannot show: the **full-size Planet**
+(the world map of `WORLD_MAP_SIZE`, the client's own `load`, the standard bands, `d0` 1028.2
+Voxels) with the **real loader workers and the real scene thread**, on the machine's clock, with a
+frame at 60 a second, drawn on the GPU. What the threads have done by a frame depends on what the
+operating system let them do, so **everything in `streaming_real_time` is not deterministic**, is
+made by this mode only, and is not in the counts hash. The stepped test Planet mode and its hash
+It runs after the stepped mode. The stepped test Planet mode and its hash still run first (the hash's history is in [`bench-history.md`](bench-history.md)).
+
+It runs after the stepped mode, and takes tens of minutes at full size: each run generates the
+world map (about 25 s before #264; 11 s cold on the dev box's 8 threads now, and read from a file after the first build), loads, fills (a few minutes) and flies the paths, with the loader caught
+up between them. **Run it in release, on the 4090, from the Windows artifact:**
+
+```
+client.exe bench --streaming --real-time --out bench-out
+```
+
+The rest of `client bench` runs first, as for `--streaming`. `--short --streaming --real-time` runs
+the same paths on the test Planet for a few seconds each, to see that it works: its times, on lavapipe,
+mean nothing.
+
+### Headroom hooks (#242)
+
+Two switches of the real-time mode measure how much the streaming gates can afford before the new
+terrain (#238) is written; they give the headroom curve that the per-brick cost budget (#247) is set
+from. Neither is in the game, both are off by default, and with neither the run, its goldens and
+its determinism are unchanged. Both apply to the real-time mode only (the stepped mode's counts are
+committed), full size or, with `--short`, on the test Planet.
+
+**`--gen-extra-us N`: extra cost per brick.** `planet_gen::cost::ExtraCost`, given to the Planet
+(`Planet::with_extra_cost`), spends `N` µs of CPU as each brick's generation starts (`Planet::generate`:
+the one place every brick, of any level, comes from). It is charged wherever generation runs: the
+loader's workers (children and Guard cells), the spawn ring and the visible Guard cells made in `load`
+(so time to control and Guard completion carry it), and a read of the store's source on the frame
+thread. What it is:
+- **Constant per brick, at every level.** A brick of any level evaluates the same 8 x 8 x 8 Voxels,
+  and today's per-brick cost is about flat across the levels the loader makes (`gen_rate`,
+  `docs/measurements.md`: 50 µs at level 0, 83 to 131 µs at levels 1 to 7), so `N` is the charge of
+  every brick, level 0 and coarse alike, and not scaled by level. A brick is charged whether it turns
+  out to be air, one layer or mixed (today's shortcuts decide the sky and the interior in a few µs;
+  a new terrain's noise would be evaluated before it knows).
+- **CPU work, not a sleep.** A loop of a splitmix64 hash whose each round depends on the last,
+  seeded by the brick's running number, its result passed to `black_box`. The rounds for a µs are
+  calibrated once per process (the median of 15 samples of 0.2 ms).
+- **It changes nothing generated**: not which bricks, not what they hold, not the counts hash
+  (`planet_gen::cost`, and the client's test `the_extra_cost_changes_no_count_of_the_stepped_run`).
+- **The report says what it did**: `streaming_real_time.gen_extra_us_asked` (`N`; 0 with no hook),
+  `gen_extra_us_measured` (the wall-clock mean of a charge over every charge of the finished runs, in
+  µs: a little over `N` on a busy machine, since a worker preempted in a charge counts its wait; 0
+  for `N` = 0; null with no hook) and `gen_extra_bricks` (the bricks charged, not deterministic).
+  Read `measured` against `asked` before reading anything else: a ratio far from 1 means the machine
+  was too busy for the sweep point to mean what it says. The planet's label has `, +N µs a brick`.
+
+**`--peak-m M --trench-m M`: a taller ground column.** `WorldMap::with_relief(Relief)`. The map is
+generated as ever (its texels, `content_hash`, biomes, slope-roughness, drainage and caves are
+today's), and **only the heights are stretched, linearly about sea level, where they are read**: an
+elevation above sea level is read `peak / 2000 m` times as high and one below it `trench / 1000 m`
+times as deep (`--peak-m 8000 --trench-m 4000` is 4 times, an exact power of two, each way; a test
+holds `elevation_at` to exactly 4 times the default's). The stored `i16` in 10 cm units is not
+touched, so the 3.27 km cap of #243 is not hit by this proxy. **What follows the range**, because it
+reads it from the map's `Relief` and not from the constants `PEAK` and `TRENCH`: the Planet's
+`max_radius` and `interior_radius` (so the Guard's cells and its box, the bands' and the horizon's
+top, the scene's `Bound`), the cave table's highest anchor, the bounds on the ground over a brick
+(`field_range`) and so every sky, sea, deep-rock and one-layer shortcut, and what the bricks of the
+stretched ground are (tests: `planet/tests/relief_tests.rs`: the bounds hold at every Voxel, no
+brick is its Voxels wrongly, `air_below` and `solid_below` are never claimed wrongly on the peak, the
+trench and the steepest ground). **What is not scaled**: horizontal distances (so slopes are 4 times
+as steep), the detail's amplitudes (20 m) and its thresholds in metres (the roughness reaches
+its full at 150 m of the stored height, since it reads the stretched height), the erosion, the
+continent shapes, the biome's choice, the strata depths, the sea level and the radius, the spawn's
+rule (it reads the stored height, 20 to 100 m, and a relief of up to 40 m on the stretched ground, so
+it is the same texel as today's if that is gentle enough, 4 times as high above sea), the bands'
+`d0`, the Guard's finest level (`GUARD_FIRST`) and the sizing constants and the store's and scene's
+budgets of `main.rs`. So the run measures what a 12 km column costs in more bricks near the surface
+on steep ground, a taller Guard and the deeper dives of the paths; a gate it fails may be one of
+those fixed capacities (read `memory`, `sizing` and the store's figures with it) and not the cost of
+generation. Today's 2 km and 1 km is the default and a test holds it bit for bit; `report.relief`
+says what ran (`peak_m`, `trench_m`, `column_m`, `max_radius_above_sea_m`,
+`interior_below_sea_m`, `stretched`).
+
+**Together** (`--streaming --real-time --gen-extra-us 100 --peak-m 8000 --trench-m 4000`) the
+charge is on every brick of the taller column.
+
+**A sweep** is one process per point (each is `--runs 3`, as ever; the gates use the worst), with
+`--no-fail` so that a point over its gates still writes its report:
+
+```
+client.exe bench --streaming --real-time --no-fail --out sweep/c000-r2000 --gen-extra-us 0
+client.exe bench --streaming --real-time --no-fail --out sweep/c100-r8000 --gen-extra-us 100 --peak-m 8000 --trench-m 4000
+```
+
+and for each report: `streaming_real_time.gates` (`over` and each gate's `worst` against its limit),
+`max.cold_start.time_to_control_s` against 2 s and `spawn_ring_s`, `max.cold_start.guard_complete_s`
+(reported, not gated) and `guard_s`, `max.cold_start.fill_s`, each path's soft misses (the camera's
+on the flights, gated) and holes (gated), the frame thread's CPU p99, `gen_extra_us_measured` against
+`_asked` and `relief`.
+
+### What the 4090 script must pass
+
+**The invocation is `client.exe bench --streaming --real-time`, once, with no `--no-fail`, so that
+the exit status shows the gates (nothing else is needed: `--runs` defaults to 3). Pass it once,
+not once for each of the script's N runs.** The runs are in
+the process: `--runs N` (default 3) makes N complete runs, each on a fresh world and a fresh GPU
+context, and the report keeps all of them in `streaming_real_time.runs`, and **the least and the
+most of every number over them in `min` and `max`** (the same shape as a run: the number at its
+least and its most, over the runs; a boolean is the all of the runs' in `min` and the any in `max`,
+so a flag that says `over` says it in `max` if any run was; a word the runs agree on is kept and
+one they do not is null). The gates use the worst, and the exit status is the gates' (2 if one is
+over; 1 if the mode stopped on an error). So the script has nothing to merge:
+one `report.json` has the three runs, the envelope and the verdict. A script that runs
+`client.exe bench <args>` N times to collect N reports should pass the real-time flags to one of
+them (or pass `--runs 1` to each and take the worst itself, which the envelope in a single process
+does for it).
+
+### The paths
+
+Each starts at the Spawn with the resident set complete and the camera still, and ends with the
+camera back there and the loader caught up. The camera's speed and shape are those of #143's
+`soft_misses_on_the_flight_take_off_and_standing_paths`, at full size.
+
+| Path | The camera |
+| --- | --- |
+| `cold start` | At the Spawn from the first frame until the resident set is complete. The first frame with level 0 under the camera is in it. |
+| `flight at 2 m` | 50 m/s along the ground, 10 s, 2 m over it. |
+| `flight at 50 m` | 50 m/s sideways, 10 s, 50 m over the ground. |
+| `vertical take-off` | 50 m/s straight up, 6 s. |
+| `180 degree turn` | A half turn in a second, then the view still for a second. |
+| `sea-level crossing` | (#213) The raised camera down to 30 m under the sea and up to 80 m over it along the Spawn's radial at 50 m/s, held at the bottom until the scene has come to the camera, and at the top until it has and the flip is absorbed (`World::caught_up`; up to 90 s each), so **the horizon cap goes off and comes back on** (`CAP_ON`, 50 m over) and the path ends with nothing left to absorb. The scene follows a camera through the ground at about 0.8 m an update, so a path that does not wait never gets to the flip. **The bottom does not wait for the flip to be absorbed:** before #226 a scene whose cap was off, once built, was the wide one (544 to 557 MiB in use at 30 m under the sea and 567 MiB at the top, the 4090 566 to 567 MiB, #213), so a path that lingered there failed `scene_mib`; a camera under the sea now has the cap of the sea's sphere (ADR 0004), and `held under the sea` is the path that stays. |
+| `held under the sea` | (#226) Straight down the Spawn's radial at 8 m/s (under the 10 m/s at which the depth of the speed-scaled bands is 0) to 30 m under the sea, then held there until the scene has come to the camera, the flip is absorbed and the loader has nothing left (`World::caught_up`, up to 240 s). It is the memory of a camera that stays under the sea with the cap off: **774.4 MiB before #226** (the whole Planet drawn to its far side), **465.5 MiB after** (the cap of the sea's sphere over the camera; the dev box, full size), against the 512 MiB gate that `memory.scene_used_peak_mib` reads. The ignored test `a_camera_held_under_the_sea_at_full_size_keeps_the_scene_within_the_gate` (`cargo test --release -p client --bin client -- --ignored --nocapture held_under_the_sea`, about 5 minutes, no GPU needed) runs this path alone and asserts 0 holes and the gate. |
+| `stop after a flight` | 5 s of the flight at 2 m, then the camera stands where it was until the scene has no soft misses (up to 120 s). Settle time is in it. |
+
+After the last path the camera is back at the Spawn and the loader has caught up, and **one dig**
+is made there (below): the run's **Edit latency**. Its frames are not those of a path.
+
+**The still hold** (#217, the run's `still_after_flight`, described under "The fields"; not a path, so no
+gate sees its frames): 5 s of the flight of `stop after a flight`, then the camera stands with the game's
+policy for a Reference view, which is **catch up first, then hold** (`World::hold_still`, the call the
+client makes): once the camera has stood for 2 frames the scene thread goes on loading and following the
+camera, with Primary drawn, until the scene has reached the camera (`World::caught_up`: its lag under 1
+Voxel, and no reband pending, #168: the nodes that a change of the bands listed are looked at, and the
+speed scale has no step still to give back, `World::reband_pending`) or `CATCH_UP_CAP` (12 s, 5 s until 2026-11-17) has gone by. Then loading is paused and
+the scene thread is told; **it holds back moving the scene to the camera, the steps of coarsening and, since #168, the
+reband** (the speed scale is not looked at and what a change of the bands listed is not looked at;
+leaving Still does both) (#217, ADR 0005, "Still frames") and takes in no arrivals. The camera stands for 3 s (1 s with `--short`)
+from then. What the frame thread takes in meanwhile is the cuts of the Reference view, counted by cause
+(`cuts`, as `still_cuts` below, under the paths) over the held frames. **The acceptance of #217 is at most 1 cut here from
+scene patches** (the Planet has no Edit in this run). Then the view changes (loading goes on) and
+`catch_up` is the time to the first frame with no soft misses, nothing waiting and the scene at the
+camera, and `holes_after_catch_up` the holes the look after it found, which must be 0. Reported, not gated.
+
+### The fields
+
+`streaming_real_time.runs[]` (and `min` and `max` of the same shape), each made by this mode:
+
+- `cold_start`: `world_map_s` (generating the map, which the client does before `load`), `load_s`
+  (`load`: the spawn ring, the Guard, the first scene), **`time_to_level_0_under_camera_s`** (from
+  the start of the load to the first frame in which one ray from the camera straight down hits the
+  ground at level 0) and `fill_s` (from the start of the load to the resident set being complete).
+  `time_to_level_0_under_camera_s` is not gated, and **is not the spec's "time to control"**: the
+  field is named for the ray that it uses, and the window opens at the end of the load, so it reads
+  the load time. **`spawn_ring_s`, `guard_s` and `time_to_control_s`** (#168, #220) are the parts of the
+  load, from `crate::load`: the 20 m spawn ring (`SPAWN_REACH`), which is the player's control (ADR
+  0009: the character stands in it, and the bench has no server), the part of the Guard after it that
+  a camera within 2 km of the Spawn could see (`guard_s`: the cells that `plan_guard` says are
+  visible, judged at the Planet's highest radius), and the real time from the world map being ready
+  to the window opening (the ring, that part of the Guard and the first scene). The rest of the Guard
+  is made by the loader's workers in the background (#220, schema 28): **`guard_cells`** is how many
+  cells it has (bricks of the pyramid's top level; 0 on the test Planet, whose Guard is whole),
+  **`guard_cells_at_control`** how many of them were made before the window opened, and
+  **`guard_complete_s`** the time from the start of the load to the last of them being taken in
+  (reported, not gated). Until then a flying camera is held to a ball of 2 km round the Spawn
+  (`World::hold_to_guard`; the character is not held). **Two gates**, each the worst over the runs:
+  `spawn_ring_s` (2 s) on the ring, and **`time_to_control_s` (2 s since #220)**, which is the
+  acceptance of "control in 2 s with nothing visible from the Spawn sky". It was 10 s while the
+  window waited for the whole Guard (4.3 s on the 4090, 7 s on the loaded dev box).
+- `frame_parts` and `gpu_passes` (#54, schema 29; in each path), to find where a frame's
+  time goes: `frame_parts` is `{recentre, update, encode, submit, wait, gpu_total, wait_not_passes}`,
+  each a `Spread` (`samples, mean_ms, p99_ms, worst_ms`) of the frame thread's parts of one frame
+  (`wait` is the wait for the GPU after submitting; `gpu_total` the GPU's own time of the passes;
+  **`wait_not_passes` is `wait` less `gpu_total`: time the frame waited that no timed pass accounts
+  for**, which is the driver or the GPU idling between frames when it is large). `gpu_passes` is a map
+  from the name of each timed pass (`primary`, `normals`, `shadows`, `gi`, `shade`, `atmosphere`,
+  `bloom_*`, `exposure*`, `tone`, `upscale`) to the `Spread` of its GPU time, so a pass that costs
+  more in the game than in the GPU bench is visible. The summary prints both per path.
+- `unpaced_control` (#54, schema 29; a run's, a path's form, not gated and not in `paths`): 180 frames with the
+  camera standing at the Spawn **and no pacing sleep**, each frame following the one before as the
+  GPU bench's do. Set its `frame_time` and `gpu_passes` beside a paced path's: a frame that is much
+  longer paced than unpaced is the GPU idling between frames (clocks dropping, the driver), which no
+  pass accounts for; the same length is the work itself.
+- `still_after_flight` (#217, schema 22; a run's, not a path's): the view held Still after a flight, with
+  the game's policy ("The still hold", above):
+  - `before_hold`: the catch-up before the hold. `lag_when_still_voxels` is how far the scene was behind
+    the camera when the view went Still (what a hold at once would have held it at), `lag_when_held_voxels`
+    how far when the hold began (under 1 unless the cap ended the wait), `waited_s` from the view going
+    Still to the hold beginning (how much later the Reference view started), and **`hit_cap`**, true if the
+    wait ran to the cap and the Reference view started on a scene still behind the camera. Expected false. After #168 the wait also covers a reband (the depth of a flight is given back half a second after the stop, and what it lists is looked at: 50 s or more at full size on the dev box), and a release over `RELEASE_REBUILD_OVER` nodes is a rebuild of 8.5 to 9.0 s of the scene thread's time in the stop path and 10.0 to 10.4 s in this one on the 4090 (24 to 37 s on the dev box). **The cap is 12 s since 2026-11-17 (owner), so `hit_cap` is expected false on the 4090** (`a7c6b72`: the wait ended 10.87 to 11.24 s after the view went Still in 5 of 6 runs, and ran to the cap in 1; the figure of 9.3 to 9.7 s that the cap was set from was the stop path's `reband_s`, counted from the start of that path) **and true on the dev box**; `hit_cap` and `lag_when_held_voxels` say what the cap held.
+  - `hold_s`: how long the camera stood after the hold began.
+  - `cuts`: `still_frames`, `cuts` and `by_cause`, as `still_cuts` under the paths, over the held frames
+    only. **At most 1 is the acceptance of #217.**
+  - `catch_up`: `seconds` and `settled`, from the frame that ended the hold to the first frame with no soft
+    misses, nothing waiting and the scene at the camera (or the cap).
+  - `holes_after_catch_up`: the holes the look after it found. Must be 0.
+- `paths[]`: `name`, `frames`, `seconds` and, for each path:
+  - `frame_time`: `samples`, `mean_ms`, **`p99_ms`** (nearest rank) and **`worst_ms`**. A frame is
+    the frame thread's work in the game's order: `World::recentre`, the copy of what the scene
+    thread made to the GPU, and the draw, until the GPU has finished (the offscreen draw waits).
+  - `frame_cpu`: the same figures for the **frame thread's CPU time**: the recentring, the copy to
+    the GPU's buffers (the writes queued and the submit that sends them), and the encoding and
+    submitting of the draw, without the wait for the GPU (`Offscreen::draw_upscaled_timed`).
+    **What each figure includes.** `frame_time` runs from the start of `World::recentre` to the GPU
+    being done: recentre, update (write and flush), encode (with finishing the command buffer),
+    submit and the GPU wait, and anything
+    else the frame thread does between (`other_ms` below, a few microseconds). `frame_cpu` is the
+    same without the GPU wait. **Outside both**: working out the camera of a flight before the frame
+    starts (it reads the store for the ground, and takes its read lock, so it can wait for a lock
+    that a look for holes or an eviction holds; it delays the frame's start and is not in its time),
+    and the frame's look at the memory after its time was taken (the store's lock again, every 6
+    frames, and the harness's read of the process's resident memory, every 30). Both are reported
+    for a slow frame as `camera_ms` and `after_ms`, and `after_lock_ms` says how much of `after_ms`
+    was the wait for the store's lock (the rest is the resident read and bookkeeping, which the
+    game does not do). The pacing sleep is in neither.
+  - `frame_cycle` and `sleep_overshoot` (schema 19, #167): `samples`, `mean_ms`, `p99_ms`,
+    `worst_ms` of the **pacing** that `frame_time` leaves out. `frame_cycle` is the time from the
+    start of a frame to the start of the next (the path's last frame has none), **less what the
+    harness itself does between two frames** (`harness_ms` below: the look at the stop of a flight):
+    with the pacing sleep it is 16.7 ms when the frames are short, and a cycle that is longer than
+    the frame and its sleep need is the frame thread waking late or the store's lock. Not gated:
+    `slowest_cycles` (the five frames with the longest turn, in the form of `slowest`) says which
+    part of a long cycle it was, and `frame_cycle.worst_ms` is the number to read against it. A
+    gate on the worst cycle would be on one frame of a thousand, which a Windows scheduler tick
+    can make 30 ms, and the p99 of a paced cycle is 17.3 ms whatever the work, so a gate on that
+    would hold nothing either. **`harness_ms` is more than the wait for the scene thread:** the
+    look at the stop also draws a frame on the GPU with the update that the look made, which the game
+    would make in its next frame, so a stop's `harness_ms` is the wait plus one frame's copy and
+    draw, and not all of it is work the game would not do. It is left out of the cycle as the bench's
+    own call, not as time the game does not spend.
+    `sleep_overshoot` is by how much each pacing sleep ran **over what it asked for** (the frames
+    that slept; a frame that was already over 16.667 ms does not). On Windows a `thread::sleep` is
+    rounded up to the timer's tick (up to 15.6 ms unless the process raised the resolution) and
+    waits for the scheduler, so a sleep that is 10 to 30 ms over is the host's. Not gated.
+  - `frames_over_limit`, `frames_over_limit_by_update` and `slowest`: **where the time of a slow
+    frame went**. `frames_over_limit` is the number of frames of the path whose time was over the
+    frame-time limit (the gate's `frame_time_p99_ms`; the gate itself is unchanged and still on the
+    p99), and `frames_over_limit_by_update` is those frames by what their update was: `none`,
+    `patch` or `rebuild`, so that frames that were slow with no update to copy are counted apart
+    from those that had a large one. The three add up to `frames_over_limit` in each run; in
+    `min` and `max` each is taken on its own across the runs, so there they need not. `slowest` is
+    the five
+    longest frames of the path, worst first (a fixed list filled while the frames come: no
+    allocation, and a path with fewer frames has fewer), each with:
+    - `index` (the frame's place in the path, from 0) and `at_ms` (from the path's start to the
+      frame's start), `time_ms` and `cpu_ms`;
+    - **the frame's pacing** (schema 19, #167), outside `time_ms`: `before_ms` (from the end of the
+      frame before, its sleep done, to this frame's start: working out the camera and the
+      harness's own bookkeeping; 0 for a path's first frame, since the end look of the path before
+      it, about 0.3 s at full size, is not a wait for a wake-up), `sleep_asked_ms` (the sleep that
+      fills the frame to 16.667 ms; 0 if it was longer), `sleep_over_ms` (by how much the sleep ran
+      over that), `between_ms` (the harness's bookkeeping between the look at the memory and the sleep; `time_ms`,
+      `after_ms`, `between_ms`, `sleep_asked_ms` and `sleep_over_ms` add up to `cycle_ms`, which a
+      test of the report holds to 0.05 ms) and `cycle_ms` (from the frame's start to the end of its sleep; the cycle to the
+      next frame's start is `cycle_ms` plus the next frame's `before_ms`), and `harness_ms` (of
+      `before_ms`, the look the harness makes at the stop of a flight: it waits for the scene
+      thread to finish a round and counts the soft misses, then copies what that made to the GPU;
+      a player's frame does not do it). **How to read a 30 ms frame** (the 180° turn's waits, #166 and #167): if `cpu_ms` is normal and `wait_ms` is long
+      with `gpu_total_ms` short (`wait_not_passes_ms` large), the wait was **not our passes**: the
+      frame thread woke late from the device poll or was not scheduled, or the GPU was busy with
+      other queue work or the compositor. That is not work of ours, but this field alone does not
+      say which of those it was (a late wake-up has a `sleep_overshoot` and a `before_ms` of the
+      same kind elsewhere in the run; other GPU work does not). If `recentre_ms`, `update_ms` or
+      `encode_ms` is long, it is our work. If the frame is normal and the `sleep_over_ms` of the
+      frame before it (look at index − 1 in `slowest` of the same path only if that was slow too,
+      else `sleep_overshoot` says how often it happens) is long, the harness's sleep woke late and
+      the frame started late, which `time_ms` does not count;
+    - the parts, in milliseconds, in the order the frame does them: `recentre_ms` (`World::recentre`:
+      telling the scene thread the camera and taking what it published), `update_ms` (the copy of
+      the update to the GPU: `update_write_ms`, the copies written to the staging belt (and, if a
+      buffer grew, its new buffer and the copy into it), and `update_flush_ms`, the submit that
+      sends them; both zero with no update) and `writes` (the number of belt copies: each is a
+      copy on the GPU with a barrier of its own), `encode_ms` (the draw's encoding, the timer queries' resolving and **finishing the
+      command buffer**) and `submit_ms` (`Queue::submit` alone), `wait_ms` (**the wait for the GPU,
+      which comes after the CPU's clock has stopped**: the readback of the pass times, the device
+      poll, what wgpu frees inside it (the belt's chunks that were used), and the GPU's own
+      work: the update's copies, the draw, and whatever else the GPU was doing), and `other_ms`
+      (`time_ms` less all of those: what none of them says);
+    - **the GPU's own time for the frame's passes**, from the timestamps the passes wrote (the
+      device's clock, not wall time; they are GPU timestamps, not what the CPU waited):
+      `gpu_primary_ms` (**from schema 20 it excludes `normals` and `shade`**, which have lines of
+      their own: add them for what schema 19 called `primary`), `gpu_upscale_ms`, and
+      `gpu_total_ms` (from the start of the frame's first
+      pass to the end of its last, gaps between them included), and `wait_not_passes_ms`, which is
+      `wait_ms` less `gpu_total_ms`: what the wait was that was not our passes (the update's copies,
+      which are queued ahead of them, driver work, other GPU clients, wgpu's cleanup in the poll).
+      It is negative if the passes were already running while the CPU was still in the submit. **Which
+      frame the times belong to**: the profiler reads the times back after each frame, and the
+      bench waits for them, so a frame's times are in when its draw returns; the profiler says
+      which readback was this frame's (`Profiler::times_of_this_frame`), and the fields are **null,
+      not zero and not an earlier frame's,** where the device has no timers, the frame was not timed
+      (the readback ring was full) or its readback failed. A time between the submit and the start
+      of the first pass (the copies' own time) is not reported: it needs a timestamp before the
+      copies, in the earlier submit that sends them, and there is none there;
+    - **what a growth cost** (#145), zero in a frame where no buffer grew: `lengthen_ms` (the frame
+      thread making its own copy of the scene longer, `Scene::paste`: the `Vec`s are lengthened
+      and the new words filled with zeros; it is **inside `recentre_ms`**), `grow_ms` (the GPU's
+      new buffers and the copies old to new, recorded; **inside `update_write_ms`**) and
+      `grown_bytes` (the old buffers' bytes that were copied). The frame-thread part is the one
+      that was probed at 13.9 / 26.5 / 52.4 ms for 128 / 256 / 512 MiB (`docs/measurements.md`)
+      and is not made smaller here: the 4090 run is what measures it at full size;
+    - `over_budget`: why this frame's upload was over the plain budget, if it was (`jump`,
+      `bands`, `edit`, `growth` or `operation`: see below); null if it was not;
+    - `camera_ms` and `after_ms`, outside `time_ms` (see above);
+    - what the update copied: `update` (`none`, `patch` or `rebuild`: a rebuild makes new buffers
+      for the whole scene), `upload_bytes` (all the update writes, headers and tables included) and
+      `patch_bytes` (the words that a patch lists);
+    - `hole_look`: whether a look for holes **overlapped** the frame: the scene thread was in one at
+      the start or at the end of it, from before it takes the store's read lock to after it lets go
+      (so waiting for the lock is in it). It does not say that the look blocked the frame, and a
+      look that began after the frame's start and was done before its end is missed.
+
+    The measuring costs a few clock reads a frame. In `min` and `max` the i-th slowest frame of each
+    run is taken with the i-th of the others, member by member (a `slowest` of runs that did not
+    keep the same number of frames is null there): read the runs for a frame's own parts.
+  - `largest_updates` and `over_limit_at` (schema 13; `over_limit_at` is of a run and is not in `min` and `max` from schema 14: lists of frame places do not compare across runs, so it is under each run in `runs` only): the five frames whose update copied the
+    most bytes, the most first, in the form of `slowest` (with `index`, `at_ms`, the frame's time,
+    its copies and its wait), and the places in the path of the first 200 frames over the limit.
+    They are for reading the slow frames against the big updates: whether a wait of 30 ms with
+    the GPU's passes at 1.5 ms is in the frame of a large update, or the frames after it (the 4090
+    run of `9539899` could not say: the largest update was not among its five slowest frames).
+  - `scene_lag_voxels_max` and `scene_lag_d0_max`, with `scene_lag_voxels_p99` and
+    `scene_lag_d0_p99` (schema 15; 14 had the first two, measured at a publish, which understated
+    it): how far behind the camera the scene **that is drawn** was, at each frame of the path: the
+    distance between the frame thread's camera and the centre of the scene it draws, in Voxels and
+    in the report's `d0` (a jump is 2), the most and the 99th percentile (nearest rank) over the
+    path's frames. A lag the walk keeps up with stays near the distance a frame or two of the
+    flight covers (50 Voxels at 1 000 a second); one that grows over a flight is the walk not
+    keeping up (see "No ceiling on the lag" in [`bench-history.md`](bench-history.md)). A flight that ends with the camera 10 000 Voxels
+    from where it began and a scene 8 000 behind has a maximum a little under the end's.
+  - `upload` (#145): what the path's updates cost: `updates` (frames with one), `time` (the CPU's
+    time of the copy: mean, p99 and worst, in milliseconds), `bytes_p99` and `bytes_max`,
+    `writes_p99` and `writes_max` (the belt copies: a rebuild has none; **these are the largest
+    frame's bytes and the largest frame's copies**, which can be two frames), `cut_frames` (the
+    frames in which the scene thread held work back for the upload budget) and
+    `longest_backlog_frames` and `longest_backlog_ms` (the longest run of those frames in a row, in
+    frames and in time), `over_budget` (the frames whose upload was over the plain budget, and by
+    cause: see below), and the growths: `growth_frames`, `grown_bytes`, `lengthen_ms_max` and
+    `grow_ms_max` (the most one frame spent on each part of a growth; the slowest frames have
+    the same per frame). Nothing here is gated.
+  - `soft_misses` (a `Series` of what each frame reported: frames, total, max, frames with any) and
+    `soft_misses_per_frame`. The scene thread counts them a few times a second, so a frame
+    reports the last count, and the count stays within about 100 ms of the truth. The scene thread's own soft misses are **reported and not gated**: it counts
+    them against **its own** camera, which lags the frame thread's (see `scene_lag_*`), so 0 is the
+    scene's, not the camera's (`gates.scene_soft_miss_frames` is the flights' frames with any).
+  - `camera_soft_miss_frames`: the frames of the path in which **one ray straight down from the
+    frame's camera** hits ground drawn coarser than the (speed-scaled) bands ask at its distance,
+    less the bands' 5% hysteresis (scored on the flights only). **Gated** (#168): on the flights at
+    2 m and 50 m, the take-off and the turn, summed, at the most of the runs, must be 0
+    (`camera_soft_miss_frames`). It is the soft miss of what the player stands on, at the camera
+    that is drawn from, which the scene's own count is not. The alternative, scoring every brick
+    at the frame camera, was not taken: it is a pass over every node a frame, for the same answer
+    where the player looks. The cold start and the stop are not flights: they fill and refine,
+    and have many.
+  - `scene_lag_d0_max` and the others: **the max over the four flights is gated**
+    (`scene_lag_d0_max`, 8.0): main's 7.81 `d0` on the 4090 at 50 m plus a margin, for now. **The
+    limit tightens to about 2 `d0` once the follow fixes land**; it is not a statement of what the
+    lag should be.
+  - `generated_bricks`, `arrived_bricks`, `loader_queue_max` and `loader_queue_mean` (#168): what
+    the loader did in the path (and in the forced look after it): the bricks the generator was
+    asked for, and the bricks of the arrivals that the scene thread took in; and the loader's
+    queue, the bricks asked for and not yet taken in (`LoaderStats::pending`), as of each frame,
+    its most and its mean. They are for reading a flight as limited by the generator (a long
+    queue, few arrived) or not; reported, not gated.
+  - `loader_generating_s`, `loader_held_back_s`, `stream_calls` and `stream_slices_used` (#168):
+    what the loader's workers did with their time in the path, summed over them (the paths'
+    seconds times the workers is what there is): generating, and waiting **with jobs queued**
+    because they were `MAX_AHEAD` jobs ahead of what the scene thread had taken in. Held back
+    most of the time with the queue long means the scene thread's taking in limits the loader, not
+    the generator. And how many times the scene thread took in (its time is `scene_thread.pack_ms`)
+    and in how many of them it stopped because its slice was used up. Reported, not gated.
+  - `scene_lag_d0_mean`, `scene_follow_steps`, `scene_budget_cuts` and `camera_soft_miss_per_second` (#168; the last two
+    lines of the 4090 sweep of the slice ask for them): the
+    mean of the drawn scene's lag over the path's frames, in `d0` (the maximum and the 99th percentile
+    do not say how long the scene is behind), the rounds in which the scene moved to the camera and
+    those in which it held work back for the upload budget, the frames with a camera soft miss in
+    each second of the path (one entry for every second the path covers, so a trailing 0 is a second without a miss; a flight only: at the start of it or all along it). Reported, not gated. (The most that the
+    scene's buffers in use were in a path is `scene_used_peak_mib`, #213's, below.)
+  - `camera_soft_miss_lag_side`, `camera_soft_miss_loader_side` and `lag_over_floor_frames` (#168,
+    the flights): the camera misses split by what can have caused them. The score asks for level 0
+    within `floor(1) * (1 - HYSTERESIS)` (about 0.67 `d0`) of the frame's camera, so a frame whose
+    drawn scene is further behind the camera than that is a miss by construction, whatever the loader
+    has made. `lag_over_floor_frames` counts those frames (misses or not); a miss in one is **lag
+    side** (the scene thread's following: the long slice's giving way to a camera that moves is
+    for it), a miss in any other is **loader side** (a brick that the bands ask for is not there:
+    the generator; decision A's curve, 3 levels at 50 m/s on levels 0 to 4, is in). The two add up to `camera_soft_miss_frames`.
+  - `loader_latency`, `loader_ahead_*`, `camera_soft_miss_by_level` and `by_second` (#251, schema 35;
+    reported, not gated, of the machine's clock): for telling why a flight has camera misses.
+    `loader_latency` is how long the jobs that the scene thread took in during the path waited (the
+    jobs that were generated: a job that was dropped is not in it),
+    by class (`drawn`: the bands split the brick; `margin`; `prefetch`) and by part: `outbox` (asked
+    for, until a sync handed it to the workers: a sync that finds them busy with the queue leaves it
+    there), `queued` (in the workers' queue until one took it), `made` (being generated), `waited` (made, in
+    the channel until the scene thread took it in) and `total`; each with `mean_ms`, `p99_ms` (the
+    upper bound of the bin that holds it: 0.5, 1, 2.5, 5, 10, 25, 50, 100, 250 ms, and 500 for over
+    250) and `over_100_ms`. `loader_ahead_mean`/`_max` and `loader_frames_at_max_ahead` are the jobs
+    the workers have taken that the scene thread has not (at `MAX_AHEAD`, 512, they wait).
+    `camera_soft_miss_by_level` is the camera misses by the level of the brick that was drawn whole
+    under the camera. `by_second` is a flight's seconds one by one (`second`, `frames`,
+    `camera_soft_misses`, `loader_queue_mean`/`_max`, `loader_ahead_mean`, `arrived_bricks`, the
+    scene thread's `scene_follow_ms`, `scene_pack_ms` and `scene_reband_ms`, `lag_d0_max`), to see
+    what the second of a miss looked like against the others. The summary prints all of it.
+  - `scene_release_rebuilds`, `release_frame_ms_max` and `release_update_ms_max` (#168): how many
+    times a finer depth made the scene again (`Rebuild::Release`, `scene_worker.rs` `RELEASE_REBUILD_OVER`,
+    500 thousand nodes) instead of looking at its nodes again, and the frame thread's cost of the
+    one it took: the longest frame that had one and that frame's update (the copy to the GPU, which
+    is over the budget like a jump's and is counted under `over_budget.bands`). The scene thread's
+    time in it is `scene_thread.release_ms`, to be read against #217's `CATCH_UP_CAP` (12 s since
+    2026-11-17; it was 5 s, which the 4090's 8.8 to 9.2 s hit with `before_hold.hit_cap` true).
+    The release frame is the one frame over the limit that the owner accepted (about 230 ms); the
+    frames around it are not: **while the scene thread makes the scene again the threads that read
+    and pack its bricks run at the lowest priority** (`render::scene::select::set_worker_start`,
+    `priority.rs`), because all the cores at the frame thread's priority kept it from waking for
+    30 ms at a time (26 to 43 frames over the limit, update `none`, on the 4090), and **the
+    frame thread writes only the used words of the rebuilt buffers** (`Scene::filled_words`: the
+    rest of the roomy buffers is zero, which the GPU makes itself): a rebuild writes about half of
+    what `upload.bytes_max` says (940 MB), which still counts the buffers made, the used words and
+    the zeros, so that the count is the same on every machine. Reported, not gated.
+  - `hole_looks`, `holes` and `holes_per_frame`: **holes are sampled, not counted for every
+    frame** (see "What the holes gate can and cannot catch"). Looking at every split brick takes
+    0.3 s at full size with the store's read lock held, so the scene thread does it every 5 s
+    (`SceneWorker::count_holes`; **in threads on every core, and a look that is only due waits while
+    the bands are speed-scaled**, #168: on the 4090 it held the lock for about 90 ms in a flight and the
+    camera had misses in the second after it), and **one more look is forced at the end of every path**
+    (`SceneWorker::look_now`), so no path has 0 looks. The report has how many looks there were in
+    the path and what they found.
+  - `scene_used_peak_mib` (#213): the most MiB of the scene in use at the end of one of the path's frames (the run's `memory.scene_used_peak_mib`, which is the gate, is the most of these and of the looks between frames; this says which path holds it).
+  - `scene_used_end_mib` and `scene_level_bricks_end` (#168, schema 27): the scene's buffers in use (MiB) and the bricks drawn at each level when the path ended, to be read against `scene_used_peak_mib` and the bricks at each level at that peak (`memory.scene_used_peak_level_bricks`): a peak far over the end is a transient, and the levels say what it was made of (the crossing's 552 to 572 MiB was 251 K bricks at level 13). Reported, not gated.
+  - `scene_round_max_ms`, `scene_update_max_ms`, `cap_flips`, `cap_flip_max_ms`, `backlog_peak`,
+    `absorb_updates`, `absorb_ms` (#213, schema 26): the longest round of the scene thread in the
+    path's frames (without the look for holes), the longest single update of the scene to a camera in
+    them (one step of `follow`, the selection's update: the time the scene stood still for the frame
+    thread), the number of times the horizon cap went off or on, and the longest update that was a
+    flip's or part of absorbing one (0 if none). A flip of the cap makes every node be looked at
+    again, and **the selection spreads that**: a sweep stamps 8 192 nodes an update, and the nodes
+    that it finds changing when it first looks at them (with the children that revisiting them
+    makes, and the nodes still queued under the old cap that change when their turn comes) are
+    revisited at most 800 an update (and about 8 000 bricks changed), nearest to the camera *as it is
+    then* first, the rest waiting in a backlog; what changes because the camera moved is not held
+    back by it. Then the queue is tidied (65 536
+    entries an update) of the entries that the sweep left stale. `backlog_peak` is the most nodes
+    waiting at once, `absorb_updates` how many updates were absorbing (the sweep, the backlog, the
+    tidying), and `absorb_ms` the time from the update that found a flip to the one that ended its
+    absorbing, summed over the flips that ended in the path. **Absorbing goes on after the camera
+    has stopped, so it can spill over into the next path** (the crossing waits at the top for it, so it
+    does not; a flip absorbed at the end of another path would): these fields are in the path where it
+    ends, and `cap_flips` is in the path where the flip was. **The acceptance of #213: the longest
+    `cap_flip_max_ms` of any path (not only the crossing's) is no longer than the longest
+    `scene_update_max_ms` of the paths with no flip** (those with `cap_flip_max_ms` 0), which the
+    ignored test `the_sea_level_crossing_round_at_full_size_is_no_longer_than_the_other_paths_worst`
+    prints and asserts (`cargo test --release -p client --bin client -- --ignored --nocapture
+    sea_level_crossing`, about 8 minutes at full size, no GPU needed). The crossing's own longest
+    update is an ordinary follow step and is within a few percent of the others' from run to run.
+    A Still view waits for the absorbing to end (`World::caught_up`).
+  - `scene_thread`: milliseconds the scene thread spent in the path on `follow` (selecting again
+    for a new camera and packing what changed), `pack` (asking the loader, taking in what it made
+    and packing it; **`pack_request_ms`, `pack_receive_ms`, `pack_hold_ms` and `pack_arrive_ms`
+    (#251) are parts of it, not more time**: asking the loader, taking in what it made, holding the
+    children in the store, and the scene's taking them in with the packing of what changed, the
+    rest of `pack` being the waits for locks and the loop; they are left out of the busy sum below),
+    `upload` (publishing: copying what changed out for the frame thread, which
+    copies it to the GPU), `evict` (eviction), `coarse` (the coarse levels over an Edit) and
+    `hole_scan` (the looks for holes), `release` (making the scene again for a depth that was
+    given back, and the listing that was not looked at: `Rebuild::Release`), `reband` (looking again at the nodes that a change of the
+    bands for the camera's speed listed, and packing what changed: **not in `follow`**; ADR 0009),
+    and **`hole_scan_share`**: the looks' share of the scene
+    thread's **busy** time, which is the sum of the parts above (`pack` once, not with its own parts)
+    and not wall time (a thread that is
+    idle most of the time can still read high). **A path's figures are those of its frames: the look
+    that is forced after the last frame is not in them**, so a path in which no look came due reads
+    0 and not 100%; its time is `end_look_ms`. **While a look runs the scene thread publishes
+    nothing**, so the looks of a path are time in which the frame thread's updates were held back
+    (a look at full size is 0.3 s with the store's read lock held), and a frame says whether one was
+    running in `hole_look`. The run's `scene_thread` is over the whole run and has every look in it,
+    the forced ones too.
+  - `end_look_ms`: what the look that is forced at the end of the path took in the scene thread
+    (the scan itself), in milliseconds. It is made after the frames, so it is in no frame's time.
+  - `still_cuts`, for `stop after a flight` only (null for the others; #217, schema 22):
+    `still_frames`, `cuts` and `by_cause` (`edit`, `bands`, `coarse`, `follow`, `arrival`, `coarsen`, `reband`).
+    A **cut** is an update that the frame thread took in while the view was Still and the Reference view
+    was being shown: the camera had stood for 2 frames (`STILL_FRAMES`) and the frame before had no
+    update either, as `render::still::Still::plan` counts (an update in the 2 frames after another is
+    in Primary frames, and is no cut). The update goes to the GPU, which restarts the Reference view (a
+    cut to Primary for 2 frames and a fade, from sample 0). The count matches the renderer's. Its cause is what the
+    scene thread was doing when it made the patch: `edit` (an Edit's bricks), `bands` (a new LOD
+    bias), `coarse` (the coarse levels remade after an Edit), `follow` (the scene moving to the
+    camera), `arrival` (bricks the loader made, taken in) and `coarsen` (a step of the memory cap's
+    coarsening, or one taken back) and `reband` (#168: nodes looked at again for a change of the bands for
+    the camera's speed). A cut that was made of several kinds of work counts under each,
+    so the causes add up to at least `cuts`. In **this** path nothing is held back (it measures the
+    settle time, which needs the loader to go on), so this is what a Still view would get if the
+    scene thread worked as it does for the Primary view. The held view is `still_after_flight` of the
+    run. A stepped test (`a_still_view_held_after_a_flight_gets_at_most_one_cut_from_scene_patches`)
+    holds the number on the test Planet: 118 cuts in 120 held frames before #217, all of them
+    `follow`, and at most 1 after.
+  - `settle`, for `stop after a flight` only (null for the others): `seconds` from the frame the
+    camera stopped in to the first frame in which the scene is at the camera (the drawn scene's camera is
+    the frame's), has no soft misses and nothing left to look at again for the bands
+    (`Scene::waiting` counts both), or the cap, and `settled`; `walk_s` is the first part (the
+    scene walking to where the camera stopped), `reband_s` the second (until the scene thread has
+    looked at every node that the change of the bands for the stop listed: 0 if it had by then)
+    and `fill_s` the rest (waiting for the loader's bricks, and making them into the scene); the
+    three add up to `seconds`. **Gated** (#168), `settle_s`, 55 s:
+    main's 47.8 s on the 4090 plus 15%. Over if it is over the limit or did not settle.
+    The scene thread's count of soft misses can be from before the stop (it counts a few times a
+    second, and not at all while it sleeps), so a stale 0 would read as settled at once. So the
+    stop is followed by **a count made after it** (`SceneWorker::look_now(false)`, the count and no
+    look for holes, whose 0.3 s would be in the time), and the camera is settled when that count
+    or a later one is 0 **and `waiting()` is 0**. The check is on `waiting` (the bricks the scene
+    still waits for the loader's to split) and not on the loader's `pending`, because pending also
+    holds jobs ahead of the view, which the view does not wait for; a count after the forced one is
+    not stale, since the scene thread counts again at once when nothing waits any more, and every
+    100 ms while it works. The time has the resolution of a frame, and of the count's 100 ms.
+- `hole_looks` and `holes` of the run: the looks for holes over the whole run, **from the moment the
+  measuring began** (the paths, the catching up between them, the sizing and the Edit), and what
+  they found. **The holes gate is held to this**, not to the sum of the paths'. A look is forced at
+  the end of each catch-up (once the loader has caught up, at the Spawn), after the sizing, and at
+  the end of the run.
+- `edit_latency`: the Edit that the run makes, **frames**, **ms** and `call_ms` (see below); null
+  if there was no Edit to time, and then **`edit_not_made`** says why (`nothing in reach` or
+  `refused`; null when the Edit was made).
+- `memory`:
+  - `resident_peak_mib`: **the largest resident set sampled during the run** (Windows' working set,
+    Linux's `VmRSS`). A sample is taken every 30 frames of the cold start and the paths (every half
+    second), and at the start and the end of the run; **not during the sizing, the looks for holes
+    or the waits between paths, and not inside the generation of this run's world map and its
+    `load`**, which come before the first sample. The samples are of the whole process, so **the
+    allocator may still hold memory from the normal bench that runs first and from earlier runs**,
+    and the figure can include it: the first run's is the cleanest reading of what a run needs.
+  - `whole_process_peak_mib`: the OS's own peak for the **whole process** (Windows' peak working
+    set, which cannot be reset; Linux's `VmHWM`) since it began. It includes the normal bench's
+    generation of the full Planet and every earlier run, so it is an upper bound of the run's, and
+    only grows over the runs. Null where the system does not say (as `resident_peak_mib`).
+  - `scene_used_peak_in` and `scene_used_peak_level_bricks` (#168): what the run was doing when
+    `scene_used_peak_mib` was reached (a path's name, or "the loader's catch-up after ...", which
+    is time that is in no path), and the bricks drawn at each level then. The run's peak is of
+    every frame, those between paths included; a path's is `scene_used_peak_mib` under it.
+  - `scene_used_peak_mib`: the scene's buffers **in use** (`Scene::used_bytes`), at the most of
+    what the scene thread said: it works the figure out every 250 ms (`TABLES_EVERY`), so this is
+    the most of those, not of every frame. **The memory gate is on this**, against the full-size
+    test's `SCENE_MIB_MOST` (512 MiB). It is **not VRAM**.
+  - `scene_reserved_mib`: what the GPU reserves for the scene, used or not
+    (`Scene::reserved_bytes`: the table, the regions, the brick references and the bricks, 4 bytes a
+    word). The buffers are allocated whole and change only when one grows (#145), so this is the
+    most over the run, after the growths. This is the VRAM the scene takes (at full size the
+    bricks buffer alone is about 587 MB). Reported, not gated.
+  - `device_blocks`, `device_reserved_mib`, `device_allocated_mib`, `device_empty_blocks` and
+    `device_empty_mib` (#236): what the device's allocator keeps at the end of the run, for **all**
+    of the GPU's buffers, not the scene's: the memory blocks it holds, what they reserve, what is
+    allocated in them, and how many of the blocks have nothing in them and what those reserve
+    (`null` where the allocator cannot say). The allocator is the patched `gpu-allocator`
+    (`third_party/gpu-allocator/PATCH.md`), which **keeps up to two empty blocks** of a memory type
+    and destroys the rest, where the published crate destroys every empty block but the last: a
+    block made on a frame stalled the GPU for 6.5 to 7 ms before the builds' first command
+    (`hardware.gap_new_blocks`), on about 1% of the frames of cold start and of a flight. The
+    hardware backend also makes the blocks of `hw::SPARE_BUFFERS` buffers of 60 MiB when its scene
+    is made (two blocks, **384 to 512 MiB of VRAM** on a GPU, where blocks are 128 MiB and then
+    256), so the first builds find them. `device_empty_mib` is what is kept and nothing uses;
+    `device_reserved_mib` less `device_allocated_mib` less that is free space in blocks that are
+    used. A compute run reports them too, which is the compute default's reserve with the patch.
+    Reported, not gated (the gate is `scene_used_peak_mib`).
+  - `scene_gpu_peak_growth_mib`, `scene_host_peak_growth_mib` and `scene_gpu_peak_rebuild_mib`:
+    **the peak during a growth**, which `scene_reserved_mib` is not (it is the size after). While
+    a buffer grows the old one and the new one both exist: the GPU's is the buffers' bytes before
+    the growth plus the new buffers made (`Tracer::peak_growth_bytes`, the most over the run's
+    growths; 0 if none grew: before round 11 it was set by every patch and so equalled the scene's
+    size, e.g. the 4090's 1 000.3 MiB of `188ebe8`, which was not a growth). **A rebuild is apart**: while a rebuilt scene is made (a jump or
+    other bands) the old scene's buffers and the new ones both exist, which is
+    `scene_gpu_peak_rebuild_mib` (`Tracer::peak_rebuild_bytes`; 0 if there was none). The frame
+    thread's is its copy's reserved bytes after the growth plus the old words of
+    the buffers that grew in that frame, at the most over the frames, which is what the process
+    holds if the allocator cannot extend the `Vec` in place and copies (an upper bound; the
+    scene thread's own copy, which grew a round before, and the outbox's copies are not in it).
+    Both are **reported and not gated**: `scene_used_peak_mib` and its limit are what the memory
+    gate is on, unchanged, and it counts the words in use, not the room a growth reserves. ADR
+    0004's accounting is of the sizes after a growth; these are what it has to add during a growth and during a rebuild.
+  - `store_peak_bricks` (the store's size as its budget counts it, looked at every 6 frames) and
+    `store_limit_bricks` (the most it may hold before eviction starts: the budget with its
+    overflow).
+- `sizing`: the client's sizing constants against what was measured **at full size** with the
+  resident set complete, as `streaming.sizing` has them on the test Planet (same fields and the
+  same checks, with `d0` of 1028.2, and no share of level 0 taken out of `STREAMED_PER_D0_SQUARED`:
+  level 0 beyond the spawn ring is there at full size). The scene thread counts exactly once for
+  it (`World::count_once_exactly`), since counting at every publish is a pass over 3.4 million
+  bricks each. It is reported; `over` marks a constant that is too small, but this is not a gate.
+  This is where `WORDS_PER_BRICK`'s Guard share and the other constants of
+  `docs/measurements.md` are measured again.
+
+`gates` holds, for each measure, the `worst` over every run (and path) and the `limit`, and `over`
+lists the gates that are over: `frame_time`, `frame_cpu`, `holes`, `memory`, `soft_misses`
+(under the camera), `scene_lag`, `spawn_ring`, `time_to_control`, `settle`, `gi`. For the holes it also
+has `hole_looks_fewest_in_a_run` and `hole_looks_fewest_in_a_path`. **`gi`** (#54, schema 29) holds Primary's
+`gi` pass in this run, on the full-size Planet, which the stepped bench's small flight understated by
+about 15 times (0.3 ms there, 4 to 5 ms here in the first run): the worst path's mean (`gi_mean_ms`, the
+pass's own 1.5 ms) and 99th percentile (`gi_p99_ms`, 3 ms), from `paths[].gpu_passes.gi`; with no
+timed path (`gi_paths_timed` 0) the gate is over, since a gate that looked at nothing has not passed.
+
+**Edit latency is measured in this mode**, as ADR 0006's bound needs the real scene thread and the
+stepped mode cannot show it (its `residency.edit_latency_frames` is 0 by construction, see above).
+After the stop path the camera is back at the Spawn with the loader caught up, and one dig
+(`world.edit(&aim, &Tool::default())`, `aim` the Spawn's view pulled to 40 Voxels from the ground,
+as the stepped mode does it) is made **before the frame's look at the scene**, as the game does,
+and frames at the Spawn follow until one has taken it in (`World::edit_taken`). `edit_latency` of
+each run is **`frames`** (from the frame that made the Edit to the one whose look took it in: 1 is
+the bound, an Edit made in frame N shows in N+1, 0 the frame that made it), **`ms`** (from before the
+Edit's call to the end of that look) and `call_ms` (the Edit's own call on the frame thread:
+planning and writing the bricks). `min` and `max` have the least and the most over the runs.
+It is reported and not gated: the bound is held by the stepped and real-thread tests, and this
+gives the number from the 4090 (#168 may gate it). **A dig that cannot be made is not an error:**
+if the Spawn's view has nothing in reach (no Voxel within `AIM_REACH` along it, or the scene does not
+show the ground there) `edit_latency` is null and `edit_not_made` is `nothing in reach`; if the client
+knows the server would turn the Edit down (`Predictor::foresee`) it is `refused`. The run goes on and
+finishes. An Edit that was made and is not taken in within 600 frames is the one that stops the run
+with an error.
+
+### What the upload budget bounds
+
+The budget (`scene_worker::UPLOAD_BUDGET`: 8 MiB and 2 048 belt copies) limits what the scene thread
+**adds** to the outbox and the frame thread has not taken, not what a frame takes. This is the one
+place that says what a frame may take beyond it:
+
+- A frame takes up to **the budget, plus the one operation that took what waits to it, plus the
+  first batch of arrivals of the round, plus the gap words**. The check is between operations, and
+  a patch is whole (a frame must not draw a brick whose words are not on the GPU), so the
+  operation (a follow step or a batch of arrivals) that takes what waits to the budget is in the
+  frame. **A follow step is itself cut** (#145, round 6): a camera further from the scene than a
+  quarter of the budget's worth of its move is walked to in steps of that size, each noted in its
+  turn. The length of a step is `FollowStep` (round 8; rounds 6 and 7 had a rate, below): it
+  begins at half of its **limit**, and after each step that did not reach the camera it is that step's
+  length scaled by `target / cost` (`target` a quarter of the budget, in bytes and copies, whichever
+  binds; scaled by at most 2 up and down; a step that cost nothing doubles), kept between a quarter
+  of the limit and the limit. The **limit** is a quarter of the budget over the least that a Voxel
+  of the move is taken to cost, `FOLLOW_MIN_COST` (32 KiB and 2 copies, a little under the 4090's
+  34 KB and 1.9 at 2 m), and at most half a jump: **64 Voxels at the default budget** (2 MiB /
+  32 KiB; the copies come to 256, so the bytes bind). It does not depend on what the steps before
+  it cost, so a run of steps that moved and changed nothing, or a rebuild (which has no patch's
+  cost), cannot make the next one long (the 34 MB operation of the first 4090 run). Rounds 6 and 7
+  sized a step by a *rate*, the cost a Voxel of the last step; that fell to steps of 4 Voxels
+  and stayed there, because **a step's cost has a part that does not depend on its length** (the
+  regions that it rewrites are written whole): in the local full-size flight a step of 64 Voxels
+  cost 2.9 to 3.8 MB and 380 to 510 copies and a step of 4 cost 2.0 to 2.3 MB and 310 to 360, so a
+  quarter of the budget (2 MiB) is under the cost of a step of any length there, and a length made
+  to fit it shrank, for 240 steps and eight times the bytes of steps of 64 for the same walk. The
+  least is a quarter of the limit (16 Voxels at the default budget) for that. **What that
+  guarantees at full size:** a step is at most 64 Voxels at the default budget, so it costs at most
+  `step * actual cost a Voxel` plus the part that is not in proportion: **the 4090's flights at
+  c537d09 had steps of 64 Voxels that cost at most 3.68 MB and 516 copies** (their `bytes_max` and
+  `writes_max`; **5489545's flights: largest update 4.5 MB and 700 copies at 2 m, 4.0 MB and 562 at 50 m**, a step or a batch), and the first step of a walk is 32 Voxels (at least a Voxel). That is a bound by the limit and the
+  measured cost, not by the budget: terrain that costs more a Voxel than the flights' gives a step
+  that much over, down to the least, 16 Voxels. Before, a follow was one operation to wherever the
+  camera was: the 4090's flights followed in one step of 17 to 34 MB. The first batch of arrivals of a round is taken whenever the outbox is empty, so that the
+  follow steps do not starve the arrivals: **if a follow step crossed the budget, the frame carries
+  two operations beyond it**, the follow step and that batch. The gap words are those between
+  ranges joined into one copy (`COPY_GAP`). The copies of a frame are at most the sum of its
+  operations' (joining only makes fewer).
+- **Not budgeted at all:** an Edit and its coarse remakes (the Edit is packed ahead of the backlog,
+  so ADR 0006's bound holds); a **teleport** (the camera put further than a jump, 2 `d0`, in one
+  call of the frame thread, and ending further than a jump from the scene: the scene is made again,
+  as that is cheaper than walking) and other bands, including the coarsening at the memory cap
+  (the scene is packed again and uploaded whole: `Rebuilt`); and the copies of a growth, old buffer
+  to new (they are on the GPU, not uploads, and are in no byte count). A scene that merely fell
+  behind by more than a jump is **walked to**, not jumped to, and so is a teleport that ends within
+  a jump of the scene (round 7: it was one operation of up to two `d0`, outside the budget:
+  `a_teleport_that_ends_within_a_jump_of_the_scene_is_walked_to_within_the_budget`).
+
+**The rounds that made the budget what it is, the walk that does not keep up with a flight, the baseline measured on main and the tests of the 4090's first run** are in [`bench-history.md`](bench-history.md), entry "2026-11-12 to 2026-11-16, #145 and #197".
+
+### The gates
+
+In `bins/client/bench-budgets.toml`, table `[streaming]`; every key is needed (a missing one would
+turn its gate off, so it is an error, like a misspelt one), and `--real-time` with budgets that
+have no such table does not run. Each gate is held to the worst of the runs, and a gate that is
+over exits with status 2 (0 with `--no-fail`). `gates.over` in the report lists the gates that are over
+by these names: `frame_time`, `frame_cpu`, `holes`, `memory`, `soft_misses`, `scene_lag`, `spawn_ring`,
+`time_to_control`, `settle`, `gi` and `starting_bias`. The limits are in the file; the table says what each is held to.
+
+| Gate (`gates.over`) | Key | The worst over the runs of |
+| --- | --- | --- |
+| `frame_time` | `frame_time_p99_ms` | the p99 of `frame_time`, of every path |
+| `frame_cpu` | `frame_cpu_p99_ms` | the p99 of `frame_cpu`, of every path |
+| `holes` | `holes` | the holes that the scene thread's looks found over each **whole run**, from the moment the measuring began, summed over the runs. It also fails if a run, or a path of a run, had **no look at all**: a gate that looked at nothing has not passed |
+| `memory` | `scene_mib` | the scene's buffers **in use** (`scene_used_peak_mib`). **It is not VRAM**: what the GPU reserves is `scene_reserved_mib`, reported and not gated. Also held: the store's size against its own limit, `store_limit_bricks`, which the client sets from `STREAMED_PER_D0_SQUARED` and `BUDGET_OVERFLOW` |
+| `soft_misses` | `camera_soft_miss_frames` | the frames in which the ground straight below the frame's camera is drawn coarser than the speed-scaled bands ask, summed over the flights at 2 m and 50 m, the take-off and the turn (ADR 0009, #168). The scene thread's own count is reported and not gated |
+| `scene_lag` | `scene_lag_d0_max` | how far behind the camera the drawn scene is, in `d0`, at the most over those four flights (a limit set from main's measurement, to tighten once the follow fixes land) |
+| `spawn_ring` | `spawn_ring_s` | seconds to make the 20 m of full detail round the Spawn |
+| `time_to_control` | `time_to_control_s` | seconds from the world map being ready to the window opening (the ring, the part of the Guard a camera within 2 km of the Spawn could see, the first scene) |
+| `settle` | `settle_s` | seconds from the camera stopping after a flight at 50 m/s to a scene that is at the camera, has no soft miss and has nothing left to look at again for the bands; a run still unsettled at the 120 s cap is over whatever the limit is |
+| `gi` | `gi_mean_ms`, `gi_p99_ms` | Primary's `gi` pass, GPU milliseconds, mean and p99 of the worst path; no timed path is over |
+| `starting_bias` | (none) | a full-size run of the default profile whose client did not start at LOD bias 1.0 (#264); a run on fewer threads or less memory than the machine has (`machine.profile.lowered`) is not held to it |
+
+**Frame time is the pessimistic figure.** Here a frame is the CPU's work and then the wait for the
+GPU, one after the other, with no presentation; in a window the CPU records the next frame while the
+GPU draws the last, so the two overlap. A run that meets 16.7 ms here meets it windowed, and one
+that does not may.
+
+Reported and not gated: the time to level 0 under the camera, the scene thread's own soft misses, the
+guard's completion time and Edit latency. The pass budgets (`[passes]`, `[gpu_total]`) are the stages
+of #10, per pass (#13).
+
+#### What the holes gate can and cannot catch
+
+It catches a brick that is split with the bricks under it not resident **at the moment of a look**:
+the scene thread looks every 5 s (`HOLES_EVERY`) while it works (not while the camera's speed has the bands scaled: the look is made after the release), a look is forced at the end of
+every path, of every catch-up, of the sizing and of the run, and the gate is on everything those
+looks found in the run, between the paths too. It fails when a run or a path had no look at all.
+
+It cannot catch a hole that is made and filled **between two looks**: one that lasted less than
+the interval between looks is not seen, and that includes a hole that is in one frame of a flight
+and gone by the next. A path's looks are at the interval and the end of the path, so the 2 s turn
+and the 6 s take-off have the one at their end and, at most, one more. The stepped mode on the
+test Planet counts holes in every frame, and so catches those on the test Planet, where the
+scene thread splits only a brick whose children are resident (so a hole is a bug in that rule). **An
+exact count at every publish at full size would be follow-up work in `render`**: `Scene::holes` is
+a pass over every split brick, which at full size is about 0.3 s, and what would make it exact is
+keeping the count of split bricks with a missing child as the scene changes (made and unmade by the
+selection and by eviction), so that a publish reads it and no pass is needed. Until then the gate
+is a sample.
+
+### Reading it and tests
+
+The gates, the least and the most over runs, the shape of the report, the report of a run that
+stopped, and the budgets table are unit tests in `bench/realtime.rs` and `bench/budget.rs`, with no
+GPU and no Planet: one test per gate builds runs that are within every gate but one and checks that
+exactly that gate fires, with status 2 (the report is built from numbers, so they gate on Linux and
+on Windows). For the holes there are three: a hole in a path, a hole **outside** any path (between
+them, at the sizing, at the last look) and a gate that looked at nothing. A stepped test of the
+scene thread (`streaming_tests`) checks that a look that is asked for counts the soft misses and
+looks for holes whatever the clock says.
+The slowest-frames list, the frames over the limit by update kind, GPU pass times that are null and
+not zero, a dig with nothing in reach and a dig refused (spent by digging in a world with no scene
+thread; the report has `edit_latency` null with its reason, and the run goes on), the envelope of a
+run with no Edit, and the catching of a panic are
+synthetic tests of the same kind, with no threads, and gate.
+`the_real_time_run_on_the_test_planet_completes_with_every_path_and_field` runs the mode on the
+test Planet with real threads and no GPU, and asserts what was run, no time (a look for holes in
+every path, the Edit taken in); `a_run_that_stops_names_the_step_it_was_at` is its error case.
+Both are in `.github/real-thread-tests.txt` and so do not gate. CI does not run the full-size mode.
+
+#### When a run stops
+
+A run that stops (the loader that does not catch up within its cap, a GPU error, the Edit not
+taken in, a full scene) ends the mode, and the bench **still writes `report.json`**: the normal
+bench's results, `streaming_real_time.runs` with the runs that finished (the `min`, `max` and
+`gates` are of those; null `min` and `max` if none finished), and `streaming_real_time.error`:
+`{ "run", "step", "message" }`, the run that was going and what it was doing (`building the
+world`, `making the GPU context`, `cold start`, a path's name, `the loader's catch-up after ...`,
+`sizing`, `edit latency`, `the last look`). The exit status is **1**, even with `--no-fail`: an
+error says nothing about whether the gates would have held, and it is not 2. `error` is null when
+the mode ran to its end.
+
+**A panic** in the paths of a run is caught and reported as an error: the same errored report, with
+the step the run was at and the message `panicked: ...` (the panic's own message and backtrace still
+go to stderr). A panic in making the world or the GPU context, or in ending the run, is caught at
+the step `building the world, making the GPU context, or ending the run`. A panic on the loader's
+workers or the scene thread reaches the frame thread as one and is caught the same way. What is not
+caught is the rest of `client bench`: a panic in the normal bench before the real-time mode starts
+ends the process with **status 101 and no `report.json`**, as does any panic outside the run; and a
+process abort (an out-of-memory kill, a driver crash) ends it by signal, also with no report. In
+those cases the output on stderr is all there is.
+
+## The convergence phase
+
+ADR 0005 judges the Reference view, and Primary against it, by a convergence curve: how far the
+image is from a truth after 1, 4, 16, 64, 256 and 1024 samples. `client bench` makes that curve
+(#187), so that the estimator (#188) and the still-frame policy (#189) are measured before and
+after. It runs on every `client bench` unless `--no-convergence`, after the caves.
+
+**On the 4090**, from the Windows artifact, for ADR 0005's baseline (8192-sample truths):
+
+```
+client.exe bench --truth-spp 8192 --out bench-out
+```
+
+That is the whole bench with the phase. At `--truth-spp 8192` the phase took 146 s a run on the 4090
+with #188's estimator (about 5 minutes with the 4-bounce one, the baseline of #187; both in
+`docs/measurements.md`). With the default `--truth-spp 1024` it takes about 45 s (44.0 s for both
+views, measured on the 4090 before #188 and not measured again); the `wall_s` of the report's `convergence`
+block is the phase's wall-clock time. If the phase fails (a file it cannot write, say, or a panic),
+the bench warns on stderr, leaves the block null and still writes the rest of the report: the phase
+has no budget to fail.
+It writes `bench-out/report.json`
+(the `convergence` block), `bench-out/convergence.csv` and `bench-out/convergence/golden/` and
+`convergence/pit/` (about 0.2 GB of truths at 8192 or 1024 alike: they are the image, not the samples).
+
+**The views.** Both are on the patch of the *test* Planet (the small sphere of 1500 Voxels that the
+golden image tests use: `planet_gen::generate_region`), not on the 320 km Planet that the flight, the
+sweep and the cave stills draw. The patch takes a fraction of a second to make, and the views are
+fixed Voxel for Voxel. `golden` is the reference golden's camera and sun
+(`render_reference` in `crates/render/tests/golden.rs`); `pit` is a pit dug into the same hillside
+(41 by 61 Voxels, 40 deep: 2 by 3 m and 2 m deep at 5 cm Voxels, which #99 measured as 4 by 6 m and
+4 m at 10 cm), looked into from its rim with the sun behind the far wall, so that its far wall and
+the far part of its floor are lit by bounce light. The pit is a fixed part of the bench scene
+(`bench/convergence/views.rs`), made by setting its Voxels to air in the patch's store, and the
+`golden` scene has none of it, so the golden's picture is the one of #99 and of the golden test.
+Each view is its own scene on its own GPU context.
+
+**What is drawn.** The Reference view traces at the output resolution (twice `--size` in each
+direction: 2560x1440 for the default), one sample a dispatch, each submitted and waited for and timed
+like the flight's reference mode times its samples (`reference` and `gpu_total`: the same pass and
+timers, so they can be set beside `modes.reference`, which is at 1280x720; the view's
+`ms_per_mpix_per_sample` is the mean of `reference` over the image's megapixels). The order, per view:
+truth A (seed 1) and truth B (seed 2), `truth_spp` samples each, which warm the GPU and are not
+timed; then the run (seed `0xB4A7A9AC`, the reference's own), timed, with the image and the `f32`
+accumulation read back at each checkpoint; then the GPU context is dropped and everything is scored
+on the CPU, **outside every timer**. The truth is the same view with another seed, never the run's
+own: with the same seed the first samples would be the truth's and every error would read low.
+
+**The scores** (`report.convergence.views[].curve[]`, each against truth A):
+
+- `flip_mean` and `flip_p99`: LDR-FLIP of `flip-rs` (`=0.1.2`, pinned in `bins/client/Cargo.toml`
+  and as `FLIP_VERSION` next to the seeds, and a test holds the two together), ppd 67.02, on the 8-bit
+  image that the Reference view shows (what `render_reference` reads back: the mean encoded with the
+  true sRGB curve, since #188; before it the curve was a gamma of 2.2, which `--flip-gamma-2-2` scores
+  again, see below). `flip_p99` is the
+  error-weighted 99th percentile, a guard against speckles.
+- `mse_linear`: the mean squared difference per channel of the `f32` accumulations, in linear light.
+  `mse_linear_run_only` is that less half the floor's, which is the truth's own share, so it is the
+  run's noise alone and falls as 1/N.
+- `gpu_s`: the GPU seconds of the run's first N samples, as timed (null without timers).
+
+- `flip_mean_gamma22` (only with `--flip-gamma-2-2`; null otherwise): the same FLIP mean on the same
+  samples, with the mean encoded by the old gamma-2.2 curve on the CPU. #188 moved the Reference and
+  Primary to the true sRGB curve, which shifts FLIP a little against #187's baseline whatever the
+  estimator does; this column is the new estimator on the old curve, so the two effects separate:
+  `flip_mean_gamma22` against #187's `flip_mean` is the estimator, `flip_mean` against
+  `flip_mean_gamma22` is the curve.
+
+`converged` is how bright the view's truth A is (`mean_linear`: the mean of each channel, linear;
+`mean_luminance`: Rec. 709 luminance of that mean; `mean_luminance_b`: the same for truth B). #188
+reads the pit's converged brightness off it: the estimator's bounce light shows as a brighter pit,
+and a truth from before #188 is compared by the same mean of its `truth-a.f32`.
+
+`floor` is truth B against truth A in the same three: the metric's noise in this view. `lines` has,
+for FLIP 0.05 and 0.02, the samples at which the curve gets there (`samples`; null if it never does),
+how that was found (`how`: `at-first-checkpoint`; `interpolated` on a log-log line between two
+checkpoints; `extrapolated` along the last two, which is an estimate, not a measurement;
+`not-reached`), the GPU seconds that takes at the mean and at the p95 of one sample's time (`gpu_s`,
+`gpu_s_p95`), and `counts`: **a line counts in a view when it is at least 4 times the view's floor
+FLIP mean**. Where it does not, the view cannot tell that line from noise (on #99, FLIP 0.02 in the
+pit at 720p). Read a line that does not count as nothing, and `extrapolated` as a sign that the curve
+had not reached the line by the last checkpoint (1024 samples, fixed; `--truth-spp` does not move
+the checkpoints), so the number is an estimate to look into, not one to quote.
+
+**The files.** `convergence.csv` has the curve for plotting: `view`, `samples`, `gpu_s`,
+`flip_mean`, `flip_p99`, `mse_linear`, `mse_linear_run_only`, and the view's floor
+(`floor_flip_mean`, `floor_mse_linear`) on every row, then `flip_mean_gamma22` and
+`floor_flip_mean_gamma22` (empty without `--flip-gamma-2-2`). `convergence/VIEW/` has `sppNNNN.png` for each
+checkpoint and, for each truth, `truth-a|b.png`, `.f32` (little-endian RGB floats, linear, rows from
+the top) and `.json`, its inputs (the view, camera, sun, seed, samples, size, generator version, GPU,
+driver and build). **A truth is kept for looking at and for working out what a number was made of. It
+is for the machine, the driver and the build that made it: never compare one between machines or
+drivers, and never put one in `tests/golden/`.** Two machines' curves are compared as curves, each
+against its own truths.
+
+**A regression** is a PR whose curve on the 4090 is worse than main's by more than the floor (ADR
+0005); nothing gates on it yet, and the phase has no budget in `bench-budgets.toml`. Compare
+`curve[].flip_mean` per checkpoint, view by view, from two reports made with the same `--truth-spp`.
+Truth sample counts matter: the error against a truth of M samples carries the truth's own `1/M`.
+
+**In CI** (`--short`): the phase runs at half of the traced size with three checkpoints (1, 4, 16),
+truths of 16 samples and **no FLIP** (`convergence.flip` is null, and so are every FLIP number and
+`lines`), to see that it runs and that the report and the files have the right shape: the bench smoke
+test checks them. FLIP is never run in CI: `flip-rs` is compiled in (the Windows artifact needs it)
+and nothing calls it. Two ignored tests do, by hand: `cargo test -p client --bin client -- --ignored
+flip_of` (the wrapper) and `-- --ignored the_phase_with_flip` (the whole phase at 96x54, or at
+`CONVERGENCE_TEST_SIZE=WxH`). `crates/render/tests/convergence.rs` holds, on lavapipe at 32x32, that the
+squared error against a scene with a known answer (a flat sunlit floor: `albedo * (sun * cos + the sky
+averaged with the cosine weight)`) falls as 1/N from 1 to 256 samples, with N times the error equal to
+the variance of one sample worked out from the sky's gradient, that two seeds differ by the sum of
+their errors (the floor), and that a seed gives the same image every time.
+
+**The still view** (#189, `report.convergence.views[].still`). After the single-sample run (which is
+unchanged, as are the truths and every timed pass) each view runs the **still-frame policy** from the
+stop: frames at 60 Hz drawn by `Offscreen::draw_frame`, which is the window's Reference mode without
+the window (`Tracer::encode_frame`: the same state machine, the same budget, the same fade pass).
+The first two frames after the stop are Primary, then each frame takes a batch of the Reference view
+(1 on the first, then as many as fit in 12 ms, rising by one after 4 frames that fit) and fades it in over the last
+Primary image. A frame that takes longer than 16.7 ms waits for the next vsync, as a window does. The
+clock is the wall clock from the stop. It is the only part of the phase that is timed by wall clock
+and the only part that batches; the curve above is single samples, always (batching is inert when the
+sample count is fixed: the goldens, the curve, and every number `reference` has had).
+
+- `frame`: the work of a frame that took a batch, in ms (encoding until the GPU is done, the copy to the
+  window included), with `mean_ms`, `p95_ms`, **`p99_ms`** and `max_ms`; `frames_over` counts the ones
+  over 16.7 ms and `frame_p99_within_target` is #189's frame-time acceptance (p99 at most 16.7 ms).
+- `gpu_batch`: the GPU's time for a batch; `batch_first`, `batch_last`, `batch_max` the sizes;
+  `samples_per_s` the samples a second over the frames that took one.
+- `marks[]`: at 0.1, 0.25, 0.3, 0.5, 1 and 2 s after the stop (the 0.3 s mark is the room's: ADR 0005; every view has it), the samples the run had, and the FLIP (mean,
+  p99) and linear MSE of the image of that many samples against **the same truth A as the curve**. The
+  image is drawn after the run from single samples of the same seed, which is bit for bit what the
+  batches added up to (`batching_bit_exact` says it held on this GPU, and a test holds it on
+  lavapipe), so the run is never paused to read 59 MB back. `flip_within_target` is the FLIP
+  acceptance: at most 0.05 at the 0.25 s mark (0.3 s in the room, whose wall clock is reported, not gated: `still.flip_within_s` says which).
+- `cuts` (#217, schema 22): `total`, `view` and `scene`: the **cuts** the view had while it was Still
+  (`Tracer::cuts`: a frame that showed the Reference view and was followed by a Primary one), by what
+  changed, the camera, sun or window (`view`) or the Planet (`scene`). A cut is 2 Primary frames, a
+  fade and a restart from sample 0. The run holds the camera and the Planet still, so this is **0 in
+  both views**; it says the renderer's own count works and is where a phase that patches the Planet
+  would show them. The scene thread's patches are measured where there is a scene thread: the
+  streaming mode's `still_after_flight` (below).
+- `to_line[]`: for FLIP 0.05 and 0.02, the samples the curve needs (as `lines`) and the seconds from the
+  stop until the run had that many, with `counts` as in `lines`. A line that does not count in the view
+  is shown and not used. It is null where the run ended first.
+- The run's images at the marks are in `convergence/VIEW/still-NNNNms.png`.
+- `--short` runs 0.3 s, no FLIP; the smoke test only checks the shape.
+
+**For the 4090** (#189's acceptance, which is the orchestrator's to run, at 1440p in both views; the same
+command as the baseline above, because the still view is part of the phase):
+
+```
+client.exe bench --truth-spp 8192 --out bench-out
+```
+
+and the numbers are `report.convergence.views[].still` (`frame.p99_ms`, `marks[]` at 0.25 s,
+`to_line[]` for 0.02), with the printed lines `still view, golden|pit, ...` and `acceptance: ...` on
+stderr. Run it with both clocks locked as for the other 4090 numbers, 3 times; the policy's batch sizes
+come from the GPU's own timers, so they vary a little from run to run. The phase's wall-clock time rose
+by 2 s a view plus the single-sample images of the marks (a few seconds), so it is about 20 s longer.
+Nothing in `bench-budgets.toml` moved: `reference` is still one sample.
+
+**The policy's constants** are all in `crates/render/src/batch.rs` (`BATCH_BUDGET_MS` 12,
+`MAX_BATCH_SAMPLES` 16, `RECENT_BATCHES` 16, `RISE_AFTER_FRAMES` 4) and `crates/render/src/still.rs`
+(`STILL_FRAMES` 2, `FADE` 150 ms). The cap is on the work in a
+dispatch: 16 samples at 1440p, and the same work at any size (`max_samples`: 7 at 4K, 1 at 8K). The worst
+sample known at 1440p is 10.98 ms (#99's pit, the maximum of 1 024 samples, before #188; the pit's mean is
+4.38 ms now), so a capped batch is 16 x 10.98 = 176 ms, 9 % of Windows' default 2 s timeout (TDR), and 0.53 s
+(26 %) with ADR 0005's factor of 3 for a snow cave. A GPU would have to be 11 times slower than the 4090 on
+that sample (3.8 times with the snow cave) to reach the timeout with a capped batch. The budget, not the
+cap, sets the size: the 4090 takes 4 samples at most at 1440p (the runs on #216); the cap is for what the
+budget cannot see, timers that lie and views that cost under 0.75 ms a sample. A time of 0 or under
+`MIN_SAMPLE_MS_PER_MPIX` (0.05 ms a Mpix a sample) is no data: it is left out, and the size is held.
+
+**Times arrive late, and the flight's `reference` is not the player's number.** The GPU's times come in
+one to three frames after the batches they are of (the profiler's ring), so the size can rise sooner than 4
+frames at the new size: the rule counts timed batches that fit, and some of them were drawn at the size
+before. A drop is still at once, on the first time that says so. And the flight's `reference` pass (the
+budget in `bench-budgets.toml`, one sample) times the *internal* size, a quarter of the pixels at the
+default 0.5 render scale, while the window traces the Reference view at the full output size. The
+still-view phase, at full size with batching, is the player's number.
+
+**The sun-and-sky view** (#52, `report.convergence.shadows`, `convergence/sun/`, **schema 24**). The
+golden view's camera with **the hero sun's geometry (8 degrees up, 0.12 radians wide) and the sun
+and the sky alone in both views**: no GI (Primary has no
+ambient term; the Reference follows no path past its first surface) and no emitted light
+(`Offscreen::set_sun_and_sky_only`). What is left to compare is the sun's disc and Primary's two
+shadow rays a pixel (`--shadow-rays N` for another count; the block's `shadow_rays` says which)
+against the Reference's. It is scored at the output size (1440p), with Primary traced at half of
+it as a window does. `--shadow-rays` changes this view alone: the `shadows` line of `passes[]` is
+timed at the default count (2), so to put 1 ray's FLIP beside its cost, read that cost from the
+run without it (0.178 ms at 1 ray on the 4090, 1440p) or from `--diag` runs of a build with
+`DEFAULT_SHADOW_RAYS` changed:
+
+- **Truth A** is the Reference's direct-sun image at `--truth-spp` samples (1024 by default, so it
+  meets the ticket's "at least 1024"; pass 8192 for ADR 0005's baseline), seed 1; truth B, seed 2,
+  gives the **floor**. FLIP is LDR at the convergence views' 67.02 ppd, on the 8-bit image the
+  player sees (the old light with every stage off, as the other views have).
+- `first_frame` is Primary's first frame with no history, which is what the player has the frame
+  after a sun change; `settled` is Primary after `settle_frames` (32) frames of a still camera. Each
+  has FLIP's `flip.flip_mean` and `flip.flip_p99`, and `edge`. **`meets_target`** is the **first
+  frame's** FLIP mean at or under `target_flip` (0.05), as the ticket's acceptance has it (a
+  few samples of the disc a pixel and no upscaler history is the frame after a sun change, and the
+  worst Primary frame); **`target_counts`** is whether 0.05 is at least 4 times the floor's mean (ADR
+  0005's rule, as the views' `lines[].counts`). `settled` is reported beside it and is not held to
+  the target. **Where it stands (#52, 4090, 1440p, hero sun, 8192-sample truth, floor 0.0008):** at
+  the default 2 rays the first frame is **0.062** and the settled image **0.059**, so
+  `meets_target` is false; 1 ray was 0.074 and 0.072 (`--shadow-rays 1`). The owner shipped 2 rays
+  with the centre-cosine weight; its bias was the cause, and #55 made the unbiased per-sample weight
+  the default (0.021 settled on the 4090 with the denoiser, measured at 4c02da7; 0.026 before the filter's last change; ADR 0005's "Sun and shadows" row has the
+  numbers). `meets_target` is reported and printed only: it is not a
+  gate and does not change the exit status, and the target is not loosened.
+- **The shadow-edge error** (`edge`). FLIP's mean over a whole image says little about the few
+  pixels of a shadow's edge, where Primary weighs its rays by the cosine at the disc's centre
+  and the Reference weighs each of its samples by its own. The edge is found from the Reference: a
+  second image of the same view with the shadow rays off (`ReferenceOptions::no_shadow_rays`, 256
+  samples) gives how much of the sun each pixel has (truth A over it), and a pixel is **on an edge**
+  when it has some of the sun and not all (5 to 95 %), or has a pixel within 2 pixels on each side of
+  the half. `edge.edge_pixels`, `edge_mean` and `edge_p99` are the mean and 99th percentile of the
+  absolute difference of the 8-bit luma (Rec. 709 on the encoded values), in levels of 255, over those
+  pixels; `other_mean` is the mean over the rest of the pixels the sun reaches (the sky and the
+  faces turned from the sun say nothing of shadows, and are left out). `edge_share` is the share of
+  the image on an edge. `convergence/sun/edges.png` shows the mask, `truth-a.png`,
+  `unshadowed.png`, `primary-first.png` and `primary-settled.png` the images.
+- **CI** (`--short`) runs the view at a few dozen pixels with no FLIP, to see that the report has the
+  right shape; the edge error is made without FLIP. FLIP runs on a real GPU only, and in the ignored
+  test `the_phase_with_flip_scores_both_views_and_writes_the_files`.
+- **For the 4090** (the ticket's acceptance, which is the orchestrator's to run): the same command
+  as the baseline above. The numbers are `report.convergence.shadows` (`first_frame.flip.flip_mean` at
+  or under 0.05, `meets_target`, `target_counts`; `settled`, `edge`; `shadow_rays`) and the printed lines
+  `convergence, sun (...)` on stderr, and `passes[shadows]` in each mode (its 0.4 ms budget, held by
+  the run's exit status). The phase's wall-clock time rose by the view's two truths and the
+  unshadowed image at 1440p, which have no bounce rays and cost a fraction of the pit's.
+
+**Primary's GI against truth, the dig and the gates** (#54, `report.convergence.views[].gi`,
+`report.convergence.gi`, **schema 29**). The phase has a third view, **`room`**, the emissive
+room (a closed box of rock, 40 by 16 by 40 Voxels inside, with one block of warm light on the floor,
+seen from the opposite corner: `views::room`), which converges like the other two, with truths,
+the curve and the still run. In **each** view Primary is also drawn as the window draws it (traced at
+half the size, upscaled) and scored by FLIP (LDR, 67.02 ppd, mean and 99th percentile) against that
+view's **truth A**, which the view's own run made, at the output size:
+
+- **`gi.flat`** is Primary with **the flat ambient of 0.25** that main had (`set_flat_ambient(true)`):
+  the baseline, **before**. It is not a mode of the game, only here so that "no view moves further from
+  the Reference than main's Primary" has a number on the same build.
+- **`gi.gi`** is Primary with the radiance cache's GI: **after**.
+- Each has `first_frame` (the frame after the view is made, with a cache that has nothing in it) and
+  `settled` (after `gi.settle_frames` = 64 frames of a still camera, about a second at 60 Hz), each with `flip`
+  (`flip_mean`, `flip_p99`; null without FLIP) and `luminance_ratio` (the image's mean luminance in
+  linear light over truth A's image's, both 8-bit as the player sees them, 1 = as bright; it needs
+  no FLIP, so a short run has it).
+  `gi_not_further` is whether the settled GI image's FLIP mean is at most the flat one's.
+  The images are in `convergence/VIEW/primary-{flat,gi}-{first-frame,settled}.png`.
+- **`convergence.gi.edit`**, **the dig**: the room with a wall across it that the lamp's light does not
+  get through, seen from the dark side, warmed up for 90 frames; a gap of 160 Voxels is dug in
+  the wall and frames are drawn at 60 Hz (a frame that takes longer than 1/60 s takes its own time). The image's mean
+  luminance after each frame is `luminance[]`, at `frame_ms[]` from the start of the update.
+  **`settle_ms`** is the time of the first frame after which the luminance stays within a tenth of the
+  change's size of where it ends up (null if the dig changed it by under 5 %); `before`, `after`,
+  `update_ms` (the Edit's CPU time) and `slow_frames` (frames over 60 Hz) say the rest.
+  **`edit.game_path`** says which path made the Edit. True (the full run): **the game's own**: a ring
+  scene of the test Planet (`stream::test_planet()`), a `World` with its loader threads, the Edit made
+  by `World::edit`, the scene worker's patch arriving in `World::recentre` a frame or two later, and
+  the cache's boost taken, on the frame thread at `World::edit` time, from the Edit's changed bricks
+  (`Offscreen::edit_made`): the settle time includes that latency, which is what a player waits.
+  False (`--short`): the flat scene, `Scene::update` and `Offscreen::update_scene` at once.
+  What the settle time is made of: the cache follows an Edit within a few frames (its cells forget faster for
+  30 frames, `GI_BOOST_FRAMES`), and the rest is the upscaler's history: 16 frames of it take a new
+  light at a sixteenth a frame, which on lavapipe was 40 frames to settle (650 ms on the 4090 at
+  `2eac792`, 400 ms before the upscaler's blends moved to linear light and its clamp got slack).
+  So for the 30 frames after an Edit (`Tracer::edit_made`) the upscaler keeps no more than 4 frames of
+  history (`SETTLING_HISTORY`; a sun change starts the history over anyway): on lavapipe the dig
+  settles after 15 frames (flat) or 18 (the game's path, with the patch's two-frame latency).
+  `light_let_in_by_an_edit_shows_through_the_upscaler_within_half_a_second` holds it.
+- **The gates** (`convergence.gi.gates`, held with FLIP only, **exit status 2** if any is over, `--no-fail`
+  silences it): `primary-flip:VIEW` (**#55, schema 33:** the settled FLIP mean of Primary as the window draws it, with
+  the denoiser on, is 0.05 or under against the truth, in every view: the golden, the pit, the room and the
+  sun-and-sky view `sun`; it was the room's 0.10 before the denoiser), `no-further:VIEW` (a view's settled GI image no further from truth than its flat
+  one, for each of the three), `settle` (the dig settles within 500 ms), and `reference-room` (the
+  room's Reference view reaches FLIP 0.05 within **0.3 s of GPU time**: the line's `gpu_s`
+  (`views[].lines[]`, `flip` 0.05: its samples times the Reference pass's mean GPU time), against
+  `still::ROOM_WITHIN_S`: the owner's exception of 2026-11-20 for the closed room, whose long light
+  paths cost about three times a sample as much as the outdoor views', and **his decision the same
+  day that the gate is on GPU time**; the 4090 has 0.292 and 0.289 s; no timers (a `gpu_s` of null) is
+  over) **where that line counts in the room** (ADR 0005: at least 4 times the room's floor, so a room
+  whose truths are noisier than 0.0125 is not held to it; **the room's truths have at least 8192
+  samples** when FLIP is run, `ROOM_TRUTH_SPP`: the floor was 0.0211 at 1024 and 0.0137 at 4096 on the
+  4090, and about 0.0120 is what the two fit for 8192).
+  **Two clocks, one gated:** the room is gated on the line's `gpu_s`. The 60 Hz **wall clock** of the
+  still run (the image at the 0.3 s mark, `still.flip_within_target` with `still.flip_within_s`, and the
+  line's seconds from the stop, `still.to_line[].seconds`, which have the first still frames, the batch
+  budget of 12 ms a frame and the vsyncs in them: 0.674 s and FLIP 0.066 at the mark on the 4090) is
+  **reported, not gated**; the summary prints both as "room Reference gate". **The outdoor views are
+  unchanged**: their acceptance is still the still run's FLIP at 0.25 s on the wall clock
+  (`flip_within_target`, "met" or "NOT met" in the summary; they have no entry in `gates.over`).
+  Each view's `truth_spp` (`views[].truth_spp`, and the summary's "truths of N samples") says how many
+  samples its truths had; the room's is `ROOM_TRUTH_SPP` when that is more than `--truth-spp`.
+  `gates.over` names those that are over, `gates.not_counted` those that were not held for being under
+  4 times the floor.
+- **Why gate the settled frame**: the first frame of a cold cache is the noisiest GI is, and the player
+  has it once, in the frame the scene is made; it is reported beside the settled one, not held.
+- **CI** (`--short`) draws all of it at a few dozen pixels with no FLIP: the report has the shape, the
+  dig's frames are there, no gate is held. The ignored test
+  `the_phase_with_flip_scores_both_views_and_writes_the_files` runs it with FLIP.
+- **For the 4090** (the ticket's acceptance, which is the orchestrator's to run): the baseline command
+  above. The numbers are `report.convergence.views[].gi`, `report.convergence.gi`, `passes[gi]` (its
+  1.5 ms budget, held by the run's exit status) and the printed `convergence, Primary against truth`
+  lines. The phase's wall-clock time rose by the room's truths and still run, and twelve FLIPs of
+  1440p images.
+
+The flight, the cave stills, the streaming mode, the real-time mode and the look-dev sheet draw Primary
+with the radiance cache (`set_flat_ambient(false)`), since that is the player's frame; the convergence
+views' Reference images do not depend on it.
+
+### The denoiser (#55)
+
+Primary is drawn **denoised** in every view of the phase and in the flight: `Offscreen` starts with
+`Denoise::Off` (the tests with answers worked out from the raw samples want it), so a caller that draws
+Primary as the game does calls `set_denoise(Denoise::Full)` next to `set_flat_ambient(false)` (the bench,
+the look-dev sheet, the flight). The `denoise` pass (budget 1.0 ms in `bench-budgets.toml`) is in
+`passes[]`; it holds the frame's samples from the lattice, the temporal accumulation and the filter, and
+sits before the upscaler (`crates/render/src/denoise.rs` has the account).
+Cost: 0.227 ms mean (0.255 p95) on the 4090 at 2560x1440 with Primary traced at 1280x720 (measured at 4c02da7).
+It scales with the traced pixels, and **the review's estimate, not measured, is about 0.5 ms at 4K at the
+default 0.5 scale and about 2 ms at 4K native**, which is over the 1.0 ms budget.
+
+What the 4090 runs for #55 (the orchestrator's, with the PR's Windows artifact):
+
+```
+client bench --truth-spp 8192                                  # the gate: per-sample weight (the default), every view
+client bench --truth-spp 8192 --shadow-weight centre-cosine    # the same, with #52's weight
+```
+
+Each run reports **both weights** and the denoiser off, so one run has the comparison:
+`convergence.shadows.{first_frame,settled}` are the chosen weight denoised, `other_weight` the other,
+`raw` the chosen weight with no denoiser, `reference_64` the Reference at 64 samples (reported, not
+gated); and each view's `gi.{gi,other_weight,raw,flat}` the same for the GI views, with `gi.reference_64`.
+The gate is on the weight that `--shadow-weight` chose; the run that gets the sun view under FLIP 0.05
+settled, in the other views too, is the weight to keep. The summary prints every line.
+The convergence views' pictures are the denoised ones (`primary-gi-*.png`, and for the other weight
+`primary-gi-per-sample-*.png` or `primary-gi-centre-cosine-*.png`), and the look-dev sheet's
+`primary.png` and `primary-settled.png` are drawn as a window draws a first frame and a settled one.
+
+**Primary converged: where a view's error is.** A denoiser takes noise away, not bias, so the gate's
+error is split in two in every view (the golden, the pit, the room, and the sun view's
+`convergence.shadows`), each run: `converged` is Primary with the denoiser off, in the weight of the
+run, drawn for `--converged-frames N` frames (default 1024; 0 leaves it out) of the still view after
+it has settled, and **averaged in linear light**: the mean that Primary's own samples converge to,
+with its own bias (the radiance cache's GI, the weight of the shadow rays, the upscaler's clamp). Its
+picture is `primary-converged.png` in the view's folder.
+
+- `converged.bias`: FLIP of it against truth A. What no denoiser can remove: if this is over 0.05 in
+  a view, the gate there needs work on the light (the GI), not on the denoiser.
+- `converged.residual`: FLIP of Primary denoised and settled (`gi.settled`, `settled` for the sun)
+  against it. What the denoiser leaves of the noise: this is the denoiser's to tune.
+- `converged.raw_residual`: the same for Primary with no denoiser (`raw.settled`): what the noise is
+  without it, so the denoiser's share is `raw_residual` against `residual`.
+- `converged.luminance_ratio`: its mean luminance over the truth's: how dark or bright the light is
+  as Primary draws it, with the noise averaged out (the room's 0.92 is the bias that the room's
+  GI has, not noise).
+- `converged.denoiser_shift`: FLIP of Primary denoised and averaged over the same frames against
+  `converged`: how far the denoiser moves the mean (its clamps, the rejection of history, the
+  filter's guide), with the noise averaged out.
+- `converged.denoised_limit`: FLIP of that denoised mean against truth A, to read against `bias`: if
+  it is no worse than `bias`, the denoiser adds no error of its own to the view and what is left is
+  the light's.
+
+
+## The hardware ray backend (#50)
+
+Wgpu ray queries over procedural AABBs were faster than the compute DDA on the rays that `trace()`
+casts (the primary rays, the sun shadows and the GI) on the 4090 (PR #233), and the owner adopted
+them on 2026-11-21: **hardware is the default wherever the adapter has ray queries, and the player
+can switch to compute** (Part 2). The code is `crates/render/src/hw.rs` (the acceleration
+structures), `shaders/trace_hw.wgsl` (the shader) and `bins/client/src/bench/rt.rs` (the report).
+
+**What changed for the bench in Part 2.** `client bench` with no `--rt-backend` is **`auto`**: the
+backend the game picks, so the gated runs (`client bench`, `client bench --streaming --real-time`)
+measure what players get. On the 4090 that is hardware, and the report's `rt.requested` is `auto`
+and `rt.active` is `hw`. **The budgets and the gates are the same numbers as before; they now
+hold the hardware backend**, and `edits` (the 1 ms Edit+BVH budget) now includes the
+acceleration-structure update of each Edit (the Edit stress waits for the builds, `set_wait`). An
+adapter without ray queries runs compute with a warning, `rt.active` `compute` and the reason in
+`rt.fallback` (the real-time mode, which refuses a **requested** `hw` on such an adapter because its
+gates would say nothing of it, goes on as compute for the default). **`--rt-backend compute` is the
+old default**: pass it to measure the player's setting for compute, the reference, or to compare
+with a report from before Part 2 (the report's schema is 38 now; a report with `requested`
+`compute` is what every earlier report was). `--rt-backend hw` is the same as `auto` on an adapter
+with ray queries; use it when the run must not be allowed to fall back (in the real-time mode it
+stops with the reason).
+
+Hardware is chosen only on an adapter with `EXPERIMENTAL_RAY_QUERY` (`render::choose_backend`: no
+ray queries, or limits of 0, is the compute backend with a reason, never an error). Whether
+lavapipe has ray queries depends on its Mesa (the dev box's, 25.0.7, has them); the tests that
+compare the backends skip themselves, printing `SKIPPED ...: why`, where it has none, and the
+fallback is tested through a device made without the feature (`Offscreen::without_ray_queries`).
+**CI's `linux-tests` shards** run the goldens on both backends (`golden.rs`'s `..._on_the_hardware_backend_`
+tests) and the whole of `hw_agreement`; it falls back to compute and says so in the log when the
+runner's lavapipe has no ray queries.
+
+**The player's setting.** The game (`bins/client/src/settings.rs`, the overlay's "Hardware ray
+tracing" checkbox) asks for hardware by default and keeps the player's choice in `settings.toml`
+(`ray_tracing = "hardware" | "compute"`) in the per-user config directory, or where
+`BHAYANAK_SETTINGS` says. The overlay shows which backend runs and why not hardware. The setting
+changes at run time (the tracer is made again for the Planet, so it takes a moment) and survives
+`set_scene`.
+
+**Tight boxes are in the brick.** The scene packs each mixed brick's tight box (the lowest and
+highest Voxel its mask sets) into its header word (`scene.rs`, `pack_header`); the box pass reads
+it, and the compute walk enters the brick through the same box (`hit_brick`, `walk_brick`):
+a ray that misses the box misses the brick, and the Voxel walk starts at the box's face and ends at
+its far side. An Edit packs the brick again, so the box is as new as the mask.
+
+**What is built.** One AABB for each non-empty brick of each ring level, as tight as the Voxels that
+the brick's occupancy mask has set (a solid or uniform region is one box of its whole 64-Voxel
+cube), in a **BLAS per group**: the groups are regular, 4 x 4 x 4 regions of a level's grid
+whatever is in them (never content-driven), so an Edit rebuilds the groups it touched and nothing
+else. One TLAS instance per group, scaled by 2^level, with the TLAS in a frame anchored at the
+camera (snapped to 4096 Voxels) so that its floats are fine near the camera. On a candidate hit the
+shader runs the compute path's in-brick DDA (`hit_brick`, `hit_region`) and commits its hit with
+`rayQueryGenerateIntersection`; every pass is the same shader with either backend.
+
+**The two kinds of shadow ray.** The sun's shadow rays (`shade.wgsl`) and the GI's (`gi.wgsl`) ask
+`occluded(ray, reach)`, which only needs to know that something is there: on compute it is the same
+walk as any ray's, which goes front to back and stops at the first Voxel; on **`hw`** it is a ray
+query with `RAY_FLAG_TERMINATE_ON_FIRST_HIT` that ends at the first box that has a Voxel in the way,
+whichever the hardware reaches first; on **`hw-nearest`** it looks for the nearest hit like a
+primary ray does (what `hw` was before the early-out, kept to tell what the early-out is worth). The
+primary rays, the GI's bounces and the path tracer's rays are the nearest-hit query on both.
+
+**Running the comparison** (on the 4090, from a release build or the Windows artifact):
+
+```
+client.exe bench --rt-backend both --no-convergence --no-fail --out bench-out-rt
+client.exe bench --no-convergence --no-fail --out bench-out-hw   # the default (auto: hw), the sweep too
+client.exe bench --rt-backend compute --no-convergence --no-fail --out bench-out-compute   # the old default
+# #236: the frame thread's update on the real-time streaming mode, hardware against compute
+client.exe bench --streaming --real-time --rt-backend both --out bench-out-rt-stream
+client.exe bench --streaming --real-time --out bench-out-rt-stream-hw   # the default (auto: hw), gated
+```
+
+`both` is one process: the compute run is the ordinary bench; the hardware run is a second context
+that flies the same path and makes the same Edits; and a third, `hw-nearest`, flies the path (no
+Edits). All are on the same GPU, driver and clocks. Read `rt.comparison`:
+
+- `speedup`: for `primary`, `shadows`, `gi` and `gpu_total`, the compute mean, the hardware mean
+  and `compute_over_hw` (above 1, hardware is faster; null if a pass was not timed), and the same
+  with `hw-nearest` (`hw_nearest_mean_ms`, `compute_over_hw_nearest`).
+- **`speedup.gpu_total` is the GPU time of the frame's passes and leaves out the hardware's
+  acceleration structure updates**, which are submitted between frames (#236: they are not waited
+  for, so their GPU time is in no pass timer of the flight and in none of `frame_time`). For the
+  frame with them in, `hw_gpu_total_plus_accel_ms` is the hardware's mean `gpu_total` plus the
+  flight's updates' total cost (`hw_accel.flight.total_sum_ms`) spread over `flight_frames` (the
+  steady flight's frames, not every measured frame), and `compute_over_hw_with_accel` is compute's
+  `gpu_total` over it. Since #236 that total is the frame thread's cost (recording and
+  submitting); the GPU's own time for a build is only measured in the Edit stress (`hw_edits`),
+  which waits.
+- `compute`, `hw` and `hw_nearest`: the flight's primary mode on each backend: every pass's STATS,
+  `gpu_total`, `frame_time` and `scene_update_ms`. **`scene_update_ms` is what following the camera
+  costs the frame thread**, the hardware's acceleration structure updates included (their
+  recording and submitting: since #236 not the GPU's time): it is timed in the flight apart from
+  the passes, and there is no p99 (`p95_ms` and `max_ms` are what `STATS` has).
+- `hw_accel`: the cost of the acceleration structures. `initial` is the first build. `flight` is a
+  summary of the updates of the **steady flight**: the measured frames of the mode, less the first,
+  spread over `flight_frames` of them. The jumps are apart, since a jump builds everything at once
+  and is not what following the camera costs: **`warmup`** (the move to the end of the path where
+  the mode warms up, the warm-up frames, and whatever was still logged when the Edit stress was
+  set up: `settle_for_edits` drains it here and never throws an update away),
+  **`first_frame`** (the first measured frame, which follows the camera back from there to the
+  start of the path; `scene_update_ms` has it in its `max_ms`, which is a jump and not the
+  flight's worst frame), **`sweep`** (#236: the sweep's own updates, its still frames and its jumps
+  to each height and back; with `--rt-backend hw` alone the sweep runs on the hardware backend
+  before the Edit stress, and until then its still frames were counted in `flight` and its jumps
+  in `warmup`) and **`settle`** (the move to where the Edit stress starts). `edits` is the Edit
+  stress's. A summary has `updates`, `noop_updates` (scene
+  updates after which no box was stale), `blas_rebuilt`, `prims_rebuilt`, `tlas_rebuilds`, the
+  BLASes rebuilt per update `_mean`/`_max`, `prepare_ms`, `build_ms` and `total_ms` as STATS of the
+  updates that rebuilt something, `pending_max` (the most groups that waited for a later frame's
+  build budget; a jump has 0 as it builds all), `total_sum_ms` (their total and the search of the
+  no-op updates) and `noop_search_ms` (the no-op updates' part of it). Each update has a `kind`: `build` (all),
+  `patch` (the groups a move or an Edit touched, and the TLAS again) or `anchor` (the camera left
+  the TLAS's frame: instances only).
+  - **`prepare_ms`** is the frame thread's CPU time to take an update's dirty groups from the
+    patch (they come with it: the scene thread lists them, #236), work out which to build this
+    frame within the budget and make a BLAS for each new group. It has no scan of the scene and
+    makes no boxes (the GPU does).
+  - **`build_ms`** is the frame thread's time to record the box pass, the BLAS builds and the TLAS
+    build and submit them, **with no wait for the GPU** (#236; it used to wait for everything
+    queued, the scene's uploads included). Only in the Edit stress, which sets `set_wait(true)`,
+    does it include the GPU's own time to finish them, so that the Edit+BVH cost there is the
+    builds' own.
+- `edits_ground` (the report's top level, on the run's own backend: **compute's** in `both`) and
+  `hw_edits_ground`: the same stress again with the camera **by the ground** (48 Voxels, 2.4 m,
+  over the pole; null on `--short`), where its Edits are in level 0 and in the finest BLASes, and
+  three times as long (`GROUND_FRAMES`: about a dozen Edits, not four, since it is the one the
+  BLAS sizes are judged by). **`hw_edits`' camera is a kilometre up, so its Edits are in the coarse
+  levels, whose few cells are in the same BLASes at every `--hw-group-regions`: it does not measure
+  what a BLAS of 16 x 16 x 16 regions costs an Edit to build again; `hw_edits_ground` does** (its
+  `accel` has the builds, its `frame_thread` the Edit+BVH). It goes on from where the altitude
+  stress left the Planet (it starts with the mode that undoes the last Edit). Not gated: put
+  `edits_ground.frame_thread` by `hw_edits_ground.frame_thread` for what the hardware adds to an
+  Edit by the ground. Every Edit stress (`edits`, `hw_edits`, both grounds) has
+  **`frame_thread_parts`**, the frame thread by part, each a `Stats` over the Edits: `edit` (the
+  Edit planned and level 0 written: the same on both backends), `scene_write` (the scene's
+  buffers, what is left once the parts below are out; the same too), `scene_grow` (buffers that
+  grew: a new buffer, a copy, a new bind group), `scene_submit` (the host's time in the `Queue::submit`
+  of the scene's copies, where a driver that holds the submit up behind earlier GPU work shows;
+  `scene_queue_submit` is the `Queue::submit` call alone, the rest being the belt's finish and recall, and is
+  not in the sum of the parts),
+  `scene_emitters` (the emitter index), `flush` (the submit that sends them), `accel` (the hardware's update, less
+  its wait: what a frame of the game pays), `accel_wait` (the stress waits for the GPU's builds, the
+  game does not: **it is in `frame_thread` and in `accel.total_ms`, so the Edit+BVH figure is an
+  upper bound**) and `edit_made`; and **`frame_thread_each`**, each Edit's frame-thread ms in order
+  (the first is the cold one), and **`grown_bytes_each`**, the bytes copied into buffers that grew.
+The first Edit by the ground (5.7 ms on the 4090, its cause and the fix) is in [`bench-history.md`](bench-history.md), entry "2026-11-21, #236: the first Edit by the ground".
+- `hw_edits`: the Edit stress on the hardware backend, in the report's `edits` shape, to put by
+  `edits` (compute). **Both stress runs start from the same camera and rings**: the sweep's last
+  height (20 000 Voxels over the pole), where the compute run ends the sweep, and the hardware run
+  is put there before it starts (`settle_for_edits`; on the compute run it is one `recentre` to the
+  camera the sweep already sits at, which does nothing unless the selection still owed work, so the
+  compute `edits` are as they were, if not provably to the last digit), so the Edits land on the same
+  levels (a stress that started from
+  the flight's low end would make its Edits in level 0, which are cheaper to repair). The two sides'
+  buffers can still differ in size: the compute run flew the Reference and the sweep first. Its budgets
+  are not gated. The acceleration structures' update is inside the frame thread's time
+  (`update_scene` waits for the build), so it is in `frame_thread`.
+
+**Where the updates run (#236).** The frame thread's part is small and never waits for the GPU:
+
+- **The dirty groups are found on the scene thread** (ADR 0006), which already knows which
+  regions it wrote: `Scene::write_region` notes each region it changes (`Patch::touched`), and
+  `take_patch` maps them to groups with each group's box count (`RingPatch::groups`: a count of 0
+  means the group is gone), and flags the groups that **may have gained** (`RingPatch::grown`: a
+  brick that is new, a brick with a Voxel where it had none, a region that is new: any box not
+  inside a box the group had; a dig that exposes interior bricks the scene did not list is one).
+  A patch of a move of the rings lists every group whose boxes moved. Patches merge in the outbox
+  like the rest (the later count wins, `grown` is the union). A rebuild of the whole scene
+  (`Patched`/`Rebuilt` updates) restarts the backend: every group is made again.
+- **The boxes are made on the GPU** (`shaders/hw_boxes.wgsl`, `BoxPass`) from the occupancy masks
+  that the scene's buffers already hold, into one pool buffer (`Pool`, a first-fit allocator that
+  grows by a GPU copy), one workgroup for each region of a group. `group_prims`/`region_prims` in
+  `hw.rs` are the CPU twin, and `cargo test -p render --test hw_agreement` holds the GPU's boxes
+  to the CPU's, box for box, so that compute and hardware keep the same boxes.
+- **Nothing waits**: the box pass, the BLAS builds and the TLAS build are submitted in queue order
+  (wgpu-hal places the barriers between them). Each group has a stable TLAS instance slot.
+- **What waits, and what cannot.** A group waiting for its build keeps its old BLAS in the TLAS
+  and the shader reads the scene's current bricks through the old boxes. That is exact for a group
+  that **only lost** (every box it has now lies inside a box it had: a ray enters a box with
+  nothing in it any more and finds nothing, as the rebuilt group would, a few frames later), and
+  wrong for one that **gained**, since a ray cannot hit what no box covers: it would pass through
+  the new brick, or hit something farther. So a group that is in `RingPatch::grown`, or has no
+  BLAS yet, is built **in the frame it is listed in whatever the budget**. Only groups that only
+  lost wait; "never a hole" is true of those and of nothing else, and `pending` counts them.
+- **The budget** (`BUILD_BUDGET`, 2^18 boxes, like #145's upload budget) is **a frame's**, counted
+  over every build of the frame: the updates before the draw, and the first draw (`follow`, with
+  the profiler's frame count): a second view of a frame builds none of what may wait, and a
+  frame that has built nothing builds at least the nearest group. The groups that may wait are
+  built nearest the camera first; one that has waited `MAX_WAIT_FRAMES` (30, about half a
+  second) frames is built whatever the budget, so that a far group is not left behind for ever.
+  The groups that may not wait come first and are in the count, so a frame that gained more than
+  the budget has the cost of it: it is the number to look for in `scene_update_ms` on the 4090
+  (the ring move's leading face). A jump or a rebuild builds every group in one update: the GPU
+  is busy ~100 ms then, and the frame thread's part is one scan of the groups. Those updates
+  are in `warmup`, `first_frame`, `sweep` or `settle`, not in `flight`. The box pass dispatches
+  32768 jobs at a time, so a jump of any size cannot exceed a dimension of a dispatch.
+- **The frame's update counts every build**: `frame_parts.update` is the update's call and the
+  builds of the draw (those of `follow`, which are encoded in it; `DrawTimes::hardware`, taken
+  out of `encode`), so the "within 1.0 ms of compute" check is of all the hardware backend's work
+  on the frame thread. The log of the updates (`HwScene::take_log`) keeps the latest 4096 if
+  nobody takes it; the benches take it every frame.
+- The TLAS's frame moves with the camera (hysteresis of 1.5 snaps) in `HwScene::follow`, on the
+  frame thread, as an update of the instances only, also with no wait.
+
+**In the real-time streaming mode** (`--streaming --real-time --rt-backend hw|both`; #236): the
+runs fly on the hardware backend. The report's `streaming_real_time.rt` has `requested`, `active`,
+`fallback` and each run's `accel` summary (null on compute). `both` runs the whole mode twice, on
+compute (`streaming_real_time`) and then on hardware (`rt.real_time_hw`, the same shape), one after
+the other on contexts of their own. The acceptance of #236 reads each path's `frame_parts.update`
+(`mean_ms` and `p95_ms`: **`Spread` has `p95_ms` since schema 34**) and `frame_time`: the hardware's
+update is to be within 1.0 ms of compute's at the mean and at p95, and every gate holds with
+`--rt-backend hw`. The summary prints "frame thread's scene update" under each path's mean frame.
+Each run's `accel` has `pending_max` and `updates_waiting` (the updates that left groups waiting)
+to say how much the budget held back. **A run asked for the hardware backend (`hw`, or the hardware
+half of `both`) on an adapter with no ray queries is an error** (`error` of that report, with the
+adapter's reason, exit status 1): its gates would be compute's, and say nothing of the backend.
+
+**BLAS size** (`--hw-group-regions`, #236): the scene thread lists and counts **cells** of 4 x 4 x 4
+regions (`RingPatch::groups`), whatever the BLASes are; `HwScene` keeps each cell's count and a BLAS
+is 1, 2, 4 or 8 cells along an edge (4, 8, 16 or 32 regions) of them, set by level (`16:32@2` in the program unless `--hw-group-regions` says otherwise). The cells of a BLAS are kept as a map per BLAS (`HwScene::members`), updated as the patches come, so that a BLAS's count and its box pass's jobs do not look up every cell it could have. A BLAS with a stale cell
+is built again whole, from all its cells (the box pass has a job a cell, which writes its boxes after
+the cells before it, from the BLAS's corner); it may not wait if a cell of it gained boxes, as ever.
+`accel.*.blas_rebuilt_by_level` and `prims_rebuilt_by_level` say where the builds are (index 0 is
+level 0), `tlas_instances_max` and `prims_total_max` how big the TLAS got, and each path's
+`hardware.tlas_instances` and `hardware.draw_submit` (the draw's own submit in ms, a `Spread`) are
+there to read what a submit that traces costs by the TLAS's instances: wgpu-core checks every
+instance of a TLAS in each submit that uses it.
+
+**Where the hardware's frame-thread time goes** (each path's `hardware`, null on compute; each
+run's `accel.*.phases_ms`; each Edit's `phases_ms`). Every update is timed in parts that add up to
+its `prepare_ms + build_ms` (one clock, read between the parts), and a path's `hardware` has them
+per frame, summed over the frame's updates (the update's call and the draw's follow), over every
+frame of the path like `frame_parts.update` (zero where nothing was built): `total`, then
+`before` (the patch merged into the queue, or the TLAS's frame moved: every instance written),
+`plan` (the queue sorted, the pool's room, the new BLASes made, the jobs), `instances` (the
+instance table written and the bind group made again), `boxes_pass` (recording the box pass),
+`builds` (the entries and the BLAS and TLAS build commands recorded), `finish`, `submit`
+(`Queue::submit` of the hardware's command buffer alone) and `wait` (zero but in the Edit stress),
+each a `Spread` with `mean_ms`, `p95_ms`, `p99_ms`, `worst_ms`. `update_rest` is
+`frame_parts.update - total` per frame: what the compute backend pays as well (the scene's write
+and flush), so it is to match compute's `frame_parts.update`, and the rest of the gap is what the
+parts do not cover. `blas`, `boxes` and `submits` are per frame `{mean, p95, max}`;
+`frames_with_builds` the frames with a BLAS built; `wait_not_passes` is `frame_parts.wait_not_passes` (the
+GPU's wait that is not the passes: the boxes' pass, the builds and the TLAS of the frame land in it) as a
+`Spread` over the frames of each kind: `idle` (no BLAS built), `waiting_only` (only groups that could wait),
+`urgent` (at least one that could not), `big` (boxes at or over the build budget), `several_submits`, and the
+allocations: `created` (a BLAS was made, not only built), `pool_grew` (the box pool grew and was copied) and
+`tlas_made` (the TLAS was made again for more instances), so that
+a p99 of it says which frames carry it; the slowest frames list `hw_blas`, `hw_blas_urgent`, `hw_boxes` and
+`hw_submits`, `hw_created`, `hw_pool_grew` and `hw_tlas_made` (null on compute); with `--hw-wait` the box pass
+(and a pool's copy) is submitted and waited for before the builds are recorded: `hardware.wait_boxes` is the GPU's
+time of it and `hardware.wait` the builds' and the TLAS's alone; on a device with timestamps in encoders
+(`TIMESTAMP_QUERY_INSIDE_ENCODERS`, asked for with `--hw-wait`) `hardware.gpu_blas` and `hardware.gpu_tlas` are what
+the GPU's clock says the BLAS builds and the TLAS build took (the slowest frames: `hw_gpu_blas_ms`, `hw_gpu_tlas_ms`),
+the builds then recorded in calls of their own, the TLAS in the last; `hardware.gpu_gap` (slowest frames:
+`hw_gpu_gap_ms`) is the GPU clock's time from the end of the box pass's commands to the start of the builds'
+(the CPU's wake-up from its wait and its recording of the builds are in it, a few tenths of a millisecond; more is
+what the GPU did before the builds' first command; the look at the allocator below is left out of it); zero where the
+device has none. With `--hw-wait` the frame also looks at wgpu's allocator before the update and after its command
+buffer is finished (where wgpu makes the scratch buffers of the builds): `hardware.gap_new_blocks` and
+`hardware.gap_no_new_blocks` are `gpu_gap` of the frames in which it made a memory block and of those in which it
+did not, `hardware.scratch_bytes` the biggest allocation made while recording (the scratch buffer, as a rule), and the
+slowest frames list `hw_blocks_made`, `hw_reserved_grew` (bytes), `hw_scratch_bytes`, and the CPU's
+`hw_finish_ms` and `hw_submit_ms`;
+`per_blas_us` the parts over the BLASes built,
+in microseconds, over the frames that built (so the cost can be read per BLAS). **The `submit` of
+the hardware's command buffer also sends the `write_buffer`s of the frame's update that were
+queued before it** (the scene's upload), which on compute go in the draw's submit: read
+`frame_parts.submit` of the two backends with it (the hardware's is lower by that much).
+
+`--rt-backend hw` (and the default, `auto`, on an adapter with ray queries) runs the whole bench
+(the flight, the sweep and the Edit stress) on the hardware backend: `rt.active` is `hw`,
+`rt.accel` has the same `initial`/`flight`/`sweep`/`edits` as `hw_accel`, and `modes`, `altitudes`
+and `edits` are the hardware ones, to compare with a `compute` report's by hand (`hw-nearest` is
+the same with nearest-hit shadows). The budgets are the same for both backends, so a report is
+held to them whichever ran. The cave stills and the convergence phase always use compute: they are
+not what is compared.
+
+
+**Tests.** `cargo test -p render --lib hw::` (CPU only: the tight boxes, the regular grouping, the
+groups a patch lists with their counts (an Edit, a coarse brick written in place, a move of the
+rings, merged patches), which of them may wait (a dig of the surface only loses, a block placed or
+a dig into the interior gains, and every group that is not flagged has its new boxes inside the
+old), the box counts and the pool's allocator); `cargo test -p render --test
+hw_agreement -- --nocapture` (on a device: the choice of backend, the fallback through a device
+made without ray queries, the GPU's boxes against the CPU's box for box, an Edit's patch and
+agreement with compute at level 0 and at a coarse level, the rings moving with no group stale and
+no hole with the budget full and at 1 (**at 1, hits are compared with compute's on every step
+while groups wait, ahead of the camera and behind it: no hit lost, none farther**), the budget
+being a frame's whatever its views, a group that waited too long, the box pass in many dispatches,
+the log's bound, the draw's builds counted as the hardware's, a waiting group, a jump, the TLAS's frame following the
+camera, the shadows of both variants against compute's, and the hits of both backends on 6000
+rays; those that need ray queries skip themselves, printing why, where there are none).
+
+## Reading the report
+
+```
+{
+  "schema_version": 38,
+  "build":   { "version", "commit" },          // commit: CI builds only, else null; on a PR
+                                               // build it is GitHub's merge commit, not the head
+  "machine": { "gpu", "device_type", "driver", "driver_info", "backend", "os", "arch",
+               "timers_supported",
+               "profile": { "threads", "memory_mib", "video_memory_mib", "ray_queries",
+                            "found_threads", "found_memory_mib", "constrained", "pinning",
+                            "pinned_cpus", "starting_bias", "default_bias" } },  // #264
+  "config":  { "width", "height", "output_width", "output_height", "scene", "path",
+               "keyframes", "bias", "diag" },          // width, height: traced; output_*: upscaled
+  "modes": {
+    "primary":   { "frames", "warmup_frames", "spp", "passes": [ENTRY...], "gpu_total": ENTRY,
+                   "frame_time": STATS, "scene_update_ms": STATS,
+                   "lod_at_keyframes": [ { "frame", "height_m", "bricks": [n...] }... ] },
+    "reference": { ... same ... }
+  },
+  "altitudes": [ { "height_m", "bricks": [n...], "primary": STATS, "upscale": STATS,
+                   "reference": STATS }... ],
+  "caves":   [ { "name": "mouth" | "tunnel", "bricks": [n...], "primary": STATS,
+                 "upscale": STATS, "reference": STATS }... ],
+  "screenshots": [ "primary-frame0000.png", ..., "primary-cave-mouth.png", ... ],
+  "budgets": { "source", "ok", "failed": ["primary/primary"], "unmatched": [] },
+  "edits":   { ... } | null,                       // the Edit stress; null for --short
+  "edits_ground": { ... } | null,                  // the same by the ground (level 0), on the run's backend; null for --short
+  "convergence": { "width", "height", "scene", "checkpoints", "truth_spp", "seeds", "flip",
+                   "flip_gamma22",
+                   "lines", "min_line_over_floor", "folder", "csv", "wall_s",
+                   "views": [ { "name", ...the view's camera and sun, "reference": STATS,
+                                "gpu_total": STATS, "ms_per_mpix_per_sample", "converged", "floor",
+                                "curve": [...], "lines": [...], "files": [...],
+                                "still": STILL }... ],
+                   "shadows": { "name": "sun", ...the view's camera and sun, "width", "height",
+                                "traced_width", "traced_height", "sun_and_sky_only", "truth_spp",
+                                "unshadowed_spp", "seeds", "flip", "floor": SCORES | null,
+                                "target_flip", "min_line_over_floor", "target_counts",
+                                "first_frame": PRIMARY, "settled": PRIMARY, "settle_frames",
+                                "meets_target", "edge_share", "files" } } | null,
+                                      // null with --no-convergence or if the phase failed;
+                                      // see its section
+  "streaming": { "deterministic": true, "schedule", "counts_hash", "upload", "soft_misses",
+                 "rings", "work", "residency", "holes", "sizing",
+                 "timing": { "deterministic": false, ... } } | null,  // --streaming only
+  "streaming_real_time": { "mode": "real-time", "deterministic": false, "planet", "d0",
+                           "runs": [RUN...], "min": RUN, "max": RUN, "gates",
+                           "rt": { "requested", "active", "fallback", "accel": [SUMMARY | null...] },
+                           "error": { "run", "step", "message" } | null } | null,  // --real-time only
+  "rt": { "requested": "auto" | "compute" | "hw" | "hw-nearest" | "both", "active": "compute" | "hw", "fallback": STRING | null,
+          "accel": { "initial", "flight", "flight_frames", "warmup", "first_frame", "sweep",
+                     "settle", "edits" } | null,   // active hw only; each part is a SUMMARY
+                                        // (with its own "noop_search_ms"), "flight_frames" a count
+          "comparison": { "compute", "hw", "hw_nearest", "speedup", "hw_gpu_total_plus_accel_ms",
+                         "compute_over_hw_with_accel", "hw_accel", "hw_edits", "hw_edits_ground" } | null,  // both only
+          "real_time_hw": { ...the shape of streaming_real_time... } | null }  // both and --real-time only
+}
+```
+
+- `STATS` is `{ "samples", "mean_ms", "p95_ms", "max_ms" }`. The figures are `null` when there are
+  no samples. `p95_ms` is the nearest rank. Times come from every sample the GPU timers recorded
+  over the measured frames (`Timings::history()`), not from the overlay's rolling window.
+- `SUMMARY` (the hardware backend's updates of a stretch of a run; the parts of `rt.accel` and each
+  entry of `streaming_real_time.rt.accel`) is `{ "updates", "noop_updates", "blas_rebuilt",
+  "prims_rebuilt", "tlas_rebuilds", "blas_rebuilt_per_update_mean", "blas_rebuilt_per_update_max",
+  "pending_max", "updates_waiting", "prepare_ms": STATS, "build_ms": STATS, "total_ms": STATS,
+  "phases_ms": { "before", "plan", "instances", "boxes_pass", "builds", "finish", "submit", "wait": STATS },
+  "total_sum_ms", "noop_search_ms" }`; see "The hardware ray backend".
+- `ENTRY` is `STATS` plus `name`, `budget_ms` (null if the pass has none) and `status`:
+  - `within`: the **mean** is at most the budget.
+  - `over`: the mean is above it. This blocks the merge.
+  - `no-budget`: nothing declares a budget for it.
+  - `no-data`: it has a budget but no times, because the GPU has no timestamp queries
+    (`machine.timers_supported` is `false`). It fails the run, since nothing was checked.
+- `gpu_total` is the GPU time of one profiler frame, from the start of its first pass to the end
+  of its last. In primary mode that is one frame of the path. In reference mode every sample is a
+  profiler frame of its own, so `passes[]` and `gpu_total` are **per sample** there, with
+  `frames * spp` samples, and `gpu_total.reference` budgets one sample.
+- `frame_time` is CPU time to draw one frame of the path, and to read the image back where it is
+  read (reference mode, and primary mode's screenshot frames). For reference mode a frame is all
+  its samples. It is context, not a budget.
+- `scene_update_ms` is the CPU time per frame that the Planet takes to follow the camera: the
+  bands select the bricks again, those that changed level are packed, and the changes are written
+  to the GPU, flushed at once. It is done before the frame is timed, so it is in no pass and not
+  in `frame_time`, but a window pays it. Its mean is CPU time, not GPU time, and a CPU that is
+  slow to follow leaves the GPU idle between frames (see below).
+- `lod_at_keyframes` has, for each keyframe of the path, the frame, how high the camera is above
+  the Planet's mean radius in metres, and how many bricks are drawn at each level of detail
+  (level 0 first). Empty for `--short`.
+- `edits` is the Edit stress (#147, #156; null for `--short`): the largest cube Brush dug and
+  placed in turn at the metric rate for 30 s. `per_frame` is an `ENTRY` of CPU time over every
+  frame, those with no Edit at 0, against the `edits` budget (a mean, so a hitch can hide in it).
+  `frame_thread` is an `ENTRY` of the part of each Edit that the client's frame thread does (the
+  Edit planned, level 0 of the Voxels changed, the writes sent to the GPU), held to the
+  `edit_frame_thread` budget by its **longest** Edit, `max_ms`, so one hitch fails the run.
+  `scene_thread` is `STATS` of the rest (the coarse levels remade, the bricks packed), which the
+  frame thread does not wait for and which has no budget. `per_edit` is `STATS` of all of it as
+  if on one thread.
+- `altitudes` is the sweep: for each height, the bricks drawn at each level and the `primary` and
+  `upscale` passes of primary mode and the `reference` pass of reference mode (one sample), with
+  no budget held against them. It is how the cost of the LOD bands is read at the ground, 100 m,
+  500 m and 2 km.
+- `caves` is the same for the two cave stills (the camera at the mouth, and the one inside),
+  with the bricks of the bands at a tenth of the flight's `d0`, so far fewer than the sweep's. Empty
+  for `--short`. Their screenshots are in `screenshots`.
+- `budgets.unmatched` lists budgets for passes that did not run (a budget for a stage whose pass
+  does not exist yet): they are not an error.
+
+The mean is what is held to the budget; look at `p95_ms` and `max_ms` for stutter.
+
+### Reading a regression
+
+A pass whose work did not change but whose time did (the `upscale` pass does not read the Planet)
+points at how the frames are paced, not at the pass. The bench draws one frame at a time and
+waits for it, so the GPU idles for as long as the CPU takes to follow the camera
+(`scene_update_ms`) before the next frame, and a GPU that has idled may time a pass that is
+limited by memory (`upscale` is) differently from one that has not. To tell the Planet's GPU work
+from that gap, run the bench with `--diag` and compare `upscale` and `reference` against a plain
+run (the camera path is the same):
+
+| Run | If `upscale` falls back to main's | It is |
+| --- | --- | --- |
+| `--diag no-follow` | yes | something in following the camera: the next three say which |
+| `--diag no-follow,gap-ms=N` (N about `scene_update_ms`) | no, it stays high | the idle gap: nothing the Planet sends to the GPU |
+| `--diag no-upload` | no, it stays high | the CPU's time, not the writes |
+| `--diag no-flush` | yes | the writes being sent at once, ahead of the frame |
+
+## Budgets
+
+`bins/client/bench-budgets.toml` is compiled into the executable, so the Windows artifact needs no
+file beside it. To try other numbers, copy it and pass `--budgets copy.toml`. The report says
+which budgets it used (`budgets.source`).
+
+```toml
+[passes]            # milliseconds of GPU time per frame, by the name of the pass
+primary = 1.0
+
+[gpu_total]         # GPU total of one profiler frame, by mode: primary, or one reference sample
+primary = 8.6
+```
+
+The `[streaming]` table has the gates of the real-time mode, eleven keys ("The gates", above):
+`frame_time_p99_ms`, `frame_cpu_p99_ms`, `holes`, `scene_mib`, `camera_soft_miss_frames`,
+`scene_lag_d0_max`, `spawn_ring_s`, `time_to_control_s`, `settle_s`, `gi_mean_ms` and `gi_p99_ms`.
+
+Anything else in the file, a pass or mode with a zero, negative or non-numeric budget, a
+`[streaming]` table with a key missing or an unknown one, is an error: a typo must not silently turn
+a budget off.
+
+The numbers are the per-stage frame budget of the rendering decision (#10), on the RTX 4090 at 1440p
+output. Live today: `primary` (Primary visibility, 1.0 ms), `shadows` (the sun's shadow rays, two a pixel, 0.4 ms, #52),
+`atmosphere` (the atmosphere's tables, 0.3 ms, #53), `upscale` (the TAAU pass, 0.5 ms), `gi` (the radiance-cache GI, 1.5 ms, #54),
+`denoise` (1.0 ms, #55), `edits` (1.0 ms) and `edit_frame_thread` (4.0 ms), and the total (8.6 ms). The later stages (reflections 0.7, glass 0.7, volumetrics 1.0, post 0.5)
+are in the file as comments: **whoever adds a pass uncomments its budget and names it the same** (a
+pass is named by the string given to `Profiler::compute_pass`). `reference` has no budget in #10;
+its 3.0 ms (a sample, pass and total) catches a gross regression, set from the first real run on the
+4090, which measured a mean of 1.10 ms.
+
+## The art direction's passes (#202)
+
+The exposure, bloom, tone curve and smooth normals are passes of their own, so each has a line in
+`passes[]` with its own timing (the bench reports every pass generically, so the new lines need no
+field), and `primary` no longer includes the lighting, which is **schema 20**. Names, in the order
+they run in a Primary frame:
+
+| Pass | What it is | Budget |
+| --- | --- | --- |
+| `primary` | primary visibility and the G-buffer (it no longer lights) | 1.0 (existing) |
+| `normals` | the smooth normal of every hit (the cost of the smooth normals, alone) | none yet |
+| `atmosphere` | the tables of the atmosphere (#53): the sky-view table and the aerial-perspective volumes every frame, and the transmittance, multiple-scattering and sun-free tables only when the air or the sun's height changes. It runs first, in both views, and is a pass of its own, so it adds a line to `passes[]` and no field (no schema bump). The 0.3 ms budget is the issue's, **for the 4090**: the orchestrator measures it | 0.3 |
+| `shadows` | the sun's shadow: two shadow rays a pixel from the G-buffer (#52, **schema 24**; `--shadow-rays N` in the bench) | 0.4 |
+| `gi` | Primary's global illumination (#54, **schema 29**): one bounce and an emitter sample for **one pixel of every 2 x 2 block** (a different one each frame; the rest of the block is reconstructed in `shade_pass`) from the G-buffer, the world-space radiance cache that supplies the bounces after it, and the cache's per-frame resolve | 1.5 |
+| `denoise` | Primary's denoiser (#55, **schema 33**): the frame's samples of the sun's weight and the bounce light from the lattice (`gi_samples`, which `shade_pass` read from `gi`'s output before), the temporal accumulation with clamping, and four iterations of the variance-guided a-trous filter (A-SVGF), at the traced size and before the upscaler. **Always timed**, with the denoiser off too (then only `gi_samples` runs) | 1.0 |
+| `shade` | the lit image, as linear light, from the G-buffer, the shadows and the denoised light | none yet |
+| `exposure`, `exposure_adapt` | the log-average luminance and the adapted exposure | none yet |
+| `bloom_down`, `bloom_h`, `bloom_v` | the bloom, at a quarter of the size | none yet |
+| `tone` | exposure, bloom and tone curve into the encoded image | none yet |
+| `upscale` | the TAAU pass | 0.5 (existing) |
+
+The Reference view runs the same passes after `reference` (not `normals` or `shade`: it smooths and
+lights inside its own pass). **`primary` now excludes `normals` and `shade`** (the lighting and the
+smooth normals that it used to include), so `passes[primary]`, the cave-still `primary` and the
+real-time `gpu_primary_ms` are not comparable with a report of schema 19 or before, nor is the
+budget on them: add `normals` and `shade` to it (schema 20). #10 gave the whole of tone,
+exposure and bloom ("post") 0.5 ms and `gpu_total.primary` 8.6 ms; the new passes have no budget of their own yet, because the first
+number comes from the 4090: set them from that run (uncomment or add them in
+`bins/client/bench-budgets.toml`, named as above). The convergence phase runs on the old light with
+every stage off (`Offscreen::use_legacy_light`), so its numbers are comparable with reports before
+#202.
+
+## The look-dev shot list
+
+`bins/client/src/bench/lookdev.rs` (#148) is a recorded camera path for judging the art direction
+(#135) on the real 320 km Planet: eight shots modelled on Crystal Islands' (a forest floor, a canyon
+with haze, a dark descent, two crystal caves of different dominant hue, a sunlit cliff, a meadow and
+a pull-out to the Planet). It is not a `client bench` mode and no pass is timed on it. Each shot is
+its own short `CameraPath` (the places are kilometres apart: they are cuts), with the roll of the
+debug free camera where it tilts (`Q` and `E` roll it, `X` levels it), and names the places where
+hand-placed stamps go for what M1b has not built yet (crystals and vegetation). The shot list
+holds no stamp code.
+
+The places are found on the seeded Planet and recorded as numbers in `lookdev/shots.rs`. They are
+for one `GENERATOR_VERSION`, seed and radius, and a test fails when any of them moves on. To find
+them again:
+
+```
+RECORD_TO=$PWD/bins/client/src/bench/lookdev/shots.rs \
+  cargo test --release -p client --bin client -- --ignored record_the_look_dev_sites
+cargo fmt -p client
+```
+
+Every build runs the fast tests in `lookdev.rs`: the recorded `GENERATOR_VERSION`, seed and radius
+are the current ones, the shots are the issue's list in order, every keyframe falls on a whole frame
+and the roll blends the short way round. They read the record only and never the Planet.
+
+Three tests are `#[ignore]`d because they make the 320 km world map (25 s to a minute), and are run
+by hand after the places are recorded or the generator changes:
+`record_the_look_dev_sites`, `the_recorded_places_are_the_ones_the_finder_picks` (the record is what
+the finder finds) and `the_recorded_shots_are_where_they_say` (every camera is in the open, every
+stamp place is air against rock, each cave shot is 20 m or more under the ground at every keyframe
+with rock straight overhead, and the dark descent ends 15 m or more under, roofed). Rock overhead
+says the chamber is roofed; it does not prove there is no sky from the side.
+
+### The GI sheet (#54)
+
+`client lookdev --out DIR --gi` renders every shot, and the bench's emissive room, three times at the
+game's settings and writes them side by side to `DIR/index.html` and
+`DIR/<shot>/{reference,primary-flat,primary-gi}.png` (`DIR/room/` for the room): the Reference
+(the truth), Primary as it was before the radiance cache (the flat ambient of 0.25: today's look), and
+Primary with the cache's GI, both settled over 32 frames of a still camera. The crystal caves and the
+forest floor are shots of the list; the room is the bench's. It is for the owner's eye: the
+cache's image is held to the Reference, and the art direction (hazy, soft, pastel, a time-of-day tint,
+a warm hero light, #53) must be where it was. On lavapipe:
+`client lookdev --out DIR --gi --size 480x270 --spp 16`; `--shot NAME` narrows it.
+
+### The atmosphere sheet (#53)
+
+`client lookdev --out DIR --atmosphere` renders every shot in both views under **three looks** and
+writes them side by side to `DIR/index.html` and
+`DIR/<shot>/{primary,reference}-{gradient,untinted,tinted}.png`: hero light B's **gradient and haze as
+they were before #53**, **the physical atmosphere with no tint**, and **the atmosphere with the hero tint**
+(the game's look, `Look::HERO_B`; the owner's decision of 2026-11-18: see ADR 0005's sky row). It is the
+sheet for the owner to judge by eye that the atmosphere keeps the hero look (#148, #202). It needs the
+real Planet, so it makes the world map (25 s) per shot. On lavapipe (the dev box) a sheet at
+480x270 with 16 samples takes about 10 minutes:
+
+```
+cargo run --release -p client -- lookdev --out /tmp/lookdev-atmo --atmosphere --size 480x270 --spp 16
+```
+
+On the 4090 the same command at the default size and samples is the sheet. Each shot's camera sets
+the Planet's ground level (`set_ground_level`), which the atmosphere counts the camera's height from.
+`--untinted` makes the other sheets (the combinations, the stills) use the physical atmosphere with no
+tint (`Look::HERO_B_UNTINTED`), so that the tint can be compared on any of them.
+
+The sheet ends with **the tint by the time of day**: the forest floor and the canyon with haze, in the
+Reference view, at sun elevations of -12 (night), -4 (dusk), 0, 8 (the hero sun), 25 and 60 degrees (midday),
+the untinted atmosphere over the tinted one, in `DIR/<shot>/strip-<elevation>-{untinted,tinted}.png`. The
+tint is violet, mauve and purple when the sun is low or under the horizon and hazier and more orange when it
+is up, blended by the sun's elevation (ADR 0005's sky row). The display's auto-exposure settles on each
+image, so the night's brightness is evened out and what the strip shows is the colour. The sun is the same
+70 degrees from each shot's forward; only its height changes.
+
+The tint's five settings (`HERO_TINT` in `atmosphere.rs`) were set by eye on the strip: change them, rerun
+`client lookdev --out DIR --atmosphere --shot canyon --shot forest` (about 3 minutes at 480x270 and 8 samples on
+lavapipe: `--shot` picks the shots whose names contain it), and look at the strip. `cargo test -p render
+--test atmosphere sky_by_sun_elevation -- --ignored --nocapture` prints the sky's linear colour at the horizon,
+half way up and overhead for sun elevations from -12 to 60 degrees, untinted and tinted, and `horizon_profile`
+prints the rows of a level view through the horizon.
+
+### The day (#203): the cycle bench and the day sheet
+
+**`client bench --day-cycle`** runs, after the flight and before the GPU is let go, **a whole day of the
+world clock, sped up**, over the flight's path on its GPU, and adds a `day_cycle` block to `report.json`
+(schema 32). The clock runs on a fixed 60 Hz schedule (a frame is a sixtieth of the clock's second, whatever
+the wall clock says), so a day of `--day-seconds N` seconds (default 60, which is 30 times the game's half
+hour; at least 4, since a faster sun would jump) is `60 N` frames, each moving the sun by 360/(60 N) degrees:
+a drift, never a jump (the bench's `sun_step_max_degrees` and `sun_jumps` say so; the jumps are the first
+frame and the two times a day the key light changes hands). It reports:
+
+- `start_hours` (where the day began), `frame_ms` (mean, p95, max), `frame_p99_ms` and `frames_over_limit`: **the gate**. A frame over 16.7 ms
+  or a p99 over it is `day_cycle.gates.over` and exit status 2 (`--no-fail` as ever). This is the "no frame
+  over the limit" of #203's acceptance.
+- `exposure` and `exposure_fixed_camera`: the auto-exposure read back every 6 frames (outside the timed
+  part), twice: over the flight, and over the same day from **one camera that does not move** (the cache
+  follow's view; the exposure is let settle at the first sky for 450 frames before it is read). Each has
+  `min_stops`, `max_stops`, `max_stops_per_s` (the fastest it moved over a second of the clock),
+  `total_variation_stops`, `travel_over_range` (the path walked over the range: about 2 for one rise at
+  dusk and one fall at dawn; every wobble adds to it) and `reversals` (how many times it turned round by
+  more than 0.05 stops). The flight's cannot tell pumping from scenery (a ridge against the sky, a cave
+  mouth change the exposure too, which is the metering working), so **`exposure_fixed_camera` is the "no
+  exposure pumping" measure**: only the sky changes it, a day should have a handful of reversals (noon,
+  night, and the dusk and dawn knees) and `travel_over_range` near 2, and a pumping exposure has tens.
+  Neither is **gated** (there is no agreed number yet): the first 4090 run sets one.
+- `cache_follow`: the radiance cache against a drifting sun (#203's design problem 2). For four times of
+  day (before dawn, morning, afternoon, after dusk), at the game's half-hour pace and at the sped-up one,
+  the clock runs for 2 seconds (120 frames) with no boost, and the image is compared with the same time put
+  there by a jump and settled (`drifted_levels`, mean absolute 8-bit levels per channel; `floor_levels` is
+  two settled frames against each other, the noise to read it against). The exposure is held fixed for it.
+  On the dev box (lavapipe, 96x54): at the game's pace the drift is 0.2 to 1.3 levels (the sun moves 0.4
+  degrees in 2 s, within about 0.5 of the floor); sped up 30 times (12 degrees in 2 s) 0.5 to 2.4 against 2
+  to 5 for a cache that was not told at all. It is reported and not gated.
+
+`--time-of-day H` (hours, 0 to 24) also lights the ordinary flight, sweep and Edits by the world clock's
+sky at that time, stopped there, in place of the fixed hero sun, and **is where the day cycle starts** (the
+day runs from there round to there again; the default is midnight): `client bench --time-of-day 21` is a
+night flight (the frame times at night: the moon is the key light, the stars and the night floor are drawn).
+
+On the 4090 (the owner or the orchestrating agent; not run in CI beyond `--short`):
+
+```
+client.exe bench --day-cycle --out bench-day
+client.exe bench --day-cycle --day-seconds 120 --time-of-day 21 --no-convergence --out bench-night
+```
+
+The first is the day cycle after the ordinary bench; the second adds a 2-minute day and a night flight.
+`--short --day-cycle` runs on the test Planet as a smoke test (its day is 6 s).
+
+**`client lookdev --out DIR --day`** is the sheet for the eye: the shots **meadow** (ground), **pull-out
+to the Planet** (orbit: the Zoom's far end) and **crystal cave, cyan** at **dawn, golden hour (hero light B's
+sun, on its way down), noon, dusk and night**, each in the Reference view and in Primary settled, with the
+world clock stopped there. At night the sky's frame is turned so that the moon is in view. It needs the real
+Planet (25 s of world map), and on lavapipe at 320x180 and 8 samples took about 3 minutes:
+
+```
+cargo run --release -p client -- lookdev --out /tmp/lookdev-day --day --size 320x180 --spp 8
+client.exe lookdev --out DIR --day          (the 4090: 1280x720, 64 samples)
+```
+
+**Tests** (`crates/render/tests/daylight.rs`, lavapipe): a time of day is one look whatever came before it
+(set, drifted to or run to give the same frame bit for bit) and two goldens (`daylight_moon_*`,
+`daylight_golden_*`); the moon and the stars are in the night sky and not the day's; the Reference view shows
+the same moon as Primary; the pillar's shadow falls away from the sun by day and from the moon by night; the
+sun's epoch holds under a drift and moves for a set and for the key light's two changes of hands; the cache
+keeps up with a drift at the game's pace and a sped-up one; the Reference view starts when the sky holds still
+and never while it moves; and the exposure aims lower the darker the sky. `cargo test -p render --test
+daylight dump_the_day -- --ignored` writes a sheet of the ground and orbit at eight times of day to
+`$DAY_DUMP`.
+
+## Tests
+
+The statistics, budget evaluation and exit status, camera path, argument parsing and report shape
+are unit tests in `bins/client/src/bench/`. So are the streaming mode's, in `bench/stream.rs`: two
+runs give identical counts, the counts have the committed hash, every integer of the report is in
+it, the Edit shows in the next frame, the holes gate gives status 2, and the sizing check passes
+and fails when a constant is lowered below its measured value. A client test
+(`a_round_that_changes_nothing_is_not_published_in_the_games_mode_but_is_when_counting_exactly`)
+fails if the scene thread publishes for its counts of work in the game's mode. They are
+stepped and need no GPU, so they gate on Linux and on Windows, which is how the two operating
+systems are compared. `bins/client/tests/bench.rs` runs the real
+`client bench --short` (and `--short --streaming`) and checks the report's schema (version 38, with
+`streaming_real_time` null), the screenshots and the exit codes, and that `--real-time` needs
+`--streaming` and budgets with a `[streaming]` table: it runs in `cargo test` (and so in CI) on
+lavapipe. It does not run the real-time mode, which has real threads and real time (see "The
+real-time mode" for the unit test that does). `--short` uses a patch of the Planet, the one the
+golden image test renders, because the whole Planet took about 22 s to generate in release (before #264; not measured again).
