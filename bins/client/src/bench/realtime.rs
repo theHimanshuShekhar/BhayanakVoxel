@@ -5690,6 +5690,168 @@ mod tests {
         }
     }
 
+    /// The cold start at full size with no GPU, and nothing after it (#269): the load (the spawn ring,
+    /// the Guard's visible part, the scene), the frames to control and the fill, with the process's
+    /// CPU sampled every 100 ms from `/proc/self/task/*/stat` (Linux). It prints the load's and
+    /// control's times, and for each window of the run how many cores the process used and how many
+    /// of its threads were over half a core, and the CPU of each kind of thread over the run. The
+    /// profile of what bounds time to control and the fill: `docs/perf/resource-audit.md`.
+    ///
+    /// `GEN_EXTRA_US`, `PEAK_M` and `TRENCH_M` are the bench's hooks (`--gen-extra-us`, `--peak-m`,
+    /// `--trench-m`); `cargo test --release -p client --bin client -- --ignored --nocapture a_full_size_cold_start`
+    #[test]
+    #[ignore = "generates the full-size world map and takes minutes: a profile, not a test"]
+    #[cfg(target_os = "linux")]
+    fn a_full_size_cold_start_with_no_gpu_reports_the_cpu_of_the_load_and_the_fill() {
+        use std::collections::HashMap;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let env = |name: &str| std::env::var(name).ok().and_then(|v| v.parse::<f64>().ok());
+        let hooks = GenHooks {
+            extra_us: env("GEN_EXTRA_US").map(|v| v as u32),
+            relief_m: match (env("PEAK_M"), env("TRENCH_M")) {
+                (None, None) => None,
+                (peak, trench) => Some((peak.unwrap_or(2000.0), trench.unwrap_or(1000.0))),
+            },
+        };
+        // The map is made (or read) first, so that the sampling begins at the load.
+        let _ = crate::world_map();
+        let ticks_per_s = 100.0;
+        let stat_ticks = |text: &str| -> Option<(String, u64)> {
+            // `pid (name) state ... utime stime`: the name may hold spaces and brackets.
+            let (open, close) = (text.find('(')?, text.rfind(')')?);
+            let rest: Vec<&str> = text[close + 2..].split_whitespace().collect();
+            let (user, system): (u64, u64) = (rest[11].parse().ok()?, rest[12].parse().ok()?);
+            Some((text[open + 1..close].to_string(), user + system))
+        };
+        let stop = Arc::new(AtomicBool::new(false));
+        // The sampler's clock and the run's: the load begins at once.
+        let began = Instant::now();
+        // (seconds, process ticks, threads' ticks since the last sample by tid and name)
+        type Sample = (f64, u64, Vec<(u32, String, u64)>);
+        let sampler = {
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                let mut samples: Vec<Sample> = Vec::new();
+                let mut last: HashMap<u32, u64> = HashMap::new();
+                while !stop.load(Ordering::Relaxed) {
+                    let process = std::fs::read_to_string("/proc/self/stat")
+                        .ok()
+                        .and_then(|t| stat_ticks(&t))
+                        .map_or(0, |(_, t)| t);
+                    let mut threads = Vec::new();
+                    for entry in std::fs::read_dir("/proc/self/task")
+                        .into_iter()
+                        .flatten()
+                        .flatten()
+                    {
+                        let Some(tid) = entry
+                            .file_name()
+                            .to_str()
+                            .and_then(|t| t.parse::<u32>().ok())
+                        else {
+                            continue;
+                        };
+                        let Some((name, ticks)) =
+                            std::fs::read_to_string(entry.path().join("stat"))
+                                .ok()
+                                .and_then(|t| stat_ticks(&t))
+                        else {
+                            continue;
+                        };
+                        let before = last.insert(tid, ticks).unwrap_or(0);
+                        threads.push((tid, name, ticks - before.min(ticks)));
+                    }
+                    samples.push((began.elapsed().as_secs_f64(), process, threads));
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                samples
+            })
+        };
+        let built = build_full(&hooks).expect("the full-size Planet builds");
+        let load = built.setup.load;
+        let mut script = Script::full();
+        script.stream_slice = crate::scene_worker::BACKED_UP_SLICE;
+        let Built { world, setup, .. } = built;
+        world.set_backed_up_slice(script.stream_slice);
+        world.count_soft_misses();
+        world.measure_scene_thread();
+        let mut no_gpu = NoGpu;
+        let mut session = Session::new(world, &mut no_gpu, BUDGETS.frame_time_p99_ms);
+        let (cold, _) = session
+            .cold_start(&setup, &script)
+            .unwrap_or_else(|e| panic!("the cold start stopped: {e}"));
+        let ended = began.elapsed().as_secs_f64();
+        eprintln!("SCENE THREAD {:?}", session.world.scene_thread_time());
+        stop.store(true, Ordering::Relaxed);
+        let samples = sampler.join().expect("the sampler ran");
+        eprintln!(
+            "COLD START: load (time to control) {:.2} s = spawn ring {:.2} + the rest {:.2}, Guard {:.2} s, \
+             level 0 under the camera {:.2} s, Guard complete {:.1} s, fill {:.1} s",
+            load.as_secs_f64(),
+            setup.ring.as_secs_f64(),
+            load.as_secs_f64() - setup.ring.as_secs_f64(),
+            setup.guard.as_secs_f64(),
+            cold.time_to_level_0_under_camera_s,
+            cold.guard_complete_s,
+            cold.fill_s,
+        );
+        // Windows of the run, from the load's start: finer at the start.
+        let mut edges = vec![0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 5.0, 8.0, 12.0, 20.0, 30.0];
+        let mut at = 60.0;
+        while at < ended + 30.0 {
+            edges.push(at);
+            at += 30.0;
+        }
+        eprintln!("window (s)      cores  threads over 0.5 core  busiest thread (cores)");
+        for pair in edges.windows(2) {
+            let (a, b) = (pair[0], pair[1]);
+            let inside: Vec<&Sample> = samples.iter().filter(|s| s.0 > a && s.0 <= b).collect();
+            let (Some(first), Some(last)) =
+                (samples.iter().rev().find(|s| s.0 <= a), inside.last())
+            else {
+                continue;
+            };
+            let span = last.0 - first.0;
+            if span <= 0.0 {
+                continue;
+            }
+            let cores = (last.1 - first.1) as f64 / ticks_per_s / span;
+            let mut by_tid: HashMap<u32, f64> = HashMap::new();
+            for s in &inside {
+                for (tid, _, ticks) in &s.2 {
+                    *by_tid.entry(*tid).or_default() += *ticks as f64 / ticks_per_s;
+                }
+            }
+            let over = by_tid.values().filter(|&&c| c / span > 0.5).count();
+            let busiest = by_tid.values().copied().fold(0.0, f64::max) / span;
+            eprintln!(
+                "{:>5.1}..{:<6.1} {:>7.2} {:>8} {:>22.2}",
+                pair[0],
+                pair[1].min(ended),
+                cores,
+                over,
+                busiest
+            );
+        }
+        let mut by_name: HashMap<String, f64> = HashMap::new();
+        for s in &samples {
+            for (_, name, ticks) in &s.2 {
+                let name = if name.starts_with("ring loader") {
+                    "ring loader".to_string()
+                } else {
+                    name.clone()
+                };
+                *by_name.entry(name).or_default() += *ticks as f64 / ticks_per_s;
+            }
+        }
+        let mut names: Vec<_> = by_name.into_iter().collect();
+        names.sort_by(|a, b| b.1.total_cmp(&a.1));
+        eprintln!("CPU seconds by thread name over the run (live threads only):");
+        for (name, seconds) in names.iter().take(8) {
+            eprintln!("  {name:<20} {seconds:>8.1} s");
+        }
+    }
+
     /// The sea-level crossing at full size, without a GPU (#213): the scene thread's longest round
     /// in each path, and the flips' updates held against the others'. The scene thread's rounds are
     /// the same work as on the 4090 (a frame's time is not, with no GPU). It runs the whole
