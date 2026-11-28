@@ -75,8 +75,16 @@ A ready-made Voxel model, such as a brick or a log, one metre across, that a pla
 _Avoid_: Block, prefab, tile
 
 **Tool**:
-What a character holds to make Edits, such as a pickaxe or a shovel. A Tool decides which Brushes its holder can use and how fast it digs each Material. Not in the Vertical slice, where a player picks a Brush freely.
+What a character holds to dig in Survival: an axe, a shovel or a pickaxe, each of a tier. Every Material names the Tool that digs it. A wrong Tool or bare hands dig it far more slowly but never not at all, and a better tier digs faster. A Tool decides which Brushes its holder can dig with. Placing needs no Tool. Not in Creative.
 _Avoid_: Item, weapon
+
+**Creative**:
+The way to play with every Brush and Material free and no Tools, as in the Vertical slice.
+_Avoid_: Sandbox mode, build mode
+
+**Survival**:
+The way to play where a character gathers, carries an inventory, has health, and digs with Tools.
+_Avoid_: Adventure mode
 
 **Ghost**:
 The preview of a Brush where the next click would apply it, showing exactly the Voxels the Edit would change.

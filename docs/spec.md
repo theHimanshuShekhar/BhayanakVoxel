@@ -256,7 +256,23 @@ A headless bot soak against the in-process server runs from M1a on (tick time an
 Decided 2026-11-11. These are ordered but not designed; each is grilled when it is near.
 
 - **M6: Moving Pieces.** Doors and hatches, on Debris's moving bodies.
-- **M7: Survival and Tools.** Gathering, an inventory, health. A Tool is what a character holds; it owns the Brushes its holder can use, and replaces free Brush choice.
+- **M7: Survival and Tools.** Gathering, an inventory, health. A Tool is what a character holds; it owns the Brushes its holder can dig with, and replaces free Brush choice in Survival. Creative keeps free Brushes and Materials. Decided with the owner on 2026-11-28:
+  - **Tools:**
+    - **Kinds:** axe, shovel and pickaxe.
+    - **Which Tool digs each Material:** a `tool` field in `materials.toml`, added in M7. Each Material is axe, shovel, pickaxe or any.
+      - **Axe:** bark, wood, planks, cactus.
+      - **Shovel:** soil, grassy soil, clay, gravel, sand, red sand, mud, peat.
+      - **Pickaxe:** the rocks, ice, coal, crystals, bricks, concrete, marble, metals, glass, roof tiles and lights.
+      - **Any, hands included:** snow, leaves, grasses, moss, flowers, mushrooms, cloth, rope, thatch.
+      - **Water and lava** wait for Fluids.
+    - **Wrong Tool or bare hands:** about 5–10× slower, never blocked.
+    - **Tiers** (for example wood, stone, iron, steel) set the speed. Digging time comes from the Material's hardness, then whether the Tool is right, then its tier. A low tier on very hard Materials is as slow as the wrong Tool.
+  - **Brush shapes by Tool:**
+    - **Pickaxe:** small and precise, up to about 0.5 m.
+    - **Shovel:** wide and shallow, plus smooth and flatten.
+    - **Axe:** a thin planar slab, the felling cut.
+    - Placing needs no Tool.
+  - **Breaking behaviour** (felling, walls coming down, placed items breaking) is decided later. It works from the Voxels alone: Materials and connectivity, with unsupported parts falling as Debris (M3). The Planet keeps forgetting Pieces and Plants (ADR 0011).
 - **M8: Solar system.** More than one Planet, and travel between them.
 - **Deferred from the inspirations** (#136, #137, #138):
   - Scorch and paint marks, snow build-up, moss growth and seasons, a spline-camera photo mode, and a gamepad.
