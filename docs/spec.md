@@ -256,7 +256,31 @@ A headless bot soak against the in-process server runs from M1a on (tick time an
 Decided 2026-11-11. These are ordered but not designed; each is grilled when it is near.
 
 - **M6: Moving Pieces.** Doors and hatches, on Debris's moving bodies.
-- **M7: Survival and Tools.** Gathering, an inventory, health. A Tool is what a character holds; it owns the Brushes its holder can use, and replaces free Brush choice.
+- **M7: Survival and Tools.** Gathering, an inventory, health. A Tool is what a character holds; it owns the Brushes its holder can dig with, and replaces free Brush choice in Survival. Creative keeps free Brushes and Materials. Decided with the owner on 2026-11-28:
+  - **Tools:**
+    - **Kinds:** axe, shovel and pickaxe.
+    - **Which Tool digs each Material:** a `tool` field in `materials.toml`, added in M7. Each Material is axe, shovel, pickaxe or any.
+      - **Axe:** bark, wood, planks, cactus.
+      - **Shovel:** soil, grassy soil, clay, gravel, sand, red sand, mud, peat.
+      - **Pickaxe:** the rocks, ice, coal, crystals, bricks, concrete, marble, metals, glass, roof tiles and lights.
+      - **Any, hands included:** snow, leaves, grasses, moss, flowers, mushrooms, cloth, rope, thatch.
+      - **Water and lava** wait for Fluids.
+    - **Wrong Tool or bare hands:** about 5–10× slower, never blocked.
+    - **Tiers** (for example wood, stone, iron, steel) set the speed. Digging time comes from the Material's hardness, then whether the Tool is right, then its tier. A low tier on very hard Materials is as slow as the wrong Tool.
+  - **Brush shapes by Tool:**
+    - **Pickaxe:** small and precise, up to about 0.5 m.
+    - **Shovel:** wide and shallow, plus smooth and flatten.
+    - **Axe:** a thin planar slab, the felling cut.
+    - Placing needs no Tool.
+  - **Building** (owner, 2026-11-28, #283):
+    - **Every Piece is crafted** from bare Materials at a station, the plain brick Piece included (stone makes stone stairs, planks make a door), and stacks in an item slot. A Piece costs exactly the litres it stamps. Fired brick, planks and glass are Materials made by conversion recipes.
+    - **Digging a placed Piece** is an ordinary dig at full Yield: it returns its Material's litres, not the Piece. The Planet keeps no record of it.
+    - **Loose ground:** the shovel pours soil, sand, gravel and snow straight from the Ledger; nothing else goes down except as a crafted Piece.
+    - **Containers** hold litres and stacks of crafted Pieces; a broken one spills its Pieces as their Material (ADR 0011).
+    - **A Blueprint in Survival** is never pasted: it shows as the player's own Ghost, kept in their player data, which they fill with crafted Pieces at the usual cost. The Ghost marks the Voxels still missing; any Piece that fills them counts.
+    - **Creative's building helpers** are one ticket after saves (#62) and uploads (#163): a box or plane of Pieces, fill, hollow and outline with one Material, masked replace, mirror (the plane in the build's own frame), copy and Paste, and Blueprints. A Paste uploads its Clipboard or Blueprint once as a blob named by its hash; the Paste Edit names the blob, a position and a 90° turn, and the server applies it at the Edit rate and replicates it like a snapshot. Helpers queue Edits at the Edit rate with the Ghost showing progress; a server setting can raise it for Creative players up to the tick budget. Blueprints are kept per player on the server under a quota sized from its free disk, with a floor, and export and import as files.
+    - **Structural integrity** is not specified yet: only Debris connectivity (M3).
+  - **Breaking behaviour** (felling, walls coming down, placed items breaking) is decided later. It works from the Voxels alone: Materials and connectivity, with unsupported parts falling as Debris (M3). The Planet keeps forgetting Pieces and Plants (ADR 0011).
 - **M8: Solar system.** More than one Planet, and travel between them.
 - **Deferred from the inspirations** (#136, #137, #138):
   - Scorch and paint marks, snow build-up, moss growth and seasons, a spline-camera photo mode, and a gamepad.
@@ -278,7 +302,7 @@ Of the Vertical slice; the first two items are M7 and M8's.
 - MMO scale and sharding.
 - Web, console and mobile.
 - Commercial concerns.
-- Paint, line/box and copy-paste tools, and landscape-scale area sculpting.
+- Paint and landscape-scale area sculpting. (Line/box and copy-paste are no longer deferred: they are Creative's building helpers, after saves and uploads; see M7's *Building*, #283.)
 - Travel aids: teleport and fast travel. The Planet is crossed by walking and flying, and seen whole from orbit.
 - Ambient creatures, vehicles, fire and explosives, mechanisms (moving Pieces are M6's), and recreating real places (#138).
 - Public servers, claims and per-player rollback.

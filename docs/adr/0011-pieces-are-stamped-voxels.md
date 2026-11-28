@@ -7,6 +7,13 @@ We chose it because 5 cm Voxels make free-hand architecture impractical (a small
 - **A Piece is data**: a shape and a Material pattern, in a data file like the Materials. The pattern is a function of position in the Piece's own space, so mortar lines and tree rings stay straight whatever way the Piece is turned.
 - **A Piece is an Edit operation of the usual size** (ADR 0003): which Piece, where, which way. Every client stamps the same Voxels.
 - **A Piece lines up with the Piece it is placed against.** The first Piece of a build stands on the Planet's local up and faces the way the camera looks; later ones take their frame from their neighbour, so a build has one straight grid of its own. Two builds begun apart do not line up.
+- **Snapping (owner, 2026-11-28; details revisited with the Pieces ticket):**
+  - A new Piece snaps to any face of its neighbour: sides, top, and underside (lintels, ceilings).
+  - Along that face it may sit at half and quarter steps of its length, so walls can be staggered like brickwork.
+  - Within a build it turns only in 90° steps, so corners stay square.
+  - With nothing to snap to (open ground, or a face too damaged to read), it is the first Piece of a new build, and the Ghost shows that it is not snapped. Placing never fails.
+  - Sizes are set by the Pieces ticket's catalogue. A building brick is a "brick Piece", because "brick" is the storage unit (ADR 0002).
+- **Containers are the exception (owner, 2026-11-28, #282).** A Container (a chest or crate) is drawn as ordinary Voxels, plus a small record at its anchor holding a Ledger of Materials. It is saved and replicated like a player's Ledger. Digging any of its Voxels breaks it: the record goes, and its contents spill as heaps of Voxels. Containers hold matter and stacks of crafted Pieces, counted by Piece type and Material; broken, they spill the Pieces as their Material. Every other placed thing stays forgotten Voxels. In Survival every Piece is crafted from bare Materials and costs exactly the litres it stamps; digging it is an ordinary dig that returns those litres, not the Piece (owner, 2026-11-28, #283), so Pieces need no record.
 - **Voxels are on one lattice for the whole Planet**, so a build that is tilted against it has faces stepped at 5 cm, as a cube Brush has today. Accepted.
 - **Pieces are static.** A doorway is a gap. Pieces that move (doors, hatches) come after the Vertical slice, built on Debris's moving bodies.
 

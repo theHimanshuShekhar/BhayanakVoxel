@@ -19,8 +19,52 @@ Said of a solid Voxel with air against one of its faces. The Planet's surface is
 _Avoid_: Visible, surface Voxel
 
 **Cave**:
-Air that the generator carves under the Planet's land, in tunnels and chambers, some of which open to the surface as cave mouths. A part of the Planet's generated terrain, not an Edit.
+Air that the generator carves under the Planet's land, in tunnels, chambers and ravines, some of which open to the surface as cave mouths. Each Cave has its Cave Biome. A part of the Planet's generated terrain, not an Edit.
 _Avoid_: Dungeon, hole (a hole is dug)
+
+**Climate**:
+The conditions at a point on the Planet: its temperature and its moisture. It chooses the Biome.
+_Avoid_: Weather, environment
+
+**Landform**:
+The kind of shape the land takes at a place, such as a range, plateau, canyon, valley, plains, coast, volcanic land or ocean.
+_Avoid_: Terrain type, relief
+
+**Biome**:
+A named kind of land with its own surface and life, chosen by the Climate from those its Landform allows (a canyon in a hot, dry Climate is badlands), or, for a Cave Biome, by the land above it and its depth.
+_Avoid_: Zone, region
+
+**Cave Biome**:
+The Biome of a Cave, chosen by the surface Biome's moisture and rock above it and by its depth, such as lush caves under wet land or dripstone in limestone. The surface above keeps its own Biome.
+_Avoid_: Cave type, underground biome
+
+**Relief**:
+The height of the Planet's solid surface at each place, the sea floor included: one height per place, so it has no overhangs. Most of the terrain is the Relief alone.
+_Avoid_: Heightfield, ground (the Ground is what is generated around a character), elevation (the world map's coarse share of it)
+
+**Formation**:
+A 3D shape the generator adds to the Relief or carves from it, only where a Biome or a Landmark asks for one: a leaning cliff, a spire, an arch, a sky island. A place is solid when it is under the Relief or inside an added Formation, and not inside a carved one; carving wins. Caves are carved Formations. Part of the generated terrain, not an Edit.
+_Avoid_: Overhang (one kind), stamp, 3D layer
+
+**Landmark**:
+One of the few giant one-off Formations placed across the Planet from the seed, such as a 500 m arch or a sky archipelago, each where its Biome allows its kind. The everyday spires and arches are just Formations.
+_Avoid_: POI, wonder, structure (structures are buildings and villages)
+
+**Ore**:
+A Material dug to be turned into metal, fuel or gems, such as iron ore, coal or Skyrite. Ore lies in the ground as ordinary Voxels.
+_Avoid_: Resource (too broad), mineral
+
+**Vein**:
+One body of an Ore in the ground, whatever its shape: a seam along the strata, a winding streak, a pocket, or flecks in sand. Part of the generated terrain, not an Edit.
+_Avoid_: Deposit, node, lode
+
+**Plant**:
+One generated growth of Voxels that a Biome places: a tree, shrub, grass tuft, flower, fern, vine or fallen log, each grown differently from the seed. Its Voxels are ordinary Voxels, so digging cuts it like anything else, and the Planet does not remember which Voxels belong to which Plant. Part of the generated terrain, not an Edit.
+_Avoid_: Species, foliage, flora, vegetation (the informal name for Plants together)
+
+**Plant kind**:
+A template that grows Plants, such as a conifer, a broadleaf tree or a fern, with its shape and Materials. Each Biome lists the Plant kinds it grows and how densely.
+_Avoid_: Species, tree type
 
 **Crystal cluster**:
 A few radiating hexagonal prisms with pointed tips, of one of eight emissive crystal Materials, that the generator grows from a sunlit slope or the wall of a Cave in the world map's crystal-caves region, along the surface's normal. Part of the generated terrain (it fills air only, and is in the levels of detail up to 3), not an Edit. Each Cave has a dominant hue.
@@ -30,7 +74,7 @@ _Avoid_: Crystal (the Material of one prism), geode
 A test of a place that depends on the seed alone (the world map and the Caves' density, never the order bricks are made in), so that every brick, at any level, and the server agree on what is there: sunlit (slope, aspect, open sky), Cave wall (the density's gradient) and room (the local density). Content is placed by them.
 
 **Material**:
-The kind of matter a Voxel is made of (e.g. rock, sand, water, glass), carrying properties like hardness or emissiveness.
+The kind of matter a Voxel is made of (e.g. rock, sand, water, glass), carrying properties like hardness, emissiveness, or whether a character can walk through it (leaves and grass can).
 _Avoid_: Block type, voxel type
 
 **Edit**:
@@ -42,12 +86,44 @@ The shape and size an Edit applies to the Planet (e.g. a 1 m sphere).
 _Avoid_: Tool size, cursor
 
 **Piece**:
-A ready-made Voxel model, such as a brick or a log, one metre across, that a player places whole in a single Edit. Once placed it is ordinary Voxels and the Planet does not remember it. A Piece lines up with the Piece it is placed against.
-_Avoid_: Block, prefab, tile
+A ready-made Voxel model, such as a brick Piece or a log, about a metre across, that a player places whole in a single Edit. Once placed it is ordinary Voxels and the Planet does not remember it. A Piece snaps to any face of the Piece it is placed against, in line or staggered, and turned square to it; with nothing to snap to it starts a new build.
+_Avoid_: Block, prefab, tile, brick (a brick is the 8×8×8 Voxel storage unit; say "brick Piece")
 
 **Tool**:
-What a character holds to make Edits, such as a pickaxe or a shovel. A Tool decides which Brushes its holder can use and how fast it digs each Material. Not in the Vertical slice, where a player picks a Brush freely.
+What a character holds to dig in Survival: an axe, a shovel or a pickaxe, each of a tier. Every Material names the Tool that digs it. A wrong Tool or bare hands dig it far more slowly but never not at all, and a better tier digs faster. A Tool decides which Brushes its holder can dig with. Placing needs no Tool. Not in Creative.
 _Avoid_: Item, weapon
+
+**Yield**:
+What a dig gives a player in Survival: the volume of each Material it removed, shown in litres.
+_Avoid_: Drop, loot, resources
+
+**Ledger**:
+The litres of each Material that a player or a Container holds in Survival. Yield fills it; crafting spends from it, and so does pouring loose ground with a shovel.
+_Avoid_: Pack (the thing that sets its size), inventory (informal: a player's Ledger plus slots of Tools and crafted Pieces)
+
+**Container**:
+A placed chest or crate that holds a Ledger and stacks of crafted Pieces: the one kind of placed thing the Planet remembers. Digging into it breaks it and spills what it held as Materials.
+_Avoid_: Storage block, inventory
+
+**Clipboard**:
+The region of Voxels a player has copied in Creative and not saved, ready to Paste.
+_Avoid_: Selection (what is outlined before it is copied), buffer
+
+**Blueprint**:
+A saved region of Voxels in a player's library, kept by the server and exportable as a file. In Creative it is Pasted; in Survival it shows as a Ghost that the player builds into with Pieces.
+_Avoid_: Prefab, schematic, design
+
+**Paste**:
+The Edit that stamps a Clipboard or Blueprint onto the Planet at a position, turned in 90° steps. Afterwards it is ordinary Voxels.
+_Avoid_: Clone, place (placing is one Piece)
+
+**Creative**:
+The way to play with every Brush and Material free and no Tools, as in the Vertical slice.
+_Avoid_: Sandbox mode, build mode
+
+**Survival**:
+The way to play where a character gathers, carries an inventory, has health, and digs with Tools.
+_Avoid_: Adventure mode
 
 **Ghost**:
 The preview of a Brush where the next click would apply it, showing exactly the Voxels the Edit would change.
